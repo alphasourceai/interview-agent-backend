@@ -18,9 +18,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
-
-const { handleTavusWebhook } = require('./handlers/tavusWebhook');
-app.post('/api/tavus-webhook', express.json(), handleTavusWebhook);
-
-const { handleTavusWebhook } = require('./handlers/tavusWebhook');
-app.post('/api/tavus-webhook', express.json(), handleTavusWebhook);
