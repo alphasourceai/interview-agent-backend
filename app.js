@@ -21,3 +21,6 @@ app.listen(PORT, () => {
 
 const { handleTavusWebhook } = require('./handlers/tavusWebhook');
 app.post('/api/tavus-webhook', express.json(), handleTavusWebhook);
+
+const { handleTavusWebhook } = require('./handlers/tavusWebhook');
+app.post('/api/tavus-webhook', express.json(), handleTavusWebhook);
