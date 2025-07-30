@@ -30,7 +30,7 @@ async function createTavusInterview(candidate) {
 
     const data = response.data;
 
-    const insertResult = await supabase.from('conversations').insert([{
+    const insertResponse = await supabase.from('conversations').insert([{
       candidate_id: candidate.candidate_id,
       email: candidate.email,
       name: candidate.name,
@@ -38,10 +38,10 @@ async function createTavusInterview(candidate) {
       conversation_url: data.conversation_url
     }]);
 
-    console.log('Supabase insert response:', insertResult);
+    console.log('Supabase insert response:', insertResponse);
 
-    if (insertResult.error) {
-      console.error('Supabase insert error:', insertResult.error);
+    if (insertResponse.error) {
+      console.error('Supabase insert error:', insertResponse.error);
     }
 
     return data;
