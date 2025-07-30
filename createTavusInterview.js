@@ -1,36 +1,53 @@
-const axios = require('axios');
-const { config } = require('dotenv');
+const fetch = require('node-fetch');
+require('dotenv').config();
 
-config();
+const TAVUS_API_KEY = process.env.TAVUS_API_KEY;
+const TAVUS_PERSONA_ID = process.env.TAVUS_PERSONA_ID;
 
-async function createTavusInterview(candidate) {
-  const TAVUS_API_KEY = process.env.TAVUS_API_KEY;
-  const WEBHOOK_URL = process.env.TAVUS_WEBHOOK_URL;
+async function createTavusInterview(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).send({ error: 'Method not allowed' });
+  }
 
-  const payload = {
-    template_id: process.env.TAVUS_TEMPLATE_ID, // You must define this in .env
-    webhook_url: WEBHOOK_URL,
-    metadata: {
-      candidate_id: candidate.id,
-      email: candidate.email
-    },
-    variables: {
-      name: candidate.name
+  const { candidate_id, email, name } = req.body;
+
+  if (!candidate_id || !email || !name) {
+    return res.status(400).send({ error: 'Missing candidate_id, name, or email' });
+  }
+
+  try {
+    const response = await fetch('https://api.tavus.io/conversations', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${TAVUS_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        persona_id: TAVUS_PERSONA_ID,
+        callback_url: 'https://interview-agent-backend-z6un.onrender.com/tavus-webhook',
+        metadata: {
+          candidate_id,
+          email,
+        },
+        variables: {
+          name,
+        },
+      }),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('Tavus error:', data);
+      return res.status(500).send({ error: 'Failed to create Tavus conversation' });
     }
-  };
 
-  const headers = {
-    Authorization: `Bearer ${TAVUS_API_KEY}`,
-    'Content-Type': 'application/json'
-  };
-
-  const response = await axios.post(
-    'https://api.tavus.io/v1/videos',
-    payload,
-    { headers }
-  );
-
-  return response.data?.url || null;
+    return res.status(200).send({ message: 'Conversation created', data });
+  } catch (error) {
+    console.error('Error creating Tavus conversation:', error);
+    return res.status(500).send({ error: 'Internal server error' });
+  }
 }
 
-module.exports = createTavusInterview;
+module.exports = { createTavusInterview };
+
