@@ -8,7 +8,6 @@ async function createTavusInterview(candidate) {
   const WEBHOOK_URL = process.env.TAVUS_WEBHOOK_URL;
 
   const payload = {
-    template_id: process.env.TAVUS_TEMPLATE_ID,
     webhook_url: WEBHOOK_URL,
     metadata: {
       candidate_id: candidate.id,
@@ -34,4 +33,3 @@ async function createTavusInterview(candidate) {
 }
 
 module.exports = createTavusInterview;
-
