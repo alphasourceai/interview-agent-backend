@@ -7,7 +7,7 @@ config();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 async function createTavusInterview(candidate) {
-  console.log('Incoming candidate payload:', candidate); // DEBUG LOG
+  console.log('Incoming candidate payload:', candidate);
 
   const API_KEY = process.env.TAVUS_API_KEY;
   const WEBHOOK_URL = process.env.TAVUS_WEBHOOK_URL;
@@ -33,7 +33,7 @@ async function createTavusInterview(candidate) {
     const data = response.data;
 
     const insertResponse = await supabase.from('conversations').insert([{
-      candidate_id: candidate.candidate_id,
+      candidate_id: candidate.id,
       email: candidate.email,
       name: candidate.name,
       conversation_id: data.conversation_id,
