@@ -5,7 +5,8 @@
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "nodemon app.js"
   },
   "keywords": [],
   "author": "",
@@ -14,12 +15,18 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.53.0",
     "axios": "^1.11.0",
+    "cors": "^2.8.5",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
+    "mime-types": "^3.0.1",
     "multer": "^2.0.2",
+    "node-fetch": "^2.7.0",
     "openai": "^5.10.2",
     "pdf-parse": "^1.1.1",
     "puppeteer": "^24.15.0",
     "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
   }
 }

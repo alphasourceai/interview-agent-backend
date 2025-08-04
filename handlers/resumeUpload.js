@@ -20,7 +20,8 @@ const handleResumeUpload = [
       const resumeFile = req.file;
       const fileExt = path.extname(resumeFile.originalname);
       const timestamp = Date.now();
-      const storagePath = `resumes/${email}-${timestamp}${fileExt}`;
+      const candidate_id = `cand-${uuidv4()}`;
+      const storagePath = `resumes/${candidate_id}${fileExt}`;
 
       const { data: uploadData, error: uploadError } = await supabase.storage
         .from('resumes')
@@ -34,16 +35,6 @@ const handleResumeUpload = [
       }
 
       const publicURL = `https://${process.env.SUPABASE_URL.split('//')[1]}/storage/v1/object/public/${uploadData.path}`;
-
-      const { data: candidate, error: dbError } = await supabase
-        .from('candidates')
-        .insert([{ id: uuidv4(), name, email, role_id, upload_ts: new Date().toISOString(), status: 'Resume Uploaded' }])
-        .select()
-        .single();
-
-      if (dbError) {
-        return res.status(500).json({ error: 'Failed to save candidate metadata', dbError });
-      }
 
       const pdfText = (await pdfParse(resumeFile.buffer)).text;
 
@@ -81,7 +72,31 @@ Respond in JSON with:
         temperature: 0.3,
       });
 
-      const analysis = JSON.parse(response.choices[0].message.content);
+      const raw = response.choices[0].message.content;
+const cleanJson = raw.replace(/```json|```/g, '').trim();
+const analysis = JSON.parse(cleanJson);
+
+
+      const { data: candidate, error: dbError } = await supabase
+        .from('candidates')
+        .insert([{
+          id: uuidv4(),
+          candidate_id,
+          name,
+          email,
+          role_id,
+          upload_ts: new Date().toISOString(),
+          status: 'Resume Uploaded',
+          interview_status: 'pending',
+          resume_url: publicURL,
+          analysis_summary: analysis.summary
+        }])
+        .select()
+        .single();
+
+      if (dbError) {
+        return res.status(500).json({ error: 'Failed to save candidate metadata', dbError });
+      }
 
       await supabase.from('reports').insert([
         {
