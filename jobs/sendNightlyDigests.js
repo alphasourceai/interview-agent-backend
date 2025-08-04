@@ -6,6 +6,8 @@ const { format, startOfDay, endOfDay } = require('date-fns');
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
 async function sendNightlyDigests() {
+  console.log('🚀 Nightly digest job started');
+
   try {
     const now = new Date();
     const timezoneOffset = -6 * 60; // CST offset in minutes
@@ -22,6 +24,7 @@ async function sendNightlyDigests() {
       .select('id, title, client_id, created_at');
 
     if (rolesError) throw new Error('Failed to fetch roles');
+    console.log(`📌 Fetched ${roles.length} roles`);
 
     for (const role of roles) {
       const { data: clientData, error: clientError } = await supabase
@@ -30,7 +33,10 @@ async function sendNightlyDigests() {
         .eq('id', role.client_id)
         .single();
 
-      if (clientError || !clientData?.email) continue;
+      if (clientError || !clientData?.email) {
+        console.log(`⚠️ Skipping role ${role.title} (missing client email)`);
+        continue;
+      }
 
       const { data: reports, error: reportsError } = await supabase
         .from('reports')
@@ -39,14 +45,20 @@ async function sendNightlyDigests() {
         .lte('created_at', end.toISOString())
         .eq('role_id', role.id);
 
-      if (reportsError || !reports.length) continue;
+      if (reportsError || !reports.length) {
+        console.log(`📭 No reports for role ${role.title} today`);
+        continue;
+      }
 
       const { data: candidates, error: candidatesError } = await supabase
         .from('candidates')
         .select('id, name, email')
         .in('id', reports.map(r => r.candidate_id));
 
-      if (candidatesError) continue;
+      if (candidatesError) {
+        console.log(`⚠️ Failed to fetch candidates for role ${role.title}`);
+        continue;
+      }
 
       const candidateMap = Object.fromEntries(candidates.map(c => [c.id, c]));
 
@@ -74,7 +86,11 @@ async function sendNightlyDigests() {
         role_id: role.id,
         email: clientData.email
       });
+
+      console.log(`📝 Logged digest for role ${role.title}`);
     }
+
+    console.log('✅ Nightly digest job completed');
   } catch (err) {
     console.error('❌ Error sending nightly digests:', err.message);
   }
