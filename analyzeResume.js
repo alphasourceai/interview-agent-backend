@@ -20,9 +20,16 @@ async function analyzeResume(candidate, resumePath, role) {
   const pdfData = await pdfParse(fs.readFileSync(resumePath));
   const resumeText = pdfData.text;
 
-  const prompt = `
-You are an expert recruiter. Analyze this resume against the role description.
+  const systemPrompt = `
+You are an unbiased, compliance-aware AI assistant helping evaluate candidates.
+You must remain fully ADA and EEOC compliant.
 
+Do not infer or consider any protected characteristics such as age, gender, race, disability, ethnicity, or appearance.
+
+Evaluate the candidate solely based on their resume’s stated experience, education, and skills in relation to the job description.
+`;
+
+const userPrompt = `
 Role Description:
 ${role.description}
 
@@ -30,17 +37,21 @@ Resume:
 ${resumeText}
 
 Provide a JSON response with:
-- resume_score (0-100)
-- skills_match_percent (0-100)
-- experience_match_percent (0-100)
-- education_match_percent (0-100)
-- overall_resume_match_percent (0-100)
-- summary (100-150 words)
+- resume_score (0–100)
+- skills_match_percent (0–100)
+- experience_match_percent (0–100)
+- education_match_percent (0–100)
+- overall_resume_match_percent (0–100)
+- summary (100–150 words)
 `;
+
 
   const response = await openai.chat.completions.create({
     model: "gpt-4o-mini",
-    messages: [{ role: "user", content: prompt }],
+    messages: [
+  { role: "system", content: systemPrompt },
+  { role: "user", content: userPrompt }
+],
     response_format: { type: "json_object" }
   });
 

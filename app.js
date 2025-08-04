@@ -3,11 +3,12 @@ const express = require('express');
 const cors = require('cors');
 
 const { handleResumeUpload } = require('./handlers/resumeUpload');
-const { handleTavusWebhook } = require('./handlers/tavusWebhook'); // ✅ Correct handler
+const { handleTavusWebhook } = require('./handlers/tavusWebhook');
 const createTavusInterviewHandler = require('./handlers/createTavusInterview');
 
 const candidateRoutes = require('./routes/candidates');
-const reportRoutes = require('./routes/reports'); // ✅ Reports route
+const reportRoutes = require('./routes/reports');
+const createRoleRoute = require('./routes/createRole'); // ✅ NEW: Role Creator Route
 
 const app = express();
 app.use(cors());
@@ -17,19 +18,18 @@ app.use(express.urlencoded({ extended: true }));
 app.get('/', (req, res) => res.send('Interview Agent Backend Running'));
 
 app.post('/upload-resume', handleResumeUpload);
-app.post('/webhook/recording-ready', handleTavusWebhook); // ✅ Updated to correct handler
+app.post('/webhook/recording-ready', handleTavusWebhook);
 
 app.post('/create-tavus-interview', async (req, res) => {
   try {
     const { candidate_id, name, email, role_id } = req.body;
 
-const candidate = {
-  id: candidate_id,
-  name,
-  email,
-  role_id
-};
-
+    const candidate = {
+      id: candidate_id,
+      name,
+      email,
+      role_id
+    };
 
     const video_url = await createTavusInterviewHandler(candidate);
     return res.status(200).json({ message: 'Tavus interview created', video_url });
@@ -40,7 +40,8 @@ const candidate = {
 });
 
 app.use('/candidates', candidateRoutes);
-app.use('/reports', reportRoutes); // ✅ Keep reports route
+app.use('/reports', reportRoutes);
+app.use('/create-role', createRoleRoute); // ✅ New route added here
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
