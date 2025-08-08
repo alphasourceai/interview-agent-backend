@@ -59,16 +59,38 @@ async function handleTavusWebhook(req, res) {
 
   const jobDescription = candidate.roles?.description || 'Not provided';
 
-  const { data: report, error: reportError } = await supabase
+let { data: report, error: reportError } = await supabase
+  .from('reports')
+  .select('*')
+  .eq('candidate_id', candidate_id)
+  .single();
+
+if (reportError || !report) {
+  console.warn('⚠️ No existing report found — inserting new report record');
+
+  const insertResponse = await supabase
     .from('reports')
-    .select('*')
-    .eq('candidate_id', candidate_id)
+    .insert([
+      {
+        candidate_id,
+        role_id: candidate.role_id,
+        name: candidate.name,
+        email: candidate.email,
+        resume_score: candidate.resume_score || 0,
+        resume_breakdown: candidate.resume_breakdown || {},
+        created_at: new Date()
+      }
+    ])
+    .select()
     .single();
 
-  if (reportError || !report) {
-    console.error('❌ Report not found:', reportError);
-    return res.status(404).send({ error: 'Report not found' });
+  if (insertResponse.error) {
+    console.error('❌ Failed to insert new report:', insertResponse.error);
+    return res.status(500).send({ error: 'Failed to insert report' });
   }
+
+  report = insertResponse.data;
+}
 
   // Fallback for resume_breakdown structure
   const resume_breakdown = report.resume_breakdown || {};

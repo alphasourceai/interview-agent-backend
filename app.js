@@ -10,6 +10,10 @@ const candidateRoutes = require('./routes/candidates');
 const reportRoutes = require('./routes/reports');
 const createRoleRoute = require('./routes/createRole'); // ✅ NEW: Role Creator Route
 
+// ✅ New route handlers for frontend interview flow
+const candidateSubmitRoute = require('./routes/candidateSubmit');
+const verifyOtpRoute = require('./routes/verifyOtp');
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -41,7 +45,11 @@ app.post('/create-tavus-interview', async (req, res) => {
 
 app.use('/candidates', candidateRoutes);
 app.use('/reports', reportRoutes);
-app.use('/create-role', createRoleRoute); // ✅ New route added here
+app.use('/create-role', createRoleRoute);
+
+// ✅ Add these lines for the interview access form and OTP verification
+app.use('/api/candidate/submit', candidateSubmitRoute);
+app.use('/api/candidate/verify-otp', verifyOtpRoute);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

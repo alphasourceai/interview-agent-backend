@@ -28,7 +28,10 @@
     "openai": "^5.11.0",
     "pdf-parse": "^1.1.1",
     "puppeteer": "^24.15.0",
+    "react-router-dom": "^7.7.1",
     "resend": "^4.8.0",
+    "supabase": "^2.33.9",
+    "twilio": "^5.8.0",
     "uuid": "^11.1.0"
   },
   "devDependencies": {
