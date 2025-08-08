@@ -5,6 +5,7 @@ const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
 const { createClient } = require('@supabase/supabase-js');
 const { OpenAI } = require('openai');
+const { v4: uuidv4 } = require('uuid');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -38,7 +39,7 @@ router.post('/', upload.single('job_description_file'), async (req, res) => {
     const fileType = req.file.originalname.split('.').pop().toLowerCase();
     const fileName = `${Date.now()}-${req.file.originalname}`;
     const { data: uploadData, error: uploadError } = await supabase.storage
-      .from('resumes') // You can switch to 'job-descriptions' bucket if needed
+      .from('resumes') // Consider renaming to 'job-descriptions'
       .upload(`job-descriptions/${fileName}`, fileBuffer);
 
     if (uploadError) {
@@ -59,11 +60,11 @@ router.post('/', upload.single('job_description_file'), async (req, res) => {
       return res.status(400).json({ error: 'Unsupported file type. Upload PDF or DOCX.' });
     }
 
-    // Build OpenAI system prompt
+    // Build OpenAI prompt
     const basePrompt = {
-      basic: `You are an AI assistant creating quick screening questions. Based on the job description provided, generate 4 to 6 concise, easy-to-answer interview questions to assess general fit and communication ability. These should take no more than 10 minutes for a candidate to respond to.`,
-      detailed: `You are an AI assistant creating structured leadership-style interview questions. Based on the job description, generate 6 to 8 open-ended questions that assess decision-making, collaboration, leadership, and role-relevant experience. These should be suitable for a 20-minute initial interview.`,
-      technical: `You are an AI assistant generating technical screening questions. Based on the job description, generate 6 to 8 questions that test practical skills, tools, and problem-solving abilities. The questions should be specific to the technologies or methods mentioned in the job description and suitable for a 20-minute technical interview.`
+      basic: `You are an AI assistant creating quick screening questions. Based on the job description provided, generate 4 to 6 concise, easy-to-answer interview questions to assess general fit and communication ability.`,
+      detailed: `You are an AI assistant creating structured leadership-style interview questions. Based on the job description, generate 6 to 8 open-ended questions that assess decision-making, collaboration, leadership, and experience.`,
+      technical: `You are an AI assistant generating technical screening questions. Based on the job description, generate 6 to 8 questions that test practical skills and problem-solving.`
     };
 
     const systemPrompt = basePrompt[interview_type.toLowerCase()] || basePrompt.basic;
@@ -93,7 +94,10 @@ router.post('/', upload.single('job_description_file'), async (req, res) => {
 
     const combinedQuestions = [...aiQuestions, ...manualFormatted];
 
-    // Insert role into Supabase
+    // 🔐 Generate role token
+    const slug_or_token = uuidv4();
+
+    // 📥 Insert role into Supabase
     const { data, error } = await supabase.from('roles').insert([
       {
         title,
@@ -101,7 +105,8 @@ router.post('/', upload.single('job_description_file'), async (req, res) => {
         rubric: { questions: combinedQuestions },
         interview_type,
         client_id,
-        job_description_url
+        job_description_url,
+        slug_or_token // ✅ Injected token
       }
     ]).select().single();
 
@@ -112,6 +117,7 @@ router.post('/', upload.single('job_description_file'), async (req, res) => {
     return res.status(200).json({
       message: 'Role created successfully',
       role_id: data.id,
+      slug_or_token: data.slug_or_token,
       questions: combinedQuestions
     });
 
