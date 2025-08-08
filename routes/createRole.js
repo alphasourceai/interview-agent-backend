@@ -5,10 +5,11 @@ const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
 const { createClient } = require('@supabase/supabase-js');
 const { OpenAI } = require('openai');
-const { v4: uuidv4 } = require('uuid');
+const { customAlphabet } = require('nanoid');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const generateToken = customAlphabet('1234567890abcdef', 12); // 12-char slug
 
 // Multer config (store uploads in memory)
 const storage = multer.memoryStorage();
@@ -19,12 +20,10 @@ router.post('/', upload.single('job_description_file'), async (req, res) => {
     const { title, interview_type, client_id } = req.body;
     let manual_questions = [];
 
-    // Validate required fields
     if (!title || !interview_type || !client_id || !req.file) {
       return res.status(400).json({ error: 'Missing required fields.' });
     }
 
-    // Parse manual_questions if present
     if (req.body.manual_questions) {
       try {
         manual_questions = JSON.parse(req.body.manual_questions);
@@ -34,12 +33,11 @@ router.post('/', upload.single('job_description_file'), async (req, res) => {
       }
     }
 
-    // Store uploaded file in Supabase Storage
     const fileBuffer = req.file.buffer;
     const fileType = req.file.originalname.split('.').pop().toLowerCase();
     const fileName = `${Date.now()}-${req.file.originalname}`;
     const { data: uploadData, error: uploadError } = await supabase.storage
-      .from('resumes') // Consider renaming to 'job-descriptions'
+      .from('resumes') // use job-descriptions bucket if applicable
       .upload(`job-descriptions/${fileName}`, fileBuffer);
 
     if (uploadError) {
@@ -48,7 +46,6 @@ router.post('/', upload.single('job_description_file'), async (req, res) => {
 
     const job_description_url = uploadData.path;
 
-    // Extract text from file
     let extractedText = '';
     if (fileType === 'pdf') {
       const data = await pdfParse(fileBuffer);
@@ -60,11 +57,10 @@ router.post('/', upload.single('job_description_file'), async (req, res) => {
       return res.status(400).json({ error: 'Unsupported file type. Upload PDF or DOCX.' });
     }
 
-    // Build OpenAI prompt
     const basePrompt = {
-      basic: `You are an AI assistant creating quick screening questions. Based on the job description provided, generate 4 to 6 concise, easy-to-answer interview questions to assess general fit and communication ability.`,
-      detailed: `You are an AI assistant creating structured leadership-style interview questions. Based on the job description, generate 6 to 8 open-ended questions that assess decision-making, collaboration, leadership, and experience.`,
-      technical: `You are an AI assistant generating technical screening questions. Based on the job description, generate 6 to 8 questions that test practical skills and problem-solving.`
+      basic: `You are an AI assistant creating quick screening questions. Based on the job description provided, generate 4 to 6 concise, easy-to-answer interview questions to assess general fit and communication ability. These should take no more than 10 minutes for a candidate to respond to.`,
+      detailed: `You are an AI assistant creating structured leadership-style interview questions. Based on the job description, generate 6 to 8 open-ended questions that assess decision-making, collaboration, leadership, and role-relevant experience. These should be suitable for a 20-minute initial interview.`,
+      technical: `You are an AI assistant generating technical screening questions. Based on the job description, generate 6 to 8 questions that test practical skills, tools, and problem-solving abilities. The questions should be specific to the technologies or methods mentioned in the job description and suitable for a 20-minute technical interview.`
     };
 
     const systemPrompt = basePrompt[interview_type.toLowerCase()] || basePrompt.basic;
@@ -93,11 +89,8 @@ router.post('/', upload.single('job_description_file'), async (req, res) => {
     }));
 
     const combinedQuestions = [...aiQuestions, ...manualFormatted];
+    const slug = generateToken();
 
-    // 🔐 Generate role token
-    const slug_or_token = uuidv4();
-
-    // 📥 Insert role into Supabase
     const { data, error } = await supabase.from('roles').insert([
       {
         title,
@@ -106,7 +99,7 @@ router.post('/', upload.single('job_description_file'), async (req, res) => {
         interview_type,
         client_id,
         job_description_url,
-        slug_or_token // ✅ Injected token
+        slug_or_token: slug
       }
     ]).select().single();
 
@@ -117,7 +110,7 @@ router.post('/', upload.single('job_description_file'), async (req, res) => {
     return res.status(200).json({
       message: 'Role created successfully',
       role_id: data.id,
-      slug_or_token: data.slug_or_token,
+      slug_or_token: slug,
       questions: combinedQuestions
     });
 
