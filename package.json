@@ -24,6 +24,7 @@
     "mammoth": "^1.10.0",
     "mime-types": "^3.0.1",
     "multer": "^2.0.2",
+    "nanoid": "^5.1.5",
     "node-fetch": "^2.7.0",
     "openai": "^5.11.0",
     "pdf-parse": "^1.1.1",
