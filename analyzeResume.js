@@ -1,40 +1,64 @@
-const fs = require('fs');
+// analyzeResume.js (backend root)
+require('dotenv').config();
 const pdfParse = require('pdf-parse');
-const OpenAI = require('openai');
+const mammoth = require('mammoth');
+const { OpenAI } = require('openai');
 const { createClient } = require('@supabase/supabase-js');
-const { config } = require('dotenv');
-
-config();
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-async function analyzeResume(candidate, resumePath, role) {
-  // Extract text from PDF
-  const pdfData = await pdfParse(fs.readFileSync(resumePath));
-  const resumeText = pdfData.text;
+/**
+ * Analyze a resume from a raw file buffer against a role.
+ * Inserts into `reports` (candidate_id, resume_score, resume_breakdown)
+ * and returns the parsed result.
+ *
+ * @param {Buffer} fileBuffer
+ * @param {string} mimeType      e.g. "application/pdf" or DOCX mimetype
+ * @param {object} role          expects { description, title, interview_type, rubric? }
+ * @param {string} candidateId
+ * @returns {Promise<{resume_score:number, resume_breakdown:Object, summary:string}>}
+ */
+async function analyzeResume(fileBuffer, mimeType, role, candidateId) {
+  // 1) Extract text
+  let resumeText = '';
+  try {
+    const isPdf = /pdf/i.test(mimeType);
+    const isDocx = /wordprocessingml|officedocument|docx/i.test(mimeType);
 
+    if (isPdf) {
+      const data = await pdfParse(fileBuffer);
+      resumeText = (data.text || '').trim();
+    } else if (isDocx) {
+      const res = await mammoth.extractRawText({ buffer: fileBuffer });
+      resumeText = (res.value || '').trim();
+    } else {
+      resumeText = Buffer.from(fileBuffer).toString('utf8').trim();
+    }
+  } catch (e) {
+    console.warn('Resume extraction failed (non-fatal):', e?.message || e);
+    resumeText = '';
+  }
+
+  if (resumeText.length > 15000) {
+    resumeText = resumeText.slice(0, 15000) + '\n\n[Truncated for analysis]';
+  }
+
+  // 2) Build prompts (keep ADA/EEOC compliance)
   const systemPrompt = `
 You are an unbiased, compliance-aware AI assistant helping evaluate candidates.
-You must remain fully ADA and EEOC compliant.
+You must remain fully ADA and EEOC compliant. Do not infer or consider any protected characteristics.`;
 
-Do not infer or consider any protected characteristics such as age, gender, race, disability, ethnicity, or appearance.
-
-Evaluate the candidate solely based on their resume’s stated experience, education, and skills in relation to the job description.
-`;
-
-const userPrompt = `
+  const userPrompt = `
 Role Description:
-${role.description}
+${role?.description || '[none provided]'}
 
 Resume:
-${resumeText}
+${resumeText || '[no extractable text]'}
 
 Provide a JSON response with:
 - resume_score (0–100)
@@ -45,28 +69,58 @@ Provide a JSON response with:
 - summary (100–150 words)
 `;
 
+  // 3) Call OpenAI
+  let result = {
+    resume_score: 0,
+    skills_match_percent: 0,
+    experience_match_percent: 0,
+    education_match_percent: 0,
+    overall_resume_match_percent: 0,
+    summary: 'Automated analysis unavailable; manual review recommended.'
+  };
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-  { role: "system", content: systemPrompt },
-  { role: "user", content: userPrompt }
-],
-    response_format: { type: "json_object" }
-  });
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      response_format: { type: 'json_object' }
+    });
 
-  const result = JSON.parse(response.choices[0].message.content);
+    const parsed = JSON.parse(response.choices[0].message.content);
+    if (parsed && typeof parsed === 'object') {
+      result = {
+        resume_score: Number(parsed.resume_score) || 0,
+        skills_match_percent: Number(parsed.skills_match_percent) || 0,
+        experience_match_percent: Number(parsed.experience_match_percent) || 0,
+        education_match_percent: Number(parsed.education_match_percent) || 0,
+        overall_resume_match_percent: Number(parsed.overall_resume_match_percent) || 0,
+        summary: parsed.summary || result.summary
+      };
+    }
+  } catch (e) {
+    console.warn('OpenAI resume analysis failed (non-fatal):', e?.message || e);
+  }
 
-  // Insert into reports table
-  const { error } = await supabase
-    .from('reports')
-    .insert([{
-      candidate_id: candidate.id,
-      resume_score: result.resume_score,
-      resume_breakdown: result
-    }]);
+  // 4) Insert into reports
+  try {
+    const { error } = await supabase
+      .from('reports')
+      .insert([{
+        candidate_id: candidateId,
+        resume_score: result.resume_score,
+        resume_breakdown: result
+      }]);
 
-  if (error) throw new Error(error.message);
+    if (error) {
+      console.error('Insert into reports failed:', error);
+    }
+  } catch (e) {
+    console.error('Insert into reports threw:', e?.message || e);
+  }
+
   return result;
 }
 
