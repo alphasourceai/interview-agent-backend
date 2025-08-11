@@ -96,7 +96,7 @@ router.post('/', upload.single('resume'), async (req, res) => {
 
     // 5) Create OTP (10 minutes)
     const otpCode = String(Math.floor(100000 + Math.random() * 900000));
-    const expireAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
     const { error: otpErr } = await supabase
       .from('otp_tokens')
@@ -106,7 +106,7 @@ router.post('/', upload.single('resume'), async (req, res) => {
         code: otpCode,
         role_id: role.id,
         // IMPORTANT: match your DB column name:
-        expire_at: expireAt,
+        expires_at: expiresAt,
       });
 
     if (otpErr) {

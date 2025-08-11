@@ -26,7 +26,7 @@ router.post('/', async (req, res) => {
     }
 
     // Expiry check (column is expire_at in your DB)
-    if (otpToken.expire_at && new Date(otpToken.expire_at) < new Date()) {
+    if (otpToken.expires_at && new Date(otpToken.expires_at) < new Date()) {
       return res.status(410).json({ error: 'OTP has expired. Please try again.' });
     }
 
