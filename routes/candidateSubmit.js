@@ -4,7 +4,7 @@ const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 const { supabase } = require('../lib/supabaseClient');
 const twilio = require('twilio');
-const analyzeResume = require('../handlers/analyzeResume'); // ✅ from earlier working version
+const analyzeResume = require('../analyzeResume'); // ✅ from earlier working version
 
 const upload = multer();
 const client = twilio(
