@@ -37,7 +37,7 @@ export default function InterviewAccessForm({ roleToken }) {
     body.append('role_token', roleToken);
 
     try {
-      const res = await axios.post('http://localhost:3000/api/candidate/submit', body);
+      const res = await axios.post(`${import.meta.env.VITE_BACKEND_URL}/api/candidate/submit`, body);
       setMessage(res.data.message);
     } catch (err) {
       setError(err.response?.data?.error || 'Something went wrong.');
