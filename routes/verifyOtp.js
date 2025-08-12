@@ -1,10 +1,7 @@
 const express = require('express');
 const router = express.Router();
 
-// Use the service-role Supabase client on the backend
-const { supabase } = require('../supabaseClient');
-
-// Reuse your working Tavus creator; we’ll pass both candidate + role
+const { supabase } = require('../supabaseClient'); // service-role client
 const createTavusInterview = require('../handlers/createTavusInterview');
 
 router.post('/', async (req, res) => {
@@ -15,7 +12,7 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'Missing email or OTP.' });
     }
 
-    // 1) Get the latest OTP for this email
+    // 1) Latest OTP for this email
     const { data: otpToken, error: otpErr } = await supabase
       .from('otp_tokens')
       .select('*')
@@ -27,21 +24,20 @@ router.post('/', async (req, res) => {
     if (otpErr || !otpToken) {
       return res.status(401).json({ error: 'Invalid or expired OTP.' });
     }
-
     if (otpToken.code !== code) {
       return res.status(401).json({ error: 'Invalid OTP code.' });
     }
-
-    if (new Date() > new Date(otpToken.expires_at)) {
+    if (otpToken.expires_at && new Date(otpToken.expires_at) < new Date()) {
       return res.status(410).json({ error: 'OTP has expired. Please try again.' });
     }
 
-    // 2) Mark candidate as verified (also fetch the candidate row)
+    // 2) Mark candidate verified + set status
     const { data: candidate, error: candErr } = await supabase
       .from('candidates')
       .update({
         verified: true,
-        otp_verified_at: new Date().toISOString()
+        otp_verified_at: new Date().toISOString(),
+        status: 'Verified'
       })
       .eq('email', email)
       .eq('role_id', otpToken.role_id)
@@ -49,10 +45,10 @@ router.post('/', async (req, res) => {
       .single();
 
     if (candErr || !candidate) {
-      return res.status(500).json({ error: 'Failed to verify candidate.' });
+      return res.status(500).json({ error: 'Could not update verification status.' });
     }
 
-    // 3) Load the role so we can build a role-specific Tavus prompt
+    // 3) Load role for dynamic Tavus prompt
     const { data: role, error: roleErr } = await supabase
       .from('roles')
       .select('id, title, description, interview_type, rubric')
@@ -63,29 +59,39 @@ router.post('/', async (req, res) => {
       return res.status(500).json({ error: 'Failed to load role for interview.' });
     }
 
-    // 4) Create the Tavus interview (handler should use role to craft prompt)
-    let tavusData;
+    // 4) Create Tavus (timeout inside handler)
+    let tavusData = null;
     try {
       tavusData = await createTavusInterview(candidate, role);
+      // Optional: bump status to reflect interview availability
+      try {
+        await supabase.from('candidates').update({ status: 'Interview Ready' }).eq('id', candidate.id);
+      } catch (_) {}
     } catch (tvErr) {
       console.error('Tavus creation failed:', tvErr?.response?.data || tvErr?.message || tvErr);
-      return res.status(502).json({ error: 'Failed to create interview session.' });
+      // Don’t block verification; return success without link and keep status as Verified
+      try { await supabase.from('otp_tokens').delete().eq('id', otpToken.id); } catch {}
+      return res.status(200).json({
+        message: 'Verification complete, but the interview link is not ready yet. Please try again shortly.',
+        verified: true,
+        redirect_url: null
+      });
     }
 
-    // 5) (Optional) Invalidate the OTP after successful verification
+    // 5) Invalidate OTP
     try {
       await supabase.from('otp_tokens').delete().eq('id', otpToken.id);
     } catch (delErr) {
-      // non-fatal
       console.warn('Failed to delete OTP token (non-fatal):', delErr?.message || delErr);
     }
 
     return res.status(200).json({
       message: 'Verification complete.',
+      verified: true,
       redirect_url: tavusData?.conversation_url || tavusData?.url || null
     });
   } catch (err) {
-    console.error('Error in verify-otp:', err);
+    console.error('Error in /api/candidate/verify-otp:', err);
     return res.status(500).json({ error: 'Server error during OTP verification.' });
   }
 });
