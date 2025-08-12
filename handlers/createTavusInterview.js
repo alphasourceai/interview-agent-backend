@@ -1,16 +1,28 @@
 // handlers/createTavusInterview.js
-// Creates a Tavus interview with a role-specific prompt.
-// Exports: async function createTavusInterview(candidate, role) -> { conversation_url, id? }
+// Tavus v2 (as in 8/4/2025 version) using tavusapi.com/v2/conversations
+// Auth: x-api-key
+// Returns: { conversation_url, conversation_id? }
+// Also inserts a "Pending" interview row for the candidate.
 
 require('dotenv').config();
 const axios = require('axios');
+const https = require('https');
+const { createClient } = require('@supabase/supabase-js');
 
-function buildPrompt(role) {
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// Build an optional role-based script (prompt)
+function buildScript(role) {
+  if (!role) return null;
+
   const questions = Array.isArray(role?.rubric?.questions)
     ? role.rubric.questions.map(q => (typeof q === 'string' ? q : q?.text)).filter(Boolean)
     : [];
 
-  const interviewerStyle =
+  const style =
     role?.interview_type === 'technical'
       ? 'a technical interviewer who focuses on practical problem solving, tooling, and trade-offs'
       : role?.interview_type === 'detailed'
@@ -20,7 +32,7 @@ function buildPrompt(role) {
   const jd = (role?.description || '').slice(0, 3000);
 
   return `
-You are ${interviewerStyle}.
+You are ${style}.
 Position: ${role?.title || 'Unknown'}
 Job Description (trimmed):
 ${jd || '[none provided]'}
@@ -30,85 +42,97 @@ If the candidate drifts, briefly refocus them. Thank them at the end.
 
 Questions:
 ${questions.length ? questions.map((q, i) => `${i + 1}. ${q}`).join('\n') : '1. Tell me about your relevant experience for this role.'}
-`.trim();
+  `.trim();
 }
 
+/**
+ * Create a Tavus v2 conversation for a candidate.
+ * @param {object} candidate - expects { id, email, role_id, name? }
+ * @param {object} role      - expects { id, title, description, interview_type, rubric }
+ * @returns {Promise<{conversation_url: string|null, conversation_id?: string|null}>}
+ */
 module.exports = async function createTavusInterview(candidate, role) {
-  const API_KEY = process.env.TAVUS_API_KEY;
+  if (!candidate?.id || !candidate?.email || !candidate?.role_id) {
+    throw new Error('createTavusInterview: missing candidate.id/email/role_id');
+  }
+
+  const API_KEY = (process.env.TAVUS_API_KEY || '').trim();
   const REPLICA_ID = (process.env.TAVUS_REPLICA_ID || '').trim();
-  const PUBLIC_BACKEND_URL = process.env.PUBLIC_BACKEND_URL || process.env.VITE_BACKEND_URL || '';
+  const PERSONA_ID = (process.env.TAVUS_PERSONA_ID || '').trim();
 
   if (!API_KEY) throw new Error('Missing TAVUS_API_KEY');
-  if (!REPLICA_ID) console.warn('TAVUS_REPLICA_ID is empty—using Tavus default for your account (if any).');
+  if (!REPLICA_ID) throw new Error('Missing TAVUS_REPLICA_ID');
 
-  const interviewer_prompt = buildPrompt(role);
+  // Webhook URL preference: explicit env -> PUBLIC_BACKEND_URL -> VITE_BACKEND_URL
+  const explicitWebhook = (process.env.TAVUS_WEBHOOK_URL || '').trim();
+  const backendBase =
+    (process.env.PUBLIC_BACKEND_URL || '').trim() ||
+    (process.env.VITE_BACKEND_URL || '').trim();
+  const WEBHOOK_URL = explicitWebhook || (backendBase ? `${backendBase.replace(/\/+$/, '')}/webhook/recording-ready` : undefined);
 
-  // Prefer applications first (your webhook uses application.recording_ready), then conversations
-  const endpoints = [
-    'https://api.tavus.io/v2/applications',
-    'https://api.tavus.io/v2/conversations'
-  ];
+  // Keep the same host & path that worked before:
+  const endpoint = 'https://tavusapi.com/v2/conversations';
 
-  // Build payload (include common prompt fields in case Tavus expects specific keys)
+  // Minimal payload that matched 8/4 behavior, with optional script:
   const payload = {
-    replica_id: REPLICA_ID || undefined,
+    replica_id: REPLICA_ID,
+    ...(PERSONA_ID ? { persona_id: PERSONA_ID } : {}),
+    ...(WEBHOOK_URL ? { webhook_url: WEBHOOK_URL } : {}),
+    // Tavus often accepts `script` in v2 conversations; include it so we don't fall back to generic persona
+    // If their project ignores it, call still succeeds (we keep old behavior).
+    script: buildScript(role) || undefined,
+    // Metadata can be useful; safe to include
     metadata: {
       candidate_id: candidate.id,
-      role_id: role?.id,
+      role_id: candidate.role_id,
       email: candidate.email,
       role_title: role?.title || null
-    },
-    interviewer_prompt,
-    system_prompt: interviewer_prompt,
-    script: interviewer_prompt,
-    // Uncomment if your Tavus project expects a webhook:
-    // webhook_url: PUBLIC_BACKEND_URL ? `${PUBLIC_BACKEND_URL}/webhook/recording-ready` : undefined,
+    }
   };
 
+  const httpsAgent = new https.Agent({ keepAlive: true, timeout: 10000 });
   const axiosOpts = {
     headers: {
-      Authorization: `Bearer ${API_KEY}`,
+      'x-api-key': API_KEY,
       'Content-Type': 'application/json'
     },
-    timeout: 12000 // 12s hard timeout so the verify request never hangs forever
+    httpsAgent,
+    timeout: 10000, // 10s to keep verify step responsive
+    transitional: { clarifyTimeoutError: true }
   };
 
-  let lastErr;
-  for (const url of endpoints) {
-    try {
-      const resp = await axios.post(url, payload, axiosOpts);
-
-      const data = resp?.data || {};
-      const conversation_url =
-        data.conversation_url ||
-        data.url ||
-        data.join_url ||
-        data.link ||
-        null;
-
-      if (!conversation_url) {
-        // Sometimes Tavus only returns an ID; return it for later use/debug.
-        return { conversation_url: null, id: data.id || null };
-      }
-
-      return { conversation_url };
-    } catch (err) {
-      lastErr = err;
-      // Try the next endpoint variant
+  let resp;
+  try {
+    resp = await axios.post(endpoint, payload, axiosOpts);
+  } catch (err) {
+    const code = err?.code || '';
+    const msg = err?.response?.data || err?.message || err;
+    // Surface concise error (verify route catches and won’t freeze)
+    if (code === 'ECONNABORTED' || code === 'ETIMEDOUT') {
+      throw new Error('Tavus creation failed: request timed out');
     }
+    throw new Error(`Tavus creation failed: ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`);
   }
 
-  // If both attempts failed, surface a concise error (timeout/network/response)
-  const code = lastErr?.code || '';
-  const msg =
-    lastErr?.response?.data ||
-    lastErr?.message ||
-    lastErr;
+  const data = resp?.data || {};
+  const conversation_url =
+    data.conversation_url || data.url || data.join_url || data.link || null;
+  const conversation_id = data.conversation_id || data.id || null;
 
-  // Normalize common network timeouts for clearer logs upstream
-  if (code === 'ECONNABORTED' || code === 'ETIMEDOUT') {
-    throw new Error('Tavus creation failed: request timed out');
+  // Insert a Pending interview row immediately (matches older behavior)
+  try {
+    await supabase.from('interviews').insert([{
+      candidate_id: candidate.id,
+      role_id: candidate.role_id,
+      video_url: conversation_url || null,       // may be null if Tavus delayed
+      tavus_application_id: conversation_id,     // older code stored conversation_id here
+      status: 'Pending',
+      rubric: role?.rubric || null
+    }]);
+  } catch (interviewError) {
+    // Don’t fail user flow if DB insert has an issue; log and continue
+    console.warn('Interview insert warning:', interviewError?.message || interviewError);
   }
 
-  throw new Error(`Tavus creation failed: ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`);
+  return { conversation_url, conversation_id };
 };
