@@ -1,6 +1,6 @@
 // handlers/createTavusInterview.js
 // Creates a Tavus interview with a role-specific prompt.
-// Exports: async function createTavusInterview(candidate, role) -> { conversation_url }
+// Exports: async function createTavusInterview(candidate, role) -> { conversation_url, id? }
 
 require('dotenv').config();
 const axios = require('axios');
@@ -36,20 +36,21 @@ ${questions.length ? questions.map((q, i) => `${i + 1}. ${q}`).join('\n') : '1. 
 module.exports = async function createTavusInterview(candidate, role) {
   const API_KEY = process.env.TAVUS_API_KEY;
   const REPLICA_ID = (process.env.TAVUS_REPLICA_ID || '').trim();
+  const PUBLIC_BACKEND_URL = process.env.PUBLIC_BACKEND_URL || process.env.VITE_BACKEND_URL || '';
+
   if (!API_KEY) throw new Error('Missing TAVUS_API_KEY');
   if (!REPLICA_ID) console.warn('TAVUS_REPLICA_ID is empty—using Tavus default for your account (if any).');
 
   const interviewer_prompt = buildPrompt(role);
 
-  // Prefer the endpoint you’ve been using; v2 "applications" vs "conversations" varies by account.
-  // We’ll try `applications` first since your webhook emits `application.recording_ready`.
+  // Prefer applications first (your webhook uses application.recording_ready), then conversations
   const endpoints = [
     'https://api.tavus.io/v2/applications',
     'https://api.tavus.io/v2/conversations'
   ];
 
+  // Build payload (include common prompt fields in case Tavus expects specific keys)
   const payload = {
-    // Common fields
     replica_id: REPLICA_ID || undefined,
     metadata: {
       candidate_id: candidate.id,
@@ -57,27 +58,26 @@ module.exports = async function createTavusInterview(candidate, role) {
       email: candidate.email,
       role_title: role?.title || null
     },
-
-    // Prompt fields (Tavus may name these differently; include common variants)
     interviewer_prompt,
     system_prompt: interviewer_prompt,
     script: interviewer_prompt,
-
-    // If your Tavus project expects a webhook URL, set it here (optional):
-    // webhook_url: `${process.env.PUBLIC_BACKEND_URL}/webhook/recording-ready`,
+    // Uncomment if your Tavus project expects a webhook:
+    // webhook_url: PUBLIC_BACKEND_URL ? `${PUBLIC_BACKEND_URL}/webhook/recording-ready` : undefined,
   };
 
-  const headers = {
-    Authorization: `Bearer ${API_KEY}`,
-    'Content-Type': 'application/json'
+  const axiosOpts = {
+    headers: {
+      Authorization: `Bearer ${API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    timeout: 12000 // 12s hard timeout so the verify request never hangs forever
   };
 
   let lastErr;
   for (const url of endpoints) {
     try {
-      const resp = await axios.post(url, payload, { headers });
+      const resp = await axios.post(url, payload, axiosOpts);
 
-      // Normalize potential shapes
       const data = resp?.data || {};
       const conversation_url =
         data.conversation_url ||
@@ -87,8 +87,7 @@ module.exports = async function createTavusInterview(candidate, role) {
         null;
 
       if (!conversation_url) {
-        // Sometimes Tavus returns an id and expects you to build the URL in the web app domain.
-        // Keep id in case you need to debug or construct a URL.
+        // Sometimes Tavus only returns an ID; return it for later use/debug.
         return { conversation_url: null, id: data.id || null };
       }
 
@@ -99,7 +98,17 @@ module.exports = async function createTavusInterview(candidate, role) {
     }
   }
 
-  // If both attempts failed, surface the last error cleanly
-  const msg = lastErr?.response?.data || lastErr?.message || lastErr;
-  throw new Error(`Tavus creation failed: ${JSON.stringify(msg)}`);
+  // If both attempts failed, surface a concise error (timeout/network/response)
+  const code = lastErr?.code || '';
+  const msg =
+    lastErr?.response?.data ||
+    lastErr?.message ||
+    lastErr;
+
+  // Normalize common network timeouts for clearer logs upstream
+  if (code === 'ECONNABORTED' || code === 'ETIMEDOUT') {
+    throw new Error('Tavus creation failed: request timed out');
+  }
+
+  throw new Error(`Tavus creation failed: ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`);
 };
