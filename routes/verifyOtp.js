@@ -1,8 +1,10 @@
+// routes/verifyOtp.js
 const express = require('express');
 const router = express.Router();
-
 const { supabase } = require('../supabaseClient'); // service-role client
-const createTavusInterview = require('../handlers/createTavusInterview');
+
+// NOTE: This route ONLY verifies OTP and marks the candidate verified.
+// Tavus creation happens in a separate request (/create-tavus-interview) from the frontend.
 
 router.post('/', async (req, res) => {
   try {
@@ -12,7 +14,7 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'Missing email or OTP.' });
     }
 
-    // 1) Latest OTP for this email
+    // 1) Get latest OTP for this email
     const { data: otpToken, error: otpErr } = await supabase
       .from('otp_tokens')
       .select('*')
@@ -31,7 +33,7 @@ router.post('/', async (req, res) => {
       return res.status(410).json({ error: 'OTP has expired. Please try again.' });
     }
 
-    // 2) Mark candidate verified + set status
+    // 2) Mark candidate verified + update status
     const { data: candidate, error: candErr } = await supabase
       .from('candidates')
       .update({
@@ -48,47 +50,18 @@ router.post('/', async (req, res) => {
       return res.status(500).json({ error: 'Could not update verification status.' });
     }
 
-    // 3) Load role for dynamic Tavus prompt
-    const { data: role, error: roleErr } = await supabase
-      .from('roles')
-      .select('id, title, description, interview_type, rubric')
-      .eq('id', candidate.role_id)
-      .single();
-
-    if (roleErr || !role) {
-      return res.status(500).json({ error: 'Failed to load role for interview.' });
-    }
-
-    // 4) Create Tavus (timeout inside handler)
-    let tavusData = null;
-    try {
-      tavusData = await createTavusInterview(candidate, role);
-      // Optional: bump status to reflect interview availability
-      try {
-        await supabase.from('candidates').update({ status: 'Interview Ready' }).eq('id', candidate.id);
-      } catch (_) {}
-    } catch (tvErr) {
-      console.error('Tavus creation failed:', tvErr?.response?.data || tvErr?.message || tvErr);
-      // Don’t block verification; return success without link and keep status as Verified
-      try { await supabase.from('otp_tokens').delete().eq('id', otpToken.id); } catch {}
-      return res.status(200).json({
-        message: 'Verification complete, but the interview link is not ready yet. Please try again shortly.',
-        verified: true,
-        redirect_url: null
-      });
-    }
-
-    // 5) Invalidate OTP
+    // 3) Invalidate OTP (non-fatal if delete fails)
     try {
       await supabase.from('otp_tokens').delete().eq('id', otpToken.id);
-    } catch (delErr) {
-      console.warn('Failed to delete OTP token (non-fatal):', delErr?.message || delErr);
-    }
+    } catch (_) {}
 
+    // 4) Return data the frontend needs to start Tavus in a separate call
     return res.status(200).json({
       message: 'Verification complete.',
       verified: true,
-      redirect_url: tavusData?.conversation_url || tavusData?.url || null
+      candidate_id: candidate.id,
+      email: candidate.email,
+      role_id: candidate.role_id
     });
   } catch (err) {
     console.error('Error in /api/candidate/verify-otp:', err);
