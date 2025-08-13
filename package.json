@@ -14,7 +14,7 @@
   "type": "commonjs",
   "dependencies": {
     "@sendgrid/mail": "^8.1.5",
-    "@supabase/supabase-js": "^2.53.0",
+    "@supabase/supabase-js": "^2.55.0",
     "axios": "^1.11.0",
     "cors": "^2.8.5",
     "date-fns": "^4.1.0",
