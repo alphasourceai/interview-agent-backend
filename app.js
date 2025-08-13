@@ -27,6 +27,8 @@ const createRoleRoute = require('./routes/createRole');
 const candidateSubmitRoute = require('./routes/candidateSubmit');
 const verifyOtpRoute = require('./routes/verifyOtp');
 const { kbRouter } = require('./routes/kb');
+const createInterviewRouter = require('./routes/createTavusInterview');
+const retryRouter = require('./routes/retryInterview');
 
 app.get('/health', (req, res) => res.status(200).json({ ok: true }));
 
@@ -36,6 +38,8 @@ app.use('/create-role', createRoleRoute);
 app.use('/api/candidate/submit', candidateSubmitRoute);
 app.use('/api/candidate/verify-otp', verifyOtpRoute);
 app.use('/kb', kbRouter);
+app.use('/create-tavus-interview', createInterviewRouter);
+app.use('/interviews', retryRouter);
 
 app.post('/webhook/recording-ready', handleTavusWebhook);
 
