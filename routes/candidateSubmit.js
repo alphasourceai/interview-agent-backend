@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
-const { supabase } = require('../src/supabaseClient'); // <-- adjust if your tree differs
+const { supabase } = require('../src/lib/supabaseClient'); // <-- adjust if your tree differs
 const sg = require('@sendgrid/mail');
 
 // config
