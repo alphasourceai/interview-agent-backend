@@ -1,56 +1,62 @@
-// /src/pages/VerifyOtp.jsx
-import React, { useEffect, useState, useRef, useCallback } from 'react';
-import { useSearchParams } from 'react-router-dom';
+// src/pages/VerifyOtp.jsx
+import React, { useEffect, useRef, useState, useCallback } from "react";
+import { useSearchParams } from "react-router-dom";
 
-function VerifyOtp() {
+export default function VerifyOtp() {
   const [params] = useSearchParams();
-  const emailFromQuery = params.get('email') || '';
-  const roleIdFromQuery = params.get('role_id') || '';
-  const candidateIdFromQuery = params.get('candidate_id') || '';
+
+  const emailFromQuery = params.get("email") || "";
+  const roleIdFromQuery = params.get("role_id") || "";
+  const candidateIdFromQuery = params.get("candidate_id") || "";
 
   const [email, setEmail] = useState(emailFromQuery);
-  const [otp, setOtp] = useState('');
-  const [error, setError] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [message, setMessage] = useState('');
+  const [roleId, setRoleId] = useState(roleIdFromQuery);
+  const [candidateId, setCandidateId] = useState(candidateIdFromQuery);
+  const [otp, setOtp] = useState("");
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [verifying, setVerifying] = useState(false);
   const [creating, setCreating] = useState(false);
-  const otpInputRef = useRef(null);
 
-  const API_BASE = import.meta.env.VITE_BACKEND_URL;
+  const [interviewId, setInterviewId] = useState(
+    () => sessionStorage.getItem("interviewId") || ""
+  );
+
+  const otpRef = useRef(null);
+  const API_BASE = (import.meta.env.VITE_BACKEND_URL || "").replace(/\/+$/, "");
 
   useEffect(() => {
-    otpInputRef.current?.focus();
+    otpRef.current?.focus();
   }, []);
 
-  const extractLink = (data) =>
-    data?.video_url ||
-    data?.redirect_url ||
-    data?.conversation_url ||
-    data?.url ||
-    data?.link ||
-    null;
+  const extractLink = (obj) =>
+    obj?.video_url || obj?.conversation_url || obj?.redirect_url || obj?.url || obj?.link || null;
 
   const startInterview = useCallback(
-    async (candidate_id, role_id, verifiedEmail) => {
+    async (candId, rId, verifiedEmail) => {
+      if (!candId) {
+        setMessage("Verified, but missing candidate ID.");
+        return;
+      }
       setCreating(true);
-      setError('');
+      setError("");
+      setMessage("");
       try {
         const resp = await fetch(`${API_BASE}/create-tavus-interview`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            candidate_id,
-            name: '', // optional
-            email: verifiedEmail,
-            role_id
-          })
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ candidate_id: candId, role_id: rId, email: verifiedEmail })
         });
-
         const data = await resp.json();
+
         if (!resp.ok) {
-          // Back end will send a helpful error message if Tavus times out
-          setMessage(data.message || 'Interview link not ready yet. Please try again.');
+          setError(data?.error || "Could not start interview.");
           return;
+        }
+
+        if (data?.interview_id) {
+          setInterviewId(data.interview_id);
+          sessionStorage.setItem("interviewId", data.interview_id);
         }
 
         const link = extractLink(data);
@@ -58,11 +64,9 @@ function VerifyOtp() {
           window.location.href = link;
           return;
         }
-
-        setMessage('Verified. Interview link not ready yet—please try again.');
+        setMessage("Interview room is initializing. You can try again or use Resume.");
       } catch (e) {
-        console.error('create-tavus-interview failed:', e);
-        setMessage('Verified. Interview link not ready yet—please try again.');
+        setError("Network error creating interview.");
       } finally {
         setCreating(false);
       }
@@ -70,115 +74,154 @@ function VerifyOtp() {
     [API_BASE]
   );
 
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setSubmitting(true);
-    setError('');
-    setMessage('');
+  const resumeInterview = useCallback(
+    async () => {
+      if (!interviewId) {
+        setMessage("No interview to resume yet.");
+        return;
+      }
+      setCreating(true);
+      setError("");
+      setMessage("");
+      try {
+        const resp = await fetch(`${API_BASE}/interviews/${interviewId}/retry-create`, { method: "POST" });
+        const data = await resp.json();
+        if (!resp.ok) {
+          setError(data?.error || "Could not resume yet.");
+          return;
+        }
+        const link = extractLink(data);
+        if (link) {
+          window.location.href = link;
+          return;
+        }
+        setMessage(data?.message || "Room not ready—try again shortly.");
+      } catch (e) {
+        setError("Network error resuming interview.");
+      } finally {
+        setCreating(false);
+      }
+    },
+    [API_BASE, interviewId]
+  );
 
-    if (!/^\d{6}$/.test(otp)) {
-      setError('Please enter the 6-digit code.');
-      setSubmitting(false);
+  const onSubmit = async (e) => {
+    e.preventDefault();
+    setVerifying(true);
+    setError("");
+    setMessage("");
+
+    if (!email || !/^\d{6}$/.test(otp)) {
+      setError("Enter your email and a 6-digit code.");
+      setVerifying(false);
       return;
     }
 
     try {
-      // 1) Verify OTP (FAST) — no Tavus call here
-      const response = await fetch(`${API_BASE}/api/candidate/verify-otp`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+      const resp = await fetch(`${API_BASE}/api/candidate/verify-otp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, code: otp })
       });
+      const data = await resp.json();
 
-      const result = await response.json();
-
-      if (!response.ok) {
-        setError(result.error || 'Verification failed.');
+      if (!resp.ok) {
+        setError(data?.error || "Verification failed.");
         return;
       }
 
-      setMessage(result.message || 'Verified.');
-      const candidate_id = result.candidate_id || candidateIdFromQuery || '';
-      const role_id = result.role_id || roleIdFromQuery || '';
+      const nextCandidateId = data?.candidate_id || candidateId;
+      const nextRoleId = data?.role_id || roleId;
+      const verifiedEmail = data?.email || email;
 
-      // 2) Now create Tavus interview (separate call)
-      if (candidate_id && role_id && (result.email || email)) {
-        await startInterview(candidate_id, role_id, result.email || email);
-      } else {
-        setMessage('Verified. Missing candidate or role information.');
-      }
-    } catch (err) {
-      console.error('Error verifying OTP:', err);
-      setError('Server error. Please try again.');
+      setCandidateId(nextCandidateId || "");
+      setRoleId(nextRoleId || "");
+      setMessage("Verified. Launching your interview…");
+
+      await startInterview(nextCandidateId, nextRoleId, verifiedEmail);
+    } catch (e) {
+      setError("Network error verifying code.");
     } finally {
-      setSubmitting(false);
+      setVerifying(false);
     }
   };
 
   return (
-    <div className="flex flex-col items-center justify-center min-h-screen p-6">
-      <h1 className="text-2xl font-semibold mb-4">Verify Your OTP</h1>
+    <div className="min-h-screen flex items-center justify-center p-6">
+      <div className="w-full max-w-md bg-white shadow rounded-2xl p-6">
+        <h1 className="text-xl font-semibold mb-4">Verify your code</h1>
 
-      <form onSubmit={handleSubmit} className="w-full max-w-sm bg-white shadow-md rounded px-8 py-6">
-        <label className="block mb-2 text-sm font-bold text-gray-700">Email</label>
-        <input
-          type="email"
-          className="w-full mb-4 px-3 py-2 border rounded"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          required
-          readOnly={!!emailFromQuery}
-        />
+        <form onSubmit={onSubmit} className="space-y-4">
+          <div>
+            <label className="block text-sm mb-1">Email</label>
+            <input
+              type="email"
+              className="w-full border rounded px-3 py-2"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              required
+              readOnly={!!emailFromQuery}
+            />
+          </div>
 
-        <label className="block mb-2 text-sm font-bold text-gray-700">6-Digit OTP</label>
-        <input
-          ref={otpInputRef}
-          type="text"
-          inputMode="numeric"
-          maxLength={6}
-          pattern="\d{6}"
-          className="w-full mb-4 px-3 py-2 border rounded"
-          value={otp}
-          onChange={(e) => setOtp(e.target.value.replace(/\D/g, ''))}
-          required
-        />
+          <div>
+            <label className="block text-sm mb-1">6-digit code</label>
+            <input
+              ref={otpRef}
+              type="text"
+              inputMode="numeric"
+              pattern="\d{6}"
+              maxLength={6}
+              className="w-full border rounded px-3 py-2 tracking-widest"
+              value={otp}
+              onChange={(e) => setOtp(e.target.value.replace(/\D/g, ""))}
+              placeholder="••••••"
+              required
+            />
+          </div>
 
-        {error && <p className="text-red-500 mb-4">{error}</p>}
-        {message && <p className="text-green-600 mb-4">{message}</p>}
+          {error ? <p className="text-red-600 text-sm">{error}</p> : null}
+          {message ? <p className="text-green-700 text-sm">{message}</p> : null}
 
-        <button
-          type="submit"
-          disabled={submitting || creating}
-          className="bg-[#00cfc8] text-white px-4 py-2 rounded hover:bg-[#00b8b1] w-full"
-        >
-          {submitting ? 'Verifying...' : creating ? 'Starting interview…' : 'Submit OTP'}
-        </button>
-
-        {/* If Tavus was slow/timeouts, allow retry without re-entering OTP */}
-        {message && !error && !submitting && !creating && (
           <button
-            type="button"
-            onClick={() =>
-              startInterview(
-                candidateIdFromQuery,
-                roleIdFromQuery,
-                email
-              )
-            }
-            className="mt-3 w-full border px-4 py-2 rounded"
+            type="submit"
+            disabled={verifying || creating}
+            className="w-full bg-black text-white rounded px-4 py-2"
           >
-            Try launching interview again
+            {verifying ? "Verifying…" : creating ? "Starting…" : "Submit"}
           </button>
+        </form>
+
+        {(interviewId || (!verifying && !creating && message)) && (
+          <div className="mt-4 space-y-2">
+            <button
+              type="button"
+              disabled={creating}
+              onClick={() => startInterview(candidateId, roleId, email)}
+              className="w-full border rounded px-4 py-2"
+            >
+              Try launching again
+            </button>
+
+            {interviewId ? (
+              <button
+                type="button"
+                disabled={creating}
+                onClick={resumeInterview}
+                className="w-full border rounded px-4 py-2"
+              >
+                Resume interview
+              </button>
+            ) : null}
+          </div>
         )}
 
         {import.meta.env.DEV && (
           <p className="text-xs text-gray-500 mt-3">
-            Tip: If SMS is disabled, copy the latest code from the <code>otp_tokens</code> table.
+            Dev tip: OTP lives in <code>otp_tokens</code> if SMS isn’t wired yet.
           </p>
         )}
-      </form>
+      </div>
     </div>
   );
 }
-
-export default VerifyOtp;
