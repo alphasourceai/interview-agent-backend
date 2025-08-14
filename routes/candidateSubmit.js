@@ -1,161 +1,84 @@
-const express = require('express');
+const express = require("express");
+const multer = require("multer");
+const { supabase } = require("../src/lib/supabaseClient");
+
 const router = express.Router();
-const multer = require('multer');
-const { v4: uuidv4 } = require('uuid');
-const twilio = require('twilio');
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
-// IMPORTANT: use the backend service-role client (not anon)
-const { supabase } = require('../supabaseClient');
-const analyzeResume = require('../analyzeResume');
+function six() { return String(Math.floor(100000 + Math.random() * 900000)); }
 
-const upload = multer();
-
-// Twilio (best-effort; never block the request)
-const hasTwilio =
-  !!process.env.TWILIO_ACCOUNT_SID &&
-  !!process.env.TWILIO_AUTH_TOKEN &&
-  !!process.env.TWILIO_PHONE_NUMBER;
-
-let sms = null;
-if (hasTwilio) {
+router.post("/", upload.any(), async (req, res) => {
   try {
-    sms = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-  } catch (e) {
-    console.warn('Twilio init failed (non-fatal):', e?.message || e);
-  }
-}
+    const role_id = req.body.role_id;
+    const name = req.body.name;
+    const email = req.body.email;
+    const phone = (req.body.phone || "").replace(/\D/g, "");
+    const resume_url_in = req.body.resume_url || null;
 
-router.post('/', upload.single('resume'), async (req, res) => {
-  try {
-    const { first_name, last_name, email, phone, role_token } = req.body;
-    const resume = req.file;
-
-    if (!first_name || !last_name || !email || !phone || !resume || !role_token) {
-      return res.status(400).json({ error: 'All fields are required.' });
+    if (!role_id || !name || !email || !phone) {
+      return res.status(400).json({ error: "All fields are required: role_id, name, email, phone." });
     }
 
-    const name = `${first_name} ${last_name}`.trim();
+    // Accept a file under any common field name
+    const file = (req.files || []).find(f =>
+      ["resume", "resume_file", "file", "resumeFile", "pdf"].includes(f.fieldname)
+    );
 
-    // 1) Resolve role via slug/token
-    const { data: role, error: roleErr } = await supabase
-      .from('roles')
-      .select('id, title, description, interview_type, rubric, client_id')
-      .eq('slug_or_token', role_token)
-      .single();
-
-    if (roleErr || !role) {
-      return res.status(404).json({ error: 'Invalid role link.' });
-    }
-
-    // 2) Prevent duplicate per role/email
-    const { count: existing, error: dupErr } = await supabase
-      .from('candidates')
-      .select('*', { count: 'exact', head: true })
-      .eq('email', email)
-      .eq('role_id', role.id);
-
-    if (dupErr) {
-      console.error('Duplicate check error:', dupErr);
-      return res.status(500).json({ error: 'Server error.' });
-    }
-    if (existing > 0) {
-      return res.status(409).json({ error: 'You have already applied for this role.' });
-    }
-
-    // 3) Upload resume
-    const safeName = (resume.originalname || 'resume.pdf').replace(/[^a-zA-Z0-9.\-_]/g, '_');
-    const resumePath = `resumes/${role.id}/${uuidv4()}_${safeName}`;
-
-    const { error: uploadError } = await supabase.storage
-      .from('resumes')
-      .upload(resumePath, resume.buffer, {
-        contentType: resume.mimetype || 'application/octet-stream',
-        upsert: false
-      });
-
-    if (uploadError) {
-      console.error('Resume upload error:', uploadError);
-      return res.status(500).json({ error: 'Failed to upload resume.' });
-    }
-
-    // 4) Insert candidate with correct status
-    const { data: candidate, error: candidateErr } = await supabase
-      .from('candidates')
+    // Create candidate
+    const { data: inserted, error: cErr } = await supabase
+      .from("candidates")
       .insert({
+        role_id,
         name,
-        first_name,
-        last_name,
         email,
         phone,
-        resume_url: resumePath,
-        role_id: role.id,
-        verified: false,
-        status: 'Resume Uploaded',
-        upload_ts: new Date().toISOString()
+        status: "Resume Uploaded"
       })
-      .select()
+      .select("id")
       .single();
 
-    if (candidateErr || !candidate) {
-      console.error('Candidate insert error:', candidateErr);
-      return res.status(500).json({ error: 'Failed to save candidate.' });
-    }
+    if (cErr) return res.status(500).json({ error: cErr.message });
+    const candidate_id = inserted.id;
 
-    // 5) Resume analysis (non-blocking)
+    // Upload resume file to Supabase Storage (optional; skip if fails)
+    let resume_url = resume_url_in;
     try {
-      const analysis = await analyzeResume(resume.buffer, resume.mimetype, role, candidate.id);
-      await supabase
-        .from('candidates')
-        .update({ analysis_summary: analysis })
-        .eq('id', candidate.id);
-    } catch (analysisErr) {
-      console.warn('Resume analysis failed (non-fatal):', analysisErr?.message || analysisErr);
-    }
-
-    // 6) Create OTP (10 min)
-    const otpCode = String(Math.floor(100000 + Math.random() * 900000));
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-
-    const { error: otpErr } = await supabase.from('otp_tokens').insert({
-      candidate_email: email,
-      phone,
-      code: otpCode,
-      role_id: role.id,
-      expires_at: expiresAt
-    });
-
-    if (otpErr) {
-      console.error('OTP insert error:', otpErr);
-      // continue — frontend can still route to /verify-otp and read code from DB during testing
-    }
-
-    // 7) Send OTP via Twilio (best-effort)
-    (async () => {
-      try {
-        if (sms && hasTwilio) {
-          await sms.messages.create({
-            body: `Your AlphaSource interview verification code is: ${otpCode}. It expires in 10 minutes.`,
-            from: process.env.TWILIO_PHONE_NUMBER,
-            to: phone
-          });
-        } else {
-          console.warn('Twilio not configured. Skipping SMS send.');
+      if (file) {
+        const bucket = process.env.SUPABASE_RESUMES_BUCKET || "resumes";
+        const path = `${candidate_id}.pdf`;
+        const up = await supabase.storage.from(bucket).upload(path, file.buffer, {
+          contentType: file.mimetype || "application/pdf",
+          upsert: true
+        });
+        if (!up.error) {
+          const { data: pub } = supabase.storage.from(bucket).getPublicUrl(path);
+          resume_url = pub?.publicUrl || resume_url;
         }
-      } catch (smsErr) {
-        console.warn('Twilio send failed (non-fatal):', smsErr?.message || smsErr);
       }
-    })();
+    } catch (e) {
+      console.error("resume upload failed:", e?.message || e);
+    }
 
-    // 8) Success (return data for redirect to /verify-otp)
-    return res.status(200).json({
-      message: 'OTP created.',
-      candidate_id: candidate.id,
+    if (resume_url) {
+      await supabase.from("candidates").update({ resume_url }).eq("id", candidate_id);
+    }
+
+    // Create OTP token (no SMS here; we’ll add Authkey later)
+    const code = six();
+    await supabase.from("otp_tokens").insert({
       email,
-      role_id: role.id
+      code
+      // expires_at: new Date(Date.now() + 10*60*1000).toISOString()
     });
-  } catch (err) {
-    console.error('Error in /api/candidate/submit:', err);
-    return res.status(500).json({ error: 'Server error.' });
+
+    return res.status(200).json({
+      message: "Candidate created. OTP generated (fetch from DB for now).",
+      candidate_id,
+      role_id,
+      resume_url: resume_url || null
+    });
+  } catch (e) {
+    return res.status(500).json({ error: e.message || "Server error" });
   }
 });
 
