@@ -84,14 +84,15 @@ router.post('/', upload.any(), async (req, res) => {
     if (resume_url) await supabase.from('candidates').update({ resume_url }).eq('id', candidate_id);
 
     // OTP (10 minutes)
-    const code = six();
-    const { error: otpErr } = await supabase.from('otp_tokens').insert({
-      email,
-      code,
-      expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
-      used: false
-    });
-    if (otpErr) return res.status(500).json({ error: `Could not create OTP: ${otpErr.message}` });
+const code = six();
+const { error: otpErr } = await supabase.from('otp_tokens').insert({
+  candidate_email: email,                 // <-- (was: email)
+  code,
+  expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+  used: false
+});
+if (otpErr) return res.status(500).json({ error: `Could not create OTP: ${otpErr.message}` });
+
 
     // Email the OTP via SendGrid
     let emailSent = false, emailError = null;
