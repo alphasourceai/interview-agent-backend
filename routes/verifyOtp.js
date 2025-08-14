@@ -17,18 +17,17 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ error: "Invalid email or 6-digit code." });
     }
 
-    // 1) Find newest candidate for this email
+    // 1) Newest candidate for this email
     const { data: cand, error: cErr } = await supabase
       .from("candidates")
-      .select("id, role_id, status")
+      .select("id, role_id")
       .eq("email", email)
       .order("created_at", { ascending: false })
       .limit(1)
       .single();
-
     if (cErr || !cand) return res.status(404).json({ error: "Candidate not found." });
 
-    // 2) Newest OTP token for this email + role (your schema uses candidate_email + role_id)
+    // 2) Newest OTP for (candidate_email, role_id)
     const { data: token, error: tErr } = await supabase
       .from("otp_tokens")
       .select("id, code, expires_at, used, role_id")
@@ -37,57 +36,71 @@ router.post("/", async (req, res) => {
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
-
     if (tErr || !token) return res.status(400).json({ error: "OTP not found." });
 
-    // 3) Validate that token
+    // 3) Validate
     if (token.expires_at && new Date(token.expires_at) <= new Date()) {
       return res.status(400).json({ error: "OTP has expired. Please try again." });
     }
-    if (token.used === true) {
-      return res.status(400).json({ error: "OTP already used. Please request a new one." });
+    const isUsed = String(token.used).toLowerCase() === "true"; // supports text/boolean
+    if (isUsed) return res.status(400).json({ error: "OTP already used. Please request a new one." });
+    if (String(token.code) !== code) return res.status(400).json({ error: "Invalid code." });
+
+    // 4) Mark OTP used (handle text/boolean schemas). Prefer update by id; confirm with read-back.
+    const updatesToTry = [
+      { used: true,  used_at: new Date().toISOString() }, // boolean + used_at (newer schema)
+      { used: true },                                     // boolean only
+      { used: "true" },                                   // text schema
+    ];
+
+    let updatedOk = false;
+    let lastErr = null;
+
+    for (const payload of updatesToTry) {
+      const { error } = await supabase.from("otp_tokens").update(payload).eq("id", token.id);
+      if (!error) {
+        // Read back to confirm it took
+        const { data: checkRow } = await supabase
+          .from("otp_tokens")
+          .select("used")
+          .eq("id", token.id)
+          .single();
+        const nowUsed = String(checkRow?.used).toLowerCase() === "true";
+        if (nowUsed) { updatedOk = true; break; }
+      } else {
+        lastErr = error;
+      }
     }
-    if (String(token.code) !== code) {
-      return res.status(400).json({ error: "Invalid code." });
-    }
 
-    // 4) Mark OTP used (robust): first try by id; if that fails, try by composite keys
-    const nowIso = new Date().toISOString();
-
-    let uTokErr = null;
-    let updated = 0;
-
-    // try by id (preferred)
-    {
-      const { data: upd, error } = await supabase
+    // Last-resort composite update if id route failed (RLS quirks, etc.)
+    if (!updatedOk) {
+      const { error } = await supabase
         .from("otp_tokens")
-        .update({ used: true, used_at: nowIso })
-        .eq("id", token.id)
-        .eq("used", false)              // idempotent guard
-        .select("id");
-      uTokErr = error || null;
-      updated = Array.isArray(upd) ? upd.length : 0;
-    }
-
-    // fallback by composite if nothing updated (handles schemas without id or RLS quirks)
-    if (!uTokErr && updated === 0) {
-      const { data: upd2, error: err2 } = await supabase
-        .from("otp_tokens")
-        .update({ used: true, used_at: nowIso })
+        .update({ used: "true" }) // text-safe; casts in boolean schemas as well
         .eq("candidate_email", email)
         .eq("role_id", cand.role_id)
-        .eq("code", code)
-        .eq("used", false)
-        .select("role_id");
-      uTokErr = err2 || null;
-      updated = Array.isArray(upd2) ? upd2.length : updated;
+        .eq("code", code);
+      if (!error) {
+        const { data: checkRow2 } = await supabase
+          .from("otp_tokens")
+          .select("used")
+          .eq("candidate_email", email)
+          .eq("role_id", cand.role_id)
+          .eq("code", code)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .single();
+        const nowUsed = String(checkRow2?.used).toLowerCase() === "true";
+        updatedOk = nowUsed;
+      } else {
+        lastErr = error;
+      }
     }
 
-    if (uTokErr || updated === 0) {
-      return res.status(500).json({
-        error: "Could not mark OTP as used."
-        // (we keep the error minimal in the response; logs will have details)
-      });
+    if (!updatedOk) {
+      // Log server-side for debugging; keep client error minimal
+      console.error("mark-used failed:", lastErr);
+      return res.status(500).json({ error: "Could not mark OTP as used." });
     }
 
     // 5) Update candidate to Verified
@@ -97,7 +110,6 @@ router.post("/", async (req, res) => {
       .eq("id", cand.id);
     if (uCandErr) return res.status(500).json({ error: "Could not update verification status." });
 
-    // 6) Done
     return res.status(200).json({
       message: "Verified",
       candidate_id: cand.id,
@@ -105,7 +117,6 @@ router.post("/", async (req, res) => {
       email
     });
   } catch (e) {
-    // Log server-side for debugging
     console.error("verify-otp error:", e?.response?.data || e?.message || e);
     return res.status(500).json({ error: e?.message || "Server error" });
   }
