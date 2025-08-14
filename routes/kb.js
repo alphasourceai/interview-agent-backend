@@ -36,7 +36,7 @@ kbRouter.post("/upload", async (req, res) => {
       headers: { "x-api-key": process.env.TAVUS_API_KEY }
     });
 
-    const kbId = resp?.data?.uuid || resp?.data?.id || null;
+    const kbId = resp?.data?.document_id || resp?.data?.uuid || resp?.data?.id || null;
     if (!kbId) return res.status(502).json({ error: "No document id from Tavus", details: resp?.data });
 
     const { error } = await supabase.from("roles").update({ kb_document_id: kbId }).eq("id", role_id);
