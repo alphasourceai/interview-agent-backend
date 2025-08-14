@@ -1,33 +1,9 @@
+// routes/kb.js (POST /kb/upload)
 const express = require("express");
 const axios = require("axios");
 const { supabase } = require("../src/lib/supabaseClient");
 
 const kbRouter = express.Router();
-
-kbRouter.get("/:role_id", async (req, res) => {
-  try {
-    const { role_id } = req.params;
-    const { data: role, error } = await supabase
-      .from("roles")
-      .select("id, title, rubric")
-      .eq("id", role_id)
-      .single();
-    if (error || !role) return res.status(404).send("Not found");
-    const lines = [];
-    lines.push(`Role: ${role.title}`);
-    lines.push(`Interview Rubric / Questions`);
-    if (Array.isArray(role?.rubric?.questions)) {
-      role.rubric.questions.forEach((q, i) => {
-        const t = typeof q === "string" ? q : q?.text || "";
-        lines.push(`${i + 1}. ${t}`);
-      });
-    }
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    return res.status(200).send(lines.join("\n"));
-  } catch (e) {
-    return res.status(500).send("Error");
-  }
-});
 
 kbRouter.post("/upload", async (req, res) => {
   try {
@@ -37,23 +13,41 @@ kbRouter.post("/upload", async (req, res) => {
     const base = (process.env.PUBLIC_BACKEND_URL || "").replace(/\/+$/,"");
     if (!base) return res.status(500).json({ error: "PUBLIC_BACKEND_URL not set" });
 
+    // optional: fetch role name for a nicer document_name
+    const { data: role, error: rErr } = await supabase
+      .from("roles")
+      .select("id, title")
+      .eq("id", role_id)
+      .single();
+    if (rErr || !role) return res.status(404).json({ error: "Role not found" });
+
     const document_url = `${base}/kb/${role_id}`;
 
-    const r = await axios.post(
-      "https://tavusapi.com/v2/documents",
-      { document_url, document_tags: ["role", String(role_id)] },
-      { headers: { "x-api-key": process.env.TAVUS_API_KEY } }
-    );
+    // IMPORTANT: use `tags` (not `document_tags`)
+    const payload = {
+      document_url,
+      document_name: role.title ? `Role KB — ${role.title}` : `role-kb-${role_id}`,
+      tags: ["role", String(role_id)]
+      // callback_url: "<optional webhook for doc processing>"
+      // properties: { any: "metadata" } // optional
+    };
 
-    const kbId = r?.data?.uuid || r?.data?.id || null;
-    if (!kbId) return res.status(502).json({ error: "No document id from Tavus" });
+    const resp = await axios.post("https://tavusapi.com/v2/documents", payload, {
+      headers: { "x-api-key": process.env.TAVUS_API_KEY }
+    });
+
+    const kbId = resp?.data?.uuid || resp?.data?.id || null;
+    if (!kbId) return res.status(502).json({ error: "No document id from Tavus", details: resp?.data });
 
     const { error } = await supabase.from("roles").update({ kb_document_id: kbId }).eq("id", role_id);
     if (error) return res.status(500).json({ error: error.message });
 
     return res.status(200).json({ kb_document_id: kbId });
   } catch (e) {
-    return res.status(500).json({ error: e.message });
+    // Bubble up Tavus error details to help debugging
+    const status = e.response?.status || 500;
+    const details = e.response?.data || e.message;
+    return res.status(status).json({ error: details });
   }
 });
 
