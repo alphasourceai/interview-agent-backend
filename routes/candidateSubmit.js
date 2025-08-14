@@ -1,10 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
-const { supabase } = require('../src/lib/supabaseClient'); // <-- adjust if your tree differs
+const { supabase } = require('../src/lib/supabaseClient');
 const sg = require('@sendgrid/mail');
 
-// config
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const FROM_EMAIL = process.env.SENDGRID_FROM;
 const SENDGRID_KEY = process.env.SENDGRID_API_KEY;
@@ -12,51 +11,47 @@ if (SENDGRID_KEY) sg.setApiKey(SENDGRID_KEY);
 
 function six() { return String(Math.floor(100000 + Math.random() * 900000)); }
 
-/**
- * POST /api/candidate/submit
- * Accepts multipart (resume under: resume | resume_file | file | resumeFile | pdf)
- * or JSON that includes resume_url.
- * Required: role_token, first_name, last_name, email
- * Phone is optional when using email OTP.
- */
 router.post('/', upload.any(), async (req, res) => {
   try {
+    // Accept both shapes
+    const role_token = (req.body.role_token || '').trim();
+    const role_id_in = (req.body.role_id || '').trim();
     const first_name = req.body.first_name?.trim();
     const last_name  = req.body.last_name?.trim();
+    const rawName    = req.body.name?.trim();
     const email      = (req.body.email || '').trim();
-    const phone      = (req.body.phone || '').replace(/\D/g, ''); // optional now
-    const role_token = (req.body.role_token || '').trim();
+    const phone      = (req.body.phone || '').replace(/\D/g, ''); // optional
     const resume_url_in = req.body.resume_url || null;
 
-    if (!role_token || !first_name || !last_name || !email) {
-      return res.status(400).json({ error: 'Required: role_token, first_name, last_name, email.' });
+    const fullName = rawName || [first_name, last_name].filter(Boolean).join(' ').trim();
+
+    if (!email || !fullName || (!role_token && !role_id_in)) {
+      return res.status(400).json({
+        error: "Required: email, (name OR first_name+last_name), and (role_id OR role_token)."
+      });
     }
 
-    // 1) Find role by token
-    const { data: role, error: roleErr } = await supabase
-      .from('roles')
-      .select('id, title, token')
-      .eq('token', role_token)
-      .single();
-
-    if (roleErr || !role) {
-      return res.status(404).json({ error: 'Invalid role link.' });
+    // Find role by id OR token
+    let role, rErr;
+    if (role_id_in) {
+      ({ data: role, error: rErr } = await supabase.from('roles').select('id, title').eq('id', role_id_in).single());
+    } else {
+      ({ data: role, error: rErr } = await supabase.from('roles').select('id, title, token').eq('token', role_token).single());
     }
+    if (rErr || !role) return res.status(404).json({ error: 'Role not found.' });
 
-    // 2) Duplicate check (same email + role)
+    // Duplicate check (email + role)
     const { count: existingCount, error: dupErr } = await supabase
       .from('candidates')
       .select('*', { count: 'exact', head: true })
       .eq('email', email)
       .eq('role_id', role.id);
-
     if (dupErr) return res.status(500).json({ error: dupErr.message });
     if ((existingCount || 0) > 0) {
       return res.status(409).json({ error: 'You have already started an interview for this role.' });
     }
 
-    // 3) Create candidate
-    const fullName = `${first_name} ${last_name}`.trim();
+    // Create candidate
     const { data: inserted, error: cErr } = await supabase
       .from('candidates')
       .insert({ role_id: role.id, name: fullName, email, phone, status: 'Resume Uploaded' })
@@ -65,7 +60,7 @@ router.post('/', upload.any(), async (req, res) => {
     if (cErr) return res.status(500).json({ error: cErr.message });
     const candidate_id = inserted.id;
 
-    // 4) Upload resume (optional)
+    // Optional: upload resume file to storage
     let resume_url = resume_url_in;
     try {
       const file = (req.files || []).find(f =>
@@ -86,11 +81,9 @@ router.post('/', upload.any(), async (req, res) => {
     } catch (e) {
       console.error('resume upload failed:', e?.message || e);
     }
-    if (resume_url) {
-      await supabase.from('candidates').update({ resume_url }).eq('id', candidate_id);
-    }
+    if (resume_url) await supabase.from('candidates').update({ resume_url }).eq('id', candidate_id);
 
-    // 5) Issue OTP (10-minute TTL)
+    // OTP (10 minutes)
     const code = six();
     const { error: otpErr } = await supabase.from('otp_tokens').insert({
       email,
@@ -100,17 +93,18 @@ router.post('/', upload.any(), async (req, res) => {
     });
     if (otpErr) return res.status(500).json({ error: `Could not create OTP: ${otpErr.message}` });
 
-    // 6) Email the OTP via SendGrid
+    // Email the OTP via SendGrid
     let emailSent = false, emailError = null;
     try {
       if (!SENDGRID_KEY || !FROM_EMAIL) throw new Error('SENDGRID_API_KEY or SENDGRID_FROM not configured');
-      const subject = `Your ${process.env.APP_NAME || 'Interview Agent'} verification code`;
+      const appName = process.env.APP_NAME || 'Interview Agent';
+      const subject = `Your ${appName} verification code`;
       const text = `Your verification code is ${code}. It expires in 10 minutes.`;
       const html = `<p>Your verification code is <strong style="font-size:18px">${code}</strong>.</p>
                     <p>It expires in 10 minutes.</p>`;
       const [resp] = await sg.send({
         to: email,
-        from: { email: FROM_EMAIL, name: process.env.APP_NAME || 'Interview Agent' },
+        from: { email: FROM_EMAIL, name: appName },
         subject, text, html
       });
       emailSent = resp?.statusCode === 202;
