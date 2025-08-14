@@ -2,3 +2,6 @@
 node_modules/
 .env
 node_modules/
+
+# Ignore stray frontend copy
+interview-agent-frontend/
