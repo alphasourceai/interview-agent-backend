@@ -7,15 +7,6 @@ const { createTavusInterviewHandler } = require('../handlers/createTavusIntervie
 
 const createInterviewRouter = express.Router();
 
-/**
- * POST /create-tavus-interview
- * Body: { candidate_id: string, role_id?: string, email?: string }
- * Behavior:
- *  - Loads candidate + role (role by candidate.role_id if role_id not provided)
- *  - Builds webhook URL from PUBLIC_BACKEND_URL
- *  - Calls handler to create/ensure Tavus conversation (attaches KB via document_ids)
- *  - Upserts into interviews table (status 'Pending' until webhook marks 'Video Ready')
- */
 createInterviewRouter.post('/', async (req, res) => {
   try {
     const base = (process.env.PUBLIC_BACKEND_URL || '').replace(/\/+$/, '');
@@ -24,7 +15,6 @@ createInterviewRouter.post('/', async (req, res) => {
     const { candidate_id, role_id: roleIdFromBody } = req.body || {};
     if (!candidate_id) return res.status(400).json({ error: 'candidate_id required' });
 
-    // Candidate
     const { data: candidate, error: cErr } = await supabase
       .from('candidates')
       .select('*')
@@ -32,7 +22,6 @@ createInterviewRouter.post('/', async (req, res) => {
       .single();
     if (cErr || !candidate) return res.status(404).json({ error: cErr?.message || 'Candidate not found' });
 
-    // Role (allow role_id passed in body to override)
     const roleId = roleIdFromBody || candidate.role_id;
     if (!roleId) return res.status(400).json({ error: 'role_id not provided and candidate has no role_id' });
 
@@ -45,10 +34,8 @@ createInterviewRouter.post('/', async (req, res) => {
 
     const webhookUrl = `${base}/webhook/recording-ready`;
 
-    // Create (or recreate) conversation with KB if present
     const result = await createTavusInterviewHandler(candidate, role, webhookUrl);
 
-    // Check for existing interview for this (candidate, role)
     const { data: existing, error: eErr } = await supabase
       .from('interviews')
       .select('id, tavus_application_id')
@@ -60,13 +47,11 @@ createInterviewRouter.post('/', async (req, res) => {
     if (eErr) return res.status(500).json({ error: eErr.message });
 
     if (!existing) {
-      // Insert fresh interview row
       const { error: iErr, data: iData } = await supabase
         .from('interviews')
         .insert({
           candidate_id,
           role_id: roleId,
-          // Conversation URL is the join link; we reuse 'video_url' until webhook sets real video URL.
           video_url: result.conversation_url || null,
           tavus_application_id: result.conversation_id || null,
           status: 'Pending'
@@ -81,7 +66,6 @@ createInterviewRouter.post('/', async (req, res) => {
         interview_id: iData.id
       });
     } else {
-      // Update existing record with latest conversation info
       const { error: uErr } = await supabase
         .from('interviews')
         .update({

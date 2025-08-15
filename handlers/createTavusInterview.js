@@ -26,14 +26,9 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl) {
   }
 
   const payload = {
-    // Either/both accepted (persona may carry a default replica; replica here overrides).
     persona_id: PERSONA_ID || undefined,
     replica_id: REPLICA_ID || undefined,
-
-    // Webhook for conversation events
     callback_url: webhookUrl || undefined,
-
-    // Optional niceties
     conversation_name: candidate?.name || candidate?.email || 'Interview',
     properties: {
       candidate_id: candidate?.id ?? null,
@@ -41,10 +36,8 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl) {
     }
   };
 
-  // Attach KB properly via document_ids (array of Tavus document IDs)
   if (role?.kb_document_id) {
     payload.document_ids = [role.kb_document_id];
-    // Optional: retrieval strategy (speed | balanced | quality)
     payload.document_retrieval_strategy = RETRIEVAL;
   }
 
@@ -62,7 +55,6 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl) {
       conversation_id: data.conversation_id || data.id || null
     };
   } catch (e) {
-    // Surface Tavus error details so callers (route) can send actionable messages
     const status = e.response?.status || 500;
     const details = e.response?.data || e.message;
     const err = new Error(typeof details === 'string' ? details : JSON.stringify(details));
