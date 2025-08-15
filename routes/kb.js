@@ -98,7 +98,6 @@ function rubricToPlainText(rubric) {
     }
   }
 
-  // Common nice-to-haves if the rubric has these keys
   const preferredKeys = ['summary', 'overview', 'categories', 'weights', 'scoring', 'skills', 'experience', 'behavioral', 'technical'];
   const keys = Object.keys(rubric || {});
   const ordered = [...new Set([...preferredKeys.filter(k => keys.includes(k)), ...keys.filter(k => !preferredKeys.includes(k))])];
@@ -110,35 +109,32 @@ function rubricToPlainText(rubric) {
 /**
  * POST /kb/from-rubric
  * Body: { role_id, use_signed_url?, document_name?, tags?[] }
- * Exports roles.rubric as plain TXT (bullets) and appends JD text if present, then creates a Tavus KB document.
+ * Exports roles.rubric as plain TXT (bullets) and appends JD URL if present,
+ * then creates a Tavus KB document.
  */
 kbRouter.post('/from-rubric', async (req, res) => {
   try {
     const { role_id, use_signed_url, document_name, tags } = req.body || {};
     if (!role_id) return res.status(400).json({ error: 'role_id required' });
 
-    // Try to fetch common role fields that may hold JD text
+    // NOTE: fetch job_description_url (not job_description)
     const { data: role, error: rErr } = await supabase
       .from('roles')
-      .select('id, title, rubric, job_description, jd, jd_text, description')
+      .select('id, title, rubric, job_description_url')
       .eq('id', role_id)
       .single();
     if (rErr || !role) return res.status(404).json({ error: rErr?.message || 'Role not found' });
     if (!role.rubric) return res.status(400).json({ error: 'roles.rubric is empty for this role' });
 
     const rubricText = rubricToPlainText(role.rubric);
-    const jdText = role.job_description || role.jd || role.jd_text || role.description || '';
 
-    const header = [
-      `ROLE: ${role.title || role.id}`,
-      jdText ? '\nJOB DESCRIPTION:\n' + jdText : ''
-    ].join('\n');
+    // We don't try to read the PDF here—just include the URL/path for reference.
+    const jdLine = role.job_description_url
+      ? `\nJOB DESCRIPTION FILE (storage path): ${role.job_description_url}\n`
+      : '';
 
-    const body = [
-      header,
-      '\nRUBRIC:\n',
-      rubricText
-    ].join('\n');
+    const header = `ROLE: ${role.title || role.id}${jdLine}`;
+    const body = [header, '\nRUBRIC:\n', rubricText].join('\n');
 
     // Upload as .txt to the kbs bucket
     const bucket = process.env.SUPABASE_KB_BUCKET || 'kbs';
