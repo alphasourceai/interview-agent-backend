@@ -1,57 +1,62 @@
 // handlers/createTavusInterview.js
+'use strict';
+
 require('dotenv').config();
 const axios = require('axios');
 
 /**
  * Create a Tavus v2 conversation for a candidate/role.
- * Attaches the role Knowledge Base document when available.
+ * - Attaches role KB via document_ids when available.
+ * - Includes callback_url so Tavus posts to our webhook.
  * Returns { conversation_url, conversation_id }.
  *
  * @param {Object} candidate - { id, role_id, email, name }
  * @param {Object} role - { id, kb_document_id }
- * @param {string} [webhookUrl] - Full URL to your /webhook/recording-ready endpoint
+ * @param {string} [webhookUrl] - Full URL to /webhook/recording-ready
  */
 async function createTavusInterviewHandler(candidate, role, webhookUrl) {
- // inside createTavusInterviewHandler(candidate, role, webhookUrl)
-const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
-const REPLICA_ID = String(process.env.TAVUS_REPLICA_ID || '').trim();
-const PERSONA_ID = String(process.env.TAVUS_PERSONA_ID || '').trim();
+  const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
+  const REPLICA_ID = String(process.env.TAVUS_REPLICA_ID || '').trim();
+  const PERSONA_ID = String(process.env.TAVUS_PERSONA_ID || '').trim();
+  const RETRIEVAL = String(process.env.TAVUS_DOCUMENT_STRATEGY || 'balanced').trim();
 
-if (!API_KEY) throw new Error('TAVUS_API_KEY is not set');
-
-// Minimal required identifiers per Tavus v2
-const payload = {
-  // One or both should be supplied per your setup
-  persona_id: PERSONA_ID || undefined,
-  replica_id: REPLICA_ID || undefined,
-
-  // Ensures Tavus pings your webhook when done
-  callback_url: webhookUrl || undefined,
-
-  // Optional but handy
-  conversation_name: candidate?.name || candidate?.email || 'Interview',
-  properties: {
-    candidate_id: candidate?.id || null,
-    role_id: role?.id || null
+  if (!API_KEY) throw new Error('TAVUS_API_KEY is not set');
+  if (!REPLICA_ID && !PERSONA_ID) {
+    throw new Error('Tavus requires persona_id or replica_id. Set TAVUS_REPLICA_ID or TAVUS_PERSONA_ID.');
   }
-};
 
-// Attach the KB by ID (array of strings like "df-...")
-if (role?.kb_document_id) {
-  payload.document_ids = [role.kb_document_id];
-}
+  const payload = {
+    persona_id: PERSONA_ID || undefined,
+    replica_id: REPLICA_ID || undefined,
+    callback_url: webhookUrl || undefined,
+    conversation_name: candidate?.name || candidate?.email || 'Interview'
+  };
 
-// POST https://tavusapi.com/v2/conversations
-const resp = await axios.post('https://tavusapi.com/v2/conversations', payload, {
-  headers: { 'x-api-key': API_KEY }
-});
+  if (role?.kb_document_id) {
+    payload.document_ids = [role.kb_document_id];
+    payload.document_retrieval_strategy = RETRIEVAL;
+  }
 
-const data = resp?.data || {};
-const conversation_url = data.conversation_url || data.url || data.link || null;
-const conversation_id = data.conversation_id || data.id || null;
+  try {
+    const resp = await axios.post('https://tavusapi.com/v2/conversations', payload, {
+      headers: {
+        'x-api-key': API_KEY,
+        'Content-Type': 'application/json'
+      }
+    });
 
-return { conversation_url, conversation_id };
-
+    const data = resp?.data || {};
+    return {
+      conversation_url: data.conversation_url || data.url || data.link || null,
+      conversation_id: data.conversation_id || data.id || null
+    };
+  } catch (e) {
+    const status = e.response?.status || 500;
+    const details = e.response?.data || e.message;
+    const err = new Error(typeof details === 'string' ? details : JSON.stringify(details));
+    err.status = status;
+    throw err;
+  }
 }
 
 module.exports = { createTavusInterviewHandler };
