@@ -9,10 +9,6 @@ const axios = require('axios');
  * - Attaches role KB via document_ids when available.
  * - Includes callback_url so Tavus posts to our webhook.
  * Returns { conversation_url, conversation_id }.
- *
- * @param {Object} candidate - { id, role_id, email, name }
- * @param {Object} role - { id, kb_document_id }
- * @param {string} [webhookUrl] - Full URL to /webhook/recording-ready
  */
 async function createTavusInterviewHandler(candidate, role, webhookUrl) {
   const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
@@ -25,24 +21,29 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl) {
     throw new Error('Tavus requires persona_id or replica_id. Set TAVUS_REPLICA_ID or TAVUS_PERSONA_ID.');
   }
 
+  // Nudge the agent to USE the KB doc
+  const context = [
+    'You are interviewing a candidate. Use the attached knowledge-base "rubric" document to guide your questions and answers.',
+    'If the candidate asks about evaluation, list the scoring categories exactly as written in the rubric.',
+    'Prefer facts from the document over generic advice.'
+  ].join(' ');
+
   const payload = {
     persona_id: PERSONA_ID || undefined,
     replica_id: REPLICA_ID || undefined,
     callback_url: webhookUrl || undefined,
-    conversation_name: candidate?.name || candidate?.email || 'Interview'
+    conversation_name: candidate?.name || candidate?.email || 'Interview',
+    conversational_context: context
   };
 
   if (role?.kb_document_id) {
     payload.document_ids = [role.kb_document_id];
-    payload.document_retrieval_strategy = RETRIEVAL;
+    payload.document_retrieval_strategy = RETRIEVAL; // speed | balanced | quality
   }
 
   try {
     const resp = await axios.post('https://tavusapi.com/v2/conversations', payload, {
-      headers: {
-        'x-api-key': API_KEY,
-        'Content-Type': 'application/json'
-      }
+      headers: { 'x-api-key': API_KEY, 'Content-Type': 'application/json' }
     });
 
     const data = resp?.data || {};
