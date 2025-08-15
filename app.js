@@ -29,7 +29,9 @@ const verifyOtpRoute = require('./routes/verifyOtp');
 const { kbRouter } = require('./routes/kb');
 const createInterviewRouter = require('./routes/createTavusInterview');
 const retryRouter = require('./routes/retryInterview');
+const webhookRouter = require('./routes/webhook');
 
+app.use('/webhook', webhookRouter);
 app.get('/health', (req, res) => res.status(200).json({ ok: true }));
 
 app.use('/candidates', candidateRoutes);
