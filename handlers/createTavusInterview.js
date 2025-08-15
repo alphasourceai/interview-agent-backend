@@ -12,33 +12,47 @@ const axios = require('axios');
  * @param {string} [webhookUrl] - Full URL to your /webhook/recording-ready endpoint
  */
 async function createTavusInterviewHandler(candidate, role, webhookUrl) {
-  const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
-  const REPLICA_ID = String(process.env.TAVUS_REPLICA_ID || '').trim();
-  const PERSONA_ID = process.env.TAVUS_PERSONA_ID ? String(process.env.TAVUS_PERSONA_ID).trim() : null;
+  // inside createTavusInterviewHandler(candidate, role, webhookUrl)
+const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
+const REPLICA_ID = String(process.env.TAVUS_REPLICA_ID || '').trim();
+const PERSONA_ID = String(process.env.TAVUS_PERSONA_ID || '').trim();
 
-  if (!API_KEY) throw new Error('TAVUS_API_KEY missing');
-  if (!REPLICA_ID) throw new Error('TAVUS_REPLICA_ID missing');
+if (!API_KEY) throw new Error('TAVUS_API_KEY is not set');
 
-  const payload = {
-    replica_id: REPLICA_ID
-  };
+const payload = {
+  // At least one of these is typically required based on your setup
+  persona_id: PERSONA_ID || undefined,
+  replica_id: REPLICA_ID || undefined,
 
-  if (PERSONA_ID) payload.persona_id = PERSONA_ID;
-  if (webhookUrl) payload.webhook_url = webhookUrl;
-  if (role && role.kb_document_id) {
-    payload.document_ids = [role.kb_document_id];
-    payload.document_retrieval_strategy = 'balanced';
+  // Ensures Tavus calls back to your server when recording/transcripts are ready
+  callback_url: webhookUrl || undefined,
+
+  // Optional labels for convenience
+  conversation_name: candidate?.name || candidate?.email || 'Interview',
+  properties: {
+    candidate_id: candidate?.id || null,
+    role_id: role?.id || null
   }
+};
 
-  const resp = await axios.post('https://tavusapi.com/v2/conversations', payload, {
-    headers: { 'x-api-key': API_KEY }
-  });
+// Attach the Knowledge Base doc if we have it
+if (role?.kb_document_id) {
+  // Tavus KB docs can be added to conversations;
+  // API currently accepts a list of documents.
+  payload.documents = [{ uuid: role.kb_document_id }];
+}
 
-  const data = resp && resp.data ? resp.data : {};
-  const conversation_url = data.conversation_url || data.url || data.link || null;
-  const conversation_id = data.conversation_id || data.id || null;
+// POST https://tavusapi.com/v2/conversations with x-api-key header
+const resp = await axios.post('https://tavusapi.com/v2/conversations', payload, {
+  headers: { 'x-api-key': API_KEY }
+});
 
-  return { conversation_url, conversation_id };
+const data = resp?.data || {};
+const conversation_url = data.conversation_url || data.url || data.link || null;
+const conversation_id = data.conversation_id || data.id || null;
+
+return { conversation_url, conversation_id };
+
 }
 
 module.exports = { createTavusInterviewHandler };

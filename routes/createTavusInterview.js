@@ -7,7 +7,7 @@ const createInterviewRouter = express.Router();
 createInterviewRouter.post("/", async (req, res) => {
   try {
     const base = (process.env.PUBLIC_BACKEND_URL || "").replace(/\/+$/,"");
-    if (!base) return res.status(500).json({ error: "PUBLIC_BACKEND_URL not set" });
+if (!base) return res.status(500).json({ error: "PUBLIC_BACKEND_URL not set" });
 
     const { candidate_id, role_id: roleIdFromBody } = req.body || {};
     if (!candidate_id) return res.status(400).json({ error: "candidate_id required" });
