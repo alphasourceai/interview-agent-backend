@@ -62,35 +62,94 @@ kbRouter.post('/upload', async (req, res) => {
   }
 });
 
+/** Turn JSON rubric into human-readable bullet text. */
+function rubricToPlainText(rubric) {
+  const lines = [];
+
+  function isPrimitive(v) {
+    return v == null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
+  }
+
+  function titleCase(s) {
+    try {
+      return String(s)
+        .replace(/[_\-]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .replace(/\b\w/g, (c) => c.toUpperCase());
+    } catch { return String(s); }
+  }
+
+  function walk(node, indent = 0, label) {
+    const pad = '  '.repeat(indent);
+    if (isPrimitive(node)) {
+      if (label != null) lines.push(`${pad}- ${titleCase(label)}: ${node}`);
+      else lines.push(`${pad}- ${node}`);
+      return;
+    }
+    if (Array.isArray(node)) {
+      if (label != null) lines.push(`${pad}- ${titleCase(label)}:`);
+      node.forEach((item) => walk(item, indent + 1));
+      return;
+    }
+    if (typeof node === 'object') {
+      if (label != null) lines.push(`${pad}- ${titleCase(label)}:`);
+      Object.entries(node).forEach(([k, v]) => walk(v, indent + 1, k));
+    }
+  }
+
+  // Common nice-to-haves if the rubric has these keys
+  const preferredKeys = ['summary', 'overview', 'categories', 'weights', 'scoring', 'skills', 'experience', 'behavioral', 'technical'];
+  const keys = Object.keys(rubric || {});
+  const ordered = [...new Set([...preferredKeys.filter(k => keys.includes(k)), ...keys.filter(k => !preferredKeys.includes(k))])];
+
+  ordered.forEach((k) => walk(rubric[k], 0, k));
+  return lines.join('\n');
+}
+
 /**
  * POST /kb/from-rubric
  * Body: { role_id, use_signed_url?, document_name?, tags?[] }
- * Saves roles.rubric to Storage as **TXT** and creates a Tavus KB doc from that URL.
+ * Exports roles.rubric as plain TXT (bullets) and appends JD text if present, then creates a Tavus KB document.
  */
 kbRouter.post('/from-rubric', async (req, res) => {
   try {
     const { role_id, use_signed_url, document_name, tags } = req.body || {};
     if (!role_id) return res.status(400).json({ error: 'role_id required' });
 
+    // Try to fetch common role fields that may hold JD text
     const { data: role, error: rErr } = await supabase
       .from('roles')
-      .select('id, rubric')
+      .select('id, title, rubric, job_description, jd, jd_text, description')
       .eq('id', role_id)
       .single();
     if (rErr || !role) return res.status(404).json({ error: rErr?.message || 'Role not found' });
     if (!role.rubric) return res.status(400).json({ error: 'roles.rubric is empty for this role' });
 
-    // Write as plain text (we’ll stringify JSON but save as .txt)
+    const rubricText = rubricToPlainText(role.rubric);
+    const jdText = role.job_description || role.jd || role.jd_text || role.description || '';
+
+    const header = [
+      `ROLE: ${role.title || role.id}`,
+      jdText ? '\nJOB DESCRIPTION:\n' + jdText : ''
+    ].join('\n');
+
+    const body = [
+      header,
+      '\nRUBRIC:\n',
+      rubricText
+    ].join('\n');
+
+    // Upload as .txt to the kbs bucket
     const bucket = process.env.SUPABASE_KB_BUCKET || 'kbs';
-    const path = `${role_id}.txt`; // <-- changed from .json
-    const content = JSON.stringify(role.rubric, null, 2);
-    const upload = await supabase.storage.from(bucket).upload(path, content, {
-      contentType: 'text/plain', // <-- changed from application/json
+    const path = `${role_id}.txt`;
+    const upload = await supabase.storage.from(bucket).upload(path, body, {
+      contentType: 'text/plain',
       upsert: true
     });
     if (upload.error) return res.status(500).json({ error: upload.error.message });
 
-    // Public or signed URL
+    // Get URL (public or signed)
     let docUrl;
     if (use_signed_url) {
       const { data: signed, error: signErr } = await supabase
@@ -105,7 +164,7 @@ kbRouter.post('/from-rubric', async (req, res) => {
     }
     if (!docUrl) return res.status(500).json({ error: 'Failed to get document URL' });
 
-    // Create Tavus Document from URL
+    // Create Tavus Document
     const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
     if (!API_KEY) return res.status(500).json({ error: 'TAVUS_API_KEY not set' });
 
