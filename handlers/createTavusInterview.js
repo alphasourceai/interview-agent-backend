@@ -12,22 +12,23 @@ const axios = require('axios');
  * @param {string} [webhookUrl] - Full URL to your /webhook/recording-ready endpoint
  */
 async function createTavusInterviewHandler(candidate, role, webhookUrl) {
-  // inside createTavusInterviewHandler(candidate, role, webhookUrl)
+ // inside createTavusInterviewHandler(candidate, role, webhookUrl)
 const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
 const REPLICA_ID = String(process.env.TAVUS_REPLICA_ID || '').trim();
 const PERSONA_ID = String(process.env.TAVUS_PERSONA_ID || '').trim();
 
 if (!API_KEY) throw new Error('TAVUS_API_KEY is not set');
 
+// Minimal required identifiers per Tavus v2
 const payload = {
-  // At least one of these is typically required based on your setup
+  // One or both should be supplied per your setup
   persona_id: PERSONA_ID || undefined,
   replica_id: REPLICA_ID || undefined,
 
-  // Ensures Tavus calls back to your server when recording/transcripts are ready
+  // Ensures Tavus pings your webhook when done
   callback_url: webhookUrl || undefined,
 
-  // Optional labels for convenience
+  // Optional but handy
   conversation_name: candidate?.name || candidate?.email || 'Interview',
   properties: {
     candidate_id: candidate?.id || null,
@@ -35,14 +36,12 @@ const payload = {
   }
 };
 
-// Attach the Knowledge Base doc if we have it
+// Attach the KB by ID (array of strings like "df-...")
 if (role?.kb_document_id) {
-  // Tavus KB docs can be added to conversations;
-  // API currently accepts a list of documents.
-  payload.documents = [{ uuid: role.kb_document_id }];
+  payload.document_ids = [role.kb_document_id];
 }
 
-// POST https://tavusapi.com/v2/conversations with x-api-key header
+// POST https://tavusapi.com/v2/conversations
 const resp = await axios.post('https://tavusapi.com/v2/conversations', payload, {
   headers: { 'x-api-key': API_KEY }
 });
