@@ -23,12 +23,12 @@ function checkSecret(req, res) {
 
 /**
  * POST /webhook/tavus
- * Handles Tavus conversation callbacks:
- * - system.replica_joined         -> status = 'In Progress'
- * - system.shutdown               -> status = 'Ended'
- * - application.recording_ready   -> set video_url (if provided)
- * - application.transcription_ready -> status = 'Transcribed'
- * - application.perception_analysis -> status = 'Analyzed'
+ * Tavus conversation callbacks. See docs for payload shapes:
+ * - application.transcription_ready → transcript in properties.transcript
+ * - application.perception_analysis → analysis summary in properties.analysis
+ * - application.recording_ready     → video url in properties.video_url / body.video_url
+ * - system.replica_joined / system.shutdown
+ * Docs: https://docs.tavus.io/sections/webhooks-and-callbacks
  */
 webhookRouter.post('/tavus', async (req, res) => {
   try {
@@ -41,43 +41,103 @@ webhookRouter.post('/tavus', async (req, res) => {
       return res.status(400).json({ error: 'conversation_id and event_type required' });
     }
 
+    // Find the interview by Tavus conversation id
     const { data: interview, error: findErr } = await supabase
       .from('interviews')
       .select('id, status, video_url')
       .eq('tavus_application_id', conversation_id)
       .maybeSingle();
-
     if (findErr) return res.status(500).json({ error: findErr.message });
     if (!interview) return res.status(404).json({ error: 'interview not found for conversation_id' });
 
-    const patch = {};
-
+    // --- System events ---
     if (event_type === 'system.replica_joined') {
-      patch.status = 'In Progress';
-    } else if (event_type === 'system.shutdown') {
-      patch.status = 'Ended';
-    } else if (event_type === 'application.recording_ready') {
-      const s3Key = properties?.s3_key || null;
-      const videoUrl = properties?.video_url || body.video_url || null;
-      patch.status = 'Video Ready';
-      if (videoUrl) patch.video_url = videoUrl;
-      else if (s3Key) patch.video_url = s3Key;
-    } else if (event_type === 'application.transcription_ready') {
-      patch.status = 'Transcribed';
-    } else if (event_type === 'application.perception_analysis') {
-      patch.status = 'Analyzed';
-    } else {
-      return res.json({ ok: true, note: 'ignored event_type', event_type });
+      await supabase.from('interviews').update({ status: 'In Progress' }).eq('id', interview.id);
+      return res.json({ ok: true });
+    }
+    if (event_type === 'system.shutdown') {
+      await supabase.from('interviews').update({ status: 'Ended' }).eq('id', interview.id);
+      return res.json({ ok: true });
     }
 
-    const { error: updErr } = await supabase
-      .from('interviews')
-      .update(patch)
-      .eq('id', interview.id);
+    // --- Recording ready ---
+    if (event_type === 'application.recording_ready') {
+      const videoUrl = properties?.video_url || body.video_url || properties?.s3_key || null;
+      const patch = { status: 'Video Ready' };
+      if (videoUrl) patch.video_url = videoUrl;
+      const { error: updErr } = await supabase.from('interviews').update(patch).eq('id', interview.id);
+      if (updErr) return res.status(500).json({ error: updErr.message });
+      return res.json({ ok: true });
+    }
 
-    if (updErr) return res.status(500).json({ error: updErr.message });
+    // --- Transcription ready ---
+    if (event_type === 'application.transcription_ready') {
+      // Tavus sends transcript as an array of { role, content } messages. :contentReference[oaicite:1]{index=1}
+      const transcript = properties?.transcript;
+      if (!Array.isArray(transcript)) {
+        // Fallback: if Tavus starts sending a URL instead
+        const tUrl = properties?.transcript_url || null;
+        if (tUrl) {
+          const { error: updErr } = await supabase
+            .from('interviews')
+            .update({ status: 'Transcribed', transcript_url: tUrl })
+            .eq('id', interview.id);
+          if (updErr) return res.status(500).json({ error: updErr.message });
+          return res.json({ ok: true, note: 'stored transcript_url' });
+        }
+        return res.status(400).json({ error: 'transcript missing in properties' });
+      }
 
-    return res.json({ ok: true });
+      const bucket = process.env.SUPABASE_TRANSCRIPTS_BUCKET || 'transcripts';
+      const path = `${conversation_id}.json`;
+      const content = JSON.stringify({ conversation_id, transcript }, null, 2);
+
+      const upload = await supabase.storage.from(bucket).upload(path, content, {
+        contentType: 'application/json',
+        upsert: true,
+      });
+      if (upload.error) return res.status(500).json({ error: upload.error.message });
+
+      const { data: pub } = supabase.storage.from(bucket).getPublicUrl(path);
+      const transcript_url = pub?.publicUrl || null;
+
+      const { error: updErr } = await supabase
+        .from('interviews')
+        .update({ status: 'Transcribed', transcript_url })
+        .eq('id', interview.id);
+      if (updErr) return res.status(500).json({ error: updErr.message });
+
+      return res.json({ ok: true, transcript_url });
+    }
+
+    // --- Perception analysis ready ---
+    if (event_type === 'application.perception_analysis') {
+      // Docs: analysis summary arrives post-call when perception is enabled. :contentReference[oaicite:2]{index=2}
+      const analysis = properties?.analysis ?? properties ?? {};
+      const bucket = process.env.SUPABASE_ANALYSIS_BUCKET || 'analysis';
+      const path = `${conversation_id}.json`;
+      const content = JSON.stringify({ conversation_id, analysis }, null, 2);
+
+      const upload = await supabase.storage.from(bucket).upload(path, content, {
+        contentType: 'application/json',
+        upsert: true,
+      });
+      if (upload.error) return res.status(500).json({ error: upload.error.message });
+
+      const { data: pub } = supabase.storage.from(bucket).getPublicUrl(path);
+      const analysis_url = pub?.publicUrl || null;
+
+      const { error: updErr } = await supabase
+        .from('interviews')
+        .update({ status: 'Analyzed', analysis_url })
+        .eq('id', interview.id);
+      if (updErr) return res.status(500).json({ error: updErr.message });
+
+      return res.json({ ok: true, analysis_url });
+    }
+
+    // Unknown event -> acknowledge to avoid retries
+    return res.json({ ok: true, note: 'ignored event_type', event_type });
   } catch (e) {
     return res.status(500).json({ error: e.message || String(e) });
   }
