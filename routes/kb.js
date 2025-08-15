@@ -1,50 +1,81 @@
 // routes/kb.js (POST /kb/upload)
-const express = require("express");
-const axios = require("axios");
-const { supabase } = require("../src/lib/supabaseClient");
+'use strict';
+
+const express = require('express');
+const axios = require('axios');
+const { supabase } = require('../src/lib/supabaseClient');
 
 const kbRouter = express.Router();
 
-kbRouter.post("/upload", async (req, res) => {
+/**
+ * Create (or set) a KB document for a role.
+ *
+ * POST /kb/upload
+ * Body (one of):
+ *   - { role_id, document_url, document_name?, tags?[] }  → creates a Tavus doc and stores its document_id/uuid
+ *   - { role_id, kb_document_id }                         → directly stores an existing Tavus document_id
+ *
+ * Returns: { kb_document_id: "<document_id>" }
+ *
+ * Notes:
+ * - Tavus KB docs page shows create returns a "document_id" used later in create-conversation as "document_ids".
+ * - API reference also shows "uuid" in responses. We accept both and persist whichever is present (preferring document_id).
+ */
+kbRouter.post('/upload', async (req, res) => {
   try {
-    const { role_id } = req.body || {};
-    if (!role_id) return res.status(400).json({ error: "role_id required" });
+    const { role_id, kb_document_id, document_url, document_name, tags } = req.body || {};
+    if (!role_id) return res.status(400).json({ error: 'role_id required' });
 
-    const base = (process.env.PUBLIC_BACKEND_URL || "").replace(/\/+$/,"");
-    if (!base) return res.status(500).json({ error: "PUBLIC_BACKEND_URL not set" });
+    // If caller already has a Tavus document id, just save it.
+    if (kb_document_id) {
+      const { error } = await supabase
+        .from('roles')
+        .update({ kb_document_id: kb_document_id })
+        .eq('id', role_id);
+      if (error) return res.status(500).json({ error: error.message });
+      return res.status(200).json({ kb_document_id });
+    }
 
-    // optional: fetch role name for a nicer document_name
-    const { data: role, error: rErr } = await supabase
-      .from("roles")
-      .select("id, title")
-      .eq("id", role_id)
-      .single();
-    if (rErr || !role) return res.status(404).json({ error: "Role not found" });
+    // Otherwise, create the document via Tavus API from a public URL.
+    if (!document_url) {
+      return res.status(400).json({ error: 'Provide kb_document_id OR document_url' });
+    }
 
-    const document_url = `${base}/kb/${role_id}`;
+    const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
+    if (!API_KEY) return res.status(500).json({ error: 'TAVUS_API_KEY not set' });
 
-    // IMPORTANT: use `tags` (not `document_tags`)
     const payload = {
       document_url,
-      document_name: role.title ? `Role KB — ${role.title}` : `role-kb-${role_id}`,
-      tags: ["role", String(role_id)]
-      // callback_url: "<optional webhook for doc processing>"
-      // properties: { any: "metadata" } // optional
+      document_name: document_name || `role-${role_id}-kb-doc`,
+      // Optionally pass tags to group docs and use document_tags later
+      tags: Array.isArray(tags) ? tags : undefined
+      // callback_url for document processing updates is optional; omit for now
     };
 
-    const resp = await axios.post("https://tavusapi.com/v2/documents", payload, {
-      headers: { "x-api-key": process.env.TAVUS_API_KEY }
+    const resp = await axios.post('https://tavusapi.com/v2/documents', payload, {
+      headers: {
+        'x-api-key': API_KEY,
+        'Content-Type': 'application/json'
+      }
     });
 
-    const kbId = resp?.data?.document_id || resp?.data?.uuid || resp?.data?.id || null;
-    if (!kbId) return res.status(502).json({ error: "No document id from Tavus", details: resp?.data });
+    // Tavus docs show either "document_id" (KB page) or "uuid" (API ref). Save whichever exists.
+    const respData = resp?.data || {};
+    const docId =
+      respData.document_id || respData.uuid || respData.id || null;
 
-    const { error } = await supabase.from("roles").update({ kb_document_id: kbId }).eq("id", role_id);
+    if (!docId) {
+      return res.status(500).json({ error: 'No document id returned from Tavus' });
+    }
+
+    const { error } = await supabase
+      .from('roles')
+      .update({ kb_document_id: docId })
+      .eq('id', role_id);
     if (error) return res.status(500).json({ error: error.message });
 
-    return res.status(200).json({ kb_document_id: kbId });
+    return res.status(200).json({ kb_document_id: docId });
   } catch (e) {
-    // Bubble up Tavus error details to help debugging
     const status = e.response?.status || 500;
     const details = e.response?.data || e.message;
     return res.status(status).json({ error: details });
