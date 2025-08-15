@@ -65,7 +65,7 @@ kbRouter.post('/upload', async (req, res) => {
 /**
  * POST /kb/from-rubric
  * Body: { role_id, use_signed_url?, document_name?, tags?[] }
- * Saves roles.rubric to Storage and creates a Tavus KB doc from that URL.
+ * Saves roles.rubric to Storage as **TXT** and creates a Tavus KB doc from that URL.
  */
 kbRouter.post('/from-rubric', async (req, res) => {
   try {
@@ -80,15 +80,17 @@ kbRouter.post('/from-rubric', async (req, res) => {
     if (rErr || !role) return res.status(404).json({ error: rErr?.message || 'Role not found' });
     if (!role.rubric) return res.status(400).json({ error: 'roles.rubric is empty for this role' });
 
+    // Write as plain text (we’ll stringify JSON but save as .txt)
     const bucket = process.env.SUPABASE_KB_BUCKET || 'kbs';
-    const path = `${role_id}.json`;
+    const path = `${role_id}.txt`; // <-- changed from .json
     const content = JSON.stringify(role.rubric, null, 2);
     const upload = await supabase.storage.from(bucket).upload(path, content, {
-      contentType: 'application/json',
+      contentType: 'text/plain', // <-- changed from application/json
       upsert: true
     });
     if (upload.error) return res.status(500).json({ error: upload.error.message });
 
+    // Public or signed URL
     let docUrl;
     if (use_signed_url) {
       const { data: signed, error: signErr } = await supabase
@@ -103,12 +105,13 @@ kbRouter.post('/from-rubric', async (req, res) => {
     }
     if (!docUrl) return res.status(500).json({ error: 'Failed to get document URL' });
 
+    // Create Tavus Document from URL
     const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
     if (!API_KEY) return res.status(500).json({ error: 'TAVUS_API_KEY not set' });
 
     const payload = {
       document_url: docUrl,
-      document_name: document_name || `role-${role_id}-kb-from-rubric`,
+      document_name: document_name || `role-${role_id}-kb-from-rubric-txt`,
       tags: Array.isArray(tags) ? tags : undefined
     };
 
