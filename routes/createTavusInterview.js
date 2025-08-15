@@ -32,7 +32,7 @@ createInterviewRouter.post('/', async (req, res) => {
       .single();
     if (rErr || !role) return res.status(404).json({ error: rErr?.message || 'Role not found' });
 
-    const webhookUrl = `${base}/webhook/recording-ready`;
+    const webhookUrl = `${base}/webhook/tavus`;
 
     const result = await createTavusInterviewHandler(candidate, role, webhookUrl);
 
