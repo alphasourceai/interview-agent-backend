@@ -25,18 +25,27 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl) {
     throw new Error('Tavus requires persona_id or replica_id. Set TAVUS_REPLICA_ID or TAVUS_PERSONA_ID.');
   }
 
+  // Nudge the agent to use the KB doc
+  const context = [
+    'You are interviewing a candidate. Use the attached knowledge-base "rubric" document to guide your questions and answers.',
+    'If the candidate asks about evaluation, list the scoring categories exactly as written in the rubric.',
+    'Prefer facts from the document over generic advice.'
+  ].join(' ');
+
   // Build the payload Tavus expects
   const payload = {
     persona_id: PERSONA_ID || undefined,
     replica_id: REPLICA_ID || undefined,
     callback_url: webhookUrl || undefined,
-    conversation_name: candidate?.name || candidate?.email || 'Interview'
+    conversation_name: candidate?.name || candidate?.email || 'Interview',
+    conversational_context: context
   };
 
   // Attach KB via document_ids if we have it
   if (role?.kb_document_id) {
     payload.document_ids = [role.kb_document_id];
-    payload.document_retrieval_strategy = RETRIEVAL; // "speed" | "balanced" | "quality"
+    // "speed" | "balanced" | "quality"
+    payload.document_retrieval_strategy = RETRIEVAL;
   }
 
   try {
