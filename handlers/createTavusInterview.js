@@ -6,7 +6,7 @@ const axios = require('axios');
 
 /**
  * Create a Tavus v2 conversation for a candidate/role.
- * - Attaches role KB via document_ids when available (per KB docs).
+ * - Attaches role KB via document_ids when available.
  * - Includes callback_url so Tavus posts to our webhook.
  * Returns { conversation_url, conversation_id }.
  *
@@ -25,20 +25,18 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl) {
     throw new Error('Tavus requires persona_id or replica_id. Set TAVUS_REPLICA_ID or TAVUS_PERSONA_ID.');
   }
 
+  // Build the payload Tavus expects
   const payload = {
     persona_id: PERSONA_ID || undefined,
     replica_id: REPLICA_ID || undefined,
     callback_url: webhookUrl || undefined,
-    conversation_name: candidate?.name || candidate?.email || 'Interview',
-    properties: {
-      candidate_id: candidate?.id ?? null,
-      role_id: role?.id ?? null
-    }
+    conversation_name: candidate?.name || candidate?.email || 'Interview'
   };
 
+  // Attach KB via document_ids if we have it
   if (role?.kb_document_id) {
     payload.document_ids = [role.kb_document_id];
-    payload.document_retrieval_strategy = RETRIEVAL;
+    payload.document_retrieval_strategy = RETRIEVAL; // "speed" | "balanced" | "quality"
   }
 
   try {
