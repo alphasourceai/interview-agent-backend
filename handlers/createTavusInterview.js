@@ -9,6 +9,10 @@ const axios = require('axios');
  * - Attaches role KB via document_ids when available.
  * - Includes callback_url so Tavus posts to our webhook.
  * Returns { conversation_url, conversation_id }.
+ *
+ * @param {Object} candidate - { id, role_id, email, name }
+ * @param {Object} role - { id, kb_document_id }
+ * @param {string} [webhookUrl] - Full URL to /webhook/recording-ready
  */
 async function createTavusInterviewHandler(candidate, role, webhookUrl) {
   const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
@@ -21,13 +25,14 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl) {
     throw new Error('Tavus requires persona_id or replica_id. Set TAVUS_REPLICA_ID or TAVUS_PERSONA_ID.');
   }
 
-  // Nudge the agent to USE the KB doc
+  // Nudge the agent to use the KB doc
   const context = [
     'You are interviewing a candidate. Use the attached knowledge-base "rubric" document to guide your questions and answers.',
     'If the candidate asks about evaluation, list the scoring categories exactly as written in the rubric.',
     'Prefer facts from the document over generic advice.'
   ].join(' ');
 
+  // Build the payload Tavus expects
   const payload = {
     persona_id: PERSONA_ID || undefined,
     replica_id: REPLICA_ID || undefined,
@@ -36,14 +41,19 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl) {
     conversational_context: context
   };
 
+  // Attach KB via document_ids if we have it
   if (role?.kb_document_id) {
     payload.document_ids = [role.kb_document_id];
-    payload.document_retrieval_strategy = RETRIEVAL; // speed | balanced | quality
+    // "speed" | "balanced" | "quality"
+    payload.document_retrieval_strategy = RETRIEVAL;
   }
 
   try {
     const resp = await axios.post('https://tavusapi.com/v2/conversations', payload, {
-      headers: { 'x-api-key': API_KEY, 'Content-Type': 'application/json' }
+      headers: {
+        'x-api-key': API_KEY,
+        'Content-Type': 'application/json'
+      }
     });
 
     const data = resp?.data || {};
