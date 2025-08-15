@@ -25,6 +25,7 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl) {
     throw new Error('Tavus requires persona_id or replica_id. Set TAVUS_REPLICA_ID or TAVUS_PERSONA_ID.');
   }
 
+  // Build the payload Tavus expects
   const payload = {
     persona_id: PERSONA_ID || undefined,
     replica_id: REPLICA_ID || undefined,
@@ -32,9 +33,10 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl) {
     conversation_name: candidate?.name || candidate?.email || 'Interview'
   };
 
+  // Attach KB via document_ids if we have it
   if (role?.kb_document_id) {
     payload.document_ids = [role.kb_document_id];
-    payload.document_retrieval_strategy = RETRIEVAL;
+    payload.document_retrieval_strategy = RETRIEVAL; // "speed" | "balanced" | "quality"
   }
 
   try {
