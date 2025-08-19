@@ -1,69 +1,127 @@
-// app.js
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
+require('dotenv').config()
+const express = require('express')
+const cors = require('cors')
+const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
 
-const app = express();
+const app = express()
 
-/** CORS (simple) */
 const DEFAULT_ORIGINS = [
   'http://localhost:5173',
-  'https://interview-agent-frontend.onrender.com',
-];
+  'https://interview-agent-frontend.onrender.com'
+]
 const envOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
-  .filter(Boolean);
-const ALLOWED_ORIGINS = envOrigins.length ? envOrigins : DEFAULT_ORIGINS;
-
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin || ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error('Not allowed by CORS'));
+  .filter(Boolean)
+const ALLOWLIST = Array.from(new Set([...DEFAULT_ORIGINS, ...envOrigins]))
+const corsOptions = {
+  origin: function (origin, cb) {
+    if (!origin) return cb(null, true)
+    if (ALLOWLIST.includes(origin)) return cb(null, true)
+    return cb(new Error('Not allowed by CORS'))
   },
-  credentials: true,
-}));
+  credentials: true
+}
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.set('trust proxy', 1)
+app.use(cors(corsOptions))
+app.use(express.json({ limit: '10mb' }))
+app.use(express.urlencoded({ extended: true, limit: '10mb' }))
 
-/** Routes */
-const webhookRouter = require('./routes/webhook');
-const candidateRoutes = require('./routes/candidates');
-const reportRoutes = require('./routes/reports');
-const createRoleRoute = require('./routes/createRole');
-const candidateSubmitRoute = require('./routes/candidateSubmit');
-const verifyOtpRoute = require('./routes/verifyOtp');
-const { kbRouter } = require('./routes/kb');
-const createInterviewRouter = require('./routes/createTavusInterview');
-const retryRouter = require('./routes/retryInterview');
+function mountIfExists(routePath, mountPoint) {
+  try {
+    const router = require(routePath)
+    app.use(mountPoint, router)
+  } catch (e) {}
+}
 
-/** Healthcheck */
-app.get('/health', (req, res) => res.status(200).json({ ok: true }));
+mountIfExists('./routes/webhook', '/webhook')
+mountIfExists('./routes/kb', '/kb')
+mountIfExists('./routes/createTavusInterview', '/create-tavus-interview')
+mountIfExists('./routes/reports', '/reports')
+mountIfExists('./routes/candidates', '/candidates')
+mountIfExists('./routes/retryInterview', '/interviews')
 
-/** Mount routers */
-app.use('/webhook', webhookRouter);                 // <— unified Tavus webhook (/webhook/tavus and /webhook/recording-ready)
-app.use('/candidates', candidateRoutes);
-app.use('/reports', reportRoutes);
-app.use('/create-role', createRoleRoute);
-app.use('/api/candidate/submit', candidateSubmitRoute);
-app.use('/api/candidate/verify-otp', verifyOtpRoute);
-app.use('/kb', kbRouter);
-app.use('/create-tavus-interview', createInterviewRouter);
-app.use('/interviews', retryRouter);
+async function requireAuth(req, res, next) {
+  const h = req.headers.authorization || ''
+  const token = h.startsWith('Bearer ') ? h.slice(7) : null
+  if (!token) return res.status(401).json({ error: 'Missing bearer token' })
+  const { data, error } = await supabaseAnon.auth.getUser(token)
+  if (error || !data?.user) return res.status(401).json({ error: 'Invalid token' })
+  req.user = data.user
+  req.jwt = token
+  next()
+}
 
-/** NOTE:
- * We intentionally REMOVED the legacy direct mount:
- *   app.post('/webhook/recording-ready', handleTavusWebhook)
- * to avoid conflicting handlers.
- * The new unified router handles:
- *   POST /webhook/recording-ready   (manual tests)
- *   POST /webhook/tavus             (real Tavus callbacks)
- */
+async function withClientScope(req, res, next) {
+  if (!req.user) return res.status(500).json({ error: 'User not loaded' })
+  const { data, error } = await supabaseAdmin
+    .from('client_members')
+    .select('client_id, role')
+    .eq('user_id', req.user.id)
+  if (error) return res.status(500).json({ error: 'Failed to load memberships' })
+  req.clientIds = data.map(r => r.client_id)
+  req.memberships = data
+  next()
+}
 
-const PORT = process.env.PORT || 3000;
+app.get('/auth/ping', requireAuth, withClientScope, (req, res) => {
+  res.json({ ok: true, userId: req.user.id, clientIds: req.clientIds })
+})
+
+app.get('/auth/me', requireAuth, withClientScope, (req, res) => {
+  const user = { id: req.user.id, email: req.user.email }
+  res.json({ user, memberships: req.memberships })
+})
+
+app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) => {
+  const requested = (req.query.client_id || '').trim()
+  const filterIds = requested && req.clientIds.includes(requested) ? [requested] : req.clientIds
+  if (!filterIds || filterIds.length === 0) return res.json({ items: [] })
+
+  const select = `
+    id, candidate_id, role_id, created_at,
+    video_url, transcript_url, analysis_url, client_id,
+    roles:role_id ( id, title, client_id )
+  `
+  const { data, error } = await supabaseAdmin
+    .from('interviews')
+    .select(select)
+    .in('client_id', filterIds)
+    .order('created_at', { ascending: false })
+
+  if (error) return res.status(500).json({ error: 'Failed to load interviews' })
+
+  const items = (data || []).map(r => ({
+    id: r.id,
+    created_at: r.created_at,
+    candidate_id: r.candidate_id || null,
+    role_id: r.role_id || null,
+    client_id: r.client_id || null,
+    role: r.roles ? { id: r.roles.id, title: r.roles.title, client_id: r.roles.client_id } : null,
+    video_url: r.video_url || null,
+    transcript_url: r.transcript_url || null,
+    analysis_url: r.analysis_url || null,
+    has_video: !!r.video_url,
+    has_transcript: !!r.transcript_url,
+    has_analysis: !!r.analysis_url
+  }))
+
+  res.json({ items })
+})
+
+app.get('/health', (req, res) => res.json({ ok: true }))
+app.get('/', (req, res) => res.send('ok'))
+
+app.use(function (err, req, res, next) {
+  const status = err.status || 500
+  const msg = err.message || 'Server error'
+  res.status(status).json({ error: msg })
+})
+
+const PORT = process.env.PORT || 3000
 app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+  console.log(`Server running on http://localhost:${PORT}`)
+})
 
-module.exports = app;
+module.exports = app
