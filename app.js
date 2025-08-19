@@ -92,6 +92,27 @@ app.get('/auth/me', requireAuth, withClientScope, (req, res) => {
   res.json({ user, memberships: req.memberships })
 })
 
+// List my clients (name + role) for dropdowns
+app.get('/clients/my', requireAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('client_members')
+      .select('client_id, role, clients!inner(name)')
+      .eq('user_id', req.user.id)
+      .order('clients(name)')
+    if (error) return res.status(500).json({ error: 'Failed to load clients' })
+
+    const items = (data || []).map(r => ({
+      client_id: r.client_id,
+      role: r.role,
+      name: r.clients?.name || r.client_id
+    }))
+    res.json({ items })
+  } catch (e) {
+    res.status(500).json({ error: 'Server error' })
+  }
+})
+
 // ---------- Dashboard: scoped interviews ----------
 app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) => {
   try {
