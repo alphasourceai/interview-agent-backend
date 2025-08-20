@@ -16,7 +16,7 @@ const envOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean)
-// CHANGE #1: ensure FRONTEND_URL is always allowed
+// Ensure FRONTEND_URL is always allowed
 const ALLOWLIST = Array.from(new Set([...DEFAULT_ORIGINS, ...envOrigins, FRONTEND_URL]))
 
 const corsOptions = {
@@ -26,7 +26,7 @@ const corsOptions = {
     return cb(new Error('Not allowed by CORS'))
   },
   credentials: true,
-  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }
 
@@ -35,8 +35,6 @@ app.set('trust proxy', 1)
 app.use(cors(corsOptions))
 app.use(express.json({ limit: '10mb' }))
 app.use(express.urlencoded({ extended: true, limit: '10mb' }))
-
-// CHANGE #2 is further down when mounting routes/files with auth + scope
 
 // ---------- Helper to mount optional routers without crashing ----------
 function mountIfExists(routePath, mountPoint) {
@@ -49,10 +47,12 @@ function mountIfExists(routePath, mountPoint) {
 }
 
 // Existing feature routers (present in your repo)
+// NOTE: Leave webhook/kb/create-tavus/candidates/retry mounted as-is.
+// DO NOT mount /reports here; we mount it later behind auth/scope.
 mountIfExists('./routes/webhook', '/webhook')                 // GET /_ping, POST /tavus, POST /recording-ready
 mountIfExists('./routes/kb', '/kb')                           // POST /upload, POST /from-rubric
 mountIfExists('./routes/createTavusInterview', '/create-tavus-interview')
-mountIfExists('./routes/reports', '/reports')
+// mountIfExists('./routes/reports', '/reports')              // ← removed (mounted with auth below)
 mountIfExists('./routes/candidates', '/candidates')           // intake + OTP verify
 mountIfExists('./routes/retryInterview', '/interviews')
 
@@ -193,13 +193,12 @@ app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
       .single()
     if (error) return res.status(500).json({ error: 'Failed to create invite' })
 
-    const acceptUrl = new URL('/accept-invite', FRONTEND_URL)
-    acceptUrl.searchParams.set('token', token)
+    const acceptUrl = `${FRONTEND_URL}/accept-invite?token=${encodeURIComponent(token)}`
 
     res.json({
       ok: true,
       invite_id: data.id,
-      accept_url: acceptUrl.toString()
+      accept_url: acceptUrl
     })
   } catch (e) {
     res.status(500).json({ error: 'Server error' })
@@ -242,11 +241,13 @@ app.post('/clients/accept-invite', requireAuth, async (req, res) => {
   }
 })
 
-// ---------- Signed URLs for private storage (mounted with auth/scope) ----------
+// ---------- PROTECTED: Signed URLs + Reports (tenant-scoped) ----------
+// /files (e.g., GET /files/signed-url?interview_id=...&kind=transcript|analysis)
+// /reports (e.g., GET/POST /reports/:interview_id/generate)
 app.use(
   requireAuth,
   withClientScope,
-  // Normalize to the shape expected by routes/files (req.client_memberships: string[])
+  // normalize memberships to the shape expected by downstream routes
   (req, _res, next) => {
     if (!req.client_memberships) {
       const ids = Array.isArray(req.memberships)
@@ -257,6 +258,21 @@ app.use(
     next()
   },
   require('./routes/files')
+)
+app.use(
+  '/reports',
+  requireAuth,
+  withClientScope,
+  (req, _res, next) => {
+    if (!req.client_memberships) {
+      const ids = Array.isArray(req.memberships)
+        ? req.memberships.map(m => m.client_id)
+        : (req.clientIds || [])
+      req.client_memberships = ids
+    }
+    next()
+  },
+  require('./routes/reports')
 )
 
 // ---------- Health ----------
