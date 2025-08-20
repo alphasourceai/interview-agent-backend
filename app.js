@@ -138,12 +138,14 @@ app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) 
     const finalIds = wantedClientId ? filterIds.filter(id => id === wantedClientId) : filterIds
     if (finalIds.length === 0) return res.json({ items: [] })
 
+    // 1) Load interviews + candidate + role
     const select = `
       id, created_at, candidate_id, role_id, client_id,
       video_url, transcript_url, analysis_url,
-      roles:roles(id, title, client_id)
+      roles:roles(id, title, client_id),
+      candidates:candidates(id, name, email)
     `
-    const { data, error } = await supabaseAdmin
+    const { data: interviews, error } = await supabaseAdmin
       .from('interviews')
       .select(select)
       .in('client_id', finalIds)
@@ -151,26 +153,116 @@ app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) 
 
     if (error) return res.status(500).json({ error: 'Failed to load interviews' })
 
-    const items = (data || []).map(r => ({
-      id: r.id,
-      created_at: r.created_at,
-      candidate_id: r.candidate_id || null,
-      role_id: r.role_id || null,
-      client_id: r.client_id || null,
-      role: r.roles ? { id: r.roles.id, title: r.roles.title, client_id: r.roles.client_id } : null,
-      video_url: r.video_url || null,
-      transcript_url: r.transcript_url || null,
-      analysis_url: r.analysis_url || null,
-      has_video: !!r.video_url,
-      has_transcript: !!r.transcript_url,
-      has_analysis: !!r.analysis_url
-    }))
+    // 2) Collect candidate_ids to fetch reports
+    const candidateIds = Array.from(
+      new Set(
+        (interviews || [])
+          .map(r => (r.candidates?.id ?? r.candidate_id))
+          .filter(Boolean)
+      )
+    )
+
+    // 3) Fetch reports for these candidates (newest first)
+    let reportsByCandidate = {}
+    if (candidateIds.length) {
+      const { data: reports, error: repErr } = await supabaseAdmin
+        .from('reports')
+        .select(`
+          id, candidate_id, role_id,
+          resume_score, interview_score, overall_score,
+          resume_breakdown, interview_breakdown,
+          report_url, created_at
+        `)
+        .in('candidate_id', candidateIds)
+        .order('created_at', { ascending: false })
+
+      if (!repErr && reports) {
+        for (const rep of reports) {
+          if (!reportsByCandidate[rep.candidate_id]) reportsByCandidate[rep.candidate_id] = []
+          reportsByCandidate[rep.candidate_id].push(rep)
+        }
+      }
+    }
+
+    // helpers
+    const numOrNull = (v) => (typeof v === 'number' && isFinite(v)) ? v : (v === 0 ? 0 : null)
+
+    // 4) Shape the response
+    const items = (interviews || []).map(r => {
+      const candId = r.candidates?.id ?? r.candidate_id ?? null
+      const roleId = r.role_id ?? null
+      const cr = candId ? (reportsByCandidate[candId] || []) : []
+
+      // Prefer a report for the same role; otherwise the newest
+      const rep = cr.find(x => roleId && x.role_id === roleId) || cr[0] || null
+
+      // High-level scores
+      const resume_score     = rep?.resume_score ?? null
+      const interview_score  = rep?.interview_score ?? null
+      const overall_score    = rep?.overall_score ?? null
+
+      // Resume breakdown (map to Experience / Skills / Education)
+      const rb = rep?.resume_breakdown || {}
+      const resume_analysis = {
+        // tolerate different key names if templates change
+        experience:   numOrNull(rb.experience_match_percent ?? rb.experience),
+        skills:       numOrNull(rb.skills_match_percent ?? rb.skills),
+        education:    numOrNull(rb.education_match_percent ?? rb.education),
+        summary:      typeof rb.summary === 'string' ? rb.summary : ''
+      }
+
+      // Interview breakdown (Clarity / Confidence / Body language)
+      const ib = rep?.interview_breakdown || {}
+      const interview_analysis = {
+        clarity:       numOrNull(ib.clarity),
+        confidence:    numOrNull(ib.confidence),
+        body_language: numOrNull(ib.body_language)
+      }
+
+      return {
+        id: r.id,
+        created_at: r.created_at,
+        client_id: r.client_id || null,
+
+        // Candidate columns for the main table
+        candidate: r.candidates
+          ? { id: r.candidates.id, name: r.candidates.name || '', email: r.candidates.email || '' }
+          : { id: r.candidate_id || null, name: '', email: '' },
+
+        // Role for display
+        role: r.roles ? { id: r.roles.id, title: r.roles.title, client_id: r.roles.client_id } : null,
+
+        // Links for expanded row
+        video_url: r.video_url || null,
+        transcript_url: r.transcript_url || null,
+        analysis_url: r.analysis_url || null,
+
+        has_video: !!r.video_url,
+        has_transcript: !!r.transcript_url,
+        has_analysis: !!r.analysis_url,
+
+        // High-level scores (for main table columns)
+        resume_score,
+        interview_score,
+        overall_score,
+
+        // Breakdown (for expanded view)
+        resume_analysis,
+        interview_analysis,
+
+        // Optional: latest report info (handy if you add a "View last PDF" link)
+        latest_report_url: rep?.report_url ?? null,
+        report_generated_at: rep?.created_at ?? null
+      }
+    })
 
     res.json({ items })
   } catch (e) {
     res.status(500).json({ error: 'Server error' })
   }
 })
+
+
 
 // ---------- Invite teammates (owner/admin) ----------
 app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
