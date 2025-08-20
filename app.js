@@ -359,13 +359,14 @@ app.use(
     if (!req.client_memberships) {
       const ids = Array.isArray(req.memberships)
         ? req.memberships.map(m => m.client_id)
-        : (req.clientIds || [])
-      req.client_memberships = ids
+        : (req.clientIds || []);
+      req.client_memberships = ids;
     }
-    next()
+    next();
   },
   require('./routes/reports')
-)
+);
+
 
 // ---------- Health ----------
 app.get('/health', (req, res) => res.json({ ok: true }))
