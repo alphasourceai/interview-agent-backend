@@ -3,9 +3,7 @@ const express = require('express');
 const router = express.Router();
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 
-// --- Helpers ---------------------------------------------------------------
-
-// Parse "<bucket>/<path>" or Supabase object URL => { bucket, path }
+// ---------- helpers ----------
 function parseBucketPathFromUrl(input) {
   if (!input) return null;
   try {
@@ -38,7 +36,6 @@ async function getInterview(interviewId) {
 }
 
 function ensureAccess(req, clientId) {
-  // Accept either req.client_memberships (ids) or req.memberships [{client_id}]
   const ids =
     Array.isArray(req.client_memberships) && req.client_memberships.length
       ? req.client_memberships
@@ -46,13 +43,11 @@ function ensureAccess(req, clientId) {
       ? req.memberships.map(m => (typeof m === 'string' ? m : m?.client_id)).filter(Boolean)
       : (req.clientIds || []);
   if (!ids.includes(clientId)) {
-    const e = new Error('Forbidden');
-    e.status = 403;
-    throw e;
+    const e = new Error('Forbidden'); e.status = 403; throw e;
   }
 }
 
-// Build payload for PDFMonkey (tolerates missing transcript/analysis)
+// Build PDF payload (tolerates missing transcript/analysis)
 async function buildPayload(interview) {
   const transcript = interview.transcript_url ? await downloadJsonFromStorage(interview.transcript_url) : null;
   const analysis   = interview.analysis_url   ? await downloadJsonFromStorage(interview.analysis_url)   : null;
@@ -63,12 +58,12 @@ async function buildPayload(interview) {
     candidate_id: interview.candidate_id || null,
     role_id: interview.role_id || null,
 
-    // High-level scores (fill real values later if you like)
+    // High-level scores (fill real values later if desired)
     resume_score: 0,
     interview_score: 0,
     overall_score: 0,
 
-    // Breakdowns (keys aligned with your template)
+    // Breakdowns keyed like your template
     resume_breakdown: {
       summary: transcript?.summary || '',
       experience_match_percent: transcript?.experience_match_percent ?? null,
@@ -83,35 +78,39 @@ async function buildPayload(interview) {
   };
 }
 
-// Minimal PDFMonkey client (Node 18+ global fetch)
+// ---------- PDFMonkey client ----------
 const PDF_API = 'https://api.pdfmonkey.io/api/v1';
-async function pdfmonkeyCreateAndWait(payload) {
+
+async function pdfmonkeyCreateAndWait(payload, filename = 'Candidate_Report.pdf') {
   const apiKey = process.env.PDFMONKEY_API_KEY;
   const templateId = process.env.PDFMONKEY_TEMPLATE_ID;
   if (!apiKey) { const e = new Error('PDFMonkey: missing PDFMONKEY_API_KEY'); e.status = 500; throw e; }
   if (!templateId) { const e = new Error('PDFMonkey: missing PDFMONKEY_TEMPLATE_ID'); e.status = 500; throw e; }
 
-  // 1) Create document
+  // 1) Create document (correct field is document_template_id; status should be pending)
+  const createBody = {
+    document: {
+      document_template_id: templateId, // <- required by PDFMonkey
+      status: 'pending',                // <- queue generation immediately
+      payload,
+      meta: { _filename: filename }
+    }
+  };
+
   const res = await fetch(`${PDF_API}/documents`, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${apiKey}`,
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({
-      document: {
-        template_id: templateId,
-        payload,
-        status: 'processed' // ask to render immediately
-      }
-    })
+    body: JSON.stringify(createBody)
   });
 
   if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    const e = new Error(`PDFMonkey create failed (${res.status}) ${t}`);
-    e.status = 502;
-    throw e;
+    const txt = await res.text().catch(() => '');
+    const err = new Error(`PDFMonkey create failed (${res.status}) ${txt}`);
+    err.status = 502;
+    throw err;
   }
 
   const created = await res.json();
@@ -119,30 +118,31 @@ async function pdfmonkeyCreateAndWait(payload) {
   let id = doc?.id;
   let url = doc?.download_url || created?.download_url || created?.url;
 
-  // 2) Poll up to ~10s if URL not ready yet
-  for (let i = 0; !url && i < 10; i++) {
+  // 2) Poll documents/:id until we get a download_url or see failure (max ~20s)
+  for (let i = 0; !url && i < 20; i++) {
     await new Promise(r => setTimeout(r, 1000));
-    const s = await fetch(`${PDF_API}/documents/${id}`, {
+    const show = await fetch(`${PDF_API}/documents/${id}`, {
       headers: { 'Authorization': `Bearer ${apiKey}` }
     });
-    if (!s.ok) continue;
-    const j = await s.json();
+    if (!show.ok) continue;
+    const j = await show.json();
     const d = j.document || j;
-    if (d.status === 'processed' && (d.download_url || d.url)) {
+    if ((d.status === 'success' || d.status === 'processed') && (d.download_url || d.url)) {
       url = d.download_url || d.url;
       break;
     }
-    if (d.status === 'failed') {
-      const e = new Error('PDFMonkey rendering failed');
-      e.status = 502;
-      throw e;
+    if (d.status === 'failure' || d.status === 'failed') {
+      const t = d.failure_cause ? `: ${d.failure_cause}` : '';
+      const err = new Error('PDFMonkey rendering failed' + t);
+      err.status = 502;
+      throw err;
     }
   }
 
   if (!url) {
-    const e = new Error('PDFMonkey did not return a download URL');
-    e.status = 502;
-    throw e;
+    const err = new Error('PDFMonkey did not return a download URL');
+    err.status = 502;
+    throw err;
   }
   return url;
 }
@@ -153,9 +153,10 @@ async function generateForInterview(interviewId, req) {
   ensureAccess(req, interview.client_id);
 
   const payload = await buildPayload(interview);
-  const url = await pdfmonkeyCreateAndWait(payload);
+  const filename = `Candidate_Report_${interviewId}.pdf`;
+  const url = await pdfmonkeyCreateAndWait(payload, filename);
 
-  // Best-effort: upsert report URL by interview (optional schema)
+  // Best-effort: upsert last URL by interview (optional)
   try {
     await supabaseAdmin
       .from('reports')
@@ -168,9 +169,7 @@ async function generateForInterview(interviewId, req) {
   return { url, interview };
 }
 
-// --- Routes ----------------------------------------------------------------
-
-// JSON: returns { ok, url } (hosted PDFMonkey URL)
+// ---------- routes ----------
 async function handlerGenerate(req, res) {
   try {
     if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
@@ -182,7 +181,6 @@ async function handlerGenerate(req, res) {
   }
 }
 
-// Download: streams the PDF so the browser saves it directly
 async function handlerDownload(req, res) {
   try {
     if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
