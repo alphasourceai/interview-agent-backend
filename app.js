@@ -16,7 +16,8 @@ const envOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean)
-const ALLOWLIST = Array.from(new Set([...DEFAULT_ORIGINS, ...envOrigins]))
+// CHANGE #1: ensure FRONTEND_URL is always allowed
+const ALLOWLIST = Array.from(new Set([...DEFAULT_ORIGINS, ...envOrigins, FRONTEND_URL]))
 
 const corsOptions = {
   origin(origin, cb) {
@@ -24,7 +25,9 @@ const corsOptions = {
     if (ALLOWLIST.includes(origin)) return cb(null, true)
     return cb(new Error('Not allowed by CORS'))
   },
-  credentials: true
+  credentials: true,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }
 
 // ---------- App basics ----------
@@ -32,6 +35,8 @@ app.set('trust proxy', 1)
 app.use(cors(corsOptions))
 app.use(express.json({ limit: '10mb' }))
 app.use(express.urlencoded({ extended: true, limit: '10mb' }))
+
+// CHANGE #2 is further down when mounting routes/files with auth + scope
 
 // ---------- Helper to mount optional routers without crashing ----------
 function mountIfExists(routePath, mountPoint) {
@@ -81,31 +86,41 @@ async function withClientScope(req, res, next) {
   next()
 }
 
-// ---------- Simple test endpoint ----------
+// ---------- Auth helpers ----------
 app.get('/auth/ping', requireAuth, withClientScope, (req, res) => {
-  res.json({ ok: true, userId: req.user.id, clientIds: req.clientIds })
+  res.json({ ok: true })
 })
 
-// ---------- Auth: who am I ----------
 app.get('/auth/me', requireAuth, withClientScope, (req, res) => {
-  const user = { id: req.user.id, email: req.user.email }
-  res.json({ user, memberships: req.memberships })
+  res.json({
+    user: { id: req.user.id, email: req.user.email },
+    memberships: req.memberships
+  })
 })
 
-// List my clients (name + role) for dropdowns
+// ---------- Clients: list my clients with names ----------
 app.get('/clients/my', requireAuth, async (req, res) => {
   try {
-    const { data, error } = await supabaseAdmin
+    const { data: mems, error: memErr } = await supabaseAdmin
       .from('client_members')
-      .select('client_id, role, clients!inner(name)')
+      .select('client_id, role')
       .eq('user_id', req.user.id)
-      .order('clients(name)')
-    if (error) return res.status(500).json({ error: 'Failed to load clients' })
+    if (memErr) return res.status(500).json({ error: 'Failed to load memberships' })
 
-    const items = (data || []).map(r => ({
-      client_id: r.client_id,
-      role: r.role,
-      name: r.clients?.name || r.client_id
+    const clientIds = (mems || []).map(m => m.client_id)
+    if (clientIds.length === 0) return res.json({ items: [] })
+
+    const { data: clients, error: cliErr } = await supabaseAdmin
+      .from('clients')
+      .select('id, name')
+      .in('id', clientIds)
+    if (cliErr) return res.status(500).json({ error: 'Failed to load clients' })
+
+    const nameById = Object.fromEntries((clients || []).map(c => [c.id, c.name]))
+    const items = (mems || []).map(m => ({
+      client_id: m.client_id,
+      name: nameById[m.client_id] || m.client_id,
+      role: m.role
     }))
     res.json({ items })
   } catch (e) {
@@ -116,17 +131,22 @@ app.get('/clients/my', requireAuth, async (req, res) => {
 // ---------- Dashboard: scoped interviews ----------
 app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) => {
   try {
-    const requested = (req.query.client_id || '').trim()
-    const filterIds = requested && req.clientIds.includes(requested) ? [requested] : req.clientIds
-    if (!filterIds || filterIds.length === 0) return res.json({ items: [] })
+    const filterIds = req.clientIds || []
+    if (filterIds.length === 0) return res.json({ items: [] })
 
-    const select =
-      'id, candidate_id, role_id, created_at, video_url, transcript_url, analysis_url, client_id, roles:role_id ( id, title, client_id )'
+    const wantedClientId = req.query.client_id
+    const finalIds = wantedClientId ? filterIds.filter(id => id === wantedClientId) : filterIds
+    if (finalIds.length === 0) return res.json({ items: [] })
 
+    const select = `
+      id, created_at, candidate_id, role_id, client_id,
+      video_url, transcript_url, analysis_url,
+      roles:roles(id, title, client_id)
+    `
     const { data, error } = await supabaseAdmin
       .from('interviews')
       .select(select)
-      .in('client_id', filterIds)
+      .in('client_id', finalIds)
       .order('created_at', { ascending: false })
 
     if (error) return res.status(500).json({ error: 'Failed to load interviews' })
@@ -155,53 +175,53 @@ app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) 
 // ---------- Invite teammates (owner/admin) ----------
 app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
   try {
-    const { email, role = 'member', client_id } = req.body || {}
-    if (!email || !client_id) return res.status(400).json({ error: 'email and client_id are required' })
+    const { email, role, client_id } = req.body || {}
+    if (!email || !role || !client_id) {
+      return res.status(400).json({ error: 'email, role, client_id are required' })
+    }
 
-    const membership = (req.memberships || []).find(m => m.client_id === client_id)
-    if (!membership || !['owner', 'admin'].includes(membership.role)) {
-      return res.status(403).json({ error: 'not allowed' })
+    const me = req.memberships.find(m => m.client_id === client_id)
+    if (!me || !['owner', 'admin'].includes(me.role)) {
+      return res.status(403).json({ error: 'Not allowed' })
     }
 
     const token = crypto.randomBytes(24).toString('hex')
-    const expiresAt = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString()
+    const { data, error } = await supabaseAdmin
+      .from('client_invites')
+      .insert({ client_id, email, role, token })
+      .select('id')
+      .single()
+    if (error) return res.status(500).json({ error: 'Failed to create invite' })
 
-    const { error: insertError } = await supabaseAdmin.from('client_invites').insert({
-      client_id,
-      email,
-      role,
-      token,
-      expires_at: expiresAt
+    const acceptUrl = new URL('/accept-invite', FRONTEND_URL)
+    acceptUrl.searchParams.set('token', token)
+
+    res.json({
+      ok: true,
+      invite_id: data.id,
+      accept_url: acceptUrl.toString()
     })
-    if (insertError) return res.status(500).json({ error: 'failed to create invite' })
-
-    const acceptUrl = `${FRONTEND_URL}/accept-invite?token=${encodeURIComponent(token)}`
-    res.json({ ok: true, accept_url: acceptUrl })
   } catch (e) {
     res.status(500).json({ error: 'Server error' })
   }
 })
 
-// ---------- Accept invite (logged-in invitee) ----------
+// ---------- Accept invite (logged-in user) ----------
 app.post('/clients/accept-invite', requireAuth, async (req, res) => {
   try {
     const { token } = req.body || {}
-    if (!token) return res.status(400).json({ error: 'token required' })
+    if (!token) return res.status(400).json({ error: 'token is required' })
 
-    const { data: invites, error } = await supabaseAdmin
+    const { data: invite, error } = await supabaseAdmin
       .from('client_invites')
-      .select('id, client_id, email, role, expires_at, accepted_at')
+      .select('*')
       .eq('token', token)
-      .limit(1)
+      .is('accepted_at', null)
+      .single()
 
-    if (error || !invites || invites.length === 0) return res.status(400).json({ error: 'invalid token' })
-
-    const invite = invites[0]
-    if (invite.accepted_at) return res.status(400).json({ error: 'invite already accepted' })
-    if (new Date(invite.expires_at) < new Date()) return res.status(400).json({ error: 'invite expired' })
+    if (error || !invite) return res.status(400).json({ error: 'Invalid or expired invite' })
 
     const userId = req.user.id
-
     const { error: upsertError } = await supabaseAdmin
       .from('client_members')
       .upsert(
@@ -216,15 +236,36 @@ app.post('/clients/accept-invite', requireAuth, async (req, res) => {
       .eq('id', invite.id)
     if (markAccepted) return res.status(500).json({ error: 'failed to mark accepted' })
 
-    res.json({ ok: true, client_id: invite.client_id, role: invite.role })
+    res.json({ ok: true })
   } catch (e) {
     res.status(500).json({ error: 'Server error' })
   }
 })
 
-// ---------- Health & root ----------
+// ---------- Signed URLs for private storage (mounted with auth/scope) ----------
+app.use(
+  requireAuth,
+  withClientScope,
+  // Normalize to the shape expected by routes/files (req.client_memberships: string[])
+  (req, _res, next) => {
+    if (!req.client_memberships) {
+      const ids = Array.isArray(req.memberships)
+        ? req.memberships.map(m => m.client_id)
+        : (req.clientIds || [])
+      req.client_memberships = ids
+    }
+    next()
+  },
+  require('./routes/files')
+)
+
+// ---------- Health ----------
 app.get('/health', (req, res) => res.json({ ok: true }))
-app.get('/', (req, res) => res.send('ok'))
+
+// ---------- Root ----------
+app.get('/', (req, res) => {
+  res.json({ ok: true, message: 'Interview Agent Backend' })
+})
 
 // ---------- Error handler ----------
 app.use(function (err, req, res, next) {
