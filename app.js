@@ -1,10 +1,14 @@
 require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
-const crypto = require('crypto')
 const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
 
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
+// Routers
+const rolesRouter = require('./routes/roles')
+const clientsRouter = require('./routes/clients') // sendgrid-enabled clients routes
+// Optional routers (mounted if present later): kb, webhook, tavus
+
+const FRONTEND_URL = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/+$/, '')
 const app = express()
 
 // ---------- CORS ----------
@@ -16,12 +20,7 @@ const envOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean)
-
-const ALLOWLIST = Array.from(new Set([
-  ...DEFAULT_ORIGINS,
-  FRONTEND_URL.replace(/\/+$/, ''),
-  ...envOrigins
-].filter(Boolean)))
+const ALLOWLIST = Array.from(new Set([...DEFAULT_ORIGINS, FRONTEND_URL, ...envOrigins].filter(Boolean)))
 
 app.use(cors({
   origin: (origin, cb) => {
@@ -31,9 +30,11 @@ app.use(cors({
   },
   credentials: true
 }))
+
+// ---------- Parsers ----------
 app.use(express.json({ limit: '10mb' }))
 
-// ---------- small util ----------
+// ---------- helpers ----------
 function bearer(req) {
   const h = req.headers['authorization'] || req.headers['Authorization']
   if (!h) return null
@@ -50,66 +51,49 @@ async function requireAuth(req, res, next) {
     if (error || !data?.user) return res.status(401).json({ error: 'Unauthorized' })
     req.user = { id: data.user.id, email: data.user.email }
     next()
-  } catch (e) {
-    return res.status(401).json({ error: 'Unauthorized' })
+  } catch {
+    res.status(401).json({ error: 'Unauthorized' })
   }
 }
 
 async function withClientScope(req, res, next) {
   try {
     if (!req.user) return res.status(401).json({ error: 'Unauthorized' })
-
     const { data, error } = await supabaseAdmin
       .from('client_members')
       .select('client_id, role')
       .eq('user_id', req.user.id)
-
     if (error) return res.status(500).json({ error: 'Failed to load memberships' })
-
-    req.clientIds = (data || []).map(r => r.client_id)
     req.memberships = data || []
+    req.clientIds = (data || []).map(r => r.client_id)
     next()
-  } catch (e) {
-    return res.status(500).json({ error: 'Server error' })
+  } catch {
+    res.status(500).json({ error: 'Server error' })
   }
 }
 
-// ---------- Simple test endpoint ----------
+// Normalizer so downstream routers always see req.client_memberships[]
+function injectClientMemberships(req, _res, next) {
+  if (!req.client_memberships) {
+    const ids = Array.isArray(req.memberships) ? req.memberships.map(m => m.client_id) : (req.clientIds || [])
+    req.client_memberships = ids
+  }
+  next()
+}
+
+// ---------- Simple test endpoints ----------
 app.get('/auth/ping', requireAuth, withClientScope, (req, res) => {
   res.json({ ok: true, user: req.user, client_ids: req.clientIds })
 })
 
-// ---------- Auth me ----------
 app.get('/auth/me', requireAuth, withClientScope, (req, res) => {
   res.json({ user: req.user, memberships: req.memberships })
 })
 
-// ---------- Clients: my ----------
-app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
-  try {
-    const ids = req.clientIds || []
-    if (ids.length === 0) return res.json({ items: [] })
+// ---------- Clients (my, invite, accept-invite) ----------
+app.use('/clients', requireAuth, withClientScope, injectClientMemberships, clientsRouter)
 
-    const { data: clients, error } = await supabaseAdmin
-      .from('clients')
-      .select('id, name')
-      .in('id', ids)
-
-    if (error) return res.status(500).json({ error: 'Failed to load clients' })
-
-    const roleById = Object.fromEntries((req.memberships || []).map(m => [m.client_id, m.role]))
-    const items = (clients || []).map(c => ({
-      client_id: c.id,
-      name: c.name,
-      role: roleById[c.id] || 'member'
-    }))
-    res.json({ items })
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' })
-  }
-})
-
-// ---------- Dashboard: scoped interviews with scores + breakdowns ----------
+// ---------- Dashboard: client-scoped interviews with scores ----------
 app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) => {
   try {
     const filterIds = req.clientIds || []
@@ -133,59 +117,34 @@ app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) 
 
     if (error) return res.status(500).json({ error: 'Failed to load interviews' })
 
-    const candidateIds = Array.from(
-      new Set((interviews || []).map(r => (r.candidates?.id ?? r.candidate_id)).filter(Boolean))
-    )
-
-    // Fetch related reports once; newest first for each candidate
-    let reportsByCandidate = {}
-    if (candidateIds.length) {
-      const { data: reports, error: repErr } = await supabaseAdmin
+    const intIds = (interviews || []).map(r => r.id)
+    let reportsByInterview = {}
+    if (intIds.length) {
+      const { data: reps } = await supabaseAdmin
         .from('reports')
-        .select(`
-          id, candidate_id, role_id,
-          resume_score, interview_score, overall_score,
-          resume_breakdown, interview_breakdown,
-          report_url, created_at
-        `)
-        .in('candidate_id', candidateIds)
+        .select('*')
+        .in('interview_id', intIds)
         .order('created_at', { ascending: false })
-
-      if (!repErr && reports) {
-        for (const rep of reports) {
-          if (!reportsByCandidate[rep.candidate_id]) reportsByCandidate[rep.candidate_id] = []
-          reportsByCandidate[rep.candidate_id].push(rep)
-        }
+      for (const r of reps || []) {
+        if (!reportsByInterview[r.interview_id]) reportsByInterview[r.interview_id] = r
       }
     }
 
-    const numOrNull = (v) => (typeof v === 'number' && isFinite(v)) ? v : (v === 0 ? 0 : null)
+    const numOrNull = x => Number.isFinite(Number(x)) ? Number(x) : null
 
     const items = (interviews || []).map(r => {
-      const candId = r.candidates?.id ?? r.candidate_id ?? null
-      const roleId = r.role_id ?? null
-      const cr = candId ? (reportsByCandidate[candId] || []) : []
-      const rep = cr.find(x => roleId && x.role_id === roleId) || cr[0] || null
+      const rep = reportsByInterview[r.id] || null
 
-      const resume_score = rep?.resume_score ?? null
-      const interview_score = rep?.interview_score ?? null
-      const overall_score = rep?.overall_score ?? null
+      const resume_score = numOrNull(rep?.resume_score)
+      const interview_score = numOrNull(rep?.interview_score)
+      const overall_score =
+        numOrNull(rep?.overall_score) ??
+        (Number.isFinite(resume_score) && Number.isFinite(interview_score)
+          ? Math.round((resume_score + interview_score) / 2)
+          : null)
 
       const rb = rep?.resume_breakdown || {}
       const ib = rep?.interview_breakdown || {}
-
-      const resume_analysis = {
-        experience: numOrNull(rb.experience_match_percent ?? rb.experience),
-        skills:     numOrNull(rb.skills_match_percent ?? rb.skills),
-        education:  numOrNull(rb.education_match_percent ?? rb.education),
-        summary:    typeof rb.summary === 'string' ? rb.summary : ''
-      }
-
-      const interview_analysis = {
-        clarity:       numOrNull(ib.clarity),
-        confidence:    numOrNull(ib.confidence),
-        body_language: numOrNull(ib.body_language)
-      }
 
       return {
         id: r.id,
@@ -210,70 +169,30 @@ app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) 
         interview_score,
         overall_score,
 
-        resume_analysis,
-        interview_analysis,
+        resume_analysis: {
+          experience: numOrNull(rb.experience),
+          skills:     numOrNull(rb.skills),
+          education:  numOrNull(rb.education),
+          summary:    typeof rb.summary === 'string' ? rb.summary : ''
+        },
+        interview_analysis: {
+          clarity:       numOrNull(ib.clarity),
+          confidence:    numOrNull(ib.confidence),
+          body_language: numOrNull(ib.body_language)
+        },
 
-        latest_report_url: rep?.report_url ?? null,
+        report_url: rep?.report_url ?? null,
         report_generated_at: rep?.created_at ?? null
       }
     })
 
     res.json({ items })
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: 'Server error' })
   }
 })
 
-// ---------- Optional: invites endpoints (kept minimal) ----------
-app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
-  try {
-    const { email, role = 'member', client_id } = req.body || {}
-    if (!email || !client_id) return res.status(400).json({ error: 'email and client_id are required' })
-    if (!(req.clientIds || []).includes(client_id)) return res.status(403).json({ error: 'Forbidden' })
-
-    const token = crypto.randomBytes(16).toString('hex')
-    const { error } = await supabaseAdmin
-      .from('client_invites')
-      .insert({ client_id, email, role, token, invited_by: req.user.id })
-    if (error) return res.status(500).json({ error: 'Failed to create invite' })
-
-    const acceptUrlBase = (process.env.FRONTEND_URL || FRONTEND_URL).replace(/\/+$/, '')
-    const accept_url = `${acceptUrlBase}/accept-invite?token=${encodeURIComponent(token)}`
-    res.json({ ok: true, accept_url })
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' })
-  }
-})
-
-app.post('/clients/accept-invite', requireAuth, async (req, res) => {
-  try {
-    const { token } = req.body || {}
-    if (!token) return res.status(400).json({ error: 'token is required' })
-
-    const { data: invite, error: invErr } = await supabaseAdmin
-      .from('client_invites')
-      .select('client_id, email, role')
-      .eq('token', token)
-      .single()
-
-    if (invErr || !invite) return res.status(400).json({ error: 'Invalid invite' })
-
-    if (invite.email && invite.email !== req.user.email) {
-      return res.status(400).json({ error: 'Invite email does not match your account' })
-    }
-
-    const { error } = await supabaseAdmin
-      .from('client_members')
-      .upsert({ client_id: invite.client_id, user_id: req.user.id, role: invite.role }, { onConflict: 'client_id,user_id' })
-    if (error) return res.status(500).json({ error: 'Failed to join client' })
-
-    res.json({ ok: true })
-  } catch (e) {
-    res.status(500).json({ error: 'Server error' })
-  }
-})
-
-// ---------- Mount legacy/optional feature routes if present ----------
+// ---------- Optional mounts if present ----------
 function mountIfExists(relPath, urlPath) {
   try {
     const mod = require(relPath)
@@ -289,13 +208,7 @@ app.use(
   '/files',
   requireAuth,
   withClientScope,
-  (req, _res, next) => {
-    if (!req.client_memberships) {
-      const ids = Array.isArray(req.memberships) ? req.memberships.map(m => m.client_id) : (req.clientIds || [])
-      req.client_memberships = ids
-    }
-    next()
-  },
+  injectClientMemberships,
   require('./routes/files')
 )
 
@@ -303,24 +216,24 @@ app.use(
   '/reports',
   requireAuth,
   withClientScope,
-  (req, _res, next) => {
-    if (!req.client_memberships) {
-      const ids = Array.isArray(req.memberships) ? req.memberships.map(m => m.client_id) : (req.clientIds || [])
-      req.client_memberships = ids
-    }
-    next()
-  },
-  require('./routes/reports')
+  injectClientMemberships,
+  require('./routes/reports') // fingerprinting + cache
+)
+
+// ---------- Roles (mount same router at BOTH paths) ----------
+app.use(
+  ['/roles', '/create-role'],
+  requireAuth,
+  withClientScope,
+  injectClientMemberships,
+  rolesRouter
 )
 
 // ---------- health ----------
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
-// ---------- 404 ----------
-app.use((_req, res) => res.status(404).json({ error: 'Not found' }))
-
 // ---------- Error handler ----------
-app.use(function (err, req, res, next) {
+app.use(function (err, _req, res, _next) {
   const status = err.status || 500
   const msg = err.message || 'Server error'
   res.status(status).json({ error: msg })

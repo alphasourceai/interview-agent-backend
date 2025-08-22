@@ -1,177 +1,149 @@
 // routes/webhook.js
-'use strict';
+const express = require('express')
+const router = express.Router()
+const { createClient } = require('@supabase/supabase-js')
 
-const express = require('express');
-const { supabase } = require('../src/lib/supabaseClient');
+const SUPABASE_URL = process.env.SUPABASE_URL
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY')
+}
+const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
 
-const webhookRouter = express.Router();
+const TRANSCRIPTS_BUCKET = process.env.SUPABASE_TRANSCRIPTS_BUCKET || 'transcripts'
+const ANALYSIS_BUCKET    = process.env.SUPABASE_ANALYSIS_BUCKET    || 'analysis'
 
-/** Quick ping so we can verify this router is mounted */
-webhookRouter.get('/_ping', (req, res) => {
-  res.json({ ok: true, router: 'webhook', ts: Date.now() });
-});
-
-/** Optional shared secret check */
-function checkSecret(req, res) {
-  const expected = (process.env.TAVUS_WEBHOOK_SECRET || '').trim();
-  if (!expected) return true; // no secret set, allow
-  const got = String(req.headers['x-webhook-secret'] || '').trim();
-  if (got && got === expected) return true;
-  res.status(401).json({ error: 'invalid or missing x-webhook-secret' });
-  return false;
+// --- utilities ---
+function pickFirst(...vals) {
+  for (const v of vals) if (v !== undefined && v !== null) return v
+  return undefined
 }
 
-/**
- * POST /webhook/tavus
- * Tavus conversation callbacks. See docs for payload shapes:
- * - application.transcription_ready → transcript in properties.transcript
- * - application.perception_analysis → analysis summary in properties.analysis
- * - application.recording_ready     → video url in properties.video_url / body.video_url
- * - system.replica_joined / system.shutdown
- * Docs: https://docs.tavus.io/sections/webhooks-and-callbacks
- */
-webhookRouter.post('/tavus', async (req, res) => {
-  try {
-    if (!checkSecret(req, res)) return;
-
-    const body = req.body || {};
-    const { event_type, conversation_id, properties = {} } = body;
-
-    if (!conversation_id || !event_type) {
-      return res.status(400).json({ error: 'conversation_id and event_type required' });
-    }
-
-    // Find the interview by Tavus conversation id
-    const { data: interview, error: findErr } = await supabase
-      .from('interviews')
-      .select('id, status, video_url')
-      .eq('tavus_application_id', conversation_id)
-      .maybeSingle();
-    if (findErr) return res.status(500).json({ error: findErr.message });
-    if (!interview) return res.status(404).json({ error: 'interview not found for conversation_id' });
-
-    // --- System events ---
-    if (event_type === 'system.replica_joined') {
-      await supabase.from('interviews').update({ status: 'In Progress' }).eq('id', interview.id);
-      return res.json({ ok: true });
-    }
-    if (event_type === 'system.shutdown') {
-      await supabase.from('interviews').update({ status: 'Ended' }).eq('id', interview.id);
-      return res.json({ ok: true });
-    }
-
-    // --- Recording ready ---
-    if (event_type === 'application.recording_ready') {
-      const videoUrl = properties?.video_url || body.video_url || properties?.s3_key || null;
-      const patch = { status: 'Video Ready' };
-      if (videoUrl) patch.video_url = videoUrl;
-      const { error: updErr } = await supabase.from('interviews').update(patch).eq('id', interview.id);
-      if (updErr) return res.status(500).json({ error: updErr.message });
-      return res.json({ ok: true });
-    }
-
-    // --- Transcription ready ---
-    if (event_type === 'application.transcription_ready') {
-      // Tavus sends transcript as an array of { role, content } messages. :contentReference[oaicite:1]{index=1}
-      const transcript = properties?.transcript;
-      if (!Array.isArray(transcript)) {
-        // Fallback: if Tavus starts sending a URL instead
-        const tUrl = properties?.transcript_url || null;
-        if (tUrl) {
-          const { error: updErr } = await supabase
-            .from('interviews')
-            .update({ status: 'Transcribed', transcript_url: tUrl })
-            .eq('id', interview.id);
-          if (updErr) return res.status(500).json({ error: updErr.message });
-          return res.json({ ok: true, note: 'stored transcript_url' });
-        }
-        return res.status(400).json({ error: 'transcript missing in properties' });
-      }
-
-      const bucket = process.env.SUPABASE_TRANSCRIPTS_BUCKET || 'transcripts';
-      const path = `${conversation_id}.json`;
-      const content = JSON.stringify({ conversation_id, transcript }, null, 2);
-
-      const upload = await supabase.storage.from(bucket).upload(path, content, {
-        contentType: 'application/json',
-        upsert: true,
-      });
-      if (upload.error) return res.status(500).json({ error: upload.error.message });
-
-      const { data: pub } = supabase.storage.from(bucket).getPublicUrl(path);
-      const transcript_url = pub?.publicUrl || null;
-
-      const { error: updErr } = await supabase
-        .from('interviews')
-        .update({ status: 'Transcribed', transcript_url })
-        .eq('id', interview.id);
-      if (updErr) return res.status(500).json({ error: updErr.message });
-
-      return res.json({ ok: true, transcript_url });
-    }
-
-    // --- Perception analysis ready ---
-    if (event_type === 'application.perception_analysis') {
-      // Docs: analysis summary arrives post-call when perception is enabled. :contentReference[oaicite:2]{index=2}
-      const analysis = properties?.analysis ?? properties ?? {};
-      const bucket = process.env.SUPABASE_ANALYSIS_BUCKET || 'analysis';
-      const path = `${conversation_id}.json`;
-      const content = JSON.stringify({ conversation_id, analysis }, null, 2);
-
-      const upload = await supabase.storage.from(bucket).upload(path, content, {
-        contentType: 'application/json',
-        upsert: true,
-      });
-      if (upload.error) return res.status(500).json({ error: upload.error.message });
-
-      const { data: pub } = supabase.storage.from(bucket).getPublicUrl(path);
-      const analysis_url = pub?.publicUrl || null;
-
-      const { error: updErr } = await supabase
-        .from('interviews')
-        .update({ status: 'Analyzed', analysis_url })
-        .eq('id', interview.id);
-      if (updErr) return res.status(500).json({ error: updErr.message });
-
-      return res.json({ ok: true, analysis_url });
-    }
-
-    // Unknown event -> acknowledge to avoid retries
-    return res.json({ ok: true, note: 'ignored event_type', event_type });
-  } catch (e) {
-    return res.status(500).json({ error: e.message || String(e) });
+function fromAny(obj, ...paths) {
+  for (const p of paths) {
+    try {
+      const parts = p.split('.')
+      let cur = obj
+      for (const key of parts) cur = cur?.[key]
+      if (cur !== undefined) return cur
+    } catch {}
   }
-});
+  return undefined
+}
 
-/**
- * POST /webhook/recording-ready
- * Manual test helper: { conversation_id, video_url }
- */
-webhookRouter.post('/recording-ready', async (req, res) => {
-  try {
-    if (!checkSecret(req, res)) return;
+async function getInterviewByAnyId(anyId) {
+  if (!anyId) return null
+  // Try by id
+  let { data, error } = await supabaseAdmin.from('interviews').select('*').eq('id', anyId).maybeSingle()
+  if (data) return data
+  // Try by conversation_id
+  ;({ data, error } = await supabaseAdmin.from('interviews').select('*').eq('conversation_id', anyId).maybeSingle())
+  if (data) return data
+  return null
+}
 
-    const { conversation_id, video_url } = req.body || {};
-    if (!conversation_id) return res.status(400).json({ error: 'conversation_id required' });
-
-    const { data: interview, error: findErr } = await supabase
-      .from('interviews')
-      .select('id')
-      .eq('tavus_application_id', conversation_id)
-      .maybeSingle();
-    if (findErr) return res.status(500).json({ error: findErr.message });
-    if (!interview) return res.status(404).json({ error: 'interview not found' });
-
-    const { error: updErr } = await supabase
-      .from('interviews')
-      .update({ status: 'Video Ready', video_url: video_url || null })
-      .eq('id', interview.id);
-    if (updErr) return res.status(500).json({ error: updErr.message });
-
-    return res.json({ ok: true });
-  } catch (e) {
-    return res.status(500).json({ error: e.message || String(e) });
+async function ensureBucket(name) {
+  const { data: list } = await supabaseAdmin.storage.listBuckets()
+  if (!list?.find(b => b.name === name)) {
+    try { await supabaseAdmin.storage.createBucket(name, { public: false }) } catch {}
   }
-});
+}
 
-module.exports = webhookRouter;
+async function putJsonToStorage(bucket, path, jsonOrUrl) {
+  await ensureBucket(bucket)
+  let buf
+  let contentType = 'application/json'
+  if (typeof jsonOrUrl === 'string' && /^https?:\/\//i.test(jsonOrUrl)) {
+    // fetch from remote URL
+    const r = await fetch(jsonOrUrl)
+    if (!r.ok) throw new Error(`fetch ${jsonOrUrl} failed: ${r.status}`)
+    const ct = r.headers.get('content-type') || ''
+    contentType = ct || contentType
+    const ab = await r.arrayBuffer()
+    buf = Buffer.from(ab)
+  } else if (typeof jsonOrUrl === 'string') {
+    buf = Buffer.from(jsonOrUrl, 'utf8')
+  } else {
+    buf = Buffer.from(JSON.stringify(jsonOrUrl ?? {}), 'utf8')
+  }
+  const { error } = await supabaseAdmin.storage.from(bucket).upload(path, buf, { upsert: true, contentType })
+  if (error) throw new Error(error.message)
+  return `${bucket}/${path}`
+}
+
+router.get('/_ping', (_req, res) => res.json({ ok: true }))
+
+// Primary webhook entry
+router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
+  try {
+    const body = req.body || {}
+    // Find an interview identifier from the payload
+    const anyId = pickFirst(
+      fromAny(body, 'interview_id'),
+      fromAny(body, 'interviewId'),
+      fromAny(body, 'conversation_id'),
+      fromAny(body, 'conversationId'),
+      fromAny(body, 'metadata.interview_id'),
+      fromAny(body, 'metadata.conversation_id')
+    )
+    if (!anyId) return res.status(400).json({ error: 'No interview identifier in payload' })
+
+    const interview = await getInterviewByAnyId(anyId)
+    if (!interview) return res.status(404).json({ error: 'Interview not found' })
+
+    // Determine event type loosely
+    const event = pickFirst(
+      fromAny(body, 'event'),
+      fromAny(body, 'type'),
+      fromAny(body, 'status')
+    ) || ''
+
+    // Possible blobs/links
+    const transcriptObj  = pickFirst(fromAny(body, 'transcript'), fromAny(body, 'payload.transcript'))
+    const transcriptUrl  = pickFirst(fromAny(body, 'transcript_url'), fromAny(body, 'payload.transcript_url'))
+    const analysisObj    = pickFirst(fromAny(body, 'analysis'), fromAny(body, 'payload.analysis'))
+    const analysisUrl    = pickFirst(fromAny(body, 'analysis_url'), fromAny(body, 'payload.analysis_url'))
+    const videoUrl       = pickFirst(fromAny(body, 'video_url'), fromAny(body, 'payload.video_url'), fromAny(body, 'output.video_url'))
+
+    const updates = {}
+
+    // If video URL present, persist it
+    if (videoUrl && !interview.video_url) {
+      updates.video_url = videoUrl
+    }
+
+    // If transcript present (object or url), upload privately and store bucket/path
+    if (transcriptObj || transcriptUrl) {
+      const path = `${interview.id}.json`
+      const stored = await putJsonToStorage(TRANSCRIPTS_BUCKET, path, transcriptObj || transcriptUrl)
+      updates.transcript_url = stored
+    }
+
+    // If analysis present (object or url), upload privately and store bucket/path
+    if (analysisObj || analysisUrl) {
+      const path = `${interview.id}.json`
+      const stored = await putJsonToStorage(ANALYSIS_BUCKET, path, analysisObj || analysisUrl)
+      updates.analysis_url = stored
+    }
+
+    // Optional status update heuristics
+    if (updates.analysis_url) {
+      updates.status = 'Analyzed'
+    } else if (updates.transcript_url) {
+      updates.status = 'Transcribed'
+    } else if (updates.video_url) {
+      updates.status = 'VideoReady'
+    }
+
+    if (Object.keys(updates).length) {
+      await supabaseAdmin.from('interviews').update(updates).eq('id', interview.id)
+    }
+
+    res.json({ ok: true, interview_id: interview.id, event })
+  } catch (e) {
+    console.error('[webhook] error:', e.message)
+    res.status(200).json({ ok: true }) // Be lenient to avoid provider retries storms
+  }
+})
+
+module.exports = router
