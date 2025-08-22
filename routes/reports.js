@@ -1,269 +1,206 @@
-const express = require('express');
-const router = express.Router();
-const { supabaseAdmin } = require('../src/lib/supabaseClient');
+// routes/reports.js
+const express = require('express')
+const crypto = require('crypto')
+const { createClient } = require('@supabase/supabase-js')
 
-// -------------------- helpers --------------------
+const SUPABASE_URL = process.env.SUPABASE_URL
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY')
+}
+const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
 
-function parseBucketPathFromUrl(input) {
-  if (!input) return null;
-  try {
-    if (input.startsWith('http')) {
-      const u = new URL(input);
-      const m = u.pathname.match(/\/object\/(?:public|sign)\/([^/]+)\/(.+)$/);
-      if (m) return { bucket: m[1], path: decodeURIComponent(m[2]) };
-    }
-  } catch (_) {}
-  const i = input.indexOf('/');
-  if (i === -1) return null;
-  return { bucket: input.slice(0, i), path: input.slice(i + 1) };
+const PDFMONKEY_API_KEY = process.env.PDFMONKEY_API_KEY
+const PDFMONKEY_TEMPLATE_ID = process.env.PDFMONKEY_TEMPLATE_ID
+const REPORTS_BUCKET = process.env.SUPABASE_REPORTS_BUCKET || 'reports'
+
+const router = express.Router()
+
+function requireScope(req, res, next) {
+  if (!Array.isArray(req.client_memberships)) return res.status(403).json({ error: 'No client scope' })
+  next()
+}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
+function sha256(obj){const s=typeof obj==='string'?obj:JSON.stringify(obj);return crypto.createHash('sha256').update(s).digest('hex')}
+
+async function fetchInterview(interview_id) {
+  const { data, error } = await supabaseAdmin.from('interviews').select('*').eq('id', interview_id).maybeSingle()
+  if (error) throw new Error(error.message)
+  if (!data) throw new Error('Interview not found')
+  return data
+}
+async function fetchCandidate(candidate_id) {
+  if (!candidate_id) return null
+  const { data, error } = await supabaseAdmin.from('candidates').select('*').eq('id', candidate_id).maybeSingle()
+  if (error) throw new Error(error.message)
+  return data
 }
 
-async function downloadJsonFromStorage(urlOrPath) {
-  const bp = parseBucketPathFromUrl(urlOrPath);
-  if (!bp) return null;
-  const { data, error } = await supabaseAdmin.storage.from(bp.bucket).download(bp.path);
-  if (error || !data) return null;
-  const text = await data.text();
-  try { return JSON.parse(text); } catch { return null; }
-}
-
-async function getInterview(interviewId) {
-  return supabaseAdmin
-    .from('interviews')
-    .select('id, client_id, candidate_id, role_id, created_at, video_url, transcript_url, analysis_url')
-    .eq('id', interviewId)
-    .single();
-}
-
-async function getCandidate(candidateId) {
-  if (!candidateId) return { data: null, error: null };
-  return supabaseAdmin.from('candidates')
-    .select('id, name, email')
-    .eq('id', candidateId)
-    .single();
-}
-
-async function getReportsForCandidate(candidateId) {
-  if (!candidateId) return { data: [], error: null };
-  return supabaseAdmin
-    .from('reports')
-    .select('id,candidate_id,role_id,resume_score,interview_score,overall_score,resume_breakdown,interview_breakdown,report_url,created_at')
-    .eq('candidate_id', candidateId)
-    .order('created_at', { ascending: false });
-}
-
-function ensureAccess(req, clientId) {
-  const ids = Array.isArray(req.client_memberships)
-    ? req.client_memberships
-    : Array.isArray(req.memberships)
-      ? req.memberships.map(m => (typeof m === 'string' ? m : m?.client_id)).filter(Boolean)
-      : (req.clientIds || []);
-  if (!ids.includes(clientId)) {
-    const e = new Error('Forbidden'); e.status = 403; throw e;
-  }
-}
-
-const PDF_API = 'https://api.pdfmonkey.io/api/v1';
-
-async function pdfmonkeyCreateAndWait(payload, filename = 'Candidate_Report.pdf') {
-  const apiKey = process.env.PDFMONKEY_API_KEY;
-  const templateId = process.env.PDFMONKEY_TEMPLATE_ID;
-  if (!apiKey) { const e = new Error('PDFMonkey: missing PDFMONKEY_API_KEY'); e.status = 500; throw e; }
-  if (!templateId) { const e = new Error('PDFMonkey: missing PDFMONKEY_TEMPLATE_ID'); e.status = 500; throw e; }
-
-  // correct PDFMonkey fields
-  const createRes = await fetch(`${PDF_API}/documents`, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      document: {
-        document_template_id: templateId,
-        status: 'pending',              // enqueue rendering
-        payload,
-        meta: { _filename: filename }
+// Try multiple possible columns on reports: interview_id, interview, interviewId, conversation_id
+async function fetchLatestReportForInterview(interview_id) {
+  const tryCols = ['interview_id', 'interview', 'interviewId', 'conversation_id']
+  for (const col of tryCols) {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('reports')
+        .select('*')
+        .eq(col, interview_id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+      if (error) {
+        // If it's a "column does not exist" error, try next
+        if (/column .* does not exist/i.test(error.message)) continue
+        // Other DB error -> propagate
+        throw error
       }
-    })
-  });
-
-  if (!createRes.ok) {
-    const txt = await createRes.text().catch(() => '');
-    const err = new Error(`PDFMonkey create failed (${createRes.status}) ${txt}`);
-    err.status = 502;
-    throw err;
-  }
-
-  const created = await createRes.json();
-  let doc = created.document || created;
-  let id = doc?.id;
-  let url = doc?.download_url || created?.download_url || created?.url;
-
-  // poll until ready (max ~20s)
-  for (let i = 0; !url && i < 20; i++) {
-    await new Promise(r => setTimeout(r, 1000));
-    const showRes = await fetch(`${PDF_API}/documents/${id}`, {
-      headers: { 'Authorization': `Bearer ${apiKey}` }
-    });
-    if (!showRes.ok) continue;
-    const j = await showRes.json();
-    const d = j.document || j;
-    if ((d.status === 'success' || d.status === 'processed') && (d.download_url || d.url)) {
-      url = d.download_url || d.url;
-      break;
-    }
-    if (d.status === 'failure' || d.status === 'failed') {
-      const err = new Error('PDFMonkey rendering failed');
-      err.status = 502;
-      throw err;
+      if (data) return data
+      // no row; keep trying next column name
+    } catch (e) {
+      if (/column .* does not exist/i.test(String(e.message))) continue
+      throw e
     }
   }
-
-  if (!url) {
-    const err = new Error('PDFMonkey did not return a download URL');
-    err.status = 502;
-    throw err;
-  }
-  return url;
+  // No matching column or no report found
+  return null
 }
 
-function pickBestReport(reports, targetRoleId) {
-  if (!Array.isArray(reports) || reports.length === 0) return null;
-  return reports.find(r => targetRoleId && r.role_id === targetRoleId) || reports[0];
-}
-
-function numOrNull(v) { return (typeof v === 'number' && isFinite(v)) ? v : (v === 0 ? 0 : null); }
+function coalesceScore(n){const x=Number(n);return Number.isFinite(x)?x:0}
 
 async function buildPayload(interview) {
-  const { data: candidate } = await getCandidate(interview.candidate_id);
-  const { data: reports } = await getReportsForCandidate(interview.candidate_id);
-  const matchedReport = pickBestReport(reports || [], interview.role_id);
+  const candidate = await fetchCandidate(interview.candidate_id)
+  const report = await fetchLatestReportForInterview(interview.id)
 
-  // scores from report if present; else derive from transcript/analysis
-  let resume_score = matchedReport?.resume_score ?? null;
-  let interview_score = matchedReport?.interview_score ?? null;
-  let overall_score = matchedReport?.overall_score ?? null;
+  const name = candidate?.name || interview.candidate_name || 'Unknown'
+  const email = candidate?.email || interview.candidate_email || 'unknown@example.com'
 
-  let rb = matchedReport?.resume_breakdown || {};
-  let ib = matchedReport?.interview_breakdown || {};
+  const resume_breakdown = report?.resume_breakdown || { experience:0, skills:0, education:0 }
+  const interview_breakdown = report?.interview_breakdown || { clarity:0, confidence:0, body_language:0 }
 
-  if (!matchedReport) {
-    const transcript = interview.transcript_url ? await downloadJsonFromStorage(interview.transcript_url) : null;
-    const analysis   = interview.analysis_url   ? await downloadJsonFromStorage(interview.analysis_url)   : null;
-    rb = {
-      summary: transcript?.summary || '',
-      experience_match_percent: transcript?.experience_match_percent ?? null,
-      skills_match_percent:     transcript?.skills_match_percent ?? null,
-      education_match_percent:  transcript?.education_match_percent ?? null
-    };
-    ib = {
-      clarity: analysis?.clarity ?? null,
-      confidence: analysis?.confidence ?? null,
-      body_language: analysis?.body_language ?? null
-    };
-    // naive fallback numbers
-    resume_score = numOrNull(transcript?.overall_resume_match_percent);
-    if (resume_score === null) {
-      const parts = [rb.experience_match_percent, rb.skills_match_percent, rb.education_match_percent]
-        .filter(v => typeof v === 'number');
-      resume_score = parts.length ? Math.round(parts.reduce((a,b)=>a+b,0)/parts.length) : 0;
-    }
-    const interviewParts = [ib.clarity, ib.confidence, ib.body_language].filter(v => typeof v === 'number');
-    interview_score = interviewParts.length ? Math.round(interviewParts.reduce((a,b)=>a+b,0)/interviewParts.length) : 0;
-    overall_score = Math.round(((resume_score||0) + (interview_score||0)) / 2);
-  }
+  const resume_score = coalesceScore(report?.resume_score)
+  const interview_score = coalesceScore(report?.interview_score)
+  const overall_score = coalesceScore(report?.overall_score) || Math.round((resume_score + interview_score)/2)
 
   return {
-    interview_id: interview.id,
-    created_at: interview.created_at,
-    candidate_id: interview.candidate_id || null,
-    role_id: interview.role_id || null,
-
-    name: candidate?.name || '',
-    email: candidate?.email || '',
-
-    resume_score: numOrNull(resume_score) ?? 0,
-    interview_score: numOrNull(interview_score) ?? 0,
-    overall_score: numOrNull(overall_score) ?? 0,
-
+    name, email,
+    resume_score, interview_score, overall_score,
     resume_breakdown: {
-      summary: typeof rb.summary === 'string' ? rb.summary : '',
-      experience_match_percent: numOrNull(rb.experience_match_percent),
-      skills_match_percent:     numOrNull(rb.skills_match_percent),
-      education_match_percent:  numOrNull(rb.education_match_percent)
+      experience: coalesceScore(resume_breakdown.experience),
+      skills: coalesceScore(resume_breakdown.skills),
+      education: coalesceScore(resume_breakdown.education),
     },
     interview_breakdown: {
-      clarity:       numOrNull(ib.clarity),
-      confidence:    numOrNull(ib.confidence),
-      body_language: numOrNull(ib.body_language)
-    }
-  };
-}
-
-async function generateForInterview(interviewId, req) {
-  const { data: interview, error } = await getInterview(interviewId);
-  if (error || !interview) { const e = new Error('Interview not found'); e.status = 404; throw e; }
-  ensureAccess(req, interview.client_id);
-
-  const payload = await buildPayload(interview);
-  const filename = `Candidate_Report_${interviewId}.pdf`;
-  const url = await pdfmonkeyCreateAndWait(payload, filename);
-
-  // Optional: persist last URL by interview if your schema has `interview_id`
-  try {
-    await supabaseAdmin
-      .from('reports')
-      .upsert({ interview_id: interviewId, report_url: url, created_at: new Date().toISOString() }, { onConflict: 'interview_id' });
-  } catch (_) {}
-
-  return { url, interview };
-}
-
-// -------------------- routes --------------------
-
-async function handlerGenerate(req, res) {
-  try {
-    if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
-    const interviewId = req.params.interview_id;
-    const { url } = await generateForInterview(interviewId, req);
-    return res.json({ ok: true, url });
-  } catch (e) {
-    return res.status(e.status || 500).json({ error: e.message || 'Server error' });
+      clarity: coalesceScore(interview_breakdown.clarity),
+      confidence: coalesceScore(interview_breakdown.confidence),
+      body_language: coalesceScore(interview_breakdown.body_language),
+    },
+    video_url: interview.video_url || null,
+    transcript_url: null,
+    analysis_url: null,
   }
 }
 
-async function handlerDownload(req, res) {
-  try {
-    if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
-    const interviewId = req.params.interview_id;
-    const { url } = await generateForInterview(interviewId, req);
-
-    const r = await fetch(url);
-    if (!r.ok) {
-      const t = await r.text().catch(() => '');
-      const err = new Error(`Fetch PDF failed (${r.status}) ${t}`);
-      err.status = 502;
-      throw err;
-    }
-
-    const filename = `Candidate_Report_${interviewId}.pdf`;
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-
-    if (r.body?.pipe) {
-      r.body.pipe(res);
-    } else {
-      const buf = Buffer.from(await r.arrayBuffer());
-      res.end(buf);
-    }
-  } catch (e) {
-    res.status(e.status || 500).json({ error: e.message || 'Server error' });
-  }
+// Storage helpers
+async function ensureBucketExists(bucket){
+  const { data:list } = await supabaseAdmin.storage.listBuckets()
+  if (!list?.find(b=>b.name===bucket)) { try{ await supabaseAdmin.storage.createBucket(bucket, { public:false }) }catch{} }
+}
+async function signedUrlIfExists(bucket,path,expires=300){
+  const { data, error } = await supabaseAdmin.storage.from(bucket).createSignedUrl(path, expires)
+  if (error) return null
+  return data?.signedUrl || null
+}
+async function uploadPdf(bucket,path,buffer){
+  await ensureBucketExists(bucket)
+  const { error } = await supabaseAdmin.storage.from(bucket).upload(path, buffer, { contentType:'application/pdf', upsert:true })
+  if (error) throw new Error(error.message)
 }
 
-router.get('/:interview_id/generate', handlerGenerate);
-router.post('/:interview_id/generate', handlerGenerate);
-router.get('/:interview_id/download', handlerDownload);
+// PDFMonkey
+async function pdfmonkeyCreateAndWait(payload, filename){
+  if (!PDFMONKEY_API_KEY || !PDFMONKEY_TEMPLATE_ID) throw new Error('PDFMonkey not configured')
+  const base='https://api.pdfmonkey.io/api/v1'
+  const headers={ Authorization:`Bearer ${PDFMONKEY_API_KEY}`, 'Content-Type':'application/json' }
+  const body=JSON.stringify({ document:{ document_template_id:PDFMONKEY_TEMPLATE_ID, status:'pending', payload, meta:{ filename } } })
+  const createRes=await fetch(`${base}/documents`,{ method:'POST', headers, body })
+  if (!createRes.ok){ const t=await createRes.text(); throw new Error(`PDF create failed: ${createRes.status} ${t}`) }
+  const created=await createRes.json(); const id=created?.data?.id; if (!id) throw new Error('No document id')
 
-module.exports = router;
+  for (let i=0;i<30;i++){
+    const showRes=await fetch(`${base}/documents/${id}`,{ headers })
+    const doc=await showRes.json()
+    const status=doc?.data?.attributes?.status
+    const url=doc?.data?.attributes?.download_url
+    if (status==='success' && url) return url
+    if (status==='failure' || status==='error') throw new Error('PDFMonkey document failed')
+    await sleep(1000)
+  }
+  throw new Error('PDF generation timed out')
+}
+
+async function generateOrGetCached(interview_id){
+  const interview = await fetchInterview(interview_id)
+  const payload = await buildPayload(interview)
+  const fp = sha256(payload)
+  const path = `${fp}.pdf`
+
+  const cached = await signedUrlIfExists(REPORTS_BUCKET, path, 300)
+  if (cached) return { url: cached, fingerprint: fp, cached: true }
+
+  const filename = `report-${interview_id}.pdf`
+  const pdfUrl = await pdfmonkeyCreateAndWait(payload, filename)
+  const resp = await fetch(pdfUrl)
+  if (!resp.ok) throw new Error(`Fetch PDF failed: ${resp.statusText}`)
+  const buf = Buffer.from(await resp.arrayBuffer())
+  await uploadPdf(REPORTS_BUCKET, path, buf)
+
+  const signed = await signedUrlIfExists(REPORTS_BUCKET, path, 300)
+  return { url: signed || pdfUrl, fingerprint: fp, cached: false }
+}
+
+// Routes
+router.get('/:interview_id/generate', requireScope, async (req, res) => {
+  try {
+    const { interview_id } = req.params
+    const { data: row, error } = await supabaseAdmin
+      .from('interviews')
+      .select('client_id')
+      .eq('id', interview_id)
+      .maybeSingle()
+    if (error) return res.status(400).json({ error: error.message })
+    if (!row) return res.status(404).json({ error: 'Interview not found' })
+    if (!req.client_memberships.includes(row.client_id)) return res.status(403).json({ error: 'Forbidden' })
+
+    const out = await generateOrGetCached(interview_id)
+    res.json({ ok: true, url: out.url, cached: out.cached, fingerprint: out.fingerprint })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+router.get('/:interview_id/download', requireScope, async (req, res) => {
+  try {
+    const { interview_id } = req.params
+    const { data: row, error } = await supabaseAdmin
+      .from('interviews')
+      .select('client_id')
+      .eq('id', interview_id)
+      .maybeSingle()
+    if (error) return res.status(400).json({ error: error.message })
+    if (!row) return res.status(404).json({ error: 'Interview not found' })
+    if (!req.client_memberships.includes(row.client_id)) return res.status(403).json({ error: 'Forbidden' })
+
+    const out = await generateOrGetCached(interview_id)
+    const pdfResp = await fetch(out.url)
+    if (!pdfResp.ok) return res.status(502).json({ error: 'Failed to fetch cached PDF' })
+
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="report-${interview_id}.pdf"`)
+    const ab = await pdfResp.arrayBuffer()
+    res.end(Buffer.from(ab))
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+module.exports = router

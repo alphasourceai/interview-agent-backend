@@ -41,3 +41,16 @@ Security:
 - All report generation and storage is server-side with service-role keys.
 - Clients only ever receive signed URLs or streamed PDFs.
 
+SUPABASE_URL=
+SUPABASE_SERVICE_ROLE_KEY=
+SUPABASE_ANON_KEY=
+PDFMONKEY_API_KEY=
+PDFMONKEY_TEMPLATE_ID=
+SENDGRID_API_KEY=
+SENDGRID_FROM=no-reply@yourdomain.com
+FRONTEND_URL=http://localhost:5173
+CORS_ORIGINS=http://localhost:5173
+SUPABASE_REPORTS_BUCKET=reports
+SUPABASE_TRANSCRIPTS_BUCKET=transcripts
+SUPABASE_ANALYSIS_BUCKET=analysis
+SIGNED_URL_TTL_SECONDS=300
