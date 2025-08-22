@@ -1,3 +1,4 @@
+// chore: mvp-hardening-backend-v3 (no-op)
 require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
