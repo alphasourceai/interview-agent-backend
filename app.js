@@ -6,6 +6,7 @@ const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
 
 // Routers
 const rolesRouter = require('./routes/roles')
+const rolesUploadRouter = require('./routes/rolesUpload')
 const clientsRouter = require('./routes/clients') // sendgrid-enabled clients routes
 // Optional routers (mounted if present later): kb, webhook, tavus
 
@@ -25,7 +26,7 @@ const ALLOWLIST = Array.from(new Set([...DEFAULT_ORIGINS, FRONTEND_URL, ...envOr
 
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true) // curl / same-origin
+    if (!origin) return cb(null, true)
     if (ALLOWLIST.includes(origin)) return cb(null, true)
     return cb(null, false)
   },
@@ -73,35 +74,28 @@ async function withClientScope(req, res, next) {
   }
 }
 
-// Normalizer so downstream routers always see req.client_memberships[]
 function injectClientMemberships(req, _res, next) {
-  if (!req.client_memberships) {
-    const ids = Array.isArray(req.memberships) ? req.memberships.map(m => m.client_id) : (req.clientIds || [])
-    req.client_memberships = ids
-  }
+  req.getClientIds = () => Array.isArray(req.clientIds) ? req.clientIds : []
+  req.hasClient = (id) => req.getClientIds().includes(id)
   next()
 }
 
-// ---------- Simple test endpoints ----------
-app.get('/auth/ping', requireAuth, withClientScope, (req, res) => {
-  res.json({ ok: true, user: req.user, client_ids: req.clientIds })
+// ---------- auth/identity ----------
+app.get('/auth/me', requireAuth, withClientScope, injectClientMemberships, async (req, res) => {
+  res.json({
+    user: req.user,
+    clientIds: req.getClientIds(),
+    memberships: req.memberships
+  })
 })
 
-app.get('/auth/me', requireAuth, withClientScope, (req, res) => {
-  res.json({ user: req.user, memberships: req.memberships })
-})
+app.get('/auth/ping', (_req, res) => res.json({ ok: true }))
 
-// ---------- Clients (my, invite, accept-invite) ----------
-app.use('/clients', requireAuth, withClientScope, injectClientMemberships, clientsRouter)
-
-// ---------- Dashboard: client-scoped interviews with scores ----------
-app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) => {
+// ---------- dashboard summaries (kept for legacy /dashboard consumers) ----------
+app.get('/dashboard/interviews', requireAuth, withClientScope, injectClientMemberships, async (req, res) => {
   try {
-    const filterIds = req.clientIds || []
-    if (filterIds.length === 0) return res.json({ items: [] })
-
-    const wantedClientId = req.query.client_id
-    const finalIds = wantedClientId ? filterIds.filter(id => id === wantedClientId) : filterIds
+    const qIds = String(req.query.client_id || '').split(',').map(s => s.trim()).filter(Boolean)
+    const finalIds = qIds.length ? qIds.filter(id => req.hasClient(id)) : req.getClientIds()
     if (finalIds.length === 0) return res.json({ items: [] })
 
     const select = `
@@ -118,13 +112,13 @@ app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) 
 
     if (error) return res.status(500).json({ error: 'Failed to load interviews' })
 
-    const intIds = (interviews || []).map(r => r.id)
-    let reportsByInterview = {}
-    if (intIds.length) {
+    const interviewIds = (interviews || []).map(r => r.id)
+    const reportsByInterview = {}
+    if (interviewIds.length) {
       const { data: reps } = await supabaseAdmin
         .from('reports')
         .select('*')
-        .in('interview_id', intIds)
+        .in('interview_id', interviewIds)
         .order('created_at', { ascending: false })
       for (const r of reps || []) {
         if (!reportsByInterview[r.interview_id]) reportsByInterview[r.interview_id] = r
@@ -135,69 +129,39 @@ app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) 
 
     const items = (interviews || []).map(r => {
       const rep = reportsByInterview[r.id] || null
-
       const resume_score = numOrNull(rep?.resume_score)
       const interview_score = numOrNull(rep?.interview_score)
-      const overall_score =
-        numOrNull(rep?.overall_score) ??
-        (Number.isFinite(resume_score) && Number.isFinite(interview_score)
-          ? Math.round((resume_score + interview_score) / 2)
-          : null)
-
-      const rb = rep?.resume_breakdown || {}
-      const ib = rep?.interview_breakdown || {}
-
+      const overall_score = numOrNull(rep?.overall_score)
       return {
         id: r.id,
         created_at: r.created_at,
-        client_id: r.client_id || null,
-
-        candidate: r.candidates
-          ? { id: r.candidates.id, name: r.candidates.name || '', email: r.candidates.email || '' }
-          : { id: r.candidate_id || null, name: '', email: '' },
-
-        role: r.roles ? { id: r.roles.id, title: r.roles.title, client_id: r.roles.client_id } : null,
-
-        video_url: r.video_url || null,
-        transcript_url: r.transcript_url || null,
-        analysis_url: r.analysis_url || null,
-
-        has_video: !!r.video_url,
+        role: r.roles ? { id: r.roles.id, title: r.roles.title } : null,
+        candidate: r.candidates ? { id: r.candidates.id, name: r.candidates.name, email: r.candidates.email } : null,
         has_transcript: !!r.transcript_url,
         has_analysis: !!r.analysis_url,
-
-        resume_score,
-        interview_score,
-        overall_score,
-
-        resume_analysis: {
-          experience: numOrNull(rb.experience),
-          skills:     numOrNull(rb.skills),
-          education:  numOrNull(rb.education),
-          summary:    typeof rb.summary === 'string' ? rb.summary : ''
-        },
-        interview_analysis: {
-          clarity:       numOrNull(ib.clarity),
-          confidence:    numOrNull(ib.confidence),
-          body_language: numOrNull(ib.body_language)
-        },
-
-        report_url: rep?.report_url ?? null,
-        report_generated_at: rep?.created_at ?? null
+        report_url: rep?.report_url || null,
+        resume_score, interview_score, overall_score
       }
     })
 
     res.json({ items })
-  } catch {
+  } catch (_e) {
     res.status(500).json({ error: 'Server error' })
   }
 })
 
-// ---------- Optional mounts if present ----------
-function mountIfExists(relPath, urlPath) {
+// ---------- Clients (invitations, members) ----------
+app.use('/clients', requireAuth, withClientScope, injectClientMemberships, clientsRouter)
+
+// ---------- Optional router mounts helper ----------
+function mountIfExists(modPath, urlPath, middlewares = []) {
   try {
-    const mod = require(relPath)
-    app.use(urlPath, mod)
+    const mod = require(modPath)
+    if (mod && typeof mod === 'function') {
+      if (middlewares.length) app.use(urlPath, ...middlewares, mod)
+      else app.use(urlPath, mod)
+      console.log(`Mounted ${modPath} at ${urlPath}`)
+    }
   } catch (_) {}
 }
 mountIfExists('./routes/kb', '/kb')
@@ -219,6 +183,15 @@ app.use(
   withClientScope,
   injectClientMemberships,
   require('./routes/reports') // fingerprinting + cache
+)
+
+// ---------- Roles JD upload (protected) ----------
+app.use(
+  '/roles',
+  requireAuth,
+  withClientScope,
+  injectClientMemberships,
+  rolesUploadRouter
 )
 
 // ---------- Roles (mount same router at BOTH paths) ----------
