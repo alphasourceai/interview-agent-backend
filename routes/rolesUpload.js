@@ -6,41 +6,69 @@ const { supabaseAdmin } = require("../src/lib/supabaseClient");
 const { BUCKETS } = require("../config/storage");
 
 const router = express.Router();
-const upload = multer({ limits: { fileSize: 20 * 1024 * 1024 } }); // 20MB
+
+// ✅ make storage explicit so req.file.buffer is always available
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
+});
+
+// helper: simple filename sanitizer
+function sanitize(name) {
+  return String(name || "file").replace(/[^\w.\-]+/g, "_");
+}
 
 // POST /roles/upload-jd?client_id=...
 // form-data: file=<pdf|doc|docx>
 router.post("/upload-jd", upload.single("file"), async (req, res) => {
   try {
     const clientId = req.query.client_id;
-    if (!clientId || !req.clientIds || !req.clientIds.includes(clientId)) {
-      return res.status(403).json({ error: "Forbidden or missing client_id" });
-    }
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
-    const allowed = [
+    // ✅ client scope check (your app sets req.clientIds in app.js)
+    if (!clientId || !Array.isArray(req.clientIds) || !req.clientIds.includes(clientId)) {
+      return res.status(403).json({ error: "No client scope" });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: "file required" });
+    }
+
+    // (optional) basic mime/type guard
+    const okTypes = new Set([
       "application/pdf",
       "application/msword",
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ];
-    if (!allowed.includes(req.file.mimetype)) {
-      return res.status(400).json({ error: "Unsupported file type" });
+    ]);
+    if (!okTypes.has(req.file.mimetype)) {
+      // allow anyway if extension looks OK; otherwise reject
+      const ext = path.extname(req.file.originalname || "").toLowerCase();
+      const okExt = new Set([".pdf", ".doc", ".docx"]);
+      if (!okExt.has(ext)) {
+        return res.status(400).json({ error: "Unsupported file type" });
+      }
     }
 
-    const ext = path.extname(req.file.originalname).toLowerCase();
-    const key = `role-jds/${clientId}/${randomUUID()}${ext}`;
+    const bucket = BUCKETS?.KBS || "kbs"; // your config should define this bucket
+    const ext = path.extname(req.file.originalname || "").toLowerCase();
+    const base = sanitize(path.basename(req.file.originalname || "jd" + (ext || "")));
+    const key = `jd/${clientId}/${Date.now()}_${randomUUID()}_${base}`;
 
-    const { error: upErr } = await supabaseAdmin.storage
-      .from(BUCKETS.KBS)
+    // ✅ upload buffer to Supabase Storage (private bucket)
+    const { error } = await supabaseAdmin.storage
+      .from(bucket)
       .upload(key, req.file.buffer, {
         contentType: req.file.mimetype,
-        upsert: false,
+        upsert: true,
       });
 
-    if (upErr) return res.status(500).json({ error: upErr.message });
+    if (error) {
+      console.error("upload-jd storage error:", error.message);
+      return res.status(500).json({ error: "Upload failed" });
+    }
 
+    // return a reference your roles create will persist
     return res.json({
-      bucket: BUCKETS.KBS,
+      bucket,
       path: key,
       original_name: req.file.originalname,
       mime_type: req.file.mimetype,
