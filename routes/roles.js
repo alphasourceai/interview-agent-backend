@@ -11,50 +11,64 @@ const supabase = createClient(
   { auth: { persistSession: false } }
 );
 
-function ensureScope(req, res, next) {
-  if (!Array.isArray(req.client_memberships)) req.client_memberships = [];
+function ensureScope(req, _res, next) {
+  if (!Array.isArray(req.client_memberships)) {
+    const ids = Array.isArray(req.memberships) ? req.memberships.map(m => m.client_id) : (req.clientIds || []);
+    req.client_memberships = ids;
+  }
   next();
 }
 
 // GET /roles?client_id=...
 router.get('/', ensureScope, async (req, res) => {
-  const cid = req.query.client_id;
-  if (!cid) return res.status(400).json({ error: 'client_id required' });
-  if (!req.client_memberships.includes(cid)) return res.status(403).json({ error: 'No client scope' });
+  try {
+    const clientId = req.query.client_id;
+    if (!clientId) return res.status(400).json({ error: 'client_id required' });
+    if (!req.client_memberships.includes(clientId)) return res.status(403).json({ error: 'No client scope' });
 
-  const { data, error } = await supabase
-    .from('roles')
-    .select('id, title, interview_type, created_at')
-    .eq('client_id', cid)
-    .order('created_at', { ascending: false });
+    const { data, error } = await supabase
+      .from('roles')
+      .select('id, title, interview_type, created_at')
+      .eq('client_id', clientId)
+      .order('created_at', { ascending: false });
 
-  if (error) return res.status(400).json({ error: error.message });
-  res.json({ roles: data || [] });
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ roles: (data || []) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // POST /roles
+// body: { client_id, title, interview_type, jd_bucket?, jd_path?, manual_questions? }
 router.post('/', ensureScope, async (req, res) => {
-  const { client_id, title, interview_type, jd_bucket, jd_path, manual_questions } = req.body || {};
-  if (!client_id || !title || !interview_type) {
-    return res.status(400).json({ error: 'client_id, title, interview_type required' });
-  }
-  if (!req.client_memberships.includes(client_id)) return res.status(403).json({ error: 'No client scope' });
+  try {
+    const { client_id, title, interview_type, jd_bucket, jd_path, manual_questions } = req.body || {};
+    if (!client_id || !title || !interview_type) {
+      return res.status(400).json({ error: 'client_id, title, interview_type required' });
+    }
+    if (!req.client_memberships.includes(client_id)) return res.status(403).json({ error: 'No client scope' });
 
-  const { data, error } = await supabase
-    .from('roles')
-    .insert({
+    const payload = {
       client_id,
-      title,
-      interview_type,
+      title: (title || '').toString().trim(),
+      interview_type: (interview_type || '').toString().trim(),
       jd_bucket: jd_bucket || null,
       jd_path: jd_path || null,
       manual_questions: manual_questions || null,
-    })
-    .select('*')
-    .single();
+    };
 
-  if (error) return res.status(400).json({ error: error.message });
-  res.json({ role: data });
+    const { data, error } = await supabase
+      .from('roles')
+      .insert(payload)
+      .select('*')
+      .single();
+
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ role: data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 module.exports = router;

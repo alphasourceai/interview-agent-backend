@@ -14,36 +14,31 @@ const supabase = createClient(
 
 const FRONTEND_URL = (process.env.FRONTEND_URL || '').replace(/\/+$/, '');
 
-// Optional mailer (won't crash if not present)
-let sendInviteSafe = async () => {};
-try {
-  const { sendInvite } = require('../utils/mailer');
-  if (typeof sendInvite === 'function') sendInviteSafe = sendInvite;
-} catch (_) { /* noop */ }
-
-// Utility: ensure req.client_memberships exists (app.js sets it)
+// Ensure downstream sees req.client_memberships[]
 function ensureScope(req, _res, next) {
-  if (!Array.isArray(req.client_memberships)) req.client_memberships = [];
+  if (!Array.isArray(req.client_memberships)) {
+    const ids = Array.isArray(req.memberships) ? req.memberships.map(m => m.client_id) : (req.clientIds || []);
+    req.client_memberships = ids;
+  }
   next();
 }
 
 // ---------- GET /clients/my ----------
-// Returns the current user's client memberships with client NAME
-router.get('/my', async (req, res) => {
+router.get('/my', ensureScope, async (req, res) => {
   try {
     const uid = req.user?.id;
     if (!uid) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { data, error } = await supabase
+    const { data: rows, error } = await supabase
       .from('client_members')
-      .select('client_id, role, clients!inner(name)')
+      .select('client_id, role, clients:clients(id, name)')
       .eq('user_id', uid)
-      .order('client_id', { ascending: true });
+      .order('created_at', { ascending: false });
 
     if (error) return res.status(400).json({ error: error.message });
 
-    const clients = (data || []).map(r => ({
-      id: r.client_id,
+    const clients = (rows || []).map(r => ({
+      id: r.clients?.id || r.client_id,
       name: r.clients?.name || r.client_id,
       role: r.role || 'member',
     }));
@@ -55,7 +50,6 @@ router.get('/my', async (req, res) => {
 });
 
 // ---------- GET /clients/members?client_id=... ----------
-// Returns member list WITH name (from client_members.name) + emails
 router.get('/members', ensureScope, async (req, res) => {
   try {
     const cid = req.query.client_id;
@@ -65,21 +59,23 @@ router.get('/members', ensureScope, async (req, res) => {
     const { data: rows, error } = await supabase
       .from('client_members')
       .select('user_id, role, name')
-      .eq('client_id', cid);
+      .eq('client_id', cid)
+      .order('created_at', { ascending: true });
 
     if (error) return res.status(400).json({ error: error.message });
 
-    // enrich emails via admin list
-    const { data: usersRes } = await supabase.auth.admin.listUsers();
-    const emailById = {};
-    for (const u of usersRes?.users || []) emailById[u.id] = u.email;
-
-    const members = (rows || []).map(r => ({
-      user_id: r.user_id,
-      email: emailById[r.user_id] || null,
-      role: r.role || 'member',
-      name: r.name || null,
-    }));
+    // Enrich with auth user email (service role)
+    const members = [];
+    for (const row of rows || []) {
+      let email = null;
+      if (row.user_id) {
+        try {
+          const u = await supabase.auth.admin.getUserById(row.user_id);
+          email = u.data?.user?.email || null;
+        } catch (_) {}
+      }
+      members.push({ user_id: row.user_id, role: row.role, name: row.name || null, email });
+    }
 
     res.json({ members });
   } catch (e) {
@@ -87,86 +83,86 @@ router.get('/members', ensureScope, async (req, res) => {
   }
 });
 
-// ---------- POST /clients/invite { client_id, email, name?, role? } ----------
+// Optional alt path
+router.get('/:id/members', ensureScope, async (req, res, next) => {
+  req.url = `/members?client_id=${encodeURIComponent(req.params.id)}`;
+  next();
+}, router);
+
+// ---------- POST /clients/invite ----------
+// body: { client_id, email, name?, role? }
 router.post('/invite', ensureScope, async (req, res) => {
   try {
     const { client_id, email, name, role } = req.body || {};
-    if (!client_id || !email) return res.status(400).json({ error: 'client_id and email are required' });
+    if (!client_id || !email) return res.status(400).json({ error: 'client_id and email required' });
     if (!req.client_memberships.includes(client_id)) return res.status(403).json({ error: 'No client scope' });
 
     const token = crypto.randomBytes(24).toString('hex');
+    const expires_at = new Date(Date.now() + 1000 * 60 * 60 * 24 * 7).toISOString(); // 7 days
 
-    const { data: invite, error } = await supabase
+    const { error } = await supabase
       .from('client_invites')
       .insert({
         client_id,
-        email,
-        name: name || null,          // <-- store invited name
+        email: email.toLowerCase(),
         role: role || 'member',
         token,
-        invited_by: req.user?.id || null,
-        accepted_at: null,
-      })
-      .select('*')
-      .single();
+        expires_at,
+        name: name || null, // column you added
+      });
 
     if (error) return res.status(400).json({ error: error.message });
 
-    const acceptUrl = `${FRONTEND_URL}/accept-invite?token=${encodeURIComponent(token)}`;
-    try { await sendInviteSafe(email, acceptUrl, req.user?.email || ''); } catch (_) {}
-
-    res.json({ ok: true, invite, accept_url: acceptUrl });
+    const accept_url = `${FRONTEND_URL}/accept-invite?token=${encodeURIComponent(token)}`;
+    res.json({ ok: true, accept_url });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// ---------- POST /clients/accept-invite { token } ----------
-// Carries invite.name into client_members.name
-router.post('/accept-invite', async (req, res) => {
+// ---------- POST /clients/accept-invite ----------
+// body: { token }
+router.post('/accept-invite', ensureScope, async (req, res) => {
   try {
     const uid = req.user?.id;
-    if (!uid) return res.status(401).json({ error: 'Unauthorized' });
-
     const { token } = req.body || {};
+    if (!uid) return res.status(401).json({ error: 'Unauthorized' });
     if (!token) return res.status(400).json({ error: 'token required' });
 
-    const { data: inv, error: invErr } = await supabase
+    const { data: invite, error } = await supabase
       .from('client_invites')
-      .select('*')
+      .select('id, client_id, email, role, name, expires_at, accepted_at')
       .eq('token', token)
-      .is('accepted_at', null)
-      .maybeSingle();
+      .single();
 
-    if (invErr) return res.status(400).json({ error: invErr.message });
-    if (!inv) return res.status(404).json({ error: 'Invite not found or already accepted' });
+    if (error || !invite) return res.status(400).json({ error: 'invalid token' });
+    if (invite.accepted_at) return res.json({ ok: true, alreadyAccepted: true });
+    if (new Date(invite.expires_at) < new Date()) return res.status(400).json({ error: 'expired' });
 
     const { error: upErr } = await supabase
       .from('client_members')
-      .upsert(
-        {
-          client_id: inv.client_id,
-          user_id: uid,
-          role: inv.role || 'member',
-          name: inv.name || null,   // <-- carry invited name into membership
-        },
-        { onConflict: 'client_id,user_id' }
-      );
+      .upsert({
+        client_id: invite.client_id,
+        user_id: uid,
+        role: invite.role || 'member',
+        name: invite.name || null,
+      }, { onConflict: 'client_id,user_id' });
+
     if (upErr) return res.status(400).json({ error: upErr.message });
 
-    const { error: markErr } = await supabase
+    await supabase
       .from('client_invites')
       .update({ accepted_at: new Date().toISOString() })
-      .eq('token', token);
-    if (markErr) return res.status(400).json({ error: markErr.message });
+      .eq('id', invite.id);
 
-    res.json({ ok: true, client_id: inv.client_id });
+    res.json({ ok: true, client_id: invite.client_id, role: invite.role, name: invite.name || null });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// ---------- POST /clients/members/revoke { client_id, user_id } ----------
+// ---------- POST /clients/members/revoke ----------
+// body: { client_id, user_id }
 router.post('/members/revoke', ensureScope, async (req, res) => {
   try {
     const { client_id, user_id } = req.body || {};
