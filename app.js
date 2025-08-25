@@ -29,18 +29,26 @@ const supabaseAdmin = createClient(
 );
 
 // ---------- Auth + client scope (as in your original app.js) ----------
-function requireAuth(req, res, next) {
-  const h = req.headers.authorization || '';
-  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing bearer token' });
+// before: requireAuth using jwt.verify(...SUPABASE_JWT_SECRET)
+// after: validate token via Supabase Admin (no JWT secret needed)
+// validate token via Supabase Admin (no SUPABASE_JWT_SECRET needed)
+async function requireAuth(req, res, next) {
+  const h = req.headers.authorization || "";
+  const token = h.startsWith("Bearer ") ? h.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Missing bearer token" });
+
   try {
-    const payload = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
-    req.user = { id: payload.sub, email: payload.email || null };
-    next();
+    const { data, error } = await supabaseAdmin.auth.getUser(token);
+    if (error || !data?.user) {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+    req.user = { id: data.user.id, email: data.user.email || null };
+    return next();
   } catch (e) {
-    return res.status(401).json({ error: 'Invalid token' });
+    return res.status(401).json({ error: "Invalid token" });
   }
 }
+
 
 async function withClientScope(req, _res, next) {
   try {
