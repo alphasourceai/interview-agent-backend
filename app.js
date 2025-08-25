@@ -31,6 +31,7 @@ const supabaseAdmin = createClient(
 // ---------- Auth + client scope (as in your original app.js) ----------
 // before: requireAuth using jwt.verify(...SUPABASE_JWT_SECRET)
 // after: validate token via Supabase Admin (no JWT secret needed)
+// validate token via Supabase Admin (no SUPABASE_JWT_SECRET needed)
 async function requireAuth(req, res, next) {
   const h = req.headers.authorization || "";
   const token = h.startsWith("Bearer ") ? h.slice(7) : null;
@@ -47,6 +48,7 @@ async function requireAuth(req, res, next) {
     return res.status(401).json({ error: "Invalid token" });
   }
 }
+
 
 async function withClientScope(req, _res, next) {
   try {
