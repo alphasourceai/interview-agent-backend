@@ -2,8 +2,8 @@
 'use strict';
 
 const express = require('express');
-const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
 const sgMail = require('@sendgrid/mail');
 
 const router = express.Router();
@@ -18,55 +18,86 @@ const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 });
 
 const FRONTEND_URL = (process.env.FRONTEND_URL || '').replace(/\/+$/, '');
-const SENDER_EMAIL = process.env.SENDGRID_FROM || process.env.SENDER_EMAIL;
+const FROM_EMAIL = process.env.SENDGRID_FROM || process.env.SENDER_EMAIL || null;
 
 if (process.env.SENDGRID_API_KEY) {
-  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+  try { sgMail.setApiKey(process.env.SENDGRID_API_KEY); } catch {}
 }
 
-function mustBeInScope(req, client_id) {
+function inScope(req, client_id) {
   const scope = req.clientIds || [];
   return scope.includes(client_id);
 }
 
 async function getUserEmail(uid) {
-  // Admin API to fetch email for a user_id
-  const { data, error } = await supabaseAdmin.auth.admin.getUserById(uid);
-  if (error) return null;
-  return data?.user?.email || null;
+  try {
+    const u = await supabaseAdmin.auth.admin.getUserById(uid);
+    return u.data?.user?.email || null;
+  } catch {
+    return null;
+  }
 }
 
-// GET /clients/mine  -> [{id, name, email, role}]
+/* ---------- GET /clients/my (FE expects this) ---------- */
+router.get('/my', async (req, res) => {
+  try {
+    const uid = req.user?.id;
+    if (!uid) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: mem, error } = await supabaseAdmin
+      .from('client_members')
+      .select('client_id, role')
+      .eq('user_id', uid);
+    if (error) return res.status(400).json({ error: error.message });
+
+    const clientIds = (mem || []).map(r => r.client_id);
+    if (clientIds.length === 0) return res.json({ clients: [] });
+
+    const { data: clients, error: e2 } = await supabaseAdmin
+      .from('clients')
+      .select('id, name')
+      .in('id', clientIds);
+    if (e2) return res.status(400).json({ error: e2.message });
+
+    const roleById = Object.fromEntries((mem || []).map(r => [r.client_id, r.role || 'member']));
+    const clientsOut = (clients || []).map(c => ({
+      id: c.id,
+      name: c.name || c.id,
+      role: roleById[c.id] || 'member',
+    }));
+
+    res.json({ clients: clientsOut });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------- GET /clients/mine (alias; returns items[]) ---------- */
 router.get('/mine', async (req, res) => {
   try {
     const uid = req.user?.id;
     if (!uid) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { data, error } = await supabaseAdmin
+    const { data: mem, error } = await supabaseAdmin
       .from('client_members')
       .select('client_id, role')
       .eq('user_id', uid);
-
     if (error) return res.status(400).json({ error: error.message });
 
-    const clientIds = (data || []).map(r => r.client_id);
+    const clientIds = (mem || []).map(r => r.client_id);
     if (clientIds.length === 0) return res.json({ items: [] });
 
     const { data: clients, error: e2 } = await supabaseAdmin
       .from('clients')
-      .select('id, name, email')
-      .in('id', clientIds)
-      .order('created_at', { ascending: false });
-
+      .select('id, name')
+      .in('id', clientIds);
     if (e2) return res.status(400).json({ error: e2.message });
 
-    // attach role
-    const roleByClient = Object.fromEntries((data || []).map(r => [r.client_id, r.role]));
+    const roleById = Object.fromEntries((mem || []).map(r => [r.client_id, r.role || 'member']));
     const items = (clients || []).map(c => ({
       id: c.id,
       name: c.name || c.id,
-      email: c.email || null,
-      role: roleByClient[c.id] || 'member',
+      role: roleById[c.id] || 'member',
     }));
 
     res.json({ items });
@@ -75,24 +106,21 @@ router.get('/mine', async (req, res) => {
   }
 });
 
-// GET /clients/members?client_id=...
-// Returns accepted members (with email + name + role) and pending invites.
+/* ---------- GET /clients/members?client_id=... ---------- */
 router.get('/members', async (req, res) => {
   try {
     const client_id = req.query.client_id;
     if (!client_id) return res.status(400).json({ error: 'Missing client_id' });
-    if (!mustBeInScope(req, client_id)) return res.status(403).json({ error: 'Forbidden' });
+    if (!inScope(req, client_id)) return res.status(403).json({ error: 'Forbidden' });
 
-    // accepted members
-    const { data: membersRows, error: mErr } = await supabaseAdmin
+    const { data: rows, error } = await supabaseAdmin
       .from('client_members')
-      .select('client_id, user_id, role, name')
+      .select('user_id, role, name')
       .eq('client_id', client_id);
-    if (mErr) return res.status(400).json({ error: mErr.message });
+    if (error) return res.status(400).json({ error: error.message });
 
-    // hydrate emails via Admin API
     const members = [];
-    for (const r of membersRows || []) {
+    for (const r of rows || []) {
       const email = await getUserEmail(r.user_id);
       members.push({
         user_id: r.user_id,
@@ -103,66 +131,56 @@ router.get('/members', async (req, res) => {
       });
     }
 
-    // pending invites (not yet accepted)
-    const { data: invitesRows, error: iErr } = await supabaseAdmin
+    const { data: invites, error: iErr } = await supabaseAdmin
       .from('client_invites')
       .select('email, role, name, accepted_at, expires_at')
       .eq('client_id', client_id)
       .is('accepted_at', null);
     if (iErr) return res.status(400).json({ error: iErr.message });
 
-    const invites = (invitesRows || []).map(r => ({
+    const pending = (invites || []).map(i => ({
       user_id: null,
-      email: r.email,
-      role: r.role || 'member',
-      name: r.name || null,
+      email: i.email,
+      role: i.role || 'member',
+      name: i.name || null,
       pending: true,
-      expires_at: r.expires_at || null,
+      expires_at: i.expires_at || null,
     }));
 
-    res.json({ members, invites });
+    res.json({ members, invites: pending });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// POST /clients/invite  { client_id, email, role, name }
+/* ---------- POST /clients/invite { client_id, email, role?, name? } ---------- */
 router.post('/invite', async (req, res) => {
   try {
     const { client_id, email, role = 'member', name = null } = req.body || {};
     if (!client_id || !email) return res.status(400).json({ error: 'Missing client_id or email' });
-    if (!mustBeInScope(req, client_id)) return res.status(403).json({ error: 'Forbidden' });
+    if (!inScope(req, client_id)) return res.status(403).json({ error: 'Forbidden' });
 
     const token = crypto.randomUUID();
     const expires_at = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
 
     const { error } = await supabaseAdmin.from('client_invites').insert({
-      client_id,
-      email,
-      role,
-      token,
-      expires_at,
-      name,
+      client_id, email, role, token, expires_at, name,
     });
     if (error) return res.status(400).json({ error: error.message });
 
-    if (process.env.SENDGRID_API_KEY && SENDER_EMAIL && FRONTEND_URL) {
-      const link = `${FRONTEND_URL.replace(/\/+$/, '')}/accept-invite?token=${encodeURIComponent(token)}`;
+    if (process.env.SENDGRID_API_KEY && FROM_EMAIL && FRONTEND_URL) {
+      const accept = `${FRONTEND_URL}/accept-invite?token=${encodeURIComponent(token)}`;
       try {
         await sgMail.send({
           to: email,
-          from: SENDER_EMAIL,
+          from: FROM_EMAIL,
           subject: 'You’ve been invited to Interview Agent',
-          text: `Hello${name ? ` ${name}` : ''},\n\nYou’ve been invited to join the client workspace.\n\nAccept your invite: ${link}\n\nThis link expires in 7 days.`,
-          html: `
-            <p>Hello${name ? ` ${name}` : ''},</p>
-            <p>You’ve been invited to join the client workspace.</p>
-            <p><a href="${link}">Accept your invite</a></p>
-            <p>This link expires in 7 days.</p>
-          `,
+          html: `<p>Hello${name ? ' ' + name : ''},</p>
+                 <p>You’ve been invited to join the client workspace.</p>
+                 <p><a href="${accept}">Accept your invite</a></p>
+                 <p>This link expires in 7 days.</p>`,
         });
       } catch (e) {
-        // email failure shouldn't block the API; surface as warning
         console.warn('[sendgrid] failed:', e.message);
       }
     }
@@ -173,20 +191,20 @@ router.post('/invite', async (req, res) => {
   }
 });
 
-// POST /clients/accept-invite  { token }
+/* ---------- POST /clients/accept-invite { token } ---------- */
 router.post('/accept-invite', async (req, res) => {
   try {
     const uid = req.user?.id;
-    const token = (req.body && req.body.token) || null;
+    const userEmail = (req.user?.email || '').toLowerCase();
+    const { token } = req.body || {};
     if (!uid) return res.status(401).json({ error: 'Unauthorized' });
     if (!token) return res.status(400).json({ error: 'Missing token' });
 
     const { data: invite, error } = await supabaseAdmin
       .from('client_invites')
-      .select('id, client_id, email, role, token, expires_at, accepted_at, name')
+      .select('id, client_id, email, role, name, expires_at, accepted_at')
       .eq('token', token)
       .maybeSingle();
-
     if (error) return res.status(400).json({ error: error.message });
     if (!invite) return res.status(400).json({ error: 'Invalid token' });
     if (invite.accepted_at) return res.status(400).json({ error: 'Already accepted' });
@@ -194,17 +212,23 @@ router.post('/accept-invite', async (req, res) => {
       return res.status(400).json({ error: 'Invite expired' });
     }
 
-    // If user is already a member, keep existing OWNER
-    const { data: existing, error: exErr } = await supabaseAdmin
+    // Require the signed-in user to match the invited email
+    if ((invite.email || '').toLowerCase() !== userEmail) {
+      return res.status(403).json({
+        error: 'email_mismatch',
+        message: `Signed in as ${userEmail || '(unknown)'} but invite is for ${invite.email}. Sign in with the invited address.`,
+      });
+    }
+
+    // Preserve existing OWNER role if present
+    const { data: existing } = await supabaseAdmin
       .from('client_members')
-      .select('client_id, user_id, role, name')
+      .select('role, name')
       .eq('client_id', invite.client_id)
       .eq('user_id', uid)
       .maybeSingle();
-    if (exErr) return res.status(400).json({ error: exErr.message });
 
     if (existing?.role === 'owner') {
-      // preserve owner; just update name if provided
       if (invite.name && invite.name !== existing.name) {
         await supabaseAdmin
           .from('client_members')
@@ -213,7 +237,6 @@ router.post('/accept-invite', async (req, res) => {
           .eq('user_id', uid);
       }
     } else {
-      // upsert as invited role
       const { error: upErr } = await supabaseAdmin
         .from('client_members')
         .upsert(
@@ -223,7 +246,7 @@ router.post('/accept-invite', async (req, res) => {
       if (upErr) return res.status(400).json({ error: upErr.message });
     }
 
-    // mark accepted
+    // Mark invite accepted
     const { error: accErr } = await supabaseAdmin
       .from('client_invites')
       .update({ accepted_at: new Date().toISOString() })
@@ -236,14 +259,14 @@ router.post('/accept-invite', async (req, res) => {
   }
 });
 
-// POST /clients/members/revoke  { client_id, user_id }
+/* ---------- POST /clients/members/revoke ---------- */
 router.post('/members/revoke', async (req, res) => {
   try {
     const { client_id, user_id } = req.body || {};
     if (!client_id || !user_id) return res.status(400).json({ error: 'Missing client_id or user_id' });
-    if (!mustBeInScope(req, client_id)) return res.status(403).json({ error: 'Forbidden' });
+    if (!inScope(req, client_id)) return res.status(403).json({ error: 'Forbidden' });
 
-    // prevent self-revoking an owner (safety)
+    // Do not allow revoking an owner
     const { data: row, error } = await supabaseAdmin
       .from('client_members')
       .select('role')
@@ -251,9 +274,7 @@ router.post('/members/revoke', async (req, res) => {
       .eq('user_id', user_id)
       .maybeSingle();
     if (error) return res.status(400).json({ error: error.message });
-    if (row?.role === 'owner') {
-      return res.status(400).json({ error: 'Cannot revoke an owner' });
-    }
+    if (row?.role === 'owner') return res.status(400).json({ error: 'Cannot revoke an owner' });
 
     const { error: delErr } = await supabaseAdmin
       .from('client_members')
