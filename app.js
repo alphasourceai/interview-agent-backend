@@ -4,6 +4,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
+const dashboardRouter = require('./routes/dashboard');
 
 const app = express();
 
@@ -103,6 +104,7 @@ const rolesUploadRouter = require('./routes/rolesUpload'); // /roles/upload-jd
 app.use('/clients', requireAuth, withClientScope, injectClientMemberships, clientsRouter);
 app.use('/roles',   requireAuth, withClientScope, injectClientMemberships, rolesRouter);
 app.use('/roles',   requireAuth, withClientScope, injectClientMemberships, rolesUploadRouter);
+app.use('/dashboard', requireAuth, withClientScope, injectClientMemberships, dashboardRouter);
 
 /* ---------------------- Default root --------------------- */
 app.get('/', (_req, res) => res.json({ ok: true }));
