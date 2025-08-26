@@ -1,173 +1,271 @@
 // routes/clients.js
+'use strict';
+
 const express = require('express');
-const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
+const crypto = require('crypto');
 const sgMail = require('@sendgrid/mail');
 
 const router = express.Router();
-router.use(express.json());
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  { auth: { persistSession: false } }
-);
-
-if (process.env.SENDGRID_API_KEY) sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+}
+const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
+});
 
 const FRONTEND_URL = (process.env.FRONTEND_URL || '').replace(/\/+$/, '');
-const FROM_EMAIL = process.env.SENDGRID_FROM || process.env.SENDER_EMAIL;
+const SENDER_EMAIL = process.env.SENDGRID_FROM || process.env.SENDER_EMAIL;
 
-function pick(row, keys) { for (const k of keys) if (k in row && row[k] != null) return row[k]; }
-function ensureScope(req, _res, next) { if (!Array.isArray(req.client_memberships)) req.client_memberships = []; next(); }
+if (process.env.SENDGRID_API_KEY) {
+  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+}
 
-// ---------- GET /clients/my ----------
-router.get('/my', ensureScope, async (req, res) => {
+function mustBeInScope(req, client_id) {
+  const scope = req.clientIds || [];
+  return scope.includes(client_id);
+}
+
+async function getUserEmail(uid) {
+  // Admin API to fetch email for a user_id
+  const { data, error } = await supabaseAdmin.auth.admin.getUserById(uid);
+  if (error) return null;
+  return data?.user?.email || null;
+}
+
+// GET /clients/mine  -> [{id, name, email, role}]
+router.get('/mine', async (req, res) => {
   try {
     const uid = req.user?.id;
     if (!uid) return res.status(401).json({ error: 'Unauthorized' });
 
-    const { data: rows, error } = await supabase.from('client_members').select('*');
+    const { data, error } = await supabaseAdmin
+      .from('client_members')
+      .select('client_id, role')
+      .eq('user_id', uid);
+
     if (error) return res.status(400).json({ error: error.message });
 
-    const mine = (rows || []).filter(r => pick(r, ['user_id', 'user_id_uuid']) === uid);
-    const clientIds = mine.map(r => pick(r, ['client_id', 'client_id_uuid'])).filter(Boolean);
+    const clientIds = (data || []).map(r => r.client_id);
+    if (clientIds.length === 0) return res.json({ items: [] });
 
-    const { data: clientsRows, error: cErr } = await supabase
+    const { data: clients, error: e2 } = await supabaseAdmin
       .from('clients')
-      .select('id,name')
-      .in('id', clientIds);
-    if (cErr) return res.status(400).json({ error: cErr.message });
+      .select('id, name, email')
+      .in('id', clientIds)
+      .order('created_at', { ascending: false });
 
-    const nameById = Object.fromEntries((clientsRows || []).map(c => [c.id, c.name]));
-    const clients = clientIds.map(id => ({
-      id,
-      name: nameById[id] || id,
-      role: (mine.find(m => pick(m, ['client_id', 'client_id_uuid']) === id)?.role) || 'member',
+    if (e2) return res.status(400).json({ error: e2.message });
+
+    // attach role
+    const roleByClient = Object.fromEntries((data || []).map(r => [r.client_id, r.role]));
+    const items = (clients || []).map(c => ({
+      id: c.id,
+      name: c.name || c.id,
+      email: c.email || null,
+      role: roleByClient[c.id] || 'member',
     }));
 
-    res.json({ clients });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    res.json({ items });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// ---------- GET /clients/members?client_id=... ----------
-router.get('/members', ensureScope, async (req, res) => {
+// GET /clients/members?client_id=...
+// Returns accepted members (with email + name + role) and pending invites.
+router.get('/members', async (req, res) => {
   try {
-    const cid = req.query.client_id;
-    if (!cid) return res.status(400).json({ error: 'client_id required' });
-    if (!req.client_memberships.includes(cid)) return res.status(403).json({ error: 'No client scope' });
+    const client_id = req.query.client_id;
+    if (!client_id) return res.status(400).json({ error: 'Missing client_id' });
+    if (!mustBeInScope(req, client_id)) return res.status(403).json({ error: 'Forbidden' });
 
-    const { data: rows, error } = await supabase.from('client_members').select('*');
-    if (error) return res.status(400).json({ error: error.message });
+    // accepted members
+    const { data: membersRows, error: mErr } = await supabaseAdmin
+      .from('client_members')
+      .select('client_id, user_id, role, name')
+      .eq('client_id', client_id);
+    if (mErr) return res.status(400).json({ error: mErr.message });
 
-    const list = (rows || []).filter(r => pick(r, ['client_id', 'client_id_uuid']) === cid);
-
+    // hydrate emails via Admin API
     const members = [];
-    for (const r of list) {
-      const userId = pick(r, ['user_id', 'user_id_uuid']);
-      let email = null;
-      if (userId) {
-        try { const u = await supabase.auth.admin.getUserById(userId); email = u.data?.user?.email || null; } catch {}
-      }
-      members.push({ user_id: userId, role: r.role || 'member', name: r.name ?? r['Name'] ?? null, email });
+    for (const r of membersRows || []) {
+      const email = await getUserEmail(r.user_id);
+      members.push({
+        user_id: r.user_id,
+        email: email || 'unknown',
+        role: r.role || 'member',
+        name: r.name || null,
+        pending: false,
+      });
     }
-    res.json({ members });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+
+    // pending invites (not yet accepted)
+    const { data: invitesRows, error: iErr } = await supabaseAdmin
+      .from('client_invites')
+      .select('email, role, name, accepted_at, expires_at')
+      .eq('client_id', client_id)
+      .is('accepted_at', null);
+    if (iErr) return res.status(400).json({ error: iErr.message });
+
+    const invites = (invitesRows || []).map(r => ({
+      user_id: null,
+      email: r.email,
+      role: r.role || 'member',
+      name: r.name || null,
+      pending: true,
+      expires_at: r.expires_at || null,
+    }));
+
+    res.json({ members, invites });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// ---------- POST /clients/invite ----------
-router.post('/invite', ensureScope, async (req, res) => {
+// POST /clients/invite  { client_id, email, role, name }
+router.post('/invite', async (req, res) => {
   try {
-    const { client_id, email, name, role } = req.body || {};
-    if (!client_id || !email) return res.status(400).json({ error: 'client_id and email required' });
-    if (!req.client_memberships.includes(client_id)) return res.status(403).json({ error: 'No client scope' });
+    const { client_id, email, role = 'member', name = null } = req.body || {};
+    if (!client_id || !email) return res.status(400).json({ error: 'Missing client_id or email' });
+    if (!mustBeInScope(req, client_id)) return res.status(403).json({ error: 'Forbidden' });
 
-    const token = crypto.randomBytes(24).toString('hex');
+    const token = crypto.randomUUID();
     const expires_at = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
 
-    const { error } = await supabase.from('client_invites').insert({
-      client_id, email: email.toLowerCase(), role: role || 'member',
-      token, expires_at, name: name || null,
+    const { error } = await supabaseAdmin.from('client_invites').insert({
+      client_id,
+      email,
+      role,
+      token,
+      expires_at,
+      name,
     });
     if (error) return res.status(400).json({ error: error.message });
 
-    const accept_url = `${FRONTEND_URL}/accept-invite?token=${encodeURIComponent(token)}`;
-
-    if (FROM_EMAIL && process.env.SENDGRID_API_KEY) {
+    if (process.env.SENDGRID_API_KEY && SENDER_EMAIL && FRONTEND_URL) {
+      const link = `${FRONTEND_URL.replace(/\/+$/, '')}/accept-invite?token=${encodeURIComponent(token)}`;
       try {
         await sgMail.send({
-          to: email, from: FROM_EMAIL,
+          to: email,
+          from: SENDER_EMAIL,
           subject: 'You’ve been invited to Interview Agent',
-          html: `<p>Hello${name ? ' ' + name : ''},</p>
-                 <p>You’ve been invited to join the client workspace.</p>
-                 <p><a href="${accept_url}">${accept_url}</a></p>
-                 <p>This link expires in 7 days.</p>`,
+          text: `Hello${name ? ` ${name}` : ''},\n\nYou’ve been invited to join the client workspace.\n\nAccept your invite: ${link}\n\nThis link expires in 7 days.`,
+          html: `
+            <p>Hello${name ? ` ${name}` : ''},</p>
+            <p>You’ve been invited to join the client workspace.</p>
+            <p><a href="${link}">Accept your invite</a></p>
+            <p>This link expires in 7 days.</p>
+          `,
         });
-      } catch (e) { console.error('SendGrid error:', e.message); }
-    }
-    res.json({ ok: true, accept_url, emailed: !!(FROM_EMAIL && process.env.SENDGRID_API_KEY) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ---------- POST /clients/accept-invite ----------
-router.post('/accept-invite', ensureScope, async (req, res) => {
-  try {
-    const uid = req.user?.id;
-    const { token } = req.body || {};
-    if (!uid) return res.status(401).json({ error: 'Unauthorized' });
-    if (!token) return res.status(400).json({ error: 'token required' });
-
-    const { data: invite, error } = await supabase
-      .from('client_invites').select('*').eq('token', token).single();
-    if (error || !invite) return res.status(400).json({ error: 'invalid token' });
-    if (invite.accepted_at) return res.json({ ok: true, alreadyAccepted: true });
-    if (new Date(invite.expires_at) < new Date()) return res.status(400).json({ error: 'expired' });
-
-    // upsert basic membership
-    const base = { client_id: invite.client_id, user_id: uid, role: invite.role || 'member' };
-    const up1 = await supabase.from('client_members').upsert(base, { onConflict: 'client_id,user_id' });
-    if (up1.error) return res.status(400).json({ error: up1.error.message });
-
-    // best-effort update of name, supporting either name or "Name"
-    if (invite.name) {
-      const tryLower = await supabase.from('client_members')
-        .update({ name: invite.name })
-        .eq('client_id', invite.client_id)
-        .eq('user_id', uid);
-
-      if (tryLower.error) {
-        // Try quoted "Name" key
-        const payload = {}; payload['Name'] = invite.name;
-        const tryUpper = await supabase.from('client_members')
-          .update(payload)
-          .eq('client_id', invite.client_id)
-          .eq('user_id', uid);
-
-        // If both fail, keep going without blocking
-        if (tryUpper.error) console.warn('Name update failed:', tryLower.error.message, ' / ', tryUpper.error.message);
+      } catch (e) {
+        // email failure shouldn't block the API; surface as warning
+        console.warn('[sendgrid] failed:', e.message);
       }
     }
 
-    await supabase.from('client_invites')
-      .update({ accepted_at: new Date().toISOString() })
-      .eq('id', invite.id);
-
-    res.json({ ok: true, client_id: invite.client_id, role: invite.role, name: invite.name || null });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// ---------- POST /clients/members/revoke ----------
-router.post('/members/revoke', ensureScope, async (req, res) => {
+// POST /clients/accept-invite  { token }
+router.post('/accept-invite', async (req, res) => {
+  try {
+    const uid = req.user?.id;
+    const token = (req.body && req.body.token) || null;
+    if (!uid) return res.status(401).json({ error: 'Unauthorized' });
+    if (!token) return res.status(400).json({ error: 'Missing token' });
+
+    const { data: invite, error } = await supabaseAdmin
+      .from('client_invites')
+      .select('id, client_id, email, role, token, expires_at, accepted_at, name')
+      .eq('token', token)
+      .maybeSingle();
+
+    if (error) return res.status(400).json({ error: error.message });
+    if (!invite) return res.status(400).json({ error: 'Invalid token' });
+    if (invite.accepted_at) return res.status(400).json({ error: 'Already accepted' });
+    if (invite.expires_at && new Date(invite.expires_at).getTime() < Date.now()) {
+      return res.status(400).json({ error: 'Invite expired' });
+    }
+
+    // If user is already a member, keep existing OWNER
+    const { data: existing, error: exErr } = await supabaseAdmin
+      .from('client_members')
+      .select('client_id, user_id, role, name')
+      .eq('client_id', invite.client_id)
+      .eq('user_id', uid)
+      .maybeSingle();
+    if (exErr) return res.status(400).json({ error: exErr.message });
+
+    if (existing?.role === 'owner') {
+      // preserve owner; just update name if provided
+      if (invite.name && invite.name !== existing.name) {
+        await supabaseAdmin
+          .from('client_members')
+          .update({ name: invite.name })
+          .eq('client_id', invite.client_id)
+          .eq('user_id', uid);
+      }
+    } else {
+      // upsert as invited role
+      const { error: upErr } = await supabaseAdmin
+        .from('client_members')
+        .upsert(
+          { client_id: invite.client_id, user_id: uid, role: invite.role || 'member', name: invite.name || null },
+          { onConflict: 'client_id,user_id' }
+        );
+      if (upErr) return res.status(400).json({ error: upErr.message });
+    }
+
+    // mark accepted
+    const { error: accErr } = await supabaseAdmin
+      .from('client_invites')
+      .update({ accepted_at: new Date().toISOString() })
+      .eq('id', invite.id);
+    if (accErr) return res.status(400).json({ error: accErr.message });
+
+    res.json({ ok: true, client_id: invite.client_id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /clients/members/revoke  { client_id, user_id }
+router.post('/members/revoke', async (req, res) => {
   try {
     const { client_id, user_id } = req.body || {};
-    if (!client_id || !user_id) return res.status(400).json({ error: 'client_id and user_id required' });
-    if (!req.client_memberships.includes(client_id)) return res.status(403).json({ error: 'No client scope' });
+    if (!client_id || !user_id) return res.status(400).json({ error: 'Missing client_id or user_id' });
+    if (!mustBeInScope(req, client_id)) return res.status(403).json({ error: 'Forbidden' });
 
-    const { error } = await supabase.from('client_members')
-      .delete().eq('client_id', client_id).eq('user_id', user_id);
+    // prevent self-revoking an owner (safety)
+    const { data: row, error } = await supabaseAdmin
+      .from('client_members')
+      .select('role')
+      .eq('client_id', client_id)
+      .eq('user_id', user_id)
+      .maybeSingle();
     if (error) return res.status(400).json({ error: error.message });
+    if (row?.role === 'owner') {
+      return res.status(400).json({ error: 'Cannot revoke an owner' });
+    }
+
+    const { error: delErr } = await supabaseAdmin
+      .from('client_members')
+      .delete()
+      .eq('client_id', client_id)
+      .eq('user_id', user_id);
+    if (delErr) return res.status(400).json({ error: delErr.message });
+
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 module.exports = router;

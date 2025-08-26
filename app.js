@@ -1,118 +1,142 @@
 // app.js
-require('dotenv').config();
+'use strict';
 
+// ----- Env & deps -----
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const morgan = require('morgan');
 const { createClient } = require('@supabase/supabase-js');
-const dashboardRouter = require('./routes/dashboard');
 
+const PORT = process.env.PORT || 3000;
+const CORS_ORIGINS =
+  (process.env.CORS_ORIGINS || process.env.FRONTEND_URL || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+}
+
+// Admin client (server-only)
+const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
+});
+
+// ----- App -----
 const app = express();
 
-/* ------------------------- CORS ------------------------- */
-const origins = (process.env.CORS_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-// allow credentials so Authorization header is passed through
 app.use(
   cors({
-    origin: origins.length ? origins : true,
-    credentials: true,
+    origin: (origin, cb) => {
+      // Allow same-origin & local dev when origin is undefined (e.g. curl)
+      if (!origin) return cb(null, true);
+      if (CORS_ORIGINS.length === 0) return cb(null, true);
+      cb(null, CORS_ORIGINS.includes(origin));
+    },
+    credentials: false,
+    allowedHeaders: ['Authorization', 'Content-Type'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   })
 );
+app.use(express.json({ limit: '10mb' }));
+app.use(morgan('tiny'));
 
-// Basic body parsers (file uploads use multer in their routers)
-app.use(express.json({ limit: '4mb' }));
-app.use(express.urlencoded({ extended: true }));
+// ----- Auth helpers -----
+async function getUserFromReq(req) {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return { user: null, token: null };
 
-/* -------------------- Supabase Admin -------------------- */
-const supabaseAdmin = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  { auth: { persistSession: false } }
-);
+  const { data, error } = await supabaseAdmin.auth.getUser(token);
+  if (error) return { user: null, token: null };
+  return { user: data?.user || null, token };
+}
 
-/* -------------------- Auth middleware ------------------- */
-// Extract Bearer token and validate it against Supabase Admin
+async function loadMemberships(userId) {
+  if (!userId) return { clientIds: [], memberships: [] };
+  const { data, error } = await supabaseAdmin
+    .from('client_members')
+    .select('client_id, user_id, role, name')
+    .eq('user_id', userId);
+  if (error) return { clientIds: [], memberships: [] };
+  const clientIds = (data || []).map(r => r.client_id);
+  return { clientIds, memberships: data || [] };
+}
+
 async function requireAuth(req, res, next) {
-  const h = req.headers.authorization || '';
-  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Missing bearer token' });
-
   try {
-    const { data, error } = await supabaseAdmin.auth.getUser(token);
-    if (error || !data?.user) return res.status(401).json({ error: 'Invalid token' });
+    const { user, token } = await getUserFromReq(req);
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
+    req.user = user;
+    req.accessToken = token;
 
-    req.user = { id: data.user.id, email: data.user.email || null };
+    const { clientIds, memberships } = await loadMemberships(user.id);
+    req.clientIds = clientIds;
+    req.client_memberships = memberships;
     next();
   } catch (e) {
-    return res.status(401).json({ error: 'Invalid token' });
+    res.status(401).json({ error: 'Unauthorized' });
   }
 }
 
-/* ----------------- Client scope middleware --------------- */
-// Support either column naming scheme in client_members:
-// - client_id / user_id
-// - client_id_uuid / user_id_uuid
-async function withClientScope(req, _res, next) {
+// Small wrapper so we can mount optional routers without crashing if file missing
+function mountOptional(prefix, middlewares, path) {
   try {
-    const uid = req.user?.id;
-    if (!uid) {
-      req.clientIds = [];
-      return next();
+    // eslint-disable-next-line import/no-dynamic-require, global-require
+    const router = require(path);
+    if (Array.isArray(middlewares) && middlewares.length) {
+      app.use(prefix, ...middlewares, router);
+    } else {
+      app.use(prefix, router);
     }
-
-    const { data, error } = await supabaseAdmin.from('client_members').select('*');
-    if (error) {
-      req.clientIds = [];
-      return next();
+    // eslint-disable-next-line no-console
+    console.log(`[mount] ${prefix} -> ${path}`);
+  } catch (e) {
+    if (e.code === 'MODULE_NOT_FOUND') {
+      console.warn(`[mount:skip] ${path} (not found)`);
+    } else {
+      console.warn(`[mount:skip] ${path} (${e.message})`);
     }
-
-    const myRows = (data || []).filter(
-      (r) => (r.user_id ?? r.user_id_uuid) === uid
-    );
-
-    req.clientIds = myRows
-      .map((r) => (r.client_id ?? r.client_id_uuid))
-      .filter(Boolean);
-
-    next();
-  } catch {
-    req.clientIds = [];
-    next();
   }
 }
 
-function injectClientMemberships(req, _res, next) {
-  req.client_memberships = Array.isArray(req.clientIds) ? req.clientIds : [];
-  next();
-}
-
-/* ---------------------- Health/Auth ---------------------- */
-app.get('/healthz', (_req, res) => res.json({ ok: true }));
-app.get('/auth/me', requireAuth, (req, res) =>
-  res.json({ user: req.user, memberships: req.client_memberships || [] })
+// ----- Health -----
+app.get('/healthz', (_req, res) =>
+  res.json({ ok: true, service: 'interview-agent-backend', time: new Date().toISOString() })
 );
 
-/* ------------------------ Routers ------------------------ */
-// NOTE: Ensure these files exist in ./routes
-const clientsRouter = require('./routes/clients');       // /clients/my, /clients/members, /clients/invite, etc.
-const rolesRouter = require('./routes/roles');           // /roles (GET/POST)
-const rolesUploadRouter = require('./routes/rolesUpload'); // /roles/upload-jd
+// ----- Core routers -----
+// Clients (in this message)
+mountOptional('/clients', [requireAuth], './routes/clients');
 
-app.use('/clients', requireAuth, withClientScope, injectClientMemberships, clientsRouter);
-app.use('/roles',   requireAuth, withClientScope, injectClientMemberships, rolesRouter);
-app.use('/roles',   requireAuth, withClientScope, injectClientMemberships, rolesUploadRouter);
-app.use('/dashboard', requireAuth, withClientScope, injectClientMemberships, dashboardRouter);
+// Roles CRUD
+mountOptional('/roles', [requireAuth], './routes/roles');
+// Role file upload (pdf/doc/docx JD) — used by RoleNew.jsx
+mountOptional('/roles', [requireAuth], './routes/rolesUpload');
 
-/* ---------------------- Default root --------------------- */
+// Private file signer (transcripts/analysis) used by Candidates page
+mountOptional('/files', [requireAuth], './routes/files');
+
+// Reports (generate/download)
+mountOptional('/reports', [requireAuth], './routes/reports');
+
+// Dashboard (legacy-compatible endpoint powering Candidates page)
+mountOptional('/dashboard', [requireAuth], './routes/dashboard');
+
+// Tavus webhook (unauthenticated, signature handled inside the route)
+mountOptional('/webhook/tavus', [], './routes/webhookTavus');
+
+// Root
 app.get('/', (_req, res) => res.json({ ok: true }));
 
-/* ------------------------ Startup ------------------------ */
-const PORT = process.env.PORT || 3001;
-if (require.main === module) {
-  app.listen(PORT, () => console.log(`API listening on :${PORT}`));
-}
+// ----- Start -----
+app.listen(PORT, () => {
+  // eslint-disable-next-line no-console
+  console.log(`⚙️  backend listening on :${PORT}`);
+});
 
 module.exports = app;
