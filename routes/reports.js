@@ -1,41 +1,61 @@
 // routes/reports.js
-const router = require('express').Router();
-const { requireAuth, withClientScope, supabase } = require('../middleware/auth');
+// Factory router. ctx: { supabase, auth, withClientScope, buckets }
 
-/**
- * GET /reports/:id/download
- * Looks up report by id scoped to client, generates signed URL from private bucket, and redirects (302).
- * Falls back to streaming if sign fails.
- */
-router.get('/:id/download', requireAuth, withClientScope, async (req, res) => {
-  const id = req.params.id;
+const express = require('express');
 
-  const { data, error } = await supabase
-    .from('reports')
-    .select('id, client_id, storage_path, mime_type')
-    .eq('id', id)
-    .eq('client_id', req.client.id)
-    .single();
+module.exports = function makeReportsRouter({ supabase, auth, withClientScope, buckets }) {
+  const router = express.Router();
+  const bucket = (buckets && buckets.reports) || 'reports';
 
-  if (error || !data) return res.status(404).json({ error: 'Report not found' });
+  // GET /reports/:id/download
+  // Try to find report path in DB; if absent, fall back to a conventional path.
+  router.get('/:id/download', auth, withClientScope, async (req, res) => {
+    try {
+      const id = req.params.id;
+      if (!id) return res.status(400).send('Missing id');
 
-  const bucket = process.env.SUPABASE_REPORTS_BUCKET || 'reports';
-  const ttl = Number(process.env.SIGNED_URL_TTL_SECONDS || 60);
+      // Try DB lookup first
+      let storagePath = null;
+      try {
+        const { data } = await supabase
+          .from('reports')
+          .select('storage_path, path, file_path, client_id')
+          .eq('id', id)
+          .limit(1)
+          .single();
 
-  const { data: signed, error: signErr } =
-    await supabase.storage.from(bucket).createSignedUrl(data.storage_path, ttl);
+        storagePath =
+          data?.storage_path || data?.path || data?.file_path || null;
 
-  if (!signErr && signed?.signedUrl) {
-    return res.redirect(302, signed.signedUrl);
-  }
+        // If still unknown, fall back to a conventional path with client
+        if (!storagePath) {
+          const clientId =
+            req.query.client_id || req.client?.id || data?.client_id || null;
+          storagePath = clientId
+            ? `${clientId}/reports/${id}.pdf`
+            : `reports/${id}.pdf`;
+        }
+      } catch {
+        // If the table doesn’t exist in this env, use generic fallback path
+        storagePath = `reports/${id}.pdf`;
+      }
 
-  // Last resort: stream through server (avoid if large)
-  const { data: dl, error: dlErr } =
-    await supabase.storage.from(bucket).download(data.storage_path);
-  if (dlErr || !dl) return res.status(500).json({ error: 'Unable to fetch report' });
+      // Generate a short-lived signed URL and redirect
+      const { data: signed, error } = await supabase.storage
+        .from(bucket)
+        .createSignedUrl(storagePath, 60);
 
-  res.setHeader('Content-Type', data.mime_type || 'application/pdf');
-  return dl.arrayBuffer().then(buf => res.send(Buffer.from(buf)));
-});
+      if (error || !signed?.signedUrl) {
+        console.error('[GET /reports/:id/download] storage error', error || 'no url');
+        return res.status(404).send('Report not found');
+      }
 
-module.exports = router;
+      return res.redirect(302, signed.signedUrl);
+    } catch (e) {
+      console.error('[GET /reports/:id/download] unexpected', e);
+      return res.status(500).send('Server error');
+    }
+  });
+
+  return router;
+};
