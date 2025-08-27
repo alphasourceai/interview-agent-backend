@@ -1,93 +1,98 @@
-// routes/dashboard.js — provides /dashboard/candidates (& /interviews for legacy)
+// routes/dashboard.js
 const express = require('express');
-const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
+
+const router = express.Router();
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
-}
-const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false },
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { autoRefreshToken: false, persistSession: false },
+  global: { fetch }
 });
 
-// ---------- helpers ----------
-function normalizeCandidateRow(row) {
-  const summary = row.analysis_summary || {};
-  const resume_score =
-    (typeof summary.resume_score === 'number' ? summary.resume_score : null) ??
-    (typeof summary.overall_resume_match_percent === 'number'
-      ? summary.overall_resume_match_percent
-      : null);
-
-  const interview_score =
-    typeof summary.interview_score === 'number' ? summary.interview_score : null;
-
-  const overall_score =
-    (typeof summary.overall_score === 'number' ? summary.overall_score : null) ??
-    (resume_score != null && interview_score != null
-      ? Math.round((resume_score + interview_score) / 2)
-      : resume_score ?? interview_score ?? null);
-
-  return {
-    id: row.id,
-    created_at: row.created_at,
-    email: row.email,
-    name: [row.first_name, row.last_name].filter(Boolean).join(' ') || summary.name || null,
-    role: row.roles?.title || null,
-    interview_type: row.roles?.interview_type || null,
-    resume_url: row.resume_url || null,
-    interview_video_url: row.interview_video_url || null,
-    analysis_summary: summary,
-    resume_score,
-    interview_score,
-    overall_score,
-  };
+// Helper: ensure client_id provided and within req.clientIds
+function ensureClientScope(req, res) {
+  const clientId = req.query.client_id;
+  if (!clientId) {
+    res.status(400).json({ error: 'client_id required' });
+    return null;
+  }
+  const allowed = (req.clientIds || []).includes(clientId);
+  if (!allowed) {
+    res.status(403).json({ error: 'No client scope' });
+    return null;
+  }
+  return clientId;
 }
 
-async function fetchCandidatesByClient(client_id) {
-  const { data, error } = await supabaseAdmin
+// Legacy endpoint some FE code still hits (kept to avoid crashes)
+router.get('/interviews', async (req, res) => {
+  const clientId = ensureClientScope(req, res);
+  if (!clientId) return;
+  // If you eventually re-introduce interviews, fetch here.
+  return res.json({ items: [] });
+});
+
+// The real Candidates endpoint the Candidates tab should call
+router.get('/candidates', async (req, res) => {
+  const clientId = ensureClientScope(req, res);
+  if (!clientId) return;
+
+  // Pull candidates for this client
+  const { data: rows, error } = await supabase
     .from('candidates')
-    .select(
-      `
-      id, created_at, email, first_name, last_name, resume_url, interview_video_url, analysis_summary,
-      roles:role_id ( id, title, interview_type, client_id )
-    `,
-    )
-    .eq('roles.client_id', client_id)
+    .select('id, first_name, last_name, email, role_id, analysis_summary, resume_url, interview_video_url, created_at, status')
+    .eq('client_id', clientId)
     .order('created_at', { ascending: false });
 
-  if (error) throw error;
-  return (data || []).map(normalizeCandidateRow);
-}
-
-// ---------- routes ----------
-
-// GET /dashboard/candidates?client_id=...
-router.get('/candidates', async (req, res) => {
-  const client_id = req.query.client_id;
-  if (!client_id) return res.status(400).json({ error: 'client_id is required' });
-
-  try {
-    const rows = await fetchCandidatesByClient(client_id);
-    res.json({ rows });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  if (error) {
+    console.error('[dashboard/candidates] supabase error', error);
+    return res.status(500).json({ error: 'query failed' });
   }
-});
 
-// Legacy alias kept for older FE: /dashboard/interviews
-router.get('/interviews', async (req, res) => {
-  const client_id = req.query.client_id;
-  if (!client_id) return res.status(400).json({ error: 'client_id is required' });
-
-  try {
-    const rows = await fetchCandidatesByClient(client_id);
-    res.json({ rows });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  // Join role titles
+  const roleIds = Array.from(new Set(rows.filter(r => r.role_id).map(r => r.role_id)));
+  let rolesById = {};
+  if (roleIds.length) {
+    const { data: roles, error: rErr } = await supabase
+      .from('roles')
+      .select('id, title')
+      .in('id', roleIds);
+    if (rErr) {
+      console.error('[dashboard/candidates] roles join error', rErr);
+    } else {
+      rolesById = Object.fromEntries(roles.map(r => [r.id, r.title]));
+    }
   }
+
+  // Map analysis_summary JSON into scores (tolerant of missing keys)
+  const mapped = rows.map(r => {
+    let resumeScore = null, interviewScore = null, overallScore = null;
+    try {
+      const a = r.analysis_summary || {};
+      // Support both snake_case and the older keys we used
+      resumeScore    = a.resume_score ?? a.resume ?? a.resume_match_percent ?? null;
+      interviewScore = a.interview_score ?? a.interview ?? null;
+      overallScore   = a.overall_score ?? a.overall ?? a.overall_resume_match_percent ?? null;
+    } catch {}
+
+    return {
+      id: r.id,
+      name: [r.first_name, r.last_name].filter(Boolean).join(' ') || '—',
+      email: r.email || '—',
+      role: rolesById[r.role_id] || '—',
+      resume_score: isFinite(resumeScore) ? Number(resumeScore) : null,
+      interview_score: isFinite(interviewScore) ? Number(interviewScore) : null,
+      overall_score: isFinite(overallScore) ? Number(overallScore) : null,
+      created_at: r.created_at,
+      resume_url: r.resume_url || null,
+      interview_video_url: r.interview_video_url || null,
+      analysis_summary: r.analysis_summary || {}
+    };
+  });
+
+  res.json({ items: mapped });
 });
 
 module.exports = router;
