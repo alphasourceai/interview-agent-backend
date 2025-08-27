@@ -11,7 +11,7 @@ const path = require('path');
 
 // Use the shared auth + supabase from middleware/auth.js
 // (This file should export: { requireAuth: auth, withClientScope, supabase })
-const { requireAuth: auth, withClientScope, supabase } = require('./middleware/auth');
+const { requireAuth: auth, withClientScope, supabase } = require('./src/middleware/auth');
 
 // ---------------------------------------------------------------------------
 // Env / constants
