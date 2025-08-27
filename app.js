@@ -4,11 +4,11 @@ require('dotenv').config();
 const express = require('express');
 const morgan = require('morgan');
 const cors = require('cors');
-const fs = require('fs');
 const path = require('path');
 
-// NOTE: your middleware is under src/middleware/auth.js
-// It must export: { requireAuth, withClientScope, supabase }
+/* ------------------------------------------------------------------------- */
+/* Auth middleware (your repo stores it under src/middleware/auth.js)        */
+/* ------------------------------------------------------------------------- */
 const { requireAuth: auth, withClientScope, supabase } = require('./src/middleware/auth');
 
 /* ------------------------------------------------------------------------- */
@@ -66,19 +66,29 @@ app.use(express.urlencoded({ extended: true }));
 /* Helpers                                                                   */
 /* ------------------------------------------------------------------------- */
 
+/**
+ * Robust require that lets Node resolve extensions.
+ * - Tries requiring the resolved absolute path as-is.
+ * - If that fails, tries appending ".js".
+ * - Returns null with a warning if it still fails.
+ */
 function safeRequire(relPath) {
-  const full = path.resolve(__dirname, relPath);
+  const abs = path.resolve(__dirname, relPath);
   try {
-    if (!fs.existsSync(full)) {
-      console.warn(`[require] Not found: ${relPath}`);
+    // Let Node do normal resolution (it will add .js, .json, etc.)
+    // eslint-disable-next-line import/no-dynamic-require, global-require
+    const mod = require(abs);
+    return mod && mod.__esModule ? (mod.default || mod) : mod;
+  } catch (e1) {
+    try {
+      // Try with explicit .js for environments where resolution differs
+      // eslint-disable-next-line import/no-dynamic-require, global-require
+      const mod2 = require(abs + '.js');
+      return mod2 && mod2.__esModule ? (mod2.default || mod2) : mod2;
+    } catch (e2) {
+      console.warn(`[require] Not found or failed: ${relPath} (${e2.message})`);
       return null;
     }
-    // eslint-disable-next-line import/no-dynamic-require, global-require
-    const mod = require(full);
-    return mod && mod.__esModule ? mod.default || mod : mod;
-  } catch (e) {
-    console.error(`[require] Failed to load ${relPath}`, e);
-    return null;
   }
 }
 
@@ -183,4 +193,3 @@ app.listen(PORT, () => {
   console.log(`api listening on :${PORT}`);
   console.log(`[cors] allowed origins: ${allowedOrigins.length ? allowedOrigins.join(', ') : '(permissive)'}`);
 });
-

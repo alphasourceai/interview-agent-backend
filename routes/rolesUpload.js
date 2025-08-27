@@ -1,49 +1,94 @@
 // routes/rolesUpload.js
+'use strict';
+
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
-const { randomUUID } = require('crypto');
+const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+}
+const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
+});
+
+const KB_BUCKET = process.env.SUPABASE_KB_BUCKET || 'kbs';
+
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
+  fileFilter: (_req, file, cb) => {
+    const okExt = ['.pdf', '.doc', '.docx'];
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    if (!okExt.includes(ext)) return cb(new Error('Only pdf/doc/docx allowed'));
+    cb(null, true);
+  },
+});
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  { auth: { persistSession: false } }
-);
+function okContentType(filename) {
+  const ext = path.extname(filename || '').toLowerCase();
+  if (ext === '.pdf') return 'application/pdf';
+  if (ext === '.doc') return 'application/msword';
+  if (ext === '.docx') {
+    return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  }
+  return 'application/octet-stream';
+}
 
-function sanitize(name) { return String(name || 'file').replace(/[^\w.\-]+/g, '_'); }
+function slug(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\-_.]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
 
+/**
+ * POST /roles/upload-jd?client_id=...&role_id=...(optional)
+ * FormData: file
+ */
 router.post('/upload-jd', upload.single('file'), async (req, res) => {
   try {
-    const clientId = req.query.client_id;
-    if (!clientId) return res.status(400).json({ error: 'client_id required' });
-    if (!Array.isArray(req.clientIds) || !req.clientIds.includes(clientId)) {
-      return res.status(403).json({ error: 'No client scope' });
-    }
-    if (!req.file) return res.status(400).json({ error: 'file required' });
+    // auth + scope middlewares mounted at app level
+    const uid = req.user?.id;
+    if (!uid) return res.status(401).json({ error: 'Unauthorized' });
 
-    const bucket = process.env.SUPABASE_KB_BUCKET || 'kbs';
-    const ext = path.extname(req.file.originalname || '').toLowerCase();
-    const base = sanitize(path.basename(req.file.originalname || `jd${ext || ''}`));
-    const key = `jd/${clientId}/${Date.now()}_${randomUUID()}_${base}`;
+    const client_id = req.query.client_id || req.body.client_id;
+    if (!client_id) return res.status(400).json({ error: 'Missing client_id' });
 
-    const { error } = await supabase.storage.from(bucket).upload(key, req.file.buffer, {
-      contentType: req.file.mimetype || 'application/octet-stream',
-      upsert: true,
+    const scope = Array.isArray(req.client_memberships) ? req.client_memberships : (req.clientIds || []);
+    if (!scope.includes(client_id)) return res.status(403).json({ error: 'Forbidden' });
+
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const { originalname, buffer } = req.file;
+    const ext = path.extname(originalname || '').toLowerCase();
+    const ctype = okContentType(originalname);
+    const rolePart = req.query.role_id ? `${req.query.role_id}/` : '';
+    const namePart = slug(path.basename(originalname, ext));
+    const key = `${client_id}/${rolePart}${Date.now()}_${crypto.randomBytes(4).toString('hex')}_${namePart}${ext}`;
+
+    const { data, error } = await supabaseAdmin
+      .storage
+      .from(KB_BUCKET)
+      .upload(key, buffer, { contentType: ctype, upsert: true });
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    // Return a stable "bucket/path" string for storing on roles.meta
+    return res.json({
+      ok: true,
+      bucket: KB_BUCKET,
+      path_in_bucket: key,
+      storage_path: `${KB_BUCKET}/${key}`,
     });
-    if (error) {
-      console.error('JD upload error:', error.message);
-      const msg = /Bucket not found/i.test(error.message) ? 'Bucket not found. Check SUPABASE_KB_BUCKET.' : error.message;
-      return res.status(500).json({ error: `Upload failed: ${msg}` });
-    }
-
-    res.json({ bucket, path: key, original_name: req.file.originalname, mime_type: req.file.mimetype, size: req.file.size });
   } catch (e) {
-    console.error('JD upload exception:', e);
-    res.status(500).json({ error: 'Upload failed' });
+    res.status(500).json({ error: e.message });
   }
 });
 

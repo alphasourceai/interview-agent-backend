@@ -1,159 +1,103 @@
 // routes/roles.js
-const express = require('express');
+const router = require('express').Router();
 const multer = require('multer');
-const { createClient } = require('@supabase/supabase-js');
-
-const router = express.Router();
-
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const BUCKET = process.env.SUPABASE_KB_BUCKET || 'jd';
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { autoRefreshToken: false, persistSession: false },
-});
-
-// -------------------------------
-// helpers
-// -------------------------------
-function ensureClientScope(req, res) {
-  const clientId = req.query.client_id || req.body.client_id;
-  if (!clientId) {
-    res.status(400).json({ error: 'client_id required' });
-    return null;
-  }
-  const allowed = (req.clientIds || []).includes(clientId);
-  if (!allowed) {
-    res.status(403).json({ error: 'No client scope' });
-    return null;
-  }
-  return clientId;
-}
-
-function sanitizeFilename(name) {
-  return (name || 'file')
-    .replace(/[^A-Za-z0-9._-]+/g, '_')
-    .slice(0, 120);
-}
-
-const ALLOWED_MIME = new Set([
-  'application/pdf',
-  'application/msword',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-]);
+const { requireAuth, withClientScope, supabase } = require('../middleware/auth');
+const { parseBufferToText } = require('../utils/jdParser');
 
 const upload = multer({
-  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-  fileFilter: (_req, file, cb) => {
-    if (ALLOWED_MIME.has(file.mimetype)) return cb(null, true);
-    cb(new Error(`Upload failed: mime type ${file.mimetype} is not supported`));
-  },
 });
 
-// -------------------------------
-// GET /roles?client_id=...
-// -------------------------------
-router.get('/', async (req, res) => {
-  const clientId = ensureClientScope(req, res);
-  if (!clientId) return;
+const JD_MIME_ALLOW = new Set([
+  'application/pdf',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+]);
 
+// List roles (stable)
+router.get('/', requireAuth, withClientScope, async (req, res) => {
   const { data, error } = await supabase
     .from('roles')
     .select('id, title, interview_type, created_at')
-    .eq('client_id', clientId)
+    .eq('client_id', req.client.id)
     .order('created_at', { ascending: false });
-
-  if (error) {
-    console.error('[roles] list error', error);
-    return res.status(500).json({ error: 'query failed' });
-  }
-  res.json({ items: data || [] });
+  if (error) return res.status(500).json({ error: 'Failed to load roles' });
+  res.json(data);
 });
 
-// -------------------------------
-// POST /roles  (create role)
-// body: { client_id, title, interview_type, jd_url?, manual_questions? }
-// NOTE: we insert defensively and retry with a minimal column set if schema differs
-// -------------------------------
-router.post('/', express.json(), async (req, res) => {
-  const clientId = ensureClientScope(req, res);
-  if (!clientId) return;
-
-  const { title, interview_type, jd_url, manual_questions } = req.body || {};
+// Create role (stable)
+router.post('/', requireAuth, withClientScope, async (req, res) => {
+  const { title, interview_type } = req.body || {};
   if (!title) return res.status(400).json({ error: 'title required' });
 
-  // try with richer columns first
-  const attempts = [
-    { client_id: clientId, title, interview_type, jd_url, manual_questions },
-    { client_id: clientId, title, interview_type, jd_url },
-    { client_id: clientId, title, interview_type },
-    { client_id: clientId, title },
-  ];
+  const { data, error } = await supabase
+    .from('roles')
+    .insert({ client_id: req.client.id, title, interview_type })
+    .select('id')
+    .single();
 
-  for (const row of attempts) {
-    // remove undefined keys
-    Object.keys(row).forEach(k => row[k] === undefined && delete row[k]);
-
-    const { data, error } = await supabase.from('roles').insert(row).select().limit(1).maybeSingle();
-    if (!error && data) return res.status(201).json({ role: data });
-
-    // if the error is a column-not-found, continue to next attempt
-    const msg = (error && (error.message || error.toString())) || '';
-    const isSchemaMismatch = /column .* does not exist|invalid input/i.test(msg);
-    if (!isSchemaMismatch) {
-      console.error('[roles] create error', error);
-      return res.status(500).json({ error: 'create failed' });
-    }
-  }
-
-  // if we got here, we could not find a compatible column set
-  return res.status(500).json({ error: 'create failed (schema mismatch)' });
+  if (error) return res.status(500).json({ error: 'Failed to create role' });
+  res.json({ id: data.id });
 });
 
-// -------------------------------
-// POST /roles/upload-jd?client_id=...  (multipart, field: file)
-// returns: { path, signed_url, mime, size }
-// -------------------------------
-router.post('/upload-jd', upload.single('file'), async (req, res) => {
-  const clientId = ensureClientScope(req, res);
-  if (!clientId) return;
+/**
+ * POST /roles/upload-jd?client_id=...&role_id=...
+ * multipart/form-data: file
+ * Parses PDF/DOCX → saves original file to kbs/, saves a .txt next to it. Returns paths + parsed text.
+ */
+router.post('/upload-jd', requireAuth, withClientScope, upload.single('file'), async (req, res) => {
+  try {
+    const roleId = req.query.role_id || req.body?.role_id;
+    if (!roleId) return res.status(400).json({ error: 'role_id is required' });
+    if (!req.file) return res.status(400).json({ error: 'file is required' });
 
-  if (!req.file) return res.status(400).json({ error: 'file required' });
+    const { originalname, mimetype, buffer } = req.file;
+    if (!JD_MIME_ALLOW.has(mimetype)) {
+      return res.status(415).json({ error: 'Only PDF or DOCX are supported for now' });
+    }
 
-  const { originalname, mimetype, buffer, size } = req.file;
-  const ts = Date.now();
-  const fname = sanitizeFilename(originalname);
-  const path = `roles/${clientId}/${ts}-${fname}`;
+    // Parse to text
+    const text = await parseBufferToText(buffer, mimetype, originalname);
 
-  // upload to Supabase Storage
-  const { error: upErr } = await supabase
-    .storage
-    .from(BUCKET)
-    .upload(path, buffer, { contentType: mimetype, upsert: true });
+    // Store original
+    const base = `kbs/${req.client.id}/${roleId}/jd/${Date.now()}-${originalname}`;
+    const { error: upErr1 } = await supabase.storage.from(process.env.SUPABASE_KB_BUCKET || 'kbs').upload(base, buffer, {
+      contentType: mimetype,
+      upsert: false
+    });
+    if (upErr1) return res.status(500).json({ error: 'Failed to store JD file' });
 
-  if (upErr) {
-    console.error('[roles] upload error', upErr);
-    return res.status(500).json({ error: upErr.message || 'upload failed' });
+    // Store .txt alongside
+    const txtPath = base.replace(/\.[^.]+$/, '') + '.txt';
+    const { error: upErr2 } = await supabase.storage.from(process.env.SUPABASE_KB_BUCKET || 'kbs')
+      .upload(txtPath, Buffer.from(text, 'utf8'), { contentType: 'text/plain', upsert: true });
+    if (upErr2) return res.status(500).json({ error: 'Failed to store JD text' });
+
+    // Persist reference on role if jd_path column exists, otherwise just return payload.
+    let jdSaved = false;
+    try {
+      const upd = await supabase.from('roles').update({ jd_path: base }).eq('id', roleId);
+      if (!upd.error) jdSaved = true;
+    } catch (_) {}
+
+    // Try to persist jd_text if column exists
+    try {
+      const upd2 = await supabase.from('roles').update({ jd_text: text }).eq('id', roleId);
+      if (!upd2.error) jdSaved = true;
+    } catch (_) {}
+
+    return res.json({
+      ok: true,
+      role_id: roleId,
+      path: base,
+      text_path: txtPath,
+      mime: mimetype,
+      size_bytes: buffer.length,
+      parsed_text_preview: text.slice(0, 1200)
+    });
+  } catch (e) {
+    const status = e.status || 500;
+    return res.status(status).json({ error: e.message || 'JD upload failed' });
   }
-
-  // create a 7-day signed URL (works even if bucket is private)
-  const { data: signed, error: signErr } = await supabase
-    .storage
-    .from(BUCKET)
-    .createSignedUrl(path, 60 * 60 * 24 * 7);
-
-  if (signErr) {
-    console.error('[roles] signed url error', signErr);
-    return res.status(500).json({ error: 'could not sign url', path });
-  }
-
-  res.json({
-    path,
-    signed_url: signed?.signedUrl,
-    mime: mimetype,
-    size,
-  });
 });
 
 module.exports = router;
