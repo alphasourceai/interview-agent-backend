@@ -1,103 +1,78 @@
 // routes/roles.js
-const router = require('express').Router();
-const multer = require('multer');
-const { requireAuth, withClientScope, supabase } = require('../middleware/auth');
-const { parseBufferToText } = require('../utils/jdParser');
+// Factory router. ctx is provided by app.js: { supabase, auth, withClientScope, buckets }
 
-const upload = multer({
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
-});
+const express = require('express');
 
-const JD_MIME_ALLOW = new Set([
-  'application/pdf',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-]);
+module.exports = function makeRolesRouter({ supabase, auth, withClientScope }) {
+  const router = express.Router();
 
-// List roles (stable)
-router.get('/', requireAuth, withClientScope, async (req, res) => {
-  const { data, error } = await supabase
-    .from('roles')
-    .select('id, title, interview_type, created_at')
-    .eq('client_id', req.client.id)
-    .order('created_at', { ascending: false });
-  if (error) return res.status(500).json({ error: 'Failed to load roles' });
-  res.json(data);
-});
+  // GET /roles?client_id=...
+  // Returns a list of roles for the specified (or scoped) client.
+  router.get('/', auth, withClientScope, async (req, res) => {
+    try {
+      const clientId =
+        req.query.client_id ||
+        req.client?.id ||
+        req.clientScope?.defaultClientId ||
+        null;
 
-// Create role (stable)
-router.post('/', requireAuth, withClientScope, async (req, res) => {
-  const { title, interview_type } = req.body || {};
-  if (!title) return res.status(400).json({ error: 'title required' });
+      if (!clientId) return res.json({ roles: [] });
 
-  const { data, error } = await supabase
-    .from('roles')
-    .insert({ client_id: req.client.id, title, interview_type })
-    .select('id')
-    .single();
+      const { data, error } = await supabase
+        .from('roles')
+        .select('*')
+        .eq('client_id', clientId)
+        .order('created_at', { ascending: false });
 
-  if (error) return res.status(500).json({ error: 'Failed to create role' });
-  res.json({ id: data.id });
-});
+      if (error) {
+        console.error('[GET /roles] supabase error', error);
+        return res.status(500).json({ error: 'Failed to fetch roles' });
+      }
 
-/**
- * POST /roles/upload-jd?client_id=...&role_id=...
- * multipart/form-data: file
- * Parses PDF/DOCX → saves original file to kbs/, saves a .txt next to it. Returns paths + parsed text.
- */
-router.post('/upload-jd', requireAuth, withClientScope, upload.single('file'), async (req, res) => {
-  try {
-    const roleId = req.query.role_id || req.body?.role_id;
-    if (!roleId) return res.status(400).json({ error: 'role_id is required' });
-    if (!req.file) return res.status(400).json({ error: 'file is required' });
-
-    const { originalname, mimetype, buffer } = req.file;
-    if (!JD_MIME_ALLOW.has(mimetype)) {
-      return res.status(415).json({ error: 'Only PDF or DOCX are supported for now' });
+      return res.json({ roles: data || [] });
+    } catch (e) {
+      console.error('[GET /roles] unexpected', e);
+      return res.status(500).json({ error: 'Server error' });
     }
+  });
 
-    // Parse to text
-    const text = await parseBufferToText(buffer, mimetype, originalname);
-
-    // Store original
-    const base = `kbs/${req.client.id}/${roleId}/jd/${Date.now()}-${originalname}`;
-    const { error: upErr1 } = await supabase.storage.from(process.env.SUPABASE_KB_BUCKET || 'kbs').upload(base, buffer, {
-      contentType: mimetype,
-      upsert: false
-    });
-    if (upErr1) return res.status(500).json({ error: 'Failed to store JD file' });
-
-    // Store .txt alongside
-    const txtPath = base.replace(/\.[^.]+$/, '') + '.txt';
-    const { error: upErr2 } = await supabase.storage.from(process.env.SUPABASE_KB_BUCKET || 'kbs')
-      .upload(txtPath, Buffer.from(text, 'utf8'), { contentType: 'text/plain', upsert: true });
-    if (upErr2) return res.status(500).json({ error: 'Failed to store JD text' });
-
-    // Persist reference on role if jd_path column exists, otherwise just return payload.
-    let jdSaved = false;
+  // POST /roles  { title, description, jd_text }
+  // Minimal create; accepts JSON or FormData (when going through api.post it’s JSON).
+  router.post('/', auth, withClientScope, async (req, res) => {
     try {
-      const upd = await supabase.from('roles').update({ jd_path: base }).eq('id', roleId);
-      if (!upd.error) jdSaved = true;
-    } catch (_) {}
+      const clientId =
+        req.body.client_id ||
+        req.client?.id ||
+        req.clientScope?.defaultClientId ||
+        null;
 
-    // Try to persist jd_text if column exists
-    try {
-      const upd2 = await supabase.from('roles').update({ jd_text: text }).eq('id', roleId);
-      if (!upd2.error) jdSaved = true;
-    } catch (_) {}
+      if (!clientId) return res.status(400).json({ error: 'client_id required' });
 
-    return res.json({
-      ok: true,
-      role_id: roleId,
-      path: base,
-      text_path: txtPath,
-      mime: mimetype,
-      size_bytes: buffer.length,
-      parsed_text_preview: text.slice(0, 1200)
-    });
-  } catch (e) {
-    const status = e.status || 500;
-    return res.status(status).json({ error: e.message || 'JD upload failed' });
-  }
-});
+      const payload = {
+        client_id: clientId,
+        title: req.body.title || 'Untitled Role',
+        description: req.body.description || null,
+        jd_text: req.body.jd_text || null,
+      };
 
-module.exports = router;
+      const { data, error } = await supabase
+        .from('roles')
+        .insert(payload)
+        .select()
+        .limit(1)
+        .single();
+
+      if (error) {
+        console.error('[POST /roles] supabase error', error);
+        return res.status(500).json({ error: 'Failed to create role' });
+      }
+
+      return res.json({ role: data });
+    } catch (e) {
+      console.error('[POST /roles] unexpected', e);
+      return res.status(500).json({ error: 'Server error' });
+    }
+  });
+
+  return router;
+};

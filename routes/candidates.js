@@ -1,83 +1,64 @@
+// routes/candidates.js
+// Factory router. ctx: { supabase, auth, withClientScope }
+// Minimal endpoints to satisfy existing FE calls.
+
 const express = require('express');
-const router = express.Router();
-const { supabase } = require('../supabaseClient');
 
-router.get('/', async (req, res) => {
-  const { data, error } = await supabase
-    .from('candidates')
-    .select('*')
-    .order('created_at', { ascending: false });
+module.exports = function makeCandidatesRouter({ supabase, auth, withClientScope }) {
+  const router = express.Router();
 
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
+  // GET /candidates?role_id=...  OR  /candidates?client_id=...
+  router.get('/', auth, withClientScope, async (req, res) => {
+    try {
+      const roleId = req.query.role_id || null;
+      const clientId =
+        req.query.client_id ||
+        req.client?.id ||
+        req.clientScope?.defaultClientId ||
+        null;
 
-router.post('/', async (req, res) => {
-  const { candidate_id, name, email } = req.body;
+      let query = supabase.from('candidates').select('*');
 
-  if (!candidate_id || !name || !email) {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
+      if (roleId) query = query.eq('role_id', roleId);
+      if (!roleId && clientId) query = query.eq('client_id', clientId);
 
-  const { data, error } = await supabase
-    .from('candidates')
-    .insert([{ candidate_id, name, email, interview_status: 'pending' }])
-    .select();
+      const { data, error } = await query.order('created_at', { ascending: false });
 
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json(data[0]);
-});
+      if (error) {
+        console.error('[GET /candidates] supabase error', error);
+        return res.status(500).json({ error: 'Failed to fetch candidates' });
+      }
 
-router.put('/:id', async (req, res) => {
-  const { id } = req.params;
-  const updateData = req.body;
-
-  const { data, error } = await supabase
-    .from('candidates')
-    .update(updateData)
-    .eq('id', id)
-    .select();
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data[0]);
-});
-
-router.get('/:id/report', async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    const { data: candidate, error: candidateError } = await supabase
-      .from('candidates')
-      .select('id, name, email, resume_url, interview_video_url')
-      .eq('id', id)
-      .single();
-
-    if (candidateError || !candidate) {
-      return res.status(404).json({ error: 'Candidate not found', details: candidateError });
+      return res.json({ candidates: data || [] });
+    } catch (e) {
+      console.error('[GET /candidates] unexpected', e);
+      return res.status(500).json({ error: 'Server error' });
     }
+  });
 
-    const { data: report, error: reportError } = await supabase
-      .from('reports')
-      .select('resume_breakdown, interview_breakdown, analysis, report_url')
-      .eq('candidate_id', candidate.id)
-      .single();
+  // (Optional) GET /candidates/by-role/:roleId
+  router.get('/by-role/:roleId', auth, async (req, res) => {
+    try {
+      const roleId = req.params.roleId;
+      if (!roleId) return res.status(400).json({ error: 'roleId required' });
 
-    if (reportError || !report) {
-      return res.status(404).json({ error: 'Analysis report not found', details: reportError });
+      const { data, error } = await supabase
+        .from('candidates')
+        .select('*')
+        .eq('role_id', roleId)
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.error('[GET /candidates/by-role/:roleId] supabase error', error);
+        return res.status(500).json({ error: 'Failed to fetch candidates' });
+      }
+
+      return res.json({ candidates: data || [] });
+    } catch (e) {
+      console.error('[GET /candidates/by-role/:roleId] unexpected', e);
+      return res.status(500).json({ error: 'Server error' });
     }
+  });
 
-    return res.json({
-      name: candidate.name,
-      email: candidate.email,
-      resume_url: candidate.resume_url,
-      interview_video_url: candidate.interview_video_url,
-      report_url: report.report_url,
-      ...report.analysis,
-    });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Internal server error', details: err.message });
-  }
-});
-
-module.exports = router;
+  return router;
+};
