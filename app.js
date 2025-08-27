@@ -7,8 +7,8 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 
-// Your middleware is under src/middleware/auth.js
-// It should export: { requireAuth, withClientScope, supabase }
+// NOTE: your middleware is under src/middleware/auth.js
+// It must export: { requireAuth, withClientScope, supabase }
 const { requireAuth: auth, withClientScope, supabase } = require('./src/middleware/auth');
 
 /* ------------------------------------------------------------------------- */
@@ -22,7 +22,7 @@ const buckets = {
   kbs: process.env.SUPABASE_KB_BUCKET || 'kbs',
 };
 
-// Build CORS allowlist safely (no line-leading dot)
+// Build CORS allowlist safely
 const corsOriginsRaw = typeof process.env.CORS_ORIGINS === 'string'
   ? process.env.CORS_ORIGINS
   : '';
@@ -50,7 +50,7 @@ app.use(
     origin: (origin, cb) => {
       // permissive if no allowlist or '*' present
       if (!allowedOrigins.length || allowedOrigins.includes('*')) return cb(null, true);
-      // same-origin/curl/webviews
+      // same-origin / curl / webviews
       if (!origin) return cb(null, true);
       return cb(null, allowedOrigins.includes(origin));
     },
@@ -146,12 +146,11 @@ app.get('/auth/me', auth, withClientScope, (req, res) => {
 });
 
 /* ------------------------------------------------------------------------- */
-/* Routers                                                                   */
+/* Routers (matches your repo)                                               */
 /* ------------------------------------------------------------------------- */
 
 const ctx = { supabase, auth, withClientScope, buckets };
 
-// Match your repo’s route files (factory-friendly)
 mountRouter('/clients',         safeRequire('./routes/clients'), ctx);
 mountRouter('/roles',           safeRequire('./routes/roles'), ctx);
 mountRouter('/dashboard',       safeRequire('./routes/dashboard'), ctx);
@@ -184,3 +183,4 @@ app.listen(PORT, () => {
   console.log(`api listening on :${PORT}`);
   console.log(`[cors] allowed origins: ${allowedOrigins.length ? allowedOrigins.join(', ') : '(permissive)'}`);
 });
+
