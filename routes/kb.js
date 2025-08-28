@@ -192,4 +192,5 @@ kbRouter.post('/from-rubric', async (req, res) => {
   }
 });
 
-module.exports = { kbRouter };
+module.exports = kbRouter;
+
