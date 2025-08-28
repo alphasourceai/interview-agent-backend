@@ -61,29 +61,56 @@ module.exports = function makeClientsRouter({ supabase, auth, withClientScope })
   // Tolerates schema drift (user_id_uuid vs user_id). If lookup fails,
   // gracefully returns an empty list instead of 404.
   // -----------------------------------------------------------------------
-  router.get('/members', auth, async (req, res) => {
-    try {
-      const clientId = req.query.client_id;
-      if (!clientId) return res.status(400).json({ error: 'client_id is required' });
+  // GET /clients/members?client_id=...
+router.get('/members', auth, async (req, res) => {
+  try {
+    const clientId = req.query.client_id;
+    if (!clientId) return res.status(400).json({ error: 'client_id is required' });
 
-      // Try to select membership rows and join client/users if available.
-      // Keep selection simple to avoid brittle joins across envs.
-      let { data, error } = await supabase
-        .from('client_members')
-        .select('id, client_id, role, invited_email, user_id_uuid');
+    // 1) Get current members (no 'id' column in this table)
+    const { data: rows, error } = await supabase
+      .from('client_members')
+      .select('client_id, user_id, role, name')
+      .eq('client_id', clientId);
 
-      if (error && error.code === '42703') {
-        // Legacy column fallback
-        const retry = await supabase
-          .from('client_members')
-          .select('id, client_id, role, invited_email, user_id');
-        data = retry.data;
-        error = retry.error;
+    if (error) {
+      console.error('[clients/members] select error', error);
+      return res.json({ members: [] }); // never blow up the FE
+    }
+
+    // 2) Try to enrich with email via profiles
+    const userIds = (rows || []).map(r => r.user_id).filter(Boolean);
+    let emailByUser = new Map();
+    if (userIds.length) {
+      const { data: profiles, error: pErr } = await supabase
+        .from('profiles')
+        .select('id, email, full_name')
+        .in('id', userIds);
+      if (!pErr && profiles) {
+        emailByUser = new Map(profiles.map(p => [p.id, { email: p.email, name: p.full_name }]));
       }
-      if (error) {
-        console.error('[clients/members] select error', error);
-        return res.json({ members: [] });
-      }
+    }
+
+    // 3) Shape response; keep fields your UI expects
+    const members = (rows || []).map(r => {
+      const p = emailByUser.get(r.user_id) || {};
+      return {
+        // no numeric 'id' in this schema; leave null so the FE won’t rely on it
+        id: null,
+        role: r.role || 'member',
+        name: r.name || p.name || null,
+        email: p.email || null,
+        user_id: r.user_id,
+      };
+    });
+
+    return res.json({ members });
+  } catch (e) {
+    console.error('[GET /clients/members] unexpected', e);
+    return res.json({ members: [] });
+  }
+});
+
 
       const rows = (data || []).filter(r => r.client_id === clientId);
 
