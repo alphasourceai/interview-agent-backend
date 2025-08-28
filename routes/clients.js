@@ -11,48 +11,54 @@ module.exports = function makeClientsRouter({ supabase, auth, withClientScope })
   // GET /clients/my
   // Returns { client, clients, membership }
   // -----------------------------------------------------------------------
-  router.get('/my', auth, withClientScope, async (req, res) => {
-    try {
-      const userId = req.user?.id;
-      if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-      // Get memberships for this user (new column first, then legacy)
-      let { data, error } = await supabase
+router.get('/my', auth, withClientScope, async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+    // Try new column, then legacy
+    let { data, error } = await supabase
+      .from('client_members')
+      .select('client_id, role, user_id_uuid, clients ( id, name )')
+      .eq('user_id_uuid', userId);
+
+    if (error && error.code === '42703') {
+      const retry = await supabase
         .from('client_members')
-        .select('client_id, role, user_id_uuid, clients ( id, name )')
-        .eq('user_id_uuid', userId);
-
-      if (error && error.code === '42703') {
-        const retry = await supabase
-          .from('client_members')
-          .select('client_id, role, user_id, clients ( id, name )')
-          .eq('user_id', userId);
-        data = retry.data;
-        error = retry.error;
-      }
-      if (error) return res.status(500).json({ error: 'Failed to load clients for user' });
-
-      const clients = (data || []).map(r => ({
-        client_id: r.clients?.id || r.client_id,
-        name: r.clients?.name || null,
-        role: r.role || 'member',
-      }));
-
-      const defaultId =
-        req.client?.id ||
-        req.clientScope?.defaultClientId ||
-        (clients[0] && clients[0].client_id) ||
-        null;
-
-      const primary = clients.find(c => c.client_id === defaultId) || null;
-      const membership = primary ? { role: primary.role } : null;
-
-      return res.json({ client: primary, clients, membership });
-    } catch (e) {
-      console.error('[GET /clients/my] unexpected', e);
-      return res.status(500).json({ error: 'Server error' });
+        .select('client_id, role, user_id, clients ( id, name )')
+        .eq('user_id', userId);
+      data = retry.data;
+      error = retry.error;
     }
-  });
+    if (error) return res.status(500).json({ error: 'Failed to load clients for user' });
+
+    // Normalize to { id, name, role }
+    const clients = (data || []).map(r => ({
+      id: r.clients?.id || r.client_id,
+      name: r.clients?.name || null,
+      role: r.role || 'member',
+    }));
+
+    const hintedId =
+      req.client?.id ||
+      req.clientScope?.defaultClientId ||
+      null;
+
+    const primary =
+      clients.find(c => c.id === hintedId) ||
+      clients[0] ||
+      null;
+
+    const membership = primary ? { role: primary.role } : null;
+
+    return res.json({ client: primary, clients, membership });
+  } catch (e) {
+    console.error('[GET /clients/my] unexpected', e);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
 
   // -----------------------------------------------------------------------
   // GET /clients/members?client_id=...
