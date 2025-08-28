@@ -1,123 +1,117 @@
 // app.js
+// Express bootstrap for Interview Agent backend
+
 require('dotenv').config();
 
 const express = require('express');
 const morgan = require('morgan');
 const cors = require('cors');
 const path = require('path');
+const { createClient } = require('@supabase/supabase-js');
 
-/* ------------------------------------------------------------------------- */
-/* Auth middleware (your repo stores it under src/middleware/auth.js)        */
-/* ------------------------------------------------------------------------- */
-const { requireAuth: auth, withClientScope, supabase } = require('./src/middleware/auth');
-
-/* ------------------------------------------------------------------------- */
-/* Env & constants                                                           */
-/* ------------------------------------------------------------------------- */
+// --- Env + clients ----------------------------------------------------------
 
 const PORT = process.env.PORT || 10000;
 
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
+if (!SUPABASE_URL || !SERVICE_ROLE) {
+  console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+  process.exit(1);
+}
+const supabase = createClient(SUPABASE_URL, SERVICE_ROLE, {
+  auth: { persistSession: false },
+});
+
+// Buckets used by routes (keep names you already rely on)
 const buckets = {
   reports: process.env.SUPABASE_REPORTS_BUCKET || 'reports',
   kbs: process.env.SUPABASE_KB_BUCKET || 'kbs',
 };
 
-// Build CORS allowlist safely
-const corsOriginsRaw = typeof process.env.CORS_ORIGINS === 'string'
-  ? process.env.CORS_ORIGINS
-  : '';
+// CORS: allow explicit list and FRONTEND_URL
+const corsOriginsRaw = String(process.env.CORS_ORIGINS || '').trim();
+const extra = process.env.FRONTEND_URL ? [String(process.env.FRONTEND_URL).trim()] : [];
+const allowedOrigins = Array.from(
+  new Set(
+    corsOriginsRaw
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean)
+      .concat(extra)
+  )
+);
 
-const frontendUrlArr = process.env.FRONTEND_URL
-  ? [String(process.env.FRONTEND_URL).trim()]
-  : [];
-
-const allowedOrigins = Array.from(new Set(
-  corsOriginsRaw
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
-    .concat(frontendUrlArr)
-));
-
-/* ------------------------------------------------------------------------- */
-/* App init                                                                  */
-/* ------------------------------------------------------------------------- */
+// --- App + middleware -------------------------------------------------------
 
 const app = express();
 
 app.use(
   cors({
     origin: (origin, cb) => {
-      // permissive if no allowlist or '*' present
       if (!allowedOrigins.length || allowedOrigins.includes('*')) return cb(null, true);
-      // same-origin / curl / webviews
       if (!origin) return cb(null, true);
       return cb(null, allowedOrigins.includes(origin));
     },
     credentials: true,
   })
 );
-
 app.use(morgan('dev'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-/* ------------------------------------------------------------------------- */
-/* Helpers                                                                   */
-/* ------------------------------------------------------------------------- */
+// --- Helpers: safeRequire + mountRouter ------------------------------------
 
-/**
- * Robust require that lets Node resolve extensions.
- * - Tries requiring the resolved absolute path as-is.
- * - If that fails, tries appending ".js".
- * - Returns null with a warning if it still fails.
- */
 function safeRequire(relPath) {
   const abs = path.resolve(__dirname, relPath);
   try {
-    // Let Node do normal resolution (it will add .js, .json, etc.)
+    // Let Node resolve extensions/index automatically
     // eslint-disable-next-line import/no-dynamic-require, global-require
     const mod = require(abs);
-    return mod && mod.__esModule ? (mod.default || mod) : mod;
-  } catch (e1) {
+    return mod && mod.__esModule ? mod.default || mod : mod;
+  } catch (err1) {
     try {
-      // Try with explicit .js for environments where resolution differs
+      // Fallback for .js explicit
       // eslint-disable-next-line import/no-dynamic-require, global-require
       const mod2 = require(abs + '.js');
-      return mod2 && mod2.__esModule ? (mod2.default || mod2) : mod2;
-    } catch (e2) {
-      console.warn(`[require] Not found or failed: ${relPath} (${e2.message})`);
+      return mod2 && mod2.__esModule ? mod2.default || mod2 : mod2;
+    } catch (err2) {
+      console.warn(`[require] Not found or failed: ${relPath} (${err2.message})`);
       return null;
     }
   }
 }
 
-/**
- * mountRouter supports:
- *  - module.exports = (ctx) => router
- *  - module.exports = router
- *  - module.exports = { router }
- */
-function mountRouter(basePath, mod, ctx = {}) {
+function isExpressRouter(x) {
+  return typeof x === 'function' && x.use && x.handle;
+}
+
+function mountRouter(basePath, mod, deps) {
   if (!mod) {
     console.warn(`[mount] Skipped ${basePath}: module missing`);
     return;
   }
+
   let router = null;
 
   if (typeof mod === 'function') {
-    try {
-      router = mod(ctx);
-    } catch (e) {
-      console.error(`[mount] Factory threw for ${basePath}`, e);
+    if (isExpressRouter(mod)) {
+      // Already a router instance (callable) — do NOT call it
+      router = mod;
+    } else {
+      // Factory: call with deps to get the router
+      try {
+        router = mod(deps || {});
+      } catch (e) {
+        console.error(`[mount] Factory threw for ${basePath}`, e);
+        return;
+      }
     }
-  } else if (mod.router) {
+  } else if (mod && isExpressRouter(mod.router)) {
     router = mod.router;
-  } else {
-    router = mod;
   }
 
-  if (!router || typeof router !== 'function') {
+  if (!router || !isExpressRouter(router)) {
     console.error(`[mount] Invalid router for ${basePath}`);
     return;
   }
@@ -126,68 +120,35 @@ function mountRouter(basePath, mod, ctx = {}) {
   console.log(`[mount] ${basePath}`);
 }
 
-/* ------------------------------------------------------------------------- */
-/* Health + Root auth                                                        */
-/* ------------------------------------------------------------------------- */
+// pull auth/withClientScope from your middleware
+const authMod = safeRequire('./src/middleware/auth');
+const requireAuth = authMod?.requireAuth || authMod?.auth || authMod?.default?.requireAuth;
+const withClientScope = authMod?.withClientScope || authMod?.default?.withClientScope;
 
+const deps = { supabase, auth: requireAuth, withClientScope, buckets };
+
+// --- Mount routes -----------------------------------------------------------
+
+// Note: we can mount factory-style OR plain-router exports safely now.
+mountRouter('/clients', safeRequire('./routes/clients'), deps);
+mountRouter('/roles', safeRequire('./routes/roles'), deps);
+mountRouter('/dashboard', safeRequire('./routes/dashboard'), deps);
+mountRouter('/candidates', safeRequire('./routes/candidates'), deps);
+mountRouter('/candidate-submit', safeRequire('./routes/candidateSubmit'), deps);
+mountRouter('/reports', safeRequire('./routes/reports'), deps);
+mountRouter('/kb', safeRequire('./routes/kb'), deps);
+mountRouter('/files', safeRequire('./routes/files'), deps);
+mountRouter('/roles-upload', safeRequire('./routes/rolesUpload'), deps);
+mountRouter('/webhook', safeRequire('./routes/webhook'), deps);
+mountRouter('/webhooks/stripe', safeRequire('./routes/webhookStripe'), { supabase });
+mountRouter('/interviews', safeRequire('./routes/createTavusInterview'), deps);
+mountRouter('/interviews/retry', safeRequire('./routes/retryInterview'), deps);
+mountRouter('/verify-otp', safeRequire('./routes/verifyOtp'), deps);
+
+// Health check
 app.get('/', (_req, res) => res.send('ok'));
 
-// FE calls this on boot; also returns client scope summary
-app.get('/auth/me', auth, withClientScope, (req, res) => {
-  try {
-    const { user, memberships, defaultClientId } = req.clientScope || {};
-    if (!user?.id) return res.status(401).json({ error: 'unauthorized' });
-
-    const clients = (memberships || []).map(m => ({
-      id: m.client_id,
-      role: m.role,
-      name: m.name || null,
-    }));
-
-    return res.json({
-      user: { id: user.id, email: user.email || null },
-      clients,
-      defaultClientId: defaultClientId || (clients[0] && clients[0].id) || null,
-    });
-  } catch (err) {
-    console.error('[auth/me]', err);
-    return res.status(500).json({ error: 'server_error' });
-  }
-});
-
-/* ------------------------------------------------------------------------- */
-/* Routers (matches your repo)                                               */
-/* ------------------------------------------------------------------------- */
-
-const ctx = { supabase, auth, withClientScope, buckets };
-
-mountRouter('/clients',         safeRequire('./routes/clients'), ctx);
-mountRouter('/roles',           safeRequire('./routes/roles'), ctx);
-mountRouter('/dashboard',       safeRequire('./routes/dashboard'), ctx);
-mountRouter('/candidates',      safeRequire('./routes/candidates'), ctx);
-mountRouter('/reports',         safeRequire('./routes/reports'), ctx);
-mountRouter('/kb',              safeRequire('./routes/kb'), ctx);
-mountRouter('/files',           safeRequire('./routes/files'), ctx);
-mountRouter('/roles-upload',    safeRequire('./routes/rolesUpload'), ctx);
-mountRouter('/webhook',         safeRequire('./routes/webhook'), ctx);
-mountRouter('/webhooks/stripe', safeRequire('./routes/webhookStripe'), ctx);
-mountRouter('/interviews',      safeRequire('./routes/createTavusInterview'), ctx);
-mountRouter('/interviews/retry',safeRequire('./routes/retryInterview'), ctx);
-mountRouter('/verify-otp',      safeRequire('./routes/verifyOtp'), ctx);
-
-/* ------------------------------------------------------------------------- */
-/* Error handler (last)                                                      */
-/* ------------------------------------------------------------------------- */
-
-// eslint-disable-next-line no-unused-vars
-app.use((err, _req, res, _next) => {
-  console.error('[unhandled]', err);
-  res.status(500).json({ error: 'Server error' });
-});
-
-/* ------------------------------------------------------------------------- */
-/* Start                                                                     */
-/* ------------------------------------------------------------------------- */
+// --- Start ------------------------------------------------------------------
 
 app.listen(PORT, () => {
   console.log(`api listening on :${PORT}`);
