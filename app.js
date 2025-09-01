@@ -120,30 +120,38 @@ function mountRouter(basePath, mod, deps) {
   console.log(`[mount] ${basePath}`);
 }
 
-// pull auth/withClientScope from your middleware
-const authMod = safeRequire('./src/middleware/auth');
-const requireAuth = authMod?.requireAuth || authMod?.auth || authMod?.default?.requireAuth;
-const withClientScope = authMod?.withClientScope || authMod?.default?.withClientScope;
+// --- Middlewares: use the split files (not a combined "auth" module) -------
+
+const { requireAuth } = safeRequire('./src/middleware/requireAuth') || {};
+const { withClientScope } = safeRequire('./src/middleware/withClientScope') || {};
 
 const deps = { supabase, auth: requireAuth, withClientScope, buckets };
 
 // --- Mount routes -----------------------------------------------------------
-
-// Note: we can mount factory-style OR plain-router exports safely now.
+// FACTORY routes (need deps):
 mountRouter('/clients', safeRequire('./routes/clients'), deps);
-mountRouter('/roles', safeRequire('./routes/roles'), deps);
-mountRouter('/dashboard', safeRequire('./routes/dashboard'), deps);
-mountRouter('/candidates', safeRequire('./routes/candidates'), deps);
-mountRouter('/candidate-submit', safeRequire('./routes/candidateSubmit'), deps);
-mountRouter('/reports', safeRequire('./routes/reports'), deps);
-mountRouter('/kb', safeRequire('./routes/kb'), deps);
-mountRouter('/files', safeRequire('./routes/files'), deps);
-mountRouter('/roles-upload', safeRequire('./routes/rolesUpload'), deps);
-mountRouter('/webhook', safeRequire('./routes/webhook'), deps);
-mountRouter('/webhooks/stripe', safeRequire('./routes/webhookStripe'), { supabase });
-mountRouter('/interviews', safeRequire('./routes/createTavusInterview'), deps);
-mountRouter('/interviews/retry', safeRequire('./routes/retryInterview'), deps);
-mountRouter('/verify-otp', safeRequire('./routes/verifyOtp'), deps);
+
+// If you converted roles.js and reports.js to direct routers, mount them below
+// without deps. If you kept them as factories, leave them here with deps:
+mountRouter('/roles', safeRequire('./routes/roles'), deps);        // <- keep if roles.js is factory
+// mountRouter('/roles', safeRequire('./routes/roles'));           // <- use this if roles.js is now direct
+
+mountRouter('/reports', safeRequire('./routes/reports'), deps);    // <- keep if reports.js is factory
+// mountRouter('/reports', safeRequire('./routes/reports'));       // <- use this if reports.js is now direct
+
+// DIRECT routers (do not need deps):
+mountRouter('/dashboard', safeRequire('./routes/dashboard'));
+mountRouter('/candidates', safeRequire('./routes/candidates'));
+mountRouter('/candidate-submit', safeRequire('./routes/candidateSubmit'));
+mountRouter('/kb', safeRequire('./routes/kb'));
+mountRouter('/files', safeRequire('./routes/files'));
+mountRouter('/roles-upload', safeRequire('./routes/rolesUpload'));
+mountRouter('/webhook', safeRequire('./routes/webhook'));
+mountRouter('/webhooks/stripe', safeRequire('./routes/webhookStripe'));
+mountRouter('/interviews', safeRequire('./routes/createTavusInterview'));
+mountRouter('/interviews/retry', safeRequire('./routes/retryInterview'));
+mountRouter('/verify-otp', safeRequire('./routes/verifyOtp'));
+mountRouter('/auth', safeRequire('./routes/authPing'));
 
 // Health check
 app.get('/', (_req, res) => res.send('ok'));
