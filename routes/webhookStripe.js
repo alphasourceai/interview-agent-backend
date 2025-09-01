@@ -1,6 +1,11 @@
+// routes/webhookStripe.js
 const express = require('express');
-module.exports = function webhookStripeRouter() {
-  const router = express.Router();
-  router.post('/', (_req, res) => res.status(200).send('ok'));
-  return router;
-};
+const router = express.Router();
+
+// Stripe webhook endpoint (placeholder).
+// Extend later with signature verification, event handling, etc.
+router.post('/', (_req, res) => {
+  res.status(200).send('ok');
+});
+
+module.exports = router;

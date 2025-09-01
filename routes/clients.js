@@ -1,18 +1,17 @@
 // routes/clients.js
-// Factory-style router; ctx is provided by app.js.
-// ctx: { supabase, auth, withClientScope }
+// Direct-export Express router
 
 const express = require('express');
+const { supabase } = require('../src/lib/supabaseClient'); // normalized path
+const { requireAuth, withClientScope } = require('../src/middleware/auth');
 
-module.exports = function makeClientsRouter({ supabase, auth, withClientScope }) {
-  const router = express.Router();
+const router = express.Router();
 
-  // -----------------------------------------------------------------------
-  // GET /clients/my
-  // Returns { client, clients, membership }
-  // -----------------------------------------------------------------------
-
-router.get('/my', auth, withClientScope, async (req, res) => {
+// -----------------------------------------------------------------------
+// GET /clients/my
+// Returns { client, clients, membership }
+// -----------------------------------------------------------------------
+router.get('/my', requireAuth, withClientScope, async (req, res) => {
   try {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
@@ -59,57 +58,55 @@ router.get('/my', auth, withClientScope, async (req, res) => {
   }
 });
 
+// -----------------------------------------------------------------------
+// GET /clients/members?client_id=...
+// Only accepted members (from client_members). No pending invites here.
+// Schema-safe: client_members has no 'id' column in prod.
+// -----------------------------------------------------------------------
+router.get('/members', requireAuth, async (req, res) => {
+  try {
+    const clientId = req.query.client_id;
+    if (!clientId) return res.status(400).json({ error: 'client_id is required' });
 
-  // -----------------------------------------------------------------------
-  // GET /clients/members?client_id=...
-  // Only accepted members (from client_members). No pending invites here.
-  // Schema-safe: client_members has no 'id' column in prod.
-  // -----------------------------------------------------------------------
-  router.get('/members', auth, async (req, res) => {
-    try {
-      const clientId = req.query.client_id;
-      if (!clientId) return res.status(400).json({ error: 'client_id is required' });
+    // 1) Current members
+    const { data: rows, error } = await supabase
+      .from('client_members')
+      .select('client_id, user_id, role, name')
+      .eq('client_id', clientId);
 
-      // 1) Current members (there is no numeric 'id' column here)
-      const { data: rows, error } = await supabase
-        .from('client_members')
-        .select('client_id, user_id, role, name')
-        .eq('client_id', clientId);
-
-      if (error) {
-        console.error('[clients/members] select error', error);
-        return res.json({ members: [] }); // do not crash UI
-      }
-
-      // 2) Enrich with email/full_name via profiles
-      const userIds = (rows || []).map(r => r.user_id).filter(Boolean);
-      let profileMap = new Map();
-      if (userIds.length) {
-        const { data: profiles } = await supabase
-          .from('profiles')
-          .select('id, email, full_name')
-          .in('id', userIds);
-        if (profiles) profileMap = new Map(profiles.map(p => [p.id, { email: p.email, name: p.full_name }]));
-      }
-
-      // 3) Response shape (keep fields UI expects)
-      const members = (rows || []).map(r => {
-        const p = profileMap.get(r.user_id) || {};
-        return {
-          id: null,                     // table has no id column
-          role: r.role || 'member',
-          name: r.name || p.name || null,
-          email: p.email || null,
-          user_id: r.user_id,
-        };
-      });
-
-      return res.json({ members });
-    } catch (e) {
-      console.error('[GET /clients/members] unexpected', e);
-      return res.json({ members: [] });
+    if (error) {
+      console.error('[clients/members] select error', error);
+      return res.json({ members: [] }); // do not crash UI
     }
-  });
 
-  return router;
-};
+    // 2) Enrich with email/full_name via profiles
+    const userIds = (rows || []).map(r => r.user_id).filter(Boolean);
+    let profileMap = new Map();
+    if (userIds.length) {
+      const { data: profiles } = await supabase
+        .from('profiles')
+        .select('id, email, full_name')
+        .in('id', userIds);
+      if (profiles) profileMap = new Map(profiles.map(p => [p.id, { email: p.email, name: p.full_name }]));
+    }
+
+    // 3) Response shape (keep fields UI expects)
+    const members = (rows || []).map(r => {
+      const p = profileMap.get(r.user_id) || {};
+      return {
+        id: null,                     // table has no id column
+        role: r.role || 'member',
+        name: r.name || p.name || null,
+        email: p.email || null,
+        user_id: r.user_id,
+      };
+    });
+
+    return res.json({ members });
+  } catch (e) {
+    console.error('[GET /clients/members] unexpected', e);
+    return res.json({ members: [] });
+  }
+});
+
+module.exports = router;

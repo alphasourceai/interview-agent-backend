@@ -3,7 +3,7 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const sg = require('@sendgrid/mail');
-const { supabase } = require('../src/lib/supabaseClient'); // <- keep this path
+const { supabase } = require('../src/lib/supabaseClient'); // <- correct path
 
 // --- config ---
 const upload = multer({
@@ -23,24 +23,16 @@ function six() {
  * POST /api/candidate/submit
  * Accepts multipart (file fields: resume | resume_file | file | resumeFile | pdf)
  * OR JSON with resume_url.
- *
- * Supports both payload shapes:
- *  - role_id  OR role_token
- *  - name     OR first_name + last_name
- *
- * Required: email + (name or first/last) + (role_id or role_token)
- * Phone is optional (kept if provided).
  */
 router.post('/', upload.any(), async (req, res) => {
   try {
-    // --- accept both shapes ---
     const role_token = (req.body.role_token || '').trim();
     const role_id_in = (req.body.role_id || '').trim();
     const first_name = req.body.first_name?.trim();
     const last_name  = req.body.last_name?.trim();
     const rawName    = req.body.name?.trim();
     const email      = (req.body.email || '').trim();
-    const phone      = (req.body.phone || '').replace(/\D/g, ''); // optional
+    const phone      = (req.body.phone || '').replace(/\D/g, '');
     const resume_url_in = req.body.resume_url || null;
 
     const fullName = rawName || [first_name, last_name].filter(Boolean).join(' ').trim();
@@ -66,12 +58,10 @@ router.post('/', upload.any(), async (req, res) => {
         .eq('token', role_token)
         .single());
     }
-    if (rErr || !role) {
-      return res.status(404).json({ error: 'Role not found.' });
-    }
+    if (rErr || !role) return res.status(404).json({ error: 'Role not found.' });
     const roleId = role.id;
 
-    // --- duplicate check (same email + role) ---
+    // --- duplicate check ---
     const { count: existingCount, error: dupErr } = await supabase
       .from('candidates')
       .select('*', { count: 'exact', head: true })
@@ -91,7 +81,7 @@ router.post('/', upload.any(), async (req, res) => {
     if (cErr) return res.status(500).json({ error: cErr.message });
     const candidate_id = inserted.id;
 
-    // --- optional: upload resume to storage ---
+    // --- optional: upload resume ---
     let resume_url = resume_url_in;
     try {
       const file = (req.files || []).find(f =>
@@ -116,9 +106,7 @@ router.post('/', upload.any(), async (req, res) => {
       await supabase.from('candidates').update({ resume_url }).eq('id', candidate_id);
     }
 
-    // ----------------- HARDENING PATCH START -----------------
-
-    // Invalidate any previous, unused OTPs for this (email, role)
+    // --- OTP handling ---
     const nowIso = new Date().toISOString();
     await supabase
       .from('otp_tokens')
@@ -127,7 +115,6 @@ router.post('/', upload.any(), async (req, res) => {
       .eq('role_id', roleId)
       .eq('used', false);
 
-    // Create exactly one fresh OTP (10-minute TTL)
     const freshCode = six();
     const { error: otpErr } = await supabase.from('otp_tokens').insert({
       candidate_email: email,
@@ -136,11 +123,8 @@ router.post('/', upload.any(), async (req, res) => {
       expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
       used: false,
     });
-    if (otpErr) {
-      return res.status(500).json({ error: `Could not create OTP: ${otpErr.message}` });
-    }
+    if (otpErr) return res.status(500).json({ error: `Could not create OTP: ${otpErr.message}` });
 
-    // Read back the newest OTP (defensive) and email THAT code
     const { data: newest, error: readErr } = await supabase
       .from('otp_tokens')
       .select('id, code, created_at')
@@ -151,9 +135,7 @@ router.post('/', upload.any(), async (req, res) => {
       .single();
     const codeToSend = (!readErr && newest?.code) ? newest.code : freshCode;
 
-    // ------------------ HARDENING PATCH END ------------------
-
-    // --- send OTP via SendGrid (non-fatal on failure; surfaced in response) ---
+    // --- send OTP via SendGrid ---
     let emailSent = false, emailError = null;
     try {
       if (!SENDGRID_KEY || !FROM_EMAIL) throw new Error('SENDGRID_API_KEY or SENDGRID_FROM not configured');

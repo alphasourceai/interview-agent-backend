@@ -2,46 +2,85 @@
 const jwt = require('jsonwebtoken');
 const { createClient } = require('@supabase/supabase-js');
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
 
-// Validate Supabase JWT from Authorization: Bearer <token>
+if (!SUPABASE_URL || !SERVICE_ROLE) {
+  // Don’t crash process here; some scripts import this file.
+  // Instead, throw lazily if we actually try to use the client.
+  console.warn('[auth] SUPABASE_URL / SERVICE_ROLE not set at require-time.');
+}
+
+const supabase = SUPABASE_URL && SERVICE_ROLE
+  ? createClient(SUPABASE_URL, SERVICE_ROLE, { auth: { persistSession: false } })
+  : null;
+
+/**
+ * Extract a bearer token from:
+ *  - Authorization: Bearer <token>
+ *  - Cookie: sb-access-token=<token> (or sb:token)
+ */
+function getToken(req) {
+  const hdr = req.header('authorization') || req.header('Authorization') || '';
+  if (hdr.startsWith('Bearer ')) return hdr.slice(7).trim();
+
+  // Very light cookie parse to avoid bringing a dependency
+  const rawCookie = req.headers.cookie || '';
+  if (rawCookie) {
+    for (const part of rawCookie.split(';')) {
+      const [k, v] = part.split('=').map(s => (s || '').trim());
+      if (!k) continue;
+      if (k === 'sb-access-token' || k === 'sb:token') return decodeURIComponent(v || '');
+    }
+  }
+  return null;
+}
+
+/**
+ * Auth middleware
+ * - Decodes the Supabase JWT (no verification here; Supabase will verify on DB calls via RLS)
+ * - Attaches req.user and req.userToken
+ */
 function requireAuth(req, res, next) {
   try {
-    const authHeader = req.header('authorization') || req.header('Authorization') || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    const token = getToken(req);
     if (!token) return res.status(401).json({ error: 'Missing bearer token' });
 
     const decoded = jwt.decode(token);
-    if (!decoded || !decoded.sub) return res.status(401).json({ error: 'Invalid token' });
+    // Supabase JWT normally includes `sub` as the user id
+    const sub = decoded && (decoded.sub || decoded.user_id);
+    if (!decoded || !sub) return res.status(401).json({ error: 'Invalid token' });
 
-    req.user = { id: decoded.sub, email: decoded.email || decoded.user_email || null };
+    req.user = { id: sub, email: decoded.email || decoded.user_email || null };
     req.userToken = token;
-    next();
+    return next();
   } catch (err) {
     console.error('[requireAuth] error', err);
     return res.status(401).json({ error: 'Unauthorized' });
   }
 }
 
-// Resolve user’s client scope.
-// Accepts ?client_id=... or falls back to first membership.
-// Works with either client_members.user_id_uuid or client_members.user_id.
+/**
+ * Client scope middleware
+ * - Works with client_members.user_id_uuid (new) OR client_members.user_id (legacy)
+ * - Attaches:
+ *     req.client_memberships: string[] of client_ids
+ *     req.clientScope: { user, memberships, defaultClientId? }
+ *     req.client: { id, name? }
+ */
 async function withClientScope(req, res, next) {
   try {
+    if (!supabase) {
+      console.error('[withClientScope] Supabase client not configured.');
+      return res.status(500).json({ error: 'Server not configured' });
+    }
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
-    const explicit = req.query.client_id || req.body?.client_id;
-    if (explicit) {
-      req.client = { id: explicit };
-      req.clientScope = { user: req.user, memberships: [], defaultClientId: explicit };
-      return next();
-    }
+    const explicit = req.query.client_id || req.body?.client_id || null;
 
     // Try modern column first
+    let rows = [];
     let { data, error } = await supabase
       .from('client_members')
       .select('client_id, role, user_id_uuid, clients ( id, name )')
@@ -59,25 +98,43 @@ async function withClientScope(req, res, next) {
       error = retry.error;
     }
 
-    if (error) return res.status(500).json({ error: 'Client scope lookup failed' });
-    if (!data || data.length === 0) return res.status(403).json({ error: 'No client membership found' });
+    if (error) {
+      console.error('[withClientScope] lookup error', error);
+      // Don’t block every request due to a read failure; attach empty context
+      req.client_memberships = [];
+      req.clientScope = { user: req.user, memberships: [] };
+      return next();
+    }
 
-    const memberships = data.map(r => ({
+    rows = Array.isArray(data) ? data : [];
+    const memberships = rows.map(r => ({
       client_id: r.client_id,
       role: r.role || 'member',
       name: r.clients?.name || null,
     }));
 
-    const defaultClientId = memberships[0].client_id;
+    const ids = memberships.map(m => m.client_id).filter(Boolean);
+    req.client_memberships = ids;
 
-    req.client = { id: defaultClientId, name: memberships[0].name || null };
-    req.membership = { role: memberships[0].role };
+    // Decide default
+    let defaultClientId = explicit || (ids.length ? ids[0] : null);
+
+    // Attach helpers for routes that expect them
     req.clientScope = { user: req.user, memberships, defaultClientId };
+    if (defaultClientId) {
+      const m = memberships.find(x => x.client_id === defaultClientId) || memberships[0] || null;
+      req.client = { id: defaultClientId, name: m?.name || null };
+      req.membership = m ? { role: m.role } : null;
+    }
 
-    next();
+    // IMPORTANT: we no longer hard-403 when user has zero memberships here.
+    // Let routes decide whether to 403 or show an empty state.
+    return next();
   } catch (err) {
     console.error('[withClientScope] error', err);
-    return res.status(500).json({ error: 'Client scope error' });
+    req.client_memberships = [];
+    req.clientScope = { user: req.user, memberships: [] };
+    return next();
   }
 }
 

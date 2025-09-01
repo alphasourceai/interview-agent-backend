@@ -1,11 +1,20 @@
-import { Router } from 'express'
-import { requireAuth } from '../src/middleware/requireAuth.js'
-import { withClientScope } from '../src/middleware/withClientScope.js'
+// routes/authPing.js
+const express = require('express');
+const router = express.Router();
 
-const router = Router()
+// import from the actual files in src/middleware
+const { requireAuth } = require('../src/middleware/requireAuth');
+const { withClientScope } = require('../src/middleware/withClientScope');
 
 router.get('/ping', requireAuth, withClientScope, (req, res) => {
-  res.json({ ok: true, userId: req.user.id, clientIds: req.clientIds })
-})
+  res.json({
+    ok: true,
+    ts: new Date().toISOString(),
+    user: req.user || null,
+    client: req.client || null,
+    scope: req.clientScope || null,
+  });
+});
 
-export default router
+module.exports = router;
+
