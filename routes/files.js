@@ -1,110 +1,81 @@
 // routes/files.js
-// Factory-style router; ctx provided by app.js
-// ctx: { supabase, auth, withClientScope }
-
 const express = require('express');
+const { createClient } = require('@supabase/supabase-js');
+const { requireAuth, withClientScope } = require('../src/middleware/auth');
 
-function parseBucketPath(value) {
-  if (!value || typeof value !== 'string') return null;
-  const v = value.trim();
+const router = express.Router();
 
-  // New/desired format: "bucket/path..."
-  if (!/^https?:\/\//i.test(v)) {
-    const firstSlash = v.indexOf('/');
-    if (firstSlash > 0) {
-      return { bucket: v.slice(0, firstSlash), path: v.slice(firstSlash + 1) };
-    }
-    return null;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+}
+const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
+});
+
+// Accepts either "bucket/path" or a Supabase Storage URL
+function parseBucketPath(v) {
+  if (!v || typeof v !== 'string') return null;
+  const s = v.trim();
+  if (!/^https?:\/\//i.test(s)) {
+    const i = s.indexOf('/');
+    return i > 0 ? { bucket: s.slice(0, i), path: s.slice(i + 1) } : null;
   }
-
-  // Old format: public or signed URL
   try {
-    const u = new URL(v);
+    const u = new URL(s);
     const parts = u.pathname.split('/').filter(Boolean);
-    // ["storage","v1","object","public|sign", "<bucket>", "...path..."]
     const idx = parts.findIndex(p => p === 'public' || p === 'sign');
     if (idx >= 0 && parts[idx + 1]) {
       const bucket = parts[idx + 1];
       const path = parts.slice(idx + 2).join('/');
       if (bucket && path) return { bucket, path };
     }
-  } catch (_) {
-    // ignore
-  }
+  } catch {}
   return null;
 }
 
-module.exports = function makeFilesRouter({ supabase, auth, withClientScope }) {
-  const router = express.Router();
+router.get('/signed-url', requireAuth, withClientScope, async (req, res) => {
+  try {
+    const { interview_id, kind } = req.query;
+    if (!interview_id || !kind) return res.status(400).json({ error: 'interview_id and kind are required' });
+    if (!['transcript', 'analysis'].includes(kind)) return res.status(400).json({ error: 'kind must be transcript|analysis' });
 
-  /**
-   * GET /files/signed-url?interview_id=...&kind=transcript|analysis
-   *
-   * Returns a signed URL for the requested storage object, after enforcing:
-   *  - caller is authenticated
-   *  - caller has scope for the interview's client_id
-   */
-  router.get('/signed-url', auth, withClientScope, async (req, res) => {
-    try {
-      const { interview_id, kind } = req.query;
-      if (!interview_id || !kind) {
-        return res.status(400).json({ error: 'interview_id and kind are required' });
-      }
-      if (!['transcript', 'analysis'].includes(kind)) {
-        return res.status(400).json({ error: 'kind must be transcript|analysis' });
-      }
+    const scopedIds = Array.isArray(req?.clientScope?.memberships)
+      ? req.clientScope.memberships.map(m => m.client_id)
+      : [];
+    if (!scopedIds.length) return res.status(403).json({ error: 'No client scope' });
 
-      // Load interview
-      const { data: interview, error } = await supabase
-        .from('interviews')
-        .select('id, client_id, transcript_url, analysis_url')
-        .eq('id', interview_id)
-        .maybeSingle();
+    const { data: interview, error } = await supabaseAdmin
+      .from('interviews')
+      .select('id, client_id, transcript_url, analysis_url')
+      .eq('id', interview_id)
+      .maybeSingle();
 
-      if (error) return res.status(400).json({ error: error.message });
-      if (!interview) return res.status(404).json({ error: 'Interview not found' });
+    if (error) return res.status(400).json({ error: error.message });
+    if (!interview) return res.status(404).json({ error: 'Interview not found' });
+    if (!scopedIds.includes(interview.client_id)) return res.status(403).json({ error: 'Forbidden' });
 
-      // Enforce scope:
-      // Prefer explicit membership array if present; else allow if the single scoped client matches.
-      const scopeIds = Array.isArray(req.clientIds) ? req.clientIds : [];
-      const scopedClientId = req.client?.id || null;
-      const allowed =
-        (scopeIds.length && scopeIds.includes(interview.client_id)) ||
-        (scopedClientId && scopedClientId === interview.client_id);
+    const raw = kind === 'transcript' ? interview.transcript_url : interview.analysis_url;
+    if (!raw) return res.status(404).json({ error: `${kind} not available` });
 
-      if (!allowed) return res.status(403).json({ error: 'Forbidden' });
-
-      // Grab the storage location from the interview
-      const raw = kind === 'transcript' ? interview.transcript_url : interview.analysis_url;
-      if (!raw) return res.status(404).json({ error: `${kind} not available` });
-
-      const parsed = parseBucketPath(raw);
-      if (!parsed) {
-        // If it already looks like a full URL (legacy public/signed), return it
-        if (/^https?:\/\//i.test(raw)) return res.json({ ok: true, url: raw, mode: 'legacy_url' });
-        return res.status(400).json({ error: 'Unrecognized storage path/URL' });
-      }
-
-      const EXPIRES = Number(process.env.SIGNED_URL_TTL_SECONDS || 300);
-
-      // Use the shared server-side Supabase client from app.js (service role)
-      const { data: signed, error: signErr } = await supabase
-        .storage
-        .from(parsed.bucket)
-        .createSignedUrl(parsed.path, EXPIRES);
-
-      if (signErr) return res.status(400).json({ error: signErr.message });
-
-      return res.json({
-        ok: true,
-        url: signed?.signedUrl,
-        mode: 'signed',
-        bucket: parsed.bucket,
-      });
-    } catch (e) {
-      return res.status(500).json({ error: e.message });
+    const parsed = parseBucketPath(raw);
+    if (!parsed) {
+      if (/^https?:\/\//i.test(raw)) return res.json({ ok: true, url: raw, mode: 'legacy_url' });
+      return res.status(400).json({ error: 'Unrecognized storage path/URL' });
     }
-  });
 
-  return router;
-};
+    const EXPIRES = Number(process.env.SIGNED_URL_TTL_SECONDS || 300);
+    const { data: signed, error: signErr } = await supabaseAdmin
+      .storage
+      .from(parsed.bucket)
+      .createSignedUrl(parsed.path, EXPIRES);
+
+    if (signErr) return res.status(400).json({ error: signErr.message });
+    return res.json({ ok: true, url: signed?.signedUrl, mode: 'signed', bucket: parsed.bucket });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+module.exports = router;

@@ -2,14 +2,17 @@
 const express = require('express');
 const router = express.Router();
 
-// import from the actual files in src/middleware
-const { requireAuth } = require('../src/middleware/requireAuth');
-const { withClientScope } = require('../src/middleware/withClientScope');
+const { requireAuth, withClientScope } = require('../src/middleware/auth');
 
-router.get('/ping', requireAuth, withClientScope, (req, res) => {
+// Simple health
+router.get('/ping', (_req, res) => {
+  res.json({ ok: true, ts: new Date().toISOString() });
+});
+
+// What the FE expects
+router.get('/me', requireAuth, withClientScope, (req, res) => {
   res.json({
     ok: true,
-    ts: new Date().toISOString(),
     user: req.user || null,
     client: req.client || null,
     scope: req.clientScope || null,
@@ -17,4 +20,3 @@ router.get('/ping', requireAuth, withClientScope, (req, res) => {
 });
 
 module.exports = router;
-
