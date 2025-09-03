@@ -4,8 +4,8 @@ services:
     env: node
     plan: starter
     branch: prod-backend-stable
-    buildCommand: npm ci && npm run build
-    startCommand: node dist/app.js
+    buildCommand: npm ci
+    startCommand: node app.js
     envVars:
       - key: NODE_ENV
         value: production
@@ -23,8 +23,8 @@ services:
     env: node
     plan: starter
     branch: qa-backend
-    buildCommand: npm ci && npm run build
-    startCommand: node dist/app.js
+    buildCommand: npm ci
+    startCommand: node app.js
     envVars:
       - key: NODE_ENV
         value: production
@@ -42,8 +42,8 @@ services:
     env: node
     plan: starter
     branch: staging-backend
-    buildCommand: npm ci && npm run build
-    startCommand: node dist/app.js
+    buildCommand: npm ci
+    startCommand: node app.js
     envVars:
       - key: NODE_ENV
         value: production
