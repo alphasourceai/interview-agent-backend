@@ -4,17 +4,27 @@ const router = express.Router();
 
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 
-// Simple health
-router.get('/ping', (_req, res) => {
-  res.json({ ok: true, ts: new Date().toISOString() });
+// Existing ping
+router.get('/ping', requireAuth, withClientScope, (req, res) => {
+  res.json({
+    ok: true,
+    ts: new Date().toISOString(),
+    user: req.user || null,
+    client: req.client || (req.clientScope?.defaultClientId
+      ? { id: req.clientScope.defaultClientId }
+      : null),
+    scope: req.clientScope || null,
+  });
 });
 
-// What the FE expects
+// New: many FE helpers expect /auth/me
 router.get('/me', requireAuth, withClientScope, (req, res) => {
   res.json({
     ok: true,
     user: req.user || null,
-    client: req.client || null,
+    client: req.client || (req.clientScope?.defaultClientId
+      ? { id: req.clientScope.defaultClientId }
+      : null),
     scope: req.clientScope || null,
   });
 });
