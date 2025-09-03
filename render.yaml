@@ -1,0 +1,57 @@
+services:
+  - type: web
+    name: ia-backend-prod
+    env: node
+    plan: starter
+    branch: prod-backend-stable
+    buildCommand: npm ci && npm run build
+    startCommand: node dist/app.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: FRONTEND_URL
+        value: https://ia-frontend-prod.onrender.com
+      - key: CORS_ORIGINS
+        value: https://ia-frontend-prod.onrender.com
+
+  - type: web
+    name: ia-backend-qa
+    env: node
+    plan: starter
+    branch: qa-backend
+    buildCommand: npm ci && npm run build
+    startCommand: node dist/app.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: FRONTEND_URL
+        value: https://ia-frontend-qa.onrender.com
+      - key: CORS_ORIGINS
+        value: https://ia-frontend-qa.onrender.com
+
+  - type: web
+    name: ia-backend-staging
+    env: node
+    plan: starter
+    branch: staging-backend
+    buildCommand: npm ci && npm run build
+    startCommand: node dist/app.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: FRONTEND_URL
+        value: https://ia-frontend-staging.onrender.com
+      - key: CORS_ORIGINS
+        value: https://ia-frontend-staging.onrender.com
