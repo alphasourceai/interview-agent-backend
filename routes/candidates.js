@@ -1,82 +1,62 @@
+// routes/candidates.js
 const express = require('express');
 const router = express.Router();
-const { supabase } = require('../supabaseClient');
 
-router.get('/', async (req, res) => {
-  const { data, error } = await supabase
-    .from('candidates')
-    .select('*')
-    .order('created_at', { ascending: false });
+const { requireAuth, withClientScope } = require('../src/middleware/auth');
+const { supabase } = require('../src/lib/supabaseClient');
 
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data);
-});
+// Keep FE flexible for now
+const CANDIDATE_SELECT = '*';
 
-router.post('/', async (req, res) => {
-  const { candidate_id, name, email } = req.body;
-
-  if (!candidate_id || !name || !email) {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
-
-  const { data, error } = await supabase
-    .from('candidates')
-    .insert([{ candidate_id, name, email, interview_status: 'pending' }])
-    .select();
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.status(201).json(data[0]);
-});
-
-router.put('/:id', async (req, res) => {
-  const { id } = req.params;
-  const updateData = req.body;
-
-  const { data, error } = await supabase
-    .from('candidates')
-    .update(updateData)
-    .eq('id', id)
-    .select();
-
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data[0]);
-});
-
-router.get('/:id/report', async (req, res) => {
-  const { id } = req.params;
-
+// GET /candidates?role_id=... OR /candidates?client_id=...
+router.get('/', requireAuth, withClientScope, async (req, res) => {
   try {
-    const { data: candidate, error: candidateError } = await supabase
+    const roleId = req.query.role_id || null;
+    const clientId =
+      req.query.client_id ||
+      req.client?.id ||
+      req.clientScope?.defaultClientId ||
+      null;
+
+    if (!roleId && !clientId) return res.json({ candidates: [] });
+
+    let query = supabase.from('candidates').select(CANDIDATE_SELECT);
+    if (roleId)   query = query.eq('role_id', roleId);
+    if (clientId) query = query.eq('client_id', clientId);
+    query = query.order('created_at', { ascending: false });
+
+    const { data, error } = await query;
+    if (error) {
+      console.error('[GET /candidates] supabase error', error);
+      return res.status(500).json({ error: 'Failed to fetch candidates' });
+    }
+    return res.json({ candidates: data || [] });
+  } catch (e) {
+    console.error('[GET /candidates] unexpected', e);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// GET /candidates/by-role/:roleId
+router.get('/by-role/:roleId', requireAuth, withClientScope, async (req, res) => {
+  try {
+    const roleId = req.params.roleId;
+    if (!roleId) return res.json({ candidates: [] });
+
+    const { data, error } = await supabase
       .from('candidates')
-      .select('id, name, email, resume_url, interview_video_url')
-      .eq('id', id)
-      .single();
+      .select(CANDIDATE_SELECT)
+      .eq('role_id', roleId)
+      .order('created_at', { ascending: false });
 
-    if (candidateError || !candidate) {
-      return res.status(404).json({ error: 'Candidate not found', details: candidateError });
+    if (error) {
+      console.error('[GET /candidates/by-role/:roleId] supabase error', error);
+      return res.status(500).json({ error: 'Failed to fetch candidates' });
     }
-
-    const { data: report, error: reportError } = await supabase
-      .from('reports')
-      .select('resume_breakdown, interview_breakdown, analysis, report_url')
-      .eq('candidate_id', candidate.id)
-      .single();
-
-    if (reportError || !report) {
-      return res.status(404).json({ error: 'Analysis report not found', details: reportError });
-    }
-
-    return res.json({
-      name: candidate.name,
-      email: candidate.email,
-      resume_url: candidate.resume_url,
-      interview_video_url: candidate.interview_video_url,
-      report_url: report.report_url,
-      ...report.analysis,
-    });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: 'Internal server error', details: err.message });
+    return res.json({ candidates: data || [] });
+  } catch (e) {
+    console.error('[GET /candidates/by-role/:roleId] unexpected', e);
+    return res.status(500).json({ error: 'Server error' });
   }
 });
 

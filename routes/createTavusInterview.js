@@ -5,9 +5,9 @@ const express = require('express');
 const { supabase } = require('../src/lib/supabaseClient');
 const { createTavusInterviewHandler } = require('../handlers/createTavusInterview');
 
-const createInterviewRouter = express.Router();
+const router = express.Router();
 
-createInterviewRouter.post('/', async (req, res) => {
+router.post('/', async (req, res) => {
   try {
     const base = (process.env.PUBLIC_BACKEND_URL || '').replace(/\/+$/, '');
     if (!base) return res.status(500).json({ error: 'PUBLIC_BACKEND_URL not set' });
@@ -15,6 +15,7 @@ createInterviewRouter.post('/', async (req, res) => {
     const { candidate_id, role_id: roleIdFromBody } = req.body || {};
     if (!candidate_id) return res.status(400).json({ error: 'candidate_id required' });
 
+    // --- candidate lookup ---
     const { data: candidate, error: cErr } = await supabase
       .from('candidates')
       .select('*')
@@ -25,6 +26,7 @@ createInterviewRouter.post('/', async (req, res) => {
     const roleId = roleIdFromBody || candidate.role_id;
     if (!roleId) return res.status(400).json({ error: 'role_id not provided and candidate has no role_id' });
 
+    // --- role lookup ---
     const { data: role, error: rErr } = await supabase
       .from('roles')
       .select('*')
@@ -34,8 +36,10 @@ createInterviewRouter.post('/', async (req, res) => {
 
     const webhookUrl = `${base}/webhook/tavus`;
 
+    // --- create interview with Tavus ---
     const result = await createTavusInterviewHandler(candidate, role, webhookUrl);
 
+    // --- check if interview already exists ---
     const { data: existing, error: eErr } = await supabase
       .from('interviews')
       .select('id, tavus_application_id')
@@ -47,6 +51,7 @@ createInterviewRouter.post('/', async (req, res) => {
     if (eErr) return res.status(500).json({ error: eErr.message });
 
     if (!existing) {
+      // --- create new interview ---
       const { error: iErr, data: iData } = await supabase
         .from('interviews')
         .insert({
@@ -54,7 +59,7 @@ createInterviewRouter.post('/', async (req, res) => {
           role_id: roleId,
           video_url: result.conversation_url || null,
           tavus_application_id: result.conversation_id || null,
-          status: 'Pending'
+          status: 'Pending',
         })
         .select('id')
         .single();
@@ -63,15 +68,16 @@ createInterviewRouter.post('/', async (req, res) => {
       return res.status(200).json({
         message: 'Interview created',
         conversation_url: result.conversation_url || null,
-        interview_id: iData.id
+        interview_id: iData.id,
       });
     } else {
+      // --- update existing interview ---
       const { error: uErr } = await supabase
         .from('interviews')
         .update({
           video_url: result.conversation_url || null,
           tavus_application_id: result.conversation_id || existing.tavus_application_id || null,
-          status: 'Pending'
+          status: 'Pending',
         })
         .eq('id', existing.id);
       if (uErr) return res.status(500).json({ error: uErr.message });
@@ -79,7 +85,7 @@ createInterviewRouter.post('/', async (req, res) => {
       return res.status(200).json({
         message: 'Interview updated',
         conversation_url: result.conversation_url || null,
-        interview_id: existing.id
+        interview_id: existing.id,
       });
     }
   } catch (e) {
@@ -88,4 +94,4 @@ createInterviewRouter.post('/', async (req, res) => {
   }
 });
 
-module.exports = createInterviewRouter;
+module.exports = router;
