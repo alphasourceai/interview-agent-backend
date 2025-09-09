@@ -1,3 +1,4 @@
+// app.js (drop-in)
 require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
@@ -10,7 +11,9 @@ const app = express()
 // ---------- CORS ----------
 const DEFAULT_ORIGINS = [
   'http://localhost:5173',
-  'https://interview-agent-frontend.onrender.com'
+  'https://interview-agent-frontend.onrender.com',
+  'https://ia-frontend-prod.onrender.com',
+  'https://www.alphasourceai.com',
 ]
 const envOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
@@ -58,14 +61,11 @@ async function requireAuth(req, res, next) {
 async function withClientScope(req, res, next) {
   try {
     if (!req.user) return res.status(401).json({ error: 'Unauthorized' })
-
     const { data, error } = await supabaseAdmin
       .from('client_members')
       .select('client_id, role')
       .eq('user_id', req.user.id)
-
     if (error) return res.status(500).json({ error: 'Failed to load memberships' })
-
     req.clientIds = (data || []).map(r => r.client_id)
     req.memberships = data || []
     next()
@@ -73,6 +73,11 @@ async function withClientScope(req, res, next) {
     return res.status(500).json({ error: 'Server error' })
   }
 }
+
+// ---------- Public candidate endpoints (MOUNTED) ----------
+app.use('/api/candidate/submit', require('./routes/candidateSubmit'))
+app.use('/api/candidate/verify-otp', require('./routes/verifyOtp'))
+app.use('/create-tavus-interview', require('./routes/createTavusInterview'))
 
 // ---------- Simple test endpoint ----------
 app.get('/auth/ping', requireAuth, withClientScope, (req, res) => {
@@ -94,7 +99,6 @@ app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
       .from('clients')
       .select('id, name')
       .in('id', ids)
-
     if (error) return res.status(500).json({ error: 'Failed to load clients' })
 
     const roleById = Object.fromEntries((req.memberships || []).map(m => [m.client_id, m.role]))
@@ -109,12 +113,11 @@ app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
   }
 })
 
-// ---------- Dashboard: scoped interviews with scores + breakdowns ----------
+// ---------- Dashboard: scoped interviews + reports ----------
 app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) => {
   try {
     const filterIds = req.clientIds || []
     if (filterIds.length === 0) return res.json({ items: [] })
-
     const wantedClientId = req.query.client_id
     const finalIds = wantedClientId ? filterIds.filter(id => id === wantedClientId) : filterIds
     if (finalIds.length === 0) return res.json({ items: [] })
@@ -130,14 +133,13 @@ app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) 
       .select(select)
       .in('client_id', finalIds)
       .order('created_at', { ascending: false })
-
     if (error) return res.status(500).json({ error: 'Failed to load interviews' })
 
     const candidateIds = Array.from(
       new Set((interviews || []).map(r => (r.candidates?.id ?? r.candidate_id)).filter(Boolean))
     )
 
-    // Fetch related reports once; newest first for each candidate
+    // Fetch related reports once; newest first per candidate
     let reportsByCandidate = {}
     if (candidateIds.length) {
       const { data: reports, error: repErr } = await supabaseAdmin
@@ -150,7 +152,6 @@ app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) 
         `)
         .in('candidate_id', candidateIds)
         .order('created_at', { ascending: false })
-
       if (!repErr && reports) {
         for (const rep of reports) {
           if (!reportsByCandidate[rep.candidate_id]) reportsByCandidate[rep.candidate_id] = []
@@ -224,7 +225,7 @@ app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) 
   }
 })
 
-// ---------- Optional: invites endpoints (kept minimal) ----------
+// ---------- Optional: invites ----------
 app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
   try {
     const { email, role = 'member', client_id } = req.body || {}
@@ -255,9 +256,7 @@ app.post('/clients/accept-invite', requireAuth, async (req, res) => {
       .select('client_id, email, role')
       .eq('token', token)
       .single()
-
     if (invErr || !invite) return res.status(400).json({ error: 'Invalid invite' })
-
     if (invite.email && invite.email !== req.user.email) {
       return res.status(400).json({ error: 'Invite email does not match your account' })
     }
