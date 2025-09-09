@@ -6,33 +6,48 @@ const router = express.Router();
 
 /**
  * POST /api/candidate/verify-otp
- * Body: { email: string, code: "######" }
+ * Body (preferred): { email, code, candidate_id?, role_id? }
+ * - email and 6-digit code are required
+ * - candidate_id/role_id remove ambiguity if the same email is used across roles
  */
 router.post("/", async (req, res) => {
   try {
-    const email = String(req.body?.email || "").trim();
+    const email = String(req.body?.email || "").trim().toLowerCase();
     const code  = String(req.body?.code  || "").trim();
+    const candidateIdIn = req.body?.candidate_id ? String(req.body.candidate_id).trim() : "";
+    const roleIdIn      = req.body?.role_id ? String(req.body.role_id).trim() : "";
 
     if (!email || !/^\d{6}$/.test(code)) {
       return res.status(400).json({ error: "Invalid email or 6-digit code." });
     }
 
-    // 1) Newest candidate for this email
-    const { data: cand, error: cErr } = await supabase
-      .from("candidates")
-      .select("id, role_id")
-      .eq("email", email)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .single();
+    // 1) Resolve candidate + role
+    let cand = null, cErr = null;
+    if (candidateIdIn) {
+      ({ data: cand, error: cErr } = await supabase
+        .from("candidates")
+        .select("id, role_id")
+        .eq("id", candidateIdIn)
+        .single());
+    } else {
+      ({ data: cand, error: cErr } = await supabase
+        .from("candidates")
+        .select("id, role_id")
+        .eq("email", email)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .single());
+    }
     if (cErr || !cand) return res.status(404).json({ error: "Candidate not found." });
+
+    const roleId = roleIdIn || cand.role_id;
 
     // 2) Newest OTP for (candidate_email, role_id)
     const { data: token, error: tErr } = await supabase
       .from("otp_tokens")
       .select("id, code, expires_at, used, role_id")
       .eq("candidate_email", email)
-      .eq("role_id", cand.role_id)
+      .eq("role_id", roleId)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -59,7 +74,6 @@ router.post("/", async (req, res) => {
     for (const payload of updatesToTry) {
       const { error } = await supabase.from("otp_tokens").update(payload).eq("id", token.id);
       if (!error) {
-        // Read back to confirm it took
         const { data: checkRow } = await supabase
           .from("otp_tokens")
           .select("used")
@@ -78,14 +92,14 @@ router.post("/", async (req, res) => {
         .from("otp_tokens")
         .update({ used: "true" }) // text-safe; casts in boolean schemas as well
         .eq("candidate_email", email)
-        .eq("role_id", cand.role_id)
+        .eq("role_id", roleId)
         .eq("code", code);
       if (!error) {
         const { data: checkRow2 } = await supabase
           .from("otp_tokens")
           .select("used")
           .eq("candidate_email", email)
-          .eq("role_id", cand.role_id)
+          .eq("role_id", roleId)
           .eq("code", code)
           .order("created_at", { ascending: false })
           .limit(1)
@@ -98,22 +112,22 @@ router.post("/", async (req, res) => {
     }
 
     if (!updatedOk) {
-      // Log server-side for debugging; keep client error minimal
       console.error("mark-used failed:", lastErr);
       return res.status(500).json({ error: "Could not mark OTP as used." });
     }
 
-    // 5) Update candidate to Verified
+    // 5) Update candidate to Verified (set flags + timestamp)
     const { error: uCandErr } = await supabase
       .from("candidates")
-      .update({ status: "Verified" })
+      .update({ status: "Verified", verified: true, otp_verified_at: new Date().toISOString() })
       .eq("id", cand.id);
     if (uCandErr) return res.status(500).json({ error: "Could not update verification status." });
 
     return res.status(200).json({
       message: "Verified",
+      verified: true,
       candidate_id: cand.id,
-      role_id: cand.role_id,
+      role_id: roleId,
       email
     });
   } catch (e) {

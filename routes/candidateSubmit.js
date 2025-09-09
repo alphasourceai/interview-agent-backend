@@ -39,7 +39,8 @@ router.post('/', upload.any(), async (req, res) => {
     const first_name = req.body.first_name?.trim();
     const last_name  = req.body.last_name?.trim();
     const rawName    = req.body.name?.trim();
-    const email      = (req.body.email || '').trim();
+    // normalize email so BE + DB (unique index on lower(email)) agree
+    const email      = (req.body.email || '').trim().toLowerCase();
     const phone      = (req.body.phone || '').replace(/\D/g, ''); // optional
     const resume_url_in = req.body.resume_url || null;
 
@@ -51,7 +52,7 @@ router.post('/', upload.any(), async (req, res) => {
       });
     }
 
-    // --- find role by id OR token ---
+    // --- find role by id OR token (slug_or_token) ---
     let role = null, rErr = null;
     if (role_id_in) {
       ({ data: role, error: rErr } = await supabase
@@ -62,8 +63,8 @@ router.post('/', upload.any(), async (req, res) => {
     } else {
       ({ data: role, error: rErr } = await supabase
         .from('roles')
-        .select('id, title, token')
-        .eq('token', role_token)
+        .select('id, title, slug_or_token')
+        .eq('slug_or_token', role_token)
         .single());
     }
     if (rErr || !role) {
