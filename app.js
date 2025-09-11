@@ -79,6 +79,7 @@ app.use('/api/candidate/submit', require('./routes/candidateSubmit'))
 app.use('/api/candidate/verify-otp', require('./routes/verifyOtp'))
 app.use('/create-tavus-interview', require('./routes/createTavusInterview'))
 
+
 // ---------- Simple test endpoint ----------
 app.get('/auth/ping', requireAuth, withClientScope, (req, res) => {
   res.json({ ok: true, user: req.user, client_ids: req.clientIds })
