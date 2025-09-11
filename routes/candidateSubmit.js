@@ -1,9 +1,9 @@
-// routes/candidateSubmit.js
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const sg = require('@sendgrid/mail');
-const { supabase } = require('../src/lib/supabaseClient'); // <- keep this path
+const { supabase } = require('../src/lib/supabaseClient'); // keep this path
+const analyzeResume = require('../analyzeResume'); // <- use your analyzer
 
 // --- config ---
 const upload = multer({
@@ -52,18 +52,18 @@ router.post('/', upload.any(), async (req, res) => {
       });
     }
 
-    // --- find role by id OR token (slug_or_token) ---
+    // --- find role by id OR token (need description for resume analysis) ---
     let role = null, rErr = null;
     if (role_id_in) {
       ({ data: role, error: rErr } = await supabase
         .from('roles')
-        .select('id, title')
+        .select('id, title, description, kb_document_id')
         .eq('id', role_id_in)
         .single());
     } else {
       ({ data: role, error: rErr } = await supabase
         .from('roles')
-        .select('id, title, slug_or_token')
+        .select('id, title, description, kb_document_id, slug_or_token')
         .eq('slug_or_token', role_token)
         .single());
     }
@@ -80,27 +80,73 @@ router.post('/', upload.any(), async (req, res) => {
       .eq('role_id', roleId);
     if (dupErr) return res.status(500).json({ error: dupErr.message });
     if ((existingCount || 0) > 0) {
-      return res.status(409).json({ error: 'You have already started an interview for this role.' });
+      // Still create a fresh OTP so the flow continues
+      const freshCode = six();
+      await supabase
+        .from('otp_tokens')
+        .update({ used: true, used_at: new Date().toISOString() })
+        .eq('candidate_email', email)
+        .eq('role_id', roleId)
+        .eq('used', false);
+
+      const { error: otpErr } = await supabase.from('otp_tokens').insert({
+        candidate_email: email,
+        role_id: roleId,
+        code: freshCode,
+        expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+        used: false,
+      });
+      if (otpErr) return res.status(500).json({ error: `Could not create OTP: ${otpErr.message}` });
+
+      let emailSent = false, emailError = null;
+      try {
+        if (!SENDGRID_KEY || !FROM_EMAIL) throw new Error('SENDGRID_API_KEY or SENDGRID_FROM not configured');
+        const subject = `Your ${APP_NAME} verification code`;
+        const html = `<p>Your verification code is <strong style="font-size:18px">${freshCode}</strong>.</p><p>It expires in 10 minutes.</p>`;
+        const [resp] = await sg.send({ to: email, from: { email: FROM_EMAIL, name: APP_NAME }, subject, html });
+        emailSent = resp?.statusCode === 202;
+      } catch (e) {
+        emailError = e?.response?.data || e?.message || String(e);
+        console.error('sendEmailOtp (dup) failed:', emailError);
+      }
+      return res.status(409).json({
+        message: emailSent ? 'We found an existing start for this role. OTP emailed.' : 'We found an existing start for this role. OTP email failed.',
+        email_sent: emailSent,
+        email_error: emailError,
+        email,
+        role_id: roleId,
+      });
     }
 
-    // --- create candidate ---
+    // --- create candidate (now storing first/last) ---
     const { data: inserted, error: cErr } = await supabase
       .from('candidates')
-      .insert({ role_id: roleId, name: fullName, email, phone, status: 'Resume Uploaded' })
+      .insert({ role_id: roleId, name: fullName, first_name, last_name, email, phone, status: 'Resume Uploaded' })
       .select('id')
       .single();
     if (cErr) return res.status(500).json({ error: cErr.message });
+
     const candidate_id = inserted.id;
+
+    // mirror id -> candidate_id (your schema shows this helper column)
+    await supabase.from('candidates').update({ candidate_id }).eq('id', candidate_id);
 
     // --- optional: upload resume to storage ---
     let resume_url = resume_url_in;
+    let uploadedFile = null;
     try {
       const file = (req.files || []).find(f =>
         ['resume', 'resume_file', 'file', 'resumeFile', 'pdf'].includes(f.fieldname)
       );
       if (file) {
+        uploadedFile = file; // keep buffer for analysis
         const bucket = process.env.SUPABASE_RESUMES_BUCKET || 'resumes';
-        const path = `${candidate_id}.pdf`;
+        // allow multiple types; default to pdf extension if unknown
+        const extFromType =
+          /pdf/i.test(file.mimetype) ? 'pdf' :
+          /wordprocessingml|officedocument|docx/i.test(file.mimetype) ? 'docx' :
+          'pdf';
+        const path = `${candidate_id}.${extFromType}`;
         const up = await supabase.storage.from(bucket).upload(path, file.buffer, {
           contentType: file.mimetype || 'application/pdf',
           upsert: true,
@@ -117,9 +163,27 @@ router.post('/', upload.any(), async (req, res) => {
       await supabase.from('candidates').update({ resume_url }).eq('id', candidate_id);
     }
 
-    // ----------------- HARDENING PATCH START -----------------
+    // --- resume analysis -> candidates.analysis_summary (and reports row via analyzer) ---
+    try {
+      if (uploadedFile?.buffer?.length) {
+        const analysis = await analyzeResume(uploadedFile.buffer, uploadedFile.mimetype || 'application/pdf', {
+          description: role?.description || '',
+          title: role?.title || '',
+          interview_type: role?.interview_type || '',
+          rubric: role?.rubric || null
+        }, candidate_id);
 
-    // Invalidate any previous, unused OTPs for this (email, role)
+        await supabase
+          .from('candidates')
+          .update({ analysis_summary: analysis })
+          .eq('id', candidate_id);
+      }
+    } catch (e) {
+      // Non-fatal; OTP flow must still proceed
+      console.warn('resume analysis failed (non-fatal):', e?.message || e);
+    }
+
+    // ----------------- OTP: invalidate old & create one fresh -----------------
     const nowIso = new Date().toISOString();
     await supabase
       .from('otp_tokens')
@@ -128,7 +192,6 @@ router.post('/', upload.any(), async (req, res) => {
       .eq('role_id', roleId)
       .eq('used', false);
 
-    // Create exactly one fresh OTP (10-minute TTL)
     const freshCode = six();
     const { error: otpErr } = await supabase.from('otp_tokens').insert({
       candidate_email: email,
@@ -141,7 +204,7 @@ router.post('/', upload.any(), async (req, res) => {
       return res.status(500).json({ error: `Could not create OTP: ${otpErr.message}` });
     }
 
-    // Read back the newest OTP (defensive) and email THAT code
+    // Read back newest OTP & send email
     const { data: newest, error: readErr } = await supabase
       .from('otp_tokens')
       .select('id, code, created_at')
@@ -152,20 +215,16 @@ router.post('/', upload.any(), async (req, res) => {
       .single();
     const codeToSend = (!readErr && newest?.code) ? newest.code : freshCode;
 
-    // ------------------ HARDENING PATCH END ------------------
-
-    // --- send OTP via SendGrid (non-fatal on failure; surfaced in response) ---
     let emailSent = false, emailError = null;
     try {
       if (!SENDGRID_KEY || !FROM_EMAIL) throw new Error('SENDGRID_API_KEY or SENDGRID_FROM not configured');
       const subject = `Your ${APP_NAME} verification code`;
-      const text = `Your verification code is ${codeToSend}. It expires in 10 minutes.`;
       const html = `<p>Your verification code is <strong style="font-size:18px">${codeToSend}</strong>.</p>
                     <p>It expires in 10 minutes.</p>`;
       const [resp] = await sg.send({
         to: email,
         from: { email: FROM_EMAIL, name: APP_NAME },
-        subject, text, html,
+        subject, html,
       });
       emailSent = resp?.statusCode === 202;
     } catch (e) {
@@ -179,6 +238,7 @@ router.post('/', upload.any(), async (req, res) => {
       email_error: emailError,
       candidate_id,
       role_id: roleId,
+      email,              // <— return for FE convenience
       resume_url: resume_url || null,
     });
   } catch (err) {
