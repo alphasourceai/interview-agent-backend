@@ -68,13 +68,15 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
     const candIds = Array.from(new Set((rows || []).map(r => r.candidate_id).filter(Boolean)));
     const roleIds = Array.from(new Set((rows || []).map(r => r.role_id).filter(Boolean)));
 
-    // 2) Candidates
+    // 2) Candidates (restrict to SAME client)
     let candidatesById = {};
     if (candIds.length) {
       const { data: cands, error: cErr } = await supabase
         .from('candidates')
-        .select('id, first_name, last_name, name, email')
-        .in('id', candIds);
+        .select('id, first_name, last_name, name, email, client_id')
+        .in('id', candIds)
+        .eq('client_id', clientId); // ensure same client
+
       if (cErr) {
         console.error('[dashboard/interviews] candidates join error', cErr);
       } else {
@@ -90,13 +92,15 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
       }
     }
 
-    // 3) Roles
+    // 3) Roles (also restrict to SAME client for consistency)
     let rolesById = {};
     if (roleIds.length) {
       const { data: roles, error: rErr } = await supabase
         .from('roles')
         .select('id, title, client_id')
-        .in('id', roleIds);
+        .in('id', roleIds)
+        .eq('client_id', clientId);
+
       if (rErr) {
         console.error('[dashboard/interviews] roles join error', rErr);
       } else {
@@ -106,32 +110,34 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
       }
     }
 
-    // 4) Normalize & return — NO demo data appended
-    const items = (rows || []).map(r => {
-      const candidate = candidatesById[r.candidate_id] || { id: r.candidate_id || null, name: '', email: '' };
-      const role = r.role_id ? (rolesById[r.role_id] || null) : null;
+    // 4) Normalize & return — drop rows whose candidate isn't resolvable for this client
+    const items = (rows || [])
+      .filter(r => r.candidate_id && candidatesById[r.candidate_id])
+      .map(r => {
+        const candidate = candidatesById[r.candidate_id];
+        const role = r.role_id ? (rolesById[r.role_id] || null) : null;
 
-      return {
-        id: r.id,
-        created_at: r.created_at,
-        client_id: r.client_id,
-        candidate,
-        role,
-        video_url: r.video_url || null,
-        transcript_url: r.transcript_url || null,
-        analysis_url: r.analysis_url || null,
-        has_video: !!r.video_url,
-        has_transcript: !!r.transcript_url,
-        has_analysis: !!r.analysis_url,
-        resume_score: isFinite(r.resume_score) ? Number(r.resume_score) : null,
-        interview_score: isFinite(r.interview_score) ? Number(r.interview_score) : null,
-        overall_score: isFinite(r.overall_score) ? Number(r.overall_score) : null,
-        resume_analysis: r.resume_analysis || { experience: null, skills: null, education: null, summary: '' },
-        interview_analysis: r.interview_analysis || { clarity: null, confidence: null, body_language: null },
-        latest_report_url: r.latest_report_url || null,
-        report_generated_at: r.report_generated_at || null,
-      };
-    });
+        return {
+          id: r.id,
+          created_at: r.created_at,
+          client_id: r.client_id,
+          candidate,
+          role,
+          video_url: r.video_url || null,
+          transcript_url: r.transcript_url || null,
+          analysis_url: r.analysis_url || null,
+          has_video: !!r.video_url,
+          has_transcript: !!r.transcript_url,
+          has_analysis: !!r.analysis_url,
+          resume_score: isFinite(r.resume_score) ? Number(r.resume_score) : null,
+          interview_score: isFinite(r.interview_score) ? Number(r.interview_score) : null,
+          overall_score: isFinite(r.overall_score) ? Number(r.overall_score) : null,
+          resume_analysis: r.resume_analysis || { experience: null, skills: null, education: null, summary: '' },
+          interview_analysis: r.interview_analysis || { clarity: null, confidence: null, body_language: null },
+          latest_report_url: r.latest_report_url || null,
+          report_generated_at: r.report_generated_at || null,
+        };
+      });
 
     return res.json({ items });
   } catch (e) {
@@ -142,7 +148,7 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
 
 /**
  * GET /dashboard/candidates
- * (unchanged from your current file)
+ * (unchanged except for the existing client_id filter)
  */
 router.get('/candidates', requireAuth, withClientScope, async (req, res) => {
   try {
