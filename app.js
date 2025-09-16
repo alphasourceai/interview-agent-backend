@@ -114,38 +114,68 @@ app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
   }
 })
 
-// ---------- Dashboard: scoped interviews + reports ----------
+// ---------- Dashboard: scoped rows (CANDIDATE-FIRST) ----------
 async function buildDashboardRows(req, res) {
   try {
-    const filterIds = req.clientIds || []
-    if (filterIds.length === 0) return res.json({ items: [] })
+    const filterIds = req.clientIds || [];
+    if (filterIds.length === 0) return res.json({ items: [] });
 
-    const wantedClientId = req.query.client_id
-    const finalIds = wantedClientId ? filterIds.filter(id => id === wantedClientId) : filterIds
-    if (finalIds.length === 0) return res.json({ items: [] })
+    const wantedClientId = req.query.client_id;
+    const finalIds = wantedClientId ? filterIds.filter(id => id === wantedClientId) : filterIds;
+    if (finalIds.length === 0) return res.json({ items: [] });
 
-    const select = `
-      id, created_at, candidate_id, role_id, client_id,
-      video_url, transcript_url, analysis_url,
-      roles:roles(id, title, client_id),
-      candidates:candidates(id, name, email)
-    `
-    const { data: interviews, error } = await supabaseAdmin
-      .from('interviews')
-      .select(select)
+    // 1) Pull candidates for the scoped client(s)
+    const { data: candRows, error: candErr } = await supabaseAdmin
+      .from('candidates')
+      .select('id, first_name, last_name, name, email, role_id, client_id, created_at')
       .in('client_id', finalIds)
-      .order('created_at', { ascending: false })
+      .order('created_at', { ascending: false });
 
-    if (error) return res.status(500).json({ error: 'Failed to load interviews' })
+    if (candErr) return res.status(500).json({ error: 'Failed to load candidates' });
 
-    const candidateIds = Array.from(
-      new Set((interviews || []).map(r => (r.candidates?.id ?? r.candidate_id)).filter(Boolean))
-    )
+    const candidateIds = Array.from(new Set((candRows || []).map(c => c.id)));
+    const roleIds = Array.from(new Set((candRows || []).map(c => c.role_id).filter(Boolean)));
 
-    // Fetch related reports once; newest first per candidate
-    let reportsByCandidate = {}
+    // 2) Join roles for display
+    let rolesById = {};
+    if (roleIds.length) {
+      const { data: roles, error: roleErr } = await supabaseAdmin
+        .from('roles')
+        .select('id, title, client_id')
+        .in('id', roleIds);
+
+      if (roleErr) {
+        rolesById = {};
+      } else {
+        rolesById = Object.fromEntries(
+          (roles || []).map(r => [r.id, { id: r.id, title: r.title, client_id: r.client_id }])
+        );
+      }
+    }
+
+    // 3) Find the latest interview per candidate (same client scope)
+    let latestInterviewByCand = {};
     if (candidateIds.length) {
-      const { data: reports, error: repErr } = await supabaseAdmin
+      const { data: ivs, error: intErr } = await supabaseAdmin
+        .from('interviews')
+        .select('id, candidate_id, client_id, role_id, created_at, video_url, transcript_url, analysis_url')
+        .in('candidate_id', candidateIds)
+        .in('client_id', finalIds)
+        .order('created_at', { ascending: false });
+
+      if (!intErr && ivs) {
+        for (const r of ivs) {
+          const cid = r.candidate_id;
+          // since ordered DESC, first one we see is the latest
+          if (!latestInterviewByCand[cid]) latestInterviewByCand[cid] = r;
+        }
+      }
+    }
+
+    // 4) Pull reports once; then choose best per candidate (prefer matching role_id)
+    let bestReportByCand = {};
+    if (candidateIds.length) {
+      const { data: reps, error: repErr } = await supabaseAdmin
         .from('reports')
         .select(`
           id, candidate_id, role_id,
@@ -154,79 +184,93 @@ async function buildDashboardRows(req, res) {
           report_url, created_at
         `)
         .in('candidate_id', candidateIds)
-        .order('created_at', { ascending: false })
-      if (!repErr && reports) {
-        for (const rep of reports) {
-          if (!reportsByCandidate[rep.candidate_id]) reportsByCandidate[rep.candidate_id] = []
-          reportsByCandidate[rep.candidate_id].push(rep)
+        .order('created_at', { ascending: false });
+
+      if (!repErr && reps) {
+        for (const rep of reps) {
+          // keep the first we see (newest), but if role matches candidate.role_id, prefer that
+          const cur = bestReportByCand[rep.candidate_id];
+          if (!cur) {
+            bestReportByCand[rep.candidate_id] = rep;
+          } else {
+            // prefer role match over non-match; if both match, keep newest (already newest)
+            const candRole = (candRows.find(c => c.id === rep.candidate_id) || {}).role_id;
+            const curMatch = cur.role_id && candRole && cur.role_id === candRole;
+            const newMatch = rep.role_id && candRole && rep.role_id === candRole;
+            if (!curMatch && newMatch) bestReportByCand[rep.candidate_id] = rep;
+          }
         }
       }
     }
 
-    const numOrNull = (v) => (typeof v === 'number' && isFinite(v)) ? v : (v === 0 ? 0 : null)
+    const numOrNull = v => (typeof v === 'number' && isFinite(v)) ? v : (v === 0 ? 0 : null);
 
-    const items = (interviews || []).map(r => {
-      const candId = r.candidates?.id ?? r.candidate_id ?? null
-      const roleId = r.role_id ?? null
-      const cr = candId ? (reportsByCandidate[candId] || []) : []
-      const rep = cr.find(x => roleId && x.role_id === roleId) || cr[0] || null
+    // 5) Normalize to FE shape
+    const items = (candRows || []).map(c => {
+      const fullName =
+        c.name ||
+        [c.first_name, c.last_name].filter(Boolean).join(' ').trim() ||
+        '';
 
-      const resume_score    = rep?.resume_score ?? null
-      const interview_score = rep?.interview_score ?? null
-      const overall_score   = rep?.overall_score ?? null
+      const role = c.role_id ? (rolesById[c.role_id] || null) : null;
+      const latest = latestInterviewByCand[c.id] || null;
+      const rep = bestReportByCand[c.id] || null;
 
-      const rb = rep?.resume_breakdown || {}
-      const ib = rep?.interview_breakdown || {}
+      const rb = rep?.resume_breakdown || {};
+      const ib = rep?.interview_breakdown || {};
 
       const resume_analysis = {
         experience: numOrNull(rb.experience_match_percent ?? rb.experience),
         skills:     numOrNull(rb.skills_match_percent ?? rb.skills),
         education:  numOrNull(rb.education_match_percent ?? rb.education),
         summary:    typeof rb.summary === 'string' ? rb.summary : ''
-      }
+      };
 
       const interview_analysis = {
         clarity:       numOrNull(ib.clarity),
         confidence:    numOrNull(ib.confidence),
         body_language: numOrNull(ib.body_language)
-      }
+      };
 
       return {
-        id: r.id,
-        created_at: r.created_at,
-        client_id: r.client_id || null,
+        // IMPORTANT: keep "id" = latest interview id so Transcript/PDF buttons work
+        id: latest?.id ?? null,
 
-        candidate: r.candidates
-          ? { id: r.candidates.id, name: r.candidates.name || '', email: r.candidates.email || '' }
-          : { id: r.candidate_id || null, name: '', email: '' },
+        // show candidate creation time in table
+        created_at: c.created_at,
+        client_id: c.client_id,
 
-        role: r.roles ? { id: r.roles.id, title: r.roles.title, client_id: r.roles.client_id } : null,
+        candidate: { id: c.id, name: fullName, email: c.email || '' },
+        role,
 
-        video_url: r.video_url || null,
-        transcript_url: r.transcript_url || null,
-        analysis_url: r.analysis_url || null,
+        // interview-derived fields for the expanded row
+        video_url: latest?.video_url || null,
+        transcript_url: latest?.transcript_url || null,
+        analysis_url: latest?.analysis_url || null,
 
-        has_video: !!r.video_url,
-        has_transcript: !!r.transcript_url,
-        has_analysis: !!r.analysis_url,
+        has_video: !!latest?.video_url,
+        has_transcript: !!latest?.transcript_url,
+        has_analysis: !!latest?.analysis_url,
 
-        resume_score,
-        interview_score,
-        overall_score,
+        // report-derived scores/analyses
+        resume_score:    numOrNull(rep?.resume_score ?? null),
+        interview_score: numOrNull(rep?.interview_score ?? null),
+        overall_score:   numOrNull(rep?.overall_score ?? null),
 
         resume_analysis,
         interview_analysis,
 
         latest_report_url: rep?.report_url ?? null,
         report_generated_at: rep?.created_at ?? null
-      }
-    })
+      };
+    });
 
-    return res.json({ items })
+    return res.json({ items });
   } catch (e) {
-    return res.status(500).json({ error: 'Server error' })
+    return res.status(500).json({ error: 'Server error' });
   }
 }
+
 
 // Existing path (kept for compatibility)
 app.get('/dashboard/interviews', requireAuth, withClientScope, (req, res) => {
