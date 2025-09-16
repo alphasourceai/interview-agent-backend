@@ -115,10 +115,11 @@ app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
 })
 
 // ---------- Dashboard: scoped interviews + reports ----------
-app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) => {
+async function buildDashboardRows(req, res) {
   try {
     const filterIds = req.clientIds || []
     if (filterIds.length === 0) return res.json({ items: [] })
+
     const wantedClientId = req.query.client_id
     const finalIds = wantedClientId ? filterIds.filter(id => id === wantedClientId) : filterIds
     if (finalIds.length === 0) return res.json({ items: [] })
@@ -134,6 +135,7 @@ app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) 
       .select(select)
       .in('client_id', finalIds)
       .order('created_at', { ascending: false })
+
     if (error) return res.status(500).json({ error: 'Failed to load interviews' })
 
     const candidateIds = Array.from(
@@ -169,9 +171,9 @@ app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) 
       const cr = candId ? (reportsByCandidate[candId] || []) : []
       const rep = cr.find(x => roleId && x.role_id === roleId) || cr[0] || null
 
-      const resume_score = rep?.resume_score ?? null
+      const resume_score    = rep?.resume_score ?? null
       const interview_score = rep?.interview_score ?? null
-      const overall_score = rep?.overall_score ?? null
+      const overall_score   = rep?.overall_score ?? null
 
       const rb = rep?.resume_breakdown || {}
       const ib = rep?.interview_breakdown || {}
@@ -220,11 +222,22 @@ app.get('/dashboard/interviews', requireAuth, withClientScope, async (req, res) 
       }
     })
 
-    res.json({ items })
+    return res.json({ items })
   } catch (e) {
-    res.status(500).json({ error: 'Server error' })
+    return res.status(500).json({ error: 'Server error' })
   }
+}
+
+// Existing path (kept for compatibility)
+app.get('/dashboard/interviews', requireAuth, withClientScope, (req, res) => {
+  buildDashboardRows(req, res)
 })
+
+// New path used by the FE
+app.get('/dashboard/rows', requireAuth, withClientScope, (req, res) => {
+  buildDashboardRows(req, res)
+})
+
 
 // ---------- Optional: invites ----------
 app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
