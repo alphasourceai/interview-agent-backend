@@ -9,20 +9,12 @@ const router = express.Router();
 
 /**
  * GET /dashboard/interviews
- * Returns interviews for the scoped client — DB ONLY (no demo injection)
- * Output shape matches the frontend expectation:
- * {
- *   id, created_at, client_id,
- *   candidate: { id, name, email },
- *   role: { id, title, client_id } | null,
- *   video_url, transcript_url, analysis_url,
- *   has_video, has_transcript, has_analysis,
- *   resume_score, interview_score, overall_score,
- *   resume_analysis, interview_analysis,
- *   latest_report_url, report_generated_at
- * }
+ * DB-only, strictly scoped to the client's data.
+ * Optional debug mode: add ?debug=1 to include a __meta block and emit server logs.
  */
 router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
+  const DEBUG = String(req.query.debug || '') === '1';
+
   try {
     const clientId =
       req.client?.id ||
@@ -34,7 +26,7 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
       return res.status(400).json({ error: 'client_id required' });
     }
 
-    // 1) Interviews (DB only)
+    // 1) Interviews (DB only) for this client.
     const { data: rows, error: iErr } = await supabase
       .from('interviews')
       .select(
@@ -68,13 +60,15 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
     const candIds = Array.from(new Set((rows || []).map(r => r.candidate_id).filter(Boolean)));
     const roleIds = Array.from(new Set((rows || []).map(r => r.role_id).filter(Boolean)));
 
-    // 2) Candidates
+    // 2) Candidates (restrict to SAME client)
     let candidatesById = {};
     if (candIds.length) {
       const { data: cands, error: cErr } = await supabase
         .from('candidates')
-        .select('id, first_name, last_name, name, email')
-        .in('id', candIds);
+        .select('id, first_name, last_name, name, email, client_id')
+        .in('id', candIds)
+        .eq('client_id', clientId); // ensure same client
+
       if (cErr) {
         console.error('[dashboard/interviews] candidates join error', cErr);
       } else {
@@ -90,13 +84,15 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
       }
     }
 
-    // 3) Roles
+    // 3) Roles (also restrict to SAME client for consistency)
     let rolesById = {};
     if (roleIds.length) {
       const { data: roles, error: rErr } = await supabase
         .from('roles')
         .select('id, title, client_id')
-        .in('id', roleIds);
+        .in('id', roleIds)
+        .eq('client_id', clientId);
+
       if (rErr) {
         console.error('[dashboard/interviews] roles join error', rErr);
       } else {
@@ -106,9 +102,10 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
       }
     }
 
-    // 4) Normalize & return — NO demo data appended
-    const items = (rows || []).map(r => {
-      const candidate = candidatesById[r.candidate_id] || { id: r.candidate_id || null, name: '', email: '' };
+    // 4) Normalize & return — drop rows whose candidate isn't resolvable for this client
+    const filtered = (rows || []).filter(r => r.candidate_id && candidatesById[r.candidate_id]);
+    const items = filtered.map(r => {
+      const candidate = candidatesById[r.candidate_id];
       const role = r.role_id ? (rolesById[r.role_id] || null) : null;
 
       return {
@@ -133,18 +130,50 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
       };
     });
 
+    // Stamp a header so we can confirm the live build easily
+    res.set('X-IA-Route', 'interviews-strict-2025-09-12d');
+
+    if (DEBUG) {
+      // Emit concise server logs to help verify what's happening
+      console.log('[dashboard/interviews][debug]', {
+        clientId,
+        totalInterviews: rows?.length || 0,
+        uniqueCandidateIds: candIds.length,
+        candidatesLoaded: Object.keys(candidatesById).length,
+        rolesLoaded: Object.keys(rolesById).length,
+        returnedItems: items.length,
+        sampleInterviewIds: (rows || []).slice(0, 3).map(r => r.id),
+        sampleReturnedIds: items.slice(0, 3).map(r => r.id),
+      });
+
+      return res.json({
+        items,
+        __meta: {
+          clientId,
+          totalInterviews: rows?.length || 0,
+          uniqueCandidateIds: candIds.length,
+          candidatesLoaded: Object.keys(candidatesById).length,
+          rolesLoaded: Object.keys(rolesById).length,
+          returnedItems: items.length,
+        }
+      });
+    }
+
     return res.json({ items });
   } catch (e) {
     console.error('[dashboard/interviews] unexpected', e);
+    res.set('X-IA-Route', 'interviews-strict-2025-09-12d');
     return res.status(500).json({ error: 'Server error' });
   }
 });
 
 /**
  * GET /dashboard/candidates
- * (unchanged from your current file)
+ * DB-only, scoped to client_id.
  */
 router.get('/candidates', requireAuth, withClientScope, async (req, res) => {
+  const DEBUG = String(req.query.debug || '') === '1';
+
   try {
     const clientId =
       req.client?.id ||
@@ -154,7 +183,7 @@ router.get('/candidates', requireAuth, withClientScope, async (req, res) => {
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
 
-    // 1) Candidates
+    // 1) Candidates for this client
     const { data: rows, error } = await supabase
       .from('candidates')
       .select(
@@ -168,18 +197,20 @@ router.get('/candidates', requireAuth, withClientScope, async (req, res) => {
       return res.status(500).json({ error: 'query failed' });
     }
 
-    // 2) Join role titles
+    // 2) Join role titles (no extra client filter needed if roles are unique, but safe if you prefer)
     const roleIds = Array.from(new Set((rows || []).map(r => r.role_id).filter(Boolean)));
     let rolesById = {};
     if (roleIds.length) {
       const { data: roles, error: rErr } = await supabase
         .from('roles')
-        .select('id, title')
-        .in('id', roleIds);
+        .select('id, title, client_id')
+        .in('id', roleIds)
+        .eq('client_id', clientId);
+
       if (rErr) {
         console.error('[dashboard/candidates] roles join error', rErr);
       } else {
-        rolesById = Object.fromEntries(roles.map(r => [r.id, r.title]));
+        rolesById = Object.fromEntries((roles || []).map(r => [r.id, r.title]));
       }
     }
 
@@ -208,10 +239,32 @@ router.get('/candidates', requireAuth, withClientScope, async (req, res) => {
       };
     });
 
-    res.json({ items });
+    res.set('X-IA-Route', 'candidates-strict-2025-09-12d');
+
+    if (DEBUG) {
+      console.log('[dashboard/candidates][debug]', {
+        clientId,
+        totalCandidates: rows?.length || 0,
+        rolesLoaded: Object.keys(rolesById).length,
+        returnedItems: items.length,
+        sampleIds: items.slice(0, 3).map(i => i.id),
+      });
+      return res.json({
+        items,
+        __meta: {
+          clientId,
+          totalCandidates: rows?.length || 0,
+          rolesLoaded: Object.keys(rolesById).length,
+          returnedItems: items.length,
+        }
+      });
+    }
+
+    return res.json({ items });
   } catch (e) {
     console.error('[dashboard/candidates] unexpected', e);
-    res.status(500).json({ error: 'Server error' });
+    res.set('X-IA-Route', 'candidates-strict-2025-09-12d');
+    return res.status(500).json({ error: 'Server error' });
   }
 });
 
