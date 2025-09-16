@@ -9,20 +9,12 @@ const router = express.Router();
 
 /**
  * GET /dashboard/interviews
- * Returns interviews for the scoped client — DB ONLY (no demo injection)
- * Output shape matches the frontend expectation:
- * {
- *   id, created_at, client_id,
- *   candidate: { id, name, email },
- *   role: { id, title, client_id } | null,
- *   video_url, transcript_url, analysis_url,
- *   has_video, has_transcript, has_analysis,
- *   resume_score, interview_score, overall_score,
- *   resume_analysis, interview_analysis,
- *   latest_report_url, report_generated_at
- * }
+ * DB-only, strictly scoped to the client's data.
+ * Optional debug mode: add ?debug=1 to include a __meta block and emit server logs.
  */
 router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
+  const DEBUG = String(req.query.debug || '') === '1';
+
   try {
     const clientId =
       req.client?.id ||
@@ -34,7 +26,7 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
       return res.status(400).json({ error: 'client_id required' });
     }
 
-    // 1) Interviews (DB only)
+    // 1) Interviews (DB only) for this client.
     const { data: rows, error: iErr } = await supabase
       .from('interviews')
       .select(
@@ -111,46 +103,77 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
     }
 
     // 4) Normalize & return — drop rows whose candidate isn't resolvable for this client
-    const items = (rows || [])
-      .filter(r => r.candidate_id && candidatesById[r.candidate_id])
-      .map(r => {
-        const candidate = candidatesById[r.candidate_id];
-        const role = r.role_id ? (rolesById[r.role_id] || null) : null;
+    const filtered = (rows || []).filter(r => r.candidate_id && candidatesById[r.candidate_id]);
+    const items = filtered.map(r => {
+      const candidate = candidatesById[r.candidate_id];
+      const role = r.role_id ? (rolesById[r.role_id] || null) : null;
 
-        return {
-          id: r.id,
-          created_at: r.created_at,
-          client_id: r.client_id,
-          candidate,
-          role,
-          video_url: r.video_url || null,
-          transcript_url: r.transcript_url || null,
-          analysis_url: r.analysis_url || null,
-          has_video: !!r.video_url,
-          has_transcript: !!r.transcript_url,
-          has_analysis: !!r.analysis_url,
-          resume_score: isFinite(r.resume_score) ? Number(r.resume_score) : null,
-          interview_score: isFinite(r.interview_score) ? Number(r.interview_score) : null,
-          overall_score: isFinite(r.overall_score) ? Number(r.overall_score) : null,
-          resume_analysis: r.resume_analysis || { experience: null, skills: null, education: null, summary: '' },
-          interview_analysis: r.interview_analysis || { clarity: null, confidence: null, body_language: null },
-          latest_report_url: r.latest_report_url || null,
-          report_generated_at: r.report_generated_at || null,
-        };
+      return {
+        id: r.id,
+        created_at: r.created_at,
+        client_id: r.client_id,
+        candidate,
+        role,
+        video_url: r.video_url || null,
+        transcript_url: r.transcript_url || null,
+        analysis_url: r.analysis_url || null,
+        has_video: !!r.video_url,
+        has_transcript: !!r.transcript_url,
+        has_analysis: !!r.analysis_url,
+        resume_score: isFinite(r.resume_score) ? Number(r.resume_score) : null,
+        interview_score: isFinite(r.interview_score) ? Number(r.interview_score) : null,
+        overall_score: isFinite(r.overall_score) ? Number(r.overall_score) : null,
+        resume_analysis: r.resume_analysis || { experience: null, skills: null, education: null, summary: '' },
+        interview_analysis: r.interview_analysis || { clarity: null, confidence: null, body_language: null },
+        latest_report_url: r.latest_report_url || null,
+        report_generated_at: r.report_generated_at || null,
+      };
+    });
+
+    // Stamp a header so we can confirm the live build easily
+    res.set('X-IA-Route', 'interviews-strict-2025-09-12d');
+
+    if (DEBUG) {
+      // Emit concise server logs to help verify what's happening
+      console.log('[dashboard/interviews][debug]', {
+        clientId,
+        totalInterviews: rows?.length || 0,
+        uniqueCandidateIds: candIds.length,
+        candidatesLoaded: Object.keys(candidatesById).length,
+        rolesLoaded: Object.keys(rolesById).length,
+        returnedItems: items.length,
+        sampleInterviewIds: (rows || []).slice(0, 3).map(r => r.id),
+        sampleReturnedIds: items.slice(0, 3).map(r => r.id),
       });
+
+      return res.json({
+        items,
+        __meta: {
+          clientId,
+          totalInterviews: rows?.length || 0,
+          uniqueCandidateIds: candIds.length,
+          candidatesLoaded: Object.keys(candidatesById).length,
+          rolesLoaded: Object.keys(rolesById).length,
+          returnedItems: items.length,
+        }
+      });
+    }
 
     return res.json({ items });
   } catch (e) {
     console.error('[dashboard/interviews] unexpected', e);
+    res.set('X-IA-Route', 'interviews-strict-2025-09-12d');
     return res.status(500).json({ error: 'Server error' });
   }
 });
 
 /**
  * GET /dashboard/candidates
- * (unchanged except for the existing client_id filter)
+ * DB-only, scoped to client_id.
  */
 router.get('/candidates', requireAuth, withClientScope, async (req, res) => {
+  const DEBUG = String(req.query.debug || '') === '1';
+
   try {
     const clientId =
       req.client?.id ||
@@ -160,7 +183,7 @@ router.get('/candidates', requireAuth, withClientScope, async (req, res) => {
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
 
-    // 1) Candidates
+    // 1) Candidates for this client
     const { data: rows, error } = await supabase
       .from('candidates')
       .select(
@@ -174,18 +197,20 @@ router.get('/candidates', requireAuth, withClientScope, async (req, res) => {
       return res.status(500).json({ error: 'query failed' });
     }
 
-    // 2) Join role titles
+    // 2) Join role titles (no extra client filter needed if roles are unique, but safe if you prefer)
     const roleIds = Array.from(new Set((rows || []).map(r => r.role_id).filter(Boolean)));
     let rolesById = {};
     if (roleIds.length) {
       const { data: roles, error: rErr } = await supabase
         .from('roles')
-        .select('id, title')
-        .in('id', roleIds);
+        .select('id, title, client_id')
+        .in('id', roleIds)
+        .eq('client_id', clientId);
+
       if (rErr) {
         console.error('[dashboard/candidates] roles join error', rErr);
       } else {
-        rolesById = Object.fromEntries(roles.map(r => [r.id, r.title]));
+        rolesById = Object.fromEntries((roles || []).map(r => [r.id, r.title]));
       }
     }
 
@@ -214,10 +239,32 @@ router.get('/candidates', requireAuth, withClientScope, async (req, res) => {
       };
     });
 
-    res.json({ items });
+    res.set('X-IA-Route', 'candidates-strict-2025-09-12d');
+
+    if (DEBUG) {
+      console.log('[dashboard/candidates][debug]', {
+        clientId,
+        totalCandidates: rows?.length || 0,
+        rolesLoaded: Object.keys(rolesById).length,
+        returnedItems: items.length,
+        sampleIds: items.slice(0, 3).map(i => i.id),
+      });
+      return res.json({
+        items,
+        __meta: {
+          clientId,
+          totalCandidates: rows?.length || 0,
+          rolesLoaded: Object.keys(rolesById).length,
+          returnedItems: items.length,
+        }
+      });
+    }
+
+    return res.json({ items });
   } catch (e) {
     console.error('[dashboard/candidates] unexpected', e);
-    res.status(500).json({ error: 'Server error' });
+    res.set('X-IA-Route', 'candidates-strict-2025-09-12d');
+    return res.status(500).json({ error: 'Server error' });
   }
 });
 
