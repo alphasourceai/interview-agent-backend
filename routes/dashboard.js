@@ -1,269 +1,130 @@
 // routes/dashboard.js
-// Express router mounted at /dashboard
-
 const express = require('express');
 const { supabase } = require('../src/lib/supabaseClient');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
-
 const router = express.Router();
 
 /**
- * GET /dashboard/interviews
- * DB-only, strictly scoped to the client's data.
- * Optional debug mode: add ?debug=1 to include a __meta block and emit server logs.
+ * GET /dashboard/rows
+ * One row per candidate for the scoped client.
+ * - role title from roles
+ * - latest report (scores + analyses + url)
+ * - latest interview (video/transcript/analysis_url)
  */
-router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
-  const DEBUG = String(req.query.debug || '') === '1';
-
+router.get('/rows', requireAuth, withClientScope, async (req, res) => {
   try {
     const clientId =
       req.client?.id ||
       req.clientScope?.defaultClientId ||
-      req.query.client_id ||
-      null;
-
-    if (!clientId) {
-      return res.status(400).json({ error: 'client_id required' });
-    }
-
-    // 1) Interviews (DB only) for this client.
-    const { data: rows, error: iErr } = await supabase
-      .from('interviews')
-      .select(
-        [
-          'id',
-          'created_at',
-          'client_id',
-          'candidate_id',
-          'role_id',
-          'video_url',
-          'transcript_url',
-          'analysis_url',
-          'resume_score',
-          'interview_score',
-          'overall_score',
-          'resume_analysis',
-          'interview_analysis',
-          'latest_report_url',
-          'report_generated_at',
-        ].join(', ')
-      )
-      .eq('client_id', clientId)
-      .order('created_at', { ascending: false })
-      .limit(500);
-
-    if (iErr) {
-      console.error('[dashboard/interviews] supabase error', iErr);
-      return res.status(500).json({ error: 'query failed' });
-    }
-
-    const candIds = Array.from(new Set((rows || []).map(r => r.candidate_id).filter(Boolean)));
-    const roleIds = Array.from(new Set((rows || []).map(r => r.role_id).filter(Boolean)));
-
-    // 2) Candidates (restrict to SAME client)
-    let candidatesById = {};
-    if (candIds.length) {
-      const { data: cands, error: cErr } = await supabase
-        .from('candidates')
-        .select('id, first_name, last_name, name, email, client_id')
-        .in('id', candIds)
-        .eq('client_id', clientId); // ensure same client
-
-      if (cErr) {
-        console.error('[dashboard/interviews] candidates join error', cErr);
-      } else {
-        candidatesById = Object.fromEntries(
-          (cands || []).map(c => {
-            const fullName =
-              c.name ||
-              [c.first_name, c.last_name].filter(Boolean).join(' ').trim() ||
-              '';
-            return [c.id, { id: c.id, name: fullName, email: c.email || '' }];
-          })
-        );
-      }
-    }
-
-    // 3) Roles (also restrict to SAME client for consistency)
-    let rolesById = {};
-    if (roleIds.length) {
-      const { data: roles, error: rErr } = await supabase
-        .from('roles')
-        .select('id, title, client_id')
-        .in('id', roleIds)
-        .eq('client_id', clientId);
-
-      if (rErr) {
-        console.error('[dashboard/interviews] roles join error', rErr);
-      } else {
-        rolesById = Object.fromEntries(
-          (roles || []).map(r => [r.id, { id: r.id, title: r.title, client_id: r.client_id }])
-        );
-      }
-    }
-
-    // 4) Normalize & return — drop rows whose candidate isn't resolvable for this client
-    const filtered = (rows || []).filter(r => r.candidate_id && candidatesById[r.candidate_id]);
-    const items = filtered.map(r => {
-      const candidate = candidatesById[r.candidate_id];
-      const role = r.role_id ? (rolesById[r.role_id] || null) : null;
-
-      return {
-        id: r.id,
-        created_at: r.created_at,
-        client_id: r.client_id,
-        candidate,
-        role,
-        video_url: r.video_url || null,
-        transcript_url: r.transcript_url || null,
-        analysis_url: r.analysis_url || null,
-        has_video: !!r.video_url,
-        has_transcript: !!r.transcript_url,
-        has_analysis: !!r.analysis_url,
-        resume_score: isFinite(r.resume_score) ? Number(r.resume_score) : null,
-        interview_score: isFinite(r.interview_score) ? Number(r.interview_score) : null,
-        overall_score: isFinite(r.overall_score) ? Number(r.overall_score) : null,
-        resume_analysis: r.resume_analysis || { experience: null, skills: null, education: null, summary: '' },
-        interview_analysis: r.interview_analysis || { clarity: null, confidence: null, body_language: null },
-        latest_report_url: r.latest_report_url || null,
-        report_generated_at: r.report_generated_at || null,
-      };
-    });
-
-    // Stamp a header so we can confirm the live build easily
-    res.set('X-IA-Route', 'interviews-strict-2025-09-12d');
-
-    if (DEBUG) {
-      // Emit concise server logs to help verify what's happening
-      console.log('[dashboard/interviews][debug]', {
-        clientId,
-        totalInterviews: rows?.length || 0,
-        uniqueCandidateIds: candIds.length,
-        candidatesLoaded: Object.keys(candidatesById).length,
-        rolesLoaded: Object.keys(rolesById).length,
-        returnedItems: items.length,
-        sampleInterviewIds: (rows || []).slice(0, 3).map(r => r.id),
-        sampleReturnedIds: items.slice(0, 3).map(r => r.id),
-      });
-
-      return res.json({
-        items,
-        __meta: {
-          clientId,
-          totalInterviews: rows?.length || 0,
-          uniqueCandidateIds: candIds.length,
-          candidatesLoaded: Object.keys(candidatesById).length,
-          rolesLoaded: Object.keys(rolesById).length,
-          returnedItems: items.length,
-        }
-      });
-    }
-
-    return res.json({ items });
-  } catch (e) {
-    console.error('[dashboard/interviews] unexpected', e);
-    res.set('X-IA-Route', 'interviews-strict-2025-09-12d');
-    return res.status(500).json({ error: 'Server error' });
-  }
-});
-
-/**
- * GET /dashboard/candidates
- * DB-only, scoped to client_id.
- */
-router.get('/candidates', requireAuth, withClientScope, async (req, res) => {
-  const DEBUG = String(req.query.debug || '') === '1';
-
-  try {
-    const clientId =
-      req.client?.id ||
-      req.clientScope?.defaultClientId ||
-      req.query.client_id ||
-      null;
+      req.query.client_id || null;
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
 
-    // 1) Candidates for this client
-    const { data: rows, error } = await supabase
+    // Candidates
+    const { data: cands, error: cErr } = await supabase
       .from('candidates')
-      .select(
-        'id, first_name, last_name, email, role_id, analysis_summary, resume_url, interview_video_url, created_at, status'
-      )
+      .select('id, first_name, last_name, name, email, role_id, client_id, created_at')
       .eq('client_id', clientId)
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: false })
+      .limit(500);
+    if (cErr) { console.error('[rows] candidates', cErr); return res.status(500).json({ error: 'query failed' }); }
 
-    if (error) {
-      console.error('[dashboard/candidates] supabase error', error);
-      return res.status(500).json({ error: 'query failed' });
-    }
+    const candIds = (cands || []).map(c => c.id);
+    const roleIds = Array.from(new Set((cands || []).map(c => c.role_id).filter(Boolean)));
 
-    // 2) Join role titles (no extra client filter needed if roles are unique, but safe if you prefer)
-    const roleIds = Array.from(new Set((rows || []).map(r => r.role_id).filter(Boolean)));
+    // Roles
     let rolesById = {};
     if (roleIds.length) {
-      const { data: roles, error: rErr } = await supabase
+      const { data: roles, error } = await supabase
         .from('roles')
         .select('id, title, client_id')
         .in('id', roleIds)
         .eq('client_id', clientId);
-
-      if (rErr) {
-        console.error('[dashboard/candidates] roles join error', rErr);
-      } else {
-        rolesById = Object.fromEntries((roles || []).map(r => [r.id, r.title]));
-      }
+      if (!error && roles) {
+        rolesById = Object.fromEntries(roles.map(r => [r.id, { id: r.id, title: r.title, client_id: r.client_id }]));
+      } else if (error) { console.error('[rows] roles', error); }
     }
 
-    // 3) Normalize output
-    const items = (rows || []).map(r => {
-      let resumeScore = null, interviewScore = null, overallScore = null;
-      try {
-        const a = r.analysis_summary || {};
-        resumeScore    = a.resume_score ?? a.resume ?? a.resume_match_percent ?? null;
-        interviewScore = a.interview_score ?? a.interview ?? null;
-        overallScore   = a.overall_score ?? a.overall ?? a.overall_resume_match_percent ?? null;
-      } catch {}
+    // Latest report per candidate
+    let latestReportByCand = {};
+    if (candIds.length) {
+      const { data: reports, error } = await supabase
+        .from('reports')
+        .select('id, candidate_id, role_id, resume_score, interview_score, overall_score, resume_analysis, interview_analysis, created_at, pdf_url, latest_report_url, report_generated_at')
+        .eq('client_id', clientId)
+        .in('candidate_id', candIds);
+      if (!error && reports) {
+        for (const r of reports) {
+          const prev = latestReportByCand[r.candidate_id];
+          if (!prev || new Date(r.created_at) > new Date(prev.created_at)) {
+            latestReportByCand[r.candidate_id] = r;
+          }
+        }
+      } else if (error) { console.error('[rows] reports', error); }
+    }
+
+    // Latest interview per candidate
+    let latestInterviewByCand = {};
+    if (candIds.length) {
+      const { data: ints, error } = await supabase
+        .from('interviews')
+        .select('id, candidate_id, role_id, video_url, transcript_url, analysis_url, created_at')
+        .eq('client_id', clientId)
+        .in('candidate_id', candIds);
+      if (!error && ints) {
+        for (const iv of ints) {
+          const prev = latestInterviewByCand[iv.candidate_id];
+          if (!prev || new Date(iv.created_at) > new Date(prev.created_at)) {
+            latestInterviewByCand[iv.candidate_id] = iv;
+          }
+        }
+      } else if (error) { console.error('[rows] interviews', error); }
+    }
+
+    // Normalize
+    const items = (cands || []).map(c => {
+      const fullName = c.name || [c.first_name, c.last_name].filter(Boolean).join(' ').trim() || '';
+      const role = c.role_id ? (rolesById[c.role_id] || null) : null;
+      const rep  = latestReportByCand[c.id] || {};
+      const iv   = latestInterviewByCand[c.id] || {};
+
+      const resumeScore    = Number.isFinite(rep.resume_score)    ? Number(rep.resume_score)    : null;
+      const interviewScore = Number.isFinite(rep.interview_score) ? Number(rep.interview_score) : null;
+      const overallScore   = Number.isFinite(rep.overall_score)   ? Number(rep.overall_score)   : null;
 
       return {
-        id: r.id,
-        name: [r.first_name, r.last_name].filter(Boolean).join(' ') || '—',
-        email: r.email || '—',
-        role: rolesById[r.role_id] || '—',
-        resume_score: isFinite(resumeScore) ? Number(resumeScore) : null,
-        interview_score: isFinite(interviewScore) ? Number(interviewScore) : null,
-        overall_score: isFinite(overallScore) ? Number(overallScore) : null,
-        created_at: r.created_at,
-        resume_url: r.resume_url || null,
-        interview_video_url: r.interview_video_url || null,
-        analysis_summary: r.analysis_summary || {},
+        id: c.id,                             // <- candidate id
+        created_at: c.created_at,
+        client_id: c.client_id,
+
+        candidate: { id: c.id, name: fullName, email: c.email || '' },
+        role,                                  // { id,title,client_id } | null
+
+        // latest interview bits
+        latest_interview_id: iv.id || null,
+        video_url: iv.video_url || null,
+        transcript_url: iv.transcript_url || null,
+        analysis_url: iv.analysis_url || null,
+        has_video: !!iv.video_url,
+        has_transcript: !!iv.transcript_url,
+        has_analysis: !!iv.analysis_url,
+
+        // latest report bits
+        latest_report_id: rep.id || null,
+        resume_score: resumeScore,
+        interview_score: interviewScore,
+        overall_score: overallScore,
+        resume_analysis: rep.resume_analysis || { experience: null, skills: null, education: null, summary: '' },
+        interview_analysis: rep.interview_analysis || { clarity: null, confidence: null, body_language: null },
+        latest_report_url: rep.pdf_url || rep.latest_report_url || null,
+        report_generated_at: rep.report_generated_at || rep.created_at || null,
       };
     });
 
-    res.set('X-IA-Route', 'candidates-strict-2025-09-12d');
-
-    if (DEBUG) {
-      console.log('[dashboard/candidates][debug]', {
-        clientId,
-        totalCandidates: rows?.length || 0,
-        rolesLoaded: Object.keys(rolesById).length,
-        returnedItems: items.length,
-        sampleIds: items.slice(0, 3).map(i => i.id),
-      });
-      return res.json({
-        items,
-        __meta: {
-          clientId,
-          totalCandidates: rows?.length || 0,
-          rolesLoaded: Object.keys(rolesById).length,
-          returnedItems: items.length,
-        }
-      });
-    }
-
+    res.set('X-IA-Debug', `rows v1 | client=${clientId} | items=${items.length}`);
     return res.json({ items });
   } catch (e) {
-    console.error('[dashboard/candidates] unexpected', e);
-    res.set('X-IA-Route', 'candidates-strict-2025-09-12d');
+    console.error('[rows] unexpected', e);
     return res.status(500).json({ error: 'Server error' });
   }
 });
