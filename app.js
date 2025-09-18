@@ -193,10 +193,9 @@ async function buildDashboardRows(req, res) {
           if (!cur) {
             bestReportByCand[rep.candidate_id] = rep;
           } else {
-            // prefer role match over non-match; if both match, keep newest (already newest)
             const candRole = (candRows.find(c => c.id === rep.candidate_id) || {}).role_id;
-            const curMatch = cur.role_id && candRole && cur.role_id === candRole;
-            const newMatch = rep.role_id && candRole && rep.role_id === candRole;
+            const curMatch = cur?.role_id && candRole && cur.role_id === candRole;
+            const newMatch = rep?.role_id && candRole && rep.role_id === candRole;
             if (!curMatch && newMatch) bestReportByCand[rep.candidate_id] = rep;
           }
         }
@@ -329,6 +328,143 @@ app.post('/clients/accept-invite', requireAuth, async (req, res) => {
     res.status(500).json({ error: 'Server error' })
   }
 })
+
+/* ========================= ADDED: Admin guard + Admin API ========================= */
+
+// Admin-only guard (after requireAuth)
+async function requireAdmin(req, res, next) {
+  try {
+    const email = req.user?.email || null
+    if (!email) return res.status(403).json({ error: 'not_admin' })
+
+    const { data: adm, error } = await supabaseAdmin
+      .from('admins')
+      .select('id,is_active')
+      .eq('email', email)
+      .eq('is_active', true)
+      .maybeSingle()
+
+    if (error) return res.status(500).json({ error: 'admin_lookup_failed' })
+    if (!adm) return res.status(403).json({ error: 'not_admin' })
+    next()
+  } catch (e) {
+    return res.status(500).json({ error: 'admin_guard_failed' })
+  }
+}
+
+// Admin router (global admin; no client association)
+const adminRouter = express.Router()
+
+// List all clients
+adminRouter.get('/clients', requireAuth, requireAdmin, async (req, res) => {
+  const { data, error } = await supabaseAdmin
+    .from('clients')
+    .select('id,name,created_at')
+  if (error) return res.status(500).json({ error: 'list_clients_failed' })
+  res.json({ items: data || [] })
+})
+
+// Create client
+adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
+  const name = (req.body?.name || '').trim()
+  if (!name) return res.status(400).json({ error: 'name_required' })
+  const { data, error } = await supabaseAdmin
+    .from('clients')
+    .insert({ name })
+    .select('id,name,created_at')
+    .single()
+  if (error) return res.status(500).json({ error: 'create_client_failed' })
+  res.json({ item: data })
+})
+
+// Delete client
+adminRouter.delete('/clients/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { error } = await supabaseAdmin.from('clients').delete().eq('id', req.params.id)
+  if (error) return res.status(500).json({ error: 'delete_client_failed' })
+  res.json({ ok: true })
+})
+
+// List roles (optional client filter)
+adminRouter.get('/roles', requireAuth, requireAdmin, async (req, res) => {
+  const { client_id } = req.query
+  let q = supabaseAdmin.from('roles')
+    .select('id,title,client_id,slug_or_token,created_at')
+    .order('created_at', { ascending: false })
+  if (client_id) q = q.eq('client_id', client_id)
+  const { data, error } = await q
+  if (error) return res.status(500).json({ error: 'list_roles_failed' })
+  res.json({ items: data || [] })
+})
+
+// Create role (slug_or_token auto via trigger; see SQL migration)
+adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
+  const { client_id, title } = req.body || {}
+  if (!client_id || !title || !title.trim()) {
+    return res.status(400).json({ error: 'client_id_and_title_required' })
+  }
+  const { data, error } = await supabaseAdmin
+    .from('roles')
+    .insert({ client_id, title: title.trim() })
+    .select('id,title,client_id,slug_or_token,created_at')
+    .single()
+  if (error) return res.status(500).json({ error: 'create_role_failed' })
+  res.json({ item: data })
+})
+
+// Delete role
+adminRouter.delete('/roles/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { error } = await supabaseAdmin.from('roles').delete().eq('id', req.params.id)
+  if (error) return res.status(500).json({ error: 'delete_role_failed' })
+  res.json({ ok: true })
+})
+
+// List members for a client
+adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) => {
+  const { client_id } = req.query
+  if (!client_id) return res.status(400).json({ error: 'client_id_required' })
+  const { data, error } = await supabaseAdmin
+    .from('client_members')
+    .select('id,client_id,user_id,email,name,created_at')
+    .eq('client_id', client_id)
+    .order('created_at', { ascending: false })
+  if (error) return res.status(500).json({ error: 'list_members_failed' })
+  res.json({ items: data || [] })
+})
+
+// Add a client member (invite by magic link)
+adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) => {
+  const { client_id, email, name } = req.body || {}
+  if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
+
+  let userId = null
+  try {
+    // Use service-role client to invite (redirect back to embedded Wix page)
+    const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
+      redirectTo: 'https://www.alphasourceai.com/account?auth_callback=1'
+    })
+    userId = invited?.data?.user?.id || null
+  } catch (_) {}
+
+  const payload = { client_id, email, name, user_id: userId }
+  const { data, error } = await supabaseAdmin
+    .from('client_members')
+    .insert(payload)
+    .select('id,client_id,user_id,email,name,created_at')
+    .single()
+  if (error) return res.status(500).json({ error: 'add_member_failed' })
+  res.json({ item: data })
+})
+
+// Remove a client member
+adminRouter.delete('/client-members/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { error } = await supabaseAdmin.from('client_members').delete().eq('id', req.params.id)
+  if (error) return res.status(500).json({ error: 'remove_member_failed' })
+  res.json({ ok: true })
+})
+
+app.use('/admin', adminRouter)
+
+/* ======================= END: Admin guard + Admin API ======================= */
 
 // ---------- Mount legacy/optional feature routes if present ----------
 function mountIfExists(relPath, urlPath) {
