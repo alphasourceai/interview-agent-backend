@@ -65,7 +65,7 @@ async function withClientScope(req, res, next) {
       .from('client_members')
       .select('client_id, role')
       .eq('user_id', req.user.id)
-    if (error) return res.status(500).json({ error: 'Failed to load memberships' })
+    if (error) return res.status(500).json({ error: 'Failed to load memberships', detail: error.message })
     req.clientIds = (data || []).map(r => r.client_id)
     req.memberships = data || []
     next()
@@ -99,7 +99,7 @@ app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
       .from('clients')
       .select('id, name')
       .in('id', ids)
-    if (error) return res.status(500).json({ error: 'Failed to load clients' })
+    if (error) return res.status(500).json({ error: 'Failed to load clients', detail: error.message })
 
     const roleById = Object.fromEntries((req.memberships || []).map(m => [m.client_id, m.role]))
     const items = (clients || []).map(c => ({
@@ -130,7 +130,7 @@ async function buildDashboardRows(req, res) {
       .in('client_id', finalIds)
       .order('created_at', { ascending: false });
 
-    if (candErr) return res.status(500).json({ error: 'Failed to load candidates' });
+    if (candErr) return res.status(500).json({ error: 'Failed to load candidates', detail: candErr.message });
 
     const candidateIds = Array.from(new Set((candRows || []).map(c => c.id)));
     const roleIds = Array.from(new Set((candRows || []).map(c => c.role_id).filter(Boolean)));
@@ -283,7 +283,7 @@ app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
     const { error } = await supabaseAdmin
       .from('client_invites')
       .insert({ client_id, email, role, token, invited_by: req.user.id })
-    if (error) return res.status(500).json({ error: 'Failed to create invite' })
+    if (error) return res.status(500).json({ error: 'Failed to create invite', detail: error.message })
 
     const acceptUrlBase = (process.env.FRONTEND_URL || FRONTEND_URL).replace(/\/+$/, '')
     const accept_url = `${acceptUrlBase}/accept-invite?token=${encodeURIComponent(token)}`
@@ -303,7 +303,7 @@ app.post('/clients/accept-invite', requireAuth, async (req, res) => {
       .select('client_id, email, role')
       .eq('token', token)
       .single()
-    if (invErr || !invite) return res.status(400).json({ error: 'Invalid invite' })
+    if (invErr || !invite) return res.status(400).json({ error: 'Invalid invite', detail: invErr?.message })
     if (invite.email && invite.email !== req.user.email) {
       return res.status(400).json({ error: 'Invite email does not match your account' })
     }
@@ -311,7 +311,7 @@ app.post('/clients/accept-invite', requireAuth, async (req, res) => {
     const { error } = await supabaseAdmin
       .from('client_members')
       .upsert({ client_id: invite.client_id, user_id: req.user.id, role: invite.role }, { onConflict: 'client_id,user_id' })
-    if (error) return res.status(500).json({ error: 'Failed to join client' })
+    if (error) return res.status(500).json({ error: 'Failed to join client', detail: error.message })
 
     res.json({ ok: true })
   } catch (e) {
@@ -319,7 +319,7 @@ app.post('/clients/accept-invite', requireAuth, async (req, res) => {
   }
 })
 
-/* ========================= ADDED: Admin guard + Admin API (PATCHED) ========================= */
+/* ========================= Admin guard + Admin API (patched) ========================= */
 
 // Admin-only guard (after requireAuth)
 async function requireAdmin(req, res, next) {
@@ -334,7 +334,10 @@ async function requireAdmin(req, res, next) {
       .eq('is_active', true)
       .maybeSingle()
 
-    if (error) return res.status(500).json({ error: 'admin_lookup_failed' })
+    if (error) {
+      console.error('admin_lookup_failed:', error.message)
+      return res.status(500).json({ error: 'admin_lookup_failed', detail: error.message })
+    }
     if (!adm) return res.status(403).json({ error: 'not_admin' })
     next()
   } catch (e) {
@@ -351,7 +354,7 @@ adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
     .from('clients')
     .select('id,name,created_at')
     .order('created_at', { ascending: false })
-  if (error) return res.status(500).json({ error: 'list_clients_failed' })
+  if (error) return res.status(500).json({ error: 'list_clients_failed', detail: error.message })
   res.json({ items: data || [] })
 })
 
@@ -367,7 +370,10 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
     .insert({ name })
     .select('id,name,created_at')
     .single()
-  if (cErr) return res.status(500).json({ error: 'create_client_failed' })
+  if (cErr) {
+    console.error('create_client_failed:', cErr.message)
+    return res.status(500).json({ error: 'create_client_failed', detail: cErr.message, hint: cErr.hint })
+  }
 
   let seeded_member = null
   if (adminEmail) {
@@ -377,7 +383,9 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
         redirectTo: 'https://www.alphasourceai.com/account?auth_callback=1'
       })
       userId = invited?.data?.user?.id || null
-    } catch {}
+    } catch (e) {
+      console.error('inviteUserByEmail failed:', e?.message || e)
+    }
 
     const payload = {
       client_id: client.id,
@@ -385,14 +393,14 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
       name: adminName || adminEmail,
       role: 'admin',
       user_id: userId,
+      // keep write to user_id_uuid only if it exists (handled below)
       user_id_uuid: userId
     }
 
-    // Insert; tolerate schemas missing user_id_uuid
     const tryInsert = async (p) => supabaseAdmin
       .from('client_members')
       .insert(p)
-      .select('id,client_id,user_id,user_id_uuid,email,name,role,created_at')
+      .select('id,client_id,user_id,email,name,role,created_at') // <- no user_id_uuid in SELECT
       .single()
 
     let ins = await tryInsert(payload)
@@ -400,7 +408,11 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
       const p2 = { ...payload }; delete p2.user_id_uuid
       ins = await tryInsert(p2)
     }
-    if (!ins.error) seeded_member = ins.data
+    if (ins.error) {
+      console.error('seed_member_failed:', ins.error.message)
+    } else {
+      seeded_member = ins.data
+    }
   }
 
   res.json({ item: client, seeded_member })
@@ -409,7 +421,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
 // Delete client
 adminRouter.delete('/clients/:id', requireAuth, requireAdmin, async (req, res) => {
   const { error } = await supabaseAdmin.from('clients').delete().eq('id', req.params.id)
-  if (error) return res.status(500).json({ error: 'delete_client_failed' })
+  if (error) return res.status(500).json({ error: 'delete_client_failed', detail: error.message })
   res.json({ ok: true })
 })
 
@@ -421,7 +433,7 @@ adminRouter.get('/roles', requireAuth, requireAdmin, async (req, res) => {
     .order('created_at', { ascending: false })
   if (client_id) q = q.eq('client_id', client_id)
   const { data, error } = await q
-  if (error) return res.status(500).json({ error: 'list_roles_failed' })
+  if (error) return res.status(500).json({ error: 'list_roles_failed', detail: error.message })
   res.json({ items: data || [] })
 })
 
@@ -447,7 +459,7 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
     })
     .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
     .single()
-  if (error) return res.status(500).json({ error: 'create_role_failed' })
+  if (error) return res.status(500).json({ error: 'create_role_failed', detail: error.message })
 
   // Optional enrichment (tolerant to missing modules)
   let updated = role
@@ -462,7 +474,9 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
           const r = await parseFn({ path: job_description_url, client_id, role_id: role.id })
           descriptionText = r?.description || r?.text || descriptionText
         }
-      } catch {}
+      } catch (e) {
+        console.error('jdParser missing/failed:', e?.message || e)
+      }
 
       try {
         const genMod = require('./utils/generateRubric.js')
@@ -477,7 +491,9 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
           rubric = r?.rubric || r || rubric
           if (!descriptionText && r?.description) descriptionText = r.description
         }
-      } catch {}
+      } catch (e) {
+        console.error('generateRubric missing/failed:', e?.message || e)
+      }
 
       try {
         const kbMod = require('./routes/kb')
@@ -487,7 +503,9 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
           kbDocId = r?.kb_document_id || kbDocId
           if (!descriptionText && r?.description) descriptionText = r.description
         }
-      } catch {}
+      } catch (e) {
+        console.error('kb helper missing/failed:', e?.message || e)
+      }
 
       const { data: saved } = await supabaseAdmin
         .from('roles')
@@ -501,7 +519,7 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
         .single()
       updated = saved || role
     } catch (e) {
-      console.error('enrich_role_failed', e?.message || e)
+      console.error('enrich_role_failed:', e?.message || e)
     }
   }
 
@@ -511,24 +529,24 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
 // Delete role
 adminRouter.delete('/roles/:id', requireAuth, requireAdmin, async (req, res) => {
   const { error } = await supabaseAdmin.from('roles').delete().eq('id', req.params.id)
-  if (error) return res.status(500).json({ error: 'delete_role_failed' })
+  if (error) return res.status(500).json({ error: 'delete_role_failed', detail: error.message })
   res.json({ ok: true })
 })
 
-// List members for a client
+// List members for a client  (REMOVED user_id_uuid from SELECT)
 adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) => {
   const { client_id } = req.query
   if (!client_id) return res.status(400).json({ error: 'client_id_required' })
   const { data, error } = await supabaseAdmin
     .from('client_members')
-    .select('id,client_id,user_id,user_id_uuid,email,name,role,created_at')
+    .select('id,client_id,user_id,email,name,role,created_at')
     .eq('client_id', client_id)
     .order('created_at', { ascending: false })
-  if (error) return res.status(500).json({ error: 'list_members_failed' })
+  if (error) return res.status(500).json({ error: 'list_members_failed', detail: error.message })
   res.json({ items: data || [] })
 })
 
-// Add a client member (invite + persist role & dual UUIDs)
+// Add a client member (invite + persist role, tolerant dual-UUID write)
 adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) => {
   const { client_id, email, name } = req.body || {}
   const role = (req.body?.role || 'member').toLowerCase()
@@ -540,7 +558,9 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
       redirectTo: 'https://www.alphasourceai.com/account?auth_callback=1'
     })
     userId = invited?.data?.user?.id || null
-  } catch {}
+  } catch (e) {
+    console.error('inviteUserByEmail failed:', e?.message || e)
+  }
 
   const basePayload = {
     client_id, email, name, role,
@@ -551,7 +571,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   const tryInsert = async (p) => supabaseAdmin
     .from('client_members')
     .insert(p)
-    .select('id,client_id,user_id,user_id_uuid,email,name,role,created_at')
+    .select('id,client_id,user_id,email,name,role,created_at') // <- no user_id_uuid in SELECT
     .single()
 
   let ins = await tryInsert(basePayload)
@@ -559,7 +579,10 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
     const p2 = { ...basePayload }; delete p2.user_id_uuid
     ins = await tryInsert(p2)
   }
-  if (ins.error) return res.status(500).json({ error: 'add_member_failed' })
+  if (ins.error) {
+    console.error('add_member_failed:', ins.error.message)
+    return res.status(500).json({ error: 'add_member_failed', detail: ins.error.message, hint: ins.error.hint })
+  }
 
   res.json({ item: ins.data })
 })
@@ -567,13 +590,13 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
 // Remove a client member (by id)
 adminRouter.delete('/client-members/:id', requireAuth, requireAdmin, async (req, res) => {
   const { error } = await supabaseAdmin.from('client_members').delete().eq('id', req.params.id)
-  if (error) return res.status(500).json({ error: 'remove_member_failed' })
+  if (error) return res.status(500).json({ error: 'remove_member_failed', detail: error.message })
   res.json({ ok: true })
 })
 
 app.use('/admin', adminRouter)
 
-/* ======================= END: Admin guard + Admin API (PATCHED) ======================= */
+/* ======================= END: Admin guard + Admin API (patched) ======================= */
 
 // ---------- Mount legacy/optional feature routes if present ----------
 function mountIfExists(relPath, urlPath) {
