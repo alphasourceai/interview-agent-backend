@@ -348,6 +348,62 @@ async function requireAdmin(req, res, next) {
 // Admin router (global admin; no client association)
 const adminRouter = express.Router()
 
+// Helper: ensure a user exists & (preferably) send an invite; return user_id + optional action_link
+async function ensureUserIdAndInvite(email, redirectTo) {
+  let userId = null
+  let actionLink = null
+  let method = null
+
+  // 1) Try invite first (sends email)
+  try {
+    const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo })
+    userId = invited?.data?.user?.id || null
+    method = 'invite'
+  } catch (e) {
+    console.error('inviteUserByEmail failed:', e?.message || e)
+  }
+
+  // 2) If no userId, try generating a magic link (gives user + link; you can DM it if needed)
+  if (!userId) {
+    try {
+      const link = await supabaseAdmin.auth.admin.generateLink({
+        type: 'magiclink',
+        email,
+        options: { redirectTo }
+      })
+      userId = link?.data?.user?.id || null
+      actionLink = link?.data?.action_link || null
+      method = method || 'magiclink'
+    } catch (e) {
+      console.error('generateLink(magiclink) failed:', e?.message || e)
+    }
+  }
+
+  // 3) If still no user, create the user (ensures a UUID), then try inviting again
+  if (!userId) {
+    try {
+      const created = await supabaseAdmin.auth.admin.createUser({
+        email,
+        email_confirm: true
+      })
+      userId = created?.data?.user?.id || null
+      method = method || 'createUser'
+    } catch (e) {
+      console.error('createUser failed:', e?.message || e)
+    }
+    if (userId) {
+      try {
+        await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo })
+        method = 'createUser+invite'
+      } catch (e) {
+        console.error('second invite after createUser failed:', e?.message || e)
+      }
+    }
+  }
+
+  return { userId, actionLink, method }
+}
+
 // List all clients
 adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
   const { data, error } = await supabaseAdmin
@@ -373,7 +429,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
 
   const { data: client, error: cErr } = await supabaseAdmin
     .from('clients')
-    .insert({ name, email: emailForClient }) // <<<<<< write email
+    .insert({ name, email: emailForClient })
     .select('id,name,created_at')
     .single()
   if (cErr) {
@@ -381,17 +437,16 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
     return res.status(500).json({ error: 'create_client_failed', detail: cErr.message, hint: cErr.hint })
   }
 
-  // Optionally seed an admin member for that client
+  // Optionally seed an admin member
   let seeded_member = null
   if (adminEmail) {
-    let userId = null
-    try {
-      const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(adminEmail, {
-        redirectTo: 'https://www.alphasourceai.com/account?auth_callback=1'
-      })
-      userId = invited?.data?.user?.id || null
-    } catch (e) {
-      console.error('inviteUserByEmail failed:', e?.message || e)
+    const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
+    const { userId, actionLink, method } = await ensureUserIdAndInvite(adminEmail, redirectTo)
+
+    if (!userId) {
+      console.error('seed_member_no_user_id', { email: adminEmail, method })
+      // We return client OK but skip seeding to satisfy NOT NULL
+      return res.json({ item: client, seeded_member: null, note: 'client_created_invite_failed', action_link: actionLink || null })
     }
 
     const payload = {
@@ -399,26 +454,19 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
       email: adminEmail,
       name: adminName || adminEmail,
       role: 'admin',
-      user_id: userId || null,
-      user_id_uuid: userId || null
+      user_id: userId
     }
 
-    // Insert; tolerate schemas missing user_id_uuid
-    const tryInsert = async (p) => supabaseAdmin
+    const { data: inserted, error: insErr } = await supabaseAdmin
       .from('client_members')
-      .insert(p)
-      .select('client_id,user_id,email,name,role,created_at') // no "id"
+      .insert(payload)
+      .select('client_id,user_id,email,name,role,created_at')
       .single()
 
-    let ins = await tryInsert(payload)
-    if (ins.error?.message?.includes('user_id_uuid')) {
-      const p2 = { ...payload }; delete p2.user_id_uuid
-      ins = await tryInsert(p2)
-    }
-    if (!ins.error) {
-      // add synthetic id for FE convenience
-      const m = ins.data
-      seeded_member = { ...m, id: m.user_id || m.email }
+    if (insErr) {
+      console.error('seed_member_insert_failed:', insErr.message)
+    } else {
+      seeded_member = { ...inserted, id: inserted.user_id || inserted.email }
     }
   }
 
@@ -444,7 +492,7 @@ adminRouter.get('/roles', requireAuth, requireAdmin, async (req, res) => {
   res.json({ items: data || [] })
 })
 
-// Create role (unchanged main logic)
+// Create role (same as before; JD parsing can be added after we stabilize)
 adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
   const { client_id, title } = req.body || {}
   let { interview_type, job_description_url } = req.body || {}
@@ -468,11 +516,10 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
     .single()
   if (error) return res.status(500).json({ error: 'create_role_failed', detail: error.message })
 
-  // (Optional enrichment omitted here for brevity—same as previous version)
   res.json({ item: role })
 })
 
-// List members for a client  (no "id" in SELECT; add synthetic id in response)
+// List members for a client (no "id" in SELECT; add synthetic id)
 adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) => {
   const { client_id } = req.query
   if (!client_id) return res.status(400).json({ error: 'client_id_required' })
@@ -487,60 +534,50 @@ adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) =
   res.json({ items })
 })
 
-// Add a client member (invite + persist; respond with synthetic id)
+// Add a client member (guarantee user_id before insert)
 adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) => {
   const { client_id, email, name } = req.body || {}
   const role = (req.body?.role || 'member').toLowerCase()
   if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
 
-  let userId = null
-  try {
-    const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
-      redirectTo: 'https://www.alphasourceai.com/account?auth_callback=1'
+  const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
+  const { userId, actionLink, method } = await ensureUserIdAndInvite(email, redirectTo)
+
+  if (!userId) {
+    console.error('add_member_no_user_id', { email, method })
+    return res.status(400).json({
+      error: 'add_member_failed',
+      detail: 'Could not create or locate user for this email.',
+      hint: 'Try again or send the magic link manually.',
+      action_link: actionLink || null
     })
-    userId = invited?.data?.user?.id || null
-  } catch (e) {
-    console.error('inviteUserByEmail failed:', e?.message || e)
   }
 
-  const basePayload = {
-    client_id, email, name, role,
-    user_id: userId || null,
-    user_id_uuid: userId || null
-  }
+  const payload = { client_id, email, name, role, user_id: userId }
 
-  const tryInsert = async (p) => supabaseAdmin
+  const { data, error } = await supabaseAdmin
     .from('client_members')
-    .insert(p)
-    .select('client_id,user_id,email,name,role,created_at') // no "id"
+    .insert(payload)
+    .select('client_id,user_id,email,name,role,created_at')
     .single()
 
-  let ins = await tryInsert(basePayload)
-  if (ins.error?.message?.includes('user_id_uuid')) {
-    const p2 = { ...basePayload }; delete p2.user_id_uuid
-    ins = await tryInsert(p2)
-  }
-  if (ins.error) {
-    console.error('add_member_failed:', ins.error.message)
-    return res.status(500).json({ error: 'add_member_failed', detail: ins.error.message, hint: ins.error.hint })
+  if (error) {
+    console.error('add_member_insert_failed:', error.message)
+    return res.status(500).json({ error: 'add_member_failed', detail: error.message })
   }
 
-  const m = ins.data
+  const m = data
   res.json({ item: { ...m, id: m.user_id || m.email } })
 })
 
-// Remove a client member
-// Treat :id as user_id (UUID) OR email. Optional ?client_id= to scope the deletion.
+// Remove a client member (treat :id as user_id or email; optional ?client_id=)
 adminRouter.delete('/client-members/:id', requireAuth, requireAdmin, async (req, res) => {
   const key = req.params.id
   const client_id = req.query.client_id || null
 
   let q = supabaseAdmin.from('client_members').delete()
-  if (key.includes('@')) {
-    q = q.eq('email', key)
-  } else {
-    q = q.eq('user_id', key)
-  }
+  if (key.includes('@')) q = q.eq('email', key)
+  else q = q.eq('user_id', key)
   if (client_id) q = q.eq('client_id', client_id)
 
   const { error } = await q
