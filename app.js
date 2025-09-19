@@ -79,7 +79,6 @@ app.use('/api/candidate/submit', require('./routes/candidateSubmit'))
 app.use('/api/candidate/verify-otp', require('./routes/verifyOtp'))
 app.use('/create-tavus-interview', require('./routes/createTavusInterview'))
 
-
 // ---------- Simple test endpoint ----------
 app.get('/auth/ping', requireAuth, withClientScope, (req, res) => {
   res.json({ ok: true, user: req.user, client_ids: req.clientIds })
@@ -166,13 +165,12 @@ async function buildDashboardRows(req, res) {
       if (!intErr && ivs) {
         for (const r of ivs) {
           const cid = r.candidate_id;
-          // since ordered DESC, first one we see is the latest
           if (!latestInterviewByCand[cid]) latestInterviewByCand[cid] = r;
         }
       }
     }
 
-    // 4) Pull reports once; then choose best per candidate (prefer matching role_id)
+    // 4) Pull reports once; then choose best per candidate
     let bestReportByCand = {};
     if (candidateIds.length) {
       const { data: reps, error: repErr } = await supabaseAdmin
@@ -188,7 +186,6 @@ async function buildDashboardRows(req, res) {
 
       if (!repErr && reps) {
         for (const rep of reps) {
-          // keep the first we see (newest), but if role matches candidate.role_id, prefer that
           const cur = bestReportByCand[rep.candidate_id];
           if (!cur) {
             bestReportByCand[rep.candidate_id] = rep;
@@ -232,17 +229,13 @@ async function buildDashboardRows(req, res) {
       };
 
       return {
-        // IMPORTANT: keep "id" = latest interview id so Transcript/PDF buttons work
         id: latest?.id ?? null,
-
-        // show candidate creation time in table
         created_at: c.created_at,
         client_id: c.client_id,
 
         candidate: { id: c.id, name: fullName, email: c.email || '' },
         role,
 
-        // interview-derived fields for the expanded row
         video_url: latest?.video_url || null,
         transcript_url: latest?.transcript_url || null,
         analysis_url: latest?.analysis_url || null,
@@ -251,7 +244,6 @@ async function buildDashboardRows(req, res) {
         has_transcript: !!latest?.transcript_url,
         has_analysis: !!latest?.analysis_url,
 
-        // report-derived scores/analyses
         resume_score:    numOrNull(rep?.resume_score ?? null),
         interview_score: numOrNull(rep?.interview_score ?? null),
         overall_score:   numOrNull(rep?.overall_score ?? null),
@@ -270,7 +262,6 @@ async function buildDashboardRows(req, res) {
   }
 }
 
-
 // Existing path (kept for compatibility)
 app.get('/dashboard/interviews', requireAuth, withClientScope, (req, res) => {
   buildDashboardRows(req, res)
@@ -280,7 +271,6 @@ app.get('/dashboard/interviews', requireAuth, withClientScope, (req, res) => {
 app.get('/dashboard/rows', requireAuth, withClientScope, (req, res) => {
   buildDashboardRows(req, res)
 })
-
 
 // ---------- Optional: invites ----------
 app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
@@ -329,7 +319,7 @@ app.post('/clients/accept-invite', requireAuth, async (req, res) => {
   }
 })
 
-/* ========================= ADDED: Admin guard + Admin API ========================= */
+/* ========================= ADDED: Admin guard + Admin API (PATCHED) ========================= */
 
 // Admin-only guard (after requireAuth)
 async function requireAdmin(req, res, next) {
@@ -356,23 +346,22 @@ async function requireAdmin(req, res, next) {
 const adminRouter = express.Router()
 
 // List all clients
-adminRouter.get('/clients', requireAuth, requireAdmin, async (req, res) => {
+adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
   const { data, error } = await supabaseAdmin
     .from('clients')
     .select('id,name,created_at')
+    .order('created_at', { ascending: false })
   if (error) return res.status(500).json({ error: 'list_clients_failed' })
   res.json({ items: data || [] })
 })
 
-/* ---------- REPLACED: Create client (with optional seeded admin) ---------- */
+// Create client (with optional seeded admin)
 adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   const name = (req.body?.name || '').trim()
   const adminName  = (req.body?.admin_name  || '').trim()
   const adminEmail = (req.body?.admin_email || '').trim()
-
   if (!name) return res.status(400).json({ error: 'name_required' })
 
-  // 1) Create client
   const { data: client, error: cErr } = await supabaseAdmin
     .from('clients')
     .insert({ name })
@@ -380,43 +369,41 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
     .single()
   if (cErr) return res.status(500).json({ error: 'create_client_failed' })
 
-  // 2) Optionally seed an admin member
-  let seeded = null
-  if (adminName && adminEmail) {
+  let seeded_member = null
+  if (adminEmail) {
     let userId = null
     try {
       const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(adminEmail, {
         redirectTo: 'https://www.alphasourceai.com/account?auth_callback=1'
       })
       userId = invited?.data?.user?.id || null
-    } catch (_) {}
+    } catch {}
 
     const payload = {
       client_id: client.id,
-      role: 'admin',
-      name: adminName,
       email: adminEmail,
-      user_id: userId || null,
-      user_id_uuid: userId || null
+      name: adminName || adminEmail,
+      role: 'admin',
+      user_id: userId,
+      user_id_uuid: userId
     }
 
-    const tryInsert = async (p) => {
-      return await supabaseAdmin
-        .from('client_members')
-        .insert(p)
-        .select('id,client_id,user_id,email,name,role,created_at')
-        .single()
-    }
+    // Insert; tolerate schemas missing user_id_uuid
+    const tryInsert = async (p) => supabaseAdmin
+      .from('client_members')
+      .insert(p)
+      .select('id,client_id,user_id,user_id_uuid,email,name,role,created_at')
+      .single()
 
     let ins = await tryInsert(payload)
     if (ins.error?.message?.includes('user_id_uuid')) {
       const p2 = { ...payload }; delete p2.user_id_uuid
       ins = await tryInsert(p2)
     }
-    if (!ins.error) seeded = ins.data
+    if (!ins.error) seeded_member = ins.data
   }
 
-  res.json({ item: client, seeded_member: seeded })
+  res.json({ item: client, seeded_member })
 })
 
 // Delete client
@@ -426,7 +413,7 @@ adminRouter.delete('/clients/:id', requireAuth, requireAdmin, async (req, res) =
   res.json({ ok: true })
 })
 
-// List roles (optional client filter) — include more fields for UI
+// List roles (optional client filter)
 adminRouter.get('/roles', requireAuth, requireAdmin, async (req, res) => {
   const { client_id } = req.query
   let q = supabaseAdmin.from('roles')
@@ -438,7 +425,7 @@ adminRouter.get('/roles', requireAuth, requireAdmin, async (req, res) => {
   res.json({ items: data || [] })
 })
 
-/* ---------- REPLACED: Create role (type + JD + enrichment) ---------- */
+// Create role (saves interview_type + job_description_url; best-effort enrichment hooks)
 adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
   const { client_id, title } = req.body || {}
   let { interview_type, job_description_url } = req.body || {}
@@ -446,13 +433,10 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
   if (!client_id || !title || !title.trim()) {
     return res.status(400).json({ error: 'client_id_and_title_required' })
   }
-
-  // Normalize interview type to uppercase set
   const IT = String(interview_type || '').toUpperCase()
   const VALID = new Set(['BASIC','DETAILED','TECHNICAL'])
   interview_type = VALID.has(IT) ? IT : null
 
-  // 1) Create role (token via trigger)
   const { data: role, error } = await supabaseAdmin
     .from('roles')
     .insert({
@@ -465,13 +449,12 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
     .single()
   if (error) return res.status(500).json({ error: 'create_role_failed' })
 
-  // 2) Best-effort enrichment if JD present
+  // Optional enrichment (tolerant to missing modules)
   let updated = role
   if (job_description_url) {
     try {
       let rubric = null, descriptionText = null, kbDocId = null
 
-      // Try jdParser (optional)
       try {
         const jdParser = require('./utils/jdParser.js')
         const parseFn = jdParser?.parseJD || jdParser?.default
@@ -479,9 +462,8 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
           const r = await parseFn({ path: job_description_url, client_id, role_id: role.id })
           descriptionText = r?.description || r?.text || descriptionText
         }
-      } catch (_) {}
+      } catch {}
 
-      // Try generateRubric (optional)
       try {
         const genMod = require('./utils/generateRubric.js')
         const genFn = genMod?.generateRubricForJD || genMod?.generateRubric || genMod?.default
@@ -495,9 +477,8 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
           rubric = r?.rubric || r || rubric
           if (!descriptionText && r?.description) descriptionText = r.description
         }
-      } catch (_) {}
+      } catch {}
 
-      // Try KB creation helper (optional)
       try {
         const kbMod = require('./routes/kb')
         const kbFn = kbMod?.createKnowledgeBaseFromJD || kbMod?.default
@@ -506,7 +487,7 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
           kbDocId = r?.kb_document_id || kbDocId
           if (!descriptionText && r?.description) descriptionText = r.description
         }
-      } catch (_) {}
+      } catch {}
 
       const { data: saved } = await supabaseAdmin
         .from('roles')
@@ -534,23 +515,23 @@ adminRouter.delete('/roles/:id', requireAuth, requireAdmin, async (req, res) => 
   res.json({ ok: true })
 })
 
-// List members for a client (include role)
+// List members for a client
 adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) => {
   const { client_id } = req.query
   if (!client_id) return res.status(400).json({ error: 'client_id_required' })
   const { data, error } = await supabaseAdmin
     .from('client_members')
-    .select('id,client_id,user_id,email,name,role,created_at')
+    .select('id,client_id,user_id,user_id_uuid,email,name,role,created_at')
     .eq('client_id', client_id)
     .order('created_at', { ascending: false })
   if (error) return res.status(500).json({ error: 'list_members_failed' })
   res.json({ items: data || [] })
 })
 
-/* ---------- REPLACED: Add client member (with role + dual UUID columns) ---------- */
+// Add a client member (invite + persist role & dual UUIDs)
 adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) => {
   const { client_id, email, name } = req.body || {}
-  const role = (req.body?.role || 'member').toLowerCase() // member|manager|admin
+  const role = (req.body?.role || 'member').toLowerCase()
   if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
 
   let userId = null
@@ -559,7 +540,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
       redirectTo: 'https://www.alphasourceai.com/account?auth_callback=1'
     })
     userId = invited?.data?.user?.id || null
-  } catch (_) {}
+  } catch {}
 
   const basePayload = {
     client_id, email, name, role,
@@ -567,13 +548,11 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
     user_id_uuid: userId || null
   }
 
-  const tryInsert = async (p) => {
-    return await supabaseAdmin
-      .from('client_members')
-      .insert(p)
-      .select('id,client_id,user_id,email,name,role,created_at')
-      .single()
-  }
+  const tryInsert = async (p) => supabaseAdmin
+    .from('client_members')
+    .insert(p)
+    .select('id,client_id,user_id,user_id_uuid,email,name,role,created_at')
+    .single()
 
   let ins = await tryInsert(basePayload)
   if (ins.error?.message?.includes('user_id_uuid')) {
@@ -585,7 +564,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   res.json({ item: ins.data })
 })
 
-// Remove a client member
+// Remove a client member (by id)
 adminRouter.delete('/client-members/:id', requireAuth, requireAdmin, async (req, res) => {
   const { error } = await supabaseAdmin.from('client_members').delete().eq('id', req.params.id)
   if (error) return res.status(500).json({ error: 'remove_member_failed' })
@@ -594,7 +573,7 @@ adminRouter.delete('/client-members/:id', requireAuth, requireAdmin, async (req,
 
 app.use('/admin', adminRouter)
 
-/* ======================= END: Admin guard + Admin API ======================= */
+/* ======================= END: Admin guard + Admin API (PATCHED) ======================= */
 
 // ---------- Mount legacy/optional feature routes if present ----------
 function mountIfExists(relPath, urlPath) {
