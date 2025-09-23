@@ -3,10 +3,14 @@ require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
 const crypto = require('crypto')
+const path = require('path')
 const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
-const { generateRubricAndKBForRole } = require('./generateRubric')
+const { parseBufferToText } = require('./utils/jdParser')
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
+const JD_BUCKET = process.env.SUPABASE_JD_BUCKET || 'job-descriptions'
+const KB_BUCKET = process.env.SUPABASE_KB_BUCKET || 'kbs'
+
 const app = express()
 
 // ---------- CORS ----------
@@ -43,6 +47,155 @@ function bearer(req) {
   if (!h) return null
   const m = String(h).match(/^Bearer\s+(.+)$/i)
   return m ? m[1] : null
+}
+
+// Normalize a storage ref the FE might send. Accepts:
+//  - "bucket/path/in/bucket.ext"
+//  - "path/in/bucket.ext" (assume default bucket)
+//  - full public URL ".../storage/v1/object/public/<bucket>/<path>"
+function normalizeStorageRef(input, defaultBucket = JD_BUCKET) {
+  if (!input) return null
+  let s = String(input).replace(/^\/+/, '')
+  // Full URL?
+  if (/^https?:\/\//i.test(s)) {
+    const idx = s.indexOf('/object/')
+    if (idx !== -1) {
+      let tail = s.slice(idx + '/object/'.length)
+      // Strip possible "public/" or "sign/" prefix
+      tail = tail.replace(/^(public|sign)\/+/, '')
+      const firstSlash = tail.indexOf('/')
+      if (firstSlash > 0) {
+        return { bucket: tail.slice(0, firstSlash), path: tail.slice(firstSlash + 1) }
+      }
+    }
+    // If we can't parse, fall back to treating it as path in default bucket
+    s = s.split('?')[0]
+    s = s.split('/').slice(-2).join('/')
+  }
+  // "bucket/path" vs "path"
+  const first = s.split('/')[0]
+  if (first.includes('.')) {
+    // looks like a filename at root -> assume default bucket
+    return { bucket: defaultBucket, path: s }
+  }
+  if (s.includes('/')) {
+    const [bucket, ...rest] = s.split('/')
+    return { bucket, path: rest.join('/') }
+  }
+  // just a bare filename
+  return { bucket: defaultBucket, path: s }
+}
+
+// Download a storage object as a Node Buffer
+async function downloadStorageObject(bucket, objectPath) {
+  const { data, error } = await supabaseAdmin.storage.from(bucket).download(objectPath)
+  if (error) throw new Error(`storage_download_failed: ${error.message}`)
+  // supabase-js returns a Blob in Node; convert
+  const ab = await data.arrayBuffer()
+  const buf = Buffer.from(ab)
+  // Best-effort mime from Blob; fall back to by extension
+  const mime = data.type || ({
+    '.pdf': 'application/pdf',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.doc': 'application/msword',
+    '.txt': 'text/plain'
+  })[path.extname(objectPath).toLowerCase()] || 'application/octet-stream'
+  return { buffer: buf, mime }
+}
+
+// Very light heuristic KB generator if no LLM is used.
+// Produces a JSON object like your existing files in the "kbs" bucket.
+function buildKbJsonFromText(text, title = 'This role') {
+  const questions = [
+    { text: `What excites you about the ${title} role?`, category: 'auto' },
+    { text: 'Tell me about a recent project that best showcases your skills for this role.', category: 'auto' },
+    { text: 'Describe a challenging technical/analytical problem you solved. What was your approach?', category: 'auto' },
+    { text: 'How do you collaborate with cross-functional partners to deliver results?', category: 'auto' },
+    { text: 'Walk me through your process for writing clean, testable code or reproducible work.', category: 'auto' },
+    { text: 'How do you stay current and continuously improve in your craft?', category: 'auto' }
+  ]
+  // If the JD has bullet markers, add one more tailored question
+  if (/\n[\-\u2022\*]\s/.test(text || '')) {
+    questions.push({ text: 'Pick one responsibility from the job description and share a relevant example.', category: 'auto' })
+  }
+  return { questions }
+}
+
+// After a role is created/updated, try to:
+//  - ensure job_description_url is stored consistently
+//  - parse its contents into plaintext and update roles.description (+ job_description_text if present)
+//  - synthesize a basic KB JSON file into the "kbs" bucket (if not already present)
+// Returns the updated role row.
+async function enrichRoleFromJD(role) {
+  try {
+    const rawRef = role.job_description_url
+    if (!rawRef) return role
+
+    // Normalize reference and make sure DB has "bucket/path" format
+    const { bucket, path: objectPath } = normalizeStorageRef(rawRef, JD_BUCKET)
+    const storage_path = `${bucket}/${objectPath}`
+
+    // If DB didn’t store the normalized form, save it
+    if (rawRef !== storage_path) {
+      await supabaseAdmin.from('roles').update({ job_description_url: storage_path }).eq('id', role.id)
+      role.job_description_url = storage_path
+    }
+
+    // Download & parse JD into plaintext
+    const { buffer, mime } = await downloadStorageObject(bucket, objectPath)
+    const descriptionText = (await parseBufferToText(buffer, mime, objectPath)) || ''
+
+    // Update description, and also try job_description_text if the column exists
+    let updated = null
+    let upd = await supabaseAdmin
+      .from('roles')
+      .update({ description: descriptionText, job_description_text: descriptionText })
+      .eq('id', role.id)
+      .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
+      .single()
+
+    if (upd.error && /column .*job_description_text.* does not exist/i.test(upd.error.message)) {
+      // Retry with description only
+      upd = await supabaseAdmin
+        .from('roles')
+        .update({ description: descriptionText })
+        .eq('id', role.id)
+        .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
+        .single()
+    }
+    if (!upd.error && upd.data) updated = upd.data
+
+    // Seed a KB JSON file if one is not set yet
+    const needsKb = !((updated || role).kb_document_id)
+    if (needsKb && descriptionText && KB_BUCKET) {
+      const kbDocId = crypto.randomUUID()
+      const kbPayload = buildKbJsonFromText(descriptionText, role.title)
+      const kbKey = `${kbDocId}.json`
+
+      const { error: kbErr } = await supabaseAdmin.storage
+        .from(KB_BUCKET)
+        .upload(kbKey, Buffer.from(JSON.stringify(kbPayload, null, 2), 'utf8'), {
+          contentType: 'application/json',
+          upsert: true
+        })
+      if (!kbErr) {
+        const upd2 = await supabaseAdmin
+          .from('roles')
+          .update({ kb_document_id: kbDocId })
+          .eq('id', role.id)
+          .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
+          .single()
+        if (!upd2.error && upd2.data) updated = upd2.data
+      } else {
+        console.error('kb_upload_failed:', kbErr.message)
+      }
+    }
+
+    return updated || role
+  } catch (e) {
+    console.error('enrich_role_failed:', e?.message || e)
+    return role
+  }
 }
 
 // ---------- auth middlewares ----------
@@ -114,7 +267,7 @@ app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
   }
 })
 
-// ---------- Dashboard: scoped rows ----------
+// ---------- Dashboard: scoped rows (CANDIDATE-FIRST) ----------
 async function buildDashboardRows(req, res) {
   try {
     const filterIds = req.clientIds || [];
@@ -124,6 +277,7 @@ async function buildDashboardRows(req, res) {
     const finalIds = wantedClientId ? filterIds.filter(id => id === wantedClientId) : filterIds;
     if (finalIds.length === 0) return res.json({ items: [] });
 
+    // 1) Pull candidates for the scoped client(s)
     const { data: candRows, error: candErr } = await supabaseAdmin
       .from('candidates')
       .select('id, first_name, last_name, name, email, role_id, client_id, created_at')
@@ -135,19 +289,24 @@ async function buildDashboardRows(req, res) {
     const candidateIds = Array.from(new Set((candRows || []).map(c => c.id)));
     const roleIds = Array.from(new Set((candRows || []).map(c => c.role_id).filter(Boolean)));
 
+    // 2) Join roles for display
     let rolesById = {};
     if (roleIds.length) {
       const { data: roles, error: roleErr } = await supabaseAdmin
         .from('roles')
         .select('id, title, client_id')
         .in('id', roleIds);
-      if (!roleErr && roles) {
+
+      if (roleErr) {
+        rolesById = {};
+      } else {
         rolesById = Object.fromEntries(
-          roles.map(r => [r.id, { id: r.id, title: r.title, client_id: r.client_id }])
+          (roles || []).map(r => [r.id, { id: r.id, title: r.title, client_id: r.client_id }])
         );
       }
     }
 
+    // 3) Find the latest interview per candidate (same client scope)
     let latestInterviewByCand = {};
     if (candidateIds.length) {
       const { data: ivs, error: intErr } = await supabaseAdmin
@@ -165,9 +324,10 @@ async function buildDashboardRows(req, res) {
       }
     }
 
+    // 4) Pull reports once; then choose best per candidate
     let bestReportByCand = {};
     if (candidateIds.length) {
-      const { data: reps } = await supabaseAdmin
+      const { data: reps, error: repErr } = await supabaseAdmin
         .from('reports')
         .select(`
           id, candidate_id, role_id,
@@ -178,7 +338,7 @@ async function buildDashboardRows(req, res) {
         .in('candidate_id', candidateIds)
         .order('created_at', { ascending: false });
 
-      if (reps) {
+      if (!repErr && reps) {
         for (const rep of reps) {
           const cur = bestReportByCand[rep.candidate_id];
           if (!cur) {
@@ -195,6 +355,7 @@ async function buildDashboardRows(req, res) {
 
     const numOrNull = v => (typeof v === 'number' && isFinite(v)) ? v : (v === 0 ? 0 : null);
 
+    // 5) Normalize to FE shape
     const items = (candRows || []).map(c => {
       const fullName =
         c.name ||
@@ -312,7 +473,7 @@ app.post('/clients/accept-invite', requireAuth, async (req, res) => {
   }
 })
 
-/* ========================= Admin guard + Admin API (with JD→Rubric→KB) ========================= */
+/* ========================= Admin guard + Admin API (fixed + JD enrichment) ========================= */
 
 // Admin-only guard (after requireAuth)
 async function requireAdmin(req, res, next) {
@@ -338,9 +499,10 @@ async function requireAdmin(req, res, next) {
   }
 }
 
+// Admin router (global admin; no client association)
 const adminRouter = express.Router()
 
-// Helper: ensure a user exists/invite; return user_id + optional action_link
+// Helper: ensure a user exists & (preferably) send an invite; return user_id + optional action_link
 async function ensureUserIdAndInvite(email, redirectTo) {
   let userId = null
   let actionLink = null
@@ -371,10 +533,7 @@ async function ensureUserIdAndInvite(email, redirectTo) {
 
   if (!userId) {
     try {
-      const created = await supabaseAdmin.auth.admin.createUser({
-        email,
-        email_confirm: true
-      })
+      const created = await supabaseAdmin.auth.admin.createUser({ email, email_confirm: true })
       userId = created?.data?.user?.id || null
       method = method || 'createUser'
     } catch (e) {
@@ -461,13 +620,6 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   res.json({ item: client, seeded_member })
 })
 
-// Delete client
-adminRouter.delete('/clients/:id', requireAuth, requireAdmin, async (req, res) => {
-  const { error } = await supabaseAdmin.from('clients').delete().eq('id', req.params.id)
-  if (error) return res.status(500).json({ error: 'delete_client_failed', detail: error.message })
-  res.json({ ok: true })
-})
-
 // List roles (optional client filter)
 adminRouter.get('/roles', requireAuth, requireAdmin, async (req, res) => {
   const { client_id } = req.query
@@ -480,7 +632,7 @@ adminRouter.get('/roles', requireAuth, requireAdmin, async (req, res) => {
   res.json({ items: data || [] })
 })
 
-// Create role (now also parses JD → generates rubric → writes KB)
+// Create role (now: saves JD url, parses JD to description, seeds KB JSON)
 adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
   const { client_id, title } = req.body || {}
   let { interview_type, job_description_url } = req.body || {}
@@ -504,21 +656,8 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
     .single()
   if (error) return res.status(500).json({ error: 'create_role_failed', detail: error.message })
 
-  // Enrichment (best-effort): parse JD -> rubric -> KB
-  try {
-    await generateRubricAndKBForRole(role.id)
-  } catch (e) {
-    console.error('enrich_role_failed:', e?.message || e)
-  }
-
-  // Return fresh row after enrichment
-  const { data: updated, error: selErr } = await supabaseAdmin
-    .from('roles')
-    .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
-    .eq('id', role.id)
-    .single()
-
-  res.json({ item: updated || role })
+  const enriched = await enrichRoleFromJD(role)
+  res.json({ item: enriched })
 })
 
 // Delete role
@@ -528,7 +667,7 @@ adminRouter.delete('/roles/:id', requireAuth, requireAdmin, async (req, res) => 
   res.json({ ok: true })
 })
 
-// List members for a client (synthetic id)
+// List members for a client (no "id" in SELECT; add synthetic id)
 adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) => {
   const { client_id } = req.query
   if (!client_id) return res.status(400).json({ error: 'client_id_required' })
@@ -543,7 +682,7 @@ adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) =
   res.json({ items })
 })
 
-// Add a client member
+// Add a client member (guarantee user_id before insert)
 adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) => {
   const { client_id, email, name } = req.body || {}
   const role = (req.body?.role || 'member').toLowerCase()
@@ -596,7 +735,7 @@ adminRouter.delete('/client-members/:id', requireAuth, requireAdmin, async (req,
 
 app.use('/admin', adminRouter)
 
-/* ======================= END: Admin guard + Admin API ======================= */
+/* ======================= END: Admin guard + Admin API (fixed + JD enrichment) ======================= */
 
 // ---------- Mount legacy/optional feature routes if present ----------
 function mountIfExists(relPath, urlPath) {
