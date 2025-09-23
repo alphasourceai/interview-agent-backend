@@ -480,7 +480,7 @@ adminRouter.get('/roles', requireAuth, requireAdmin, async (req, res) => {
   res.json({ items: data || [] })
 })
 
-// Create role (now also parses JD → generates rubric → writes KB)
+// Create role (keeps existing rubric+KB generation)
 adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
   const { client_id, title } = req.body || {}
   let { interview_type, job_description_url } = req.body || {}
@@ -504,28 +504,19 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
     .single()
   if (error) return res.status(500).json({ error: 'create_role_failed', detail: error.message })
 
-  // Enrichment (best-effort): parse JD -> rubric -> KB
   try {
     await generateRubricAndKBForRole(role.id)
   } catch (e) {
     console.error('enrich_role_failed:', e?.message || e)
   }
 
-  // Return fresh row after enrichment
-  const { data: updated, error: selErr } = await supabaseAdmin
+  const { data: updated } = await supabaseAdmin
     .from('roles')
     .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
     .eq('id', role.id)
     .single()
 
   res.json({ item: updated || role })
-})
-
-// Delete role
-adminRouter.delete('/roles/:id', requireAuth, requireAdmin, async (req, res) => {
-  const { error } = await supabaseAdmin.from('roles').delete().eq('id', req.params.id)
-  if (error) return res.status(500).json({ error: 'delete_role_failed', detail: error.message })
-  res.json({ ok: true })
 })
 
 // List members for a client (synthetic id)
@@ -579,7 +570,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   res.json({ item: { ...m, id: m.user_id || m.email } })
 })
 
-// Remove a client member (treat :id as user_id or email; optional ?client_id=)
+// Remove a client member
 adminRouter.delete('/client-members/:id', requireAuth, requireAdmin, async (req, res) => {
   const key = req.params.id
   const client_id = req.query.client_id || null
@@ -608,6 +599,11 @@ function mountIfExists(relPath, urlPath) {
 mountIfExists('./routes/kb', '/kb')
 mountIfExists('./routes/webhook', '/webhook')
 mountIfExists('./routes/tavus', '/')
+
+// ---------- JD upload route (authenticated + scoped) ----------
+try {
+  app.use('/roles-upload', requireAuth, withClientScope, require('./routes/rolesUpload'))
+} catch (_) {}
 
 // ---------- Protected mounts ----------
 app.use(
