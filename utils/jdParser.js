@@ -1,3 +1,4 @@
+// utils/jdParser.js
 'use strict';
 
 const pdfParse = require('pdf-parse');
@@ -11,44 +12,21 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-function mimeFromExt(filename = '') {
-  const ext = path.extname(filename).toLowerCase();
-  if (ext === '.pdf')  return 'application/pdf';
-  if (ext === '.docx') return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-  if (ext === '.txt')  return 'text/plain';
-  if (ext === '.doc')  return 'application/msword'; // not parsed below, just for clarity
-  return 'application/octet-stream';
-}
-
 async function parseBufferToText(buffer, mime, filename) {
-  const type = (mime || mimeFromExt(filename)).toLowerCase();
-  const ext  = (path.extname(filename || '').toLowerCase() || '').replace('.', '');
+  const ext = (path.extname(filename || '').toLowerCase() || '').replace('.', '');
+  const type = mime || '';
 
-  // TXT
-  if (type === 'text/plain' || ext === 'txt') {
-    return Buffer.isBuffer(buffer) ? buffer.toString('utf8') : String(buffer || '');
-  }
-
-  // PDF
   if (type === 'application/pdf' || ext === 'pdf') {
     const out = await pdfParse(buffer);
     return (out.text || '').trim();
   }
 
-  // DOCX
-  if (
-    type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
-    ext === 'docx'
-  ) {
+  if (type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || ext === 'docx') {
     const { value } = await mammoth.extractRawText({ buffer });
     return (value || '').trim();
   }
 
-  // Legacy .doc not supported (avoids native deps)
-  throw Object.assign(
-    new Error('Unsupported file type. Please upload PDF, DOCX, or TXT.'),
-    { status: 415 }
-  );
+  throw Object.assign(new Error('Unsupported file type. Please upload PDF or DOCX.'), { status: 415 });
 }
 
 /**
@@ -68,17 +46,27 @@ async function parseJD({ path: storedPath }) {
   const bucket = storedPath.slice(0, firstSlash);
   const key = storedPath.slice(firstSlash + 1);
 
-  const { data: fileData, error } = await supabase.storage.from(bucket).download(key);
+  const { data: fileData, error } = await supabase
+    .storage
+    .from(bucket)
+    .download(key);
+
   if (error) {
     throw new Error(`parseJD: download failed - ${error.message || error}`);
   }
 
-  // supabase-js in Node returns a Blob-like; convert to Buffer
+  // supabase-js in Node returns a Blob-like; get ArrayBuffer then Buffer
   const arrayBuf = await fileData.arrayBuffer();
   const buf = Buffer.from(arrayBuf);
 
-  const text = await parseBufferToText(buf, fileData.type || mimeFromExt(key), key);
-  return { text, description: text };
+  const ext = (path.extname(key || '').toLowerCase() || '').replace('.', '');
+  const mime =
+    ext === 'pdf'  ? 'application/pdf' :
+    ext === 'docx' ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' :
+    '';
+
+  const text = await parseBufferToText(buf, mime, key);
+  return { text, description: text }; // return both; caller may use description
 }
 
 module.exports = {
