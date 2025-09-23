@@ -4,6 +4,7 @@ const express = require('express')
 const cors = require('cors')
 const crypto = require('crypto')
 const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
+const { generateRubricAndKBForRole } = require('./generateRubric')
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const app = express()
@@ -113,7 +114,7 @@ app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
   }
 })
 
-// ---------- Dashboard: scoped rows (CANDIDATE-FIRST) ----------
+// ---------- Dashboard: scoped rows ----------
 async function buildDashboardRows(req, res) {
   try {
     const filterIds = req.clientIds || [];
@@ -123,7 +124,6 @@ async function buildDashboardRows(req, res) {
     const finalIds = wantedClientId ? filterIds.filter(id => id === wantedClientId) : filterIds;
     if (finalIds.length === 0) return res.json({ items: [] });
 
-    // 1) Pull candidates for the scoped client(s)
     const { data: candRows, error: candErr } = await supabaseAdmin
       .from('candidates')
       .select('id, first_name, last_name, name, email, role_id, client_id, created_at')
@@ -135,24 +135,19 @@ async function buildDashboardRows(req, res) {
     const candidateIds = Array.from(new Set((candRows || []).map(c => c.id)));
     const roleIds = Array.from(new Set((candRows || []).map(c => c.role_id).filter(Boolean)));
 
-    // 2) Join roles for display
     let rolesById = {};
     if (roleIds.length) {
       const { data: roles, error: roleErr } = await supabaseAdmin
         .from('roles')
         .select('id, title, client_id')
         .in('id', roleIds);
-
-      if (roleErr) {
-        rolesById = {};
-      } else {
+      if (!roleErr && roles) {
         rolesById = Object.fromEntries(
-          (roles || []).map(r => [r.id, { id: r.id, title: r.title, client_id: r.client_id }])
+          roles.map(r => [r.id, { id: r.id, title: r.title, client_id: r.client_id }])
         );
       }
     }
 
-    // 3) Find the latest interview per candidate (same client scope)
     let latestInterviewByCand = {};
     if (candidateIds.length) {
       const { data: ivs, error: intErr } = await supabaseAdmin
@@ -170,10 +165,9 @@ async function buildDashboardRows(req, res) {
       }
     }
 
-    // 4) Pull reports once; then choose best per candidate
     let bestReportByCand = {};
     if (candidateIds.length) {
-      const { data: reps, error: repErr } = await supabaseAdmin
+      const { data: reps } = await supabaseAdmin
         .from('reports')
         .select(`
           id, candidate_id, role_id,
@@ -184,7 +178,7 @@ async function buildDashboardRows(req, res) {
         .in('candidate_id', candidateIds)
         .order('created_at', { ascending: false });
 
-      if (!repErr && reps) {
+      if (reps) {
         for (const rep of reps) {
           const cur = bestReportByCand[rep.candidate_id];
           if (!cur) {
@@ -201,7 +195,6 @@ async function buildDashboardRows(req, res) {
 
     const numOrNull = v => (typeof v === 'number' && isFinite(v)) ? v : (v === 0 ? 0 : null);
 
-    // 5) Normalize to FE shape
     const items = (candRows || []).map(c => {
       const fullName =
         c.name ||
@@ -319,7 +312,7 @@ app.post('/clients/accept-invite', requireAuth, async (req, res) => {
   }
 })
 
-/* ========================= Admin guard + Admin API (fixed) ========================= */
+/* ========================= Admin guard + Admin API (with JD→Rubric→KB) ========================= */
 
 // Admin-only guard (after requireAuth)
 async function requireAdmin(req, res, next) {
@@ -345,16 +338,14 @@ async function requireAdmin(req, res, next) {
   }
 }
 
-// Admin router (global admin; no client association)
 const adminRouter = express.Router()
 
-// Helper: ensure a user exists & (preferably) send an invite; return user_id + optional action_link
+// Helper: ensure a user exists/invite; return user_id + optional action_link
 async function ensureUserIdAndInvite(email, redirectTo) {
   let userId = null
   let actionLink = null
   let method = null
 
-  // 1) Try invite first (sends email)
   try {
     const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo })
     userId = invited?.data?.user?.id || null
@@ -363,7 +354,6 @@ async function ensureUserIdAndInvite(email, redirectTo) {
     console.error('inviteUserByEmail failed:', e?.message || e)
   }
 
-  // 2) If no userId, try generating a magic link (gives user + link; you can DM it if needed)
   if (!userId) {
     try {
       const link = await supabaseAdmin.auth.admin.generateLink({
@@ -379,7 +369,6 @@ async function ensureUserIdAndInvite(email, redirectTo) {
     }
   }
 
-  // 3) If still no user, create the user (ensures a UUID), then try inviting again
   if (!userId) {
     try {
       const created = await supabaseAdmin.auth.admin.createUser({
@@ -414,7 +403,7 @@ adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
   res.json({ items: data || [] })
 })
 
-// Create client (now writes email to satisfy NOT NULL)
+// Create client (writes email to satisfy NOT NULL)
 adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   const name = (req.body?.name || '').trim()
   const adminName  = (req.body?.admin_name  || '').trim()
@@ -445,7 +434,6 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
 
     if (!userId) {
       console.error('seed_member_no_user_id', { email: adminEmail, method })
-      // We return client OK but skip seeding to satisfy NOT NULL
       return res.json({ item: client, seeded_member: null, note: 'client_created_invite_failed', action_link: actionLink || null })
     }
 
@@ -492,7 +480,7 @@ adminRouter.get('/roles', requireAuth, requireAdmin, async (req, res) => {
   res.json({ items: data || [] })
 })
 
-// Create role (same as before; JD parsing can be added after we stabilize)
+// Create role (now also parses JD → generates rubric → writes KB)
 adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
   const { client_id, title } = req.body || {}
   let { interview_type, job_description_url } = req.body || {}
@@ -516,10 +504,31 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
     .single()
   if (error) return res.status(500).json({ error: 'create_role_failed', detail: error.message })
 
-  res.json({ item: role })
+  // Enrichment (best-effort): parse JD -> rubric -> KB
+  try {
+    await generateRubricAndKBForRole(role.id)
+  } catch (e) {
+    console.error('enrich_role_failed:', e?.message || e)
+  }
+
+  // Return fresh row after enrichment
+  const { data: updated, error: selErr } = await supabaseAdmin
+    .from('roles')
+    .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
+    .eq('id', role.id)
+    .single()
+
+  res.json({ item: updated || role })
 })
 
-// List members for a client (no "id" in SELECT; add synthetic id)
+// Delete role
+adminRouter.delete('/roles/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { error } = await supabaseAdmin.from('roles').delete().eq('id', req.params.id)
+  if (error) return res.status(500).json({ error: 'delete_role_failed', detail: error.message })
+  res.json({ ok: true })
+})
+
+// List members for a client (synthetic id)
 adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) => {
   const { client_id } = req.query
   if (!client_id) return res.status(400).json({ error: 'client_id_required' })
@@ -534,7 +543,7 @@ adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) =
   res.json({ items })
 })
 
-// Add a client member (guarantee user_id before insert)
+// Add a client member
 adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) => {
   const { client_id, email, name } = req.body || {}
   const role = (req.body?.role || 'member').toLowerCase()
@@ -587,7 +596,7 @@ adminRouter.delete('/client-members/:id', requireAuth, requireAdmin, async (req,
 
 app.use('/admin', adminRouter)
 
-/* ======================= END: Admin guard + Admin API (fixed) ======================= */
+/* ======================= END: Admin guard + Admin API ======================= */
 
 // ---------- Mount legacy/optional feature routes if present ----------
 function mountIfExists(relPath, urlPath) {
