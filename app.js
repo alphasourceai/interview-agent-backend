@@ -59,19 +59,47 @@ async function requireAuth(req, res, next) {
   }
 }
 
+// Replace the existing withClientScope with this version
 async function withClientScope(req, res, next) {
   try {
-    if (!req.user) return res.status(401).json({ error: 'Unauthorized' })
+    if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
+
+    // Admins get global scope
+    let isAdmin = false;
+    try {
+      const { data: adm, error: admErr } = await supabaseAdmin
+        .from('admins')
+        .select('id')
+        .eq('email', req.user.email)
+        .eq('is_active', true)
+        .maybeSingle();
+      if (!admErr && adm) isAdmin = true;
+    } catch (_) {}
+
+    if (isAdmin) {
+      const { data: allClients, error: cErr } = await supabaseAdmin
+        .from('clients')
+        .select('id');
+      if (cErr) return res.status(500).json({ error: 'Failed to load clients', detail: cErr.message });
+      req.clientIds = (allClients || []).map(c => c.id);
+      req.memberships = (allClients || []).map(c => ({ client_id: c.id, role: 'admin' }));
+      req.isAdmin = true;
+      return next();
+    }
+
+    // Regular users: scope to their memberships
     const { data, error } = await supabaseAdmin
       .from('client_members')
       .select('client_id, role')
-      .eq('user_id', req.user.id)
-    if (error) return res.status(500).json({ error: 'Failed to load memberships', detail: error.message })
-    req.clientIds = (data || []).map(r => r.client_id)
-    req.memberships = data || []
-    next()
+      .eq('user_id', req.user.id);
+    if (error) return res.status(500).json({ error: 'Failed to load memberships', detail: error.message });
+
+    req.clientIds = (data || []).map(r => r.client_id);
+    req.memberships = data || [];
+    req.isAdmin = false;
+    next();
   } catch (e) {
-    return res.status(500).json({ error: 'Server error' })
+    return res.status(500).json({ error: 'Server error' });
   }
 }
 
