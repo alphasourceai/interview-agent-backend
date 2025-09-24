@@ -1,4 +1,3 @@
-// routes/rolesUpload.js
 'use strict';
 
 const express = require('express');
@@ -40,7 +39,8 @@ function okContentType(filename) {
  *  - Uploads JD file to JD_BUCKET
  *  - Parses text (pdf/docx)
  *  - Updates role: job_description_url, description
- * Returns: { ok, role }
+ *  - (NEW) Conditionally enriches rubric/KB if role has neither rubric nor KB yet
+ * Returns: { ok, role, parsed_text_preview }
  */
 router.post('/upload-jd', upload.single('file'), async (req, res) => {
   try {
@@ -59,7 +59,7 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
     const ext = path.extname(originalname || '').toLowerCase();
     const contentType = okContentType(originalname);
 
-    // Upload JD file to storage (no bucket prefix in key)
+    // 1) Upload JD file to storage (no bucket prefix in key)
     const objectKey = `${client_id}/${role_id}/${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`;
     const up = await supabaseAdmin.storage
       .from(JD_BUCKET)
@@ -72,7 +72,7 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
 
     const job_description_url = `${JD_BUCKET}/${objectKey}`;
 
-    // Parse JD text to populate roles.description (best-effort)
+    // 2) Parse JD text to populate roles.description (best-effort)
     let parsedText = '';
     try {
       parsedText = await parseBufferToText(buffer, contentType, originalname);
@@ -83,7 +83,8 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
     const updates = { job_description_url };
     if (parsedText) updates.description = parsedText.slice(0, 15000);
 
-    const { data: updated, error: updErr } = await supabaseAdmin
+    // 3) Update role with JD path (+ optional description)
+    let { data: updated, error: updErr } = await supabaseAdmin
       .from('roles')
       .update(updates)
       .eq('id', role_id)
@@ -95,7 +96,36 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
       return res.status(500).json({ error: 'Role update failed', detail: updErr.message });
     }
 
-    return res.json({ ok: true, role: updated });
+    // 4) (NEW) Conditional enrichment:
+    // Only run if the role has neither a rubric nor a KB doc yet.
+    // This avoids overwriting any existing curated content.
+    const needsEnrichment = !updated?.rubric && !updated?.kb_document_id;
+    if (needsEnrichment) {
+      try {
+        const { generateRubricAndKBForRole } = require('../generateRubric');
+        await generateRubricAndKBForRole(role_id);
+
+        // Re-fetch the role so FE gets fresh rubric/kb fields in the response
+        const refetch = await supabaseAdmin
+          .from('roles')
+          .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
+          .eq('id', role_id)
+          .single();
+        if (!refetch.error && refetch.data) {
+          updated = refetch.data;
+        }
+      } catch (e) {
+        console.error('[upload-jd] post-upload enrichment failed:', e?.message || e);
+        // Do not fail the upload response—JD is saved and description set.
+      }
+    }
+
+    // 5) Respond with role + preview
+    return res.json({
+      ok: true,
+      role: updated,
+      parsed_text_preview: (parsedText || '').slice(0, 1200)
+    });
   } catch (e) {
     console.error('[upload-jd] unexpected:', e?.message || e);
     return res.status(500).json({ error: 'Server error' });
