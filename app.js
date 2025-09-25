@@ -547,6 +547,68 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
   res.json({ item: updated || role })
 })
 
+// Delete role by id + client_id (matches FE call shape)
+adminRouter.delete('/roles', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const roleId = req.query.id || req.body?.id;
+    const clientId = req.query.client_id || req.body?.client_id;
+    if (!roleId || !clientId) {
+      return res.status(400).json({ error: 'id_and_client_id_required' });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('roles')
+      .delete()
+      .eq('id', roleId)
+      .eq('client_id', clientId)
+      .select('id')
+      .maybeSingle();
+
+    if (error) {
+      console.error('delete_role_failed:', error.message);
+      return res.status(500).json({ error: 'delete_role_failed', detail: error.message });
+    }
+    if (!data) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+    return res.json({ ok: true, id: data.id });
+  } catch (e) {
+    console.error('delete_role_exception:', e?.message || e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// Alternate delete endpoint via POST body { id, client_id }
+adminRouter.post('/roles/delete', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const roleId = req.body?.id;
+    const clientId = req.body?.client_id;
+    if (!roleId || !clientId) {
+      return res.status(400).json({ error: 'id_and_client_id_required' });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('roles')
+      .delete()
+      .eq('id', roleId)
+      .eq('client_id', clientId)
+      .select('id')
+      .maybeSingle();
+
+    if (error) {
+      console.error('post_delete_role_failed:', error.message);
+      return res.status(500).json({ error: 'delete_role_failed', detail: error.message });
+    }
+    if (!data) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+    return res.json({ ok: true, id: data.id });
+  } catch (e) {
+    console.error('post_delete_role_exception:', e?.message || e);
+    return res.status(500).json({ error: 'server_error' });
+  }
+});
+
 // List members for a client (synthetic id)
 adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) => {
   const { client_id } = req.query
