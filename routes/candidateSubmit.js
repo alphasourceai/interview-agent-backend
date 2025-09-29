@@ -23,6 +23,17 @@ function six() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
+// normalize helpers
+function normEmail(v = '') {
+  return String(v || '').trim().toLowerCase();
+}
+function normPhone(v = '') {
+  return String(v || '').replace(/\D/g, '');
+}
+function normName(v = '') {
+  return String(v || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
 /**
  * POST /api/candidate/submit
  * Accepts multipart form (resume) or JSON (resume_url).
@@ -31,16 +42,21 @@ function six() {
 router.post('/', upload.any(), async (req, res) => {
   try {
     // --- normalize inputs ---
-    const role_token = (req.body.role_token || '').trim();
-    const role_id_in = (req.body.role_id || '').trim();
-    const first_name = (req.body.first_name || '').trim();
-    const last_name  = (req.body.last_name  || '').trim();
-    const rawName    = (req.body.name || '').trim();
-    const email      = (req.body.email || '').trim().toLowerCase();
-    const phone      = (req.body.phone || '').replace(/\D/g, '');
+    const role_token   = (req.body.role_token || '').trim();
+    const role_id_in   = (req.body.role_id || '').trim();
+    const first_name   = (req.body.first_name || '').trim();
+    const last_name    = (req.body.last_name  || '').trim();
+    const rawName      = (req.body.name || '').trim();
+    const emailRaw     = (req.body.email || '').trim();
+    const phoneRaw     = (req.body.phone || '').trim();
     const resume_url_in = req.body.resume_url || null;
 
     const fullName = rawName || [first_name, last_name].filter(Boolean).join(' ').trim();
+
+    const email = normEmail(emailRaw);
+    const phone = normPhone(phoneRaw);
+    const nameNorm = normName(fullName);
+
     if (!email || !fullName || (!role_token && !role_id_in)) {
       return res.status(400).json({
         error: 'Required: email, (name OR first_name+last_name), and (role_id OR role_token).',
@@ -65,76 +81,85 @@ router.post('/', upload.any(), async (req, res) => {
     if (rErr || !role) return res.status(404).json({ error: 'Role not found.' });
     const roleId = role.id;
 
-    // --- duplicate guard (same email+role) ---
-    const { count: dupCount, error: dupErr } = await supabase
-      .from('candidates')
-      .select('*', { count: 'exact', head: true })
-      .eq('email', email)
-      .eq('role_id', roleId);
-    if (dupErr) return res.status(500).json({ error: dupErr.message });
-
-    if ((dupCount || 0) > 0) {
-      // invalidate old OTPs and send a fresh one
-      await supabase
-        .from('otp_tokens')
-        .update({ used: true, used_at: new Date().toISOString() })
-        .eq('candidate_email', email)
+    // --- duplicate & enrichment policy ---
+    // 1) Try exact email match for this role
+    let existing = null;
+    {
+      const { data, error } = await supabase
+        .from('candidates')
+        .select('id, name, email, phone')
         .eq('role_id', roleId)
-        .eq('used', false);
-
-      const code = six();
-      await supabase.from('otp_tokens').insert({
-        candidate_email: email,
-        role_id: roleId,
-        code,
-        expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
-        used: false,
-      });
-
-      let emailErr = null, emailOk = false;
-      try {
-        if (!SENDGRID_KEY || !FROM_EMAIL) throw new Error('SENDGRID_API_KEY or SENDGRID_FROM not configured');
-        const [resp] = await sg.send({
-          to: email,
-          from: { email: FROM_EMAIL, name: APP_NAME },
-          subject: `Your ${APP_NAME} verification code`,
-          text: `Your verification code is ${code}. It expires in 10 minutes.`,
-          html: `<p>Your verification code is <strong style="font-size:18px">${code}</strong>.</p><p>It expires in 10 minutes.</p>`,
-        });
-        emailOk = resp?.statusCode === 202;
-      } catch (e) {
-        emailErr = e?.response?.data || e?.message || String(e);
-      }
-
-      return res.status(409).json({
-        error: 'You have already started an interview for this role.',
-        email_sent: emailOk,
-        email_error: emailErr,
-        email,
-      });
+        .eq('email', email)
+        .limit(1)
+        .maybeSingle();
+      if (!error && data) existing = data;
+    }
+    // 2) If not found and we have phone, try phone match
+    if (!existing && phone) {
+      const { data, error } = await supabase
+        .from('candidates')
+        .select('id, name, email, phone')
+        .eq('role_id', roleId)
+        .eq('phone', phone)
+        .limit(1)
+        .maybeSingle();
+      if (!error && data) existing = data;
+    }
+    // 3) If still not found, try case-insensitive name match
+    if (!existing) {
+      const { data, error } = await supabase
+        .from('candidates')
+        .select('id, name, email, phone')
+        .eq('role_id', roleId)
+        .ilike('name', fullName); // ilike is case-insensitive exact when no wildcards
+      if (!error && Array.isArray(data) && data.length) existing = data[0];
     }
 
-    // --- create candidate (denormalize client_id) ---
-    const { data: inserted, error: cErr } = await supabase
-      .from('candidates')
-      .insert({
-        role_id: roleId,
-        client_id: role.client_id || null,
-        name: fullName,
-        first_name,
-        last_name,
-        email,
-        phone,
-        status: 'Resume Uploaded',
-      })
-      .select('id')
-      .single();
-    if (cErr) return res.status(500).json({ error: cErr.message });
+    // Branching:
+    // A) If an existing record is found AND both name & email match (case-insensitive),
+    //    enrich phone if provided and missing, then proceed using existing.id.
+    // B) Otherwise, block as duplicate and DO NOT send OTP.
+    let candidate_id = null;
+    if (existing) {
+      const existingNameNorm = normName(existing.name || '');
+      const existingEmailNorm = normEmail(existing.email || '');
+      const nameEmailMatch = (existingNameNorm === nameNorm) && (existingEmailNorm === email);
 
-    const candidate_id = inserted.id;
+      if (nameEmailMatch) {
+        candidate_id = existing.id;
+        // Enrich phone if we have one and it's missing on the record
+        if (phone && !existing.phone) {
+          await supabase.from('candidates').update({ phone }).eq('id', candidate_id);
+        }
+      } else {
+        return res.status(409).json({
+          error: "You’ve already interviewed for this role with this information. If you believe this is an error, contact support at info@alphasourceai.com",
+        });
+      }
+    }
 
-    // self-reference (candidate_id column)
-    await supabase.from('candidates').update({ candidate_id }).eq('id', candidate_id);
+    // --- create candidate if needed (denormalize client_id) ---
+    if (!candidate_id) {
+      const { data: inserted, error: cErr } = await supabase
+        .from('candidates')
+        .insert({
+          role_id: roleId,
+          client_id: role.client_id || null,
+          name: fullName,
+          first_name,
+          last_name,
+          email,
+          phone,
+          status: 'Resume Uploaded',
+        })
+        .select('id')
+        .single();
+      if (cErr) return res.status(500).json({ error: cErr.message });
+      candidate_id = inserted.id;
+
+      // self-reference (candidate_id column)
+      await supabase.from('candidates').update({ candidate_id }).eq('id', candidate_id);
+    }
 
     // --- resume upload (optional) ---
     let resume_url = resume_url_in;
