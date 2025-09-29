@@ -28,7 +28,9 @@ function normEmail(v = '') {
   return String(v || '').trim().toLowerCase();
 }
 function normPhone(v = '') {
-  return String(v || '').replace(/\D/g, '');
+  const digits = String(v || '').replace(/\D/g, '');
+  // Keep only last 10 digits (NANP style), chopping country codes/leading 1
+  return digits.length > 10 ? digits.slice(-10) : digits;
 }
 function normName(v = '') {
   return String(v || '').trim().replace(/\s+/g, ' ').toLowerCase();
@@ -82,8 +84,13 @@ router.post('/', upload.any(), async (req, res) => {
     const roleId = role.id;
 
     // --- duplicate & enrichment policy ---
-    // 1) Try exact email match for this role
-    let existing = null;
+    // RULES:
+    // 1) Email match for this role -> BLOCK (409). Enrich phone if missing, then stop (no OTP, no resume upload, no analysis).
+    // 2) If email does NOT match, but (name + phone) BOTH match for this role -> BLOCK (409). Enrich phone on the existing record if missing.
+    // 3) Otherwise, ALLOW (create candidate, upload, send OTP).
+
+    // 1) Email match
+    let existingByEmail = null;
     {
       const { data, error } = await supabase
         .from('candidates')
@@ -92,54 +99,47 @@ router.post('/', upload.any(), async (req, res) => {
         .eq('email', email)
         .limit(1)
         .maybeSingle();
-      if (!error && data) existing = data;
+      if (!error && data) existingByEmail = data;
     }
-    // 2) If not found and we have phone, try phone match
-    if (!existing && phone) {
+    if (existingByEmail) {
+      // Enrich phone if missing
+      if (phone && !existingByEmail.phone) {
+        await supabase.from('candidates').update({ phone }).eq('id', existingByEmail.id);
+      }
+      return res.status(409).json({
+        error:
+          "You’ve already interviewed for this role with this information. If you believe this is an error, contact support at info@alphasourceai.com",
+      });
+    }
+
+    // 2) Name + phone match (only if we have both a name and a phone)
+    if (fullName && phone) {
+      let existingByNamePhone = null;
       const { data, error } = await supabase
         .from('candidates')
-        .select('id, name, email, phone')
+        .select('id, phone')
         .eq('role_id', roleId)
         .eq('phone', phone)
+        .ilike('name', fullName) // case-insensitive exact match
         .limit(1)
         .maybeSingle();
-      if (!error && data) existing = data;
-    }
-    // 3) If still not found, try case-insensitive name match
-    if (!existing) {
-      const { data, error } = await supabase
-        .from('candidates')
-        .select('id, name, email, phone')
-        .eq('role_id', roleId)
-        .ilike('name', fullName); // ilike is case-insensitive exact when no wildcards
-      if (!error && Array.isArray(data) && data.length) existing = data[0];
-    }
+      if (!error && data) existingByNamePhone = data;
 
-    // Branching:
-    // A) If an existing record is found AND both name & email match (case-insensitive),
-    //    enrich phone if provided and missing, then proceed using existing.id.
-    // B) Otherwise, block as duplicate and DO NOT send OTP.
-    let candidate_id = null;
-    if (existing) {
-      const existingNameNorm = normName(existing.name || '');
-      const existingEmailNorm = normEmail(existing.email || '');
-      const nameEmailMatch = (existingNameNorm === nameNorm) && (existingEmailNorm === email);
-
-      if (nameEmailMatch) {
-        candidate_id = existing.id;
-        // Enrich phone if we have one and it's missing on the record
-        if (phone && !existing.phone) {
-          await supabase.from('candidates').update({ phone }).eq('id', candidate_id);
+      if (existingByNamePhone) {
+        // Enrich phone if the stored record is missing it (defensive; may already be set)
+        if (!existingByNamePhone.phone && phone) {
+          await supabase.from('candidates').update({ phone }).eq('id', existingByNamePhone.id);
         }
-      } else {
         return res.status(409).json({
-          error: "You’ve already interviewed for this role with this information. If you believe this is an error, contact support at info@alphasourceai.com",
+          error:
+            "You’ve already interviewed for this role with this information. If you believe this is an error, contact support at info@alphasourceai.com",
         });
       }
     }
 
-    // --- create candidate if needed (denormalize client_id) ---
-    if (!candidate_id) {
+    // --- create candidate (denormalize client_id) ---
+    let candidate_id = null;
+    {
       const { data: inserted, error: cErr } = await supabase
         .from('candidates')
         .insert({
@@ -149,7 +149,7 @@ router.post('/', upload.any(), async (req, res) => {
           first_name,
           last_name,
           email,
-          phone,
+          phone, // already normalized to last 10 digits
           status: 'Resume Uploaded',
         })
         .select('id')
