@@ -63,7 +63,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
     if (candIds.length) {
       const { data: ivs, error: iErr } = await supabase
         .from('interviews')
-        .select('id, candidate_id, client_id, created_at, video_url, transcript_url, analysis_url')
+        .select('id, candidate_id, client_id, created_at, video_url, transcript_url, analysis_url, analysis')
         .eq('client_id', clientId)
         .in('candidate_id', candIds)
         .order('created_at', { ascending: false });
@@ -131,7 +131,30 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const overall_score   = isFinite(rep?.overall_score)   ? Number(rep.overall_score)   : null;
 
       const resume_analysis = rep?.resume_analysis || { experience: null, skills: null, education: null, summary: '' };
-      const interview_analysis = rep?.interview_analysis || { clarity: null, confidence: null, body_language: null };
+      // Start from report's interview_analysis if present, else empty defaults
+      let interview_analysis = rep?.interview_analysis
+        ? { ...rep.interview_analysis }
+        : { clarity: null, confidence: null, body_language: null, summary: '' };
+
+      // Fallbacks from latest interview JSON analysis (if report lacks pieces)
+      const ivAnalysis = iv?.analysis || null;
+      if (ivAnalysis) {
+        // scores fallback
+        const scores = ivAnalysis.scores || {};
+        if (interview_analysis.clarity == null && Number.isFinite(Number(scores.clarity))) {
+          interview_analysis.clarity = Number(scores.clarity);
+        }
+        if (interview_analysis.confidence == null && Number.isFinite(Number(scores.confidence))) {
+          interview_analysis.confidence = Number(scores.confidence);
+        }
+        if (interview_analysis.body_language == null && Number.isFinite(Number(scores.body_language))) {
+          interview_analysis.body_language = Number(scores.body_language);
+        }
+        // summary fallback
+        if (!interview_analysis.summary && typeof ivAnalysis.summary === 'string') {
+          interview_analysis.summary = ivAnalysis.summary;
+        }
+      }
 
       // PDF URL preference: explicit latest_report_url, else report_url
       const latest_report_url = rep?.latest_report_url || rep?.report_url || null;
