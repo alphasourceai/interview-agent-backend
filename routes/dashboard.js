@@ -96,6 +96,9 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
           'overall_score',
           'resume_analysis',
           'interview_analysis',
+          'resume_breakdown',
+          'interview_breakdown',
+          'analysis',
           // common names I've seen/used for a public PDF URL:
           'report_url',
           'latest_report_url',
@@ -130,11 +133,28 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const interview_score = isFinite(rep?.interview_score) ? Number(rep.interview_score) : null;
       const overall_score   = isFinite(rep?.overall_score)   ? Number(rep.overall_score)   : null;
 
-      const resume_analysis = rep?.resume_analysis || { experience: null, skills: null, education: null, summary: '' };
-      // Start from report's interview_analysis if present, else empty defaults
-      let interview_analysis = rep?.interview_analysis
-        ? { ...rep.interview_analysis }
-        : { clarity: null, confidence: null, body_language: null, summary: '' };
+      // Prefer *_analysis then *_breakdown. Ensure stable shape & summary string.
+      const repRA = rep?.resume_analysis ?? rep?.resume_breakdown ?? {};
+      const resume_analysis = {
+        experience: repRA.experience ?? null,
+        skills:     repRA.skills ?? null,
+        education:  repRA.education ?? null,
+        summary:    (typeof repRA.summary === 'string' ? repRA.summary : '')
+      };
+
+      // Start from report's interview_analysis or interview_breakdown
+      const repIA = rep?.interview_analysis ?? rep?.interview_breakdown ?? {};
+      let interview_analysis = {
+        clarity:       Number.isFinite(Number(repIA.clarity)) ? Number(repIA.clarity) : null,
+        confidence:    Number.isFinite(Number(repIA.confidence)) ? Number(repIA.confidence) : null,
+        body_language: Number.isFinite(Number(repIA.body_language)) ? Number(repIA.body_language) : null,
+        summary:       (typeof repIA.summary === 'string' ? repIA.summary : '')
+      };
+
+      // If summary missing, try reports.analysis.summary
+      if ((!interview_analysis.summary || !interview_analysis.summary.trim()) && typeof rep?.analysis?.summary === 'string') {
+        interview_analysis.summary = rep.analysis.summary;
+      }
 
       // Fallbacks from latest interview JSON analysis (if report lacks pieces)
       const ivAnalysis = iv?.analysis || null;
