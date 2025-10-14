@@ -3,8 +3,8 @@ services:
     name: ia-backend-prod
     env: node
     plan: starter
-    branch: prod-backend-stable
-    buildCommand: npm ci
+    branch: prod-backend-legacy
+    buildCommand: npm ci --omit=dev
     startCommand: node app.js
     envVars:
       - key: NODE_ENV
