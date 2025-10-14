@@ -63,7 +63,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
     if (candIds.length) {
       const { data: ivs, error: iErr } = await supabase
         .from('interviews')
-        .select('id, candidate_id, client_id, created_at, video_url, transcript_url, analysis_url')
+        .select('id, candidate_id, client_id, created_at, video_url, transcript_url, analysis_url, analysis')
         .eq('client_id', clientId)
         .in('candidate_id', candIds)
         .order('created_at', { ascending: false });
@@ -96,6 +96,9 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
           'overall_score',
           'resume_analysis',
           'interview_analysis',
+          'resume_breakdown',
+          'interview_breakdown',
+          'analysis',
           // common names I've seen/used for a public PDF URL:
           'report_url',
           'latest_report_url',
@@ -130,8 +133,48 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const interview_score = isFinite(rep?.interview_score) ? Number(rep.interview_score) : null;
       const overall_score   = isFinite(rep?.overall_score)   ? Number(rep.overall_score)   : null;
 
-      const resume_analysis = rep?.resume_analysis || { experience: null, skills: null, education: null, summary: '' };
-      const interview_analysis = rep?.interview_analysis || { clarity: null, confidence: null, body_language: null };
+      // Prefer *_analysis then *_breakdown. Ensure stable shape & summary string.
+      const repRA = rep?.resume_analysis ?? rep?.resume_breakdown ?? {};
+      const resume_analysis = {
+        experience: repRA.experience ?? null,
+        skills:     repRA.skills ?? null,
+        education:  repRA.education ?? null,
+        summary:    (typeof repRA.summary === 'string' ? repRA.summary : '')
+      };
+
+      // Start from report's interview_analysis or interview_breakdown
+      const repIA = rep?.interview_analysis ?? rep?.interview_breakdown ?? {};
+      let interview_analysis = {
+        clarity:       Number.isFinite(Number(repIA.clarity)) ? Number(repIA.clarity) : null,
+        confidence:    Number.isFinite(Number(repIA.confidence)) ? Number(repIA.confidence) : null,
+        body_language: Number.isFinite(Number(repIA.body_language)) ? Number(repIA.body_language) : null,
+        summary:       (typeof repIA.summary === 'string' ? repIA.summary : '')
+      };
+
+      // If summary missing, try reports.analysis.summary
+      if ((!interview_analysis.summary || !interview_analysis.summary.trim()) && typeof rep?.analysis?.summary === 'string') {
+        interview_analysis.summary = rep.analysis.summary;
+      }
+
+      // Fallbacks from latest interview JSON analysis (if report lacks pieces)
+      const ivAnalysis = iv?.analysis || null;
+      if (ivAnalysis) {
+        // scores fallback
+        const scores = ivAnalysis.scores || {};
+        if (interview_analysis.clarity == null && Number.isFinite(Number(scores.clarity))) {
+          interview_analysis.clarity = Number(scores.clarity);
+        }
+        if (interview_analysis.confidence == null && Number.isFinite(Number(scores.confidence))) {
+          interview_analysis.confidence = Number(scores.confidence);
+        }
+        if (interview_analysis.body_language == null && Number.isFinite(Number(scores.body_language))) {
+          interview_analysis.body_language = Number(scores.body_language);
+        }
+        // summary fallback
+        if (!interview_analysis.summary && typeof ivAnalysis.summary === 'string') {
+          interview_analysis.summary = ivAnalysis.summary;
+        }
+      }
 
       // PDF URL preference: explicit latest_report_url, else report_url
       const latest_report_url = rep?.latest_report_url || rep?.report_url || null;
