@@ -200,7 +200,7 @@ async function buildDashboardRows(req, res) {
         .select(`
           id, candidate_id, role_id,
           resume_score, interview_score, overall_score,
-          resume_breakdown, interview_breakdown,
+          resume_breakdown, interview_breakdown, analysis,
           report_url, created_at
         `)
         .in('candidate_id', candidateIds)
@@ -236,6 +236,16 @@ async function buildDashboardRows(req, res) {
       const rb = rep?.resume_breakdown || {};
       const ib = rep?.interview_breakdown || {};
 
+      // Prefer summary from interview_breakdown.summary; fall back to reports.analysis
+      const interview_summary =
+        (typeof ib.summary === 'string' && ib.summary.trim())
+          ? ib.summary.trim()
+          : (
+              typeof rep?.analysis === 'string'
+                ? rep.analysis
+                : (typeof rep?.analysis?.summary === 'string' ? rep.analysis.summary : '')
+            );
+
       const resume_analysis = {
         experience: numOrNull(rb.experience_match_percent ?? rb.experience),
         skills:     numOrNull(rb.skills_match_percent ?? rb.skills),
@@ -246,7 +256,8 @@ async function buildDashboardRows(req, res) {
       const interview_analysis = {
         clarity:       numOrNull(ib.clarity),
         confidence:    numOrNull(ib.confidence),
-        body_language: numOrNull(ib.body_language)
+        body_language: numOrNull(ib.body_language),
+        summary:       typeof interview_summary === 'string' ? interview_summary : ''
       };
 
       return {
@@ -710,6 +721,7 @@ app.use(
   require('./routes/files')
 )
 
+
 app.use(
   '/reports',
   requireAuth,
@@ -723,6 +735,12 @@ app.use(
   },
   require('./routes/reports')
 )
+
+// ---------- Reports PDF (HTML→PDF) ----------
+try {
+  const reportsPdfRoutes = require('./routes/reportsPdf');
+  app.use('/api', reportsPdfRoutes);
+} catch (_) {}
 
 // ---------- health ----------
 app.get('/health', (_req, res) => res.json({ ok: true }))
