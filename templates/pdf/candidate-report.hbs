@@ -1,0 +1,106 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Candidate Report</title>
+  <style>
+    /* brand from your PDFMonkey CSS */
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background:#252a34; color:#fff; padding:24px; }
+    .container { max-width: 800px; margin: 0 auto; }
+    .header { text-align:center; margin-bottom:24px; }
+    .header img { max-height: 120px; margin: 0 auto 12px; display:block; }
+    .header h2 { font-size: 28px; margin:0; color:#00cfc8; }
+
+    .gauge-row { display:flex; gap:16px; margin:24px 0; }
+    .card { background:#fff; border:2px solid #00cfc8; border-radius:12px; padding:14px; flex:1; color:#252a34; }
+    .label { font-size: 14px; margin: 0 0 6px; color:#252a34; }
+    .score-text { font-size: 20px; font-weight: 700; color:#00cfc8; margin: 0 0 8px; }
+
+    /* reliable progress bar (replaces canvas gauge for server PDFs) */
+    .bar { width:100%; height:10px; background:#252a34; border-radius:6px; overflow:hidden; border:1px solid #00cfc8; }
+    .bar > span { display:block; height:100%; background:#00cfc8; width:0; }
+    .bar[data-pct] > span { width: attr(data-pct percentage); } /* not supported everywhere */
+    /* Use inline style for width on spans so Puppeteer picks it up 100% */
+
+    .info { margin: 18px 0 20px; font-size: 15px; }
+    .info p { margin: 4px 0; }
+
+    .breakdown-section { margin-top: 18px; }
+    .breakdown-section h2 { color:#00cfc8; font-size:18px; margin: 0 0 6px; }
+
+    .summary { margin-top:12px; background: rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.16); border-radius:10px; padding:12px; }
+    .muted { opacity: 0.85; }
+    .kv li { line-height: 1.35; }
+    .kv li strong { white-space: nowrap; }
+    .kv li { word-break: break-word; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <img src="https://i.imgur.com/Xb3LdBB.png" alt="AlphaSource Logo" />
+      <h2>Candidate Report</h2>
+    </div>
+
+    <div class="gauge-row">
+      <div class="card">
+        <p class="label">Resume Score</p>
+        <div class="score-text">{{resume_score}}%</div>
+        <div class="bar"><span style="width: {{resume_score}}%;"></span></div>
+      </div>
+      <div class="card">
+        <p class="label">Interview Score</p>
+        <div class="score-text">{{interview_score}}%</div>
+        <div class="bar"><span style="width: {{interview_score}}%;"></span></div>
+      </div>
+      <div class="card">
+        <p class="label">Overall Score</p>
+        <div class="score-text">{{overall_score}}%</div>
+        <div class="bar"><span style="width: {{overall_score}}%;"></span></div>
+      </div>
+    </div>
+
+    <div class="info">
+      <p><strong>Name:</strong> {{name}}</p>
+      <p><strong>Email:</strong> {{email}}</p>
+      <p><strong>Status:</strong> {{status}}</p>
+    </div>
+
+    <div class="breakdown-section">
+      <h2>Resume Analysis</h2>
+      <ul class="kv">
+        <li><strong>Experience:</strong> {{resume_breakdown.experience}}%</li>
+        <li><strong>Skills:</strong> {{resume_breakdown.skills}}%</li>
+        <li><strong>Education:</strong> {{resume_breakdown.education}}%</li>
+        <li><strong>Summary:</strong>
+          {{#if resume_breakdown.summary}}
+            {{resume_breakdown.summary}}
+          {{else}}
+            Summary not available
+          {{/if}}
+        </li>
+      </ul>
+    </div>
+
+    <div class="breakdown-section">
+      <h2>Interview Analysis</h2>
+      <ul class="kv">
+        <li><strong>Confidence:</strong> {{interview_breakdown.confidence}}%</li>
+        <li><strong>Clarity:</strong> {{interview_breakdown.clarity}}%</li>
+        <li><strong>Body Language:</strong> {{interview_breakdown.body_language}}%</li>
+        <li><strong>Summary:</strong>
+          {{#if interview_breakdown.summary}}
+            {{interview_breakdown.summary}}
+          {{else}}
+            {{#if analysis}}
+              {{analysis}}
+            {{else}}
+              Summary not available
+            {{/if}}
+          {{/if}}
+        </li>
+      </ul>
+    </div>
+  </div>
+</body>
+</html>

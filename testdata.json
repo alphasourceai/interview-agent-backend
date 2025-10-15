@@ -1,0 +1,22 @@
+{
+  "name": "Johnny Doe",
+  "email": "johnny.doe@example.com",
+  "role": "Sales Development Representative",
+  "resume_score": 55,
+  "interview_score": 80,
+  "overall_score": 68,
+  "resume_breakdown": {
+    "experience": 50,
+    "skills": 60,
+    "education": 80,
+    "summary": "Jason M. Gardner has a robust background in operations and management within the dental industry, including SaaS experience, which is relevant yet not prevalent in direct B2B SaaS sales roles."
+  },
+  "interview_breakdown": {
+    "clarity": 80,
+    "confidence": 75,
+    "body_language": 85,
+    "summary": "The response lacks clarity and substance, providing only a brief thank you without elaboration."
+  },
+  "resume_summary": "Jason M. Gardner has a robust background in operations and management within the dental industry, including SaaS experience, which is relevant yet not prevalent in direct B2B SaaS sales roles.",
+  "interview_summary": "The response lacks clarity and substance, providing only a brief thank you without elaboration."
+}
