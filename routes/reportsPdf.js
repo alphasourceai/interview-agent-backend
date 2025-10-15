@@ -41,7 +41,7 @@ function keyFromUrl(url) {
 }
 
 // Lightweight health check to verify router is mounted
-router.get('/reports/preview-health', (req, res) => {
+router.get('/preview-health', (req, res) => {
   res.json({ ok: true, at: new Date().toISOString() });
 });
 
@@ -55,7 +55,7 @@ function extractData(body) {
 
 // HTML preview for quick layout checks (no PDF)
 // POST /api/reports/preview-html
-router.post('/reports/preview-html', async (req, res) => {
+router.post('/preview-html', async (req, res) => {
   try {
     const data = extractData(req.body);
     const html = buildCandidateReportHtml(data);
@@ -67,7 +67,7 @@ router.post('/reports/preview-html', async (req, res) => {
   }
 });
 
-router.post('/reports/preview-pdf', async (req, res) => {
+router.post('/preview-pdf', async (req, res) => {
   try {
     const data = extractData(req.body);
     const html = buildCandidateReportHtml(data);
@@ -81,13 +81,7 @@ router.post('/reports/preview-pdf', async (req, res) => {
   }
 });
 
-/**
- * POST /api/reports/generate
- * Body: { candidate_id } OR { report_id }
- * Loads latest report (or specific), renders PDF, uploads to Supabase Storage.
- * Responds: { ok, report_id, key, url }
- */
-router.post('/reports/generate', async (req, res) => {
+async function handleGenerate(req, res) {
   try {
     if (!supabaseAdmin) {
       return res.status(500).json({ error: 'Storage not configured (missing SUPABASE_URL/SUPABASE_SERVICE_KEY)' });
@@ -187,8 +181,7 @@ router.post('/reports/generate', async (req, res) => {
       .createSignedUrl(key, expiresIn);
     if (signErr) throw signErr;
 
-    // 6) Best-effort: update reports row (keep storing a stable URL for history/back-compat)
-    // Note: Avoid storing signed URL (it expires). Use public-style URL if available; otherwise you may store null.
+    // 6) Best-effort: update reports row
     try {
       await supabaseAdmin
         .from('reports')
@@ -211,11 +204,15 @@ router.post('/reports/generate', async (req, res) => {
     console.error('[reports/generate] error', err);
     return res.status(500).json({ error: err.message || 'Failed to generate report' });
   }
-});
+}
+
+// Register both endpoints to the same handler
+router.post('/generate', handleGenerate);
+router.post('/generate-and-store', handleGenerate);
 
 // Production endpoint (stubbed until Step 3)
 // POST /api/reports/pdf
-router.post('/reports/pdf', async (req, res) => {
+router.post('/pdf', async (req, res) => {
   try {
     return res.status(501).json({ error: 'not_implemented', detail: 'PDF generation will be enabled after Step 3.' });
   } catch (err) {
@@ -228,7 +225,7 @@ router.post('/reports/pdf', async (req, res) => {
  * GET /api/reports/:id/url?expires=60
  * Returns a short-lived signed URL for an existing report PDF.
  */
-router.get('/reports/:id/url', async (req, res) => {
+router.get('/:id/url', async (req, res) => {
   try {
     if (!supabaseAdmin) {
       return res.status(500).json({ error: 'Storage not configured (missing SUPABASE_URL/SUPABASE_SERVICE_KEY)' });

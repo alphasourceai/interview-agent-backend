@@ -739,8 +739,22 @@ app.use(
 // ---------- Reports PDF (HTML→PDF) ----------
 try {
   const reportsPdfRoutes = require('./routes/reportsPdf');
-  app.use('/api', reportsPdfRoutes);
-  console.log('[mount] reportsPdfRoutes mounted at /api');
+  app.use(
+    '/reports',
+    requireAuth,
+    withClientScope,
+    (req, _res, next) => {
+      if (!req.client_memberships) {
+        const ids = Array.isArray(req.memberships)
+          ? req.memberships.map(m => m.client_id)
+          : (req.clientIds || []);
+        req.client_memberships = ids;
+      }
+      next();
+    },
+    reportsPdfRoutes
+  );
+  console.log('[mount] reportsPdfRoutes mounted at /reports');
 } catch (e) {
   console.error('[mount] Failed to load routes/reportsPdf:', e?.message || e);
 }
