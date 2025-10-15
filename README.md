@@ -26,7 +26,7 @@ Proposed files:
 - `src/lib/htmlToPdf.js` → `htmlToPdf(html) -> Buffer` using Playwright.
 
 Feature flag:
-- `PDF_PROVIDER=pdfmonkey|internal` (default `pdfmonkey`).
+- `PDF_PROVIDER=internal|internal` (default `internal`).
 - `internal` path used by `/reports/:interview_id/download` will:
   1) build payload,
   2) HTML→PDF buffer,

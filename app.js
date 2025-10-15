@@ -740,7 +740,10 @@ app.use(
 try {
   const reportsPdfRoutes = require('./routes/reportsPdf');
   app.use('/api', reportsPdfRoutes);
-} catch (_) {}
+  console.log('[mount] reportsPdfRoutes mounted at /api');
+} catch (e) {
+  console.error('[mount] Failed to load routes/reportsPdf:', e?.message || e);
+}
 
 // ---------- health ----------
 app.get('/health', (_req, res) => res.json({ ok: true }))
