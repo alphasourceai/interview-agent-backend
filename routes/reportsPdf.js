@@ -5,7 +5,7 @@ const { createClient } = require('@supabase/supabase-js');
 
 // Supabase Admin (for loading report data + uploading PDFs)
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
 const REPORTS_BUCKET = process.env.REPORTS_BUCKET || 'reports';
 const supabaseAdmin = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } })
@@ -97,7 +97,7 @@ async function handleGenerate(req, res) {
     if (report_id) {
       const { data, error } = await supabaseAdmin
         .from('reports')
-        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_analysis')
+        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown')
         .eq('id', report_id)
         .maybeSingle();
       if (error) throw error;
@@ -105,7 +105,7 @@ async function handleGenerate(req, res) {
     } else {
       const { data, error } = await supabaseAdmin
         .from('reports')
-        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_analysis')
+        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown')
         .eq('candidate_id', candidate_id)
         .order('created_at', { ascending: false })
         .limit(1);
@@ -127,7 +127,7 @@ async function handleGenerate(req, res) {
 
     // 3) Normalize data to template shape (parity with dashboard)
     const rb = reportRow.interview_breakdown || {};
-    const resume = reportRow.resume_analysis || {};
+    const resume = reportRow.resume_breakdown || {};
 
     const templateData = {
       candidate: {
