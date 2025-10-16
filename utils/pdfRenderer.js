@@ -5,6 +5,28 @@
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 
+// Prefer Puppeteer's bundled Chromium; fall back to env-provided paths if present.
+function resolveExecutablePath() {
+  const envCandidates = [
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    process.env.GOOGLE_CHROME_BIN,
+    process.env.CHROME_PATH,
+  ].filter(Boolean);
+
+  for (const p of envCandidates) {
+    try {
+      if (p && fs.existsSync(p)) return p;
+    } catch {}
+  }
+
+  try {
+    const p = typeof puppeteer.executablePath === 'function' ? puppeteer.executablePath() : null;
+    if (p && fs.existsSync(p)) return p;
+  } catch {}
+
+  return null; // let Puppeteer choose
+}
+
 // Safe flags for containerized Chrome
 const CHROME_ARGS = [
   '--no-sandbox',
@@ -15,28 +37,16 @@ const CHROME_ARGS = [
   '--no-zygote',
 ];
 
-function getLaunchOptions(allowExecPath = true) {
-  const candidates = [
-    process.env.PUPPETEER_EXECUTABLE_PATH,
-    process.env.GOOGLE_CHROME_BIN,
-    process.env.CHROME_PATH,
-  ].filter(Boolean);
-
+function getLaunchOptions(forceNoExecPath = false) {
   const opts = {
     args: CHROME_ARGS,
     headless: 'new',
   };
 
-  if (allowExecPath) {
-    const chosen = candidates.find(p => {
-      try {
-        return p && fs.existsSync(p);
-      } catch {
-        return false;
-      }
-    });
-    if (chosen) {
-      opts.executablePath = chosen;
+  if (!forceNoExecPath) {
+    const execPath = resolveExecutablePath();
+    if (execPath) {
+      opts.executablePath = execPath;
     }
   }
 
@@ -55,12 +65,12 @@ function getLaunchOptions(allowExecPath = true) {
 async function htmlToPdf(html, options = {}) {
   let browser;
   try {
-    // Try with executablePath (if present/valid)
+    // Try with resolved executablePath first
     try {
-      browser = await puppeteer.launch(getLaunchOptions(true));
-    } catch (e1) {
-      console.warn('[pdfRenderer] Launch with executablePath failed, retrying without it:', e1?.message);
       browser = await puppeteer.launch(getLaunchOptions(false));
+    } catch (e1) {
+      console.warn('[pdfRenderer] Launch with resolved executablePath failed, retrying without explicit path:', e1?.message);
+      browser = await puppeteer.launch(getLaunchOptions(true));
     }
 
     const page = await browser.newPage();
