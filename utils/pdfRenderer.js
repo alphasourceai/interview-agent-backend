@@ -7,62 +7,33 @@
  *  3) plain auto-detect (no explicit executablePath)
  */
 
-const puppeteer = require('puppeteer');
+const chromium = require('@sparticuz/chromium');
+const puppeteer = require('puppeteer-core');
 
 function resolveExecPath() {
-  // Prefer explicit configuration from env (set in Render or elsewhere)
-  const envPath =
-    process.env.PUPPETEER_EXECUTABLE_PATH ||
-    process.env.CHROME_EXECUTABLE_PATH ||
-    process.env.GOOGLE_CHROME_BIN ||
-    null;
-
-  if (envPath) return envPath;
-
-  // Fall back to Puppeteer's own detection (respects PUPPETEER_CACHE_DIR if set)
   try {
-    const { executablePath } = require('puppeteer');
-    const p = typeof executablePath === 'function' ? executablePath() : null;
-    return p || null;
+    return chromium.executablePath();
   } catch {
-    return null;
+    return (
+      process.env.CHROME_EXECUTABLE_PATH ||
+      process.env.GOOGLE_CHROME_BIN ||
+      null
+    );
   }
 }
 
 async function htmlToPdf(html, options = {}) {
   let browser;
   const launchCommon = {
-    headless: true,
+    executablePath: resolveExecPath(),
+    defaultViewport: chromium.defaultViewport,
+    args: chromium.args,
+    headless: chromium.headless,
     protocolTimeout: 90_000, // be generous on cold starts
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-zygote',
-      '--single-process'
-    ],
   };
 
-  const execPath = resolveExecPath();
-
   try {
-    // Try with an explicit executablePath first if we have one
-    if (execPath) {
-      try {
-        browser = await puppeteer.launch({
-          ...launchCommon,
-          executablePath: execPath,
-        });
-      } catch (err) {
-        console.warn('[pdfRenderer] Launch with resolved executablePath failed, retrying without explicit path:', err?.message);
-      }
-    }
-
-    // Fallback: let Puppeteer auto-detect a bundled browser (if available)
-    if (!browser) {
-      browser = await puppeteer.launch(launchCommon);
-    }
+    browser = await puppeteer.launch(launchCommon);
 
     const page = await browser.newPage();
     await page.setViewport({ width: 1200, height: 800, deviceScaleFactor: 2 });
