@@ -7,7 +7,7 @@
     "start": "node app.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "nodemon app.js",
-    "postinstall": "puppeteer browsers install chrome"
+   "postinstall": "sh -lc 'if [ \"$RENDER\" = \"true\" ]; then npx puppeteer browsers install chrome --path=/opt/render/.cache/puppeteer --force; fi'"
   },
   "keywords": [],
   "author": "",
