@@ -3,6 +3,7 @@
 // Uses PUPPETEER_EXECUTABLE_PATH if provided (Render), and hardened flags.
 
 const puppeteer = require('puppeteer');
+const fs = require('fs');
 
 // Safe flags for containerized Chrome
 const CHROME_ARGS = [
@@ -14,15 +15,31 @@ const CHROME_ARGS = [
   '--no-zygote',
 ];
 
-function getLaunchOptions() {
-  const execPath = process.env.PUPPETEER_EXECUTABLE_PATH;
+function getLaunchOptions(allowExecPath = true) {
+  const candidates = [
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    process.env.GOOGLE_CHROME_BIN,
+    process.env.CHROME_PATH,
+  ].filter(Boolean);
+
   const opts = {
     args: CHROME_ARGS,
-    headless: 'new', // modern headless mode
+    headless: 'new',
   };
-  if (execPath && execPath.trim()) {
-    opts.executablePath = execPath.trim();
+
+  if (allowExecPath) {
+    const chosen = candidates.find(p => {
+      try {
+        return p && fs.existsSync(p);
+      } catch {
+        return false;
+      }
+    });
+    if (chosen) {
+      opts.executablePath = chosen;
+    }
   }
+
   return opts;
 }
 
@@ -36,16 +53,20 @@ function getLaunchOptions() {
  * @returns {Promise<Buffer>}
  */
 async function htmlToPdf(html, options = {}) {
-  const browser = await puppeteer.launch(getLaunchOptions());
+  let browser;
   try {
+    // Try with executablePath (if present/valid)
+    try {
+      browser = await puppeteer.launch(getLaunchOptions(true));
+    } catch (e1) {
+      console.warn('[pdfRenderer] Launch with executablePath failed, retrying without it:', e1?.message);
+      browser = await puppeteer.launch(getLaunchOptions(false));
+    }
+
     const page = await browser.newPage();
-
-    // Deterministic rendering environment
     await page.setViewport({ width: 1200, height: 800, deviceScaleFactor: 2 });
-
     await page.setContent(html, { waitUntil: ['domcontentloaded', 'networkidle0'] });
 
-    // Ensure webfonts have loaded before printing
     try {
       await page.evaluate(async () => {
         if (document.fonts && document.fonts.ready) {
@@ -65,7 +86,9 @@ async function htmlToPdf(html, options = {}) {
 
     return pdfBuffer;
   } finally {
-    await browser.close();
+    if (browser) {
+      await browser.close();
+    }
   }
 }
 
