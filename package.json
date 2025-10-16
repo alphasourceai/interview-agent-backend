@@ -17,7 +17,7 @@
   "type": "commonjs",
   "dependencies": {
     "@sendgrid/mail": "^8.1.5",
-    "@sparticuz/chromium": "^22.1.1",
+    "@sparticuz/chromium": "^126.0.0",
     "@supabase/supabase-js": "^2.55.0",
     "axios": "^1.11.0",
     "cors": "^2.8.5",
@@ -37,7 +37,7 @@
     "node-fetch": "^2.7.0",
     "openai": "^5.23.1",
     "pdf-parse": "^1.1.1",
-    "puppeteer-core": "^24.4.0",
+    "puppeteer-core": "^24.1.1",
     "react-router-dom": "^7.7.1",
     "resend": "^4.8.0",
     "supabase": "^2.33.9",
