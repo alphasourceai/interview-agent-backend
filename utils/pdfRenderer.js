@@ -1,76 +1,33 @@
 // utils/pdfRenderer.js (Render-safe)
 // Renders HTML -> PDF buffer using Puppeteer.
-// Uses PUPPETEER_EXECUTABLE_PATH if provided (Render), and hardened flags.
+// Uses hardened flags.
 
 const puppeteer = require('puppeteer');
-const fs = require('fs');
+const { executablePath } = require('puppeteer');
 
-// Prefer Puppeteer's bundled Chromium; fall back to env-provided paths if present.
-function resolveExecutablePath() {
-  const envCandidates = [
-    process.env.PUPPETEER_EXECUTABLE_PATH,
-    process.env.GOOGLE_CHROME_BIN,
-    process.env.CHROME_PATH,
-  ].filter(Boolean);
-
-  for (const p of envCandidates) {
-    try {
-      if (p && fs.existsSync(p)) return p;
-    } catch {}
-  }
-
-  try {
-    const p = typeof puppeteer.executablePath === 'function' ? puppeteer.executablePath() : null;
-    if (p && fs.existsSync(p)) return p;
-  } catch {}
-
-  return null; // let Puppeteer choose
-}
-
-// Safe flags for containerized Chrome
-const CHROME_ARGS = [
-  '--no-sandbox',
-  '--disable-setuid-sandbox',
-  '--disable-dev-shm-usage',
-  '--disable-gpu',
-  '--single-process',
-  '--no-zygote',
-];
-
-function getLaunchOptions(forceNoExecPath = false) {
-  const opts = {
-    args: CHROME_ARGS,
-    headless: 'new',
-  };
-
-  if (!forceNoExecPath) {
-    const execPath = resolveExecutablePath();
-    if (execPath) {
-      opts.executablePath = execPath;
-    }
-  }
-
-  return opts;
-}
-
-/**
- * Render HTML string to a PDF Buffer.
- * @param {string} html - Full HTML document string.
- * @param {object} [options]
- * @param {string} [options.format="A4"]
- * @param {boolean} [options.printBackground=true]
- * @param {object} [options.margin] - { top,right,bottom,left }
- * @returns {Promise<Buffer>}
- */
 async function htmlToPdf(html, options = {}) {
   let browser;
+  const launchCommon = {
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-zygote',
+      '--single-process'
+    ],
+  };
+
   try {
-    // Try with resolved executablePath first
     try {
-      browser = await puppeteer.launch(getLaunchOptions(false));
-    } catch (e1) {
-      console.warn('[pdfRenderer] Launch with resolved executablePath failed, retrying without explicit path:', e1?.message);
-      browser = await puppeteer.launch(getLaunchOptions(true));
+      browser = await puppeteer.launch(launchCommon);
+    } catch (err) {
+      console.warn('[pdfRenderer] Launch auto-detect failed, retrying with executablePath():', err?.message);
+      browser = await puppeteer.launch({
+        ...launchCommon,
+        executablePath: executablePath()
+      });
     }
 
     const page = await browser.newPage();
@@ -96,9 +53,7 @@ async function htmlToPdf(html, options = {}) {
 
     return pdfBuffer;
   } finally {
-    if (browser) {
-      await browser.close();
-    }
+    if (browser) await browser.close();
   }
 }
 
