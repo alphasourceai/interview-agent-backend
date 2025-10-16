@@ -4,7 +4,10 @@ services:
     env: node
     plan: starter
     branch: prod-backend-legacy
-    buildCommand: npm ci --omit=dev
+    buildCommand: |
+      apt-get update
+      apt-get install -y chromium
+      npm ci --omit=dev
     startCommand: node app.js
     envVars:
       - key: NODE_ENV
@@ -17,13 +20,20 @@ services:
         value: https://ia-frontend-prod.onrender.com
       - key: CORS_ORIGINS
         value: https://ia-frontend-prod.onrender.com
+      - key: PUPPETEER_CACHE_DIR
+        value: /opt/render/.cache/puppeteer
+      - key: PUPPETEER_EXECUTABLE_PATH
+        value: /usr/bin/chromium
 
   - type: web
     name: ia-backend-qa
     env: node
     plan: starter
     branch: qa-backend
-    buildCommand: npm ci
+    buildCommand: |
+      apt-get update
+      apt-get install -y chromium
+      npm ci
     startCommand: node app.js
     envVars:
       - key: NODE_ENV
@@ -36,13 +46,20 @@ services:
         value: https://ia-frontend-qa.onrender.com
       - key: CORS_ORIGINS
         value: https://ia-frontend-qa.onrender.com
+      - key: PUPPETEER_CACHE_DIR
+        value: /opt/render/.cache/puppeteer
+      - key: PUPPETEER_EXECUTABLE_PATH
+        value: /usr/bin/chromium
 
   - type: web
     name: ia-backend-staging
     env: node
     plan: starter
     branch: staging-backend
-    buildCommand: npm ci
+    buildCommand: |
+      apt-get update
+      apt-get install -y chromium
+      npm ci
     startCommand: node app.js
     envVars:
       - key: NODE_ENV
@@ -55,3 +72,7 @@ services:
         value: https://ia-frontend-staging.onrender.com
       - key: CORS_ORIGINS
         value: https://ia-frontend-staging.onrender.com
+      - key: PUPPETEER_CACHE_DIR
+        value: /opt/render/.cache/puppeteer
+      - key: PUPPETEER_EXECUTABLE_PATH
+        value: /usr/bin/chromium
