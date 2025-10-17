@@ -10,25 +10,37 @@
 
 const chromium = require('@sparticuz/chromium');
 const puppeteer = require('puppeteer-core');
+const fs = require('fs');
+const { promisify } = require('util');
+const { execFile } = require('child_process');
+const execFileAsync = promisify(execFile);
 
 async function resolveExecPath() {
-  if (process.env.PUPPETEER_EXECUTABLE_PATH && process.env.PUPPETEER_EXECUTABLE_PATH.trim()) {
-    return process.env.PUPPETEER_EXECUTABLE_PATH.trim();
+  const envPath = (process.env.PUPPETEER_EXECUTABLE_PATH || '').trim();
+  if (envPath) {
+    if (fs.existsSync(envPath)) return envPath;
+    console.warn('[pdfRenderer] env PUPPETEER_EXECUTABLE_PATH not found on disk:', envPath);
   }
+
+  const tryWhich = async (bin) => {
+    try {
+      const { stdout } = await execFileAsync('which', [bin]);
+      const p = stdout.trim();
+      if (p && fs.existsSync(p)) return p;
+    } catch {}
+    return null;
+  };
+  const sysPath = (await tryWhich('chromium')) || (await tryWhich('chromium-browser'));
+  if (sysPath) return sysPath;
+
   try {
-    // @sparticuz/chromium returns a Promise — we MUST await or we pass [object Promise]
     const p = await chromium.executablePath();
-    if (p) return p;
-  } catch (_) {
-    // ignore and try env fallbacks
-  }
-  if (process.env.CHROME_EXECUTABLE_PATH && process.env.CHROME_EXECUTABLE_PATH.trim()) {
-    return process.env.CHROME_EXECUTABLE_PATH.trim();
-  }
-  if (process.env.GOOGLE_CHROME_BIN && process.env.GOOGLE_CHROME_BIN.trim()) {
-    return process.env.GOOGLE_CHROME_BIN.trim();
-  }
-  // Final safety net for Debian/Ubuntu based images on Render
+    if (p && fs.existsSync(p)) return p;
+  } catch {}
+
+  const alt = (process.env.CHROME_EXECUTABLE_PATH || process.env.GOOGLE_CHROME_BIN || '').trim();
+  if (alt && fs.existsSync(alt)) return alt;
+
   return '/usr/bin/chromium';
 }
 
@@ -45,6 +57,7 @@ async function htmlToPdf(html, options = {}) {
   };
 
   try {
+    console.log('[pdfRenderer] launching Chromium at', launchCommon.executablePath);
     browser = await puppeteer.launch(launchCommon);
 
     const page = await browser.newPage();
