@@ -6,6 +6,8 @@ services:
     branch: prod-backend-legacy
     buildCommand: |
       apt-get update
+      apt-get install -y chromium fonts-liberation fonts-noto-color-emoji
+      which chromium || which chromium-browser || true
       npm ci --omit=dev
     startCommand: node app.js
     envVars:
@@ -19,6 +21,10 @@ services:
         value: https://ia-frontend-prod.onrender.com
       - key: CORS_ORIGINS
         value: https://ia-frontend-prod.onrender.com
+      - key: PUPPETEER_EXECUTABLE_PATH
+        value: /usr/bin/chromium
+      - key: PUPPETEER_SKIP_DOWNLOAD
+        value: "true"
 
   - type: web
     name: ia-backend-qa

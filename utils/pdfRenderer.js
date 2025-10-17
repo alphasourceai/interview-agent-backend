@@ -1,35 +1,47 @@
 /**
  * utils/pdfRenderer.js (Render-safe)
  * Renders HTML -> PDF buffer using Puppeteer with hardened flags.
- * Tries multiple strategies to locate Chrome:
- *  1) PUPPETEER_EXECUTABLE_PATH or CHROME_EXECUTABLE_PATH or GOOGLE_CHROME_BIN (env)
- *  2) puppeteer.executablePath() (uses cache dir if configured)
- *  3) plain auto-detect (no explicit executablePath)
+ * Chrome resolution order:
+ *  1) PUPPETEER_EXECUTABLE_PATH (env) — set by Render when we install system Chromium
+ *  2) @sparticuz/chromium.executablePath() — MUST be awaited
+ *  3) CHROME_EXECUTABLE_PATH / GOOGLE_CHROME_BIN (env) fallback
+ *  4) Final static fallback: /usr/bin/chromium
  */
 
 const chromium = require('@sparticuz/chromium');
 const puppeteer = require('puppeteer-core');
 
-function resolveExecPath() {
-  try {
-    return chromium.executablePath();
-  } catch {
-    return (
-      process.env.CHROME_EXECUTABLE_PATH ||
-      process.env.GOOGLE_CHROME_BIN ||
-      null
-    );
+async function resolveExecPath() {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH && process.env.PUPPETEER_EXECUTABLE_PATH.trim()) {
+    return process.env.PUPPETEER_EXECUTABLE_PATH.trim();
   }
+  try {
+    // @sparticuz/chromium returns a Promise — we MUST await or we pass [object Promise]
+    const p = await chromium.executablePath();
+    if (p) return p;
+  } catch (_) {
+    // ignore and try env fallbacks
+  }
+  if (process.env.CHROME_EXECUTABLE_PATH && process.env.CHROME_EXECUTABLE_PATH.trim()) {
+    return process.env.CHROME_EXECUTABLE_PATH.trim();
+  }
+  if (process.env.GOOGLE_CHROME_BIN && process.env.GOOGLE_CHROME_BIN.trim()) {
+    return process.env.GOOGLE_CHROME_BIN.trim();
+  }
+  // Final safety net for Debian/Ubuntu based images on Render
+  return '/usr/bin/chromium';
 }
 
 async function htmlToPdf(html, options = {}) {
   let browser;
+  const executablePath = await resolveExecPath(); // <- ensure string, not Promise
+
   const launchCommon = {
-    executablePath: resolveExecPath(),
+    executablePath,
     defaultViewport: chromium.defaultViewport,
     args: chromium.args,
     headless: chromium.headless,
-    protocolTimeout: 90_000, // be generous on cold starts
+    protocolTimeout: 90_000
   };
 
   try {
@@ -56,10 +68,7 @@ async function htmlToPdf(html, options = {}) {
       format: options.format || 'A4',
       printBackground: options.printBackground !== false,
       margin: options.margin || { top: '16mm', right: '14mm', bottom: '16mm', left: '14mm' },
-      preferCSSPageSize: true,
-      // Optional tuning:
-      // scale: 1,
-      // timeout: 60000,
+      preferCSSPageSize: true
     });
 
     return pdfBuffer;

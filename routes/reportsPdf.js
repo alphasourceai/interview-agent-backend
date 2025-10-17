@@ -12,7 +12,7 @@ const supabaseAdmin = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
   : null;
 
 // Signed URL defaults
-const DEFAULT_SIGNED_SECS = 60; // short-lived; FE will open immediately
+const DEFAULT_SIGNED_SECS = 90; // short-lived; FE will open immediately
 const MIN_SIGNED_SECS = 15;
 const MAX_SIGNED_SECS = 600;
 
