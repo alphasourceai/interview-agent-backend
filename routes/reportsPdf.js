@@ -117,6 +117,19 @@ async function handleGenerate(req, res) {
       return res.status(404).json({ error: 'No report found for given id' });
     }
 
+    // Load latest interview for this candidate (for fallbacks + status)
+    let latestInterview = null;
+    {
+      const { data: ivs, error: ivErr } = await supabaseAdmin
+        .from('interviews')
+        .select('id, created_at, candidate_id, video_url, transcript_url, analysis_url, analysis')
+        .eq('candidate_id', reportRow.candidate_id)
+        .order('created_at', { ascending: false })
+        .limit(1);
+      if (ivErr) throw ivErr;
+      latestInterview = (ivs && ivs[0]) || null;
+    }
+
     // 2) Load candidate + role
     const [{ data: cand, error: candErr }, { data: role, error: roleErr }] = await Promise.all([
       supabaseAdmin.from('candidates').select('id,name,email').eq('id', reportRow.candidate_id).maybeSingle(),
@@ -125,38 +138,60 @@ async function handleGenerate(req, res) {
     if (candErr) throw candErr;
     if (roleErr) throw roleErr;
 
-    // 3) Normalize data to template shape (parity with dashboard)
+    // Normalize to the template contract (flat keys expected by candidate-report.hbs)
     const rb = reportRow.interview_breakdown || {};
     const resume = reportRow.resume_breakdown || {};
 
-    const templateData = {
-      candidate: {
-        name: cand?.name || 'Unknown Candidate',
-        email: cand?.email || '',
-      },
-      role: {
-        title: role?.title || '—',
-      },
-      resume_score: typeof reportRow.resume_score === 'number' ? reportRow.resume_score : null,
-      interview_score: typeof reportRow.interview_score === 'number' ? reportRow.interview_score : (rb?.scores?.overall ?? null),
-      overall_score: typeof reportRow.overall_score === 'number' ? reportRow.overall_score : null,
-      resume_analysis: {
-        experience: typeof resume.experience === 'number' ? resume.experience : null,
-        skills: typeof resume.skills === 'number' ? resume.skills : null,
-        education: typeof resume.education === 'number' ? resume.education : null,
-        summary: (resume.summary || '').trim(),
-      },
-      interview_analysis: {
-        clarity: rb?.scores?.clarity ?? null,
-        confidence: rb?.scores?.confidence ?? null,
-        body_language: rb?.scores?.body_language ?? null,
-        summary: (rb?.summary || '').trim(),
-      },
-      created_at: reportRow.created_at,
+    // Support both shapes for interview breakdown: either {scores:{...}, summary} or flat numbers
+    const rbScores = rb.scores || rb;
+    const ivAnalysis = latestInterview?.analysis || null;
+    const ivScores = (ivAnalysis && ivAnalysis.scores) || {};
+
+    const name = (cand?.name && cand.name.trim()) || 'Unknown Candidate';
+    const email = (cand?.email && cand.email.trim()) || '';
+
+    const resume_breakdown = {
+      experience: Number.isFinite(Number(resume.experience)) ? Number(resume.experience) : 0,
+      skills: Number.isFinite(Number(resume.skills)) ? Number(resume.skills) : 0,
+      education: Number.isFinite(Number(resume.education)) ? Number(resume.education) : 0
+    };
+    const resume_summary = (typeof resume.summary === 'string' && resume.summary.trim())
+      ? resume.summary.trim()
+      : 'Summary not available';
+
+    const interview_breakdown = {
+      clarity: Number.isFinite(Number(rbScores.clarity)) ? Number(rbScores.clarity) :
+               (Number.isFinite(Number(ivScores.clarity)) ? Number(ivScores.clarity) : 0),
+      confidence: Number.isFinite(Number(rbScores.confidence)) ? Number(rbScores.confidence) :
+                  (Number.isFinite(Number(ivScores.confidence)) ? Number(ivScores.confidence) : 0),
+      body_language: Number.isFinite(Number(rbScores.body_language)) ? Number(rbScores.body_language) :
+                     (Number.isFinite(Number(ivScores.body_language)) ? Number(ivScores.body_language) : 0)
+    };
+    const interview_summary = (typeof rb.summary === 'string' && rb.summary.trim())
+      ? rb.summary.trim()
+      : (typeof ivAnalysis?.summary === 'string' && ivAnalysis.summary.trim()
+          ? ivAnalysis.summary.trim()
+          : 'Summary not available');
+
+    const status = latestInterview?.video_url ? 'Interview Completed' : 'Pending';
+
+    const payload = {
+      name,
+      email,
+      status,
+      resume_score: Number.isFinite(Number(reportRow.resume_score)) ? Number(reportRow.resume_score) : 0,
+      interview_score: Number.isFinite(Number(reportRow.interview_score)) ? Number(reportRow.interview_score)
+                        : (Number.isFinite(Number(rbScores.overall)) ? Number(rbScores.overall) : 0),
+      overall_score: Number.isFinite(Number(reportRow.overall_score)) ? Number(reportRow.overall_score) : 0,
+      resume_breakdown,
+      resume_summary,
+      interview_breakdown,
+      interview_summary,
+      created_at: reportRow.created_at
     };
 
     // 4) Render and convert to PDF
-    const html = buildCandidateReportHtml(templateData);
+    const html = buildCandidateReportHtml(payload);
     const pdfBuffer = await htmlToPdf(html);
 
     // 5) Upload to Supabase Storage
