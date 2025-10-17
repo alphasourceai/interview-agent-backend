@@ -156,6 +156,27 @@ async function handleGenerate(req, res) {
     const name = (cand?.name && cand.name.trim()) || 'Unknown Candidate';
     const email = (cand?.email && cand.email.trim()) || '';
 
+    function coerceNumber(val) {
+      if (val === null || val === undefined) return null;
+      if (typeof val === 'number' && Number.isFinite(val)) return val;
+      if (typeof val === 'string') {
+        const m = val.match(/-?\d+(?:\.\d+)?/);
+        if (m) return Number(m[0]);
+      }
+      return null;
+    }
+
+    function pickScore(obj, keys = []) {
+      if (!obj || typeof obj !== 'object') return null;
+      for (const k of keys) {
+        if (Object.prototype.hasOwnProperty.call(obj, k)) {
+          const n = coerceNumber(obj[k]);
+          if (n !== null) return n;
+        }
+      }
+      return null;
+    }
+
     // Summaries (prefer report analysis → report-level → interview analysis)
     const resume_summary = (typeof resume.summary === 'string' && resume.summary.trim())
       ? resume.summary.trim()
@@ -169,10 +190,27 @@ async function handleGenerate(req, res) {
            'Summary not available');
 
     // Breakdowns with numeric coercion AND embedded summaries (template expects nested .summary)
+    const resumeScores = (resume && (resume.scores || resume)) || {};
+
+    const experienceScore =
+      pickScore(resumeScores, ['experience', 'exp', 'experience_score', 'experiencePercent', 'experience_percentage']) ??
+      pickScore(resume,      ['experience', 'exp', 'experience_score', 'experiencePercent', 'experience_percentage']) ??
+      0;
+
+    const skillsScore =
+      pickScore(resumeScores, ['skills', 'skill', 'skills_score', 'skillsPercent', 'skills_percentage']) ??
+      pickScore(resume,       ['skills', 'skill', 'skills_score', 'skillsPercent', 'skills_percentage']) ??
+      0;
+
+    const educationScore =
+      pickScore(resumeScores, ['education', 'edu', 'education_score', 'educationPercent', 'education_percentage']) ??
+      pickScore(resume,       ['education', 'edu', 'education_score', 'educationPercent', 'education_percentage']) ??
+      0;
+
     const resume_breakdown = {
-      experience: Number.isFinite(Number(resume.experience)) ? Number(resume.experience) : 0,
-      skills: Number.isFinite(Number(resume.skills)) ? Number(resume.skills) : 0,
-      education: Number.isFinite(Number(resume.education)) ? Number(resume.education) : 0,
+      experience: experienceScore,
+      skills: skillsScore,
+      education: educationScore,
       summary: resume_summary
     };
 
