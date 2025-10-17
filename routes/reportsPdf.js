@@ -156,14 +156,25 @@ async function handleGenerate(req, res) {
     const name = (cand?.name && cand.name.trim()) || 'Unknown Candidate';
     const email = (cand?.email && cand.email.trim()) || '';
 
-    const resume_breakdown = {
-      experience: Number.isFinite(Number(resume.experience)) ? Number(resume.experience) : 0,
-      skills: Number.isFinite(Number(resume.skills)) ? Number(resume.skills) : 0,
-      education: Number.isFinite(Number(resume.education)) ? Number(resume.education) : 0
-    };
+    // Summaries (prefer report analysis → report-level → interview analysis)
     const resume_summary = (typeof resume.summary === 'string' && resume.summary.trim())
       ? resume.summary.trim()
       : 'Summary not available';
+
+    const interview_summary =
+      (typeof rb.summary === 'string' && rb.summary.trim())
+        ? rb.summary.trim()
+        : (reportLevelSummary ||
+           (typeof ivAnalysis?.summary === 'string' && ivAnalysis.summary.trim()) ||
+           'Summary not available');
+
+    // Breakdowns with numeric coercion AND embedded summaries (template expects nested .summary)
+    const resume_breakdown = {
+      experience: Number.isFinite(Number(resume.experience)) ? Number(resume.experience) : 0,
+      skills: Number.isFinite(Number(resume.skills)) ? Number(resume.skills) : 0,
+      education: Number.isFinite(Number(resume.education)) ? Number(resume.education) : 0,
+      summary: resume_summary
+    };
 
     const interview_breakdown = {
       clarity: Number.isFinite(Number(rb.clarity)) ? Number(rb.clarity)
@@ -171,14 +182,9 @@ async function handleGenerate(req, res) {
       confidence: Number.isFinite(Number(rb.confidence)) ? Number(rb.confidence)
                  : (Number.isFinite(Number(ivScores.confidence)) ? Number(ivScores.confidence) : 0),
       body_language: Number.isFinite(Number(rb.body_language)) ? Number(rb.body_language)
-                    : (Number.isFinite(Number(ivScores.body_language)) ? Number(ivScores.body_language) : 0)
+                    : (Number.isFinite(Number(ivScores.body_language)) ? Number(ivScores.body_language) : 0),
+      summary: interview_summary
     };
-    const interview_summary =
-      (typeof rb.summary === 'string' && rb.summary.trim())
-        ? rb.summary.trim()
-        : (reportLevelSummary ||
-           (typeof ivAnalysis?.summary === 'string' && ivAnalysis.summary.trim()) ||
-           'Summary not available');
 
     const status = latestInterview?.video_url ? 'Interview Completed' : 'Pending';
 
