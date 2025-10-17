@@ -97,7 +97,7 @@ async function handleGenerate(req, res) {
     if (report_id) {
       const { data, error } = await supabaseAdmin
         .from('reports')
-        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, interview_analysis, resume_breakdown, resume_analysis, analysis')
+        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis')
         .eq('id', report_id)
         .maybeSingle();
       if (error) throw error;
@@ -105,7 +105,7 @@ async function handleGenerate(req, res) {
     } else {
       const { data, error } = await supabaseAdmin
         .from('reports')
-        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, interview_analysis, resume_breakdown, resume_analysis, analysis')
+        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis')
         .eq('candidate_id', candidate_id)
         .order('created_at', { ascending: false })
         .limit(1);
@@ -139,8 +139,9 @@ async function handleGenerate(req, res) {
     if (roleErr) throw roleErr;
 
     // Normalize to the template contract (flat keys expected by candidate-report.hbs)
-    const rbRaw = reportRow.interview_analysis || reportRow.interview_breakdown || {};
-    const resumeRaw = reportRow.resume_analysis || reportRow.resume_breakdown || {};
+    const analysis = reportRow.analysis || {};
+    const rbRaw = analysis.interview || reportRow.interview_breakdown || {};
+    const resumeRaw = analysis.resume || reportRow.resume_breakdown || {};
 
     // If shape is { scores: {...}, summary }, flatten to a single object
     const rb = rbRaw?.scores ? { ...rbRaw.scores, summary: rbRaw.summary } : rbRaw;
