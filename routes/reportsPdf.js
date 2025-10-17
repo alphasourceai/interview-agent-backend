@@ -158,10 +158,23 @@ async function handleGenerate(req, res) {
 
     function coerceNumber(val) {
       if (val === null || val === undefined) return null;
-      if (typeof val === 'number' && Number.isFinite(val)) return val;
+      if (typeof val === 'number' && Number.isFinite(val)) {
+        // Normalize 0–1 to 0–100 if clearly intended as a percent
+        if (val > 0 && val <= 1) return Math.round(val * 100);
+        return val;
+      }
       if (typeof val === 'string') {
+        // If it already contains a %, parse the numeric part and return
+        if (val.includes('%')) {
+          const m = val.match(/-?\d+(?:\.\d+)?/);
+          return m ? Number(m[0]) : null;
+        }
+        // Otherwise parse and normalize 0–1 style strings
         const m = val.match(/-?\d+(?:\.\d+)?/);
-        if (m) return Number(m[0]);
+        if (!m) return null;
+        const n = Number(m[0]);
+        if (!Number.isFinite(n)) return null;
+        return (n > 0 && n <= 1) ? Math.round(n * 100) : n;
       }
       return null;
     }
@@ -172,6 +185,24 @@ async function handleGenerate(req, res) {
         if (Object.prototype.hasOwnProperty.call(obj, k)) {
           const n = coerceNumber(obj[k]);
           if (n !== null) return n;
+        }
+      }
+      return null;
+    }
+
+    function pickScoreFromArray(arr, names = []) {
+      if (!Array.isArray(arr)) return null;
+      const keys = ['id','key','name','label','type'];
+      for (const target of names) {
+        for (const item of arr) {
+          for (const k of keys) {
+            if (item && typeof item === 'object' && typeof item[k] === 'string') {
+              if (item[k].toLowerCase() === String(target).toLowerCase()) {
+                const n = coerceNumber(item.score ?? item.value ?? item.percent ?? item.percentage);
+                if (n !== null) return n;
+              }
+            }
+          }
         }
       }
       return null;
@@ -193,18 +224,21 @@ async function handleGenerate(req, res) {
     const resumeScores = (resume && (resume.scores || resume)) || {};
 
     const experienceScore =
-      pickScore(resumeScores, ['experience', 'exp', 'experience_score', 'experiencePercent', 'experience_percentage']) ??
-      pickScore(resume,      ['experience', 'exp', 'experience_score', 'experiencePercent', 'experience_percentage']) ??
+      pickScore(resumeScores, ['experience','exp','experience_score','experienceScore','experiencePercent','experience_percentage','experience_pct','exp_pct']) ??
+      pickScore(resume,      ['experience','exp','experience_score','experienceScore','experiencePercent','experience_percentage','experience_pct','exp_pct']) ??
+      pickScoreFromArray(resumeRaw.categories || resumeRaw.items || resumeRaw.metrics || [], ['experience','exp']) ??
       0;
 
     const skillsScore =
-      pickScore(resumeScores, ['skills', 'skill', 'skills_score', 'skillsPercent', 'skills_percentage']) ??
-      pickScore(resume,       ['skills', 'skill', 'skills_score', 'skillsPercent', 'skills_percentage']) ??
+      pickScore(resumeScores, ['skills','skill','skills_score','skillsScore','skillsPercent','skills_percentage','skills_pct','skill_pct']) ??
+      pickScore(resume,       ['skills','skill','skills_score','skillsScore','skillsPercent','skills_percentage','skills_pct','skill_pct']) ??
+      pickScoreFromArray(resumeRaw.categories || resumeRaw.items || resumeRaw.metrics || [], ['skills','skill']) ??
       0;
 
     const educationScore =
-      pickScore(resumeScores, ['education', 'edu', 'education_score', 'educationPercent', 'education_percentage']) ??
-      pickScore(resume,       ['education', 'edu', 'education_score', 'educationPercent', 'education_percentage']) ??
+      pickScore(resumeScores, ['education','edu','education_score','educationScore','educationPercent','education_percentage','education_pct','edu_pct']) ??
+      pickScore(resume,       ['education','edu','education_score','educationScore','educationPercent','education_percentage','education_pct','edu_pct']) ??
+      pickScoreFromArray(resumeRaw.categories || resumeRaw.items || resumeRaw.metrics || [], ['education','edu']) ??
       0;
 
     const resume_breakdown = {
