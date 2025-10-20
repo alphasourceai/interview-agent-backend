@@ -132,7 +132,7 @@ async function handleGenerate(req, res) {
 
     // 2) Load candidate + role
     const [{ data: cand, error: candErr }, { data: role, error: roleErr }] = await Promise.all([
-      supabaseAdmin.from('candidates').select('id,name,email').eq('id', reportRow.candidate_id).maybeSingle(),
+      supabaseAdmin.from('candidates').select('id,name,email,client_id').eq('id', reportRow.candidate_id).maybeSingle(),
       supabaseAdmin.from('roles').select('id,title').eq('id', reportRow.role_id).maybeSingle(),
     ]);
     if (candErr) throw candErr;
@@ -208,6 +208,22 @@ async function handleGenerate(req, res) {
       return null;
     }
 
+    // Helper to fetch the dashboard-normalized row
+    async function getDashboardRowNormalized(clientId, candidateId) {
+      try {
+        const port = process.env.PORT || 10000;
+        const url = `http://localhost:${port}/dashboard/rows?client_id=${encodeURIComponent(clientId)}&candidate_id=${encodeURIComponent(candidateId)}`;
+        const resp = await fetch(url, { method: 'GET' });
+        if (!resp || !resp.ok) return null;
+        const json = await resp.json().catch(() => null);
+        if (!json) return null;
+        const item = Array.isArray(json?.items) ? json.items[0] : (Array.isArray(json) ? json[0] : json);
+        return item || null;
+      } catch (_) {
+        return null;
+      }
+    }
+
     // Summaries (prefer report analysis → report-level → interview analysis)
     const resume_summary = (typeof resume.summary === 'string' && resume.summary.trim())
       ? resume.summary.trim()
@@ -257,6 +273,41 @@ async function handleGenerate(req, res) {
                     : (Number.isFinite(Number(ivScores.body_language)) ? Number(ivScores.body_language) : 0),
       summary: interview_summary
     };
+
+    // Try to reuse the exact normalized row the dashboard uses (to guarantee parity)
+    const clientId = cand?.client_id || req.body?.client_id || null;
+    if (clientId) {
+      const dashRow = await getDashboardRowNormalized(clientId, reportRow.candidate_id);
+      if (dashRow) {
+        const dashResume = dashRow.resume_analysis || dashRow.resume_breakdown || {};
+        const dashInterview = dashRow.interview_analysis || dashRow.interview_breakdown || {};
+        const dashResumeScores = dashResume?.scores ? dashResume.scores : dashResume;
+        const dashInterviewScores = dashInterview?.scores ? dashInterview.scores : dashInterview;
+
+        // Overwrite summaries if dashboard has them
+        if (typeof dashResume.summary === 'string' && dashResume.summary.trim()) {
+          resume_breakdown.summary = dashResume.summary.trim();
+        }
+        if (typeof dashInterview.summary === 'string' && dashInterview.summary.trim()) {
+          interview_breakdown.summary = dashInterview.summary.trim();
+        }
+
+        // Overwrite category scores if dashboard has them
+        const exp = coerceNumber(dashResumeScores?.experience);
+        const skl = coerceNumber(dashResumeScores?.skills);
+        const edu = coerceNumber(dashResumeScores?.education);
+        if (exp !== null) resume_breakdown.experience = exp;
+        if (skl !== null) resume_breakdown.skills = skl;
+        if (edu !== null) resume_breakdown.education = edu;
+
+        const cla = coerceNumber(dashInterviewScores?.clarity);
+        const con = coerceNumber(dashInterviewScores?.confidence);
+        const bl  = coerceNumber(dashInterviewScores?.body_language);
+        if (cla !== null) interview_breakdown.clarity = cla;
+        if (con !== null) interview_breakdown.confidence = con;
+        if (bl  !== null) interview_breakdown.body_language = bl;
+      }
+    }
 
     const status = latestInterview?.video_url ? 'Interview Completed' : 'Pending';
 
