@@ -2,6 +2,7 @@ const router = require('express').Router();
 const { htmlToPdf } = require('../utils/pdfRenderer');
 const { buildCandidateReportHtml } = require('../utils/renderCandidateReport');
 const { createClient } = require('@supabase/supabase-js');
+const Sentry = require('@sentry/node');
 
 // Supabase Admin (for loading report data + uploading PDFs)
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -63,6 +64,9 @@ router.post('/preview-html', async (req, res) => {
     return res.status(200).send(html);
   } catch (err) {
     console.error('[reports/html-preview] error:', err);
+    if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+      Sentry.captureException(err, { tags: { endpoint: '/reports/preview-html' } });
+    }
     return res.status(500).json({ error: 'HTML render failed' });
   }
 });
@@ -77,12 +81,19 @@ router.post('/preview-pdf', async (req, res) => {
     return res.send(pdf);
   } catch (err) {
     console.error('[reports/preview-pdf] error:', err);
+    if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+      Sentry.captureException(err, { tags: { endpoint: '/reports/preview-pdf' } });
+    }
     res.status(500).json({ error: 'PDF render failed' });
   }
 });
 
 async function handleGenerate(req, res) {
   try {
+    if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+      Sentry.setTag('endpoint', '/reports/generate');
+      Sentry.addBreadcrumb({ category: 'reports', level: 'info', message: 'generate:start' });
+    }
     if (!supabaseAdmin) {
       return res.status(500).json({ error: 'Storage not configured (missing SUPABASE_URL/SUPABASE_SERVICE_KEY)' });
     }
@@ -116,6 +127,9 @@ async function handleGenerate(req, res) {
     if (!reportRow) {
       return res.status(404).json({ error: 'No report found for given id' });
     }
+    if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+      Sentry.addBreadcrumb({ category: 'db', level: 'info', message: 'reports:loaded', data: { report_id: reportRow.id, candidate_id: reportRow.candidate_id } });
+    }
 
     // Load latest interview for this candidate (for fallbacks + status)
     let latestInterview = null;
@@ -129,6 +143,9 @@ async function handleGenerate(req, res) {
       if (ivErr) throw ivErr;
       latestInterview = (ivs && ivs[0]) || null;
     }
+    if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+      Sentry.addBreadcrumb({ category: 'db', level: 'info', message: 'interviews:loaded', data: { latest_interview_id: latestInterview ? latestInterview.id : null } });
+    }
 
     // 2) Load candidate + role
     const [{ data: cand, error: candErr }, { data: role, error: roleErr }] = await Promise.all([
@@ -137,6 +154,10 @@ async function handleGenerate(req, res) {
     ]);
     if (candErr) throw candErr;
     if (roleErr) throw roleErr;
+    if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+      Sentry.addBreadcrumb({ category: 'db', level: 'info', message: 'candidate:loaded', data: { candidate_id: cand ? cand.id : null } });
+      Sentry.addBreadcrumb({ category: 'db', level: 'info', message: 'role:loaded', data: { role_id: role ? role.id : null } });
+    }
 
     // Normalize to the template contract (flat keys expected by candidate-report.hbs)
     const analysis = reportRow.analysis || {};
@@ -379,6 +400,9 @@ async function handleGenerate(req, res) {
 
     const status = latestInterview?.video_url ? 'Interview Completed' : 'Pending';
 
+    if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+      Sentry.addBreadcrumb({ category: 'reports', level: 'info', message: 'payload:build' });
+    }
     const payload = {
       name,
       email,
@@ -396,7 +420,13 @@ async function handleGenerate(req, res) {
 
     // 4) Render and convert to PDF
     const html = buildCandidateReportHtml(payload);
+    if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+      Sentry.addBreadcrumb({ category: 'render', level: 'info', message: 'html:built' });
+    }
     const pdfBuffer = await htmlToPdf(html);
+    if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+      Sentry.addBreadcrumb({ category: 'render', level: 'info', message: 'pdf:generated', data: { bytes: Buffer.isBuffer(pdfBuffer) ? pdfBuffer.length : undefined } });
+    }
 
     // 5) Upload to Supabase Storage
     const safeCandidate = (cand?.name || reportRow.candidate_id || 'candidate')
@@ -408,6 +438,9 @@ async function handleGenerate(req, res) {
       .from(REPORTS_BUCKET)
       .upload(key, pdfBuffer, { contentType: 'application/pdf', upsert: true });
     if (uploadErr) throw uploadErr;
+    if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+      Sentry.addBreadcrumb({ category: 'storage', level: 'info', message: 'storage:uploaded', data: { key } });
+    }
 
     // Derive a public-style URL (works if bucket is public; harmless otherwise)
     const { data: pub } = supabaseAdmin.storage.from(REPORTS_BUCKET).getPublicUrl(key);
@@ -419,6 +452,9 @@ async function handleGenerate(req, res) {
       .from(REPORTS_BUCKET)
       .createSignedUrl(key, expiresIn);
     if (signErr) throw signErr;
+    if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+      Sentry.addBreadcrumb({ category: 'storage', level: 'info', message: 'storage:signedurl', data: { expiresIn } });
+    }
 
     // 6) Best-effort: update reports row
     try {
@@ -429,7 +465,11 @@ async function handleGenerate(req, res) {
           report_generated_at: new Date().toISOString()
         })
         .eq('id', reportRow.id);
-    } catch (_) { /* non-fatal */ }
+    } catch (e) {
+      if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+        Sentry.addBreadcrumb({ category: 'db', level: 'warning', message: 'reports:update_failed', data: { report_id: reportRow.id, error: String(e && e.message || e) } });
+      }
+    }
 
     return res.json({
       ok: true,
@@ -441,6 +481,15 @@ async function handleGenerate(req, res) {
     });
   } catch (err) {
     console.error('[reports/generate] error', err);
+    if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+      Sentry.captureException(err, {
+        tags: { endpoint: '/reports/generate' },
+        extra: {
+          candidate_id: (req.body && req.body.candidate_id) || null,
+          report_id: (req.body && req.body.report_id) || null
+        }
+      });
+    }
     return res.status(500).json({ error: err.message || 'Failed to generate report' });
   }
 }
@@ -456,6 +505,9 @@ router.post('/pdf', async (req, res) => {
     return res.status(501).json({ error: 'not_implemented', detail: 'PDF generation will be enabled after Step 3.' });
   } catch (err) {
     console.error('[reports/pdf] error:', err);
+    if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+      Sentry.captureException(err, { tags: { endpoint: '/reports/pdf' } });
+    }
     return res.status(500).json({ error: 'PDF endpoint error' });
   }
 });
@@ -499,6 +551,9 @@ router.get('/:id/url', async (req, res) => {
     });
   } catch (err) {
     console.error('[reports/:id/url] error', err);
+    if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+      Sentry.captureException(err, { tags: { endpoint: '/reports/:id/url' } });
+    }
     return res.status(500).json({ error: err.message || 'Failed to mint signed URL' });
   }
 });

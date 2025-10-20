@@ -5,9 +5,55 @@ const cors = require('cors')
 const crypto = require('crypto')
 const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
 const { generateRubricAndKBForRole } = require('./generateRubric')
+// --- Sentry (errors + tracing) ---
+const Sentry = require('@sentry/node');
+const { nodeProfilingIntegration } = require('@sentry/profiling-node');
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const app = express()
+
+// Initialize Sentry early so it wraps all middlewares/routes
+const SENTRY_ENABLED = process.env.SENTRY_ENABLED === '1';
+if (SENTRY_ENABLED && process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    environment: process.env.SENTRY_ENV || process.env.NODE_ENV || 'production',
+    release: process.env.RENDER_GIT_COMMIT || process.env.VERCEL_GIT_COMMIT_SHA || undefined,
+    integrations: [
+      Sentry.httpIntegration(),
+      Sentry.expressIntegration(),
+      nodeProfilingIntegration(),
+    ],
+    tracesSampleRate: Number(process.env.SENTRY_TRACES_SAMPLE_RATE ?? 0.05),
+    profilesSampleRate: Number(process.env.SENTRY_PROFILES_SAMPLE_RATE ?? 0.0),
+    beforeSend(event) {
+      try {
+        // redact potentially sensitive values
+        if (event.request?.headers) {
+          delete event.request.headers['authorization'];
+          delete event.request.headers['cookie'];
+        }
+        const scrub = (s) =>
+          typeof s === 'string'
+            ? s
+                .replace(/[^@\s]+@[^@\s]+\.[^@\s]+/g, '***@***')
+                .replace(/(X-Amz-Signature|Signature)=[^&]+/g, '$1=REDACTED')
+                .replace(/(Authorization|Bearer)\s+[A-Za-z0-9\-\._~\+\/]+=*/gi, '$1 REDACTED')
+            : s;
+        if (event.request?.url) event.request.url = scrub(event.request.url);
+        if (event.extra) {
+          for (const k of Object.keys(event.extra)) {
+            if (typeof event.extra[k] === 'string') event.extra[k] = scrub(event.extra[k]);
+          }
+        }
+      } catch (_) {}
+      return event;
+    },
+  });
+  // Must be before all other app.use() and routes
+  app.use(Sentry.Handlers.requestHandler());
+  app.use(Sentry.Handlers.tracingHandler());
+}
 
 // ---------- CORS ----------
 const DEFAULT_ORIGINS = [
@@ -36,6 +82,19 @@ app.use(cors({
   credentials: true
 }))
 app.use(express.json({ limit: '10mb' }))
+
+// Per-request context (request_id + basic tags)
+app.use((req, _res, next) => {
+  try {
+    const rid = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
+    req.request_id = rid;
+    if (Sentry?.getCurrentScope) {
+      Sentry.setTag('request_id', rid);
+      if (req.user?.id) Sentry.setUser({ id: req.user.id, email: req.user.email || undefined });
+    }
+  } catch (_) {}
+  next();
+});
 
 // ---------- small util ----------
 function bearer(req) {
@@ -764,6 +823,11 @@ app.get('/health', (_req, res) => res.json({ ok: true }))
 
 // ---------- 404 ----------
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }))
+
+// Sentry error handler (register before your own error handler)
+if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+  app.use(Sentry.Handlers.errorHandler());
+}
 
 // ---------- Error handler ----------
 app.use(function (err, req, res, next) {
