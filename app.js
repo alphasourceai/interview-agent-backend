@@ -50,9 +50,6 @@ if (SENTRY_ENABLED && process.env.SENTRY_DSN) {
       return event;
     },
   });
-  // Must be before all other app.use() and routes
-  app.use(Sentry.Handlers.requestHandler());
-  app.use(Sentry.Handlers.tracingHandler());
 }
 
 // ---------- CORS ----------
@@ -824,9 +821,9 @@ app.get('/health', (_req, res) => res.json({ ok: true }))
 // ---------- 404 ----------
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }))
 
-// Sentry error handler (register before your own error handler)
+// Sentry error handler (v8)
 if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
-  app.use(Sentry.Handlers.errorHandler());
+  app.use(Sentry.setupExpressErrorHandler());
 }
 
 // ---------- Error handler ----------
