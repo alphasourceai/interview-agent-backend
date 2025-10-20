@@ -208,6 +208,49 @@ async function handleGenerate(req, res) {
       return null;
     }
 
+    // Deep search for a named score anywhere in a nested object/array
+    function deepFindScore(source, names = []) {
+      const seen = new Set();
+      const targets = names.map((n) => String(n).toLowerCase());
+      const valueAliases = ['score','value','percent','percentage','pct'];
+      const idAliases = ['id','key','name','label','type'];
+      const queue = [source];
+      while (queue.length) {
+        const cur = queue.shift();
+        if (!cur || typeof cur !== 'object') continue;
+        if (seen.has(cur)) continue;
+        seen.add(cur);
+
+        // 1) Direct property match: { experience: 0.82 } or { experience: "82%" }
+        for (const [k, v] of Object.entries(cur)) {
+          if (targets.includes(String(k).toLowerCase())) {
+            const n = coerceNumber(v);
+            if (n !== null) return n;
+          }
+        }
+        // 2) Array of objects with id/name/label matching and a score/value/percent
+        if (Array.isArray(cur)) {
+          for (const item of cur) {
+            if (!item || typeof item !== 'object') continue;
+            for (const idk of idAliases) {
+              const idv = item[idk];
+              if (typeof idv === 'string' && targets.includes(idv.toLowerCase())) {
+                for (const vk of valueAliases) {
+                  const n = coerceNumber(item[vk]);
+                  if (n !== null) return n;
+                }
+              }
+            }
+          }
+        }
+        // 3) Recurse into nested objects/arrays
+        for (const v of Object.values(cur)) {
+          if (v && typeof v === 'object') queue.push(v);
+        }
+      }
+      return null;
+    }
+
     // Helper to fetch the dashboard-normalized row
     async function getDashboardRowNormalized(clientId, candidateId) {
       try {
@@ -243,18 +286,21 @@ async function handleGenerate(req, res) {
       pickScore(resumeScores, ['experience','exp','experience_score','experienceScore','experiencePercent','experience_percentage','experience_pct','exp_pct']) ??
       pickScore(resume,      ['experience','exp','experience_score','experienceScore','experiencePercent','experience_percentage','experience_pct','exp_pct']) ??
       pickScoreFromArray(resumeRaw.categories || resumeRaw.items || resumeRaw.metrics || [], ['experience','exp']) ??
+      deepFindScore(analysis.resume || resumeRaw, ['experience','exp']) ??
       0;
 
     const skillsScore =
       pickScore(resumeScores, ['skills','skill','skills_score','skillsScore','skillsPercent','skills_percentage','skills_pct','skill_pct']) ??
       pickScore(resume,       ['skills','skill','skills_score','skillsScore','skillsPercent','skills_percentage','skills_pct','skill_pct']) ??
       pickScoreFromArray(resumeRaw.categories || resumeRaw.items || resumeRaw.metrics || [], ['skills','skill']) ??
+      deepFindScore(analysis.resume || resumeRaw, ['skills','skill']) ??
       0;
 
     const educationScore =
       pickScore(resumeScores, ['education','edu','education_score','educationScore','educationPercent','education_percentage','education_pct','edu_pct']) ??
       pickScore(resume,       ['education','edu','education_score','educationScore','educationPercent','education_percentage','education_pct','edu_pct']) ??
       pickScoreFromArray(resumeRaw.categories || resumeRaw.items || resumeRaw.metrics || [], ['education','edu']) ??
+      deepFindScore(analysis.resume || resumeRaw, ['education','edu']) ??
       0;
 
     const resume_breakdown = {
