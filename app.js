@@ -821,9 +821,9 @@ app.get('/health', (_req, res) => res.json({ ok: true }))
 // ---------- 404 ----------
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }))
 
-// Sentry error handler (v8)
+// Sentry error handler (v8) — pass the app instance directly
 if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
-  app.use(Sentry.setupExpressErrorHandler());
+  Sentry.setupExpressErrorHandler(app);
 }
 
 // ---------- Error handler ----------
