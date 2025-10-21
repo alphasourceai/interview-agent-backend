@@ -6,15 +6,15 @@ const Sentry = require('@sentry/node');
 const { nodeProfilingIntegration } = require('@sentry/profiling-node');
 const SENTRY_ENABLED = process.env.SENTRY_ENABLED === '1' && !!process.env.SENTRY_DSN;
 if (SENTRY_ENABLED) {
+  const integrations = [];
+  try { if (typeof Sentry.httpIntegration === 'function') integrations.push(Sentry.httpIntegration()); } catch {}
+  try { if (typeof Sentry.expressIntegration === 'function') integrations.push(Sentry.expressIntegration()); } catch {}
+  try { if (typeof nodeProfilingIntegration === 'function') integrations.push(nodeProfilingIntegration()); } catch {}
   Sentry.init({
     dsn: process.env.SENTRY_DSN,
     environment: process.env.SENTRY_ENV || process.env.NODE_ENV || 'production',
     release: process.env.RENDER_GIT_COMMIT || process.env.VERCEL_GIT_COMMIT_SHA || undefined,
-    integrations: [
-      Sentry.httpIntegration(),
-      Sentry.expressIntegration(),
-      nodeProfilingIntegration(),
-    ],
+    integrations,
     tracesSampleRate: Number(process.env.SENTRY_TRACES_SAMPLE_RATE ?? 0.05),
     profilesSampleRate: Number(process.env.SENTRY_PROFILES_SAMPLE_RATE ?? 0.0),
     beforeSend(event) {
@@ -54,7 +54,11 @@ const app = express()
 
 // Sentry request middleware (must be before other app.use and routes)
 if (SENTRY_ENABLED) {
-  app.use(Sentry.expressRequestMiddleware());
+  if (typeof Sentry.expressRequestMiddleware === 'function') {
+    app.use(Sentry.expressRequestMiddleware()); // v8+
+  } else if (Sentry.Handlers && typeof Sentry.Handlers.requestHandler === 'function') {
+    app.use(Sentry.Handlers.requestHandler()); // v7
+  }
 }
 
 // ---------- CORS ----------
@@ -844,7 +848,11 @@ app.use((_req, res) => res.status(404).json({ error: 'Not found' }))
 
 // Sentry error handler (v8) — mount after routes
 if (SENTRY_ENABLED) {
-  Sentry.setupExpressErrorHandler(app);
+  if (typeof Sentry.setupExpressErrorHandler === 'function') {
+    Sentry.setupExpressErrorHandler(app); // v8+
+  } else if (Sentry.Handlers && typeof Sentry.Handlers.errorHandler === 'function') {
+    app.use(Sentry.Handlers.errorHandler()); // v7
+  }
 }
 
 // ---------- Error handler ----------
