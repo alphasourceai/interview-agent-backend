@@ -1,20 +1,11 @@
 // app.js (drop-in)
 require('dotenv').config()
-const express = require('express')
-const cors = require('cors')
-const crypto = require('crypto')
-const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
-const { generateRubricAndKBForRole } = require('./generateRubric')
-// --- Sentry (errors + tracing) ---
+
+// --- Sentry MUST be initialized before requiring Express to instrument it ---
 const Sentry = require('@sentry/node');
 const { nodeProfilingIntegration } = require('@sentry/profiling-node');
-
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
-const app = express()
-
-// Initialize Sentry early so it wraps all middlewares/routes
-const SENTRY_ENABLED = process.env.SENTRY_ENABLED === '1';
-if (SENTRY_ENABLED && process.env.SENTRY_DSN) {
+const SENTRY_ENABLED = process.env.SENTRY_ENABLED === '1' && !!process.env.SENTRY_DSN;
+if (SENTRY_ENABLED) {
   Sentry.init({
     dsn: process.env.SENTRY_DSN,
     environment: process.env.SENTRY_ENV || process.env.NODE_ENV || 'production',
@@ -28,7 +19,6 @@ if (SENTRY_ENABLED && process.env.SENTRY_DSN) {
     profilesSampleRate: Number(process.env.SENTRY_PROFILES_SAMPLE_RATE ?? 0.0),
     beforeSend(event) {
       try {
-        // redact potentially sensitive values
         if (event.request?.headers) {
           delete event.request.headers['authorization'];
           delete event.request.headers['cookie'];
@@ -50,6 +40,21 @@ if (SENTRY_ENABLED && process.env.SENTRY_DSN) {
       return event;
     },
   });
+}
+
+// Now import Express and other modules
+const express = require('express')
+const cors = require('cors')
+const crypto = require('crypto')
+const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
+const { generateRubricAndKBForRole } = require('./generateRubric')
+
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
+const app = express()
+
+// Sentry request middleware (must be before other app.use and routes)
+if (SENTRY_ENABLED) {
+  app.use(Sentry.expressRequestMiddleware());
 }
 
 // ---------- CORS ----------
@@ -837,8 +842,8 @@ app.get('/health', (_req, res) => res.json({ ok: true }))
 // ---------- 404 ----------
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }))
 
-// Sentry error handler (v8) — pass the app instance directly
-if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
+// Sentry error handler (v8) — mount after routes
+if (SENTRY_ENABLED) {
   Sentry.setupExpressErrorHandler(app);
 }
 
