@@ -78,7 +78,23 @@ app.use(cors({
   },
   credentials: true
 }))
+
 app.use(express.json({ limit: '10mb' }))
+
+// ---------- CSP: allow Wix to embed (frame-ancestors) ----------
+app.use((req, res, next) => {
+  try {
+    // Keep CSP minimal to avoid breaking existing resources; just control who may embed us
+    // Add your production Wix domain(s) here as needed
+    res.setHeader(
+      'Content-Security-Policy',
+      "frame-ancestors https://www.alphasourceai.com https://*.wixsite.com;"
+    );
+    // Ensure we don't send legacy X-Frame-Options that could conflict with CSP
+    res.removeHeader && res.removeHeader('X-Frame-Options');
+  } catch (_) {}
+  next();
+});
 
 // Per-request context (request_id + basic tags)
 app.use((req, _res, next) => {
