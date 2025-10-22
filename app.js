@@ -104,6 +104,16 @@ app.use((req, res, next) => {
   } catch (_) {}
   next();
 });
+// ---------- Permissions-Policy: allow Tavus (daily.co) to access camera/mic in nested iframes ----------
+app.use((req, res, next) => {
+  try {
+    res.setHeader(
+      'Permissions-Policy',
+      'camera=(self "https://tavus.daily.co"), microphone=(self "https://tavus.daily.co"), fullscreen=*, autoplay=*, clipboard-read=*, clipboard-write=*'
+    );
+  } catch (_) {}
+  next();
+});
 
 // Per-request context (request_id + basic tags)
 app.use((req, _res, next) => {
