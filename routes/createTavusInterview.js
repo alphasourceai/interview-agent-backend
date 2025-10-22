@@ -12,7 +12,13 @@ router.post('/', async (req, res) => {
     const computedBase = `${req.protocol}://${req.get('host')}`;
     const base = (process.env.PUBLIC_BACKEND_URL || computedBase).replace(/\/+$/, '');
 
-    const { candidate_id, role_id: roleIdFromBody } = req.body || {};
+    const {
+      candidate_id,
+      role_id: roleIdFromBody,
+      roleToken,
+      role_token
+    } = req.body || {};
+    const roleTokenFromBody = roleToken || role_token || null;
     if (!candidate_id) return res.status(400).json({ error: 'candidate_id required' });
 
     // candidate
@@ -23,16 +29,49 @@ router.post('/', async (req, res) => {
       .single();
     if (cErr || !candidate) return res.status(404).json({ error: cErr?.message || 'Candidate not found' });
 
-    const roleId = roleIdFromBody || candidate.role_id;
-    if (!roleId) return res.status(400).json({ error: 'role_id not provided and candidate has no role_id' });
+    let role = null;
+    let roleId = roleIdFromBody || null;
 
-    // role
-    const { data: role, error: rErr } = await supabase
-      .from('roles')
-      .select('*')
-      .eq('id', roleId)
-      .single();
-    if (rErr || !role) return res.status(404).json({ error: rErr?.message || 'Role not found' });
+    // If no explicit role id, try token from body
+    if (!roleId && roleTokenFromBody) {
+      const { data: roleByToken, error: rtErr } = await supabase
+        .from('roles')
+        .select('*')
+        .or(`slug_or_token.eq.${roleTokenFromBody},token.eq.${roleTokenFromBody}`)
+        .limit(1)
+        .single();
+      if (rtErr && rtErr.code !== 'PGRST116') {
+        return res.status(500).json({ error: rtErr.message });
+      }
+      if (roleByToken) {
+        role = roleByToken;
+        roleId = roleByToken.id;
+      }
+    }
+
+    // If still no role resolved, try the candidate's role_id
+    if (!roleId && candidate.role_id) {
+      roleId = candidate.role_id;
+    }
+
+    if (!role) {
+      // If we have a roleId now, fetch the role row
+      if (!roleId) {
+        return res.status(400).json({ error: 'role_id or valid role token required (candidate has no role_id)' });
+      }
+      const { data: roleById, error: rErr } = await supabase
+        .from('roles')
+        .select('*')
+        .eq('id', roleId)
+        .single();
+      if (rErr || !roleById) return res.status(404).json({ error: rErr?.message || 'Role not found' });
+      role = roleById;
+    }
+
+    const clientId = role.client_id || candidate.client_id || null;
+    if (!clientId) {
+      return res.status(400).json({ error: 'client_id could not be determined from role or candidate' });
+    }
 
     const webhookUrl = `${base}/webhook/tavus`;
 
@@ -54,7 +93,7 @@ router.post('/', async (req, res) => {
       .from('reports')
       .update({
         role_id: role.id,
-        client_id: role.client_id || candidate.client_id || null,
+        client_id: clientId,
         candidate_external_id: result.conversation_id || null
       })
       .eq('candidate_id', candidate_id);
@@ -75,6 +114,7 @@ router.post('/', async (req, res) => {
         .from('interviews')
         .insert({
           candidate_id,
+          client_id: clientId,
           role_id: roleId,
           video_url: result.conversation_url || null,
           tavus_application_id: result.conversation_id || null,
@@ -93,6 +133,7 @@ router.post('/', async (req, res) => {
       const { error: uErr } = await supabase
         .from('interviews')
         .update({
+          client_id: clientId,
           video_url: result.conversation_url || null,
           tavus_application_id: result.conversation_id || existing.tavus_application_id || null,
           status: 'Pending'
