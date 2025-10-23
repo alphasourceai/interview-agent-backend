@@ -97,7 +97,7 @@ app.use((req, res, next) => {
     // Add your production Wix domain(s) here as needed
     res.setHeader(
       'Content-Security-Policy',
-      "frame-ancestors https://www.alphasourceai.com https://*.wixsite.com;"
+      "frame-ancestors https://www.alphasourceai.com https://alphasourceai.com https://*.wixsite.com;"
     );
     // Ensure we don't send legacy X-Frame-Options that could conflict with CSP
     res.removeHeader && res.removeHeader('X-Frame-Options');
@@ -109,7 +109,7 @@ app.use((req, res, next) => {
   try {
     res.setHeader(
       'Permissions-Policy',
-      'camera=(self "https://tavus.daily.co"), microphone=(self "https://tavus.daily.co"), fullscreen=*, autoplay=*, clipboard-read=*, clipboard-write=*'
+      'camera=(self "https://tavus.daily.co" "https://*.daily.co"), microphone=(self "https://tavus.daily.co" "https://*.daily.co"), display-capture=(self "https://tavus.daily.co" "https://*.daily.co"), screen-wake-lock=*, fullscreen=*, autoplay=*, clipboard-read=*, clipboard-write=*'
     );
   } catch (_) {}
   next();
