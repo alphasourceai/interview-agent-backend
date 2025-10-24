@@ -67,6 +67,9 @@ const DEFAULT_ORIGINS = [
   'https://interview-agent-frontend.onrender.com',
   'https://ia-frontend-prod.onrender.com',
   'https://www.alphasourceai.com',
+  'https://alphasourceai.com',
+  'https://www-alphasourceai-com.filesusr.com',
+  'https://editor.wix.com',
 ]
 const envOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
@@ -81,11 +84,23 @@ const ALLOWLIST = Array.from(new Set([
 
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true) // curl / same-origin
-    if (ALLOWLIST.includes(origin)) return cb(null, true)
-    return cb(null, false)
+    if (!origin) return cb(null, true); // curl / same-origin
+    if (ALLOWLIST.includes(origin)) return cb(null, true);
+    return cb(null, false);
   },
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: [
+    'Authorization',
+    'Content-Type',
+    'X-Requested-With',
+    'apikey',
+    'x-client-info',
+    'Prefer',
+    'Range',
+    'Accept'
+  ],
+  exposedHeaders: ['Content-Range', 'Range-Unit']
 }))
 
 app.use(express.json({ limit: '10mb' }))
