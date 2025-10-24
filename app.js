@@ -867,33 +867,48 @@ try {
   console.error('[mount] Failed to load routes/reportsPdf:', e?.message || e);
 }
 
-// ---------- Interview host shim (serve FE HTML with permission headers for Tavus) ----------
+// ---------- Interview host shim (serve container HTML that embeds FE interview with permission headers) ----------
 app.get(['/interview-host', '/interview-host/:token'], async (req, res) => {
   try {
-    const token = req.params.token ? encodeURIComponent(req.params.token) : ''
-    const targetPath = token ? `/interview-access/${token}` : '/interview-access'
-    const targetUrl = `${FRONTEND_BASE}${targetPath}`
-
-    const resp = await axios.get(targetUrl, {
-      responseType: 'text',
-      headers: { 'Accept': 'text/html' }
-    })
+    const token = req.params.token ? encodeURIComponent(req.params.token) : '';
+    const targetPath = token ? `/interview-access/${token}` : '/interview-access';
+    const targetUrl = `${FRONTEND_BASE}${targetPath}`;
 
     // Ensure required permission delegation headers are present on the document
     res.setHeader(
       'Permissions-Policy',
       'camera=(self "https://tavus.daily.co" "https://*.daily.co"), microphone=(self "https://tavus.daily.co" "https://*.daily.co"), display-capture=(self "https://tavus.daily.co" "https://*.daily.co"), screen-wake-lock=*, fullscreen=*, autoplay=*, clipboard-read=*, clipboard-write=*'
-    )
+    );
     res.setHeader(
       'Feature-Policy',
       "camera 'self' https://tavus.daily.co https://*.daily.co; microphone 'self' https://tavus.daily.co https://*.daily.co; fullscreen *"
-    )
+    );
 
-    res.status(resp.status || 200).type('html').send(resp.data)
+    const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Interview</title>
+    <style>
+      html, body { margin:0; padding:0; height:100%; background:#0000; }
+      #iv { width:100%; height:100vh; border:0; display:block; }
+    </style>
+  </head>
+  <body>
+    <iframe id="iv"
+      src="${targetUrl}"
+      allow="camera; microphone; autoplay; clipboard-read; clipboard-write; display-capture; fullscreen; storage-access"
+      allowfullscreen
+      referrerpolicy="no-referrer"
+      scrolling="no"></iframe>
+  </body>
+</html>`;
+    res.status(200).type('html').send(html);
   } catch (e) {
-    const status = e?.response?.status || 502
-    const body = typeof e?.response?.data === 'string' ? e.response.data : 'Upstream fetch error'
-    res.status(status).type('text/plain').send(body)
+    const status = e?.response?.status || 502;
+    const body = typeof e?.response?.data === 'string' ? e.response.data : 'Upstream error';
+    res.status(status).type('text/plain').send(body);
   }
 })
 // ---------- health ----------
