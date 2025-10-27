@@ -126,7 +126,7 @@ app.use((req, res, next) => {
   try {
     res.setHeader(
       'Permissions-Policy',
-      'camera=(self "https://tavus.daily.co" "https://*.daily.co"), microphone=(self "https://tavus.daily.co" "https://*.daily.co"), display-capture=(self "https://tavus.daily.co" "https://*.daily.co"), screen-wake-lock=*, fullscreen=*, autoplay=*, clipboard-read=*, clipboard-write=*'
+      'camera=(self "https://tavus.daily.co" "https://c.daily.co"), microphone=(self "https://tavus.daily.co" "https://c.daily.co"), display-capture=(self "https://tavus.daily.co" "https://c.daily.co"), fullscreen=(self "https://tavus.daily.co" "https://c.daily.co"), autoplay=(self "https://tavus.daily.co" "https://c.daily.co"), clipboard-read=(self), clipboard-write=(self)'
     );
   } catch (_) {}
   next();
@@ -877,11 +877,7 @@ app.get(['/interview-host', '/interview-host/:token'], async (req, res) => {
     // Ensure required permission delegation headers are present on the document
     res.setHeader(
       'Permissions-Policy',
-      'camera=(self "https://tavus.daily.co" "https://*.daily.co"), microphone=(self "https://tavus.daily.co" "https://*.daily.co"), display-capture=(self "https://tavus.daily.co" "https://*.daily.co"), screen-wake-lock=*, fullscreen=*, autoplay=*, clipboard-read=*, clipboard-write=*'
-    );
-    res.setHeader(
-      'Feature-Policy',
-      "camera 'self' https://tavus.daily.co https://*.daily.co; microphone 'self' https://tavus.daily.co https://*.daily.co; fullscreen *"
+      'camera=(self "https://tavus.daily.co" "https://c.daily.co"), microphone=(self "https://tavus.daily.co" "https://c.daily.co"), display-capture=(self "https://tavus.daily.co" "https://c.daily.co"), fullscreen=(self "https://tavus.daily.co" "https://c.daily.co"), autoplay=(self "https://tavus.daily.co" "https://c.daily.co"), clipboard-read=(self), clipboard-write=(self)'
     );
 
     const html = `<!doctype html>
