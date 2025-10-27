@@ -114,7 +114,7 @@ app.use((req, res, next) => {
     // Add your production Wix domain(s) here as needed
     res.setHeader(
       'Content-Security-Policy',
-      "frame-ancestors https://www.alphasourceai.com https://alphasourceai.com https://*.wixsite.com;"
+      'frame-ancestors https://www.alphasourceai.com https://alphasourceai.com https://*.wixsite.com https://*.filesusr.com;'
     );
     // Ensure we don't send legacy X-Frame-Options that could conflict with CSP
     res.removeHeader && res.removeHeader('X-Frame-Options');
