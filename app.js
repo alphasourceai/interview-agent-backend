@@ -907,6 +907,22 @@ app.get(['/interview-host', '/interview-host/:token'], async (req, res) => {
     res.status(status).type('text/plain').send(body);
   }
 })
+// Pretty link: https://interviews.alphasourceai.com/<token> -> /interview-host/<token>
+app.get('/:token', (req, res, next) => {
+  const host = (req.headers.host || '').toLowerCase();
+  // Only act on the interviews subdomain; otherwise defer
+  if (!/^interviews\.alphasourceai\.com(?::\d+)?$/.test(host)) return next();
+
+  const token = req.params.token;
+  // Conservative match: UUID v4 tokens only, prevents clashes with other paths
+  const isUuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(token);
+  if (!isUuidV4) return next();
+
+  // Preserve any query string when redirecting
+  const qsIndex = req.url.indexOf('?');
+  const qs = qsIndex >= 0 ? req.url.slice(qsIndex) : '';
+  return res.redirect(302, `/interview-host/${encodeURIComponent(token)}${qs}`);
+});
 // ---------- health ----------
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
