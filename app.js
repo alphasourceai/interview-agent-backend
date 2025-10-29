@@ -72,6 +72,8 @@ const DEFAULT_ORIGINS = [
   'https://alphasourceai.com',
   'https://www-alphasourceai-com.filesusr.com',
   'https://editor.wix.com',
+  'https://ia-frontend-qa.onrender.com',
+  'https://ia-frontend-staging.onrender.com',
 ]
 const envOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
