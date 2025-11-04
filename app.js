@@ -485,7 +485,140 @@ async function requireAdmin(req, res, next) {
   }
 }
 
+
 const adminRouter = express.Router()
+
+// --- Password reset (Admin-triggered) ---
+// Helper: send HTML email via SendGrid
+async function _sendgridSend({ to, subject, html }) {
+  const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || process.env.SENDGRID_KEY;
+  const FROM = process.env.SENDGRID_FROM || process.env.SENDGRID_FROM_EMAIL || 'info@alphasourceai.com';
+  if (!SENDGRID_API_KEY) throw new Error('missing SENDGRID_API_KEY');
+  if (!FROM) throw new Error('missing SENDGRID_FROM');
+
+  const payload = {
+    personalizations: [{ to: [{ email: to }] }],
+    from: { email: FROM, name: 'alphaSource' },
+    subject,
+    content: [{ type: 'text/html', value: html }]
+  };
+
+  await axios.post('https://api.sendgrid.com/v3/mail/send', payload, {
+    headers: {
+      Authorization: `Bearer ${SENDGRID_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    timeout: 10000
+  });
+}
+
+// POST /admin/users/:userId/reset-password
+// Optional body: { email?: string, redirect_to?: string }
+adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const userId = (req.params.userId || '').trim();
+    const fallbackEmail = (req.body?.email || '').trim();
+    const redirectTo = (req.body?.redirect_to || 'https://www.alphasourceai.com/account?password_reset=1').trim();
+
+    if (!userId && !fallbackEmail) {
+      return res.status(400).json({ error: 'user_id_or_email_required' });
+    }
+
+    // Look up Supabase user (prefer by id)
+    let email = null;
+    if (userId && supabaseAdmin?.auth?.admin?.getUserById) {
+      try {
+        const { data, error } = await supabaseAdmin.auth.admin.getUserById(userId);
+        if (!error && data?.user?.email) email = data.user.email;
+      } catch (e) {
+        // fall through to fallbackEmail
+      }
+    }
+    if (!email && fallbackEmail) email = fallbackEmail;
+
+    if (!email) {
+      return res.status(404).json({ error: 'user_email_not_found' });
+    }
+
+    // Generate a recovery link
+    const linkResp = await supabaseAdmin.auth.admin.generateLink({
+      type: 'recovery',
+      email,
+      options: { redirectTo }
+    });
+
+    const action_link = linkResp?.data?.action_link || null;
+    if (!action_link) {
+      const detail = linkResp?.error?.message || 'no_action_link';
+      return res.status(500).json({ error: 'generate_link_failed', detail });
+    }
+
+    // Branded minimal HTML (aligns with current brand; can be swapped to a SendGrid template later)
+    const html = `
+      <!doctype html>
+      <html>
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>Reset your password</title>
+      </head>
+      <body style="margin:0;padding:0;background:#0A1547;color:#ffffff;font-family:Arial,Helvetica,sans-serif;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0A1547;">
+          <tr>
+            <td align="center" style="padding:32px 16px;">
+              <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
+                <tr>
+                  <td style="padding:24px 24px 0 24px;" align="left">
+                    <img src="https://www.alphasourceai.com/alpha-logo.png" alt="alphaSource" style="height:48px;display:block;" />
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:24px;" align="left">
+                    <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Reset your password</h1>
+                    <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">
+                      Click the button below to reset your alphaSource password. This link will expire shortly for security.
+                    </p>
+                    <p style="margin:0 0 28px 0;">
+                      <a href="${action_link}"
+                         style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">
+                        Reset password
+                      </a>
+                    </p>
+                    <p style="margin:0 0 10px 0;font-size:12px;color:#bfc6e0;">
+                      Or paste this link into your browser:
+                    </p>
+                    <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;word-break:break-all;">${action_link}</p>
+                    <p style="margin:0;font-size:12px;color:#93a0c6;">
+                      If you didn’t request this, you can safely ignore this email.
+                    </p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:16px 24px 28px 24px;font-size:12px;color:#93a0c6;">
+                    Questions? Email <a href="mailto:info@alphasourceai.com" style="color:#C3B4F3;text-decoration:underline;">info@alphasourceai.com</a>.
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+      </html>
+    `;
+
+    // Send via SendGrid
+    await _sendgridSend({
+      to: email,
+      subject: 'Reset your alphaSource password',
+      html
+    });
+
+    return res.json({ ok: true, email, sent_via: 'sendgrid' });
+  } catch (e) {
+    console.error('reset_password_admin_failed:', e?.message || e);
+    return res.status(500).json({ error: 'reset_password_admin_failed', detail: e?.message || String(e) });
+  }
+});
 
 // Helper: ensure a user exists/invite; return user_id + optional action_link
 async function ensureUserIdAndInvite(email, redirectTo) {
