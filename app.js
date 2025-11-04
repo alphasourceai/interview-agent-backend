@@ -68,6 +68,8 @@ const DEFAULT_ORIGINS = [
   'http://localhost:5173',
   'https://interview-agent-frontend.onrender.com',
   'https://ia-frontend-prod.onrender.com',
+  'https://ia-frontend-qa.onrender.com',
+  'https://ia-frontend-staging.onrender.com',
   'https://www.alphasourceai.com',
   'https://alphasourceai.com',
   'https://www-alphasourceai-com.filesusr.com',
@@ -620,57 +622,49 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
   }
 });
 
-// Helper: ensure a user exists/invite; return user_id + optional action_link
-async function ensureUserIdAndInvite(email, redirectTo) {
-  let userId = null
-  let actionLink = null
-  let method = null
+// Helper: ensure a user exists and generate a magic link (no Supabase-branded email)
+async function ensureUserIdAndMagicLink(email, redirectTo) {
+  let userId = null;
+  let actionLink = null;
 
+  // Try to generate a magic link; Supabase will create the user if needed, without sending an email.
   try {
-    const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo })
-    userId = invited?.data?.user?.id || null
-    method = 'invite'
+    const link = await supabaseAdmin.auth.admin.generateLink({
+      type: 'magiclink',
+      email,
+      options: { redirectTo }
+    });
+    userId = link?.data?.user?.id || null;
+    actionLink = link?.data?.action_link || null;
   } catch (e) {
-    console.error('inviteUserByEmail failed:', e?.message || e)
+    console.error('generateLink(magiclink) failed:', e?.message || e);
   }
 
-  if (!userId) {
-    try {
-      const link = await supabaseAdmin.auth.admin.generateLink({
-        type: 'magiclink',
-        email,
-        options: { redirectTo }
-      })
-      userId = link?.data?.user?.id || null
-      actionLink = link?.data?.action_link || null
-      method = method || 'magiclink'
-    } catch (e) {
-      console.error('generateLink(magiclink) failed:', e?.message || e)
-    }
-  }
-
-  if (!userId) {
+  // Fallback: create the user then generate a magic link again
+  if (!userId || !actionLink) {
     try {
       const created = await supabaseAdmin.auth.admin.createUser({
         email,
         email_confirm: true
-      })
-      userId = created?.data?.user?.id || null
-      method = method || 'createUser'
+      });
+      userId = created?.data?.user?.id || userId;
     } catch (e) {
-      console.error('createUser failed:', e?.message || e)
+      console.error('createUser failed:', e?.message || e);
     }
-    if (userId) {
-      try {
-        await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo })
-        method = 'createUser+invite'
-      } catch (e) {
-        console.error('second invite after createUser failed:', e?.message || e)
-      }
+    try {
+      const link2 = await supabaseAdmin.auth.admin.generateLink({
+        type: 'magiclink',
+        email,
+        options: { redirectTo }
+      });
+      userId = link2?.data?.user?.id || userId;
+      actionLink = link2?.data?.action_link || actionLink;
+    } catch (e) {
+      console.error('generateLink(magiclink) retry failed:', e?.message || e);
     }
   }
 
-  return { userId, actionLink, method }
+  return { userId, actionLink };
 }
 
 // List all clients
@@ -883,10 +877,10 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
 
   const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
-  const { userId, actionLink, method } = await ensureUserIdAndInvite(email, redirectTo)
+  const { userId, actionLink } = await ensureUserIdAndMagicLink(email, redirectTo)
 
   if (!userId) {
-    console.error('add_member_no_user_id', { email, method })
+    console.error('add_member_no_user_id', { email })
     return res.status(400).json({
       error: 'add_member_failed',
       detail: 'Could not create or locate user for this email.',
@@ -909,8 +903,46 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   }
 
   const m = data
+  try {
+    const inviteHtml = `
+      <!doctype html>
+      <html><body style="margin:0;padding:0;background:#0A1547;color:#ffffff;font-family:Arial,Helvetica,sans-serif;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0A1547;">
+          <tr><td align="center" style="padding:32px 16px;">
+            <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
+              <tr><td style="padding:24px 24px 0 24px;" align="left">
+                <img src="https://www.alphasourceai.com/alpha-logo.png" alt="alphaSource" style="height:48px;display:block;" />
+              </td></tr>
+              <tr><td style="padding:24px;" align="left">
+                <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">You're invited to alphaSource</h1>
+                <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">
+                  Click below to join the client workspace and set up your account.
+                </p>
+                <p style="margin:0 0 28px 0;">
+                  <a href="${actionLink}"
+                     style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">
+                    Accept invite &amp; sign in
+                  </a>
+                </p>
+                <p style="margin:0 0 10px 0;font-size:12px;color:#bfc6e0;">Or paste this link into your browser:</p>
+                <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;word-break:break-all;">${actionLink}</p>
+                <p style="margin:0;font-size:12px;color:#93a0c6;">Questions? Email <a href="mailto:info@alphasourceai.com" style="color:#C3B4F3;">info@alphasourceai.com</a>.</p>
+              </td></tr>
+            </table>
+          </td></tr>
+        </table>
+      </body></html>`;
+    await _sendgridSend({
+      to: email,
+      subject: 'Your alphaSource invite',
+      html: inviteHtml
+    });
+  } catch (e) {
+    console.error('sendgrid_invite_failed:', e?.message || e);
+  }
   res.json({ item: { ...m, id: m.user_id || m.email } })
 })
+
 
 // Remove a client member
 adminRouter.delete('/client-members/:id', requireAuth, requireAdmin, async (req, res) => {
@@ -928,6 +960,7 @@ adminRouter.delete('/client-members/:id', requireAuth, requireAdmin, async (req,
 })
 
 app.use('/admin', adminRouter)
+console.log('[mount] admin routes mounted at /admin');
 
 /* ======================= END: Admin guard + Admin API ======================= */
 
@@ -1085,3 +1118,56 @@ app.listen(PORT, () => {
 })
 
 module.exports = app
+
+// Admin-triggered password reset by email (not userId)
+adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const email = (req.body?.email || '').trim();
+    const redirectTo = (req.body?.redirect_to || 'https://www.alphasourceai.com/account?password_reset=1').trim();
+    if (!email) return res.status(400).json({ error: 'email_required' });
+
+    const linkResp = await supabaseAdmin.auth.admin.generateLink({
+      type: 'recovery',
+      email,
+      options: { redirectTo }
+    });
+
+    const action_link = linkResp?.data?.action_link || null;
+    if (!action_link) {
+      const detail = linkResp?.error?.message || 'no_action_link';
+      return res.status(500).json({ error: 'generate_link_failed', detail });
+    }
+
+    const html = `
+      <!doctype html>
+      <html>
+      <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Reset your password</title></head>
+      <body style="margin:0;padding:0;background:#0A1547;color:#ffffff;font-family:Arial,Helvetica,sans-serif;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0A1547;">
+          <tr><td align="center" style="padding:32px 16px;">
+            <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
+              <tr><td style="padding:24px 24px 0 24px;" align="left">
+                <img src="https://www.alphasourceai.com/alpha-logo.png" alt="alphaSource" style="height:48px;display:block;" />
+              </td></tr>
+              <tr><td style="padding:24px;" align="left">
+                <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Reset your password</h1>
+                <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">Click the button below to reset your alphaSource password.</p>
+                <p style="margin:0 0 28px 0;">
+                  <a href="${action_link}" style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">Reset password</a>
+                </p>
+                <p style="margin:0 0 10px 0;font-size:12px;color:#bfc6e0;">Or paste this link into your browser:</p>
+                <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;word-break:break-all;">${action_link}</p>
+              </td></tr>
+            </table>
+          </td></tr>
+        </table>
+      </body>
+      </html>
+    `;
+    await _sendgridSend({ to: email, subject: 'Reset your alphaSource password', html });
+    return res.json({ ok: true, email, sent_via: 'sendgrid' });
+  } catch (e) {
+    console.error('reset_password_admin_email_failed:', e?.message || e);
+    return res.status(500).json({ error: 'reset_password_admin_failed', detail: e?.message || String(e) });
+  }
+});
