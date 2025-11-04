@@ -80,4 +80,62 @@ router.post('/users/:userId/reset-password', async (req, res) => {
   }
 });
 
+/**
+ * POST /admin/client-members
+ * Handles creating a new client member and sending a branded invite email via SendGrid.
+ */
+router.post('/client-members', async (req, res) => {
+  try {
+    const { client_id, email, name, role = 'member' } = req.body || {};
+    if (!client_id || !email || !name) {
+      return res.status(400).json({ error: 'missing_fields' });
+    }
+
+    const emailNorm = String(email).trim().toLowerCase();
+
+    // Generate signup link (no Supabase default email)
+    const { data: linkData, error: linkError } = await supabaseAdmin.auth.admin.generateLink({
+      type: 'signup',
+      email: emailNorm,
+      options: {
+        data: { name, role },
+        redirectTo: RESET_REDIRECT_URL,
+      },
+    });
+
+    let inviteLink = linkData?.action_link || linkData?.properties?.action_link;
+    if (linkError || !inviteLink) {
+      // fallback: if user already exists, try recovery link
+      const { data: recData, error: recErr } = await supabaseAdmin.auth.admin.generateLink({
+        type: 'recovery',
+        email: emailNorm,
+        options: { redirectTo: RESET_REDIRECT_URL },
+      });
+      if (recErr) {
+        console.error('[invite] recovery link failed', recErr);
+        return res.status(400).json({ error: recErr.message || 'generate_recovery_failed' });
+      }
+      inviteLink = recData?.action_link || recData?.properties?.action_link;
+    }
+
+    if (!inviteLink) {
+      return res.status(400).json({ error: 'invite_link_missing' });
+    }
+
+    // Send branded invite via SendGrid
+    await sendPasswordResetEmail({
+      to: emailNorm,
+      name,
+      reset_link: inviteLink,
+    });
+
+    console.log(`[invite] Branded invite sent to ${emailNorm}`);
+
+    return res.json({ ok: true, email: emailNorm });
+  } catch (e) {
+    console.error('[invite] unexpected error', e);
+    return res.status(500).json({ error: 'server_error', detail: e.message });
+  }
+});
+
 export default router;
