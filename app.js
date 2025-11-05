@@ -622,6 +622,63 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
   }
 });
 
+// Admin-triggered password reset by email (not userId)
+adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const email = (req.body?.email || '').trim();
+    const redirectTo = (req.body?.redirect_to || 'https://www.alphasourceai.com/account?password_reset=1').trim();
+    if (!email) return res.status(400).json({ error: 'email_required' });
+
+    console.log('[admin.reset-password] generating recovery link for', email, 'redirectTo=', redirectTo);
+    const linkResp = await supabaseAdmin.auth.admin.generateLink({
+      type: 'recovery',
+      email,
+      options: { redirectTo }
+    });
+    if (linkResp?.error) {
+      console.error('[admin.reset-password] generateLink error:', linkResp.error.message || linkResp.error);
+    }
+
+    const action_link = linkResp?.data?.action_link || null;
+    if (!action_link) {
+      const detail = linkResp?.error?.message || 'no_action_link';
+      return res.status(500).json({ error: 'generate_link_failed', detail });
+    }
+
+    const html = `
+      <!doctype html>
+      <html>
+      <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Reset your password</title></head>
+      <body style="margin:0;padding:0;background:#0A1547;color:#ffffff;font-family:Arial,Helvetica,sans-serif;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0A1547;">
+          <tr><td align="center" style="padding:32px 16px;">
+            <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
+              <tr><td style="padding:24px 24px 0 24px;" align="left">
+                <img src="https://www.alphasourceai.com/alpha-logo.png" alt="alphaSource" style="height:48px;display:block;" />
+              </td></tr>
+              <tr><td style="padding:24px;" align="left">
+                <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Reset your password</h1>
+                <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">Click the button below to reset your alphaSource password.</p>
+                <p style="margin:0 0 28px 0;">
+                  <a href="${action_link}" style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">Reset password</a>
+                </p>
+                <p style="margin:0 0 10px 0;font-size:12px;color:#bfc6e0;">Or paste this link into your browser:</p>
+                <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;word-break:break-all;">${action_link}</p>
+              </td></tr>
+            </table>
+          </td></tr>
+        </table>
+      </body>
+      </html>
+    `;
+    await _sendgridSend({ to: email, subject: 'Reset your alphaSource password', html });
+    return res.json({ ok: true, email, sent_via: 'sendgrid' });
+  } catch (e) {
+    console.error('reset_password_admin_email_failed:', e?.message || e);
+    return res.status(500).json({ error: 'reset_password_admin_failed', detail: e?.message || String(e) });
+  }
+});
+
 // Helper: ensure a user exists and generate a magic link (no Supabase-branded email)
 async function ensureUserIdAndMagicLink(email, redirectTo) {
   let userId = null;
@@ -1118,56 +1175,3 @@ app.listen(PORT, () => {
 })
 
 module.exports = app
-
-// Admin-triggered password reset by email (not userId)
-adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const email = (req.body?.email || '').trim();
-    const redirectTo = (req.body?.redirect_to || 'https://www.alphasourceai.com/account?password_reset=1').trim();
-    if (!email) return res.status(400).json({ error: 'email_required' });
-
-    const linkResp = await supabaseAdmin.auth.admin.generateLink({
-      type: 'recovery',
-      email,
-      options: { redirectTo }
-    });
-
-    const action_link = linkResp?.data?.action_link || null;
-    if (!action_link) {
-      const detail = linkResp?.error?.message || 'no_action_link';
-      return res.status(500).json({ error: 'generate_link_failed', detail });
-    }
-
-    const html = `
-      <!doctype html>
-      <html>
-      <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Reset your password</title></head>
-      <body style="margin:0;padding:0;background:#0A1547;color:#ffffff;font-family:Arial,Helvetica,sans-serif;">
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0A1547;">
-          <tr><td align="center" style="padding:32px 16px;">
-            <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
-              <tr><td style="padding:24px 24px 0 24px;" align="left">
-                <img src="https://www.alphasourceai.com/alpha-logo.png" alt="alphaSource" style="height:48px;display:block;" />
-              </td></tr>
-              <tr><td style="padding:24px;" align="left">
-                <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Reset your password</h1>
-                <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">Click the button below to reset your alphaSource password.</p>
-                <p style="margin:0 0 28px 0;">
-                  <a href="${action_link}" style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">Reset password</a>
-                </p>
-                <p style="margin:0 0 10px 0;font-size:12px;color:#bfc6e0;">Or paste this link into your browser:</p>
-                <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;word-break:break-all;">${action_link}</p>
-              </td></tr>
-            </table>
-          </td></tr>
-        </table>
-      </body>
-      </html>
-    `;
-    await _sendgridSend({ to: email, subject: 'Reset your alphaSource password', html });
-    return res.json({ ok: true, email, sent_via: 'sendgrid' });
-  } catch (e) {
-    console.error('reset_password_admin_email_failed:', e?.message || e);
-    return res.status(500).json({ error: 'reset_password_admin_failed', detail: e?.message || String(e) });
-  }
-});
