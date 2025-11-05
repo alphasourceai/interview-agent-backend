@@ -1,4 +1,3 @@
-
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import { sendPasswordResetEmail } from '../utils/sendEmail.js';
@@ -9,6 +8,26 @@ const router = express.Router();
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const RESET_REDIRECT_URL = process.env.RESET_REDIRECT_URL || 'https://www.alphasourceai.com/account';
+
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+function _inferEnvBase() {
+  const explicit = (process.env.REDIRECT_BASE_URL || process.env.AUTH_REDIRECT_BASE || '').trim();
+  if (explicit) return explicit.replace(/\/+$/, '');
+  const svc = (process.env.RENDER_SERVICE_NAME || process.env.RENDER_EXTERNAL_URL || '').toLowerCase();
+  const fe = (process.env.FRONTEND_URL || FRONTEND_URL || '').toLowerCase();
+  if (fe.includes('qa')) return 'https://ia-frontend-qa.onrender.com';
+  if (fe.includes('staging')) return 'https://ia-frontend-staging.onrender.com';
+  if (fe.includes('prod')) return 'https://www.alphasourceai.com';
+  if (svc.includes('-qa')) return 'https://ia-frontend-qa.onrender.com';
+  if (svc.includes('-staging')) return 'https://ia-frontend-staging.onrender.com';
+  if (svc.includes('-prod')) return 'https://www.alphasourceai.com';
+  return (process.env.NODE_ENV === 'production') ? 'https://www.alphasourceai.com' : 'http://localhost:5173';
+}
+function authRedirect(mode) {
+  const base = _inferEnvBase().replace(/\/+$/, '');
+  const qs = (mode === 'recovery') ? 'password_reset=1' : 'auth_callback=1';
+  return `${base}/account?${qs}`;
+}
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   // Fail fast on boot if misconfigured
@@ -54,7 +73,7 @@ router.post('/users/:userId/reset-password', async (req, res) => {
     const { data: linkData, error: linkError } = await supabaseAdmin.auth.admin.createLink({
       type: 'recovery',
       email,
-      options: { redirectTo: RESET_REDIRECT_URL },
+      options: { redirectTo: authRedirect('recovery') },
     });
 
     if (linkError) {
@@ -72,7 +91,7 @@ router.post('/users/:userId/reset-password', async (req, res) => {
     // Send branded email via SendGrid
     await sendPasswordResetEmail({ to: email, name, reset_link });
 
-    return res.json({ ok: true, email, redirect: RESET_REDIRECT_URL });
+    return res.json({ ok: true, email, redirect: authRedirect('recovery') });
   } catch (e) {
     console.error('[reset-password] unexpected error', e);
     const p = errPayload({ code: 'unexpected', message: 'Unexpected error', detail: String(e?.message || e) });
@@ -99,7 +118,7 @@ router.post('/client-members', async (req, res) => {
       email: emailNorm,
       options: {
         data: { name, role },
-        redirectTo: RESET_REDIRECT_URL,
+        redirectTo: authRedirect('magic'),
       },
     });
 
@@ -109,7 +128,7 @@ router.post('/client-members', async (req, res) => {
       const { data: recData, error: recErr } = await supabaseAdmin.auth.admin.generateLink({
         type: 'recovery',
         email: emailNorm,
-        options: { redirectTo: RESET_REDIRECT_URL },
+        options: { redirectTo: authRedirect('recovery') },
       });
       if (recErr) {
         console.error('[invite] recovery link failed', recErr);
@@ -154,7 +173,7 @@ router.post('/reset-password', async (req, res) => {
     const { data: linkData, error: linkError } = await supabaseAdmin.auth.admin.generateLink({
       type: 'recovery',
       email: emailNorm,
-      options: { redirectTo: RESET_REDIRECT_URL },
+      options: { redirectTo: authRedirect('recovery') },
     });
     if (linkError) {
       console.error('[reset-password] generateLink(recovery) error', linkError);
@@ -167,7 +186,7 @@ router.post('/reset-password', async (req, res) => {
     }
 
     await sendPasswordResetEmail({ to: emailNorm, name, reset_link });
-    return res.json({ ok: true, email: emailNorm, redirect: RESET_REDIRECT_URL });
+    return res.json({ ok: true, email: emailNorm, redirect: authRedirect('recovery') });
   } catch (e) {
     console.error('[reset-password] unexpected error', e);
     return res.status(500).json({ error: 'server_error', detail: e?.message || String(e) });
