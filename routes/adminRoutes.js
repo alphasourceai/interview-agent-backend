@@ -138,4 +138,40 @@ router.post('/client-members', async (req, res) => {
   }
 });
 
+/**
+ * POST /admin/reset-password
+ * Body: { email: string, name?: string }
+ * Generates a Supabase recovery link and sends a branded email via SendGrid.
+ */
+router.post('/reset-password', async (req, res) => {
+  try {
+    const { email, name = 'User' } = req.body || {};
+    if (!email) {
+      return res.status(400).json({ error: 'email_required' });
+    }
+    const emailNorm = String(email).trim().toLowerCase();
+
+    const { data: linkData, error: linkError } = await supabaseAdmin.auth.admin.generateLink({
+      type: 'recovery',
+      email: emailNorm,
+      options: { redirectTo: RESET_REDIRECT_URL },
+    });
+    if (linkError) {
+      console.error('[reset-password] generateLink(recovery) error', linkError);
+      return res.status(500).json({ error: 'generate_link_failed', detail: linkError.message });
+    }
+
+    const reset_link = linkData?.action_link || linkData?.properties?.action_link;
+    if (!reset_link) {
+      return res.status(500).json({ error: 'link_missing' });
+    }
+
+    await sendPasswordResetEmail({ to: emailNorm, name, reset_link });
+    return res.json({ ok: true, email: emailNorm, redirect: RESET_REDIRECT_URL });
+  } catch (e) {
+    console.error('[reset-password] unexpected error', e);
+    return res.status(500).json({ error: 'server_error', detail: e?.message || String(e) });
+  }
+});
+
 export default router;

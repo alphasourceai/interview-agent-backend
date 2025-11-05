@@ -52,6 +52,39 @@ const axios = require('axios')
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || FRONTEND_URL || '').replace(/\/+$/, '')
+/**
+ * Environment-aware auth redirect resolver
+ * - Honors REDIRECT_BASE_URL or AUTH_REDIRECT_BASE if set
+ * - Infers QA/Staging/Prod from FRONTEND_URL or Render service hints
+ * - Defaults to localhost in dev and www.alphasourceai.com in production
+ */
+function _inferEnvBase() {
+  const explicit = (process.env.REDIRECT_BASE_URL || process.env.AUTH_REDIRECT_BASE || '').trim();
+  if (explicit) return explicit.replace(/\/+$/, '');
+
+  const svc = (process.env.RENDER_SERVICE_NAME || process.env.RENDER_EXTERNAL_URL || '').toLowerCase();
+  const fe = (process.env.FRONTEND_URL || FRONTEND_URL || '').toLowerCase();
+
+  // Prefer explicit FE env URLs if present
+  if (fe.includes('qa')) return 'https://ia-frontend-qa.onrender.com';
+  if (fe.includes('staging')) return 'https://ia-frontend-staging.onrender.com';
+  if (fe.includes('prod')) return 'https://www.alphasourceai.com';
+
+  // Fallback to Render service name hints
+  if (svc.includes('-qa')) return 'https://ia-frontend-qa.onrender.com';
+  if (svc.includes('-staging')) return 'https://ia-frontend-staging.onrender.com';
+  if (svc.includes('-prod')) return 'https://www.alphasourceai.com';
+
+  // Local/dev default
+  return (process.env.NODE_ENV === 'production')
+    ? 'https://www.alphasourceai.com'
+    : 'http://localhost:5173';
+}
+function authRedirect(mode) {
+  const base = _inferEnvBase().replace(/\/+$/, '');
+  const qs = (mode === 'recovery') ? 'password_reset=1' : 'auth_callback=1';
+  return `${base}/account?${qs}`;
+}
 const app = express()
 
 // Sentry request middleware (must be before other app.use and routes)
