@@ -62,7 +62,7 @@ function _inferEnvBase() {
   const explicit = (process.env.REDIRECT_BASE_URL || process.env.AUTH_REDIRECT_BASE || '').trim();
   if (explicit) return explicit.replace(/\/+$/, '');
 
-  // New: prefer SENTRY_ENV hints when present
+  // Prefer SENTRY_ENV hints when present
   const sentry = (process.env.SENTRY_ENV || '').toLowerCase();
   if (sentry.includes('qa')) return 'https://ia-frontend-qa.onrender.com';
   if (sentry.includes('stag')) return 'https://ia-frontend-staging.onrender.com';
@@ -150,13 +150,10 @@ app.use(express.json({ limit: '10mb' }))
 // ---------- CSP: allow Wix to embed (frame-ancestors) ----------
 app.use((req, res, next) => {
   try {
-    // Keep CSP minimal to avoid breaking existing resources; just control who may embed us
-    // Add your production Wix domain(s) here as needed
     res.setHeader(
       'Content-Security-Policy',
       'frame-ancestors https://www.alphasourceai.com https://alphasourceai.com https://*.wixsite.com https://*.filesusr.com;'
     );
-    // Ensure we don't send legacy X-Frame-Options that could conflict with CSP
     res.removeHeader && res.removeHeader('X-Frame-Options');
   } catch (_) {}
   next();
@@ -598,10 +595,31 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
       options: { redirectTo }
     });
 
-    const action_link = linkResp?.data?.action_link || null;
-    if (!action_link) {
+    let final_link = linkResp?.data?.action_link || null;
+    let mode = 'recovery';
+
+    if (!final_link) {
       const detail = linkResp?.error?.message || 'no_action_link';
-      return res.status(500).json({ error: 'generate_link_failed', detail });
+      console.warn('[admin.reset-password] recovery returned no action_link, trying invite', { email, detail });
+
+      try {
+        const inviteResp = await supabaseAdmin.auth.admin.generateLink({
+          type: 'invite',
+          email,
+          options: { redirectTo }
+        });
+        final_link = inviteResp?.data?.action_link || null;
+        if (final_link) {
+          mode = 'invite';
+          console.log('[auth.recovery.fallback_to_invite]', { email });
+        }
+      } catch (e) {
+        console.error('[admin.reset-password] invite fallback failed:', e?.message || e);
+      }
+    }
+
+    if (!final_link) {
+      return res.status(500).json({ error: 'generate_link_failed', detail: 'no_action_link' });
     }
 
     // Branded minimal HTML (aligns with current brand; can be swapped to a SendGrid template later)
@@ -630,7 +648,7 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
                       Click the button below to reset your alphaSource password. This link will expire shortly for security.
                     </p>
                     <p style="margin:0 0 28px 0;">
-                      <a href="${action_link}"
+                      <a href="${final_link}"
                          style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">
                         Reset password
                       </a>
@@ -638,7 +656,7 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
                     <p style="margin:0 0 10px 0;font-size:12px;color:#bfc6e0;">
                       Or paste this link into your browser:
                     </p>
-                    <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;word-break:break-all;">${action_link}</p>
+                    <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;word-break:break-all;">${final_link}</p>
                     <p style="margin:0;font-size:12px;color:#93a0c6;">
                       If you didn’t request this, you can safely ignore this email.
                     </p>
@@ -664,7 +682,7 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
       html
     });
 
-    return res.json({ ok: true, email, sent_via: 'sendgrid' });
+    return res.json({ ok: true, email, sent_via: 'sendgrid', mode });
   } catch (e) {
     console.error('reset_password_admin_failed:', e?.message || e);
     return res.status(500).json({ error: 'reset_password_admin_failed', detail: e?.message || String(e) });
@@ -698,10 +716,31 @@ adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) 
       console.error('[admin.reset-password] generateLink error:', linkResp.error.message || linkResp.error);
     }
 
-    const action_link = linkResp?.data?.action_link || null;
-    if (!action_link) {
+    let final_link = linkResp?.data?.action_link || null;
+    let mode = 'recovery';
+
+    if (!final_link) {
       const detail = linkResp?.error?.message || 'no_action_link';
-      return res.status(500).json({ error: 'generate_link_failed', detail });
+      console.warn('[admin.reset-password] recovery returned no action_link, trying invite', { email, detail });
+
+      try {
+        const inviteResp = await supabaseAdmin.auth.admin.generateLink({
+          type: 'invite',
+          email,
+          options: { redirectTo }
+        });
+        final_link = inviteResp?.data?.action_link || null;
+        if (final_link) {
+          mode = 'invite';
+          console.log('[auth.recovery.fallback_to_invite]', { email });
+        }
+      } catch (e) {
+        console.error('[admin.reset-password] invite fallback failed:', e?.message || e);
+      }
+    }
+
+    if (!final_link) {
+      return res.status(500).json({ error: 'generate_link_failed', detail: 'no_action_link' });
     }
 
     const html = `
@@ -719,10 +758,10 @@ adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) 
                 <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Reset your password</h1>
                 <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">Click the button below to reset your alphaSource password.</p>
                 <p style="margin:0 0 28px 0;">
-                  <a href="${action_link}" style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">Reset password</a>
+                  <a href="${final_link}" style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">Reset password</a>
                 </p>
                 <p style="margin:0 0 10px 0;font-size:12px;color:#bfc6e0;">Or paste this link into your browser:</p>
-                <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;word-break:break-all;">${action_link}</p>
+                <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;word-break:break-all;">${final_link}</p>
               </td></tr>
             </table>
           </td></tr>
@@ -731,33 +770,46 @@ adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) 
       </html>
     `;
     await _sendgridSend({ to: email, subject: 'Reset your alphaSource password', html });
-    return res.json({ ok: true, email, sent_via: 'sendgrid' });
+    return res.json({ ok: true, email, sent_via: 'sendgrid', mode });
   } catch (e) {
     console.error('reset_password_admin_email_failed:', e?.message || e);
     return res.status(500).json({ error: 'reset_password_admin_failed', detail: e?.message || String(e) });
   }
 });
 
-// Helper: ensure a user exists and generate a magic link (no Supabase-branded email)
-async function ensureUserIdAndMagicLink(email, redirectTo) {
+// Helper: ensure a user exists and generate an invite (password-setup) or recovery link (no magic links)
+async function ensureUserIdAndInviteLink(email, redirectTo) {
   let userId = null;
   let actionLink = null;
 
-  // Try to generate a magic link; Supabase will create the user if needed, without sending an email.
   try {
     const link = await supabaseAdmin.auth.admin.generateLink({
-      type: 'magiclink',
+      type: 'invite',
       email,
       options: { redirectTo }
     });
     userId = link?.data?.user?.id || null;
     actionLink = link?.data?.action_link || null;
   } catch (e) {
-    console.error('generateLink(magiclink) failed:', e?.message || e);
+    console.error('generateLink(invite) failed:', e?.message || e);
   }
 
-  // Fallback: create the user then generate a magic link again
-  if (!userId || !actionLink) {
+  if (!actionLink) {
+    try {
+      const link2 = await supabaseAdmin.auth.admin.generateLink({
+        type: 'recovery',
+        email,
+        options: { redirectTo }
+      });
+      userId = link2?.data?.user?.id || userId;
+      actionLink = link2?.data?.action_link || actionLink;
+      if (actionLink) console.log('[auth.invite.fallback_to_recovery]', { email });
+    } catch (e) {
+      console.error('generateLink(recovery) fallback failed:', e?.message || e);
+    }
+  }
+
+  if (!userId) {
     try {
       const created = await supabaseAdmin.auth.admin.createUser({
         email,
@@ -766,17 +818,6 @@ async function ensureUserIdAndMagicLink(email, redirectTo) {
       userId = created?.data?.user?.id || userId;
     } catch (e) {
       console.error('createUser failed:', e?.message || e);
-    }
-    try {
-      const link2 = await supabaseAdmin.auth.admin.generateLink({
-        type: 'magiclink',
-        email,
-        options: { redirectTo }
-      });
-      userId = link2?.data?.user?.id || userId;
-      actionLink = link2?.data?.action_link || actionLink;
-    } catch (e) {
-      console.error('generateLink(magiclink) retry failed:', e?.message || e);
     }
   }
 
@@ -819,8 +860,8 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   // Optionally seed an admin member
   let seeded_member = null
   if (adminEmail) {
-    const redirectTo = authRedirect('magic')
-    const { userId, actionLink } = await ensureUserIdAndMagicLink(adminEmail, redirectTo)
+    const redirectTo = authRedirect('recovery')
+    const { userId, actionLink } = await ensureUserIdAndInviteLink(adminEmail, redirectTo)
 
     if (!userId) {
       console.error('seed_member_no_user_id', { email: adminEmail })
@@ -992,8 +1033,8 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   const role = (req.body?.role || 'member').toLowerCase()
   if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
 
-  const redirectTo = authRedirect('magic')
-  console.log('[auth.redirect.magic]', {
+  const redirectTo = authRedirect('recovery')
+  console.log('[auth.redirect.invite]', {
     redirectTo,
     env: {
       REDIRECT_BASE_URL: process.env.REDIRECT_BASE_URL || null,
@@ -1002,14 +1043,14 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
       FRONTEND_URL: process.env.FRONTEND_URL || null
     }
   })
-  const { userId, actionLink } = await ensureUserIdAndMagicLink(email, redirectTo)
+  const { userId, actionLink } = await ensureUserIdAndInviteLink(email, redirectTo)
 
   if (!userId) {
     console.error('add_member_no_user_id', { email })
     return res.status(400).json({
       error: 'add_member_failed',
       detail: 'Could not create or locate user for this email.',
-      hint: 'Try again or send the magic link manually.',
+      hint: 'Try again or send the invite link manually.',
       action_link: actionLink || null
     })
   }
