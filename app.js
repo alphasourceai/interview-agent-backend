@@ -46,6 +46,8 @@ if (SENTRY_ENABLED) {
 const express = require('express')
 const cors = require('cors')
 const crypto = require('crypto')
+const fs = require('fs')
+const path = require('path')
 const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
 const { generateRubricAndKBForRole } = require('./generateRubric')
 const axios = require('axios')
@@ -94,8 +96,9 @@ function _inferEnvBase(env = process.env, fallbackFrontend = FRONTEND_URL) {
 }
 function authRedirect(mode, env) {
   const base = _inferEnvBase(env).replace(/\/+$/, '');
-  const qs = (mode === 'recovery') ? 'password_reset=1' : 'auth_callback=1';
-  return `${base}/account?${qs}`;
+  if (mode === 'recovery') return `${base}/set-password?mode=recovery`;
+  if (mode === 'signup') return `${base}/set-password?mode=signup`;
+  return `${base}/account?auth_callback=1`;
 }
 
 const SHOULD_RUN_REDIRECT_TESTS =
@@ -115,7 +118,8 @@ if (SHOULD_RUN_REDIRECT_TESTS) {
     test('prefers explicit redirect base URL', () => {
       const env = buildEnv({ REDIRECT_BASE_URL: 'https://custom.example/base/' });
       assert.equal(_inferEnvBase(env), 'https://custom.example/base');
-      assert.equal(authRedirect('recovery', env), 'https://custom.example/base/account?password_reset=1');
+      assert.equal(authRedirect('recovery', env), 'https://custom.example/base/set-password?mode=recovery');
+      assert.equal(authRedirect('signup', env), 'https://custom.example/base/set-password?mode=signup');
     });
 
     test('falls back to AUTH_REDIRECT_BASE when REDIRECT_BASE_URL is absent', () => {
@@ -587,11 +591,40 @@ const adminRouter = express.Router()
 
 // --- Password reset (Admin-triggered) ---
 // Helper: send HTML email via SendGrid
-async function _sendgridSend({ to, subject, html }) {
+const INLINE_LOGO_PATH = path.join(__dirname, 'assets', 'alpha-logo.png')
+let inlineLogoBase64 = undefined
+
+function getInlineLogo() {
+  if (inlineLogoBase64 !== undefined) {
+    return inlineLogoBase64
+  }
+  try {
+    const file = fs.readFileSync(INLINE_LOGO_PATH)
+    inlineLogoBase64 = file.toString('base64')
+  } catch (err) {
+    console.warn('[sendgrid.inline_logo] unavailable:', err?.message || err)
+    inlineLogoBase64 = null
+  }
+  return inlineLogoBase64
+}
+
+async function _sendgridSend({ to, subject, html, attachments = [] }) {
   const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || process.env.SENDGRID_KEY;
   const FROM = process.env.SENDGRID_FROM || process.env.SENDGRID_FROM_EMAIL || 'info@alphasourceai.com';
   if (!SENDGRID_API_KEY) throw new Error('missing SENDGRID_API_KEY');
   if (!FROM) throw new Error('missing SENDGRID_FROM');
+
+  const finalAttachments = Array.isArray(attachments) ? [...attachments] : [];
+  const logo = getInlineLogo();
+  if (logo && !finalAttachments.some(att => att?.content_id === 'alpha-logo')) {
+    finalAttachments.push({
+      content: logo,
+      filename: 'alpha-logo.png',
+      type: 'image/png',
+      disposition: 'inline',
+      content_id: 'alpha-logo'
+    });
+  }
 
   const payload = {
     personalizations: [{ to: [{ email: to }] }],
@@ -599,6 +632,9 @@ async function _sendgridSend({ to, subject, html }) {
     subject,
     content: [{ type: 'text/html', value: html }]
   };
+  if (finalAttachments.length > 0) {
+    payload.attachments = finalAttachments;
+  }
 
   await axios.post('https://api.sendgrid.com/v3/mail/send', payload, {
     headers: {
@@ -614,9 +650,12 @@ function _extractActionLink(data) {
   return data.action_link || data.properties?.action_link || null;
 }
 
-async function generateRecoveryLink(email, redirectTo) {
+const SUPPORTED_LINK_TYPES = new Set(['recovery', 'signup', 'magiclink', 'invite']);
+
+async function generateAuthLink(type, email, redirectTo) {
+  const resolvedType = SUPPORTED_LINK_TYPES.has(type) ? type : 'recovery';
   const { data, error } = await supabaseAdmin.auth.admin.generateLink({
-    type: 'recovery',
+    type: resolvedType,
     email,
     options: { redirectTo }
   });
@@ -641,7 +680,11 @@ async function generateRecoveryLink(email, redirectTo) {
   };
 }
 
-async function ensureUserHasRecoveryLink(email, redirectTo) {
+async function generateRecoveryLink(email, redirectTo) {
+  return generateAuthLink('recovery', email, redirectTo);
+}
+
+async function ensureUserHasRecoveryLink(email, redirectTo, linkType = 'recovery') {
   const normalizedEmail = String(email || '').trim().toLowerCase();
   if (!normalizedEmail) {
     return { userId: null, actionLink: null, error: new Error('email_required') };
@@ -666,14 +709,14 @@ async function ensureUserHasRecoveryLink(email, redirectTo) {
   }
 
   try {
-    const { actionLink, userId: linkUserId } = await generateRecoveryLink(normalizedEmail, redirectTo);
+    const { actionLink, userId: linkUserId } = await generateAuthLink(linkType, normalizedEmail, redirectTo);
     return {
       userId: linkUserId || userId,
       actionLink,
       error: null
     };
   } catch (err) {
-    console.error('[ensureUserHasRecoveryLink] generateRecoveryLink failed:', err?.message || err);
+    console.error('[ensureUserHasRecoveryLink] generateAuthLink failed:', err?.message || err);
     return {
       userId,
       actionLink: null,
@@ -747,7 +790,7 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
               <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
                 <tr>
                   <td style="padding:24px 24px 0 24px;" align="left">
-                    <img src="https://www.alphasourceai.com/alpha-logo.png" alt="alphaSource" style="height:48px;display:block;" />
+                <img src="cid:alpha-logo" alt="alphaSource" style="height:48px;display:block;" />
                   </td>
                 </tr>
                 <tr>
@@ -762,10 +805,9 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
                         Reset password
                       </a>
                     </p>
-                    <p style="margin:0 0 10px 0;font-size:12px;color:#bfc6e0;">
-                      Or paste this link into your browser:
+                    <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;">
+                      Having trouble with the button? <a href="${final_link}" style="color:#C3B4F3;text-decoration:none;font-weight:600;">Click here</a>.
                     </p>
-                    <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;word-break:break-all;">${final_link}</p>
                     <p style="margin:0;font-size:12px;color:#93a0c6;">
                       If you didn’t request this, you can safely ignore this email.
                     </p>
@@ -835,7 +877,7 @@ adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) 
           <tr><td align="center" style="padding:32px 16px;">
             <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
               <tr><td style="padding:24px 24px 0 24px;" align="left">
-                <img src="https://www.alphasourceai.com/alpha-logo.png" alt="alphaSource" style="height:48px;display:block;" />
+                <img src="cid:alpha-logo" alt="alphaSource" style="height:48px;display:block;" />
               </td></tr>
               <tr><td style="padding:24px;" align="left">
                 <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Reset your password</h1>
@@ -843,8 +885,9 @@ adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) 
                 <p style="margin:0 0 28px 0;">
                   <a href="${final_link}" style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">Reset password</a>
                 </p>
-                <p style="margin:0 0 10px 0;font-size:12px;color:#bfc6e0;">Or paste this link into your browser:</p>
-                <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;word-break:break-all;">${final_link}</p>
+                <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;">
+                  Having trouble with the button? <a href="${final_link}" style="color:#C3B4F3;text-decoration:none;font-weight:600;">Click here</a>.
+                </p>
               </td></tr>
             </table>
           </td></tr>
@@ -861,8 +904,8 @@ adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) 
 });
 
 // Helper: ensure a user exists and returns a password setup (recovery) link
-async function ensureUserRecoveryLink(email, redirectTo) {
-  const result = await ensureUserHasRecoveryLink(email, redirectTo);
+async function ensureUserRecoveryLink(email, redirectTo, linkType = 'recovery') {
+  const result = await ensureUserHasRecoveryLink(email, redirectTo, linkType);
   return { userId: result.userId, actionLink: result.actionLink };
 }
 
@@ -902,8 +945,8 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   // Optionally seed an admin member
   let seeded_member = null
   if (adminEmail) {
-    const redirectTo = authRedirect('recovery')
-    const { userId, actionLink } = await ensureUserRecoveryLink(adminEmail, redirectTo)
+    const redirectTo = authRedirect('signup')
+    const { userId, actionLink } = await ensureUserRecoveryLink(adminEmail, redirectTo, 'signup')
 
     if (!userId) {
       console.error('seed_member_no_user_id', { email: adminEmail })
@@ -1075,8 +1118,8 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   const role = (req.body?.role || 'member').toLowerCase()
   if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
 
-  const redirectTo = authRedirect('recovery')
-  console.log('[auth.redirect.recovery]', {
+  const redirectTo = authRedirect('signup')
+  console.log('[auth.redirect.signup]', {
     redirectTo,
     env: {
       REDIRECT_BASE_URL: process.env.REDIRECT_BASE_URL || null,
@@ -1085,7 +1128,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
       FRONTEND_URL: process.env.FRONTEND_URL || null
     }
   })
-  const { userId, actionLink } = await ensureUserRecoveryLink(email, redirectTo)
+  const { userId, actionLink } = await ensureUserRecoveryLink(email, redirectTo, 'signup')
 
   if (!userId) {
     console.error('add_member_no_user_id', { email })
@@ -1098,7 +1141,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   }
 
   if (!actionLink) {
-    console.error('add_member_no_recovery_link', { email })
+    console.error('add_member_no_signup_link', { email })
     return res.status(500).json({ error: 'generate_link_failed', detail: 'no_action_link' })
   }
 
@@ -1124,7 +1167,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
           <tr><td align="center" style="padding:32px 16px;">
             <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
               <tr><td style="padding:24px 24px 0 24px;" align="left">
-                <img src="https://www.alphasourceai.com/alpha-logo.png" alt="alphaSource" style="height:48px;display:block;" />
+                <img src="cid:alpha-logo" alt="alphaSource" style="height:48px;display:block;" />
               </td></tr>
               <tr><td style="padding:24px;" align="left">
                 <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Set up your alphaSource password</h1>
@@ -1137,8 +1180,9 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
                     Set your password
                   </a>
                 </p>
-                <p style="margin:0 0 10px 0;font-size:12px;color:#bfc6e0;">Or paste this link into your browser:</p>
-                <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;word-break:break-all;">${actionLink}</p>
+                <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;">
+                  Having trouble with the button? <a href="${actionLink}" style="color:#C3B4F3;text-decoration:none;font-weight:600;">Click here</a>.
+                </p>
                 <p style="margin:0;font-size:12px;color:#93a0c6;">Questions? Email <a href="mailto:info@alphasourceai.com" style="color:#C3B4F3;">info@alphasourceai.com</a>.</p>
               </td></tr>
             </table>
@@ -1154,6 +1198,70 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
     console.error('sendgrid_invite_failed:', e?.message || e);
   }
   res.json({ item: { ...m, id: m.user_id || m.email } })
+})
+
+adminRouter.delete('/client-members', requireAuth, requireAdmin, async (req, res) => {
+  const userId = typeof req.body?.user_id === 'string' ? req.body.user_id.trim() : ''
+  const emailRaw = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ''
+  const clientId = typeof req.body?.client_id === 'string' ? req.body.client_id.trim() : ''
+
+  if (!userId && !emailRaw) {
+    return res.status(400).json({ error: 'user_id_or_email_required' })
+  }
+
+  const applyFilters = (builder) => {
+    if (userId) {
+      builder = builder.eq('user_id', userId)
+    } else {
+      builder = builder.eq('email', emailRaw)
+    }
+    if (clientId) builder = builder.eq('client_id', clientId)
+    return builder
+  }
+
+  try {
+    const { data: matches, error: fetchErr } = await applyFilters(
+      supabaseAdmin
+        .from('client_members')
+        .select('client_id,user_id,email')
+    )
+
+    if (fetchErr) {
+      console.error('[admin.remove-member] select_failed:', fetchErr.message)
+      return res.status(500).json({ error: 'remove_member_failed', detail: fetchErr.message })
+    }
+
+    const rows = Array.isArray(matches) ? matches : []
+    if (rows.length === 0) {
+      return res.json({ ok: true, removed: 0 })
+    }
+
+    if (!clientId) {
+      const uniqueClients = new Set(rows.map(r => r.client_id).filter(Boolean))
+      if (uniqueClients.size > 1) {
+        return res.status(400).json({
+          error: 'ambiguous_membership',
+          detail: 'Multiple client memberships found. Provide client_id to remove a specific membership.'
+        })
+      }
+    }
+
+    const { error: deleteErr } = await applyFilters(
+      supabaseAdmin
+        .from('client_members')
+        .delete()
+    )
+
+    if (deleteErr) {
+      console.error('[admin.remove-member] delete_failed:', deleteErr.message)
+      return res.status(500).json({ error: 'remove_member_failed', detail: deleteErr.message })
+    }
+
+    return res.json({ ok: true, removed: rows.length })
+  } catch (e) {
+    console.error('[admin.remove-member] unexpected:', e?.message || e)
+    return res.status(500).json({ error: 'remove_member_failed', detail: e?.message || String(e) })
+  }
 })
 
 

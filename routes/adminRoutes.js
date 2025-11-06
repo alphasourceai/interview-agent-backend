@@ -37,8 +37,9 @@ function _inferEnvBase(env = process.env, fallbackFrontend = FRONTEND_URL) {
 }
 function authRedirect(mode, env) {
   const base = _inferEnvBase(env).replace(/\/+$/, '');
-  const qs = (mode === 'recovery') ? 'password_reset=1' : 'auth_callback=1';
-  return `${base}/account?${qs}`;
+  if (mode === 'recovery') return `${base}/set-password?mode=recovery`;
+  if (mode === 'signup') return `${base}/set-password?mode=signup`;
+  return `${base}/account?auth_callback=1`;
 }
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
@@ -58,9 +59,12 @@ function errPayload({ code = 'internal_error', message = 'Unexpected error', det
 const _extractActionLink = (data) =>
   data?.action_link || data?.properties?.action_link || null;
 
-async function generateRecoveryLink(email, redirectTo) {
+const SUPPORTED_LINK_TYPES = new Set(['recovery', 'signup', 'magiclink', 'invite']);
+
+async function generateAuthLink(type, email, redirectTo) {
+  const resolvedType = SUPPORTED_LINK_TYPES.has(type) ? type : 'recovery';
   const { data, error } = await supabaseAdmin.auth.admin.generateLink({
-    type: 'recovery',
+    type: resolvedType,
     email,
     options: { redirectTo },
   });
@@ -84,7 +88,11 @@ async function generateRecoveryLink(email, redirectTo) {
   };
 }
 
-async function ensureUserHasRecoveryLink(email, redirectTo) {
+async function generateRecoveryLink(email, redirectTo) {
+  return generateAuthLink('recovery', email, redirectTo);
+}
+
+async function ensureUserHasRecoveryLink(email, redirectTo, linkType = 'recovery') {
   const normalized = String(email || '').trim().toLowerCase();
   if (!normalized) {
     return { userId: null, actionLink: null, error: new Error('email_required') };
@@ -109,10 +117,10 @@ async function ensureUserHasRecoveryLink(email, redirectTo) {
   }
 
   try {
-    const { actionLink, userId: linkUserId } = await generateRecoveryLink(normalized, redirectTo);
+    const { actionLink, userId: linkUserId } = await generateAuthLink(linkType, normalized, redirectTo);
     return { userId: linkUserId || userId, actionLink, error: null };
   } catch (err) {
-    console.error('[ensureUserHasRecoveryLink] generateRecoveryLink failed:', err?.message || err);
+    console.error('[ensureUserHasRecoveryLink] generateAuthLink failed:', err?.message || err);
     return { userId, actionLink: null, error: err };
   }
 }
@@ -178,8 +186,8 @@ router.post('/client-members', async (req, res) => {
     }
 
     const emailNorm = String(email).trim().toLowerCase();
-    const redirectTo = authRedirect('recovery');
-    const { actionLink, error: ensureErr } = await ensureUserHasRecoveryLink(emailNorm, redirectTo);
+    const redirectTo = authRedirect('signup');
+    const { actionLink, error: ensureErr } = await ensureUserHasRecoveryLink(emailNorm, redirectTo, 'signup');
 
     if (!actionLink) {
       const detail = ensureErr?.message || ensureErr?.details?.message || 'no_action_link';
@@ -200,6 +208,70 @@ router.post('/client-members', async (req, res) => {
   } catch (e) {
     console.error('[invite] unexpected error', e);
     return res.status(500).json({ error: 'server_error', detail: e.message });
+  }
+});
+
+router.delete('/client-members', async (req, res) => {
+  const userId = typeof req.body?.user_id === 'string' ? req.body.user_id.trim() : '';
+  const emailRaw = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+  const clientId = typeof req.body?.client_id === 'string' ? req.body.client_id.trim() : '';
+
+  if (!userId && !emailRaw) {
+    return res.status(400).json({ error: 'user_id_or_email_required' });
+  }
+
+  const applyFilters = (builder) => {
+    if (userId) {
+      builder = builder.eq('user_id', userId);
+    } else {
+      builder = builder.eq('email', emailRaw);
+    }
+    if (clientId) builder = builder.eq('client_id', clientId);
+    return builder;
+  };
+
+  try {
+    const { data: matches, error: selectErr } = await applyFilters(
+      supabaseAdmin
+        .from('client_members')
+        .select('client_id,user_id,email')
+    );
+
+    if (selectErr) {
+      console.error('[invite.remove-member] select_failed', selectErr.message);
+      return res.status(500).json({ error: 'remove_member_failed', detail: selectErr.message });
+    }
+
+    const rows = Array.isArray(matches) ? matches : [];
+    if (rows.length === 0) {
+      return res.json({ ok: true, removed: 0 });
+    }
+
+    if (!clientId) {
+      const distinct = new Set(rows.map((r) => r.client_id).filter(Boolean));
+      if (distinct.size > 1) {
+        return res.status(400).json({
+          error: 'ambiguous_membership',
+          detail: 'Multiple memberships found. Provide client_id to remove a specific membership.'
+        });
+      }
+    }
+
+    const { error: deleteErr } = await applyFilters(
+      supabaseAdmin
+        .from('client_members')
+        .delete()
+    );
+
+    if (deleteErr) {
+      console.error('[invite.remove-member] delete_failed', deleteErr.message);
+      return res.status(500).json({ error: 'remove_member_failed', detail: deleteErr.message });
+    }
+
+    return res.json({ ok: true, removed: rows.length });
+  } catch (e) {
+    console.error('[invite.remove-member] unexpected', e?.message || e);
+    return res.status(500).json({ error: 'remove_member_failed', detail: e?.message || String(e) });
   }
 });
 
