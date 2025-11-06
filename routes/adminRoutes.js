@@ -7,24 +7,36 @@ const router = express.Router();
 // Environment
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const RESET_REDIRECT_URL = process.env.RESET_REDIRECT_URL || 'https://www.alphasourceai.com/account';
-
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
-function _inferEnvBase() {
-  const explicit = (process.env.REDIRECT_BASE_URL || process.env.AUTH_REDIRECT_BASE || '').trim();
-  if (explicit) return explicit.replace(/\/+$/, '');
-  const svc = (process.env.RENDER_SERVICE_NAME || process.env.RENDER_EXTERNAL_URL || '').toLowerCase();
-  const fe = (process.env.FRONTEND_URL || FRONTEND_URL || '').toLowerCase();
-  if (fe.includes('qa')) return 'https://ia-frontend-qa.onrender.com';
-  if (fe.includes('staging')) return 'https://ia-frontend-staging.onrender.com';
-  if (fe.includes('prod')) return 'https://www.alphasourceai.com';
+function _inferEnvBase(env = process.env, fallbackFrontend = FRONTEND_URL) {
+  const read = (key) => {
+    const value = env?.[key];
+    return typeof value === 'string' ? value : '';
+  };
+
+  const explicitSrc = `${read('REDIRECT_BASE_URL') || read('AUTH_REDIRECT_BASE')}`.trim();
+  if (explicitSrc) return explicitSrc.replace(/\/+$/, '');
+
+  const sentry = read('SENTRY_ENV').toLowerCase();
+  if (sentry.includes('qa')) return 'https://ia-frontend-qa.onrender.com';
+  if (sentry.includes('stag')) return 'https://ia-frontend-staging.onrender.com';
+
+  const svc = (read('RENDER_SERVICE_NAME') || read('RENDER_EXTERNAL_URL')).toLowerCase();
+  const feCandidate = (read('FRONTEND_BASE') || read('FRONTEND_URL') || fallbackFrontend || '').toLowerCase();
+
+  if (feCandidate.includes('qa')) return 'https://ia-frontend-qa.onrender.com';
+  if (feCandidate.includes('staging')) return 'https://ia-frontend-staging.onrender.com';
+  if (feCandidate.includes('prod') || feCandidate.includes('alphasourceai.com')) return 'https://www.alphasourceai.com';
+
   if (svc.includes('-qa')) return 'https://ia-frontend-qa.onrender.com';
   if (svc.includes('-staging')) return 'https://ia-frontend-staging.onrender.com';
   if (svc.includes('-prod')) return 'https://www.alphasourceai.com';
-  return (process.env.NODE_ENV === 'production') ? 'https://www.alphasourceai.com' : 'http://localhost:5173';
+
+  const nodeEnv = (read('NODE_ENV') || process.env.NODE_ENV || '').toLowerCase();
+  return nodeEnv === 'production' ? 'https://www.alphasourceai.com' : 'http://localhost:5173';
 }
-function authRedirect(mode) {
-  const base = _inferEnvBase().replace(/\/+$/, '');
+function authRedirect(mode, env) {
+  const base = _inferEnvBase(env).replace(/\/+$/, '');
   const qs = (mode === 'recovery') ? 'password_reset=1' : 'auth_callback=1';
   return `${base}/account?${qs}`;
 }
@@ -41,6 +53,68 @@ const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 
 function errPayload({ code = 'internal_error', message = 'Unexpected error', detail = null, hint = null }, status = 500) {
   return { status, body: { error: message, code, detail, hint, request_id: undefined } };
+}
+
+const _extractActionLink = (data) =>
+  data?.action_link || data?.properties?.action_link || null;
+
+async function generateRecoveryLink(email, redirectTo) {
+  const { data, error } = await supabaseAdmin.auth.admin.generateLink({
+    type: 'recovery',
+    email,
+    options: { redirectTo },
+  });
+
+  if (error) {
+    const err = new Error(error.message || 'generate_link_failed');
+    err.details = error;
+    throw err;
+  }
+
+  const actionLink = _extractActionLink(data);
+  if (!actionLink) {
+    const err = new Error('no_action_link');
+    err.details = { data };
+    throw err;
+  }
+
+  return {
+    actionLink,
+    userId: data?.user?.id || null,
+  };
+}
+
+async function ensureUserHasRecoveryLink(email, redirectTo) {
+  const normalized = String(email || '').trim().toLowerCase();
+  if (!normalized) {
+    return { userId: null, actionLink: null, error: new Error('email_required') };
+  }
+
+  let userId = null;
+  const createResp = await supabaseAdmin.auth.admin.createUser({
+    email: normalized,
+    email_confirm: true,
+  });
+
+  if (createResp?.data?.user?.id) {
+    userId = createResp.data.user.id;
+  }
+
+  const createErr = createResp?.error;
+  if (createErr) {
+    const msg = createErr.message || '';
+    if (!/already exists/i.test(msg)) {
+      console.error('[ensureUserHasRecoveryLink] createUser failed:', msg);
+    }
+  }
+
+  try {
+    const { actionLink, userId: linkUserId } = await generateRecoveryLink(normalized, redirectTo);
+    return { userId: linkUserId || userId, actionLink, error: null };
+  } catch (err) {
+    console.error('[ensureUserHasRecoveryLink] generateRecoveryLink failed:', err?.message || err);
+    return { userId, actionLink: null, error: err };
+  }
 }
 
 // POST /admin/users/:userId/reset-password
@@ -69,22 +143,15 @@ router.post('/users/:userId/reset-password', async (req, res) => {
       }
     }
 
-    // Generate a password recovery link
-    const { data: linkData, error: linkError } = await supabaseAdmin.auth.admin.createLink({
-      type: 'recovery',
-      email,
-      options: { redirectTo: authRedirect('recovery') },
-    });
-
-    if (linkError) {
-      console.error('[reset-password] createLink error', linkError);
-      const p = errPayload({ code: 'link_create_failed', message: 'Could not generate reset link', detail: linkError.message });
-      return res.status(p.status).json(p.body);
-    }
-
-    const reset_link = linkData?.properties?.action_link || linkData?.action_link;
-    if (!reset_link) {
-      const p = errPayload({ code: 'link_missing', message: 'Reset link not returned from Supabase' });
+    let reset_link = null;
+    try {
+      const { actionLink } = await generateRecoveryLink(email, authRedirect('recovery'));
+      reset_link = actionLink;
+    } catch (err) {
+      console.error('[reset-password] generateRecoveryLink error', err?.message || err);
+      const p = errPayload(
+        { code: 'link_create_failed', message: 'Could not generate reset link', detail: err?.details?.message || err?.message },
+      );
       return res.status(p.status).json(p.body);
     }
 
@@ -111,41 +178,20 @@ router.post('/client-members', async (req, res) => {
     }
 
     const emailNorm = String(email).trim().toLowerCase();
+    const redirectTo = authRedirect('recovery');
+    const { actionLink, error: ensureErr } = await ensureUserHasRecoveryLink(emailNorm, redirectTo);
 
-    // Generate signup link (no Supabase default email)
-    const { data: linkData, error: linkError } = await supabaseAdmin.auth.admin.generateLink({
-      type: 'signup',
-      email: emailNorm,
-      options: {
-        data: { name, role },
-        redirectTo: authRedirect('magic'),
-      },
-    });
-
-    let inviteLink = linkData?.action_link || linkData?.properties?.action_link;
-    if (linkError || !inviteLink) {
-      // fallback: if user already exists, try recovery link
-      const { data: recData, error: recErr } = await supabaseAdmin.auth.admin.generateLink({
-        type: 'recovery',
-        email: emailNorm,
-        options: { redirectTo: authRedirect('recovery') },
-      });
-      if (recErr) {
-        console.error('[invite] recovery link failed', recErr);
-        return res.status(400).json({ error: recErr.message || 'generate_recovery_failed' });
-      }
-      inviteLink = recData?.action_link || recData?.properties?.action_link;
-    }
-
-    if (!inviteLink) {
-      return res.status(400).json({ error: 'invite_link_missing' });
+    if (!actionLink) {
+      const detail = ensureErr?.message || ensureErr?.details?.message || 'no_action_link';
+      console.error('[invite] recovery link failed', detail);
+      return res.status(500).json({ error: 'generate_link_failed', detail });
     }
 
     // Send branded invite via SendGrid
     await sendPasswordResetEmail({
       to: emailNorm,
       name,
-      reset_link: inviteLink,
+      reset_link: actionLink,
     });
 
     console.log(`[invite] Branded invite sent to ${emailNorm}`);
@@ -170,19 +216,13 @@ router.post('/reset-password', async (req, res) => {
     }
     const emailNorm = String(email).trim().toLowerCase();
 
-    const { data: linkData, error: linkError } = await supabaseAdmin.auth.admin.generateLink({
-      type: 'recovery',
-      email: emailNorm,
-      options: { redirectTo: authRedirect('recovery') },
-    });
-    if (linkError) {
-      console.error('[reset-password] generateLink(recovery) error', linkError);
-      return res.status(500).json({ error: 'generate_link_failed', detail: linkError.message });
-    }
-
-    const reset_link = linkData?.action_link || linkData?.properties?.action_link;
-    if (!reset_link) {
-      return res.status(500).json({ error: 'link_missing' });
+    let reset_link = null;
+    try {
+      const { actionLink } = await generateRecoveryLink(emailNorm, authRedirect('recovery'));
+      reset_link = actionLink;
+    } catch (err) {
+      console.error('[reset-password] generateRecoveryLink error', err?.message || err);
+      return res.status(500).json({ error: 'generate_link_failed', detail: err?.details?.message || err?.message });
     }
 
     await sendPasswordResetEmail({ to: emailNorm, name, reset_link });
@@ -192,5 +232,8 @@ router.post('/reset-password', async (req, res) => {
     return res.status(500).json({ error: 'server_error', detail: e?.message || String(e) });
   }
 });
+
+export const __authRedirect = { authRedirect, _inferEnvBase };
+export const __recoveryHelpers = { generateRecoveryLink, ensureUserHasRecoveryLink };
 
 export default router;

@@ -58,37 +58,97 @@ const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || 
  * - Infers QA/Staging/Prod from SENTRY_ENV, FRONTEND_URL, or Render service hints
  * - Defaults to localhost in dev and www.alphasourceai.com in production
  */
-function _inferEnvBase() {
-  const explicit = (process.env.REDIRECT_BASE_URL || process.env.AUTH_REDIRECT_BASE || '').trim();
-  if (explicit) return explicit.replace(/\/+$/, '');
+function _inferEnvBase(env = process.env, fallbackFrontend = FRONTEND_URL) {
+  const read = (key) => {
+    const value = env?.[key];
+    return typeof value === 'string' ? value : '';
+  };
+
+  const explicitSrc = `${read('REDIRECT_BASE_URL') || read('AUTH_REDIRECT_BASE')}`.trim();
+  if (explicitSrc) return explicitSrc.replace(/\/+$/, '');
 
   // Prefer SENTRY_ENV hints when present
-  const sentry = (process.env.SENTRY_ENV || '').toLowerCase();
+  const sentry = read('SENTRY_ENV').toLowerCase();
   if (sentry.includes('qa')) return 'https://ia-frontend-qa.onrender.com';
   if (sentry.includes('stag')) return 'https://ia-frontend-staging.onrender.com';
 
-  const svc = (process.env.RENDER_SERVICE_NAME || process.env.RENDER_EXTERNAL_URL || '').toLowerCase();
-  const fe = (process.env.FRONTEND_URL || FRONTEND_URL || '').toLowerCase();
+  const svc = (read('RENDER_SERVICE_NAME') || read('RENDER_EXTERNAL_URL')).toLowerCase();
+  const feCandidate = (read('FRONTEND_BASE') || read('FRONTEND_URL') || fallbackFrontend || '').toLowerCase();
 
   // Prefer explicit FE env URLs if present
-  if (fe.includes('qa')) return 'https://ia-frontend-qa.onrender.com';
-  if (fe.includes('staging')) return 'https://ia-frontend-staging.onrender.com';
-  if (fe.includes('prod') || fe.includes('alphasourceai.com')) return 'https://www.alphasourceai.com';
+  if (feCandidate.includes('qa')) return 'https://ia-frontend-qa.onrender.com';
+  if (feCandidate.includes('staging')) return 'https://ia-frontend-staging.onrender.com';
+  if (feCandidate.includes('prod') || feCandidate.includes('alphasourceai.com')) return 'https://www.alphasourceai.com';
 
   // Fallback to Render service name hints
   if (svc.includes('-qa')) return 'https://ia-frontend-qa.onrender.com';
   if (svc.includes('-staging')) return 'https://ia-frontend-staging.onrender.com';
   if (svc.includes('-prod')) return 'https://www.alphasourceai.com';
 
+  const nodeEnv = (read('NODE_ENV') || process.env.NODE_ENV || '').toLowerCase();
+
   // Local/dev default
-  return (process.env.NODE_ENV === 'production')
+  return nodeEnv === 'production'
     ? 'https://www.alphasourceai.com'
     : 'http://localhost:5173';
 }
-function authRedirect(mode) {
-  const base = _inferEnvBase().replace(/\/+$/, '');
+function authRedirect(mode, env) {
+  const base = _inferEnvBase(env).replace(/\/+$/, '');
   const qs = (mode === 'recovery') ? 'password_reset=1' : 'auth_callback=1';
   return `${base}/account?${qs}`;
+}
+
+const SHOULD_RUN_REDIRECT_TESTS =
+  process.argv.some(arg => /app\.reset\.redirect\.test\.js$/.test(arg)) ||
+  process.env.RUN_REDIRECT_TESTS === '1';
+
+if (SHOULD_RUN_REDIRECT_TESTS) {
+  const { describe, test } = require('node:test');
+  const assert = require('node:assert/strict');
+
+  const buildEnv = (overrides = {}) => ({
+    NODE_ENV: 'development',
+    ...overrides,
+  });
+
+  describe('authRedirect resolver', () => {
+    test('prefers explicit redirect base URL', () => {
+      const env = buildEnv({ REDIRECT_BASE_URL: 'https://custom.example/base/' });
+      assert.equal(_inferEnvBase(env), 'https://custom.example/base');
+      assert.equal(authRedirect('recovery', env), 'https://custom.example/base/account?password_reset=1');
+    });
+
+    test('falls back to AUTH_REDIRECT_BASE when REDIRECT_BASE_URL is absent', () => {
+      const env = buildEnv({ AUTH_REDIRECT_BASE: 'https://alt.example/auth' });
+      assert.equal(authRedirect('magic', env), 'https://alt.example/auth/account?auth_callback=1');
+    });
+
+    test('uses SENTRY_ENV hints for QA/Staging', () => {
+      const qaEnv = buildEnv({ SENTRY_ENV: 'qa-fleet' });
+      assert.equal(_inferEnvBase(qaEnv), 'https://ia-frontend-qa.onrender.com');
+
+      const stagEnv = buildEnv({ SENTRY_ENV: 'staging-run' });
+      assert.equal(_inferEnvBase(stagEnv), 'https://ia-frontend-staging.onrender.com');
+    });
+
+    test('infers from FRONTEND_URL when set', () => {
+      const env = buildEnv({ FRONTEND_URL: 'https://www.alphasourceai.com/app' });
+      assert.equal(_inferEnvBase(env), 'https://www.alphasourceai.com');
+    });
+
+    test('falls back to Render service hints', () => {
+      const env = buildEnv({ RENDER_SERVICE_NAME: 'worker-qa' });
+      assert.equal(_inferEnvBase(env), 'https://ia-frontend-qa.onrender.com');
+    });
+
+    test('defaults to localhost in development and prod base in production', () => {
+      const devEnv = buildEnv();
+      assert.equal(_inferEnvBase(devEnv), 'http://localhost:5173');
+
+      const prodEnv = buildEnv({ NODE_ENV: 'production' });
+      assert.equal(_inferEnvBase(prodEnv), 'https://www.alphasourceai.com');
+    });
+  });
 }
 const app = express()
 
@@ -549,6 +609,79 @@ async function _sendgridSend({ to, subject, html }) {
   });
 }
 
+function _extractActionLink(data) {
+  if (!data || typeof data !== 'object') return null;
+  return data.action_link || data.properties?.action_link || null;
+}
+
+async function generateRecoveryLink(email, redirectTo) {
+  const { data, error } = await supabaseAdmin.auth.admin.generateLink({
+    type: 'recovery',
+    email,
+    options: { redirectTo }
+  });
+
+  if (error) {
+    const err = new Error(error.message || 'generate_link_failed');
+    err.details = error;
+    throw err;
+  }
+
+  const actionLink = _extractActionLink(data);
+  if (!actionLink) {
+    const err = new Error('no_action_link');
+    err.details = { data };
+    throw err;
+  }
+
+  return {
+    actionLink,
+    userId: data?.user?.id || null,
+    raw: data
+  };
+}
+
+async function ensureUserHasRecoveryLink(email, redirectTo) {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (!normalizedEmail) {
+    return { userId: null, actionLink: null, error: new Error('email_required') };
+  }
+
+  let userId = null;
+  const ensureResp = await supabaseAdmin.auth.admin.createUser({
+    email: normalizedEmail,
+    email_confirm: true
+  });
+
+  if (ensureResp?.data?.user?.id) {
+    userId = ensureResp.data.user.id;
+  }
+
+  const ensureErr = ensureResp?.error;
+  if (ensureErr) {
+    const msg = ensureErr.message || '';
+    if (!/already exists/i.test(msg)) {
+      console.error('[ensureUserHasRecoveryLink] createUser failed:', msg);
+    }
+  }
+
+  try {
+    const { actionLink, userId: linkUserId } = await generateRecoveryLink(normalizedEmail, redirectTo);
+    return {
+      userId: linkUserId || userId,
+      actionLink,
+      error: null
+    };
+  } catch (err) {
+    console.error('[ensureUserHasRecoveryLink] generateRecoveryLink failed:', err?.message || err);
+    return {
+      userId,
+      actionLink: null,
+      error: err
+    };
+  }
+}
+
 // POST /admin/users/:userId/reset-password
 // Optional body: { email?: string, redirect_to?: string }
 adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, async (req, res) => {
@@ -588,38 +721,14 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
       }
     });
 
-    // Generate a recovery link
-    const linkResp = await supabaseAdmin.auth.admin.generateLink({
-      type: 'recovery',
-      email,
-      options: { redirectTo }
-    });
-
-    let final_link = linkResp?.data?.action_link || null;
-    let mode = 'recovery';
-
-    if (!final_link) {
-      const detail = linkResp?.error?.message || 'no_action_link';
-      console.warn('[admin.reset-password] recovery returned no action_link, trying invite', { email, detail });
-
-      try {
-        const inviteResp = await supabaseAdmin.auth.admin.generateLink({
-          type: 'invite',
-          email,
-          options: { redirectTo }
-        });
-        final_link = inviteResp?.data?.action_link || null;
-        if (final_link) {
-          mode = 'invite';
-          console.log('[auth.recovery.fallback_to_invite]', { email });
-        }
-      } catch (e) {
-        console.error('[admin.reset-password] invite fallback failed:', e?.message || e);
-      }
-    }
-
-    if (!final_link) {
-      return res.status(500).json({ error: 'generate_link_failed', detail: 'no_action_link' });
+    let final_link = null;
+    try {
+      const { actionLink } = await generateRecoveryLink(email, redirectTo);
+      final_link = actionLink;
+    } catch (err) {
+      console.error('[admin.reset-password] generateLink(recovery) failed:', err?.message || err);
+      const detail = err?.details?.message || err?.message || 'generate_link_failed';
+      return res.status(500).json({ error: 'generate_link_failed', detail });
     }
 
     // Branded minimal HTML (aligns with current brand; can be swapped to a SendGrid template later)
@@ -682,7 +791,7 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
       html
     });
 
-    return res.json({ ok: true, email, sent_via: 'sendgrid', mode });
+    return res.json({ ok: true, email, sent_via: 'sendgrid', mode: 'recovery' });
   } catch (e) {
     console.error('reset_password_admin_failed:', e?.message || e);
     return res.status(500).json({ error: 'reset_password_admin_failed', detail: e?.message || String(e) });
@@ -707,40 +816,14 @@ adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) 
       }
     });
 
-    const linkResp = await supabaseAdmin.auth.admin.generateLink({
-      type: 'recovery',
-      email,
-      options: { redirectTo }
-    });
-    if (linkResp?.error) {
-      console.error('[admin.reset-password] generateLink error:', linkResp.error.message || linkResp.error);
-    }
-
-    let final_link = linkResp?.data?.action_link || null;
-    let mode = 'recovery';
-
-    if (!final_link) {
-      const detail = linkResp?.error?.message || 'no_action_link';
-      console.warn('[admin.reset-password] recovery returned no action_link, trying invite', { email, detail });
-
-      try {
-        const inviteResp = await supabaseAdmin.auth.admin.generateLink({
-          type: 'invite',
-          email,
-          options: { redirectTo }
-        });
-        final_link = inviteResp?.data?.action_link || null;
-        if (final_link) {
-          mode = 'invite';
-          console.log('[auth.recovery.fallback_to_invite]', { email });
-        }
-      } catch (e) {
-        console.error('[admin.reset-password] invite fallback failed:', e?.message || e);
-      }
-    }
-
-    if (!final_link) {
-      return res.status(500).json({ error: 'generate_link_failed', detail: 'no_action_link' });
+    let final_link = null;
+    try {
+      const { actionLink } = await generateRecoveryLink(email, redirectTo);
+      final_link = actionLink;
+    } catch (err) {
+      console.error('[admin.reset-password] generateLink(recovery) failed:', err?.message || err);
+      const detail = err?.details?.message || err?.message || 'generate_link_failed';
+      return res.status(500).json({ error: 'generate_link_failed', detail });
     }
 
     const html = `
@@ -770,58 +853,17 @@ adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) 
       </html>
     `;
     await _sendgridSend({ to: email, subject: 'Reset your alphaSource password', html });
-    return res.json({ ok: true, email, sent_via: 'sendgrid', mode });
+    return res.json({ ok: true, email, sent_via: 'sendgrid', mode: 'recovery' });
   } catch (e) {
     console.error('reset_password_admin_email_failed:', e?.message || e);
     return res.status(500).json({ error: 'reset_password_admin_failed', detail: e?.message || String(e) });
   }
 });
 
-// Helper: ensure a user exists and generate an invite (password-setup) or recovery link (no magic links)
-async function ensureUserIdAndInviteLink(email, redirectTo) {
-  let userId = null;
-  let actionLink = null;
-
-  try {
-    const link = await supabaseAdmin.auth.admin.generateLink({
-      type: 'invite',
-      email,
-      options: { redirectTo }
-    });
-    userId = link?.data?.user?.id || null;
-    actionLink = link?.data?.action_link || null;
-  } catch (e) {
-    console.error('generateLink(invite) failed:', e?.message || e);
-  }
-
-  if (!actionLink) {
-    try {
-      const link2 = await supabaseAdmin.auth.admin.generateLink({
-        type: 'recovery',
-        email,
-        options: { redirectTo }
-      });
-      userId = link2?.data?.user?.id || userId;
-      actionLink = link2?.data?.action_link || actionLink;
-      if (actionLink) console.log('[auth.invite.fallback_to_recovery]', { email });
-    } catch (e) {
-      console.error('generateLink(recovery) fallback failed:', e?.message || e);
-    }
-  }
-
-  if (!userId) {
-    try {
-      const created = await supabaseAdmin.auth.admin.createUser({
-        email,
-        email_confirm: true
-      });
-      userId = created?.data?.user?.id || userId;
-    } catch (e) {
-      console.error('createUser failed:', e?.message || e);
-    }
-  }
-
-  return { userId, actionLink };
+// Helper: ensure a user exists and returns a password setup (recovery) link
+async function ensureUserRecoveryLink(email, redirectTo) {
+  const result = await ensureUserHasRecoveryLink(email, redirectTo);
+  return { userId: result.userId, actionLink: result.actionLink };
 }
 
 // List all clients
@@ -861,7 +903,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   let seeded_member = null
   if (adminEmail) {
     const redirectTo = authRedirect('recovery')
-    const { userId, actionLink } = await ensureUserIdAndInviteLink(adminEmail, redirectTo)
+    const { userId, actionLink } = await ensureUserRecoveryLink(adminEmail, redirectTo)
 
     if (!userId) {
       console.error('seed_member_no_user_id', { email: adminEmail })
@@ -1034,7 +1076,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
 
   const redirectTo = authRedirect('recovery')
-  console.log('[auth.redirect.invite]', {
+  console.log('[auth.redirect.recovery]', {
     redirectTo,
     env: {
       REDIRECT_BASE_URL: process.env.REDIRECT_BASE_URL || null,
@@ -1043,7 +1085,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
       FRONTEND_URL: process.env.FRONTEND_URL || null
     }
   })
-  const { userId, actionLink } = await ensureUserIdAndInviteLink(email, redirectTo)
+  const { userId, actionLink } = await ensureUserRecoveryLink(email, redirectTo)
 
   if (!userId) {
     console.error('add_member_no_user_id', { email })
@@ -1053,6 +1095,11 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
       hint: 'Try again or send the invite link manually.',
       action_link: actionLink || null
     })
+  }
+
+  if (!actionLink) {
+    console.error('add_member_no_recovery_link', { email })
+    return res.status(500).json({ error: 'generate_link_failed', detail: 'no_action_link' })
   }
 
   const payload = { client_id, email, name, role, user_id: userId }
@@ -1080,14 +1127,14 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
                 <img src="https://www.alphasourceai.com/alpha-logo.png" alt="alphaSource" style="height:48px;display:block;" />
               </td></tr>
               <tr><td style="padding:24px;" align="left">
-                <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">You're invited to alphaSource</h1>
+                <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Set up your alphaSource password</h1>
                 <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">
-                  Click below to join the client workspace and set up your account.
+                  Use the button below to create your password and access the alphaSource client workspace.
                 </p>
                 <p style="margin:0 0 28px 0;">
                   <a href="${actionLink}"
                      style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">
-                    Accept invite &amp; sign in
+                    Set your password
                   </a>
                 </p>
                 <p style="margin:0 0 10px 0;font-size:12px;color:#bfc6e0;">Or paste this link into your browser:</p>
@@ -1100,7 +1147,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
       </body></html>`;
     await _sendgridSend({
       to: email,
-      subject: 'Your alphaSource invite',
+      subject: 'Set your alphaSource password',
       html: inviteHtml
     });
   } catch (e) {
@@ -1289,9 +1336,14 @@ app.use(function (err, req, res, next) {
 })
 
 // ---------- Start ----------
-const PORT = process.env.PORT || 3000
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`)
-})
+const shouldStartServer = require.main === module && !SHOULD_RUN_REDIRECT_TESTS;
+if (shouldStartServer) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
 
 module.exports = app
+module.exports.__authRedirect = { authRedirect, _inferEnvBase };
+module.exports.__redirectTestFlag = SHOULD_RUN_REDIRECT_TESTS;
