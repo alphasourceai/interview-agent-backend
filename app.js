@@ -48,6 +48,7 @@ const cors = require('cors')
 const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
+const { isDuplicateAuthError, isDuplicateDbError, DUPLICATE_EMAIL_RESPONSE } = require('./src/lib/clientMemberErrors')
 const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
 const { generateRubricAndKBForRole } = require('./generateRubric')
 const axios = require('axios')
@@ -96,7 +97,7 @@ function _inferEnvBase(env = process.env, fallbackFrontend = FRONTEND_URL) {
 }
 function authRedirect(mode, env) {
   const base = _inferEnvBase(env).replace(/\/+$/, '');
-  if (mode === 'recovery') return `${base}/set-password?mode=recovery`;
+  if (mode === 'recovery') return `${base}/set-password?mode=recovery&password_reset=1`;
   if (mode === 'signup') return `${base}/set-password?mode=signup`;
   return `${base}/account?auth_callback=1`;
 }
@@ -118,7 +119,7 @@ if (SHOULD_RUN_REDIRECT_TESTS) {
     test('prefers explicit redirect base URL', () => {
       const env = buildEnv({ REDIRECT_BASE_URL: 'https://custom.example/base/' });
       assert.equal(_inferEnvBase(env), 'https://custom.example/base');
-      assert.equal(authRedirect('recovery', env), 'https://custom.example/base/set-password?mode=recovery');
+      assert.equal(authRedirect('recovery', env), 'https://custom.example/base/set-password?mode=recovery&password_reset=1');
       assert.equal(authRedirect('signup', env), 'https://custom.example/base/set-password?mode=signup');
     });
 
@@ -626,11 +627,24 @@ async function _sendgridSend({ to, subject, html, attachments = [] }) {
     });
   }
 
+  const textContent = html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
   const payload = {
     personalizations: [{ to: [{ email: to }] }],
     from: { email: FROM, name: 'alphaSource' },
     subject,
-    content: [{ type: 'text/html', value: html }]
+    content: [
+      { type: 'text/plain', value: textContent || subject },
+      { type: 'text/html', value: html }
+    ],
+    tracking_settings: {
+      click_tracking: { enable: false, enable_text: false },
+      open_tracking: { enable: false }
+    }
   };
   if (finalAttachments.length > 0) {
     payload.attachments = finalAttachments;
@@ -906,7 +920,7 @@ adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) 
 // Helper: ensure a user exists and returns a password setup (recovery) link
 async function ensureUserRecoveryLink(email, redirectTo, linkType = 'recovery') {
   const result = await ensureUserHasRecoveryLink(email, redirectTo, linkType);
-  return { userId: result.userId, actionLink: result.actionLink };
+  return { userId: result.userId, actionLink: result.actionLink, error: result.error };
 }
 
 // List all clients
@@ -1118,6 +1132,8 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   const role = (req.body?.role || 'member').toLowerCase()
   if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
 
+  const duplicateResponse = () => res.status(409).json(DUPLICATE_EMAIL_RESPONSE)
+
   const redirectTo = authRedirect('signup')
   console.log('[auth.redirect.signup]', {
     redirectTo,
@@ -1128,7 +1144,12 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
       FRONTEND_URL: process.env.FRONTEND_URL || null
     }
   })
-  const { userId, actionLink } = await ensureUserRecoveryLink(email, redirectTo, 'signup')
+  const { userId, actionLink, error: recoveryError } = await ensureUserRecoveryLink(email, redirectTo, 'signup')
+
+  if (recoveryError && isDuplicateAuthError(recoveryError)) {
+    console.warn('[add_member] duplicate email detected via auth', { email })
+    return duplicateResponse()
+  }
 
   if (!userId) {
     console.error('add_member_no_user_id', { email })
@@ -1141,21 +1162,34 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   }
 
   if (!actionLink) {
-    console.error('add_member_no_signup_link', { email })
+    console.error('add_member_no_signup_link', { email, error: recoveryError?.message || recoveryError })
+    if (isDuplicateAuthError(recoveryError)) {
+      return duplicateResponse()
+    }
     return res.status(500).json({ error: 'generate_link_failed', detail: 'no_action_link' })
   }
 
   const payload = { client_id, email, name, role, user_id: userId }
 
-  const { data, error } = await supabaseAdmin
-    .from('client_members')
-    .insert(payload)
-    .select('client_id,user_id,email,name,role,created_at')
-    .single()
+  let data
+  try {
+    const { data: inserted, error: insertErr } = await supabaseAdmin
+      .from('client_members')
+      .insert(payload)
+      .select('client_id,user_id,email,name,role,created_at')
+      .single()
 
-  if (error) {
-    console.error('add_member_insert_failed:', error.message)
-    return res.status(500).json({ error: 'add_member_failed', detail: error.message })
+    if (insertErr) {
+      throw insertErr
+    }
+    data = inserted
+  } catch (insertErr) {
+    if (isDuplicateDbError(insertErr)) {
+      console.warn('[add_member] duplicate email detected via db', { email, client_id })
+      return duplicateResponse()
+    }
+    console.error('add_member_insert_failed:', insertErr?.message || insertErr)
+    return res.status(500).json({ error: 'add_member_failed', detail: insertErr?.message || String(insertErr) })
   }
 
   const m = data

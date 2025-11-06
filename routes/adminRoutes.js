@@ -37,7 +37,7 @@ function _inferEnvBase(env = process.env, fallbackFrontend = FRONTEND_URL) {
 }
 function authRedirect(mode, env) {
   const base = _inferEnvBase(env).replace(/\/+$/, '');
-  if (mode === 'recovery') return `${base}/set-password?mode=recovery`;
+  if (mode === 'recovery') return `${base}/set-password?mode=recovery&password_reset=1`;
   if (mode === 'signup') return `${base}/set-password?mode=signup`;
   return `${base}/account?auth_callback=1`;
 }
