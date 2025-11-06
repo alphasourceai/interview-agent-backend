@@ -55,12 +55,17 @@ const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || 
 /**
  * Environment-aware auth redirect resolver
  * - Honors REDIRECT_BASE_URL or AUTH_REDIRECT_BASE if set
- * - Infers QA/Staging/Prod from FRONTEND_URL or Render service hints
+ * - Infers QA/Staging/Prod from SENTRY_ENV, FRONTEND_URL, or Render service hints
  * - Defaults to localhost in dev and www.alphasourceai.com in production
  */
 function _inferEnvBase() {
   const explicit = (process.env.REDIRECT_BASE_URL || process.env.AUTH_REDIRECT_BASE || '').trim();
   if (explicit) return explicit.replace(/\/+$/, '');
+
+  // New: prefer SENTRY_ENV hints when present
+  const sentry = (process.env.SENTRY_ENV || '').toLowerCase();
+  if (sentry.includes('qa')) return 'https://ia-frontend-qa.onrender.com';
+  if (sentry.includes('stag')) return 'https://ia-frontend-staging.onrender.com';
 
   const svc = (process.env.RENDER_SERVICE_NAME || process.env.RENDER_EXTERNAL_URL || '').toLowerCase();
   const fe = (process.env.FRONTEND_URL || FRONTEND_URL || '').toLowerCase();
@@ -68,7 +73,7 @@ function _inferEnvBase() {
   // Prefer explicit FE env URLs if present
   if (fe.includes('qa')) return 'https://ia-frontend-qa.onrender.com';
   if (fe.includes('staging')) return 'https://ia-frontend-staging.onrender.com';
-  if (fe.includes('prod')) return 'https://www.alphasourceai.com';
+  if (fe.includes('prod') || fe.includes('alphasourceai.com')) return 'https://www.alphasourceai.com';
 
   // Fallback to Render service name hints
   if (svc.includes('-qa')) return 'https://ia-frontend-qa.onrender.com';
@@ -553,7 +558,7 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
   try {
     const userId = (req.params.userId || '').trim();
     const fallbackEmail = (req.body?.email || '').trim();
-    const redirectTo = (req.body?.redirect_to || 'https://www.alphasourceai.com/account?password_reset=1').trim();
+    const redirectTo = (req.body?.redirect_to || authRedirect('recovery')).trim();
 
     if (!userId && !fallbackEmail) {
       return res.status(400).json({ error: 'user_id_or_email_required' });
@@ -574,6 +579,17 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
     if (!email) {
       return res.status(404).json({ error: 'user_email_not_found' });
     }
+
+    // Debug log: which redirect we used
+    console.log('[auth.redirect.recovery]', {
+      redirectTo,
+      env: {
+        REDIRECT_BASE_URL: process.env.REDIRECT_BASE_URL || null,
+        AUTH_REDIRECT_BASE: process.env.AUTH_REDIRECT_BASE || null,
+        SENTRY_ENV: process.env.SENTRY_ENV || null,
+        FRONTEND_URL: process.env.FRONTEND_URL || null
+      }
+    });
 
     // Generate a recovery link
     const linkResp = await supabaseAdmin.auth.admin.generateLink({
@@ -659,10 +675,20 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
 adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) => {
   try {
     const email = (req.body?.email || '').trim();
-    const redirectTo = (req.body?.redirect_to || 'https://www.alphasourceai.com/account?password_reset=1').trim();
+    const redirectTo = (req.body?.redirect_to || authRedirect('recovery')).trim();
     if (!email) return res.status(400).json({ error: 'email_required' });
 
-    console.log('[admin.reset-password] generating recovery link for', email, 'redirectTo=', redirectTo);
+    // Standardized debug log
+    console.log('[auth.redirect.recovery]', {
+      redirectTo,
+      env: {
+        REDIRECT_BASE_URL: process.env.REDIRECT_BASE_URL || null,
+        AUTH_REDIRECT_BASE: process.env.AUTH_REDIRECT_BASE || null,
+        SENTRY_ENV: process.env.SENTRY_ENV || null,
+        FRONTEND_URL: process.env.FRONTEND_URL || null
+      }
+    });
+
     const linkResp = await supabaseAdmin.auth.admin.generateLink({
       type: 'recovery',
       email,
@@ -793,11 +819,11 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   // Optionally seed an admin member
   let seeded_member = null
   if (adminEmail) {
-    const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
-    const { userId, actionLink, method } = await ensureUserIdAndInvite(adminEmail, redirectTo)
+    const redirectTo = authRedirect('magic')
+    const { userId, actionLink } = await ensureUserIdAndMagicLink(adminEmail, redirectTo)
 
     if (!userId) {
-      console.error('seed_member_no_user_id', { email: adminEmail, method })
+      console.error('seed_member_no_user_id', { email: adminEmail })
       return res.json({ item: client, seeded_member: null, note: 'client_created_invite_failed', action_link: actionLink || null })
     }
 
@@ -966,7 +992,16 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   const role = (req.body?.role || 'member').toLowerCase()
   if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
 
-  const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
+  const redirectTo = authRedirect('magic')
+  console.log('[auth.redirect.magic]', {
+    redirectTo,
+    env: {
+      REDIRECT_BASE_URL: process.env.REDIRECT_BASE_URL || null,
+      AUTH_REDIRECT_BASE: process.env.AUTH_REDIRECT_BASE || null,
+      SENTRY_ENV: process.env.SENTRY_ENV || null,
+      FRONTEND_URL: process.env.FRONTEND_URL || null
+    }
+  })
   const { userId, actionLink } = await ensureUserIdAndMagicLink(email, redirectTo)
 
   if (!userId) {
@@ -1033,21 +1068,6 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   res.json({ item: { ...m, id: m.user_id || m.email } })
 })
 
-
-// Remove a client member
-adminRouter.delete('/client-members/:id', requireAuth, requireAdmin, async (req, res) => {
-  const key = req.params.id
-  const client_id = req.query.client_id || null
-
-  let q = supabaseAdmin.from('client_members').delete()
-  if (key.includes('@')) q = q.eq('email', key)
-  else q = q.eq('user_id', key)
-  if (client_id) q = q.eq('client_id', client_id)
-
-  const { error } = await q
-  if (error) return res.status(500).json({ error: 'remove_member_failed', detail: error.message })
-  res.json({ ok: true })
-})
 
 app.use('/admin', adminRouter)
 console.log('[mount] admin routes mounted at /admin');
@@ -1179,6 +1199,32 @@ app.get('/:token', (req, res, next) => {
   const qs = qsIndex >= 0 ? req.url.slice(qsIndex) : '';
   return res.redirect(302, `/interview-host/${encodeURIComponent(token)}${qs}`);
 });
+
+// ---------- Diagnostics ----------
+app.get('/ops/redirect-debug', (_req, res) => {
+  try {
+    const base = _inferEnvBase();
+    res.json({
+      base,
+      samples: {
+        recovery: `${base.replace(/\/+$/, '')}/account?password_reset=1`,
+        magic: `${base.replace(/\/+$/, '')}/account?auth_callback=1`,
+      },
+      env: {
+        REDIRECT_BASE_URL: process.env.REDIRECT_BASE_URL || null,
+        AUTH_REDIRECT_BASE: process.env.AUTH_REDIRECT_BASE || null,
+        SENTRY_ENV: process.env.SENTRY_ENV || null,
+        NODE_ENV: process.env.NODE_ENV || null,
+        FRONTEND_URL: process.env.FRONTEND_URL || null,
+        RENDER_SERVICE_NAME: process.env.RENDER_SERVICE_NAME || null,
+        RENDER_EXTERNAL_URL: process.env.RENDER_EXTERNAL_URL || null,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'redirect_debug_failed', detail: String(e?.message || e) });
+  }
+});
+
 // ---------- health ----------
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
