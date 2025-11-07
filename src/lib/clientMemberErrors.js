@@ -35,14 +35,27 @@ function isDuplicateDbError(err) {
   );
 }
 
-const DUPLICATE_EMAIL_RESPONSE = {
-  error: 'duplicate_email',
-  message: 'This email is already in use. Choose a different email or remove the existing member first.'
+function isRlsViolationError(err) {
+  const msg = normalizeMessage(err);
+  if (!msg) return false;
+  return msg.includes('row-level security') || msg.includes('rls');
+}
+
+const EMAIL_IN_USE_RESPONSE = {
+  error: 'email_in_use',
+  detail: 'Email is already associated with another member.'
+};
+
+const DUPLICATE_MEMBER_RESPONSE = {
+  error: 'duplicate_member',
+  detail: 'User is already a member of this client.'
 };
 
 module.exports = {
   normalizeMessage,
   isDuplicateAuthError,
   isDuplicateDbError,
-  DUPLICATE_EMAIL_RESPONSE
+  isRlsViolationError,
+  EMAIL_IN_USE_RESPONSE,
+  DUPLICATE_MEMBER_RESPONSE
 };

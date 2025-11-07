@@ -48,7 +48,13 @@ const cors = require('cors')
 const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
-const { isDuplicateAuthError, isDuplicateDbError, DUPLICATE_EMAIL_RESPONSE } = require('./src/lib/clientMemberErrors')
+const {
+  isDuplicateAuthError,
+  isDuplicateDbError,
+  isRlsViolationError,
+  EMAIL_IN_USE_RESPONSE,
+  DUPLICATE_MEMBER_RESPONSE
+} = require('./src/lib/clientMemberErrors')
 const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
 const { generateRubricAndKBForRole } = require('./generateRubric')
 const axios = require('axios')
@@ -1128,15 +1134,18 @@ adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) =
 
 // Add a client member
 adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) => {
-  const { client_id, email, name } = req.body || {}
+  const clientId = (req.body?.client_id || '').trim()
+  const emailRaw = (req.body?.email || '').trim().toLowerCase()
+  const nameRaw = (req.body?.name || '').trim()
   const role = (req.body?.role || 'member').toLowerCase()
-  if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
+  if (!clientId || !emailRaw || !nameRaw) return res.status(400).json({ error: 'client_id_email_name_required' })
 
-  const duplicateResponse = () => res.status(409).json(DUPLICATE_EMAIL_RESPONSE)
+  const duplicateMemberResponse = () => res.status(409).json(DUPLICATE_MEMBER_RESPONSE)
+  const emailInUseResponse = () => res.status(409).json(EMAIL_IN_USE_RESPONSE)
 
-  const redirectTo = authRedirect('signup')
-  console.log('[auth.redirect.signup]', {
-    redirectTo,
+  const inviteRedirect = authRedirect('signup')
+  console.log('[auth.redirect.invite]', {
+    redirectTo: inviteRedirect,
     env: {
       REDIRECT_BASE_URL: process.env.REDIRECT_BASE_URL || null,
       AUTH_REDIRECT_BASE: process.env.AUTH_REDIRECT_BASE || null,
@@ -1144,15 +1153,18 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
       FRONTEND_URL: process.env.FRONTEND_URL || null
     }
   })
-  const { userId, actionLink, error: recoveryError } = await ensureUserRecoveryLink(email, redirectTo, 'signup')
 
-  if (recoveryError && isDuplicateAuthError(recoveryError)) {
-    console.warn('[add_member] duplicate email detected via auth', { email })
-    return duplicateResponse()
+  let linkResult = await ensureUserRecoveryLink(emailRaw, inviteRedirect, 'invite')
+  if (linkResult?.error && isDuplicateAuthError(linkResult.error)) {
+    console.warn('[add_member] invite link failed because user exists, falling back to recovery', { email: emailRaw })
+    const recoveryRedirect = authRedirect('recovery')
+    linkResult = await ensureUserRecoveryLink(emailRaw, recoveryRedirect, 'recovery')
   }
 
+  const { userId, actionLink, error: inviteError } = linkResult
+
   if (!userId) {
-    console.error('add_member_no_user_id', { email })
+    console.error('add_member_no_user_id', { email: emailRaw, inviteError: inviteError?.message || inviteError })
     return res.status(400).json({
       error: 'add_member_failed',
       detail: 'Could not create or locate user for this email.',
@@ -1161,77 +1173,88 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
     })
   }
 
-  if (!actionLink) {
-    console.error('add_member_no_signup_link', { email, error: recoveryError?.message || recoveryError })
-    if (isDuplicateAuthError(recoveryError)) {
-      return duplicateResponse()
-    }
-    return res.status(500).json({ error: 'generate_link_failed', detail: 'no_action_link' })
+  if (inviteError && !isDuplicateAuthError(inviteError)) {
+    console.error('add_member_generate_link_failed', { email: emailRaw, error: inviteError?.message || inviteError })
+    return res.status(500).json({ error: 'generate_link_failed', detail: inviteError?.message || 'invite_link_failed' })
   }
 
-  const payload = { client_id, email, name, role, user_id: userId }
+  if (!actionLink) {
+    console.warn('add_member_no_action_link', { email: emailRaw, clientId })
+  }
 
-  let data
+  const payload = { client_id: clientId, email: emailRaw, name: nameRaw, role, user_id: userId }
+
+  let insertedMember = null
   try {
-    const { data: inserted, error: insertErr } = await supabaseAdmin
+    const { data: upserted, error: upsertErr } = await supabaseAdmin
       .from('client_members')
-      .insert(payload)
+      .upsert(payload, { onConflict: 'client_id,user_id', ignoreDuplicates: true })
       .select('client_id,user_id,email,name,role,created_at')
-      .single()
 
-    if (insertErr) {
-      throw insertErr
+    if (upsertErr) {
+      if (isDuplicateDbError(upsertErr) || isRlsViolationError(upsertErr)) {
+        console.warn('[add_member] email already associated with another member', { email: emailRaw, clientId })
+        return emailInUseResponse()
+      }
+      throw upsertErr
     }
-    data = inserted
+
+    const rows = Array.isArray(upserted) ? upserted : []
+    if (rows.length === 0) {
+      console.warn('[add_member] duplicate membership detected', { email: emailRaw, clientId, userId })
+      return duplicateMemberResponse()
+    }
+
+    insertedMember = rows[0]
   } catch (insertErr) {
-    if (isDuplicateDbError(insertErr)) {
-      console.warn('[add_member] duplicate email detected via db', { email, client_id })
-      return duplicateResponse()
-    }
-    console.error('add_member_insert_failed:', insertErr?.message || insertErr)
+    console.error('add_member_upsert_failed:', insertErr?.message || insertErr)
     return res.status(500).json({ error: 'add_member_failed', detail: insertErr?.message || String(insertErr) })
   }
 
-  const m = data
-  try {
-    const inviteHtml = `
-      <!doctype html>
-      <html><body style="margin:0;padding:0;background:#0A1547;color:#ffffff;font-family:Arial,Helvetica,sans-serif;">
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0A1547;">
-          <tr><td align="center" style="padding:32px 16px;">
-            <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
-              <tr><td style="padding:24px 24px 0 24px;" align="left">
-                <img src="cid:alpha-logo" alt="alphaSource" style="height:48px;display:block;" />
-              </td></tr>
-              <tr><td style="padding:24px;" align="left">
-                <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Set up your alphaSource password</h1>
-                <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">
-                  Use the button below to create your password and access the alphaSource client workspace.
-                </p>
-                <p style="margin:0 0 28px 0;">
-                  <a href="${actionLink}"
-                     style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">
-                    Set your password
-                  </a>
-                </p>
-                <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;">
-                  Having trouble with the button? <a href="${actionLink}" style="color:#C3B4F3;text-decoration:none;font-weight:600;">Click here</a>.
-                </p>
-                <p style="margin:0;font-size:12px;color:#93a0c6;">Questions? Email <a href="mailto:info@alphasourceai.com" style="color:#C3B4F3;">info@alphasourceai.com</a>.</p>
-              </td></tr>
-            </table>
-          </td></tr>
-        </table>
-      </body></html>`;
-    await _sendgridSend({
-      to: email,
-      subject: 'Set your alphaSource password',
-      html: inviteHtml
-    });
-  } catch (e) {
-    console.error('sendgrid_invite_failed:', e?.message || e);
+  if (actionLink) {
+    try {
+      const inviteHtml = `
+        <!doctype html>
+        <html><body style="margin:0;padding:0;background:#0A1547;color:#ffffff;font-family:Arial,Helvetica,sans-serif;">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0A1547;">
+            <tr><td align="center" style="padding:32px 16px;">
+              <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
+                <tr><td style="padding:24px 24px 0 24px;" align="left">
+                  <img src="cid:alpha-logo" alt="alphaSource" style="height:48px;display:block;" />
+                </td></tr>
+                <tr><td style="padding:24px;" align="left">
+                  <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Set up your alphaSource password</h1>
+                  <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">
+                    Use the button below to create your password and access the alphaSource client workspace.
+                  </p>
+                  <p style="margin:0 0 28px 0;">
+                    <a href="${actionLink}"
+                       style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">
+                      Set your password
+                    </a>
+                  </p>
+                  <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;">
+                    Having trouble with the button? <a href="${actionLink}" style="color:#C3B4F3;text-decoration:none;font-weight:600;">Click here</a>.
+                  </p>
+                  <p style="margin:0;font-size:12px;color:#93a0c6;">Questions? Email <a href="mailto:info@alphasourceai.com" style="color:#C3B4F3;">info@alphasourceai.com</a>.</p>
+                </td></tr>
+              </table>
+            </td></tr>
+          </table>
+        </body></html>`;
+      await _sendgridSend({
+        to: emailRaw,
+        subject: 'Set your alphaSource password',
+        html: inviteHtml
+      })
+    } catch (e) {
+      console.error('sendgrid_invite_failed:', e?.message || e)
+    }
+  } else {
+    console.warn('[add_member] skipping email send because no action link was generated', { email: emailRaw, clientId })
   }
-  res.json({ item: { ...m, id: m.user_id || m.email } })
+
+  res.status(201).json({ item: { ...insertedMember, id: insertedMember.user_id || insertedMember.email } })
 })
 
 adminRouter.delete('/client-members', requireAuth, requireAdmin, async (req, res) => {
