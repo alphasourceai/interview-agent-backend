@@ -46,8 +46,6 @@ if (SENTRY_ENABLED) {
 const express = require('express')
 const cors = require('cors')
 const crypto = require('crypto')
-const fs = require('fs')
-const path = require('path')
 const {
   isDuplicateAuthError,
   isDuplicateDbError,
@@ -61,6 +59,30 @@ const axios = require('axios')
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || FRONTEND_URL || '').replace(/\/+$/, '')
+const DEFAULT_LOGO_CDN_URL = 'https://cdn.mcauto-images-production.sendgrid.net/alphasourceai/alpha-logo.png'
+const DEFAULT_LOGO_FALLBACK_URL = `${FRONTEND_BASE || 'https://www.alphasourceai.com'}/alpha-logo.png`
+const EMAIL_LOGO_PRIMARY_URL = (process.env.EMAIL_LOGO_PRIMARY_URL || DEFAULT_LOGO_CDN_URL).trim()
+const EMAIL_LOGO_FALLBACK_URL = (process.env.EMAIL_LOGO_FALLBACK_URL ||
+  process.env.EMAIL_LOGO_BRAND_URL ||
+  DEFAULT_LOGO_FALLBACK_URL).trim()
+
+function buildEmailLogoTag() {
+  const attrs = [
+    `src="${EMAIL_LOGO_PRIMARY_URL}"`,
+    'alt="alphaSource"',
+    'style="height:48px;display:block;"',
+    'width="160"',
+    'border="0"'
+  ]
+  const fallbackUrl = EMAIL_LOGO_FALLBACK_URL && EMAIL_LOGO_FALLBACK_URL !== EMAIL_LOGO_PRIMARY_URL
+    ? EMAIL_LOGO_FALLBACK_URL.replace(/"/g, '&quot;')
+    : ''
+  if (fallbackUrl) {
+    const escapedSingle = fallbackUrl.replace(/'/g, '&#39;')
+    attrs.push(`onerror="this.onerror=null;this.src='${escapedSingle}';"`)
+  }
+  return `<img ${attrs.join(' ')} />`
+}
 /**
  * Environment-aware auth redirect resolver
  * - Honors REDIRECT_BASE_URL or AUTH_REDIRECT_BASE if set
@@ -598,22 +620,6 @@ const adminRouter = express.Router()
 
 // --- Password reset (Admin-triggered) ---
 // Helper: send HTML email via SendGrid
-const INLINE_LOGO_PATH = path.join(__dirname, 'assets', 'alpha-logo.png')
-let inlineLogoBase64 = undefined
-
-function getInlineLogo() {
-  if (inlineLogoBase64 !== undefined) {
-    return inlineLogoBase64
-  }
-  try {
-    const file = fs.readFileSync(INLINE_LOGO_PATH)
-    inlineLogoBase64 = file.toString('base64')
-  } catch (err) {
-    console.warn('[sendgrid.inline_logo] unavailable:', err?.message || err)
-    inlineLogoBase64 = null
-  }
-  return inlineLogoBase64
-}
 
 async function _sendgridSend({ to, subject, html, attachments = [] }) {
   const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || process.env.SENDGRID_KEY;
@@ -621,17 +627,9 @@ async function _sendgridSend({ to, subject, html, attachments = [] }) {
   if (!SENDGRID_API_KEY) throw new Error('missing SENDGRID_API_KEY');
   if (!FROM) throw new Error('missing SENDGRID_FROM');
 
-  const finalAttachments = Array.isArray(attachments) ? [...attachments] : [];
-  const logo = getInlineLogo();
-  if (logo && !finalAttachments.some(att => att?.content_id === 'alpha-logo')) {
-    finalAttachments.push({
-      content: logo,
-      filename: 'alpha-logo.png',
-      type: 'image/png',
-      disposition: 'inline',
-      content_id: 'alpha-logo'
-    });
-  }
+  const finalAttachments = Array.isArray(attachments)
+    ? attachments.filter(Boolean)
+    : [];
 
   const textContent = html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
@@ -751,7 +749,7 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
   try {
     const userId = (req.params.userId || '').trim();
     const fallbackEmail = (req.body?.email || '').trim();
-    const redirectTo = (req.body?.redirect_to || authRedirect('recovery')).trim();
+    const redirectTo = authRedirect('recovery');
 
     if (!userId && !fallbackEmail) {
       return res.status(400).json({ error: 'user_id_or_email_required' });
@@ -810,7 +808,7 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
               <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
                 <tr>
                   <td style="padding:24px 24px 0 24px;" align="left">
-                <img src="cid:alpha-logo" alt="alphaSource" style="height:48px;display:block;" />
+                ${buildEmailLogoTag()}
                   </td>
                 </tr>
                 <tr>
@@ -826,7 +824,7 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
                       </a>
                     </p>
                     <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;">
-                      Having trouble with the button? <a href="${final_link}" style="color:#C3B4F3;text-decoration:none;font-weight:600;">Click here</a>.
+                      Click <a href="${final_link}" style="color:#C3B4F3;text-decoration:none;font-weight:600;">here</a> if the button doesn’t work.
                     </p>
                     <p style="margin:0;font-size:12px;color:#93a0c6;">
                       If you didn’t request this, you can safely ignore this email.
@@ -864,7 +862,7 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
 adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) => {
   try {
     const email = (req.body?.email || '').trim();
-    const redirectTo = (req.body?.redirect_to || authRedirect('recovery')).trim();
+    const redirectTo = authRedirect('recovery');
     if (!email) return res.status(400).json({ error: 'email_required' });
 
     // Standardized debug log
@@ -897,7 +895,7 @@ adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) 
           <tr><td align="center" style="padding:32px 16px;">
             <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
               <tr><td style="padding:24px 24px 0 24px;" align="left">
-                <img src="cid:alpha-logo" alt="alphaSource" style="height:48px;display:block;" />
+                ${buildEmailLogoTag()}
               </td></tr>
               <tr><td style="padding:24px;" align="left">
                 <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Reset your password</h1>
@@ -906,7 +904,7 @@ adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) 
                   <a href="${final_link}" style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">Reset password</a>
                 </p>
                 <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;">
-                  Having trouble with the button? <a href="${final_link}" style="color:#C3B4F3;text-decoration:none;font-weight:600;">Click here</a>.
+                  Click <a href="${final_link}" style="color:#C3B4F3;text-decoration:none;font-weight:600;">here</a> if the button doesn’t work.
                 </p>
               </td></tr>
             </table>
@@ -1143,6 +1141,28 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   const duplicateMemberResponse = () => res.status(409).json(DUPLICATE_MEMBER_RESPONSE)
   const emailInUseResponse = () => res.status(409).json(EMAIL_IN_USE_RESPONSE)
 
+  // Fast-path duplicate detection (same client + email) before hitting Supabase Auth
+  let existingMemberByEmail = null
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('client_members')
+      .select('client_id,email')
+      .eq('client_id', clientId)
+      .eq('email', emailRaw)
+      .maybeSingle()
+    if (error) {
+      throw error
+    }
+    existingMemberByEmail = data
+  } catch (err) {
+    console.error('[add_member] email duplicate probe failed', err?.message || err)
+    return res.status(500).json({ error: 'member_lookup_failed', detail: err?.message || String(err) })
+  }
+  if (existingMemberByEmail) {
+    console.info('[add_member] duplicate detected before invite', { clientId, email: emailRaw })
+    return duplicateMemberResponse()
+  }
+
   const inviteRedirect = authRedirect('signup')
   console.log('[auth.redirect.invite]', {
     redirectTo: inviteRedirect,
@@ -1162,6 +1182,27 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   }
 
   const { userId, actionLink, error: inviteError } = linkResult
+
+  if (userId) {
+    try {
+      const { data: userMembership, error: userMembershipErr } = await supabaseAdmin
+        .from('client_members')
+        .select('client_id,user_id')
+        .eq('client_id', clientId)
+        .eq('user_id', userId)
+        .maybeSingle()
+      if (userMembershipErr) {
+        throw userMembershipErr
+      }
+      if (userMembership) {
+        console.info('[add_member] duplicate detected by user_id', { clientId, email: emailRaw, userId })
+        return duplicateMemberResponse()
+      }
+    } catch (err) {
+      console.error('[add_member] membership probe failed', err?.message || err)
+      return res.status(500).json({ error: 'member_lookup_failed', detail: err?.message || String(err) })
+    }
+  }
 
   if (!userId) {
     console.error('add_member_no_user_id', { email: emailRaw, inviteError: inviteError?.message || inviteError })
@@ -1220,7 +1261,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
             <tr><td align="center" style="padding:32px 16px;">
               <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
                 <tr><td style="padding:24px 24px 0 24px;" align="left">
-                  <img src="cid:alpha-logo" alt="alphaSource" style="height:48px;display:block;" />
+                  ${buildEmailLogoTag()}
                 </td></tr>
                 <tr><td style="padding:24px;" align="left">
                   <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Set up your alphaSource password</h1>
@@ -1234,7 +1275,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
                     </a>
                   </p>
                   <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;">
-                    Having trouble with the button? <a href="${actionLink}" style="color:#C3B4F3;text-decoration:none;font-weight:600;">Click here</a>.
+                    Click <a href="${actionLink}" style="color:#C3B4F3;text-decoration:none;font-weight:600;">here</a> if the button doesn’t work.
                   </p>
                   <p style="margin:0;font-size:12px;color:#93a0c6;">Questions? Email <a href="mailto:info@alphasourceai.com" style="color:#C3B4F3;">info@alphasourceai.com</a>.</p>
                 </td></tr>
