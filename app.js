@@ -46,11 +46,13 @@ if (SENTRY_ENABLED) {
 const express = require('express')
 const cors = require('cors')
 const crypto = require('crypto')
+const fs = require('fs')
+const path = require('path')
+const { URLSearchParams } = require('url')
 const {
   isDuplicateAuthError,
   isDuplicateDbError,
   isRlsViolationError,
-  EMAIL_IN_USE_RESPONSE,
   DUPLICATE_MEMBER_RESPONSE
 } = require('./src/lib/clientMemberErrors')
 const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
@@ -59,30 +61,11 @@ const axios = require('axios')
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || FRONTEND_URL || '').replace(/\/+$/, '')
-const DEFAULT_LOGO_CDN_URL = 'https://cdn.mcauto-images-production.sendgrid.net/alphasourceai/alpha-logo.png'
-const DEFAULT_LOGO_FALLBACK_URL = `${FRONTEND_BASE || 'https://www.alphasourceai.com'}/alpha-logo.png`
-const EMAIL_LOGO_PRIMARY_URL = (process.env.EMAIL_LOGO_PRIMARY_URL || DEFAULT_LOGO_CDN_URL).trim()
-const EMAIL_LOGO_FALLBACK_URL = (process.env.EMAIL_LOGO_FALLBACK_URL ||
-  process.env.EMAIL_LOGO_BRAND_URL ||
-  DEFAULT_LOGO_FALLBACK_URL).trim()
-
-function buildEmailLogoTag() {
-  const attrs = [
-    `src="${EMAIL_LOGO_PRIMARY_URL}"`,
-    'alt="alphaSource"',
-    'style="height:48px;display:block;"',
-    'width="160"',
-    'border="0"'
-  ]
-  const fallbackUrl = EMAIL_LOGO_FALLBACK_URL && EMAIL_LOGO_FALLBACK_URL !== EMAIL_LOGO_PRIMARY_URL
-    ? EMAIL_LOGO_FALLBACK_URL.replace(/"/g, '&quot;')
-    : ''
-  if (fallbackUrl) {
-    const escapedSingle = fallbackUrl.replace(/'/g, '&#39;')
-    attrs.push(`onerror="this.onerror=null;this.src='${escapedSingle}';"`)
-  }
-  return `<img ${attrs.join(' ')} />`
-}
+const AUTH_EMAIL_HMAC_SECRET = process.env.AUTH_EMAIL_HMAC_SECRET || ''
+const PASSWORD_START_TTL_SECONDS = 15 * 60
+const PASSWORD_START_RATE_WINDOW_MS = 10 * 60 * 1000
+const PASSWORD_START_RATE_MAX = 5
+const passwordStartRateMap = new Map()
 /**
  * Environment-aware auth redirect resolver
  * - Honors REDIRECT_BASE_URL or AUTH_REDIRECT_BASE if set
@@ -128,6 +111,76 @@ function authRedirect(mode, env) {
   if (mode === 'recovery') return `${base}/set-password?mode=recovery&password_reset=1`;
   if (mode === 'signup') return `${base}/set-password?mode=signup`;
   return `${base}/account?auth_callback=1`;
+}
+
+function normalizeEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function computeEmailHmac(email, ts) {
+  if (!AUTH_EMAIL_HMAC_SECRET) return null;
+  const normalizedEmail = normalizeEmail(email);
+  const tsPart = ts ? String(ts).trim() : '';
+  if (!normalizedEmail || !tsPart) return null;
+  try {
+    return crypto
+      .createHmac('sha256', AUTH_EMAIL_HMAC_SECRET)
+      .update(`${normalizedEmail}:${tsPart}`)
+      .digest('hex');
+  } catch (err) {
+    console.error('[email_hmac] compute failed', err?.message || err);
+    return null;
+  }
+}
+
+function verifyEmailHmac(email, signature, ts) {
+  if (!AUTH_EMAIL_HMAC_SECRET) return false;
+  const expected = computeEmailHmac(email, ts);
+  if (!expected) return false;
+  const provided = String(signature || '').trim().toLowerCase();
+  if (!provided || provided.length !== expected.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(provided, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
+function buildPasswordStartUrl(email, env) {
+  const base = _inferEnvBase(env).replace(/\/+$/, '');
+  const normalizedEmail = normalizeEmail(email);
+  const ts = Math.floor(Date.now() / 1000);
+  const sig = computeEmailHmac(normalizedEmail, ts);
+  if (!sig) return null;
+  const qs = new URLSearchParams({ e: normalizedEmail, sig, ts }).toString();
+  return `${base}/password-start?${qs}`;
+}
+
+function buildRecoveryRedirect(env) {
+  return `${_inferEnvBase(env).replace(/\/+$/, '')}/set-password?mode=recovery&password_reset=1`;
+}
+
+function cleanupRateEntries(entries, windowStart) {
+  return entries.filter(ts => ts >= windowStart);
+}
+
+function rateLimitKey(email, ip) {
+  return `${normalizeEmail(email)}::${ip || 'unknown'}`;
+}
+
+function isPasswordStartRateLimited(email, ip) {
+  const now = Date.now();
+  const windowStart = now - PASSWORD_START_RATE_WINDOW_MS;
+  const key = rateLimitKey(email, ip);
+  const existing = passwordStartRateMap.get(key) || [];
+  const recent = cleanupRateEntries(existing, windowStart);
+  if (recent.length >= PASSWORD_START_RATE_MAX) {
+    passwordStartRateMap.set(key, recent);
+    return true;
+  }
+  recent.push(now);
+  passwordStartRateMap.set(key, recent);
+  return false;
 }
 
 const SHOULD_RUN_REDIRECT_TESTS =
@@ -239,6 +292,7 @@ app.use(cors({
 }))
 
 app.use(express.json({ limit: '10mb' }))
+app.use(express.urlencoded({ limit: '2mb', extended: false }))
 
 // ---------- CSP: allow Wix to embed (frame-ancestors) ----------
 app.use((req, res, next) => {
@@ -355,6 +409,70 @@ app.get('/auth/ping', requireAuth, withClientScope, (req, res) => {
 app.get('/auth/me', requireAuth, withClientScope, (req, res) => {
   res.json({ user: req.user, memberships: req.memberships })
 })
+
+// ---------- Password start (scanner-proof) ----------
+app.post('/auth/password-start', async (req, res) => {
+  try {
+    if (!AUTH_EMAIL_HMAC_SECRET) {
+      return res.status(500).json({ error: 'email_hmac_unconfigured' });
+    }
+    const bodyEmail = req.body?.email || req.body?.e;
+    const queryEmail = req.query?.email || req.query?.e;
+    const email = normalizeEmail(bodyEmail || queryEmail);
+    const sig = String(req.body?.sig || req.query?.sig || '').trim();
+    const tsParam = req.body?.ts || req.query?.ts;
+    const tsInt = Number(tsParam);
+    if (!email || !sig || !tsParam || !Number.isFinite(tsInt)) {
+      return res.status(400).json({ error: 'email_signature_timestamp_required' });
+    }
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    if (nowSec - tsInt > PASSWORD_START_TTL_SECONDS || tsInt - nowSec > 300) {
+      return res.status(400).json({ error: 'link_expired' });
+    }
+
+    if (!verifyEmailHmac(email, sig, tsInt)) {
+      return res.status(400).json({ error: 'invalid_signature' });
+    }
+
+    const ip =
+      (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
+      req.socket?.remoteAddress ||
+      '';
+
+    if (isPasswordStartRateLimited(email, ip)) {
+      return res.status(429).json({ error: 'rate_limited' });
+    }
+
+    const redirectTo = buildRecoveryRedirect();
+    console.info('[password-start] request', { email, redirectTo });
+
+    let actionLink = null;
+    try {
+      const linkResult = await generateRecoveryLink(email, redirectTo);
+      actionLink = linkResult?.actionLink;
+      console.info('[password-start] generated recovery link', { email });
+    } catch (err) {
+      console.error('[password-start] generate link failed', err?.message || err);
+      const detail = err?.details?.message || err?.message || 'generate_link_failed';
+      return res.status(500).json({ error: 'generate_link_failed', detail });
+    }
+
+    if (!actionLink) {
+      return res.status(500).json({ error: 'missing_action_link' });
+    }
+
+    if (String(req.query?.redirect || '').trim() === '1') {
+      res.setHeader('Cache-Control', 'no-store');
+      return res.redirect(actionLink);
+    }
+
+    res.json({ ok: true, action_link: actionLink });
+  } catch (err) {
+    console.error('[password-start] unexpected error', err?.message || err);
+    res.status(500).json({ error: 'password_start_failed', detail: err?.message || String(err) });
+  }
+});
 
 // ---------- Clients: my ----------
 app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
@@ -620,6 +738,20 @@ const adminRouter = express.Router()
 
 // --- Password reset (Admin-triggered) ---
 // Helper: send HTML email via SendGrid
+const INLINE_LOGO_PATH = path.join(__dirname, 'assets', 'alpha-logo.png')
+let inlineLogoBase64 = undefined
+
+function getInlineLogo() {
+  if (inlineLogoBase64 !== undefined) return inlineLogoBase64
+  try {
+    const file = fs.readFileSync(INLINE_LOGO_PATH)
+    inlineLogoBase64 = file.toString('base64')
+  } catch (err) {
+    console.warn('[sendgrid.inline_logo] unavailable:', err?.message || err)
+    inlineLogoBase64 = null
+  }
+  return inlineLogoBase64
+}
 
 async function _sendgridSend({ to, subject, html, attachments = [] }) {
   const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || process.env.SENDGRID_KEY;
@@ -630,6 +762,16 @@ async function _sendgridSend({ to, subject, html, attachments = [] }) {
   const finalAttachments = Array.isArray(attachments)
     ? attachments.filter(Boolean)
     : [];
+  const logo = getInlineLogo();
+  if (logo && !finalAttachments.some(att => att?.content_id === 'logo')) {
+    finalAttachments.push({
+      content: logo,
+      filename: 'alpha-logo.png',
+      type: 'image/png',
+      disposition: 'inline',
+      content_id: 'logo'
+    });
+  }
 
   const textContent = html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
@@ -661,6 +803,50 @@ async function _sendgridSend({ to, subject, html, attachments = [] }) {
     },
     timeout: 10000
   });
+}
+
+function renderPasswordStartEmail({ heading, bodyHtml, buttonLabel, link }) {
+  return `
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width,initial-scale=1" />
+      <title>${heading}</title>
+    </head>
+    <body style="margin:0;padding:0;background:#0A1547;color:#ffffff;font-family:Arial,Helvetica,sans-serif;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0A1547;">
+        <tr>
+          <td align="center" style="padding:32px 16px;">
+            <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
+              <tr>
+                <td style="padding:24px 24px 0 24px;" align="left">
+                  <img src="cid:logo" alt="alphaSource" width="160" style="display:block;height:auto;border:0;" />
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:24px;" align="left">
+                  <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">${heading}</h1>
+                  ${bodyHtml}
+                  <p style="margin:0 0 28px 0;">
+                    <a href="${link}"
+                       style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">
+                      ${buttonLabel}
+                    </a>
+                  </p>
+                  <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;">
+                    Click <a href="${link}" style="color:#C3B4F3;text-decoration:none;font-weight:600;">here</a> if the button doesn't work.
+                  </p>
+                  <p style="margin:0;font-size:12px;color:#93a0c6;">Questions? Email <a href="mailto:info@alphasourceai.com" style="color:#C3B4F3;">info@alphasourceai.com</a>.</p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+  `;
 }
 
 function _extractActionLink(data) {
@@ -702,54 +888,64 @@ async function generateRecoveryLink(email, redirectTo) {
   return generateAuthLink('recovery', email, redirectTo);
 }
 
-async function ensureUserHasRecoveryLink(email, redirectTo, linkType = 'recovery') {
-  const normalizedEmail = String(email || '').trim().toLowerCase();
+async function ensureAuthUserId(email) {
+  const normalizedEmail = normalizeEmail(email);
   if (!normalizedEmail) {
-    return { userId: null, actionLink: null, error: new Error('email_required') };
+    return { userId: null, created: false, error: new Error('email_required') };
   }
 
-  let userId = null;
-  const ensureResp = await supabaseAdmin.auth.admin.createUser({
+  async function lookup() {
+    if (!supabaseAdmin?.auth?.admin?.getUserByEmail) return { userId: null, error: null };
+    try {
+      const { data, error } = await supabaseAdmin.auth.admin.getUserByEmail(normalizedEmail);
+      if (error) {
+        const msg = error?.message || '';
+        if (msg && !/user not found/i.test(msg)) {
+          console.warn('[ensureAuthUserId] lookup error:', msg);
+        }
+        return { userId: null, error };
+      }
+      return { userId: data?.user?.id || null, error: null };
+    } catch (err) {
+      console.warn('[ensureAuthUserId] lookup exception:', err?.message || err);
+      return { userId: null, error: err };
+    }
+  }
+
+  const firstLookup = await lookup();
+  if (firstLookup.userId) {
+    return { userId: firstLookup.userId, created: false, error: null };
+  }
+
+  const createResp = await supabaseAdmin.auth.admin.createUser({
     email: normalizedEmail,
     email_confirm: true
   });
 
-  if (ensureResp?.data?.user?.id) {
-    userId = ensureResp.data.user.id;
-  }
-
-  const ensureErr = ensureResp?.error;
-  if (ensureErr) {
-    const msg = ensureErr.message || '';
-    if (!/already exists/i.test(msg)) {
-      console.error('[ensureUserHasRecoveryLink] createUser failed:', msg);
+  if (createResp?.error) {
+    if (!isDuplicateAuthError(createResp.error)) {
+      console.error('[ensureAuthUserId] createUser failed:', createResp.error?.message || createResp.error);
+      return { userId: null, created: false, error: createResp.error };
     }
+    const retryLookup = await lookup();
+    if (retryLookup.userId) {
+      return { userId: retryLookup.userId, created: false, error: null };
+    }
+    return { userId: null, created: false, error: createResp.error };
   }
 
-  try {
-    const { actionLink, userId: linkUserId } = await generateAuthLink(linkType, normalizedEmail, redirectTo);
-    return {
-      userId: linkUserId || userId,
-      actionLink,
-      error: null
-    };
-  } catch (err) {
-    console.error('[ensureUserHasRecoveryLink] generateAuthLink failed:', err?.message || err);
-    return {
-      userId,
-      actionLink: null,
-      error: err
-    };
-  }
+  return { userId: createResp?.data?.user?.id || null, created: true, error: null };
 }
 
 // POST /admin/users/:userId/reset-password
-// Optional body: { email?: string, redirect_to?: string }
+// Optional body: { email?: string }
 adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, async (req, res) => {
   try {
+    if (!AUTH_EMAIL_HMAC_SECRET) {
+      return res.status(500).json({ error: 'email_hmac_unconfigured' });
+    }
     const userId = (req.params.userId || '').trim();
     const fallbackEmail = (req.body?.email || '').trim();
-    const redirectTo = authRedirect('recovery');
 
     if (!userId && !fallbackEmail) {
       return res.status(400).json({ error: 'user_id_or_email_required' });
@@ -771,87 +967,31 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
       return res.status(404).json({ error: 'user_email_not_found' });
     }
 
-    // Debug log: which redirect we used
-    console.log('[auth.redirect.recovery]', {
-      redirectTo,
-      env: {
-        REDIRECT_BASE_URL: process.env.REDIRECT_BASE_URL || null,
-        AUTH_REDIRECT_BASE: process.env.AUTH_REDIRECT_BASE || null,
-        SENTRY_ENV: process.env.SENTRY_ENV || null,
-        FRONTEND_URL: process.env.FRONTEND_URL || null
-      }
-    });
-
-    let final_link = null;
-    try {
-      const { actionLink } = await generateRecoveryLink(email, redirectTo);
-      final_link = actionLink;
-    } catch (err) {
-      console.error('[admin.reset-password] generateLink(recovery) failed:', err?.message || err);
-      const detail = err?.details?.message || err?.message || 'generate_link_failed';
-      return res.status(500).json({ error: 'generate_link_failed', detail });
+    const passwordStartUrl = buildPasswordStartUrl(email);
+    if (!passwordStartUrl) {
+      return res.status(500).json({ error: 'password_start_url_unavailable' });
     }
 
-    // Branded minimal HTML (aligns with current brand; can be swapped to a SendGrid template later)
-    const html = `
-      <!doctype html>
-      <html>
-      <head>
-        <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width,initial-scale=1" />
-        <title>Reset your password</title>
-      </head>
-      <body style="margin:0;padding:0;background:#0A1547;color:#ffffff;font-family:Arial,Helvetica,sans-serif;">
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0A1547;">
-          <tr>
-            <td align="center" style="padding:32px 16px;">
-              <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
-                <tr>
-                  <td style="padding:24px 24px 0 24px;" align="left">
-                ${buildEmailLogoTag()}
-                  </td>
-                </tr>
-                <tr>
-                  <td style="padding:24px;" align="left">
-                    <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Reset your password</h1>
-                    <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">
-                      Click the button below to reset your alphaSource password. This link will expire shortly for security.
-                    </p>
-                    <p style="margin:0 0 28px 0;">
-                      <a href="${final_link}"
-                         style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">
-                        Reset password
-                      </a>
-                    </p>
-                    <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;">
-                      Click <a href="${final_link}" style="color:#C3B4F3;text-decoration:none;font-weight:600;">here</a> if the button doesn’t work.
-                    </p>
-                    <p style="margin:0;font-size:12px;color:#93a0c6;">
-                      If you didn’t request this, you can safely ignore this email.
-                    </p>
-                  </td>
-                </tr>
-                <tr>
-                  <td style="padding:16px 24px 28px 24px;font-size:12px;color:#93a0c6;">
-                    Questions? Email <a href="mailto:info@alphasourceai.com" style="color:#C3B4F3;text-decoration:underline;">info@alphasourceai.com</a>.
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-        </table>
-      </body>
-      </html>
+    const bodyHtml = `
+      <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">
+        Click the button below to reset your alphaSource password. This link will expire shortly for security.
+      </p>
     `;
 
-    // Send via SendGrid
+    const html = renderPasswordStartEmail({
+      heading: 'Reset your password',
+      bodyHtml,
+      buttonLabel: 'Reset password',
+      link: passwordStartUrl
+    });
+
     await _sendgridSend({
       to: email,
       subject: 'Reset your alphaSource password',
       html
     });
 
-    return res.json({ ok: true, email, sent_via: 'sendgrid', mode: 'recovery' });
+    return res.json({ ok: true, email, sent_via: 'sendgrid', mode: 'password_start' });
   } catch (e) {
     console.error('reset_password_admin_failed:', e?.message || e);
     return res.status(500).json({ error: 'reset_password_admin_failed', detail: e?.message || String(e) });
@@ -861,71 +1001,37 @@ adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, asy
 // Admin-triggered password reset by email (not userId)
 adminRouter.post('/reset-password', requireAuth, requireAdmin, async (req, res) => {
   try {
+    if (!AUTH_EMAIL_HMAC_SECRET) {
+      return res.status(500).json({ error: 'email_hmac_unconfigured' });
+    }
     const email = (req.body?.email || '').trim();
-    const redirectTo = authRedirect('recovery');
     if (!email) return res.status(400).json({ error: 'email_required' });
 
-    // Standardized debug log
-    console.log('[auth.redirect.recovery]', {
-      redirectTo,
-      env: {
-        REDIRECT_BASE_URL: process.env.REDIRECT_BASE_URL || null,
-        AUTH_REDIRECT_BASE: process.env.AUTH_REDIRECT_BASE || null,
-        SENTRY_ENV: process.env.SENTRY_ENV || null,
-        FRONTEND_URL: process.env.FRONTEND_URL || null
-      }
-    });
-
-    let final_link = null;
-    try {
-      const { actionLink } = await generateRecoveryLink(email, redirectTo);
-      final_link = actionLink;
-    } catch (err) {
-      console.error('[admin.reset-password] generateLink(recovery) failed:', err?.message || err);
-      const detail = err?.details?.message || err?.message || 'generate_link_failed';
-      return res.status(500).json({ error: 'generate_link_failed', detail });
+    const passwordStartUrl = buildPasswordStartUrl(email);
+    if (!passwordStartUrl) {
+      return res.status(500).json({ error: 'password_start_url_unavailable' });
     }
 
-    const html = `
-      <!doctype html>
-      <html>
-      <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Reset your password</title></head>
-      <body style="margin:0;padding:0;background:#0A1547;color:#ffffff;font-family:Arial,Helvetica,sans-serif;">
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0A1547;">
-          <tr><td align="center" style="padding:32px 16px;">
-            <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
-              <tr><td style="padding:24px 24px 0 24px;" align="left">
-                ${buildEmailLogoTag()}
-              </td></tr>
-              <tr><td style="padding:24px;" align="left">
-                <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Reset your password</h1>
-                <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">Click the button below to reset your alphaSource password.</p>
-                <p style="margin:0 0 28px 0;">
-                  <a href="${final_link}" style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">Reset password</a>
-                </p>
-                <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;">
-                  Click <a href="${final_link}" style="color:#C3B4F3;text-decoration:none;font-weight:600;">here</a> if the button doesn’t work.
-                </p>
-              </td></tr>
-            </table>
-          </td></tr>
-        </table>
-      </body>
-      </html>
+    const bodyHtml = `
+      <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">
+        Click the button below to reset your alphaSource password.
+      </p>
     `;
+
+    const html = renderPasswordStartEmail({
+      heading: 'Reset your password',
+      bodyHtml,
+      buttonLabel: 'Reset password',
+      link: passwordStartUrl
+    });
+
     await _sendgridSend({ to: email, subject: 'Reset your alphaSource password', html });
-    return res.json({ ok: true, email, sent_via: 'sendgrid', mode: 'recovery' });
+    return res.json({ ok: true, email, sent_via: 'sendgrid', mode: 'password_start' });
   } catch (e) {
     console.error('reset_password_admin_email_failed:', e?.message || e);
     return res.status(500).json({ error: 'reset_password_admin_failed', detail: e?.message || String(e) });
   }
 });
-
-// Helper: ensure a user exists and returns a password setup (recovery) link
-async function ensureUserRecoveryLink(email, redirectTo, linkType = 'recovery') {
-  const result = await ensureUserHasRecoveryLink(email, redirectTo, linkType);
-  return { userId: result.userId, actionLink: result.actionLink, error: result.error };
-}
 
 // List all clients
 adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
@@ -963,32 +1069,54 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   // Optionally seed an admin member
   let seeded_member = null
   if (adminEmail) {
-    const redirectTo = authRedirect('signup')
-    const { userId, actionLink } = await ensureUserRecoveryLink(adminEmail, redirectTo, 'signup')
-
+    const { userId, error: seedErr } = await ensureAuthUserId(adminEmail)
     if (!userId) {
-      console.error('seed_member_no_user_id', { email: adminEmail })
-      return res.json({ item: client, seeded_member: null, note: 'client_created_invite_failed', action_link: actionLink || null })
-    }
-
-    const payload = {
-      client_id: client.id,
-      email: adminEmail,
-      name: adminName || adminEmail,
-      role: 'admin',
-      user_id: userId
-    }
-
-    const { data: inserted, error: insErr } = await supabaseAdmin
-      .from('client_members')
-      .insert(payload)
-      .select('client_id,user_id,email,name,role,created_at')
-      .single()
-
-    if (insErr) {
-      console.error('seed_member_insert_failed:', insErr.message)
+      console.error('seed_member_no_user_id', { email: adminEmail, detail: seedErr?.message || seedErr })
     } else {
-      seeded_member = { ...inserted, id: inserted.user_id || inserted.email }
+      const payload = {
+        client_id: client.id,
+        email: normalizeEmail(adminEmail),
+        name: adminName || adminEmail,
+        role: 'admin',
+        user_id: userId
+      }
+
+      const { data: inserted, error: insErr } = await supabaseAdmin
+        .from('client_members')
+        .upsert(payload, { onConflict: 'client_id,user_id', ignoreDuplicates: true })
+        .select('client_id,user_id,email,name,role,created_at')
+        .maybeSingle()
+
+      if (insErr) {
+        console.error('seed_member_insert_failed:', insErr.message)
+      } else if (inserted) {
+        seeded_member = { ...inserted, id: inserted.user_id || inserted.email }
+
+        if (AUTH_EMAIL_HMAC_SECRET) {
+          try {
+            const passwordStartUrl = buildPasswordStartUrl(adminEmail)
+            if (!passwordStartUrl) throw new Error('password_start_url_unavailable')
+            const bodyHtml = `
+              <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">
+                Use the button below to create your password and access the alphaSource client workspace.
+              </p>
+            `
+            const inviteHtml = renderPasswordStartEmail({
+              heading: 'Set up your alphaSource password',
+              bodyHtml,
+              buttonLabel: 'Set your password',
+              link: passwordStartUrl
+            })
+            await _sendgridSend({
+              to: adminEmail,
+              subject: 'Set your alphaSource password',
+              html: inviteHtml
+            })
+          } catch (e) {
+            console.error('seed_member_email_failed:', e?.message || e)
+          }
+        }
+      }
     }
   }
 
@@ -1133,94 +1261,22 @@ adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) =
 // Add a client member
 adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) => {
   const clientId = (req.body?.client_id || '').trim()
-  const emailRaw = (req.body?.email || '').trim().toLowerCase()
+  const emailRaw = normalizeEmail(req.body?.email || '')
   const nameRaw = (req.body?.name || '').trim()
   const role = (req.body?.role || 'member').toLowerCase()
   if (!clientId || !emailRaw || !nameRaw) return res.status(400).json({ error: 'client_id_email_name_required' })
 
+  if (!AUTH_EMAIL_HMAC_SECRET) {
+    return res.status(500).json({ error: 'email_hmac_unconfigured' })
+  }
+
   const duplicateMemberResponse = () => res.status(409).json(DUPLICATE_MEMBER_RESPONSE)
-  const emailInUseResponse = () => res.status(409).json(EMAIL_IN_USE_RESPONSE)
 
-  // Fast-path duplicate detection (same client + email) before hitting Supabase Auth
-  let existingMemberByEmail = null
-  try {
-    const { data, error } = await supabaseAdmin
-      .from('client_members')
-      .select('client_id,email')
-      .eq('client_id', clientId)
-      .eq('email', emailRaw)
-      .maybeSingle()
-    if (error) {
-      throw error
-    }
-    existingMemberByEmail = data
-  } catch (err) {
-    console.error('[add_member] email duplicate probe failed', err?.message || err)
-    return res.status(500).json({ error: 'member_lookup_failed', detail: err?.message || String(err) })
-  }
-  if (existingMemberByEmail) {
-    console.info('[add_member] duplicate detected before invite', { clientId, email: emailRaw })
-    return duplicateMemberResponse()
-  }
-
-  const inviteRedirect = authRedirect('signup')
-  console.log('[auth.redirect.invite]', {
-    redirectTo: inviteRedirect,
-    env: {
-      REDIRECT_BASE_URL: process.env.REDIRECT_BASE_URL || null,
-      AUTH_REDIRECT_BASE: process.env.AUTH_REDIRECT_BASE || null,
-      SENTRY_ENV: process.env.SENTRY_ENV || null,
-      FRONTEND_URL: process.env.FRONTEND_URL || null
-    }
-  })
-
-  let linkResult = await ensureUserRecoveryLink(emailRaw, inviteRedirect, 'invite')
-  if (linkResult?.error && isDuplicateAuthError(linkResult.error)) {
-    console.warn('[add_member] invite link failed because user exists, falling back to recovery', { email: emailRaw })
-    const recoveryRedirect = authRedirect('recovery')
-    linkResult = await ensureUserRecoveryLink(emailRaw, recoveryRedirect, 'recovery')
-  }
-
-  const { userId, actionLink, error: inviteError } = linkResult
-
-  if (userId) {
-    try {
-      const { data: userMembership, error: userMembershipErr } = await supabaseAdmin
-        .from('client_members')
-        .select('client_id,user_id')
-        .eq('client_id', clientId)
-        .eq('user_id', userId)
-        .maybeSingle()
-      if (userMembershipErr) {
-        throw userMembershipErr
-      }
-      if (userMembership) {
-        console.info('[add_member] duplicate detected by user_id', { clientId, email: emailRaw, userId })
-        return duplicateMemberResponse()
-      }
-    } catch (err) {
-      console.error('[add_member] membership probe failed', err?.message || err)
-      return res.status(500).json({ error: 'member_lookup_failed', detail: err?.message || String(err) })
-    }
-  }
-
+  const { userId, created, error: ensureErr } = await ensureAuthUserId(emailRaw)
   if (!userId) {
-    console.error('add_member_no_user_id', { email: emailRaw, inviteError: inviteError?.message || inviteError })
-    return res.status(400).json({
-      error: 'add_member_failed',
-      detail: 'Could not create or locate user for this email.',
-      hint: 'Try again or send the invite link manually.',
-      action_link: actionLink || null
-    })
-  }
-
-  if (inviteError && !isDuplicateAuthError(inviteError)) {
-    console.error('add_member_generate_link_failed', { email: emailRaw, error: inviteError?.message || inviteError })
-    return res.status(500).json({ error: 'generate_link_failed', detail: inviteError?.message || 'invite_link_failed' })
-  }
-
-  if (!actionLink) {
-    console.warn('add_member_no_action_link', { email: emailRaw, clientId })
+    const detail = ensureErr?.message || 'ensure_user_failed'
+    console.error('[add_member] ensureAuthUserId failed', detail)
+    return res.status(500).json({ error: 'ensure_user_failed', detail })
   }
 
   const payload = { client_id: clientId, email: emailRaw, name: nameRaw, role, user_id: userId }
@@ -1234,15 +1290,15 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
 
     if (upsertErr) {
       if (isDuplicateDbError(upsertErr) || isRlsViolationError(upsertErr)) {
-        console.warn('[add_member] email already associated with another member', { email: emailRaw, clientId })
-        return emailInUseResponse()
+        console.warn('[add_member] duplicate membership detected during upsert', { email: emailRaw, clientId })
+        return duplicateMemberResponse()
       }
       throw upsertErr
     }
 
     const rows = Array.isArray(upserted) ? upserted : []
     if (rows.length === 0) {
-      console.warn('[add_member] duplicate membership detected', { email: emailRaw, clientId, userId })
+      console.warn('[add_member] duplicate membership detected (empty upsert result)', { email: emailRaw, clientId, userId })
       return duplicateMemberResponse()
     }
 
@@ -1252,50 +1308,40 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
     return res.status(500).json({ error: 'add_member_failed', detail: insertErr?.message || String(insertErr) })
   }
 
-  if (actionLink) {
-    try {
-      const inviteHtml = `
-        <!doctype html>
-        <html><body style="margin:0;padding:0;background:#0A1547;color:#ffffff;font-family:Arial,Helvetica,sans-serif;">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0A1547;">
-            <tr><td align="center" style="padding:32px 16px;">
-              <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
-                <tr><td style="padding:24px 24px 0 24px;" align="left">
-                  ${buildEmailLogoTag()}
-                </td></tr>
-                <tr><td style="padding:24px;" align="left">
-                  <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Set up your alphaSource password</h1>
-                  <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">
-                    Use the button below to create your password and access the alphaSource client workspace.
-                  </p>
-                  <p style="margin:0 0 28px 0;">
-                    <a href="${actionLink}"
-                       style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">
-                      Set your password
-                    </a>
-                  </p>
-                  <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;">
-                    Click <a href="${actionLink}" style="color:#C3B4F3;text-decoration:none;font-weight:600;">here</a> if the button doesn’t work.
-                  </p>
-                  <p style="margin:0;font-size:12px;color:#93a0c6;">Questions? Email <a href="mailto:info@alphasourceai.com" style="color:#C3B4F3;">info@alphasourceai.com</a>.</p>
-                </td></tr>
-              </table>
-            </td></tr>
-          </table>
-        </body></html>`;
-      await _sendgridSend({
-        to: emailRaw,
-        subject: 'Set your alphaSource password',
-        html: inviteHtml
-      })
-    } catch (e) {
-      console.error('sendgrid_invite_failed:', e?.message || e)
+  let note = created ? null : 'existing_user'
+  try {
+    const passwordStartUrl = buildPasswordStartUrl(emailRaw)
+    if (!passwordStartUrl) {
+      throw new Error('password_start_url_unavailable')
     }
-  } else {
-    console.warn('[add_member] skipping email send because no action link was generated', { email: emailRaw, clientId })
+    const bodyHtml = `
+      <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">
+        Use the button below to create your password and access the alphaSource client workspace.
+      </p>
+    `
+    const inviteHtml = renderPasswordStartEmail({
+      heading: 'Set up your alphaSource password',
+      bodyHtml,
+      buttonLabel: 'Set your password',
+      link: passwordStartUrl
+    })
+    await _sendgridSend({
+      to: emailRaw,
+      subject: 'Set your alphaSource password',
+      html: inviteHtml
+    })
+  } catch (e) {
+    note = 'membership_created_email_failed'
+    console.error('sendgrid_invite_failed:', e?.message || e)
   }
 
-  res.status(201).json({ item: { ...insertedMember, id: insertedMember.user_id || insertedMember.email } })
+  const responsePayload = {
+    ok: true,
+    item: { ...insertedMember, id: insertedMember.user_id || insertedMember.email }
+  }
+  if (note) responsePayload.note = note
+
+  res.status(201).json(responsePayload)
 })
 
 adminRouter.delete('/client-members', requireAuth, requireAdmin, async (req, res) => {
