@@ -899,7 +899,7 @@ app.get(['/interview-host', '/interview-host/:token'], async (req, res) => {
       allow="camera; microphone; autoplay; clipboard-read; clipboard-write; display-capture; fullscreen; storage-access"
       allowfullscreen
       referrerpolicy="no-referrer"
-      scrolling="no"></iframe>
+      scrolling="yes"></iframe>
   </body>
 </html>`;
     res.status(200).type('html').send(html);
