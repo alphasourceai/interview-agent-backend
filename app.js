@@ -890,7 +890,7 @@ app.get(['/interview-host', '/interview-host/:token'], async (req, res) => {
     <title>Interview</title>
     <style>
       html, body { margin:0; padding:0; height:100%; background:#0000; }
-      #iv { width:100%; min-height:100vh; height:1200px; border:0; display:block; }
+      #iv { width:100%; min-height:100vh; height:2000px; border:0; display:block; }
     </style>
   </head>
   <body>
@@ -905,7 +905,7 @@ app.get(['/interview-host', '/interview-host/:token'], async (req, res) => {
         var iv = document.getElementById('iv');
         function size(h){
           try {
-            var min = 1200;
+            var min = 2000;
             var vh = window.innerHeight || document.documentElement.clientHeight || 800;
             var target = Math.max(h||0, vh, min);
             iv.style.height = target + 'px';
