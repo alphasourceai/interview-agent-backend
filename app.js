@@ -1504,7 +1504,7 @@ app.get(['/interview-host', '/interview-host/:token'], async (req, res) => {
     <title>Interview</title>
     <style>
       html, body { margin:0; padding:0; height:100%; background:#0000; }
-      #iv { width:100%; height:100vh; border:0; display:block; }
+      #iv { width:100%; min-height:100vh; height:2000px; border:0; display:block; }
     </style>
   </head>
   <body>
@@ -1513,7 +1513,31 @@ app.get(['/interview-host', '/interview-host/:token'], async (req, res) => {
       allow="camera; microphone; autoplay; clipboard-read; clipboard-write; display-capture; fullscreen; storage-access"
       allowfullscreen
       referrerpolicy="no-referrer"
-      scrolling="no"></iframe>
+      scrolling="yes"></iframe>
+    <script>
+    (function(){
+      var iv = document.getElementById('iv');
+      function size(h){
+        try {
+          var min = 1200;
+          var vh = window.innerHeight || document.documentElement.clientHeight || 800;
+          var target = Math.max(h||0, vh, min);
+          iv.style.height = target + 'px';
+        } catch(e) {}
+      }
+      window.__EMBED__ = { updateSize: function(){ size(); } };
+      window.addEventListener('message', function(e){
+        try {
+          var d = e && e.data || {};
+          if ((d.type === 'EMBED_HEIGHT' || d.type === 'TAVUS_HEIGHT') && d.height) {
+            size(Number(d.height));
+          }
+        } catch(_) {}
+      });
+      size();
+      window.addEventListener('resize', function(){ size(); });
+    })();
+    </script>
   </body>
 </html>`;
     res.status(200).type('html').send(html);
