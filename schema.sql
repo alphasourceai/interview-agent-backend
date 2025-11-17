@@ -907,6 +907,7 @@ CREATE TABLE public.roles (
     job_description_url text,
     manual_questions text,
     kb_document_id text,
+    tavus_document_id text,
     job_description_text text
 );
 
@@ -1288,6 +1289,12 @@ CREATE INDEX idx_roles_client_id ON public.roles USING btree (client_id);
 --
 
 CREATE INDEX idx_roles_kb_document_id ON public.roles USING btree (kb_document_id);
+
+--
+-- Name: idx_roles_tavus_document_id; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_roles_tavus_document_id ON public.roles USING btree (tavus_document_id);
 
 
 --
@@ -1673,4 +1680,3 @@ ALTER TABLE storage.s3_multipart_uploads_parts ENABLE ROW LEVEL SECURITY;
 --
 
 \unrestrict fRKjHyYhUiUat8XnMma6gpbjvsnsZl0KPsC4SnORof1VsPtMJPPfdMGEfzFtEKO
-

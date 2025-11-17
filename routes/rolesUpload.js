@@ -88,7 +88,7 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
       .from('roles')
       .update(updates)
       .eq('id', role_id)
-      .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
+      .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,tavus_document_id,created_at')
       .single();
 
     if (updErr) {
@@ -108,7 +108,7 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
         // Re-fetch the role so FE gets fresh rubric/kb fields in the response
         const refetch = await supabaseAdmin
           .from('roles')
-          .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
+          .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,tavus_document_id,created_at')
           .eq('id', role_id)
           .single();
         if (!refetch.error && refetch.data) {

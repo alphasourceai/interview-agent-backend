@@ -148,6 +148,13 @@ router.post('/', async (req, res) => {
       });
     }
   } catch (e) {
+    if (e?.code === 'missing_tavus_kb') {
+      return res.status(500).json({
+        error: 'missing_tavus_kb',
+        detail: e.message,
+        role_id: e.role_id || roleIdFromBody || null
+      });
+    }
     const status = e.status || 500;
     return res.status(status).json({ error: e.message });
   }

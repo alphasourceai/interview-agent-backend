@@ -4,6 +4,7 @@ const OpenAI = require('openai')
 const { randomUUID } = require('crypto')
 const path = require('path')
 const { parseBufferToText } = require('./utils/jdParser')
+const { ensureTavusDocumentForRole } = require('./lib/tavusDocuments')
 
 // Create internal clients with SR key (server-side only)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
@@ -52,7 +53,7 @@ async function generateRubricAndKBForRole(roleId) {
   // 1) Load role
   const { data: role, error: roleErr } = await supabase
     .from('roles')
-    .select('id, title, interview_type, manual_questions, job_description_url')
+    .select('id, title, interview_type, manual_questions, job_description_url, tavus_document_id')
     .eq('id', roleId)
     .single()
   if (roleErr || !role) throw new Error(`role_lookup_failed: ${roleErr?.message || 'not found'}`)
@@ -147,6 +148,15 @@ ${role.manual_questions || 'None'}
     .update({ kb_document_id: kbId })
     .eq('id', roleId)
   if (updErr) throw new Error(`kb_id_update_failed: ${updErr.message}`)
+
+  try {
+    await ensureTavusDocumentForRole(
+      { id: roleId, title: role.title, kb_document_id: kbId, tavus_document_id: role.tavus_document_id },
+      { supabase }
+    )
+  } catch (e) {
+    console.error('[tavus-doc] ensure failed after KB generation:', e?.message || e)
+  }
 
   return { role_id: roleId, kb_document_id: kbId }
 }

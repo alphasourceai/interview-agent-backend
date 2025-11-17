@@ -3,6 +3,7 @@
 
 require('dotenv').config();
 const axios = require('axios');
+const { ensureTavusDocumentForRole, missingTavusKbError } = require('../lib/tavusDocuments');
 
 /**
  * Create a Tavus v2 conversation for a candidate/role.
@@ -11,7 +12,7 @@ const axios = require('axios');
  * Returns { conversation_url, conversation_id }.
  *
  * @param {Object} candidate - { id, role_id, email, name }
- * @param {Object} role - { id, kb_document_id }
+ * @param {Object} role - { id, kb_document_id, tavus_document_id }
  * @param {string} [webhookUrl] - Full URL to /webhook/recording-ready
  */
 async function createTavusInterviewHandler(candidate, role, webhookUrl) {
@@ -41,11 +42,24 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl) {
     conversational_context: context
   };
 
-  // Attach KB via document_ids if we have it
-  if (role?.kb_document_id) {
-    payload.document_ids = [role.kb_document_id];
-    // "speed" | "balanced" | "quality"
+  let tavusDocumentId = role?.tavus_document_id || null;
+  if (!tavusDocumentId && role?.kb_document_id) {
+    try {
+      tavusDocumentId = await ensureTavusDocumentForRole(role);
+    } catch (err) {
+      console.error(`[tavus-interview] Failed to sync Tavus KB for role ${role?.id || 'unknown'}:`, err?.message || err);
+      if (err?.code === 'missing_tavus_kb') throw err;
+      throw err;
+    }
+  }
+  if (tavusDocumentId) {
+    console.log(`[tavus-interview] role=${role?.id || 'unknown'} using tavus_document_id=${tavusDocumentId}`);
+    payload.document_ids = [tavusDocumentId];
     payload.document_retrieval_strategy = RETRIEVAL;
+  } else if (role?.kb_document_id) {
+    throw missingTavusKbError(role?.id, 'Role is missing Tavus KB ID');
+  } else {
+    throw missingTavusKbError(role?.id, 'Role has no KB source to sync to Tavus');
   }
 
   try {
@@ -64,8 +78,15 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl) {
   } catch (e) {
     const status = e.response?.status || 500;
     const details = e.response?.data || e.message;
+    if (status === 400 && (payload?.document_ids || []).length) {
+      console.error(
+        `[tavus-interview] Tavus rejected document ${payload.document_ids[0]} for role ${role?.id || 'unknown'}:`,
+        typeof details === 'string' ? details : JSON.stringify(details)
+      );
+    }
     const err = new Error(typeof details === 'string' ? details : JSON.stringify(details));
     err.status = status;
+    err.code = status === 400 ? 'tavus_400' : undefined;
     throw err;
   }
 }

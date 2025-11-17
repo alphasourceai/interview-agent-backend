@@ -71,7 +71,7 @@ router.post('/:id/retry-create', requireAuth, withClientScope, async (req, res) 
 
     const { data: role, error: rErr } = await supabase
       .from('roles')
-      .select('id, kb_document_id')
+      .select('id, title, kb_document_id, tavus_document_id')
       .eq('id', interview.role_id)
       .single();
     if (rErr || !role) return res.status(404).json({ error: rErr?.message || 'Role not found' });
@@ -99,6 +99,13 @@ router.post('/:id/retry-create', requireAuth, withClientScope, async (req, res) 
     return res.status(200).json({ video_url: result.conversation_url });
   } catch (e) {
     console.error('[POST /interviews/retry/:id/retry-create] error:', e);
+    if (e?.code === 'missing_tavus_kb') {
+      return res.status(500).json({
+        error: 'missing_tavus_kb',
+        detail: e.message,
+        role_id: e.role_id || null
+      });
+    }
     return res.status(500).json({ error: e.message || 'Server error' });
   }
 });
