@@ -54,6 +54,40 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || FRONTEND_URL || '').replace(/\/+$/, '')
 const app = express()
 
+const normalizeOrigin = (input) => {
+  try {
+    if (!input) return null;
+    return new URL(input).origin;
+  } catch (_) {
+    return null;
+  }
+};
+
+// Origins that need delegated camera/mic access when the Daily/Tavus player is nested
+const INTERVIEW_FRONTEND_ORIGINS = Array.from(new Set([
+  FRONTEND_BASE,
+  process.env.FRONTEND_URL,
+  process.env.FRONTEND_BASE,
+  'https://ia-frontend-prod.onrender.com',
+  'https://ia-frontend-staging.onrender.com',
+  'https://ia-frontend-qa.onrender.com',
+  'https://interview-agent-frontend.onrender.com'
+].map(normalizeOrigin).filter(Boolean)));
+
+const DAILY_ORIGINS = ['https://tavus.daily.co', 'https://c.daily.co'];
+const INTERVIEW_FEATURE_ORIGINS = Array.from(new Set(['self', ...INTERVIEW_FRONTEND_ORIGINS, ...DAILY_ORIGINS]));
+const formatPolicyOrigins = (origins) => `(${origins.map((origin) => (origin === 'self' ? 'self' : `"${origin}"`)).join(' ')})`;
+const INTERVIEW_PERMISSIONS_POLICY = [
+  'camera',
+  'microphone',
+  'display-capture',
+  'fullscreen',
+  'autoplay',
+  'storage-access'
+].map((feature) => `${feature}=${formatPolicyOrigins(INTERVIEW_FEATURE_ORIGINS)}`)
+  .concat(['clipboard-read=(self)', 'clipboard-write=(self)'])
+  .join(', ');
+
 // Sentry request middleware (must be before other app.use and routes)
 if (SENTRY_ENABLED) {
   if (typeof Sentry.expressRequestMiddleware === 'function') {
@@ -123,17 +157,6 @@ app.use((req, res, next) => {
   } catch (_) {}
   next();
 });
-// ---------- Permissions-Policy: allow Tavus (daily.co) to access camera/mic in nested iframes ----------
-app.use((req, res, next) => {
-  try {
-    res.setHeader(
-      'Permissions-Policy',
-      'camera=(self "https://tavus.daily.co" "https://c.daily.co"), microphone=(self "https://tavus.daily.co" "https://c.daily.co"), display-capture=(self "https://tavus.daily.co" "https://c.daily.co"), fullscreen=(self "https://tavus.daily.co" "https://c.daily.co"), autoplay=(self "https://tavus.daily.co" "https://c.daily.co"), clipboard-read=(self), clipboard-write=(self)'
-    );
-  } catch (_) {}
-  next();
-});
-
 // Per-request context (request_id + basic tags)
 app.use((req, _res, next) => {
   try {
@@ -876,11 +899,8 @@ app.get(['/interview-host', '/interview-host/:token'], async (req, res) => {
     const targetPath = token ? `/interview-access/${token}` : '/interview-access';
     const targetUrl = `${FRONTEND_BASE}${targetPath}`;
 
-    // Ensure required permission delegation headers are present on the document
-    res.setHeader(
-      'Permissions-Policy',
-      'camera=(self "https://tavus.daily.co" "https://c.daily.co"), microphone=(self "https://tavus.daily.co" "https://c.daily.co"), display-capture=(self "https://tavus.daily.co" "https://c.daily.co"), fullscreen=(self "https://tavus.daily.co" "https://c.daily.co"), autoplay=(self "https://tavus.daily.co" "https://c.daily.co"), clipboard-read=(self), clipboard-write=(self)'
-    );
+    // Chrome only surfaces camera/mic prompts when the parent explicitly delegates
+    res.setHeader('Permissions-Policy', INTERVIEW_PERMISSIONS_POLICY);
 
     const html = `<!doctype html>
 <html lang="en">
