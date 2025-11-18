@@ -124,6 +124,9 @@ ${role.manual_questions || 'None'}
 
   // 6) Create + upload KB JSON (kbs/<uuid>.json), store <uuid> in roles.kb_document_id
   const kbJson = makeKBFromRubric(rubricObj)
+  if (!Array.isArray(kbJson.questions) || kbJson.questions.length === 0) {
+    throw new Error('kb_generation_failed: rubric produced no questions')
+  }
   const kbId = randomUUID()
   const kbKey = `${kbId}.json`
   const { error: upErr } = await supabase.storage
