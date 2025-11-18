@@ -52,6 +52,7 @@ const axios = require('axios')
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || FRONTEND_URL || '').replace(/\/+$/, '')
+const INTERVIEW_FAVICON_URL = (process.env.INTERVIEW_HOST_FAVICON_URL || 'https://ia-frontend-prod.onrender.com/alpha-symbol.png').trim()
 const app = express()
 
 const normalizeOrigin = (input) => {
@@ -892,6 +893,14 @@ try {
   console.error('[mount] Failed to load routes/reportsPdf:', e?.message || e);
 }
 
+// Serve favicon for interview host (Chrome eagerly requests /favicon.ico)
+app.get('/favicon.ico', (req, res, next) => {
+  const host = (req.headers.host || '').toLowerCase();
+  if (!/^interviews\.alphasourceai\.com(?::\d+)?$/.test(host)) return next();
+  if (!INTERVIEW_FAVICON_URL) return res.status(404).end();
+  res.redirect(302, INTERVIEW_FAVICON_URL);
+});
+
 // ---------- Interview host shim (serve container HTML that embeds FE interview with permission headers) ----------
 app.get(['/interview-host', '/interview-host/:token'], async (req, res) => {
   try {
@@ -908,6 +917,7 @@ app.get(['/interview-host', '/interview-host/:token'], async (req, res) => {
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Interview</title>
+    ${INTERVIEW_FAVICON_URL ? `<link rel="icon" type="image/png" href="${INTERVIEW_FAVICON_URL}" />` : ''}
     <style>
       html, body { margin:0; padding:0; height:100%; background:#0000; }
       #iv { width:100%; min-height:100vh; height:2000px; border:0; display:block; }
