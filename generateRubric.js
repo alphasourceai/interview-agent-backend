@@ -12,6 +12,61 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 })
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
+const INTERVIEW_TYPE_PROMPTS = {
+  BASIC: 'Create 5 short, screening-style questions that quickly assess overall fit, communication, and motivation. Keep them grounded in the job description and highlight day-to-day expectations.',
+  DETAILED: 'Create 6-8 deeper behavioral and leadership questions. Encourage STAR-style answers and tie each question to responsibilities or success metrics pulled from the job description.',
+  TECHNICAL: 'Create 8-10 technical or skill-based questions focused on the specific tools, systems, and requirements in the job description. Include scenario-based or problem-solving prompts when appropriate.'
+}
+
+function normalizeInterviewType(type) {
+  const key = String(type || 'BASIC').trim().toUpperCase()
+  if (!['BASIC', 'DETAILED', 'TECHNICAL'].includes(key)) {
+    console.warn(`[rubric] unknown_interview_type type=${type}; falling back to BASIC`)
+    return 'BASIC'
+  }
+  return key
+}
+
+function buildPrompt({ role, jdText, manualQuestions }) {
+  const type = normalizeInterviewType(role.interview_type)
+  const guidance = INTERVIEW_TYPE_PROMPTS[type] || INTERVIEW_TYPE_PROMPTS.BASIC
+  return `You are an AI interview designer. Using the role details below, craft a JSON rubric that Interview Agent will feed into Tavus.
+
+Return ONLY valid JSON with this shape:
+{
+  "questions": [
+    { "text": "Question text...", "category": "skill_or_theme" }
+  ]
+}
+
+Rules:
+- Every question MUST reference the responsibilities, skills, or context from the job description.
+- Include clear categories (skill areas) so downstream scoring can bucket responses.
+- ${guidance}
+
+Role Title: ${role.title || 'Unknown Role'}
+Interview Type: ${type}
+
+Job Description Text:
+${jdText || 'N/A'}
+
+Custom / Manual Questions Provided By The Client (use or adapt as needed):
+${manualQuestions || 'None'}
+`
+}
+
+function validateRubric(rubricObj, context) {
+  if (!rubricObj || typeof rubricObj !== 'object') {
+    console.error('[rubric] invalid_structure', context)
+    throw new Error('rubric_invalid_structure')
+  }
+  if (!Array.isArray(rubricObj.questions) || rubricObj.questions.length === 0) {
+    console.error('[rubric] empty_rubric', context)
+    throw new Error('rubric_empty')
+  }
+  return rubricObj
+}
+
 function splitBucketAndKey(full) {
   // Expects strings like "job-descriptions/<objectPath>"
   if (!full || typeof full !== 'string') return { bucket: null, key: null }
@@ -58,6 +113,9 @@ async function generateRubricAndKBForRole(roleId) {
     .single()
   if (roleErr || !role) throw new Error(`role_lookup_failed: ${roleErr?.message || 'not found'}`)
 
+  const interviewType = normalizeInterviewType(role.interview_type)
+  console.log(`[rubric] generate role=${roleId} type=${interviewType}`)
+
   // 2) Pull + parse JD (if present)
   let jdText = ''
   let jdFileName = ''
@@ -70,27 +128,16 @@ async function generateRubricAndKBForRole(roleId) {
       jdText = await parseBufferToText(buf, mime, key)
     }
   }
+  if (!jdText) {
+    console.warn(`[rubric] missing_job_description role=${roleId} type=${interviewType} url=${role.job_description_url || 'none'}`)
+  }
 
   // 3) Build LLM prompt
-  const prompt = `
-You are an AI interview designer. Create a JSON rubric based on the job description and any custom questions.
-
-Return ONLY valid JSON. Shape:
-{
-  "questions": [
-    { "text": "Question text...", "category": "skill_or_theme" }
-  ]
-}
-
-Interview Type: ${role.interview_type || 'BASIC'}
-Role Title: ${role.title}
-
-Job Description (may be empty):
-${jdText || 'N/A'}
-
-Manual Questions:
-${role.manual_questions || 'None'}
-`.trim()
+  const prompt = buildPrompt({
+    role: { ...role, interview_type: interviewType },
+    jdText,
+    manualQuestions: role.manual_questions || 'None'
+  })
 
   // 4) Call OpenAI
   let rubricObj = null
@@ -102,18 +149,16 @@ ${role.manual_questions || 'None'}
     })
     const raw = resp?.choices?.[0]?.message?.content || ''
     rubricObj = safeJSONParse(raw)
+    if (!rubricObj) {
+      console.error('[rubric] openai_parse_failed', { role_id: roleId, interview_type: interviewType, raw })
+      throw new Error('rubric_parse_failed')
+    }
   } catch (e) {
-    // Keep going; we'll fallback to basic KB if needed
-    console.error('openai_rubric_failed:', e?.message || e)
+    console.error('[rubric] openai_rubric_failed', { role_id: roleId, interview_type: interviewType, error: e?.message || e })
+    throw e
   }
 
-  // Fallback rubric if parsing failed
-  if (!rubricObj || !Array.isArray(rubricObj.questions)) {
-    const fallbackQ = role.title
-      ? [`What experience makes you a strong fit for the ${role.title} role?`]
-      : [`Tell me about your most relevant experience for this role.`]
-    rubricObj = { questions: fallbackQ.map(t => ({ text: t, category: 'auto' })) }
-  }
+  rubricObj = validateRubric(rubricObj, { role_id: roleId, interview_type: interviewType })
 
   // 5) Write rubric to roles.rubric + description (first chunk of JD text)
   const description = jdText ? jdText.slice(0, 2000) : null
