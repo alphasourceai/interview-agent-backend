@@ -152,7 +152,7 @@ ${role.manual_questions || 'None'}
   try {
     await ensureTavusDocumentForRole(
       { id: roleId, title: role.title, kb_document_id: kbId, tavus_document_id: role.tavus_document_id },
-      { supabase }
+      { supabase, rubric: kbJson }
     )
   } catch (e) {
     console.error('[tavus-doc] ensure failed after KB generation:', e?.message || e)

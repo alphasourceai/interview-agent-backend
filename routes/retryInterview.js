@@ -99,9 +99,10 @@ router.post('/:id/retry-create', requireAuth, withClientScope, async (req, res) 
     return res.status(200).json({ video_url: result.conversation_url });
   } catch (e) {
     console.error('[POST /interviews/retry/:id/retry-create] error:', e);
-    if (e?.code === 'missing_tavus_kb') {
-      return res.status(500).json({
-        error: 'missing_tavus_kb',
+    if (e?.code === 'missing_tavus_kb' || e?.code === 'kb_not_ready') {
+      const status = e.code === 'kb_not_ready' ? 409 : 500;
+      return res.status(status).json({
+        error: e.code,
         detail: e.message,
         role_id: e.role_id || null
       });

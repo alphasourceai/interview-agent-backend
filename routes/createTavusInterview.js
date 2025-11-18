@@ -148,9 +148,11 @@ router.post('/', async (req, res) => {
       });
     }
   } catch (e) {
-    if (e?.code === 'missing_tavus_kb') {
-      return res.status(500).json({
-        error: 'missing_tavus_kb',
+    if (e?.code === 'missing_tavus_kb' || e?.code === 'kb_not_ready') {
+      const status = e.code === 'kb_not_ready' ? 409 : 500;
+      console.error(`[tavus-interview] ${e.code} role=${e.role_id || roleIdFromBody || 'unknown'}:`, e.detail || e.message);
+      return res.status(status).json({
+        error: e.code,
         detail: e.message,
         role_id: e.role_id || roleIdFromBody || null
       });
