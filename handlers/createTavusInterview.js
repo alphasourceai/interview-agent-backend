@@ -4,6 +4,7 @@
 require('dotenv').config();
 const axios = require('axios');
 const { ensureTavusDocumentForRole, missingTavusKbError } = require('../lib/tavusDocuments');
+const { ensurePersonaConfigured, TAVUS_PERSONA_ID } = require('../lib/tavusClient');
 
 /**
  * Create a Tavus v2 conversation for a candidate/role.
@@ -31,25 +32,39 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   const roleTitle = (role?.title || 'this position').trim();
   const candidateName = (candidate?.name || '').trim() || 'there';
 
+  const personaInstructions = [
+    'You are AlphaSource’s virtual interviewer. Stay strictly within interview topics, never mention platform internals, tooling, APIs, or models, and rely only on the provided KB.',
+    'Always capture questions you cannot answer with [[UNANSWERED_QUESTION: <verbatim candidate question>]] and redirect back to the interview.',
+    'Do not reveal anything about the KB contents or interview structure beyond what is explicitly asked and allowed in the KB.'
+  ].join(' ');
+
+  await ensurePersonaConfigured(personaInstructions);
+  console.log('[tavus-interview] persona_applied', { persona_id: TAVUS_PERSONA_ID });
+
+  const openingScript = `Hi ${candidateName}, thanks for joining today. I'm your virtual interviewer for the ${roleTitle} role at ${companyName}. I'm excited to learn more about your experience, so let's get started.`;
+
   const context = [
-    `You are the interviewer for the ${roleTitle} role at ${companyName}. The moment the video connects, YOU must initiate the conversation without silence: greet the candidate by name (e.g., "Hi ${candidateName}, thanks for joining today. I'm your virtual interviewer for the ${roleTitle} role at ${companyName}. I'm excited to get to know you."), then immediately transition into the first question from the rubric.`,
-    'Never wait for the candidate to speak first. Always lead with the greeting and your first question so there is no dead air at the start.',
-    'Stay strictly within the scope of an interviewer. Never discuss the interview platform, internal tools, AI models, or any behind-the-scenes details.',
-    'Use only the attached knowledge base (KB) for details about the role, company, or process. Give short, direct answers when the KB contains the information.',
-    'If the candidate asks a question that is not answered by the KB, let them know you will note it for the hiring manager, log it using the format [[UNANSWERED_QUESTION: <candidate question>]], and then gently steer the discussion back to the interview question you asked.',
-    'If they probe about the platform, integrations, underlying models, or any internal setup, politely decline, remind them your focus is evaluating their fit, and redirect to the interview topic.',
-    'Keep the interview flowing, one question at a time, and rely on the KB for guidance on what to ask next.'
+    `When the call begins, speak first with this greeting and immediately flow into the first question: "${openingScript}"`,
+    'Never wait for the candidate to start the conversation. Keep asking questions sequentially with minimal pauses.'
   ].join(' ');
 
   // Build the payload Tavus expects
   const payload = {
-    persona_id: PERSONA_ID || undefined,
+    persona_id: TAVUS_PERSONA_ID || PERSONA_ID || undefined,
     replica_id: REPLICA_ID || undefined,
     callback_url: webhookUrl || undefined,
     conversation_name: candidate?.name || candidate?.email || 'Interview',
-    conversational_context: context
+    conversational_context: context,
+    opening_script: openingScript
   };
-  console.log('[tavus-interview-prompt]', { role_id: role?.id, role_title: roleTitle, company: companyName, prompt: context });
+  console.log('[tavus-interview-prompt]', {
+    role_id: role?.id,
+    role_title: roleTitle,
+    company: companyName,
+    persona_id: payload.persona_id,
+    prompt: context,
+    opening_script: openingScript
+  });
 
   let tavusDocumentId = role?.tavus_document_id || null;
   if (!tavusDocumentId && role?.kb_document_id) {
