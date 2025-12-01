@@ -67,6 +67,17 @@ function validateRubric(rubricObj, context) {
   return rubricObj
 }
 
+function buildFallbackRubric(role) {
+  const title = role?.title || 'this role'
+  return {
+    questions: [
+      { text: `What experience makes you a strong fit for the ${title} position?`, category: 'experience' },
+      { text: `Tell me about a recent accomplishment that best demonstrates your impact for ${title}.`, category: 'impact' },
+      { text: `What motivates you most about contributing to ${title}?`, category: 'motivation' }
+    ]
+  }
+}
+
 function splitBucketAndKey(full) {
   // Expects strings like "job-descriptions/<objectPath>"
   if (!full || typeof full !== 'string') return { bucket: null, key: null }
@@ -158,7 +169,16 @@ async function generateRubricAndKBForRole(roleId) {
     throw e
   }
 
-  rubricObj = validateRubric(rubricObj, { role_id: roleId, interview_type: interviewType })
+  try {
+    rubricObj = validateRubric(rubricObj, { role_id: roleId, interview_type: interviewType })
+  } catch (err) {
+    if (!jdText) {
+      console.warn('[rubric] empty_rubric_fallback', { role_id: roleId, interview_type: interviewType, reason: 'missing_jd' })
+      rubricObj = validateRubric(buildFallbackRubric(role), { role_id: roleId, interview_type: interviewType, fallback: true })
+    } else {
+      throw err
+    }
+  }
 
   // 5) Write rubric to roles.rubric + description (first chunk of JD text)
   const description = jdText ? jdText.slice(0, 2000) : null

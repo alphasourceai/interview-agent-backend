@@ -14,7 +14,8 @@ function buildCandidateReportHtml(payload) {
   // { name, email, status, resume_score, interview_score, overall_score,
   //   resume_breakdown: { experience, skills, education, summary? },
   //   interview_breakdown: { confidence, clarity, body_language },
-  //   analysis? }
+  //   analysis?,
+  //   unanswered_candidate_questions?: [] }
   return template(payload);
 }
 

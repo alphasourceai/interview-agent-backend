@@ -99,6 +99,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
           'resume_breakdown',
           'interview_breakdown',
           'analysis',
+          'unanswered_candidate_questions',
           // common names I've seen/used for a public PDF URL:
           'report_url',
           'latest_report_url',
@@ -178,6 +179,9 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
 
       // PDF URL preference: explicit latest_report_url, else report_url
       const latest_report_url = rep?.latest_report_url || rep?.report_url || null;
+      const unanswered_candidate_questions = Array.isArray(rep?.unanswered_candidate_questions)
+        ? rep.unanswered_candidate_questions
+        : [];
 
       return {
         // row identity is the candidate (FE now uses latest_interview_id for actions)
@@ -204,6 +208,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         resume_analysis,
         interview_analysis,
         latest_report_url,
+        unanswered_candidate_questions,
         report_generated_at: rep?.created_at || null,
       };
     });
@@ -230,7 +235,7 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
 
     const { data: rows, error: iErr } = await supabase
       .from('interviews')
-      .select('id, created_at, client_id, candidate_id, role_id, video_url, transcript_url, analysis_url, resume_score, interview_score, overall_score, resume_analysis, interview_analysis, latest_report_url, report_generated_at')
+      .select('id, created_at, client_id, candidate_id, role_id, video_url, transcript_url, analysis_url, resume_score, interview_score, overall_score, resume_analysis, interview_analysis, latest_report_url, report_generated_at, unanswered_candidate_questions')
       .eq('client_id', clientId)
       .order('created_at', { ascending: false })
       .limit(500);
@@ -296,6 +301,7 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
         interview_analysis: r.interview_analysis || { clarity: null, confidence: null, body_language: null },
         latest_report_url: r.latest_report_url || null,
         report_generated_at: r.report_generated_at || null,
+        unanswered_candidate_questions: Array.isArray(r.unanswered_candidate_questions) ? r.unanswered_candidate_questions : []
       }));
 
     return res.json({ items });

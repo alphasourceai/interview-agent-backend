@@ -335,6 +335,7 @@ async function buildDashboardRows(req, res) {
           id, candidate_id, role_id,
           resume_score, interview_score, overall_score,
           resume_breakdown, interview_breakdown, analysis,
+          unanswered_candidate_questions,
           report_url, created_at
         `)
         .in('candidate_id', candidateIds)
@@ -393,6 +394,9 @@ async function buildDashboardRows(req, res) {
         body_language: numOrNull(ib.body_language),
         summary:       typeof interview_summary === 'string' ? interview_summary : ''
       };
+      const unanswered_candidate_questions = Array.isArray(rep?.unanswered_candidate_questions)
+        ? rep.unanswered_candidate_questions
+        : [];
 
       return {
         id: latest?.id ?? null,
@@ -418,7 +422,8 @@ async function buildDashboardRows(req, res) {
         interview_analysis,
 
         latest_report_url: rep?.report_url ?? null,
-        report_generated_at: rep?.created_at ?? null
+        report_generated_at: rep?.created_at ?? null,
+        unanswered_candidate_questions
       };
     });
 

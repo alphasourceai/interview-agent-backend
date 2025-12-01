@@ -134,6 +134,52 @@ function prosodyFromWhisper(whisperSegments) {
   };
 }
 
+const UNANSWERED_REGEX_SOURCE = /\[\[\s*UNANSWERED_QUESTION\s*:(.+?)\]\]/gis;
+const UNANSWERED_REGEX_STRIP = /\[\[\s*UNANSWERED_QUESTION\s*:(.+?)\]\]/gi;
+
+function normalizeQuestionText(text) {
+  if (!text || typeof text !== 'string') return null;
+  const norm = text.replace(/\s+/g, ' ').trim();
+  return norm || null;
+}
+
+function processUnansweredQuestions({ transcriptText, segments, payload }) {
+  const collected = new Set();
+  const add = (val) => {
+    const norm = normalizeQuestionText(val);
+    if (norm) collected.add(norm);
+  };
+
+  const payloadLists = [
+    payload?.unanswered_candidate_questions,
+    payload?.metadata?.unanswered_candidate_questions
+  ];
+  for (const list of payloadLists) {
+    if (Array.isArray(list)) list.forEach(add);
+  }
+
+  const source = transcriptText || '';
+  let cleanedTranscript = source.replace(new RegExp(UNANSWERED_REGEX_SOURCE), (_, q) => {
+    add(q);
+    return '';
+  });
+  cleanedTranscript = cleanedTranscript.replace(/\n{3,}/g, '\n\n').trim();
+
+  const cleanedSegments = (segments || []).map(seg => {
+    if (!seg || typeof seg !== 'object') return seg;
+    if (typeof seg.text === 'string') {
+      return { ...seg, text: seg.text.replace(new RegExp(UNANSWERED_REGEX_STRIP), '').trim() };
+    }
+    return seg;
+  });
+
+  return {
+    cleanedTranscript,
+    cleanedSegments,
+    unanswered: Array.from(collected)
+  };
+}
+
 // Make a base64 for a small image (keeps payload small)
 function fileToBase64(p) {
   const b = fs.readFileSync(p);
@@ -282,8 +328,16 @@ const handleWebhook = async (req, res) => {
 
     // 3) Transcribe with Whisper
     const whisper = await transcribeWithWhisper(audioPath);
-    const segments = whisper?.segments || [];
-    const fullTranscript = (whisper?.text || '').trim();
+    let segments = whisper?.segments || [];
+    const rawTranscript = (whisper?.text || '').trim();
+    const transcriptProcessing = processUnansweredQuestions({
+      transcriptText: rawTranscript,
+      segments,
+      payload
+    });
+    const fullTranscript = transcriptProcessing.cleanedTranscript;
+    segments = transcriptProcessing.cleanedSegments;
+    const unansweredQuestions = transcriptProcessing.unanswered;
     const transcriptSnippet = fullTranscript.slice(0, 1800); // keep prompt compact
 
     // 4) Prosody features
@@ -346,7 +400,8 @@ const handleWebhook = async (req, res) => {
           transcript_url: transcriptUrl,
           analysis_url: analysisUrl,
           // Store raw transcript text for convenient querying/filters
-          transcript: fullTranscript || null
+          transcript: fullTranscript || null,
+          unanswered_candidate_questions: unansweredQuestions
         })
         .eq('id', interviewRowId);
     }
@@ -368,7 +423,8 @@ const handleWebhook = async (req, res) => {
         prosody, // keep raw features for debugging/analytics
       },
       interview_summary: interviewOut.summary,
-      interview_video_url: publicVideoUrl
+      interview_video_url: publicVideoUrl,
+      unanswered_candidate_questions: unansweredQuestions
     };
 
     if (existingReport) {

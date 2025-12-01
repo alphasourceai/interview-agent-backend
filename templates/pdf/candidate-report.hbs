@@ -100,6 +100,19 @@
         </li>
       </ul>
     </div>
+
+    <div class="breakdown-section">
+      <h2>Unanswered Candidate Questions</h2>
+      {{#if unanswered_candidate_questions.length}}
+        <ul class="kv">
+          {{#each unanswered_candidate_questions}}
+            <li>{{this}}</li>
+          {{/each}}
+        </ul>
+      {{else}}
+        <p class="muted">None reported.</p>
+      {{/if}}
+    </div>
   </div>
 </body>
 </html>

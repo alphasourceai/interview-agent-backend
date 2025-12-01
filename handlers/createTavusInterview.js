@@ -14,8 +14,9 @@ const { ensureTavusDocumentForRole, missingTavusKbError } = require('../lib/tavu
  * @param {Object} candidate - { id, role_id, email, name }
  * @param {Object} role - { id, kb_document_id, tavus_document_id }
  * @param {string} [webhookUrl] - Full URL to /webhook/recording-ready
+ * @param {Object} [options] - { companyName }
  */
-async function createTavusInterviewHandler(candidate, role, webhookUrl) {
+async function createTavusInterviewHandler(candidate, role, webhookUrl, options = {}) {
   const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
   const REPLICA_ID = String(process.env.TAVUS_REPLICA_ID || '').trim();
   const PERSONA_ID = String(process.env.TAVUS_PERSONA_ID || '').trim();
@@ -26,11 +27,16 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl) {
     throw new Error('Tavus requires persona_id or replica_id. Set TAVUS_REPLICA_ID or TAVUS_PERSONA_ID.');
   }
 
-  // Nudge the agent to use the KB doc
+  const companyName = (options.companyName || role.company_name || '').trim() || 'the hiring organization';
+  const roleTitle = (role?.title || 'this position').trim();
+
   const context = [
-    'You are interviewing a candidate. Use the attached knowledge-base "rubric" document to guide your questions and answers.',
-    'If the candidate asks about evaluation, list the scoring categories exactly as written in the rubric.',
-    'Prefer facts from the document over generic advice.'
+    `You are the interviewer for the ${roleTitle} role at ${companyName}. When the candidate connects, YOU start the conversation with a brief, warm greeting that welcomes them to the interview and mentions you're excited to learn how their skills relate to the role.`,
+    'Stay strictly within the scope of an interviewer. Never discuss the interview platform, internal tools, AI models, or any behind-the-scenes details.',
+    'Use only the attached knowledge base (KB) for details about the role, company, or process. Give short, direct answers when the KB contains the information.',
+    'If the candidate asks a question that is not answered by the KB, let them know you will note it for the hiring manager, log it using the format [[UNANSWERED_QUESTION: <candidate question>]], and then gently steer the discussion back to the interview question you asked.',
+    'If they probe about the platform, integrations, underlying models, or any internal setup, politely decline, remind them your focus is evaluating their fit, and redirect to the interview topic.',
+    'Keep the interview flowing, one question at a time, and rely on the KB for guidance on what to ask next.'
   ].join(' ');
 
   // Build the payload Tavus expects

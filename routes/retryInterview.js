@@ -71,14 +71,27 @@ router.post('/:id/retry-create', requireAuth, withClientScope, async (req, res) 
 
     const { data: role, error: rErr } = await supabase
       .from('roles')
-      .select('id, title, kb_document_id, tavus_document_id')
+      .select('id, title, kb_document_id, tavus_document_id, client_id')
       .eq('id', interview.role_id)
       .single();
     if (rErr || !role) return res.status(404).json({ error: rErr?.message || 'Role not found' });
 
     // Create Tavus conversation (keeping your existing webhook path)
     const webhookUrl = `${base}/webhook/recording-ready`;
-    const result = await createTavusInterviewHandler(candidate, role, webhookUrl);
+
+    let companyName = 'the hiring organization';
+    try {
+      const { data: clientRow } = await supabase
+        .from('clients')
+        .select('id, name')
+        .eq('id', interview.client_id || role.client_id)
+        .single();
+      if (clientRow?.name) companyName = clientRow.name.trim();
+    } catch (err) {
+      console.warn('[retry-interview] client_lookup_failed', err?.message || err);
+    }
+
+    const result = await createTavusInterviewHandler(candidate, role, webhookUrl, { companyName });
 
     if (!result?.conversation_url) {
       return res.status(502).json({ error: 'Failed to create conversation' });

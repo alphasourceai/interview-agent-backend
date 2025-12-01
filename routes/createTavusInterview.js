@@ -75,8 +75,20 @@ router.post('/', async (req, res) => {
 
     const webhookUrl = `${base}/webhook/tavus`;
 
+    let companyName = 'the hiring organization';
+    try {
+      const { data: clientRow } = await supabase
+        .from('clients')
+        .select('id, name')
+        .eq('id', clientId)
+        .single();
+      if (clientRow?.name) companyName = clientRow.name.trim();
+    } catch (err) {
+      console.warn('[create-tavus] client_lookup_failed', err?.message || err);
+    }
+
     // Tavus
-    const result = await createTavusInterviewHandler(candidate, role, webhookUrl);
+    const result = await createTavusInterviewHandler(candidate, role, webhookUrl, { companyName });
 
     // Immediately reflect on candidate
     await supabase

@@ -847,7 +847,8 @@ CREATE TABLE public.interviews (
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
     transcript_url text,
-    analysis_url text
+    analysis_url text,
+    unanswered_candidate_questions jsonb
 );
 
 
@@ -885,7 +886,8 @@ CREATE TABLE public.reports (
     analysis jsonb,
     candidate_external_id text,
     client_id uuid,
-    role_id uuid
+    role_id uuid,
+    unanswered_candidate_questions jsonb
 );
 
 

@@ -108,7 +108,7 @@ async function handleGenerate(req, res) {
     if (report_id) {
       const { data, error } = await supabaseAdmin
         .from('reports')
-        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis')
+        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis, unanswered_candidate_questions')
         .eq('id', report_id)
         .maybeSingle();
       if (error) throw error;
@@ -116,7 +116,7 @@ async function handleGenerate(req, res) {
     } else {
       const { data, error } = await supabaseAdmin
         .from('reports')
-        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis')
+        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis, unanswered_candidate_questions')
         .eq('candidate_id', candidate_id)
         .order('created_at', { ascending: false })
         .limit(1);
@@ -403,6 +403,10 @@ async function handleGenerate(req, res) {
     if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
       Sentry.addBreadcrumb({ category: 'reports', level: 'info', message: 'payload:build' });
     }
+    const unansweredCandidateQuestions = Array.isArray(reportRow.unanswered_candidate_questions)
+      ? reportRow.unanswered_candidate_questions.filter(q => typeof q === 'string' && q.trim())
+      : [];
+
     const payload = {
       name,
       email,
@@ -415,7 +419,8 @@ async function handleGenerate(req, res) {
       resume_summary,
       interview_breakdown,
       interview_summary,
-      created_at: reportRow.created_at
+      created_at: reportRow.created_at,
+      unanswered_candidate_questions: unansweredCandidateQuestions
     };
 
     // 4) Render and convert to PDF
