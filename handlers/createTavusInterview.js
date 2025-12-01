@@ -29,9 +29,11 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
 
   const companyName = (options.companyName || role.company_name || '').trim() || 'the hiring organization';
   const roleTitle = (role?.title || 'this position').trim();
+  const candidateName = (candidate?.name || '').trim() || 'there';
 
   const context = [
-    `You are the interviewer for the ${roleTitle} role at ${companyName}. When the candidate connects, YOU start the conversation with a brief, warm greeting that welcomes them to the interview and mentions you're excited to learn how their skills relate to the role.`,
+    `You are the interviewer for the ${roleTitle} role at ${companyName}. The moment the video connects, YOU must initiate the conversation without silence: greet the candidate by name (e.g., "Hi ${candidateName}, thanks for joining today. I'm your virtual interviewer for the ${roleTitle} role at ${companyName}. I'm excited to get to know you."), then immediately transition into the first question from the rubric.`,
+    'Never wait for the candidate to speak first. Always lead with the greeting and your first question so there is no dead air at the start.',
     'Stay strictly within the scope of an interviewer. Never discuss the interview platform, internal tools, AI models, or any behind-the-scenes details.',
     'Use only the attached knowledge base (KB) for details about the role, company, or process. Give short, direct answers when the KB contains the information.',
     'If the candidate asks a question that is not answered by the KB, let them know you will note it for the hiring manager, log it using the format [[UNANSWERED_QUESTION: <candidate question>]], and then gently steer the discussion back to the interview question you asked.',
@@ -47,6 +49,7 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     conversation_name: candidate?.name || candidate?.email || 'Interview',
     conversational_context: context
   };
+  console.log('[tavus-interview-prompt]', { role_id: role?.id, role_title: roleTitle, company: companyName, prompt: context });
 
   let tavusDocumentId = role?.tavus_document_id || null;
   if (!tavusDocumentId && role?.kb_document_id) {
