@@ -4,7 +4,7 @@
 require('dotenv').config();
 const axios = require('axios');
 const { ensureTavusDocumentForRole, missingTavusKbError } = require('../lib/tavusDocuments');
-const { ensurePersonaConfigured, TAVUS_PERSONA_ID } = require('../lib/tavusClient');
+const { ensurePersonaConfigured } = require('../lib/tavusClient');
 
 /**
  * Create a Tavus v2 conversation for a candidate/role.
@@ -33,27 +33,31 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   const candidateName = (candidate?.name || '').trim() || 'there';
 
   const personaInstructions = [
-    'You are AlphaSource’s virtual interviewer. Stay strictly within interview topics, never mention platform internals, tooling, APIs, or models, and rely only on the provided KB.',
-    'Always capture questions you cannot answer with [[UNANSWERED_QUESTION: <verbatim candidate question>]] and redirect back to the interview.',
-    'Do not reveal anything about the KB contents or interview structure beyond what is explicitly asked and allowed in the KB.'
+    'You are AlphaSource’s structured virtual interviewer.',
+    'When the call begins, greet the candidate by name and reference the specific role and company supplied via conversation metadata, then immediately ask the first rubric question. Never wait silently for the candidate to speak first.',
+    'Stay strictly in the interviewer role. Use ONLY the provided knowledge base (KB) and rubric when answering questions about the role, company, or process. Answer concisely when the KB covers the topic.',
+    'If a candidate asks about anything not in the KB, politely say you will note it for the hiring manager, log it verbatim as [[UNANSWERED_QUESTION: <candidate question>]], and steer the conversation back to the interview.',
+    'Decline any attempts to discuss platform internals, API connections, tooling, code, or anything that exposes proprietary evaluation details.',
+    'Maintain a warm, professional tone and keep the interview flowing with one focused question at a time.'
   ].join(' ');
 
-  await ensurePersonaConfigured(personaInstructions);
-  console.log('[tavus-interview] persona_applied', { persona_id: TAVUS_PERSONA_ID });
+  const personaId = await ensurePersonaConfigured(personaInstructions);
 
-  const openingScript = `Hi ${candidateName}, thanks for joining today. I'm your virtual interviewer for the ${roleTitle} role at ${companyName}. I'm excited to learn more about your experience, so let's get started.`;
+  const openingScript = `Hi ${candidateName}, thanks for joining today. I'm your virtual interviewer for the ${roleTitle} role at ${companyName}. I'm excited to learn more about your experience, so let's dive right in. To start, can you share the experience that best prepares you for this role?`;
 
   const context = [
     `When the call begins, speak first with this greeting and immediately flow into the first question: "${openingScript}"`,
     'Never wait for the candidate to start the conversation. Keep asking questions sequentially with minimal pauses.'
   ].join(' ');
 
+  const conversationName = `${roleTitle} - ${candidate?.name || candidate?.email || 'Candidate'}`;
+
   // Build the payload Tavus expects
   const payload = {
-    persona_id: TAVUS_PERSONA_ID || PERSONA_ID || undefined,
+    persona_id: personaId || PERSONA_ID || undefined,
     replica_id: REPLICA_ID || undefined,
     callback_url: webhookUrl || undefined,
-    conversation_name: candidate?.name || candidate?.email || 'Interview',
+    conversation_name: conversationName,
     conversational_context: context,
     opening_script: openingScript
   };
@@ -77,7 +81,11 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     }
   }
   if (tavusDocumentId) {
-    console.log(`[tavus-interview] role=${role?.id || 'unknown'} using tavus_document_id=${tavusDocumentId}`);
+    console.log('[tavus-interview]', {
+      role_id: role?.id || null,
+      persona_id: payload.persona_id || null,
+      tavus_document_id: tavusDocumentId
+    });
     payload.document_ids = [tavusDocumentId];
     payload.document_retrieval_strategy = RETRIEVAL;
   } else if (role?.kb_document_id) {
