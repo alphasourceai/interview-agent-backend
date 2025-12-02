@@ -70,7 +70,8 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     console.error('[tavus-interview-error] persona_config_failed', {
       role_id: role?.id || null,
       candidate_id: candidate?.id || candidate?.candidate_id || null,
-      detail: err?.message || err
+      detail: err?.message || err,
+      status: err?.status || null
     });
     err.code = err.code || 'persona_config_failed';
     err.status = err.status || 500;
