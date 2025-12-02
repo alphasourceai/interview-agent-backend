@@ -7,19 +7,34 @@ const { createTavusInterviewHandler } = require('../handlers/createTavusIntervie
 
 const router = express.Router();
 
+function sendError(res, status, code, detail, context = {}, hint = null) {
+  const payload = {
+    error: code,
+    detail,
+    hint,
+    role_id: context.role_id || null,
+    candidate_id: context.candidate_id || null
+  };
+  console.error('[tavus-interview-error]', code, { ...context, status, detail, hint });
+  return res.status(status).json(payload);
+}
+
 router.post('/', async (req, res) => {
+  let candidate_id;
+  let roleIdFromBody;
+  let roleToken;
+  let role_token;
+  let roleId = null;
+  let role = null;
   try {
     const computedBase = `${req.protocol}://${req.get('host')}`;
     const base = (process.env.PUBLIC_BACKEND_URL || computedBase).replace(/\/+$/, '');
 
-    const {
-      candidate_id,
-      role_id: roleIdFromBody,
-      roleToken,
-      role_token
-    } = req.body || {};
+    ({ candidate_id, role_id: roleIdFromBody, roleToken, role_token } = req.body || {});
     const roleTokenFromBody = roleToken || role_token || null;
-    if (!candidate_id) return res.status(400).json({ error: 'candidate_id required' });
+    if (!candidate_id) {
+      return sendError(res, 400, 'missing_fields', 'candidate_id required', { candidate_id });
+    }
 
     // candidate
     const { data: candidate, error: cErr } = await supabase
@@ -27,10 +42,11 @@ router.post('/', async (req, res) => {
       .select('*')
       .eq('id', candidate_id)
       .single();
-    if (cErr || !candidate) return res.status(404).json({ error: cErr?.message || 'Candidate not found' });
+    if (cErr || !candidate) {
+      return sendError(res, 404, 'candidate_not_found', cErr?.message || 'Candidate not found', { candidate_id });
+    }
 
-    let role = null;
-    let roleId = roleIdFromBody || null;
+    roleId = roleIdFromBody || null;
 
     // If no explicit role id, try token from body
     if (!roleId && roleTokenFromBody) {
@@ -41,7 +57,7 @@ router.post('/', async (req, res) => {
         .limit(1)
         .single();
       if (rtErr && rtErr.code !== 'PGRST116') {
-        return res.status(500).json({ error: rtErr.message });
+        return sendError(res, 500, 'role_lookup_failed', rtErr.message || 'Failed to lookup role by token', { candidate_id, role_id: roleId });
       }
       if (roleByToken) {
         role = roleByToken;
@@ -57,20 +73,22 @@ router.post('/', async (req, res) => {
     if (!role) {
       // If we have a roleId now, fetch the role row
       if (!roleId) {
-        return res.status(400).json({ error: 'role_id or valid role token required (candidate has no role_id)' });
+        return sendError(res, 400, 'missing_role', 'role_id or valid role token required (candidate has no role_id)', { candidate_id });
       }
       const { data: roleById, error: rErr } = await supabase
         .from('roles')
         .select('*')
         .eq('id', roleId)
         .single();
-      if (rErr || !roleById) return res.status(404).json({ error: rErr?.message || 'Role not found' });
+      if (rErr || !roleById) {
+        return sendError(res, 404, 'role_not_found', rErr?.message || 'Role not found', { candidate_id, role_id });
+      }
       role = roleById;
     }
 
     const clientId = role.client_id || candidate.client_id || null;
     if (!clientId) {
-      return res.status(400).json({ error: 'client_id could not be determined from role or candidate' });
+      return sendError(res, 400, 'missing_client', 'client_id could not be determined from role or candidate', { candidate_id, role_id });
     }
 
     const webhookUrl = `${base}/webhook/tavus`;
@@ -134,7 +152,9 @@ router.post('/', async (req, res) => {
         })
         .select('id')
         .single();
-      if (iErr) return res.status(500).json({ error: iErr.message });
+      if (iErr) {
+        return sendError(res, 500, 'interview_insert_failed', iErr.message, { candidate_id, role_id });
+      }
 
       return res.status(200).json({
         message: 'Interview created',
@@ -151,7 +171,9 @@ router.post('/', async (req, res) => {
           status: 'Pending'
         })
         .eq('id', existing.id);
-      if (uErr) return res.status(500).json({ error: uErr.message });
+      if (uErr) {
+        return sendError(res, 500, 'interview_update_failed', uErr.message, { candidate_id, role_id });
+      }
 
       return res.status(200).json({
         message: 'Interview updated',
@@ -160,17 +182,24 @@ router.post('/', async (req, res) => {
       });
     }
   } catch (e) {
+    const context = {
+      candidate_id,
+      role_id: roleId || roleIdFromBody || null
+    };
     if (e?.code === 'missing_tavus_kb' || e?.code === 'kb_not_ready') {
       const status = e.code === 'kb_not_ready' ? 409 : 500;
-      console.error(`[tavus-interview] ${e.code} role=${e.role_id || roleIdFromBody || 'unknown'}:`, e.detail || e.message);
-      return res.status(status).json({
-        error: e.code,
-        detail: e.message,
-        role_id: e.role_id || roleIdFromBody || null
-      });
+      return sendError(res, status, e.code, e.message, context);
     }
-    const status = e.status || 500;
-    return res.status(status).json({ error: e.message });
+    if (e?.code === 'tavus_request_failed') {
+      return sendError(res, e.status || 502, 'tavus_request_failed', e.detail || e.message || 'Failed to create Tavus conversation', context, 'Check Tavus logs or retry shortly');
+    }
+    if (e?.code === 'persona_config_failed') {
+      return sendError(res, e.status || 500, 'persona_config_failed', e.message || 'Failed to configure Tavus persona', context, 'Verify TAVUS_PERSONA_ID / name / permissions');
+    }
+    if (e?.code === 'missing_env') {
+      return sendError(res, e.status || 500, 'missing_env', e.message || 'Missing Tavus configuration', context);
+    }
+    return sendError(res, e.status || 500, e.code || 'unexpected_error', e.message || 'Server error', context);
   }
 });
 

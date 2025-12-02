@@ -23,10 +23,32 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   const PERSONA_ID = String(process.env.TAVUS_PERSONA_ID || '').trim();
   const RETRIEVAL = String(process.env.TAVUS_DOCUMENT_STRATEGY || 'balanced').trim();
 
-  if (!API_KEY) throw new Error('TAVUS_API_KEY is not set');
-  if (!REPLICA_ID && !PERSONA_ID) {
-    throw new Error('Tavus requires persona_id or replica_id. Set TAVUS_REPLICA_ID or TAVUS_PERSONA_ID.');
+  if (!API_KEY) {
+    const err = new Error('TAVUS_API_KEY is not set');
+    err.code = 'missing_env';
+    err.status = 500;
+    throw err;
   }
+  if (!REPLICA_ID && !PERSONA_ID) {
+    const err = new Error('Tavus requires persona_id or replica_id. Set TAVUS_REPLICA_ID or TAVUS_PERSONA_ID.');
+    err.code = 'missing_env';
+    err.status = 500;
+    throw err;
+  }
+
+  const envFlags = {
+    TAVUS_API_KEY: !!process.env.TAVUS_API_KEY,
+    TAVUS_REPLICA_ID: !!process.env.TAVUS_REPLICA_ID,
+    TAVUS_PERSONA_ID: !!process.env.TAVUS_PERSONA_ID,
+    TAVUS_PERSONA_NAME: !!process.env.TAVUS_PERSONA_NAME
+  };
+  console.log('[tavus-interview-debug]', {
+    stage: 'handler_start',
+    candidate_id: candidate?.id || candidate?.candidate_id || null,
+    role_id: role?.id || null,
+    client_id: role?.client_id || candidate?.client_id || options?.clientId || null,
+    env: envFlags
+  });
 
   const companyName = (options.companyName || role.company_name || '').trim() || 'the hiring organization';
   const roleTitle = (role?.title || 'this position').trim();
@@ -41,7 +63,23 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     'Maintain a warm, professional tone and keep the interview flowing with one focused question at a time.'
   ].join(' ');
 
-  const personaId = await ensurePersonaConfigured(personaInstructions);
+  let personaId;
+  try {
+    personaId = await ensurePersonaConfigured(personaInstructions);
+  } catch (err) {
+    console.error('[tavus-interview-error] persona_config_failed', {
+      role_id: role?.id || null,
+      candidate_id: candidate?.id || candidate?.candidate_id || null,
+      detail: err?.message || err
+    });
+    err.code = err.code || 'persona_config_failed';
+    err.status = err.status || 500;
+    throw err;
+  }
+  console.log('[tavus-interview-debug]', {
+    stage: 'persona_configured',
+    persona_id: personaId
+  });
 
   const openingScript = `Hi ${candidateName}, thanks for joining today. I'm your virtual interviewer for the ${roleTitle} role at ${companyName}. I'm excited to learn more about your experience, so let's dive right in. To start, can you share the experience that best prepares you for this role?`;
 
@@ -110,6 +148,12 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   } catch (e) {
     const status = e.response?.status || 500;
     const details = e.response?.data || e.message;
+    console.error('[tavus-interview-error] tavus_request_failed', {
+      role_id: role?.id || null,
+      candidate_id: candidate?.id || candidate?.candidate_id || null,
+      httpStatus: status,
+      tavusErrorBody: details
+    });
     if (status === 400 && (payload?.document_ids || []).length) {
       console.error(
         `[tavus-interview] Tavus rejected document ${payload.document_ids[0]} for role ${role?.id || 'unknown'}:`,
@@ -117,8 +161,9 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
       );
     }
     const err = new Error(typeof details === 'string' ? details : JSON.stringify(details));
-    err.status = status;
-    err.code = status === 400 ? 'tavus_400' : undefined;
+    err.status = status >= 400 && status < 500 ? status : 502;
+    err.code = 'tavus_request_failed';
+    err.detail = err.message;
     throw err;
   }
 }
