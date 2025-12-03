@@ -193,9 +193,6 @@ router.post('/', async (req, res) => {
     if (e?.code === 'tavus_request_failed') {
       return sendError(res, e.status || 502, 'tavus_request_failed', e.detail || e.message || 'Failed to create Tavus conversation', context, 'Check Tavus logs or retry shortly');
     }
-    if (e?.code === 'persona_config_failed') {
-      return sendError(res, e.status || 500, 'persona_config_failed', e.message || 'Failed to configure Tavus persona', context, 'Verify TAVUS_PERSONA_ID / name / permissions');
-    }
     if (e?.code === 'missing_env') {
       return sendError(res, e.status || 500, 'missing_env', e.message || 'Missing Tavus configuration', context);
     }

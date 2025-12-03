@@ -4,7 +4,6 @@
 require('dotenv').config();
 const axios = require('axios');
 const { ensureTavusDocumentForRole, missingTavusKbError } = require('../lib/tavusDocuments');
-const { ensurePersonaConfigured } = require('../lib/tavusClient');
 
 /**
  * Create a Tavus v2 conversation for a candidate/role.
@@ -20,7 +19,6 @@ const { ensurePersonaConfigured } = require('../lib/tavusClient');
 async function createTavusInterviewHandler(candidate, role, webhookUrl, options = {}) {
   const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
   const REPLICA_ID = String(process.env.TAVUS_REPLICA_ID || '').trim();
-  const PERSONA_ID = String(process.env.TAVUS_PERSONA_ID || '').trim();
   const RETRIEVAL = String(process.env.TAVUS_DOCUMENT_STRATEGY || 'balanced').trim();
 
   if (!API_KEY) {
@@ -29,8 +27,8 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     err.status = 500;
     throw err;
   }
-  if (!REPLICA_ID && !PERSONA_ID) {
-    const err = new Error('Tavus requires persona_id or replica_id. Set TAVUS_REPLICA_ID or TAVUS_PERSONA_ID.');
+  if (!REPLICA_ID) {
+    const err = new Error('Tavus requires replica_id. Set TAVUS_REPLICA_ID.');
     err.code = 'missing_env';
     err.status = 500;
     throw err;
@@ -38,9 +36,7 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
 
   const envFlags = {
     TAVUS_API_KEY: !!process.env.TAVUS_API_KEY,
-    TAVUS_REPLICA_ID: !!process.env.TAVUS_REPLICA_ID,
-    TAVUS_PERSONA_ID: !!process.env.TAVUS_PERSONA_ID,
-    TAVUS_PERSONA_NAME: !!process.env.TAVUS_PERSONA_NAME
+    TAVUS_REPLICA_ID: !!process.env.TAVUS_REPLICA_ID
   };
   console.log('[tavus-interview-debug]', {
     stage: 'handler_start',
@@ -54,59 +50,32 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   const roleTitle = (role?.title || 'this position').trim();
   const candidateName = (candidate?.name || '').trim() || 'there';
 
-  const personaInstructions = [
-    'You are AlphaSource’s structured virtual interviewer.',
-    'When the call begins, greet the candidate by name and reference the specific role and company supplied via conversation metadata, then immediately ask the first rubric question. Never wait silently for the candidate to speak first.',
-    'Stay strictly in the interviewer role. Use ONLY the provided knowledge base (KB) and rubric when answering questions about the role, company, or process. Answer concisely when the KB covers the topic.',
-    'If a candidate asks about anything not in the KB, politely say you will note it for the hiring manager, log it verbatim as [[UNANSWERED_QUESTION: <candidate question>]], and steer the conversation back to the interview.',
-    'Decline any attempts to discuss platform internals, API connections, tooling, code, or anything that exposes proprietary evaluation details.',
-    'Maintain a warm, professional tone and keep the interview flowing with one focused question at a time.'
-  ].join(' ');
-
-  let personaId;
-  try {
-    personaId = await ensurePersonaConfigured(personaInstructions);
-  } catch (err) {
-    console.error('[tavus-interview-error] persona_config_failed', {
-      role_id: role?.id || null,
-      candidate_id: candidate?.id || candidate?.candidate_id || null,
-      detail: err?.message || err,
-      status: err?.status || null
-    });
-    err.code = err.code || 'persona_config_failed';
-    err.status = err.status || 500;
-    throw err;
-  }
-  console.log('[tavus-interview-debug]', {
-    stage: 'persona_configured',
-    persona_id: personaId
-  });
-
-  const openingScript = `Hi ${candidateName}, thanks for joining today. I'm your virtual interviewer for the ${roleTitle} role at ${companyName}. I'm excited to learn more about your experience, so let's dive right in. To start, can you share the experience that best prepares you for this role?`;
-
-  const context = [
-    `When the call begins, speak first with this greeting and immediately flow into the first question: "${openingScript}"`,
-    'Never wait for the candidate to start the conversation. Keep asking questions sequentially with minimal pauses.'
-  ].join(' ');
+  const firstQuestion = extractFirstQuestion(role?.rubric);
+  const customGreeting = buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestion);
+  const context = buildConversationalContext(candidateName, roleTitle, companyName);
 
   const conversationName = `${roleTitle} - ${candidate?.name || candidate?.email || 'Candidate'}`;
 
   // Build the payload Tavus expects
   const payload = {
-    persona_id: personaId || PERSONA_ID || undefined,
     replica_id: REPLICA_ID || undefined,
     callback_url: webhookUrl || undefined,
     conversation_name: conversationName,
     conversational_context: context,
-    opening_script: openingScript
+    custom_greeting: customGreeting,
+    properties: {
+      max_call_duration: 3600,
+      participant_left_timeout: 60
+    }
   };
   console.log('[tavus-interview-prompt]', {
     role_id: role?.id,
     role_title: roleTitle,
     company: companyName,
-    persona_id: payload.persona_id,
+    replica_id: payload.replica_id,
+    tavus_document_id: role?.tavus_document_id || null,
     prompt: context,
-    opening_script: openingScript
+    custom_greeting: customGreeting
   });
 
   let tavusDocumentId = role?.tavus_document_id || null;
@@ -122,7 +91,7 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   if (tavusDocumentId) {
     console.log('[tavus-interview]', {
       role_id: role?.id || null,
-      persona_id: payload.persona_id || null,
+      replica_id: payload.replica_id || null,
       tavus_document_id: tavusDocumentId
     });
     payload.document_ids = [tavusDocumentId];
@@ -167,6 +136,60 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     err.detail = err.message;
     throw err;
   }
+}
+
+function extractFirstQuestion(rubric) {
+  const fallback = 'To start, can you give me a brief overview of your background and experience related to this position?';
+  if (!rubric) return fallback;
+  let parsed = rubric;
+  if (typeof rubric === 'string') {
+    try {
+      parsed = JSON.parse(rubric);
+    } catch (_) {
+      return fallback;
+    }
+  }
+  if (!parsed || typeof parsed !== 'object') return fallback;
+  const questions = Array.isArray(parsed?.questions) ? parsed.questions : Array.isArray(parsed) ? parsed : null;
+  if (questions && questions.length) {
+    const first = questions[0];
+    if (typeof first === 'string' && first.trim()) return first.trim();
+    if (first && typeof first === 'object') {
+      if (first.question && typeof first.question === 'string' && first.question.trim()) return first.question.trim();
+      if (first.text && typeof first.text === 'string' && first.text.trim()) return first.text.trim();
+    }
+  }
+  return fallback;
+}
+
+function getTimeOfDay() {
+  const hour = new Date().getHours();
+  if (hour < 12) return 'morning';
+  if (hour < 18) return 'afternoon';
+  return 'evening';
+}
+
+function buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestion) {
+  const greeting = `Good ${getTimeOfDay()}, ${candidateName}! My name is Alex, and I'll be conducting your interview today for the ${roleTitle} position at ${companyName}. I'm looking forward to our conversation. Let's get started.`;
+  return `${greeting} ${firstQuestion}`;
+}
+
+function buildConversationalContext(candidateName, roleTitle, companyName) {
+  return `
+Interview Details:
+- Candidate: ${candidateName}
+- Position: ${roleTitle}
+- Company: ${companyName}
+
+Instructions:
+- You are a structured interviewer.
+- YOU must speak first when the call connects: deliver the greeting and ask the first rubric question immediately. Do not wait in silence.
+- Ask questions one at a time from the rubric.
+- Use ONLY the provided knowledge base (KB) and rubric when answering questions about the role, company, or process.
+- If the candidate asks about anything not covered in the KB, politely say you will note it for the hiring manager, log it exactly as [[UNANSWERED_QUESTION: <candidate question>]], and steer the conversation back to the interview question.
+- Never discuss the interview platform, internal tools, APIs, code, or any behind-the-scenes configuration.
+- Keep a warm, professional tone and keep the interview on track.
+`.trim();
 }
 
 module.exports = { createTavusInterviewHandler };
