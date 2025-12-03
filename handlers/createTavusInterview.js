@@ -139,7 +139,7 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
 }
 
 function extractFirstQuestion(rubric) {
-  const fallback = 'To start, can you give me a brief overview of your background and experience related to this position?';
+  const fallback = 'To start, can you tell me a bit about your background and how it relates to this role?';
   if (!rubric) return fallback;
   let parsed = rubric;
   if (typeof rubric === 'string') {
@@ -162,15 +162,8 @@ function extractFirstQuestion(rubric) {
   return fallback;
 }
 
-function getTimeOfDay() {
-  const hour = new Date().getHours();
-  if (hour < 12) return 'morning';
-  if (hour < 18) return 'afternoon';
-  return 'evening';
-}
-
 function buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestion) {
-  const greeting = `Good ${getTimeOfDay()}, ${candidateName}! My name is Alex, and I'll be conducting your interview today for the ${roleTitle} position at ${companyName}. I'm looking forward to our conversation. Let's get started.`;
+  const greeting = `Hi ${candidateName}, it's nice to meet you today. My name is Alex, and I'll be conducting your interview for the ${roleTitle} position at ${companyName}. I'm looking forward to our conversation. Let's get started.`;
   return `${greeting} ${firstQuestion}`;
 }
 
