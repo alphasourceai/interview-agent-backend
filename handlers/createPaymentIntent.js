@@ -4,7 +4,16 @@ const stripe = require('../lib/stripeClient');
 
 async function createPaymentIntent(req, res) {
   try {
-    const { amount, currency, description } = req.body || {};
+    const {
+      amount,
+      currency,
+      description,
+      name,
+      company,
+      billingStreet,
+      billingZip,
+      email
+    } = req.body || {};
 
     const amountNumber = Number(amount);
     if (!amount || Number.isNaN(amountNumber) || amountNumber <= 0) {
@@ -23,7 +32,15 @@ async function createPaymentIntent(req, res) {
       amount: amountInCents,
       currency: currency || 'usd',
       automatic_payment_methods: { enabled: true },
-      metadata: { description: description || '' }
+      receipt_email: email || undefined,
+      metadata: {
+        description: description || '',
+        name: name || '',
+        company: company || '',
+        billingStreet: billingStreet || '',
+        billingZip: billingZip || '',
+        email: email || ''
+      }
     });
 
     return res.status(200).json({ clientSecret: paymentIntent.client_secret });
