@@ -54,6 +54,13 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
 
+    const membership = (req.memberships || []).find((m) => m.client_id === clientId);
+    const role = (membership?.role || '').toLowerCase();
+    if (!membership) return res.status(403).json({ error: 'forbidden' });
+    if (role !== 'manager' && role !== 'admin') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
     const payload = {
       client_id: clientId,
       title: req.body.title || 'Untitled Role',
