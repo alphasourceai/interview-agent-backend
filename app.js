@@ -241,6 +241,7 @@ async function withClientScope(req, res, next) {
 app.use('/api/candidate/submit', require('./routes/candidateSubmit'))
 app.use('/api/candidate/verify-otp', require('./routes/verifyOtp'))
 app.use('/api/payments', require('./routes/payments'))
+app.use('/api/feedback', require('./routes/feedback'))
 app.use('/create-tavus-interview', require('./routes/createTavusInterview'))
 
 // ---------- Simple test endpoint ----------
