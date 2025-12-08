@@ -157,4 +157,45 @@ router.post('/admin/roles/delete', requireAuth, async (req, res) => {
   }
 });
 
+// Allow client managers/admins to delete a role for their client
+router.delete('/', requireAuth, withClientScope, async (req, res) => {
+  try {
+    const clientId =
+      req.query.client_id ||
+      req.client?.id ||
+      req.clientScope?.defaultClientId ||
+      null;
+    const roleId = req.query.id || null;
+
+    if (!clientId || !roleId) {
+      return res.status(400).json({ error: 'Missing id or client_id' });
+    }
+
+    const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
+    const role = (membership?.role || '').toLowerCase();
+    if (!membership || (role !== 'manager' && role !== 'admin')) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    const { data, error } = await supabase
+      .from('roles')
+      .delete()
+      .eq('id', roleId)
+      .eq('client_id', clientId)
+      .select('id')
+      .maybeSingle();
+
+    if (error) {
+      console.error('[DELETE /roles] supabase error', error);
+      return res.status(500).json({ error: 'Failed to delete role' });
+    }
+    if (!data) return res.status(404).json({ error: 'Not found' });
+
+    return res.json({ ok: true, id: data.id });
+  } catch (e) {
+    console.error('[DELETE /roles] unexpected', e);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
 module.exports = router;
