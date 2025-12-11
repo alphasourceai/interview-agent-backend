@@ -62,7 +62,7 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
 
     const { data, error } = await supabaseAdmin
       .from('client_members')
-      .select('client_id,user_id,email,name,role,created_at')
+      .select('client_id,user_id,email,name,role,created_at,tester_acknowledged_at,tester_acknowledged_ip')
       .eq('client_id', clientId)
       .order('created_at', { ascending: false });
 
@@ -89,7 +89,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
 
     const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
     const userRole = (membership?.role || '').toLowerCase();
-    if (!membership || (userRole !== 'manager' && userRole !== 'admin')) {
+    if (!membership || !['manager', 'admin', 'tester'].includes(userRole)) {
       return res.status(403).json({ error: 'forbidden' });
     }
     if (!['member', 'manager'].includes(role)) {
@@ -136,7 +136,7 @@ router.delete('/:id', requireAuth, withClientScope, async (req, res) => {
 
     const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === client_id);
     const userRole = (membership?.role || '').toLowerCase();
-    if (!membership || (userRole !== 'manager' && userRole !== 'admin')) {
+    if (!membership || !['manager', 'admin', 'tester'].includes(userRole)) {
       return res.status(403).json({ error: 'forbidden' });
     }
 
@@ -151,6 +151,43 @@ router.delete('/:id', requireAuth, withClientScope, async (req, res) => {
   } catch (e) {
     console.error('[client-members/delete] unexpected', e?.message || e);
     res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// Tester NDA acknowledgement
+router.post('/tester-ack', requireAuth, withClientScope, async (req, res) => {
+  try {
+    const clientId = req.body?.client_id || req.query.client_id || req.client?.id || req.clientScope?.defaultClientId || null;
+    if (!clientId) return res.status(400).json({ error: 'client_id_required' });
+
+    const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
+    if (!membership) return res.status(403).json({ error: 'forbidden' });
+    if ((membership.role || '').toLowerCase() !== 'tester') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    if (membership.tester_acknowledged_at) {
+      return res.json({ ok: true, tester_acknowledged_at: membership.tester_acknowledged_at, tester_acknowledged_ip: membership.tester_acknowledged_ip || null });
+    }
+
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || null;
+    let q = supabaseAdmin
+      .from('client_members')
+      .update({ tester_acknowledged_at: new Date().toISOString(), tester_acknowledged_ip: ip || null })
+      .eq('client_id', clientId);
+    // prefer user_id_uuid but fall back to legacy user_id
+    q = q.or(`user_id_uuid.eq.${req.user.id},user_id.eq.${req.user.id}`);
+
+    const { data, error } = await q
+      .select('tester_acknowledged_at,tester_acknowledged_ip')
+      .maybeSingle();
+    if (error) {
+      console.error('[tester-ack] update failed', error.message);
+      return res.status(500).json({ error: 'tester_ack_failed', detail: error.message });
+    }
+    return res.json({ ok: true, tester_acknowledged_at: data?.tester_acknowledged_at || null, tester_acknowledged_ip: data?.tester_acknowledged_ip || ip || null });
+  } catch (e) {
+    console.error('[tester-ack] unexpected', e?.message || e);
+    return res.status(500).json({ error: 'server_error' });
   }
 });
 

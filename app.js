@@ -224,7 +224,7 @@ async function withClientScope(req, res, next) {
     // Regular users: scope to their memberships
     const { data, error } = await supabaseAdmin
       .from('client_members')
-      .select('client_id, role')
+      .select('client_id, role, tester_acknowledged_at, tester_acknowledged_ip')
       .eq('user_id', req.user.id);
     if (error) return res.status(500).json({ error: 'Failed to load memberships', detail: error.message });
 
@@ -589,6 +589,10 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   const adminName  = (req.body?.admin_name  || '').trim()
   const adminEmail = (req.body?.admin_email || '').trim()
   const explicitClientEmail = (req.body?.email || '').trim()
+  const adminRole = (req.body?.admin_role || 'manager').toLowerCase()
+  if (!['manager', 'tester'].includes(adminRole)) {
+    return res.status(400).json({ error: 'admin_role_invalid', detail: 'admin_role must be manager or tester' })
+  }
   if (!name) return res.status(400).json({ error: 'name_required' })
 
   const emailForClient = explicitClientEmail || adminEmail
@@ -621,7 +625,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
       client_id: client.id,
       email: adminEmail,
       name: adminName || adminEmail,
-      role: 'admin',
+      role: adminRole,
       user_id: userId
     }
 
@@ -767,7 +771,7 @@ adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) =
   if (!client_id) return res.status(400).json({ error: 'client_id_required' })
   const { data, error } = await supabaseAdmin
     .from('client_members')
-    .select('client_id,user_id,email,name,role,created_at')
+    .select('client_id,user_id,email,name,role,created_at,tester_acknowledged_at,tester_acknowledged_ip')
     .eq('client_id', client_id)
     .order('created_at', { ascending: false })
   if (error) return res.status(500).json({ error: 'list_members_failed', detail: error.message })
@@ -781,6 +785,9 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   const { client_id, email, name } = req.body || {}
   const role = (req.body?.role || 'member').toLowerCase()
   if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
+  if (!['member', 'manager', 'tester'].includes(role)) {
+    return res.status(400).json({ error: 'invalid_role' })
+  }
 
   const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
   const { userId, actionLink, method } = await ensureUserIdAndInvite(email, redirectTo)

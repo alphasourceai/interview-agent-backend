@@ -57,7 +57,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
     const membership = (req.memberships || []).find((m) => m.client_id === clientId);
     const role = (membership?.role || '').toLowerCase();
     if (!membership) return res.status(403).json({ error: 'forbidden' });
-    if (role !== 'manager' && role !== 'admin') {
+    if (!['manager', 'admin', 'tester'].includes(role)) {
       return res.status(403).json({ error: 'forbidden' });
     }
 
@@ -173,7 +173,7 @@ router.delete('/', requireAuth, withClientScope, async (req, res) => {
 
     const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
     const role = (membership?.role || '').toLowerCase();
-    if (!membership || (role !== 'manager' && role !== 'admin')) {
+    if (!membership || !['manager', 'admin', 'tester'].includes(role)) {
       return res.status(403).json({ error: 'forbidden' });
     }
 
