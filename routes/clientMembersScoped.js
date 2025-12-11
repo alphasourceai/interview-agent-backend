@@ -8,10 +8,21 @@ const crypto = require('crypto');
 const router = express.Router();
 
 // Helper copied from app.js helper logic
-async function ensureUserIdAndInvite(email, redirectTo) {
+async function ensureUserIdAndInvite({ email, fullName, role, redirectTo }) {
   let userId = null;
   let actionLink = null;
   let method = null;
+
+  try {
+    const existing = await supabaseAdmin.auth.admin.getUserByEmail(email);
+    if (existing?.data?.user) {
+      const err = new Error('This email is already in use for another user.');
+      err.code = 'email_in_use';
+      throw err;
+    }
+  } catch (e) {
+    if (e?.code === 'email_in_use') throw e;
+  }
 
   try {
     const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo });
@@ -26,7 +37,7 @@ async function ensureUserIdAndInvite(email, redirectTo) {
       const link = await supabaseAdmin.auth.admin.generateLink({
         type: 'magiclink',
         email,
-        options: { redirectTo }
+        options: { redirectTo, data: { role, full_name: fullName || email } }
       });
       userId = link?.data?.user?.id || null;
       actionLink = link?.data?.action_link || null;
@@ -40,7 +51,8 @@ async function ensureUserIdAndInvite(email, redirectTo) {
     try {
       const created = await supabaseAdmin.auth.admin.createUser({
         email,
-        email_confirm: true
+        email_confirm: true,
+        user_metadata: { role, full_name: fullName || email }
       });
       userId = created?.data?.user?.id || null;
       method = method || 'createUser';
@@ -97,7 +109,12 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
     }
 
     const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1';
-    const { userId, actionLink, method } = await ensureUserIdAndInvite(email, redirectTo);
+    const { userId, actionLink, method } = await ensureUserIdAndInvite({
+      email,
+      fullName: name,
+      role,
+      redirectTo: `${process.env.FRONTEND_URL || 'https://www.alphasourceai.com'}/accept-invite`
+    });
     if (!userId) {
       console.error('add_member_no_user_id', { email, method });
       return res.status(400).json({
@@ -123,6 +140,9 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
     const m = data;
     res.json({ item: { ...m, id: m.user_id || m.email } });
   } catch (e) {
+    if (e?.code === 'email_in_use') {
+      return res.status(409).json({ error: 'email_in_use', message: 'This email is already in use for another user.' });
+    }
     console.error('[client-members/add] unexpected', e?.message || e);
     res.status(500).json({ error: 'server_error' });
   }

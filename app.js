@@ -448,19 +448,39 @@ app.get('/dashboard/rows', requireAuth, withClientScope, (req, res) => {
 // ---------- Optional: invites ----------
 app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
   try {
-    const { email, role = 'member', client_id } = req.body || {}
+    const { email, role = 'member', client_id, name } = req.body || {}
     if (!email || !client_id) return res.status(400).json({ error: 'email and client_id are required' })
     if (!(req.clientIds || []).includes(client_id)) return res.status(403).json({ error: 'Forbidden' })
+    const r = String(role || '').toLowerCase()
+    if (!['member', 'manager'].includes(r)) return res.status(400).json({ error: 'invalid_role' })
 
-    const token = crypto.randomBytes(16).toString('hex')
-    const { error } = await supabaseAdmin
-      .from('client_invites')
-      .insert({ client_id, email, role, token, invited_by: req.user.id })
-    if (error) return res.status(500).json({ error: 'Failed to create invite', detail: error.message })
+    try {
+      const { userId, actionLink, method } = await ensureUserIdAndInvite({
+        email,
+        fullName: name,
+        role: r,
+        redirectTo: `${FRONTEND_BASE}/accept-invite`
+      })
+      if (!userId) {
+        console.error('client_invite_no_user_id', { email, method })
+        return res.status(400).json({ error: 'invite_failed', detail: 'Could not create or locate user.' })
+      }
 
-    const acceptUrlBase = (process.env.FRONTEND_URL || FRONTEND_URL).replace(/\/+$/, '')
-    const accept_url = `${acceptUrlBase}/accept-invite?token=${encodeURIComponent(token)}`
-    res.json({ ok: true, accept_url })
+      const payload = { client_id, email, name: name || email, role: r, user_id: userId }
+      const { error } = await supabaseAdmin.from('client_members').insert(payload);
+      if (error) {
+        console.error('client_invite_insert_failed', error.message)
+        return res.status(500).json({ error: 'invite_failed', detail: error.message })
+      }
+      const accept_url = `${FRONTEND_BASE}/accept-invite`;
+      res.json({ ok: true, accept_url, action_link: actionLink || null })
+    } catch (e) {
+      if (e?.code === 'email_in_use') {
+        return res.status(409).json({ error: 'email_in_use', message: 'This email is already in use for another user.' })
+      }
+      console.error('client_invite_error', e?.message || e)
+      res.status(500).json({ error: 'invite_failed', detail: e?.message || 'Invite failed' })
+    }
   } catch (e) {
     res.status(500).json({ error: 'Server error' })
   }
@@ -521,10 +541,22 @@ async function requireAdmin(req, res, next) {
 const adminRouter = express.Router()
 
 // Helper: ensure a user exists/invite; return user_id + optional action_link
-async function ensureUserIdAndInvite(email, redirectTo) {
+async function ensureUserIdAndInvite({ email, fullName, role, redirectTo }) {
   let userId = null
   let actionLink = null
   let method = null
+
+  try {
+    const existing = await supabaseAdmin.auth.admin.getUserByEmail(email)
+    if (existing?.data?.user) {
+      const err = new Error('This email is already in use for another user.')
+      err.code = 'email_in_use'
+      throw err
+    }
+  } catch (e) {
+    if (e?.code === 'email_in_use') throw e
+    // ignore other errors and continue with invite attempts
+  }
 
   try {
     const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo })
@@ -539,7 +571,7 @@ async function ensureUserIdAndInvite(email, redirectTo) {
       const link = await supabaseAdmin.auth.admin.generateLink({
         type: 'magiclink',
         email,
-        options: { redirectTo }
+        options: { redirectTo, data: { role, full_name: fullName || email } }
       })
       userId = link?.data?.user?.id || null
       actionLink = link?.data?.action_link || null
@@ -553,7 +585,8 @@ async function ensureUserIdAndInvite(email, redirectTo) {
     try {
       const created = await supabaseAdmin.auth.admin.createUser({
         email,
-        email_confirm: true
+        email_confirm: true,
+        user_metadata: { role, full_name: fullName || email }
       })
       userId = created?.data?.user?.id || null
       method = method || 'createUser'
@@ -614,31 +647,44 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   let seeded_member = null
   if (adminEmail) {
     const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
-    const { userId, actionLink, method } = await ensureUserIdAndInvite(adminEmail, redirectTo)
+    try {
+      const { userId, actionLink, method } = await ensureUserIdAndInvite({
+        email: adminEmail,
+        fullName: adminName,
+        role: adminRole,
+        redirectTo: `${FRONTEND_BASE}/accept-invite`
+      })
 
-    if (!userId) {
-      console.error('seed_member_no_user_id', { email: adminEmail, method })
-      return res.json({ item: client, seeded_member: null, note: 'client_created_invite_failed', action_link: actionLink || null })
-    }
+      if (!userId) {
+        console.error('seed_member_no_user_id', { email: adminEmail, method })
+        return res.json({ item: client, seeded_member: null, note: 'client_created_invite_failed', action_link: actionLink || null })
+      }
 
-    const payload = {
-      client_id: client.id,
-      email: adminEmail,
-      name: adminName || adminEmail,
-      role: adminRole,
-      user_id: userId
-    }
+      const payload = {
+        client_id: client.id,
+        email: adminEmail,
+        name: adminName || adminEmail,
+        role: adminRole,
+        user_id: userId
+      }
 
-    const { data: inserted, error: insErr } = await supabaseAdmin
-      .from('client_members')
-      .insert(payload)
-      .select('client_id,user_id,email,name,role,created_at')
-      .single()
+      const { data: inserted, error: insErr } = await supabaseAdmin
+        .from('client_members')
+        .insert(payload)
+        .select('client_id,user_id,email,name,role,created_at,tester_acknowledged_at,tester_acknowledged_ip')
+        .single()
 
-    if (insErr) {
-      console.error('seed_member_insert_failed:', insErr.message)
-    } else {
-      seeded_member = { ...inserted, id: inserted.user_id || inserted.email }
+      if (insErr) {
+        console.error('seed_member_insert_failed:', insErr.message)
+      } else {
+        seeded_member = { ...inserted, id: inserted.user_id || inserted.email }
+      }
+    } catch (e) {
+      if (e?.code === 'email_in_use') {
+        return res.status(409).json({ error: 'email_in_use', message: 'This email is already in use for another user.' })
+      }
+      console.error('seed_member_invite_failed:', e?.message || e)
+      return res.status(500).json({ error: 'invite_failed', detail: e?.message || 'Invite failed' })
     }
   }
 
@@ -789,34 +835,46 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
     return res.status(400).json({ error: 'invalid_role' })
   }
 
-  const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
-  const { userId, actionLink, method } = await ensureUserIdAndInvite(email, redirectTo)
-
-  if (!userId) {
-    console.error('add_member_no_user_id', { email, method })
-    return res.status(400).json({
-      error: 'add_member_failed',
-      detail: 'Could not create or locate user for this email.',
-      hint: 'Try again or send the magic link manually.',
-      action_link: actionLink || null
+  try {
+    const { userId, actionLink, method } = await ensureUserIdAndInvite({
+      email,
+      fullName: name,
+      role,
+      redirectTo: `${FRONTEND_BASE}/accept-invite`
     })
+
+    if (!userId) {
+      console.error('add_member_no_user_id', { email, method })
+      return res.status(400).json({
+        error: 'add_member_failed',
+        detail: 'Could not create or locate user for this email.',
+        hint: 'Try again or send the magic link manually.',
+        action_link: actionLink || null
+      })
+    }
+
+    const payload = { client_id, email, name, role, user_id: userId }
+
+    const { data, error } = await supabaseAdmin
+      .from('client_members')
+      .insert(payload)
+      .select('client_id,user_id,email,name,role,created_at,tester_acknowledged_at,tester_acknowledged_ip')
+      .single()
+
+    if (error) {
+      console.error('add_member_insert_failed:', error.message)
+      return res.status(500).json({ error: 'add_member_failed', detail: error.message })
+    }
+
+    const m = data
+    res.json({ item: { ...m, id: m.user_id || m.email } })
+  } catch (e) {
+    if (e?.code === 'email_in_use') {
+      return res.status(409).json({ error: 'email_in_use', message: 'This email is already in use for another user.' })
+    }
+    console.error('add_member_invite_failed', e?.message || e)
+    return res.status(500).json({ error: 'add_member_failed', detail: e?.message || 'Invite failed' })
   }
-
-  const payload = { client_id, email, name, role, user_id: userId }
-
-  const { data, error } = await supabaseAdmin
-    .from('client_members')
-    .insert(payload)
-    .select('client_id,user_id,email,name,role,created_at')
-    .single()
-
-  if (error) {
-    console.error('add_member_insert_failed:', error.message)
-    return res.status(500).json({ error: 'add_member_failed', detail: error.message })
-  }
-
-  const m = data
-  res.json({ item: { ...m, id: m.user_id || m.email } })
 })
 
 // Remove a client member
