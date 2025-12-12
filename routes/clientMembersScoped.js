@@ -139,6 +139,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
       role,
       redirectTo: `${FRONTEND_BASE}/accept-invite`
     });
+    console.log('[client-members/scoped-add] invite-result', { request_id, email: redactEmail(email), method, userIdPresent: !!userId, redirectTo: `${FRONTEND_BASE}/accept-invite` });
     if (!userId) {
       console.error('[client-members/scoped-add] add_member_no_user_id', { request_id, email: redactEmail(email), method });
       return res.status(400).json({
@@ -168,10 +169,10 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
   } catch (e) {
     if (e?.code === 'email_in_use') {
       console.warn('[client-members/scoped-add] email_in_use', { email: redactEmail(req.body?.email), request_id: req.request_id || null });
-      return res.status(409).json({ error: 'email_in_use', message: 'This email is already in use for another user.', request_id: req.request_id || null });
+      return res.status(409).json({ error: 'email_in_use', code: 'email_in_use', detail: 'This email is already in use for another user.', message: 'This email is already in use for another user.', request_id: req.request_id || null });
     }
     console.error('[client-members/add] unexpected', { request_id: req.request_id || null, error: e?.message || e });
-    res.status(500).json({ error: 'server_error', request_id: req.request_id || null });
+    res.status(500).json({ error: 'server_error', request_id: req.request_id || null, code: 'server_error' });
   }
 });
 
