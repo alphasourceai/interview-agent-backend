@@ -5,6 +5,8 @@ const { requireAuth, withClientScope } = require('../src/middleware/auth');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const crypto = require('crypto');
 
+const FRONTEND_BASE = ((process.env.FRONTEND_URL || 'https://www.alphasourceai.com')).replace(/\/+$/, '');
+
 const router = express.Router();
 
 // Helper copied from app.js helper logic
@@ -12,6 +14,7 @@ async function ensureUserIdAndInvite({ email, fullName, role, redirectTo }) {
   let userId = null;
   let actionLink = null;
   let method = null;
+  const effectiveRedirect = redirectTo || `${FRONTEND_BASE}/accept-invite`;
 
   try {
     const existing = await supabaseAdmin.auth.admin.getUserByEmail(email);
@@ -25,7 +28,7 @@ async function ensureUserIdAndInvite({ email, fullName, role, redirectTo }) {
   }
 
   try {
-    const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo });
+    const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo: effectiveRedirect });
     userId = invited?.data?.user?.id || null;
     method = 'invite';
   } catch (e) {
@@ -37,7 +40,7 @@ async function ensureUserIdAndInvite({ email, fullName, role, redirectTo }) {
       const link = await supabaseAdmin.auth.admin.generateLink({
         type: 'magiclink',
         email,
-        options: { redirectTo, data: { role, full_name: fullName || email } }
+        options: { redirectTo: effectiveRedirect, data: { role, full_name: fullName || email } }
       });
       userId = link?.data?.user?.id || null;
       actionLink = link?.data?.action_link || null;
@@ -58,6 +61,14 @@ async function ensureUserIdAndInvite({ email, fullName, role, redirectTo }) {
       method = method || 'createUser';
     } catch (e) {
       console.error('createUser failed:', e?.message || e);
+    }
+    if (userId) {
+      try {
+        await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo: effectiveRedirect });
+        method = 'createUser+invite';
+      } catch (e) {
+        console.error('second invite after createUser failed:', e?.message || e);
+      }
     }
   }
 
@@ -108,12 +119,11 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
       return res.status(400).json({ error: 'invalid_role' });
     }
 
-    const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1';
     const { userId, actionLink, method } = await ensureUserIdAndInvite({
       email,
       fullName: name,
       role,
-      redirectTo: `${process.env.FRONTEND_URL || 'https://www.alphasourceai.com'}/accept-invite`
+      redirectTo: `${FRONTEND_BASE}/accept-invite`
     });
     if (!userId) {
       console.error('add_member_no_user_id', { email, method });

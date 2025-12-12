@@ -633,6 +633,62 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
     return res.status(400).json({ error: 'email_required_for_client' })
   }
 
+  // Block duplicate admin emails before proceeding
+  if (adminEmail) {
+    try {
+      const { data: dupClient, error: dupClientErr } = await supabaseAdmin
+        .from('clients')
+        .select('id')
+        .ilike('email', adminEmail)
+        .maybeSingle()
+      if (dupClient) {
+        return res.status(409).json({ error: 'client_admin_email_in_use', message: 'That email is already in use for another client admin.' })
+      }
+      if (dupClientErr && dupClientErr.code !== 'PGRST116') {
+        console.error('duplicate_client_lookup_failed', dupClientErr.message)
+        return res.status(500).json({ error: 'duplicate_check_failed', detail: dupClientErr.message })
+      }
+
+      const { data: dupMember, error: dupMemberErr } = await supabaseAdmin
+        .from('client_members')
+        .select('client_id')
+        .eq('email', adminEmail)
+        .in('role', ['manager', 'tester'])
+        .limit(1)
+      if (dupMember && dupMember.length > 0) {
+        return res.status(409).json({ error: 'client_admin_email_in_use', message: 'That email is already in use for another client admin.' })
+      }
+      if (dupMemberErr) {
+        console.error('duplicate_member_lookup_failed', dupMemberErr.message)
+        return res.status(500).json({ error: 'duplicate_check_failed', detail: dupMemberErr.message })
+      }
+    } catch (e) {
+      console.error('duplicate_admin_email_check_failed', e?.message || e)
+      return res.status(500).json({ error: 'duplicate_check_failed', detail: e?.message || 'Duplicate check failed' })
+    }
+  }
+
+  let inviteResult = null
+  if (adminEmail) {
+    try {
+      inviteResult = await ensureUserIdAndInvite({
+        email: adminEmail,
+        fullName: adminName,
+        role: adminRole,
+        redirectTo: `${FRONTEND_BASE}/accept-invite`
+      })
+    } catch (e) {
+      if (e?.code === 'email_in_use') {
+        return res.status(409).json({ error: 'email_in_use', message: 'This email is already in use for another account.' })
+      }
+      console.error('seed_member_invite_failed:', e?.message || e)
+      return res.status(500).json({ error: 'invite_failed', detail: e?.message || 'Invite failed' })
+    }
+    if (!inviteResult?.userId) {
+      return res.status(500).json({ error: 'invite_failed', detail: 'Could not create or locate user for this email.' })
+    }
+  }
+
   const { data: client, error: cErr } = await supabaseAdmin
     .from('clients')
     .insert({ name, email: emailForClient })
@@ -645,27 +701,14 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
 
   // Optionally seed an admin member
   let seeded_member = null
-  if (adminEmail) {
-    const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
+  if (adminEmail && inviteResult?.userId) {
     try {
-      const { userId, actionLink, method } = await ensureUserIdAndInvite({
-        email: adminEmail,
-        fullName: adminName,
-        role: adminRole,
-        redirectTo: `${FRONTEND_BASE}/accept-invite`
-      })
-
-      if (!userId) {
-        console.error('seed_member_no_user_id', { email: adminEmail, method })
-        return res.json({ item: client, seeded_member: null, note: 'client_created_invite_failed', action_link: actionLink || null })
-      }
-
       const payload = {
         client_id: client.id,
         email: adminEmail,
         name: adminName || adminEmail,
         role: adminRole,
-        user_id: userId
+        user_id: inviteResult.userId
       }
 
       const { data: inserted, error: insErr } = await supabaseAdmin
@@ -676,19 +719,19 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
 
       if (insErr) {
         console.error('seed_member_insert_failed:', insErr.message)
+        try { await supabaseAdmin.from('clients').delete().eq('id', client.id) } catch (_) {}
+        return res.status(500).json({ error: 'seed_member_failed', detail: insErr.message })
       } else {
         seeded_member = { ...inserted, id: inserted.user_id || inserted.email }
       }
     } catch (e) {
-      if (e?.code === 'email_in_use') {
-        return res.status(409).json({ error: 'email_in_use', message: 'This email is already in use for another user.' })
-      }
       console.error('seed_member_invite_failed:', e?.message || e)
+      try { await supabaseAdmin.from('clients').delete().eq('id', client.id) } catch (_) {}
       return res.status(500).json({ error: 'invite_failed', detail: e?.message || 'Invite failed' })
     }
   }
 
-  res.json({ item: client, seeded_member })
+  res.json({ item: client, seeded_member, action_link: inviteResult?.actionLink || null })
 })
 
 // Delete client

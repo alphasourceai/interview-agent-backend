@@ -781,7 +781,7 @@ CREATE TABLE public.client_members (
     role text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     name text,
-    CONSTRAINT client_members_role_check CHECK ((role = ANY (ARRAY['owner'::text, 'admin'::text, 'member'::text])))
+    CONSTRAINT client_members_role_check CHECK ((role = ANY (ARRAY['owner'::text, 'admin'::text, 'member'::text, 'manager'::text, 'tester'::text])))
 );
 
 
