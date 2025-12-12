@@ -6,6 +6,17 @@ const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const crypto = require('crypto');
 
 const FRONTEND_BASE = ((process.env.FRONTEND_URL || 'https://www.alphasourceai.com')).replace(/\/+$/, '');
+const redactEmail = (email) => {
+  try {
+    if (!email) return '';
+    const [user, domain] = String(email).split('@');
+    if (!domain) return email;
+    if (user.length <= 3) return `${user[0] || ''}***@${domain}`;
+    return `${user.slice(0, 2)}***@${domain}`;
+  } catch (_) {
+    return email;
+  }
+};
 
 const router = express.Router();
 
@@ -107,17 +118,20 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
     const { client_id, email, name } = req.body || {};
     const role = (req.body?.role || 'member').toLowerCase();
     const clientId = client_id || req.client?.id || req.clientScope?.defaultClientId || null;
+    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
 
-    if (!clientId || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' });
+    if (!clientId || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required', request_id });
 
     const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
     const userRole = (membership?.role || '').toLowerCase();
     if (!membership || !['manager', 'admin', 'tester'].includes(userRole)) {
-      return res.status(403).json({ error: 'forbidden' });
+      return res.status(403).json({ error: 'forbidden', request_id });
     }
     if (!['member', 'manager'].includes(role)) {
-      return res.status(400).json({ error: 'invalid_role' });
+      return res.status(400).json({ error: 'invalid_role', request_id });
     }
+
+    console.log('[client-members/scoped-add] start', { request_id, client_id: clientId, role, email: redactEmail(email), by_role: userRole, redirectTo: `${FRONTEND_BASE}/accept-invite` });
 
     const { userId, actionLink, method } = await ensureUserIdAndInvite({
       email,
@@ -126,12 +140,13 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
       redirectTo: `${FRONTEND_BASE}/accept-invite`
     });
     if (!userId) {
-      console.error('add_member_no_user_id', { email, method });
+      console.error('[client-members/scoped-add] add_member_no_user_id', { request_id, email: redactEmail(email), method });
       return res.status(400).json({
         error: 'add_member_failed',
         detail: 'Could not create or locate user for this email.',
         hint: 'Try again or send the magic link manually.',
-        action_link: actionLink || null
+        action_link: actionLink || null,
+        request_id
       });
     }
 
@@ -143,18 +158,20 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
       .single();
 
     if (error) {
-      console.error('add_member_insert_failed:', error.message);
-      return res.status(500).json({ error: 'add_member_failed', detail: error.message });
+      console.error('[client-members/scoped-add] add_member_insert_failed', { request_id, error: error.message, code: error.code, hint: error.hint });
+      return res.status(500).json({ error: 'add_member_failed', detail: error.message, hint: error.hint, code: error.code, request_id });
     }
 
     const m = data;
-    res.json({ item: { ...m, id: m.user_id || m.email } });
+    console.log('[client-members/scoped-add] success', { request_id, client_id: clientId, role, email: redactEmail(email), method });
+    res.json({ item: { ...m, id: m.user_id || m.email }, request_id });
   } catch (e) {
     if (e?.code === 'email_in_use') {
-      return res.status(409).json({ error: 'email_in_use', message: 'This email is already in use for another user.' });
+      console.warn('[client-members/scoped-add] email_in_use', { email: redactEmail(req.body?.email), request_id: req.request_id || null });
+      return res.status(409).json({ error: 'email_in_use', message: 'This email is already in use for another user.', request_id: req.request_id || null });
     }
-    console.error('[client-members/add] unexpected', e?.message || e);
-    res.status(500).json({ error: 'server_error' });
+    console.error('[client-members/add] unexpected', { request_id: req.request_id || null, error: e?.message || e });
+    res.status(500).json({ error: 'server_error', request_id: req.request_id || null });
   }
 });
 
