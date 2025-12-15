@@ -562,19 +562,34 @@ async function ensureUserIdAndInvite({ email, fullName, role, redirectTo }) {
   const effectiveRedirect = redirectTo || `${FRONTEND_BASE}/accept-invite`
   console.log('[invite-helper] start', { request_id, email: redactEmail(email), role, redirectTo: effectiveRedirect, FRONTEND_BASE })
 
+  // If user exists in Auth, send recovery email instead of invite
   try {
     const existing = await supabaseAdmin.auth.admin.getUserByEmail(email)
     if (existing?.data?.user) {
-      const err = new Error('This email is already in use for another user.')
-      err.code = 'email_in_use'
-      throw err
+      userId = existing.data.user.id
+      method = 'recovery'
+      try {
+        const recoverUrl = `${process.env.SUPABASE_URL}/auth/v1/recover`
+        const anonKey = process.env.SUPABASE_ANON_KEY
+        await axios.post(
+          recoverUrl,
+          { email, redirect_to: effectiveRedirect },
+          { headers: { apikey: anonKey, Authorization: `Bearer ${anonKey}`, 'Content-Type': 'application/json' } }
+        )
+        console.log('[invite-helper] recovery sent', { request_id, email: redactEmail(email), redirectTo: effectiveRedirect })
+        return { userId, actionLink: null, method, inviteActionLink: null }
+      } catch (recErr) {
+        console.error('[invite-helper] recovery send failed', { request_id, email: redactEmail(email), error: recErr?.message || recErr })
+        // fall through to invite flow
+        userId = null
+        method = null
+      }
     }
-  } catch (e) {
-    if (e?.code === 'email_in_use') throw e
-    // ignore other errors and continue with invite attempts
+  } catch (_) {
+    // continue to invite flow on failure
   }
 
-  // Generate a recovery/invite link as a fallback (invite link)
+  // Generate an invite link as fallback for manual use
   try {
     const inviteLink = await supabaseAdmin.auth.admin.generateLink({
       type: 'invite',
@@ -677,7 +692,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
         .maybeSingle()
       if (dupClient) {
         console.warn('[admin/create-client] duplicate client email', { request_id, adminEmail: redactEmail(adminEmail) })
-      return res.status(409).json({ error: 'email_in_use', code: 'email_in_use', detail: 'Email address already exists', request_id })
+        return res.status(409).json({ error: 'email_in_use', code: 'email_in_use', detail: 'Email address already exists', request_id })
       }
       if (dupClientErr && dupClientErr.code !== 'PGRST116') {
         console.error('[admin/create-client] duplicate_client_lookup_failed', { request_id, error: dupClientErr.message, code: dupClientErr.code, hint: dupClientErr.hint })
@@ -988,21 +1003,22 @@ adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, 
   const redirectTo = `${FRONTEND_BASE}/accept-invite`;
   console.log('[admin/send-password-reset] start', { request_id, email: redactEmail(email), redirectTo });
   try {
-    const link = await supabaseAdmin.auth.admin.generateLink({
-      type: 'recovery',
-      email,
-      options: { redirectTo }
+    const recoverUrl = `${process.env.SUPABASE_URL}/auth/v1/recover`;
+    const anonKey = process.env.SUPABASE_ANON_KEY;
+    const payload = { email, redirect_to: redirectTo };
+    const resp = await axios.post(recoverUrl, payload, {
+      headers: {
+        apikey: anonKey,
+        Authorization: `Bearer ${anonKey}`,
+        'Content-Type': 'application/json'
+      }
     });
-    const inviteActionLink = link?.data?.action_link || null;
-    console.log('[admin/send-password-reset] success', { request_id, email: redactEmail(email), hasActionLink: !!inviteActionLink });
-    const payload = { ok: true, request_id };
-    if (process.env.NODE_ENV !== 'production') {
-      payload.invite_action_link = inviteActionLink;
-    }
-    return res.json(payload);
+    console.log('[admin/send-password-reset] supabase_recover_response', { request_id, status: resp.status, ok: resp.status >= 200 && resp.status < 300 });
+    return res.json({ ok: true, request_id });
   } catch (e) {
-    console.error('[admin/send-password-reset] failed', { request_id, email: redactEmail(email), error: e?.message || e });
-    return res.status(500).json({ error: 'password_reset_failed', code: 'password_reset_failed', detail: e?.message || 'Failed to send password reset email', request_id });
+    const detail = e?.response?.data?.error_description || e?.response?.data?.msg || e?.message || 'Failed to send password reset email';
+    console.error('[admin/send-password-reset] failed', { request_id, email: redactEmail(email), error: detail });
+    return res.status(500).json({ error: 'password_reset_failed', code: 'password_reset_failed', detail, request_id });
   }
 });
 
