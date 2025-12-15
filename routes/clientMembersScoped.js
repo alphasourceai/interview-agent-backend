@@ -57,15 +57,15 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
       return res.status(400).json({ error: 'invalid_role', request_id });
     }
 
-    console.log('[client-members/scoped-add] start', { request_id, client_id: clientId, role, email: redactEmail(email), by_role: userRole, redirectTo: `${FRONTEND_BASE}/accept-invite` });
+    console.log('[client-members/scoped-add] start', { request_id, client_id: clientId, role, email: redactEmail(email), by_role: userRole, redirectTo: `${FRONTEND_BASE}/signin?pwreset=1` });
 
     const { userId, method, inviteActionLink, recovery_sent } = await ensureUserAndSendRecovery({
       email,
-      redirectTo: `${FRONTEND_BASE}/accept-invite`,
+      redirectTo: `${FRONTEND_BASE}/signin?pwreset=1`,
       request_id,
       loggerPrefix: '[client-members/scoped-add]'
     });
-    console.log('[client-members/scoped-add] invite-result', { request_id, email: redactEmail(email), method, userIdPresent: !!userId, hasInviteActionLink: !!inviteActionLink, redirectTo: `${FRONTEND_BASE}/accept-invite`, recovery_sent: !!recovery_sent });
+    console.log('[client-members/scoped-add] invite-result', { request_id, email: redactEmail(email), method, userIdPresent: !!userId, hasInviteActionLink: !!inviteActionLink, redirectTo: `${FRONTEND_BASE}/signin?pwreset=1`, recovery_sent: !!recovery_sent });
     if (!userId) {
       console.error('[client-members/scoped-add] add_member_no_user_id', { request_id, email: redactEmail(email), method });
       return res.status(400).json({
@@ -151,14 +151,11 @@ router.post('/tester-ack', requireAuth, withClientScope, async (req, res) => {
     }
 
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || null;
-    let q = supabaseAdmin
+    const { data, error } = await supabaseAdmin
       .from('client_members')
       .update({ tester_acknowledged_at: new Date().toISOString(), tester_acknowledged_ip: ip || null })
-      .eq('client_id', clientId);
-    // prefer user_id_uuid but fall back to legacy user_id
-    q = q.or(`user_id_uuid.eq.${req.user.id},user_id.eq.${req.user.id}`);
-
-    const { data, error } = await q
+      .eq('client_id', clientId)
+      .eq('user_id', req.user.id)
       .select('tester_acknowledged_at,tester_acknowledged_ip')
       .maybeSingle();
     if (error) {
