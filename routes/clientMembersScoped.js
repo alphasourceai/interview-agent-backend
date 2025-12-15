@@ -133,13 +133,13 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
 
     console.log('[client-members/scoped-add] start', { request_id, client_id: clientId, role, email: redactEmail(email), by_role: userRole, redirectTo: `${FRONTEND_BASE}/accept-invite` });
 
-    const { userId, actionLink, method } = await ensureUserIdAndInvite({
+    const { userId, actionLink, method, inviteActionLink } = await ensureUserIdAndInvite({
       email,
       fullName: name,
       role,
       redirectTo: `${FRONTEND_BASE}/accept-invite`
     });
-    console.log('[client-members/scoped-add] invite-result', { request_id, email: redactEmail(email), method, userIdPresent: !!userId, redirectTo: `${FRONTEND_BASE}/accept-invite` });
+    console.log('[client-members/scoped-add] invite-result', { request_id, email: redactEmail(email), method, userIdPresent: !!userId, hasInviteActionLink: !!inviteActionLink, redirectTo: `${FRONTEND_BASE}/accept-invite` });
     if (!userId) {
       console.error('[client-members/scoped-add] add_member_no_user_id', { request_id, email: redactEmail(email), method });
       return res.status(400).json({
@@ -165,11 +165,11 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
 
     const m = data;
     console.log('[client-members/scoped-add] success', { request_id, client_id: clientId, role, email: redactEmail(email), method });
-    res.json({ item: { ...m, id: m.user_id || m.email }, request_id });
+    res.json({ item: { ...m, id: m.user_id || m.email }, request_id, invite_action_link: inviteActionLink || null });
   } catch (e) {
     if (e?.code === 'email_in_use') {
       console.warn('[client-members/scoped-add] email_in_use', { email: redactEmail(req.body?.email), request_id: req.request_id || null });
-      return res.status(409).json({ error: 'email_in_use', code: 'email_in_use', detail: 'This email is already in use for another user.', message: 'This email is already in use for another user.', request_id: req.request_id || null });
+      return res.status(409).json({ error: 'email_in_use', code: 'email_in_use', detail: 'Email address already exists', request_id: req.request_id || null });
     }
     console.error('[client-members/add] unexpected', { request_id: req.request_id || null, error: e?.message || e });
     res.status(500).json({ error: 'server_error', request_id: req.request_id || null, code: 'server_error' });

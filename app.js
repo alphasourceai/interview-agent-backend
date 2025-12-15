@@ -557,6 +557,7 @@ async function ensureUserIdAndInvite({ email, fullName, role, redirectTo }) {
   let userId = null
   let actionLink = null
   let method = null
+  let inviteActionLink = null
   const request_id = crypto.randomUUID?.() || String(Date.now())
   const effectiveRedirect = redirectTo || `${FRONTEND_BASE}/accept-invite`
   console.log('[invite-helper] start', { request_id, email: redactEmail(email), role, redirectTo: effectiveRedirect, FRONTEND_BASE })
@@ -618,8 +619,20 @@ async function ensureUserIdAndInvite({ email, fullName, role, redirectTo }) {
     }
   }
 
-  console.log('[invite-helper] result', { request_id, email: redactEmail(email), method, hasActionLink: !!actionLink, userIdPresent: !!userId, redirectTo: effectiveRedirect, FRONTEND_BASE })
-  return { userId, actionLink, method }
+  try {
+    const link = await supabaseAdmin.auth.admin.generateLink({
+      type: 'invite',
+      email,
+      options: { redirectTo: effectiveRedirect }
+    });
+    inviteActionLink = link?.data?.action_link || null;
+    if (!userId) userId = link?.data?.user?.id || userId;
+  } catch (e) {
+    console.error('[invite-helper] generateLink(invite) failed', { request_id, email: redactEmail(email), error: e?.message || e });
+  }
+
+  console.log('[invite-helper] result', { request_id, email: redactEmail(email), method, hasActionLink: !!actionLink, userIdPresent: !!userId, redirectTo: effectiveRedirect, FRONTEND_BASE, hasInviteActionLink: !!inviteActionLink })
+  return { userId, actionLink, method, inviteActionLink }
 }
 
 // List all clients
@@ -677,7 +690,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
         .limit(1)
       if (dupMember && dupMember.length > 0) {
         console.warn('[admin/create-client] duplicate client member email', { request_id, adminEmail: redactEmail(adminEmail) })
-        return res.status(409).json({ error: 'client_admin_email_in_use', code: 'client_admin_email_in_use', message: 'That email is already in use for another client admin.', request_id })
+        return res.status(409).json({ error: 'email_in_use', code: 'email_in_use', detail: 'Email address already exists', request_id })
       }
       if (dupMemberErr) {
         console.error('[admin/create-client] duplicate_member_lookup_failed', { request_id, error: dupMemberErr.message, code: dupMemberErr.code, hint: dupMemberErr.hint })
@@ -701,7 +714,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
     } catch (e) {
       if (e?.code === 'email_in_use') {
         console.warn('[admin/create-client] invite email_in_use', { request_id, adminEmail: redactEmail(adminEmail) })
-        return res.status(409).json({ error: 'email_in_use', code: 'email_in_use', detail: 'This email is already in use for another account.', message: 'This email is already in use for another account.', request_id })
+        return res.status(409).json({ error: 'email_in_use', code: 'email_in_use', detail: 'Email address already exists', request_id })
       }
       console.error('[admin/create-client] seed_member_invite_failed', { request_id, error: e?.message || e })
       return res.status(500).json({ error: 'invite_failed', detail: e?.message || 'Invite failed', request_id, code: 'invite_failed' })
@@ -754,8 +767,8 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
     }
   }
 
-  console.log('[admin/create-client] success', { request_id, client_id: client.id, adminRole, adminEmail: redactEmail(adminEmail), invite_method: inviteResult?.method || null })
-  res.json({ item: client, seeded_member, action_link: inviteResult?.actionLink || null, request_id })
+  console.log('[admin/create-client] success', { request_id, client_id: client.id, adminRole, adminEmail: redactEmail(adminEmail), invite_method: inviteResult?.method || null, hasInviteActionLink: !!inviteResult?.inviteActionLink })
+  res.json({ item: client, seeded_member, action_link: inviteResult?.actionLink || null, invite_action_link: inviteResult?.inviteActionLink || null, request_id })
 })
 
 // Delete client
@@ -905,13 +918,13 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   console.log('[admin/add-member] start', { request_id, client_id, role, email: redactEmail(email), redirectTo: `${FRONTEND_BASE}/accept-invite` })
 
   try {
-    const { userId, actionLink, method } = await ensureUserIdAndInvite({
+    const { userId, actionLink, method, inviteActionLink } = await ensureUserIdAndInvite({
       email,
       fullName: name,
       role,
       redirectTo: `${FRONTEND_BASE}/accept-invite`
     })
-    console.log('[admin/add-member] invite-result', { request_id, email: redactEmail(email), method, userIdPresent: !!userId, redirectTo: `${FRONTEND_BASE}/accept-invite` })
+    console.log('[admin/add-member] invite-result', { request_id, email: redactEmail(email), method, userIdPresent: !!userId, hasInviteActionLink: !!inviteActionLink, redirectTo: `${FRONTEND_BASE}/accept-invite` })
 
     if (!userId) {
       console.error('[admin/add-member] add_member_no_user_id', { request_id, email: redactEmail(email), method })
@@ -939,7 +952,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
 
     const m = data
     console.log('[admin/add-member] success', { request_id, client_id, role, email: redactEmail(email), method })
-    res.json({ item: { ...m, id: m.user_id || m.email }, request_id })
+    res.json({ item: { ...m, id: m.user_id || m.email }, request_id, invite_action_link: inviteActionLink || null })
   } catch (e) {
     if (e?.code === 'email_in_use') {
       console.warn('[admin/add-member] email_in_use', { request_id, email: redactEmail(email) })
