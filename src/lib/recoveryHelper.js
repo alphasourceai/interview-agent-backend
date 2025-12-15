@@ -32,7 +32,7 @@ function resolveAnonKey() {
 
 async function ensureUserAndSendRecovery({ email, redirectTo, request_id, loggerPrefix = '[recover-helper]' }) {
   const requestId = request_id || crypto.randomUUID?.() || String(Date.now());
-  const effectiveRedirect = redirectTo || `${FRONTEND_BASE}/signin?pwreset=1`;
+  const effectiveRedirect = redirectTo || `${FRONTEND_BASE}/pwreset`;
   const safeEmail = redactEmail(email);
   const anon = resolveAnonKey();
   const hasAnonKey = !!anon.value;

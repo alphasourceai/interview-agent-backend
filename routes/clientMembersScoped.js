@@ -57,15 +57,15 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
       return res.status(400).json({ error: 'invalid_role', request_id });
     }
 
-    console.log('[client-members/scoped-add] start', { request_id, client_id: clientId, role, email: redactEmail(email), by_role: userRole, redirectTo: `${FRONTEND_BASE}/signin?pwreset=1` });
+    console.log('[client-members/scoped-add] start', { request_id, client_id: clientId, role, email: redactEmail(email), by_role: userRole, redirectTo: `${FRONTEND_BASE}/pwreset` });
 
     const { userId, method, inviteActionLink, recovery_sent } = await ensureUserAndSendRecovery({
       email,
-      redirectTo: `${FRONTEND_BASE}/signin?pwreset=1`,
+      redirectTo: `${FRONTEND_BASE}/pwreset`,
       request_id,
       loggerPrefix: '[client-members/scoped-add]'
     });
-    console.log('[client-members/scoped-add] invite-result', { request_id, email: redactEmail(email), method, userIdPresent: !!userId, hasInviteActionLink: !!inviteActionLink, redirectTo: `${FRONTEND_BASE}/signin?pwreset=1`, recovery_sent: !!recovery_sent });
+    console.log('[client-members/scoped-add] invite-result', { request_id, email: redactEmail(email), method, userIdPresent: !!userId, hasInviteActionLink: !!inviteActionLink, redirectTo: `${FRONTEND_BASE}/pwreset`, recovery_sent: !!recovery_sent });
     if (!userId) {
       console.error('[client-members/scoped-add] add_member_no_user_id', { request_id, email: redactEmail(email), method });
       return res.status(400).json({

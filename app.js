@@ -462,7 +462,7 @@ app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
     try {
       const { userId, method, recovery_sent } = await ensureUserIdAndInvite({
         email,
-        redirectTo: `${FRONTEND_BASE}/signin?pwreset=1`,
+        redirectTo: `${FRONTEND_BASE}/pwreset`,
         request_id,
         loggerPrefix: '[clients/invite]'
       })
@@ -480,7 +480,7 @@ app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
         }
         return res.status(500).json({ error: 'invite_failed', detail: error.message, code: error.code, request_id })
       }
-      const accept_url = `${FRONTEND_BASE}/signin?pwreset=1`;
+      const accept_url = `${FRONTEND_BASE}/pwreset`;
       res.json({ ok: true, accept_url, request_id, recovery_sent: !!recovery_sent })
     } catch (e) {
       if (e?.code === 'misconfigured_supabase_auth') {
@@ -555,7 +555,7 @@ const adminRouter = express.Router()
 // Helper: ensure a user exists and send a recovery email (used for onboarding + resets)
 async function ensureUserIdAndInvite({ email, redirectTo, request_id, loggerPrefix }) {
   const reqId = request_id || crypto.randomUUID?.() || String(Date.now())
-  const effectiveRedirect = redirectTo || `${FRONTEND_BASE}/signin?pwreset=1`
+  const effectiveRedirect = redirectTo || `${FRONTEND_BASE}/pwreset`
   const result = await ensureUserAndSendRecovery({
     email,
     redirectTo: effectiveRedirect,
@@ -600,7 +600,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
     return res.status(400).json({ error: 'email_required_for_client', request_id })
   }
 
-  console.log('[admin/create-client] start', { request_id, name, adminRole, adminEmail: redactEmail(adminEmail), emailForClient: redactEmail(emailForClient), redirectTo: `${FRONTEND_BASE}/signin?pwreset=1` })
+  console.log('[admin/create-client] start', { request_id, name, adminRole, adminEmail: redactEmail(adminEmail), emailForClient: redactEmail(emailForClient), redirectTo: `${FRONTEND_BASE}/pwreset` })
 
   // Block duplicate admin emails before proceeding
   if (adminEmail) {
@@ -644,7 +644,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
     try {
       inviteResult = await ensureUserIdAndInvite({
         email: adminEmail,
-        redirectTo: `${FRONTEND_BASE}/signin?pwreset=1`,
+        redirectTo: `${FRONTEND_BASE}/pwreset`,
         request_id,
         loggerPrefix: '[admin/create-client]'
       })
@@ -862,16 +862,16 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   if (!['member', 'manager', 'tester'].includes(role)) {
     return res.status(400).json({ error: 'invalid_role', request_id })
   }
-  console.log('[admin/add-member] start', { request_id, client_id, role, email: redactEmail(email), redirectTo: `${FRONTEND_BASE}/signin?pwreset=1` })
+  console.log('[admin/add-member] start', { request_id, client_id, role, email: redactEmail(email), redirectTo: `${FRONTEND_BASE}/pwreset` })
 
   try {
     const { userId, method, inviteActionLink, recovery_sent } = await ensureUserIdAndInvite({
       email,
-      redirectTo: `${FRONTEND_BASE}/signin?pwreset=1`,
+      redirectTo: `${FRONTEND_BASE}/pwreset`,
       request_id,
       loggerPrefix: '[admin/add-member]'
     })
-    console.log('[admin/add-member] invite-result', { request_id, email: redactEmail(email), method, userIdPresent: !!userId, hasInviteActionLink: !!inviteActionLink, redirectTo: `${FRONTEND_BASE}/signin?pwreset=1`, recovery_sent: !!recovery_sent })
+    console.log('[admin/add-member] invite-result', { request_id, email: redactEmail(email), method, userIdPresent: !!userId, hasInviteActionLink: !!inviteActionLink, redirectTo: `${FRONTEND_BASE}/pwreset`, recovery_sent: !!recovery_sent })
 
     if (!userId) {
       console.error('[admin/add-member] add_member_no_user_id', { request_id, email: redactEmail(email), method })
@@ -936,7 +936,7 @@ adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, 
   const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
   const email = (req.body?.email || '').trim();
   if (!email) return res.status(400).json({ error: 'email_required', code: 'email_required', request_id });
-  const redirectTo = `${FRONTEND_BASE}/signin?pwreset=1`;
+  const redirectTo = `${FRONTEND_BASE}/pwreset`;
   console.log('[admin/send-password-reset] start', { request_id, email: redactEmail(email), redirectTo });
   try {
     await ensureUserAndSendRecovery({
