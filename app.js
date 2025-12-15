@@ -48,7 +48,7 @@ const cors = require('cors')
 const crypto = require('crypto')
 const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
 const { generateRubricAndKBForRole } = require('./generateRubric')
-const axios = require('axios')
+const { ensureUserAndSendRecovery, redactEmail } = require('./src/lib/recoveryHelper')
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || FRONTEND_URL || '').replace(/\/+$/, '')
@@ -179,18 +179,6 @@ function bearer(req) {
   return m ? m[1] : null
 }
 
-const redactEmail = (email) => {
-  try {
-    if (!email) return '';
-    const [user, domain] = String(email).split('@');
-    if (!domain) return email;
-    if (user.length <= 3) return `${user[0] || ''}***@${domain}`;
-    return `${user.slice(0, 2)}***@${domain}`;
-  } catch (_) {
-    return email;
-  }
-};
-
 // ---------- auth middlewares ----------
 async function requireAuth(req, res, next) {
   try {
@@ -263,7 +251,11 @@ app.get('/auth/ping', requireAuth, withClientScope, (req, res) => {
 
 // ---------- Auth me ----------
 app.get('/auth/me', requireAuth, withClientScope, (req, res) => {
-  res.json({ user: req.user, memberships: req.memberships })
+  res.json({
+    user: req.user,
+    memberships: req.memberships,
+    default_client_id: req.clientScope?.defaultClientId || null
+  })
 })
 
 // ---------- Clients: my ----------
@@ -461,40 +453,45 @@ app.get('/dashboard/rows', requireAuth, withClientScope, (req, res) => {
 app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
   try {
     const { email, role = 'member', client_id, name } = req.body || {}
-    if (!email || !client_id) return res.status(400).json({ error: 'email and client_id are required' })
-    if (!(req.clientIds || []).includes(client_id)) return res.status(403).json({ error: 'Forbidden' })
+    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now())
+    if (!email || !client_id) return res.status(400).json({ error: 'email and client_id are required', request_id })
+    if (!(req.clientIds || []).includes(client_id)) return res.status(403).json({ error: 'Forbidden', request_id })
     const r = String(role || '').toLowerCase()
-    if (!['member', 'manager'].includes(r)) return res.status(400).json({ error: 'invalid_role' })
+    if (!['member', 'manager'].includes(r)) return res.status(400).json({ error: 'invalid_role', request_id })
 
     try {
-      const { userId, actionLink, method } = await ensureUserIdAndInvite({
+      const { userId, method, recovery_sent } = await ensureUserIdAndInvite({
         email,
-        fullName: name,
-        role: r,
-        redirectTo: `${FRONTEND_BASE}/accept-invite`
+        redirectTo: `${FRONTEND_BASE}/accept-invite`,
+        request_id,
+        loggerPrefix: '[clients/invite]'
       })
       if (!userId) {
-        console.error('client_invite_no_user_id', { email, method })
-        return res.status(400).json({ error: 'invite_failed', detail: 'Could not create or locate user.' })
+        console.error('client_invite_no_user_id', { request_id, email: redactEmail(email), method })
+        return res.status(400).json({ error: 'invite_failed', detail: 'Could not create or locate user.', request_id })
       }
 
       const payload = { client_id, email, name: name || email, role: r, user_id: userId }
-      const { error } = await supabaseAdmin.from('client_members').insert(payload);
+      const { error } = await supabaseAdmin.from('client_members').insert(payload).select('client_id').single();
       if (error) {
-        console.error('client_invite_insert_failed', error.message)
-        return res.status(500).json({ error: 'invite_failed', detail: error.message })
+        console.error('client_invite_insert_failed', { request_id, error: error.message, code: error.code })
+        if (error.code === '23505' || error.code === 'PGRST116') {
+          return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
+        }
+        return res.status(500).json({ error: 'invite_failed', detail: error.message, code: error.code, request_id })
       }
       const accept_url = `${FRONTEND_BASE}/accept-invite`;
-      res.json({ ok: true, accept_url, action_link: actionLink || null })
+      res.json({ ok: true, accept_url, request_id, recovery_sent: !!recovery_sent })
     } catch (e) {
       if (e?.code === 'email_in_use') {
-        return res.status(409).json({ error: 'email_in_use', message: 'This email is already in use for another user.' })
+        return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
       }
-      console.error('client_invite_error', e?.message || e)
-      res.status(500).json({ error: 'invite_failed', detail: e?.message || 'Invite failed' })
+      console.error('client_invite_error', { request_id, error: e?.message || e, status: e?.status || null })
+      res.status(500).json({ error: 'invite_failed', detail: e?.message || 'Invite failed', request_id, code: e?.code || 'invite_failed' })
     }
   } catch (e) {
-    res.status(500).json({ error: 'Server error' })
+    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now())
+    res.status(500).json({ error: 'Server error', request_id })
   }
 })
 
@@ -552,104 +549,24 @@ async function requireAdmin(req, res, next) {
 
 const adminRouter = express.Router()
 
-// Helper: ensure a user exists/invite; return user_id + optional action_link
-async function ensureUserIdAndInvite({ email, fullName, role, redirectTo }) {
-  let userId = null
-  let actionLink = null
-  let method = null
-  let inviteActionLink = null
-  const request_id = crypto.randomUUID?.() || String(Date.now())
+// Helper: ensure a user exists and send a recovery email (used for onboarding + resets)
+async function ensureUserIdAndInvite({ email, redirectTo, request_id, loggerPrefix }) {
+  const reqId = request_id || crypto.randomUUID?.() || String(Date.now())
   const effectiveRedirect = redirectTo || `${FRONTEND_BASE}/accept-invite`
-  console.log('[invite-helper] start', { request_id, email: redactEmail(email), role, redirectTo: effectiveRedirect, FRONTEND_BASE })
-
-  // If user exists in Auth, send recovery email instead of invite
-  try {
-    const existing = await supabaseAdmin.auth.admin.getUserByEmail(email)
-    if (existing?.data?.user) {
-      userId = existing.data.user.id
-      method = 'recovery'
-      try {
-        const recoverUrl = `${process.env.SUPABASE_URL}/auth/v1/recover`
-        const anonKey = process.env.SUPABASE_ANON_KEY
-        await axios.post(
-          recoverUrl,
-          { email, redirect_to: effectiveRedirect },
-          { headers: { apikey: anonKey, Authorization: `Bearer ${anonKey}`, 'Content-Type': 'application/json' } }
-        )
-        console.log('[invite-helper] recovery sent', { request_id, email: redactEmail(email), redirectTo: effectiveRedirect })
-        return { userId, actionLink: null, method, inviteActionLink: null }
-      } catch (recErr) {
-        console.error('[invite-helper] recovery send failed', { request_id, email: redactEmail(email), error: recErr?.message || recErr })
-        // fall through to invite flow
-        userId = null
-        method = null
-      }
-    }
-  } catch (_) {
-    // continue to invite flow on failure
+  const result = await ensureUserAndSendRecovery({
+    email,
+    redirectTo: effectiveRedirect,
+    request_id: reqId,
+    loggerPrefix: loggerPrefix || '[invite-helper]'
+  })
+  return {
+    userId: result?.userId || null,
+    actionLink: null,
+    method: result?.method || null,
+    inviteActionLink: null,
+    recovery_sent: !!result?.recovery_sent,
+    request_id: reqId
   }
-
-  // Generate an invite link as fallback for manual use
-  try {
-    const inviteLink = await supabaseAdmin.auth.admin.generateLink({
-      type: 'invite',
-      email,
-      options: { redirectTo: effectiveRedirect }
-    });
-    inviteActionLink = inviteLink?.data?.action_link || null;
-    if (!userId) userId = inviteLink?.data?.user?.id || userId;
-    console.log('[invite-helper] invite-link', { request_id, email: redactEmail(email), hasInviteActionLink: !!inviteActionLink, inviteLinkUserIdPresent: !!inviteLink?.data?.user?.id });
-  } catch (e) {
-    console.error('[invite-helper] generateLink(invite) failed', { request_id, email: redactEmail(email), error: e?.message || e });
-  }
-
-  try {
-    const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo: effectiveRedirect })
-    userId = invited?.data?.user?.id || null
-    method = 'invite'
-  } catch (e) {
-    console.error('[invite-helper] inviteUserByEmail failed', { request_id, email: redactEmail(email), error: e?.message || e })
-  }
-
-  if (!userId) {
-    try {
-      const link = await supabaseAdmin.auth.admin.generateLink({
-        type: 'magiclink',
-        email,
-        options: { redirectTo: effectiveRedirect, data: { role, full_name: fullName || email } }
-      })
-      userId = link?.data?.user?.id || null
-      actionLink = link?.data?.action_link || null
-      method = method || 'magiclink'
-    } catch (e) {
-      console.error('[invite-helper] generateLink(magiclink) failed', { request_id, email: redactEmail(email), error: e?.message || e })
-    }
-  }
-
-  if (!userId) {
-    try {
-      const created = await supabaseAdmin.auth.admin.createUser({
-        email,
-        email_confirm: true,
-        user_metadata: { role, full_name: fullName || email }
-      })
-      userId = created?.data?.user?.id || null
-      method = method || 'createUser'
-    } catch (e) {
-      console.error('[invite-helper] createUser failed', { request_id, email: redactEmail(email), error: e?.message || e })
-    }
-    if (userId) {
-      try {
-        await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo: effectiveRedirect })
-        method = 'createUser+invite'
-      } catch (e) {
-        console.error('[invite-helper] second invite after createUser failed', { request_id, email: redactEmail(email), error: e?.message || e })
-      }
-    }
-  }
-
-  console.log('[invite-helper] result', { request_id, email: redactEmail(email), method, hasActionLink: !!actionLink, userIdPresent: !!userId, redirectTo: effectiveRedirect, FRONTEND_BASE, hasInviteActionLink: !!inviteActionLink })
-  return { userId, actionLink, method, inviteActionLink }
 }
 
 // List all clients
@@ -692,7 +609,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
         .maybeSingle()
       if (dupClient) {
         console.warn('[admin/create-client] duplicate client email', { request_id, adminEmail: redactEmail(adminEmail) })
-        return res.status(409).json({ error: 'email_in_use', code: 'email_in_use', detail: 'Email address already exists', request_id })
+        return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
       }
       if (dupClientErr && dupClientErr.code !== 'PGRST116') {
         console.error('[admin/create-client] duplicate_client_lookup_failed', { request_id, error: dupClientErr.message, code: dupClientErr.code, hint: dupClientErr.hint })
@@ -707,7 +624,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
         .limit(1)
       if (dupMember && dupMember.length > 0) {
         console.warn('[admin/create-client] duplicate client member email', { request_id, adminEmail: redactEmail(adminEmail) })
-        return res.status(409).json({ error: 'email_in_use', code: 'email_in_use', detail: 'Email address already exists', request_id })
+        return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
       }
       if (dupMemberErr) {
         console.error('[admin/create-client] duplicate_member_lookup_failed', { request_id, error: dupMemberErr.message, code: dupMemberErr.code, hint: dupMemberErr.hint })
@@ -724,17 +641,18 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
     try {
       inviteResult = await ensureUserIdAndInvite({
         email: adminEmail,
-        fullName: adminName,
-        role: adminRole,
-        redirectTo: `${FRONTEND_BASE}/accept-invite`
+        redirectTo: `${FRONTEND_BASE}/accept-invite`,
+        request_id,
+        loggerPrefix: '[admin/create-client]'
       })
     } catch (e) {
       if (e?.code === 'email_in_use') {
         console.warn('[admin/create-client] invite email_in_use', { request_id, adminEmail: redactEmail(adminEmail) })
-        return res.status(409).json({ error: 'email_in_use', code: 'email_in_use', detail: 'Email address already exists', request_id })
+        return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
       }
-      console.error('[admin/create-client] seed_member_invite_failed', { request_id, error: e?.message || e })
-      return res.status(500).json({ error: 'invite_failed', detail: e?.message || 'Invite failed', request_id, code: 'invite_failed' })
+      const detail = e?.responseData?.error_description || e?.message || e
+      console.error('[admin/create-client] seed_member_invite_failed', { request_id, error: detail, status: e?.status || null })
+      return res.status(500).json({ error: 'invite_failed', detail: detail || 'Invite failed', request_id, code: 'invite_failed' })
     }
     if (!inviteResult?.userId) {
       console.error('[admin/create-client] invite returned no userId', { request_id, adminEmail: redactEmail(adminEmail), method: inviteResult?.method })
@@ -749,6 +667,9 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
     .single()
   if (cErr) {
     console.error('[admin/create-client] create_client_failed', { request_id, error: cErr.message, code: cErr.code, hint: cErr.hint })
+    if (cErr.code === '23505' || cErr.code === 'PGRST116') {
+      return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
+    }
     return res.status(500).json({ error: 'create_client_failed', detail: cErr.message, hint: cErr.hint, code: cErr.code, request_id })
   }
 
@@ -773,6 +694,9 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
       if (insErr) {
         console.error('[admin/create-client] seed_member_insert_failed', { request_id, error: insErr.message, code: insErr.code, hint: insErr.hint })
         try { await supabaseAdmin.from('clients').delete().eq('id', client.id) } catch (_) {}
+        if (insErr.code === '23505' || insErr.code === 'PGRST116') {
+          return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
+        }
         return res.status(500).json({ error: 'seed_member_failed', detail: insErr.message, hint: insErr.hint, code: insErr.code, request_id })
       } else {
         seeded_member = { ...inserted, id: inserted.user_id || inserted.email }
@@ -935,13 +859,13 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   console.log('[admin/add-member] start', { request_id, client_id, role, email: redactEmail(email), redirectTo: `${FRONTEND_BASE}/accept-invite` })
 
   try {
-    const { userId, actionLink, method, inviteActionLink } = await ensureUserIdAndInvite({
+    const { userId, method, inviteActionLink, recovery_sent } = await ensureUserIdAndInvite({
       email,
-      fullName: name,
-      role,
-      redirectTo: `${FRONTEND_BASE}/accept-invite`
+      redirectTo: `${FRONTEND_BASE}/accept-invite`,
+      request_id,
+      loggerPrefix: '[admin/add-member]'
     })
-    console.log('[admin/add-member] invite-result', { request_id, email: redactEmail(email), method, userIdPresent: !!userId, hasInviteActionLink: !!inviteActionLink, redirectTo: `${FRONTEND_BASE}/accept-invite` })
+    console.log('[admin/add-member] invite-result', { request_id, email: redactEmail(email), method, userIdPresent: !!userId, hasInviteActionLink: !!inviteActionLink, redirectTo: `${FRONTEND_BASE}/accept-invite`, recovery_sent: !!recovery_sent })
 
     if (!userId) {
       console.error('[admin/add-member] add_member_no_user_id', { request_id, email: redactEmail(email), method })
@@ -949,8 +873,8 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
         error: 'add_member_failed',
         detail: 'Could not create or locate user for this email.',
         hint: 'Try again or send the magic link manually.',
-        action_link: actionLink || null,
-        request_id
+        action_link: null,
+        request_id,
       })
     }
 
@@ -964,6 +888,9 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
 
     if (error) {
       console.error('[admin/add-member] add_member_insert_failed', { request_id, error: error.message, code: error.code, hint: error.hint })
+      if (error.code === '23505' || error.code === 'PGRST116') {
+        return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
+      }
       return res.status(500).json({ error: 'add_member_failed', detail: error.message, hint: error.hint, code: error.code, request_id })
     }
 
@@ -973,7 +900,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   } catch (e) {
     if (e?.code === 'email_in_use') {
       console.warn('[admin/add-member] email_in_use', { request_id, email: redactEmail(email) })
-      return res.status(409).json({ error: 'email_in_use', code: 'email_in_use', detail: 'This email is already in use for another user.', message: 'This email is already in use for another user.', request_id })
+      return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
     }
     console.error('[admin/add-member] add_member_invite_failed', { request_id, error: e?.message || e })
     return res.status(500).json({ error: 'add_member_failed', detail: e?.message || 'Invite failed', request_id, code: 'add_member_failed' })
@@ -1003,22 +930,17 @@ adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, 
   const redirectTo = `${FRONTEND_BASE}/accept-invite`;
   console.log('[admin/send-password-reset] start', { request_id, email: redactEmail(email), redirectTo });
   try {
-    const recoverUrl = `${process.env.SUPABASE_URL}/auth/v1/recover`;
-    const anonKey = process.env.SUPABASE_ANON_KEY;
-    const payload = { email, redirect_to: redirectTo };
-    const resp = await axios.post(recoverUrl, payload, {
-      headers: {
-        apikey: anonKey,
-        Authorization: `Bearer ${anonKey}`,
-        'Content-Type': 'application/json'
-      }
+    await ensureUserAndSendRecovery({
+      email,
+      redirectTo,
+      request_id,
+      loggerPrefix: '[admin/send-password-reset]'
     });
-    console.log('[admin/send-password-reset] supabase_recover_response', { request_id, status: resp.status, ok: resp.status >= 200 && resp.status < 300 });
     return res.json({ ok: true, request_id });
   } catch (e) {
-    const detail = e?.response?.data?.error_description || e?.response?.data?.msg || e?.message || 'Failed to send password reset email';
-    console.error('[admin/send-password-reset] failed', { request_id, email: redactEmail(email), error: detail });
-    return res.status(500).json({ error: 'password_reset_failed', code: 'password_reset_failed', detail, request_id });
+    const detail = e?.responseData?.error_description || e?.response?.data?.error_description || e?.response?.data?.msg || e?.message || 'Failed to send password reset email';
+    console.error('[admin/send-password-reset] failed', { request_id, email: redactEmail(email), status: e?.status || e?.response?.status || null, error: detail });
+    return res.status(500).json({ error: 'password_reset_failed', code: e?.code || 'password_reset_failed', detail, request_id });
   }
 });
 
