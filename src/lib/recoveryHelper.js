@@ -18,12 +18,42 @@ const redactEmail = (email) => {
   }
 };
 
+function resolveAnonKey() {
+  const candidates = [
+    { name: 'SUPABASE_PUBLIC_ANON_KEY', value: process.env.SUPABASE_PUBLIC_ANON_KEY },
+    { name: 'SUPABASE_ANON_KEY', value: process.env.SUPABASE_ANON_KEY },
+    { name: 'SUPABASE_ANON_PUBLIC_KEY', value: process.env.SUPABASE_ANON_PUBLIC_KEY },
+  ];
+  for (const c of candidates) {
+    if (c.value) return c;
+  }
+  return { name: 'SUPABASE_PUBLIC_ANON_KEY', value: null };
+}
+
 async function ensureUserAndSendRecovery({ email, redirectTo, request_id, loggerPrefix = '[recover-helper]' }) {
   const requestId = request_id || crypto.randomUUID?.() || String(Date.now());
   const effectiveRedirect = redirectTo || `${FRONTEND_BASE}/accept-invite`;
   const safeEmail = redactEmail(email);
+  const anon = resolveAnonKey();
+  const hasAnonKey = !!anon.value;
 
-  console.log(`${loggerPrefix} start`, { request_id: requestId, email: safeEmail, redirect_to: effectiveRedirect, FRONTEND_BASE });
+  console.log(`${loggerPrefix} start`, {
+    request_id: requestId,
+    email: safeEmail,
+    redirect_to: effectiveRedirect,
+    FRONTEND_BASE,
+    anon_env: anon.name,
+    hasAnonKey
+  });
+
+  if (!hasAnonKey) {
+    console.error(`${loggerPrefix} missing anon key`, { request_id: requestId, email: safeEmail, anon_env: anon.name });
+    const err = new Error('misconfigured_supabase_auth');
+    err.code = 'misconfigured_supabase_auth';
+    err.detail = 'Missing SUPABASE_PUBLIC_ANON_KEY';
+    err.request_id = requestId;
+    throw err;
+  }
 
   let userId = null;
   let method = 'existingUser';
@@ -59,7 +89,7 @@ async function ensureUserAndSendRecovery({ email, redirectTo, request_id, logger
   }
 
   const recoverUrl = `${process.env.SUPABASE_URL}/auth/v1/recover`;
-  const anonKey = process.env.SUPABASE_ANON_KEY;
+  const anonKey = anon.value;
   const headers = {
     apikey: anonKey,
     Authorization: `Bearer ${anonKey}`,
@@ -77,7 +107,7 @@ async function ensureUserAndSendRecovery({ email, redirectTo, request_id, logger
         status: resp?.status || null,
         data: resp?.data || null,
         redirect_to: effectiveRedirect,
-        key: 'anon'
+        key: anon.name
       });
       const err = new Error('recover_failed');
       err.code = 'recover_failed';
@@ -91,7 +121,7 @@ async function ensureUserAndSendRecovery({ email, redirectTo, request_id, logger
       email: safeEmail,
       status: resp?.status || null,
       redirect_to: effectiveRedirect,
-      key: 'anon'
+      key: anon.name
     });
     return { userId, method, recovery_sent: true, request_id: requestId };
   } catch (e) {
@@ -103,13 +133,14 @@ async function ensureUserAndSendRecovery({ email, redirectTo, request_id, logger
       status,
       data,
       redirect_to: effectiveRedirect,
-      key: 'anon'
+      key: anon.name
     });
     const err = new Error('recover_failed');
     err.code = 'recover_failed';
     err.status = status;
     err.responseData = data;
     err.request_id = requestId;
+    err.detail = data?.error_description || data?.message || e?.message || 'Recovery email failed';
     throw err;
   }
 }

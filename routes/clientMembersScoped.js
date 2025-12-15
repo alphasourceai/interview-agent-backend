@@ -96,6 +96,9 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
     console.log('[client-members/scoped-add] success', { request_id, client_id: clientId, role, email: redactEmail(email), method });
     res.json({ item: { ...m, id: m.user_id || m.email }, request_id, invite_action_link: inviteActionLink || null });
   } catch (e) {
+    if (e?.code === 'misconfigured_supabase_auth') {
+      return res.status(500).json({ error: 'misconfigured_supabase_auth', detail: e.detail || 'Missing SUPABASE_PUBLIC_ANON_KEY', request_id: req.request_id || request_id });
+    }
     if (e?.code === 'email_in_use') {
       console.warn('[client-members/scoped-add] email_in_use', { email: redactEmail(req.body?.email), request_id: req.request_id || null });
       return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id: req.request_id || null });

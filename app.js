@@ -483,6 +483,9 @@ app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
       const accept_url = `${FRONTEND_BASE}/accept-invite`;
       res.json({ ok: true, accept_url, request_id, recovery_sent: !!recovery_sent })
     } catch (e) {
+      if (e?.code === 'misconfigured_supabase_auth') {
+        return res.status(500).json({ error: 'misconfigured_supabase_auth', detail: e.detail || 'Missing SUPABASE_PUBLIC_ANON_KEY', request_id })
+      }
       if (e?.code === 'email_in_use') {
         return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
       }
@@ -646,6 +649,9 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
         loggerPrefix: '[admin/create-client]'
       })
     } catch (e) {
+      if (e?.code === 'misconfigured_supabase_auth') {
+        return res.status(500).json({ error: 'misconfigured_supabase_auth', detail: e.detail || 'Missing SUPABASE_PUBLIC_ANON_KEY', request_id })
+      }
       if (e?.code === 'email_in_use') {
         console.warn('[admin/create-client] invite email_in_use', { request_id, adminEmail: redactEmail(adminEmail) })
         return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
@@ -898,6 +904,9 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
     console.log('[admin/add-member] success', { request_id, client_id, role, email: redactEmail(email), method })
     res.json({ item: { ...m, id: m.user_id || m.email }, request_id, invite_action_link: inviteActionLink || null })
   } catch (e) {
+    if (e?.code === 'misconfigured_supabase_auth') {
+      return res.status(500).json({ error: 'misconfigured_supabase_auth', detail: e.detail || 'Missing SUPABASE_PUBLIC_ANON_KEY', request_id })
+    }
     if (e?.code === 'email_in_use') {
       console.warn('[admin/add-member] email_in_use', { request_id, email: redactEmail(email) })
       return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
@@ -938,6 +947,9 @@ adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, 
     });
     return res.json({ ok: true, request_id });
   } catch (e) {
+    if (e?.code === 'misconfigured_supabase_auth') {
+      return res.status(500).json({ error: 'misconfigured_supabase_auth', detail: e.detail || 'Missing SUPABASE_PUBLIC_ANON_KEY', request_id });
+    }
     const detail = e?.responseData?.error_description || e?.response?.data?.error_description || e?.response?.data?.msg || e?.message || 'Failed to send password reset email';
     console.error('[admin/send-password-reset] failed', { request_id, email: redactEmail(email), status: e?.status || e?.response?.status || null, error: detail });
     return res.status(500).json({ error: 'password_reset_failed', code: e?.code || 'password_reset_failed', detail, request_id });
