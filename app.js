@@ -574,6 +574,20 @@ async function ensureUserIdAndInvite({ email, fullName, role, redirectTo }) {
     // ignore other errors and continue with invite attempts
   }
 
+  // Generate a recovery/invite link as a fallback (invite link)
+  try {
+    const inviteLink = await supabaseAdmin.auth.admin.generateLink({
+      type: 'invite',
+      email,
+      options: { redirectTo: effectiveRedirect }
+    });
+    inviteActionLink = inviteLink?.data?.action_link || null;
+    if (!userId) userId = inviteLink?.data?.user?.id || userId;
+    console.log('[invite-helper] invite-link', { request_id, email: redactEmail(email), hasInviteActionLink: !!inviteActionLink, inviteLinkUserIdPresent: !!inviteLink?.data?.user?.id });
+  } catch (e) {
+    console.error('[invite-helper] generateLink(invite) failed', { request_id, email: redactEmail(email), error: e?.message || e });
+  }
+
   try {
     const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo: effectiveRedirect })
     userId = invited?.data?.user?.id || null
@@ -617,18 +631,6 @@ async function ensureUserIdAndInvite({ email, fullName, role, redirectTo }) {
         console.error('[invite-helper] second invite after createUser failed', { request_id, email: redactEmail(email), error: e?.message || e })
       }
     }
-  }
-
-  try {
-    const link = await supabaseAdmin.auth.admin.generateLink({
-      type: 'invite',
-      email,
-      options: { redirectTo: effectiveRedirect }
-    });
-    inviteActionLink = link?.data?.action_link || null;
-    if (!userId) userId = link?.data?.user?.id || userId;
-  } catch (e) {
-    console.error('[invite-helper] generateLink(invite) failed', { request_id, email: redactEmail(email), error: e?.message || e });
   }
 
   console.log('[invite-helper] result', { request_id, email: redactEmail(email), method, hasActionLink: !!actionLink, userIdPresent: !!userId, redirectTo: effectiveRedirect, FRONTEND_BASE, hasInviteActionLink: !!inviteActionLink })
@@ -675,7 +677,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
         .maybeSingle()
       if (dupClient) {
         console.warn('[admin/create-client] duplicate client email', { request_id, adminEmail: redactEmail(adminEmail) })
-        return res.status(409).json({ error: 'client_admin_email_in_use', code: 'client_admin_email_in_use', message: 'That email is already in use for another client admin.', request_id })
+      return res.status(409).json({ error: 'email_in_use', code: 'email_in_use', detail: 'Email address already exists', request_id })
       }
       if (dupClientErr && dupClientErr.code !== 'PGRST116') {
         console.error('[admin/create-client] duplicate_client_lookup_failed', { request_id, error: dupClientErr.message, code: dupClientErr.code, hint: dupClientErr.hint })
@@ -977,6 +979,32 @@ adminRouter.delete('/client-members/:id', requireAuth, requireAdmin, async (req,
   if (error) return res.status(500).json({ error: 'remove_member_failed', detail: error.message })
   res.json({ ok: true })
 })
+
+// Send password reset (admin only) for a given email
+adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+  const email = (req.body?.email || '').trim();
+  if (!email) return res.status(400).json({ error: 'email_required', code: 'email_required', request_id });
+  const redirectTo = `${FRONTEND_BASE}/accept-invite`;
+  console.log('[admin/send-password-reset] start', { request_id, email: redactEmail(email), redirectTo });
+  try {
+    const link = await supabaseAdmin.auth.admin.generateLink({
+      type: 'recovery',
+      email,
+      options: { redirectTo }
+    });
+    const inviteActionLink = link?.data?.action_link || null;
+    console.log('[admin/send-password-reset] success', { request_id, email: redactEmail(email), hasActionLink: !!inviteActionLink });
+    const payload = { ok: true, request_id };
+    if (process.env.NODE_ENV !== 'production') {
+      payload.invite_action_link = inviteActionLink;
+    }
+    return res.json(payload);
+  } catch (e) {
+    console.error('[admin/send-password-reset] failed', { request_id, email: redactEmail(email), error: e?.message || e });
+    return res.status(500).json({ error: 'password_reset_failed', code: 'password_reset_failed', detail: e?.message || 'Failed to send password reset email', request_id });
+  }
+});
 
 app.use('/admin', adminRouter)
 
