@@ -958,6 +958,64 @@ adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, 
 
 app.use('/admin', adminRouter)
 
+// ======================= Client-scoped roles (authenticated) =======================
+app.get('/roles', requireAuth, withClientScope, async (req, res) => {
+  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+  try {
+    const allowedIds = Array.isArray(req.clientIds) ? req.clientIds.filter(Boolean) : [];
+    if (!allowedIds.length) {
+      return res.json({ items: [], request_id });
+    }
+
+    const requestedClientId = req.query?.client_id || null;
+    let finalIds = allowedIds;
+    if (requestedClientId) {
+      if (!allowedIds.includes(requestedClientId)) {
+        return res.status(403).json({
+          error: 'forbidden',
+          code: 'client_scope_mismatch',
+          detail: 'You do not have access to this client',
+          hint: 'Join the client to view roles.',
+          request_id
+        });
+      }
+      finalIds = [requestedClientId];
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('roles')
+      .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
+      .in('client_id', finalIds)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('[roles:list] supabase error', {
+        request_id,
+        code: error.code,
+        hint: error.hint,
+        message: error.message
+      });
+      return res.status(500).json({
+        error: 'list_roles_failed',
+        code: error.code || 'list_roles_failed',
+        detail: error.message,
+        hint: error.hint,
+        request_id
+      });
+    }
+
+    return res.json({ items: data || [], request_id });
+  } catch (e) {
+    console.error('[roles:list] unexpected', { request_id, error: e?.message || e });
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'server_error',
+      detail: e?.message || 'Server error',
+      request_id
+    });
+  }
+});
+
 /* ======================= END: Admin guard + Admin API ======================= */
 
 // ---------- Mount legacy/optional feature routes if present ----------
