@@ -110,14 +110,28 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
 
 router.delete('/:id', requireAuth, withClientScope, async (req, res) => {
   try {
+    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
     const key = req.params.id;
     const client_id = req.query.client_id || req.client?.id || req.clientScope?.defaultClientId || null;
-    if (!client_id) return res.status(400).json({ error: 'client_id_required' });
+    if (!client_id) return res.status(400).json({ error: 'client_id_required', request_id });
 
     const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === client_id);
     const userRole = (membership?.role || '').toLowerCase();
     if (!membership || !['manager', 'admin', 'tester'].includes(userRole)) {
-      return res.status(403).json({ error: 'forbidden' });
+      return res.status(403).json({ error: 'forbidden', request_id });
+    }
+
+    // Block self-delete
+    const targetUserId = key.includes('@') ? null : key;
+    if (targetUserId && targetUserId === req.user?.id) {
+      console.error('[client/members/delete] self delete blocked', { request_id, user_id: req.user?.id, target_user_id: targetUserId });
+      return res.status(403).json({
+        error: 'not_allowed',
+        code: 'self_delete_forbidden',
+        detail: 'Not allowed to delete yourself',
+        hint: 'A user cannot remove their own membership.',
+        request_id
+      });
     }
 
     let q = supabaseAdmin.from('client_members').delete();
@@ -126,11 +140,12 @@ router.delete('/:id', requireAuth, withClientScope, async (req, res) => {
     q = q.eq('client_id', client_id);
 
     const { error } = await q;
-    if (error) return res.status(500).json({ error: 'remove_member_failed', detail: error.message });
-    res.json({ ok: true });
+    if (error) return res.status(500).json({ error: 'remove_member_failed', detail: error.message, request_id });
+    res.json({ ok: true, request_id });
   } catch (e) {
+    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
     console.error('[client-members/delete] unexpected', e?.message || e);
-    res.status(500).json({ error: 'server_error' });
+    res.status(500).json({ error: 'server_error', request_id });
   }
 });
 
