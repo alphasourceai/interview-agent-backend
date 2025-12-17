@@ -39,6 +39,37 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
   }
 });
 
+router.get('/me', requireAuth, withClientScope, async (req, res) => {
+  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+  try {
+    const clientId = req.query.client_id || req.client?.id || req.clientScope?.defaultClientId || null;
+    if (!clientId) return res.status(400).json({ error: 'client_id_required', request_id });
+
+    const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
+    if (!membership) return res.status(403).json({ error: 'forbidden', request_id });
+
+    const { data, error } = await supabaseAdmin
+      .from('client_members')
+      .select('client_id,user_id,email,name,role,created_at,tester_acknowledged_at,tester_acknowledged_ip')
+      .eq('client_id', clientId)
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+
+    if (error) {
+      console.error('[client-members/me] fetch_failed', { request_id, error: error.message, code: error.code });
+      return res.status(500).json({ error: 'fetch_member_failed', detail: error.message, code: error.code, request_id });
+    }
+    if (!data) {
+      return res.status(404).json({ error: 'membership_not_found', request_id });
+    }
+    const item = { ...data, id: data.user_id || data.email };
+    return res.json({ item, request_id });
+  } catch (e) {
+    console.error('[client-members/me] unexpected', { request_id, error: e?.message || e });
+    return res.status(500).json({ error: 'server_error', request_id });
+  }
+});
+
 router.post('/', requireAuth, withClientScope, async (req, res) => {
   try {
     const { client_id, email, name } = req.body || {};
