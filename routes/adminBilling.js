@@ -53,43 +53,43 @@ router.use(requireAuth, requireAdmin);
 router.get('/customers', async (_req, res) => {
   const request_id = crypto.randomUUID?.() || String(Date.now());
   try {
-    const { data, error } = await supabaseAdmin
+    const { data, error, status, statusText } = await supabaseAdmin
       .from('billing_customers')
-      .select('id,company_name,primary_contact_name,primary_contact_email,notes,client_id,stripe_customer_id,created_at')
+      .select('id,name,primary_contact_name,primary_contact_email,notes,client_id,stripe_customer_id,created_at,updated_at')
       .order('created_at', { ascending: false });
     if (error) {
-      console.error('[billing/customers:list] failed', { request_id, error: error.message });
-      return res.status(500).json({ error: 'list_customers_failed', detail: error.message, request_id });
+      console.error('[billing/customers:list] failed', { request_id, error: error.message, hint: error.hint, code: error.code });
+      return res.status(500).json({ error: 'list_customers_failed', code: error.code || 'list_customers_failed', detail: error.message, hint: error.hint, request_id, status, statusText });
     }
     return res.json({ items: data || [], request_id });
   } catch (e) {
     console.error('[billing/customers:list] unexpected', { request_id, error: e?.message || e });
-    return res.status(500).json({ error: 'server_error', request_id });
+    return res.status(500).json({ error: 'server_error', code: 'server_error', detail: e?.message || 'Server error', request_id });
   }
 });
 
 router.post('/customers', async (req, res) => {
   const request_id = crypto.randomUUID?.() || String(Date.now());
   try {
-    const company_name = (req.body?.company_name || '').trim();
+    const name = (req.body?.company_name || req.body?.name || '').trim();
     const primary_contact_name = (req.body?.primary_contact_name || '').trim();
     const primary_contact_email = (req.body?.primary_contact_email || '').trim();
     const notes = (req.body?.notes || '').trim();
     const client_id = (req.body?.client_id || '').trim() || null;
 
-    if (!company_name || !primary_contact_name || !primary_contact_email) {
-      return res.status(400).json({ error: 'missing_fields', detail: 'company_name, primary_contact_name, primary_contact_email required', request_id });
+    if (!name || !primary_contact_name || !primary_contact_email) {
+      return res.status(400).json({ error: 'missing_fields', code: 'missing_fields', detail: 'name, primary_contact_name, primary_contact_email required', request_id });
     }
 
     const { data, error } = await supabaseAdmin
       .from('billing_customers')
-      .insert({ company_name, primary_contact_name, primary_contact_email, notes: notes || null, client_id: client_id || null })
-      .select('id,company_name,primary_contact_name,primary_contact_email,notes,client_id,stripe_customer_id,created_at')
+      .insert({ name, primary_contact_name, primary_contact_email, notes: notes || null, client_id: client_id || null })
+      .select('id,name,primary_contact_name,primary_contact_email,notes,client_id,stripe_customer_id,created_at,updated_at')
       .single();
 
     if (error) {
-      console.error('[billing/customers:create] failed', { request_id, error: error.message, code: error.code });
-      return res.status(500).json({ error: 'create_customer_failed', detail: error.message, code: error.code, request_id });
+      console.error('[billing/customers:create] failed', { request_id, error: error.message, code: error.code, hint: error.hint });
+      return res.status(500).json({ error: 'create_customer_failed', code: error.code || 'create_customer_failed', detail: error.message, hint: error.hint, request_id });
     }
 
     return res.json({ item: data, request_id });
@@ -108,13 +108,13 @@ router.get('/invoices', async (_req, res) => {
       .order('created_at', { ascending: false })
       .limit(200);
     if (error) {
-      console.error('[billing/invoices:list] failed', { request_id, error: error.message });
-      return res.status(500).json({ error: 'list_invoices_failed', detail: error.message, request_id });
+      console.error('[billing/invoices:list] failed', { request_id, error: error.message, code: error.code, hint: error.hint });
+      return res.status(500).json({ error: 'list_invoices_failed', code: error.code || 'list_invoices_failed', detail: error.message, hint: error.hint, request_id });
     }
     return res.json({ items: data || [], request_id });
   } catch (e) {
     console.error('[billing/invoices:list] unexpected', { request_id, error: e?.message || e });
-    return res.status(500).json({ error: 'server_error', request_id });
+    return res.status(500).json({ error: 'server_error', code: 'server_error', detail: e?.message || 'Server error', request_id });
   }
 });
 
