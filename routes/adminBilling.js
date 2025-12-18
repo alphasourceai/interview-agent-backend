@@ -111,6 +111,32 @@ router.get('/invoices', async (_req, res) => {
       console.error('[billing/invoices:list] failed', { request_id, error: error.message, code: error.code, hint: error.hint });
       return res.status(500).json({ error: 'list_invoices_failed', code: error.code || 'list_invoices_failed', detail: error.message, hint: error.hint, request_id });
     }
+
+    const needsEnrichment = (data || []).filter((inv) => !inv.customer_name || !inv.customer_email);
+    if (needsEnrichment.length) {
+      const ids = Array.from(new Set(needsEnrichment.map((inv) => inv.billing_customer_id).filter(Boolean)));
+      if (ids.length) {
+        const { data: custData, error: custErr } = await supabaseAdmin
+          .from('billing_customers')
+          .select('id,name,primary_contact_email')
+          .in('id', ids);
+        if (!custErr && Array.isArray(custData)) {
+          const map = Object.fromEntries((custData || []).map((c) => [c.id, c]));
+          data.forEach((inv) => {
+            if (!inv.customer_name || !inv.customer_email) {
+              const c = map[inv.billing_customer_id];
+              if (c) {
+                inv.customer_name = inv.customer_name || c.name || null;
+                inv.customer_email = inv.customer_email || c.primary_contact_email || null;
+              }
+            }
+          });
+        } else if (custErr) {
+          console.error('[billing/invoices:list] customer_enrich_failed', { request_id, error: custErr.message, code: custErr.code, hint: custErr.hint });
+        }
+      }
+    }
+
     return res.json({ items: data || [], request_id });
   } catch (e) {
     console.error('[billing/invoices:list] unexpected', { request_id, error: e?.message || e });
@@ -239,7 +265,7 @@ router.post('/invoices/send', async (req, res) => {
           customer_name: billingCustomer.name || null,
           customer_email: billingCustomer.primary_contact_email || null
         })
-        .select('id,stripe_invoice_id,status,hosted_invoice_url,invoice_description,amount_total_cents')
+        .select('id,stripe_invoice_id,status,hosted_invoice_url,invoice_description,amount_total_cents,customer_name,customer_email')
         .single();
 
       if (insErr) {
