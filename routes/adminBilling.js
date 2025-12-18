@@ -38,7 +38,7 @@ async function requireAdmin(req, res, next) {
       .eq('is_active', true)
       .maybeSingle();
     if (error) {
-      console.error('[billing] admin_lookup_failed', { request_id: req.request_id || null, error: error.message, code: error.code });
+      console.error('[billing] admin_lookup_failed', { request_id: req.request_id || null, error: error.message, code: error.code, hint: error.hint });
       return res.status(500).json({ error: 'admin_lookup_failed', code: error.code || 'admin_lookup_failed', detail: error.message, hint: error.hint, request_id: req.request_id || null });
     }
     if (!adm) return res.status(403).json({ error: 'not_admin' });
@@ -104,7 +104,7 @@ router.get('/invoices', async (_req, res) => {
   try {
     const { data, error } = await supabaseAdmin
       .from('billing_invoices')
-      .select('id,billing_customer_id,title,invoice_description,amount_total,currency,status,hosted_invoice_url,stripe_invoice_id,created_at,customer_name,customer_email')
+      .select('id,billing_customer_id,title,invoice_description,amount_total_cents,currency,status,hosted_invoice_url,stripe_invoice_id,created_at,customer_name,customer_email')
       .order('created_at', { ascending: false })
       .limit(200);
     if (error) {
@@ -222,7 +222,7 @@ router.post('/invoices/send', async (req, res) => {
       return res.status(500).json({ error: 'invoice_send_failed', code: 'invoice_send_failed', detail: e?.message || 'Could not send invoice', request_id });
     }
 
-    const amount_total = normalizedItems.reduce((sum, li) => sum + (li.unit_amount * li.quantity), 0);
+    const amount_total_cents = Number.isFinite(sentInvoice?.amount_due) ? sentInvoice.amount_due : Math.round(normalizedItems.reduce((sum, li) => sum + (li.unit_amount * li.quantity), 0) * 100);
 
     try {
       const { data: inserted, error: insErr } = await supabaseAdmin
@@ -231,7 +231,7 @@ router.post('/invoices/send', async (req, res) => {
           billing_customer_id,
           title,
           invoice_description: invoice_description || null,
-          amount_total,
+          amount_total_cents,
           currency: 'usd',
           status: sentInvoice?.status || null,
           hosted_invoice_url: sentInvoice?.hosted_invoice_url || null,
@@ -239,7 +239,7 @@ router.post('/invoices/send', async (req, res) => {
           customer_name: billingCustomer.name || null,
           customer_email: billingCustomer.primary_contact_email || null
         })
-        .select('id,stripe_invoice_id,status,hosted_invoice_url,invoice_description')
+        .select('id,stripe_invoice_id,status,hosted_invoice_url,invoice_description,amount_total_cents')
         .single();
 
       if (insErr) {
