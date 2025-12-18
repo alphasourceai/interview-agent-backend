@@ -104,7 +104,7 @@ router.get('/invoices', async (_req, res) => {
   try {
     const { data, error } = await supabaseAdmin
       .from('billing_invoices')
-      .select('id,billing_customer_id,title,invoice_description,amount_total_cents,currency,status,hosted_invoice_url,stripe_invoice_id,created_at,customer_name,customer_email')
+      .select('id,billing_customer_id,title,invoice_title,invoice_description,amount_total_cents,currency,status,hosted_invoice_url,stripe_invoice_id,created_at,customer_name,customer_email')
       .order('created_at', { ascending: false })
       .limit(200);
     if (error) {
@@ -148,22 +148,23 @@ router.post('/invoices/send', async (req, res) => {
   const request_id = crypto.randomUUID?.() || String(Date.now());
   try {
     const billing_customer_id = req.body?.billing_customer_id || null;
-    const title = (req.body?.title || '').trim();
+    const invoice_title = (req.body?.invoice_title || req.body?.title || '').trim();
     const invoice_description = (req.body?.invoice_description || '').trim() || null;
     const days_until_due = Number.isFinite(parseInt(req.body?.days_until_due, 10)) ? parseInt(req.body?.days_until_due, 10) : 7;
     const line_items = Array.isArray(req.body?.line_items) ? req.body.line_items : [];
 
-    if (!billing_customer_id || !title) {
-      return res.status(400).json({ error: 'missing_fields', code: 'missing_fields', detail: 'billing_customer_id and title are required', request_id });
+    if (!billing_customer_id || !invoice_title) {
+      return res.status(400).json({ error: 'missing_fields', code: 'missing_fields', detail: 'billing_customer_id and invoice_title are required', request_id });
     }
 
     const normalizedItems = line_items
       .map((li) => ({
         description: (li?.description || '').trim(),
         quantity: parseInt(li?.quantity, 10) || 1,
-        unit_amount: parseFloat(li?.unit_amount)
+        unit_amount: parseFloat(li?.unit_amount),
+        unit_amount_cents: Number.isFinite(parseFloat(li?.unit_amount)) ? Math.round(parseFloat(li.unit_amount) * 100) : NaN
       }))
-      .filter((li) => li.description && !Number.isNaN(li.unit_amount) && li.unit_amount > 0 && li.quantity > 0);
+      .filter((li) => li.description && !Number.isNaN(li.unit_amount) && li.unit_amount > 0 && li.quantity > 0 && Number.isFinite(li.unit_amount_cents) && li.unit_amount_cents > 0);
 
     if (!normalizedItems.length) {
       return res.status(400).json({ error: 'invalid_line_items', code: 'invalid_line_items', detail: 'At least one valid line item is required', request_id });
@@ -212,7 +213,7 @@ router.post('/invoices/send', async (req, res) => {
           description: item.description,
           quantity: item.quantity,
           currency: 'usd',
-          unit_amount: Math.round(item.unit_amount * 100)
+          unit_amount: item.unit_amount_cents
         });
       }
     } catch (e) {
@@ -229,7 +230,7 @@ router.post('/invoices/send', async (req, res) => {
         description: invoice_description || undefined,
         metadata: {
           billing_customer_id,
-          title
+          invoice_title
         }
       });
     } catch (e) {
@@ -248,14 +249,17 @@ router.post('/invoices/send', async (req, res) => {
       return res.status(500).json({ error: 'invoice_send_failed', code: 'invoice_send_failed', detail: e?.message || 'Could not send invoice', request_id });
     }
 
-    const amount_total_cents = Number.isFinite(sentInvoice?.amount_due) ? sentInvoice.amount_due : Math.round(normalizedItems.reduce((sum, li) => sum + (li.unit_amount * li.quantity), 0) * 100);
+    const amount_total_cents = Number.isFinite(sentInvoice?.amount_due)
+      ? sentInvoice.amount_due
+      : normalizedItems.reduce((sum, li) => sum + (li.unit_amount_cents * li.quantity), 0);
 
     try {
       const { data: inserted, error: insErr } = await supabaseAdmin
         .from('billing_invoices')
         .insert({
           billing_customer_id,
-          title,
+          title: invoice_title,
+          invoice_title,
           invoice_description: invoice_description || null,
           amount_total_cents,
           currency: 'usd',
