@@ -1029,6 +1029,7 @@ mountIfExists('./routes/kb', '/kb')
 mountIfExists('./routes/webhook', '/webhook')
 mountIfExists('./routes/tavus', '/')
 mountIfExists('./routes/clientMembersScoped', '/client-members')
+mountIfExists('./routes/adminBilling', '/admin/billing')
 
 // ---------- JD upload route (authenticated + scoped) ----------
 try {
