@@ -157,18 +157,38 @@ router.post('/invoices/send', async (req, res) => {
       return res.status(400).json({ error: 'missing_fields', code: 'missing_fields', detail: 'billing_customer_id and invoice_title are required', request_id });
     }
 
-    const normalizedItems = line_items
-      .map((li) => ({
-        description: (li?.description || '').trim(),
-        quantity: parseInt(li?.quantity, 10) || 1,
-        unit_amount: parseFloat(li?.unit_amount),
-        unit_amount_cents: Number.isFinite(parseFloat(li?.unit_amount)) ? Math.round(parseFloat(li.unit_amount) * 100) : NaN
-      }))
-      .filter((li) => li.description && !Number.isNaN(li.unit_amount) && li.unit_amount > 0 && li.quantity > 0 && Number.isFinite(li.unit_amount_cents) && li.unit_amount_cents > 0);
+    const normalizedItems = (line_items || []).map((li) => {
+      const description = (li?.description || '').trim();
+      const qtyRaw = parseInt(li?.quantity, 10);
+      const quantity = Number.isFinite(qtyRaw) && qtyRaw > 0 ? qtyRaw : 1;
+      const unitDollars = Number(li?.unit_amount);
+      const unit_amount_cents = Math.round(unitDollars * 100);
+      const line_total_cents = Number.isFinite(unit_amount_cents) && Number.isFinite(quantity) ? unit_amount_cents * quantity : NaN;
+      return {
+        description,
+        quantity,
+        unit_amount_cents,
+        line_total_cents
+      };
+    });
 
-    if (!normalizedItems.length) {
-      return res.status(400).json({ error: 'invalid_line_items', code: 'invalid_line_items', detail: 'At least one valid line item is required', request_id });
+    const invalidLineItem = normalizedItems.some(
+      (li) =>
+        !li.description ||
+        !Number.isFinite(li.quantity) ||
+        li.quantity < 1 ||
+        !Number.isFinite(li.unit_amount_cents) ||
+        li.unit_amount_cents <= 0 ||
+        !Number.isFinite(li.line_total_cents) ||
+        li.line_total_cents <= 0
+    );
+    if (invalidLineItem || !normalizedItems.length) {
+      return res.status(400).json({ error: 'invalid_line_items', code: 'invalid_line_items', detail: 'Line items contain invalid or negative amounts', request_id });
     }
+
+    const computedSumCents = normalizedItems.reduce((sum, li) => sum + (Number.isFinite(li.line_total_cents) ? li.line_total_cents : 0), 0);
+
+    console.log('[billing/send] normalized_items', { request_id, items: normalizedItems });
 
     const { data: billingCustomer, error: fetchErr } = await supabaseAdmin
       .from('billing_customers')
@@ -206,27 +226,13 @@ router.post('/invoices/send', async (req, res) => {
       }
     }
 
+    let draftInvoice = null;
     try {
-      for (const item of normalizedItems) {
-        await stripe.invoiceItems.create({
-          customer: stripeCustomerId,
-          description: item.description,
-          quantity: item.quantity,
-          currency: 'usd',
-          unit_amount: item.unit_amount_cents
-        });
-      }
-    } catch (e) {
-      console.error('[billing/send] invoice_items_failed', { request_id, error: e?.message || e });
-      return res.status(500).json({ error: 'invoice_items_failed', code: 'invoice_items_failed', detail: e?.message || 'Could not create invoice items', request_id });
-    }
-
-    let createdInvoice = null;
-    try {
-      createdInvoice = await stripe.invoices.create({
+      draftInvoice = await stripe.invoices.create({
         customer: stripeCustomerId,
         collection_method: 'send_invoice',
         days_until_due: days_until_due || 7,
+        auto_advance: false,
         description: invoice_description || undefined,
         metadata: {
           billing_customer_id,
@@ -238,20 +244,68 @@ router.post('/invoices/send', async (req, res) => {
       return res.status(500).json({ error: 'invoice_create_failed', code: 'invoice_create_failed', detail: e?.message || 'Could not create invoice', request_id });
     }
 
-    let sentInvoice = createdInvoice;
     try {
-      const finalized = await stripe.invoices.finalizeInvoice(createdInvoice.id);
+      for (const item of normalizedItems) {
+        await stripe.invoiceItems.create({
+          customer: stripeCustomerId,
+          invoice: draftInvoice.id,
+          description: item.description,
+          amount: item.line_total_cents,
+          currency: 'usd'
+        });
+      }
+    } catch (e) {
+      console.error('[billing/send] invoice_items_failed', { request_id, error: e?.message || e });
+      return res.status(500).json({ error: 'invoice_items_failed', code: 'invoice_items_failed', detail: e?.message || 'Could not create invoice items', request_id });
+    }
+
+    console.log('[billing/send] invoice_items_attached', {
+      request_id,
+      invoice_id: draftInvoice?.id || null,
+      items: normalizedItems.length,
+      total_cents: computedSumCents
+    });
+
+    let sentInvoice = draftInvoice;
+    try {
+      const beforeFinalize = await stripe.invoices.retrieve(draftInvoice.id);
+      console.log('[billing/send] stripe_totals_before_finalize', {
+        request_id,
+        invoice_id: draftInvoice.id,
+        amount_due: beforeFinalize?.amount_due,
+        total: beforeFinalize?.total
+      });
+    } catch (e) {
+      console.error('[billing/send] invoice_retrieve_before_finalize_failed', { request_id, error: e?.message || e });
+    }
+
+    let afterSend = null;
+    try {
+      const finalized = await stripe.invoices.finalizeInvoice(draftInvoice.id);
       sentInvoice = finalized;
-      const sent = await stripe.invoices.sendInvoice(createdInvoice.id);
+      const sent = await stripe.invoices.sendInvoice(finalized.id);
       sentInvoice = sent || finalized;
+      try {
+        afterSend = await stripe.invoices.retrieve(finalized.id);
+        console.log('[billing/send] stripe_totals_after_send', {
+          request_id,
+          invoice_id: finalized.id,
+          amount_due: afterSend?.amount_due,
+          total: afterSend?.total
+        });
+      } catch (e) {
+        console.error('[billing/send] invoice_retrieve_after_send_failed', { request_id, error: e?.message || e });
+      }
     } catch (e) {
       console.error('[billing/send] invoice_send_failed', { request_id, error: e?.message || e });
       return res.status(500).json({ error: 'invoice_send_failed', code: 'invoice_send_failed', detail: e?.message || 'Could not send invoice', request_id });
     }
 
-    const amount_total_cents = Number.isFinite(sentInvoice?.amount_due)
-      ? sentInvoice.amount_due
-      : normalizedItems.reduce((sum, li) => sum + (li.unit_amount_cents * li.quantity), 0);
+    const amount_total_cents = Number.isFinite(afterSend?.amount_due)
+      ? afterSend.amount_due
+      : Number.isFinite(afterSend?.total)
+        ? afterSend.total
+        : computedSumCents;
 
     try {
       const { data: inserted, error: insErr } = await supabaseAdmin
