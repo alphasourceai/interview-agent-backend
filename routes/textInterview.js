@@ -12,7 +12,6 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 });
 
-const RESUME_BUCKET = process.env.SUPABASE_RESUMES_BUCKET || 'resumes';
 const TOKEN_SECRET = process.env.TEXT_INTERVIEW_JWT_SECRET || process.env.SUPABASE_JWT_SECRET || '';
 const TEXT_COMPLETION_NOTE = 'Completed via accommodation pathway (text).';
 
@@ -38,6 +37,30 @@ const parseQuestions = (rubric) => {
     })
     .filter(Boolean);
 };
+
+function getAccommodationResumeBucket() {
+  const bucket = String(process.env.SUPABASE_ACCOMMODATION_RESUMES_BUCKET || '').trim();
+  if (!bucket) {
+    const err = new Error('SUPABASE_ACCOMMODATION_RESUMES_BUCKET not configured');
+    err.code = 'bucket_missing';
+    err.detail = 'SUPABASE_ACCOMMODATION_RESUMES_BUCKET not configured';
+    throw err;
+  }
+  return bucket;
+}
+
+function sendError(res, status, { error, code, detail, hint, request_id }) {
+  return res.status(status).json({ error, code, detail, hint, request_id });
+}
+
+function logSupabaseError(message, request_id, error) {
+  console.error(message, {
+    request_id,
+    error: error?.message || error,
+    detail: error?.detail || null,
+    hint: error?.hint || null,
+  });
+}
 
 function verifyToken(raw) {
   if (!TOKEN_SECRET) {
@@ -81,14 +104,28 @@ router.post('/session', async (req, res) => {
   const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
   try {
     const token = String(req.body?.token || '').trim();
-    if (!token) return res.status(400).json({ error: 'token_required' });
+    if (!token) {
+      return sendError(res, 400, {
+        error: 'token_required',
+        code: 'token_required',
+        detail: null,
+        hint: null,
+        request_id,
+      });
+    }
     const decoded = verifyToken(token);
 
     const reqRow = await loadRequest(decoded.request_id);
     ensureApprovedStatus(reqRow.status);
 
     if (decoded.role_id && decoded.role_id !== reqRow.role_id) {
-      return res.status(403).json({ error: 'role_mismatch' });
+      return sendError(res, 403, {
+        error: 'role_mismatch',
+        code: 'role_mismatch',
+        detail: null,
+        hint: null,
+        request_id,
+      });
     }
 
     const { data: role, error: roleErr } = await supabaseAdmin
@@ -96,7 +133,15 @@ router.post('/session', async (req, res) => {
       .select('id, title, rubric, client_id')
       .eq('id', reqRow.role_id)
       .maybeSingle();
-    if (roleErr || !role) return res.status(404).json({ error: 'role_not_found' });
+    if (roleErr || !role) {
+      return sendError(res, 404, {
+        error: 'role_not_found',
+        code: roleErr?.code || 'role_not_found',
+        detail: roleErr?.message || null,
+        hint: roleErr?.hint || null,
+        request_id,
+      });
+    }
 
     let resumeRequired = !(reqRow.resume_url || reqRow.resume_received_at);
     if (resumeRequired && reqRow.candidate_id) {
@@ -127,8 +172,16 @@ router.post('/session', async (req, res) => {
       completed: !!reqRow.text_completed_at,
     });
   } catch (e) {
-    const status = e?.code === 'request_not_approved' ? 403 : 400;
-    return res.status(status).json({ error: e?.message || 'Invalid request' });
+    let status = 400;
+    if (e?.code === 'request_not_approved') status = 403;
+    if (e?.code === 'token_secret_missing') status = 500;
+    return sendError(res, status, {
+      error: e?.message || 'Invalid request',
+      code: e?.code || 'invalid_request',
+      detail: e?.detail || null,
+      hint: e?.hint || null,
+      request_id,
+    });
   }
 });
 
@@ -136,7 +189,15 @@ router.post('/resume', upload.any(), async (req, res) => {
   const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
   try {
     const token = String(req.body?.token || '').trim();
-    if (!token) return res.status(400).json({ error: 'token_required' });
+    if (!token) {
+      return sendError(res, 400, {
+        error: 'token_required',
+        code: 'token_required',
+        detail: null,
+        hint: null,
+        request_id,
+      });
+    }
     const decoded = verifyToken(token);
     const reqRow = await loadRequest(decoded.request_id);
     ensureApprovedStatus(reqRow.status);
@@ -144,25 +205,69 @@ router.post('/resume', upload.any(), async (req, res) => {
     const file = (req.files || []).find(f =>
       ['resume', 'resume_file', 'file', 'resumeFile', 'pdf'].includes(f.fieldname)
     );
-    if (!file) return res.status(400).json({ error: 'resume_required' });
+    if (!file) {
+      return sendError(res, 400, {
+        error: 'resume_required',
+        code: 'resume_required',
+        detail: null,
+        hint: null,
+        request_id,
+      });
+    }
 
     const fileType = file.mimetype || 'application/pdf';
     const ext = /pdf/i.test(fileType) ? 'pdf' : 'docx';
     const path = `accommodations/${reqRow.id}.${ext}`;
-    const up = await supabaseAdmin.storage.from(RESUME_BUCKET).upload(path, file.buffer, {
+    let bucket = null;
+    try {
+      bucket = getAccommodationResumeBucket();
+    } catch (e) {
+      console.error('[text-interview] resume bucket missing', {
+        request_id,
+        error: e?.message || e,
+        detail: e?.detail || null,
+        hint: e?.hint || null,
+      });
+      return sendError(res, 500, {
+        error: e?.code || 'bucket_missing',
+        code: e?.code || 'bucket_missing',
+        detail: e?.detail || e?.message || null,
+        hint: e?.hint || null,
+        request_id,
+      });
+    }
+    const up = await supabaseAdmin.storage.from(bucket).upload(path, file.buffer, {
       contentType: fileType,
       upsert: true,
     });
-    if (up.error) return res.status(500).json({ error: 'resume_upload_failed' });
+    if (up.error) {
+      logSupabaseError('[text-interview] resume upload failed', request_id, up.error);
+      return sendError(res, 500, {
+        error: 'resume_upload_failed',
+        code: up.error.code || 'resume_upload_failed',
+        detail: up.error.message || null,
+        hint: up.error.hint || null,
+        request_id,
+      });
+    }
 
-    const { data: pub } = supabaseAdmin.storage.from(RESUME_BUCKET).getPublicUrl(path);
-    const resume_url = pub?.publicUrl || null;
+    const resume_url = path;
     const resume_received_at = new Date().toISOString();
 
-    await supabaseAdmin
+    const { error: updateErr } = await supabaseAdmin
       .from('accommodation_requests')
       .update({ resume_url, resume_received_at })
       .eq('id', reqRow.id);
+    if (updateErr) {
+      logSupabaseError('[text-interview] resume update failed', request_id, updateErr);
+      return sendError(res, 500, {
+        error: 'resume_update_failed',
+        code: updateErr.code || 'resume_update_failed',
+        detail: updateErr.message || null,
+        hint: updateErr.hint || null,
+        request_id,
+      });
+    }
 
     if (reqRow.candidate_id) {
       const { data: cand } = await supabaseAdmin
@@ -171,7 +276,13 @@ router.post('/resume', upload.any(), async (req, res) => {
         .eq('id', reqRow.candidate_id)
         .maybeSingle();
       if (!cand?.resume_url) {
-        await supabaseAdmin.from('candidates').update({ resume_url }).eq('id', reqRow.candidate_id);
+        const { error: candUpdateErr } = await supabaseAdmin
+          .from('candidates')
+          .update({ resume_url })
+          .eq('id', reqRow.candidate_id);
+        if (candUpdateErr) {
+          logSupabaseError('[text-interview] candidate resume update failed', request_id, candUpdateErr);
+        }
       }
     }
 
@@ -179,10 +290,27 @@ router.post('/resume', upload.any(), async (req, res) => {
   } catch (e) {
     if (e?.code) {
       const status = e.code === 'request_not_approved' ? 403 : 400;
-      return res.status(status).json({ error: e?.message || 'Invalid request' });
+      return sendError(res, status, {
+        error: e?.message || 'Invalid request',
+        code: e?.code || 'invalid_request',
+        detail: e?.detail || null,
+        hint: e?.hint || null,
+        request_id,
+      });
     }
-    console.error('[text-interview] resume upload failed', { request_id, error: e?.message || e });
-    return res.status(500).json({ error: 'resume_upload_failed' });
+    console.error('[text-interview] resume upload failed', {
+      request_id,
+      error: e?.message || e,
+      detail: e?.detail || null,
+      hint: e?.hint || null,
+    });
+    return sendError(res, 500, {
+      error: 'resume_upload_failed',
+      code: 'resume_upload_failed',
+      detail: e?.message || null,
+      hint: e?.hint || null,
+      request_id,
+    });
   }
 });
 
@@ -191,8 +319,24 @@ router.post('/answers', async (req, res) => {
   try {
     const token = String(req.body?.token || '').trim();
     const answers = Array.isArray(req.body?.answers) ? req.body.answers : null;
-    if (!token) return res.status(400).json({ error: 'token_required' });
-    if (!answers || answers.length === 0) return res.status(400).json({ error: 'answers_required' });
+    if (!token) {
+      return sendError(res, 400, {
+        error: 'token_required',
+        code: 'token_required',
+        detail: null,
+        hint: null,
+        request_id,
+      });
+    }
+    if (!answers || answers.length === 0) {
+      return sendError(res, 400, {
+        error: 'answers_required',
+        code: 'answers_required',
+        detail: null,
+        hint: null,
+        request_id,
+      });
+    }
     const decoded = verifyToken(token);
     const reqRow = await loadRequest(decoded.request_id);
     ensureApprovedStatus(reqRow.status);
@@ -214,14 +358,30 @@ router.post('/answers', async (req, res) => {
         .update({ resume_url: candidateResumeUrl, resume_received_at: new Date().toISOString() })
         .eq('id', reqRow.id);
     }
-    if (!resumePresent) return res.status(400).json({ error: 'resume_required' });
+    if (!resumePresent) {
+      return sendError(res, 400, {
+        error: 'resume_required',
+        code: 'resume_required',
+        detail: null,
+        hint: null,
+        request_id,
+      });
+    }
 
     const { data: role } = await supabaseAdmin
       .from('roles')
       .select('id, title, rubric, client_id')
       .eq('id', reqRow.role_id)
       .maybeSingle();
-    if (!role) return res.status(404).json({ error: 'role_not_found' });
+    if (!role) {
+      return sendError(res, 404, {
+        error: 'role_not_found',
+        code: 'role_not_found',
+        detail: null,
+        hint: null,
+        request_id,
+      });
+    }
 
     const nowIso = new Date().toISOString();
     const firstSubmit = !reqRow.text_completed_at;
@@ -274,10 +434,27 @@ router.post('/answers', async (req, res) => {
   } catch (e) {
     if (e?.code) {
       const status = e.code === 'request_not_approved' ? 403 : 400;
-      return res.status(status).json({ error: e?.message || 'Invalid request' });
+      return sendError(res, status, {
+        error: e?.message || 'Invalid request',
+        code: e?.code || 'invalid_request',
+        detail: e?.detail || null,
+        hint: e?.hint || null,
+        request_id,
+      });
     }
-    console.error('[text-interview] answers failed', { request_id, error: e?.message || e });
-    return res.status(500).json({ error: 'submission_failed' });
+    console.error('[text-interview] answers failed', {
+      request_id,
+      error: e?.message || e,
+      detail: e?.detail || null,
+      hint: e?.hint || null,
+    });
+    return sendError(res, 500, {
+      error: 'submission_failed',
+      code: 'submission_failed',
+      detail: e?.message || null,
+      hint: e?.hint || null,
+      request_id,
+    });
   }
 });
 

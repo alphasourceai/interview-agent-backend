@@ -17,7 +17,6 @@ const SENDGRID_KEY = process.env.SENDGRID_API_KEY;
 const FROM_EMAIL = process.env.SENDGRID_FROM;
 const APP_NAME = process.env.APP_NAME || 'Interview Agent';
 const NOTIFY_EMAIL = process.env.ACCOMMODATION_NOTIFY_EMAIL || 'info@alphasourceai.com';
-const RESUME_BUCKET = process.env.SUPABASE_RESUMES_BUCKET || 'resumes';
 
 if (SENDGRID_KEY) sg.setApiKey(SENDGRID_KEY);
 
@@ -25,6 +24,30 @@ const isValidEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value |
 
 function safeText(v) {
   return String(v || '').trim();
+}
+
+function getAccommodationResumeBucket() {
+  const bucket = String(process.env.SUPABASE_ACCOMMODATION_RESUMES_BUCKET || '').trim();
+  if (!bucket) {
+    const err = new Error('SUPABASE_ACCOMMODATION_RESUMES_BUCKET not configured');
+    err.code = 'bucket_missing';
+    err.detail = 'SUPABASE_ACCOMMODATION_RESUMES_BUCKET not configured';
+    throw err;
+  }
+  return bucket;
+}
+
+function sendError(res, status, { error, code, detail, hint, request_id }) {
+  return res.status(status).json({ error, code, detail, hint, request_id });
+}
+
+function logSupabaseError(message, request_id, error) {
+  console.error(message, {
+    request_id,
+    error: error?.message || error,
+    detail: error?.detail || null,
+    hint: error?.hint || null,
+  });
 }
 
 async function findOrCreateCandidate({ role, name, email, phone }) {
@@ -80,10 +103,22 @@ router.post('/request', upload.any(), async (req, res) => {
     const role_id_in = safeText(req.body?.role_id);
 
     if (!candidate_name || !candidate_email || !request_text || (!role_token && !role_id_in)) {
-      return res.status(400).json({ error: 'Missing required fields.' });
+      return sendError(res, 400, {
+        error: 'Missing required fields.',
+        code: 'missing_fields',
+        detail: null,
+        hint: null,
+        request_id,
+      });
     }
     if (!isValidEmail(candidate_email)) {
-      return res.status(400).json({ error: 'Invalid email address.' });
+      return sendError(res, 400, {
+        error: 'Invalid email address.',
+        code: 'invalid_email',
+        detail: null,
+        hint: null,
+        request_id,
+      });
     }
 
     let role = null;
@@ -93,7 +128,15 @@ router.post('/request', upload.any(), async (req, res) => {
         .select('id, title, client_id')
         .eq('id', role_id_in)
         .maybeSingle();
-      if (error || !data) return res.status(404).json({ error: 'Role not found.' });
+      if (error || !data) {
+        return sendError(res, 404, {
+          error: 'Role not found.',
+          code: 'role_not_found',
+          detail: error?.message || null,
+          hint: error?.hint || null,
+          request_id,
+        });
+      }
       role = data;
     } else {
       const { data, error } = await supabaseAdmin
@@ -101,7 +144,15 @@ router.post('/request', upload.any(), async (req, res) => {
         .select('id, title, client_id, slug_or_token')
         .or(`slug_or_token.eq.${role_token},token.eq.${role_token}`)
         .maybeSingle();
-      if (error || !data) return res.status(404).json({ error: 'Role not found.' });
+      if (error || !data) {
+        return sendError(res, 404, {
+          error: 'Role not found.',
+          code: 'role_not_found',
+          detail: error?.message || null,
+          hint: error?.hint || null,
+          request_id,
+        });
+      }
       role = data;
     }
 
@@ -126,7 +177,13 @@ router.post('/request', upload.any(), async (req, res) => {
       .select('*')
       .single();
     if (reqErr || !reqRow) {
-      return res.status(500).json({ error: reqErr?.message || 'Could not create request.' });
+      return sendError(res, 500, {
+        error: 'Could not create request.',
+        code: reqErr?.code || 'request_insert_failed',
+        detail: reqErr?.message || null,
+        hint: reqErr?.hint || null,
+        request_id,
+      });
     }
 
     console.log('accommodation_request_created', {
@@ -137,35 +194,71 @@ router.post('/request', upload.any(), async (req, res) => {
 
     let resume_url = null;
     let resume_received_at = null;
-    try {
-      const file = (req.files || []).find(f =>
-        ['resume', 'resume_file', 'file', 'resumeFile', 'pdf'].includes(f.fieldname)
-      );
-      if (file) {
+    const file = (req.files || []).find(f =>
+      ['resume', 'resume_file', 'file', 'resumeFile', 'pdf'].includes(f.fieldname)
+    );
+    if (file) {
+      try {
+        const bucket = getAccommodationResumeBucket();
         const fileType = file.mimetype || 'application/pdf';
         const ext = /pdf/i.test(fileType) ? 'pdf' : 'docx';
         const path = `accommodations/${reqRow.id}.${ext}`;
-        const up = await supabaseAdmin.storage.from(RESUME_BUCKET).upload(path, file.buffer, {
+        const up = await supabaseAdmin.storage.from(bucket).upload(path, file.buffer, {
           contentType: fileType,
           upsert: true,
         });
-        if (!up.error) {
-          const { data: pub } = supabaseAdmin.storage.from(RESUME_BUCKET).getPublicUrl(path);
-          resume_url = pub?.publicUrl || null;
-          resume_received_at = new Date().toISOString();
+        if (up.error) {
+          logSupabaseError('[accommodation] resume upload failed', reqRow.id, up.error);
+          return sendError(res, 500, {
+            error: 'resume_upload_failed',
+            code: up.error.code || 'resume_upload_failed',
+            detail: up.error.message || null,
+            hint: up.error.hint || null,
+            request_id: reqRow.id,
+          });
         }
+        resume_url = path;
+        resume_received_at = new Date().toISOString();
+      } catch (e) {
+        console.error('[accommodation] resume upload failed', {
+          request_id: reqRow.id,
+          error: e?.message || e,
+          detail: e?.detail || null,
+          hint: e?.hint || null,
+        });
+        return sendError(res, 500, {
+          error: e?.code || 'resume_upload_failed',
+          code: e?.code || 'resume_upload_failed',
+          detail: e?.detail || e?.message || null,
+          hint: e?.hint || null,
+          request_id: reqRow.id,
+        });
       }
-    } catch (e) {
-      console.error('[accommodation] resume upload failed', { request_id: reqRow.id, error: e?.message || e });
     }
 
     if (resume_url) {
-      await supabaseAdmin
+      const { error: updateErr } = await supabaseAdmin
         .from('accommodation_requests')
         .update({ resume_url, resume_received_at })
         .eq('id', reqRow.id);
+      if (updateErr) {
+        logSupabaseError('[accommodation] resume update failed', reqRow.id, updateErr);
+        return sendError(res, 500, {
+          error: 'resume_update_failed',
+          code: updateErr.code || 'resume_update_failed',
+          detail: updateErr.message || null,
+          hint: updateErr.hint || null,
+          request_id: reqRow.id,
+        });
+      }
       if (!existingResumeUrl && candidate_id) {
-        await supabaseAdmin.from('candidates').update({ resume_url }).eq('id', candidate_id);
+        const { error: candUpdateErr } = await supabaseAdmin
+          .from('candidates')
+          .update({ resume_url })
+          .eq('id', candidate_id);
+        if (candUpdateErr) {
+          logSupabaseError('[accommodation] candidate resume update failed', reqRow.id, candUpdateErr);
+        }
       }
     }
 
@@ -203,8 +296,19 @@ router.post('/request', upload.any(), async (req, res) => {
 
     return res.status(200).json({ ok: true, request_id: reqRow.id });
   } catch (err) {
-    console.error('[accommodation] request error', { request_id, error: err?.message || err });
-    return res.status(500).json({ error: 'Server error.' });
+    console.error('[accommodation] request error', {
+      request_id,
+      error: err?.message || err,
+      detail: err?.detail || null,
+      hint: err?.hint || null,
+    });
+    return sendError(res, 500, {
+      error: 'Server error.',
+      code: err?.code || 'server_error',
+      detail: err?.message || null,
+      hint: err?.hint || null,
+      request_id,
+    });
   }
 });
 
