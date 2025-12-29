@@ -1120,7 +1120,7 @@ adminRouter.post('/accommodation-requests/:id/send-text-link', requireAuth, requ
       { expiresIn }
     );
 
-    const interview_link = `${FRONTEND_BASE}/text-interview/${encodeURIComponent(token)}`;
+    const interview_link = `${FRONTEND_BASE}/text-interview/${encodeURIComponent(token)}`.replace(/\s+/g, '');
     const expires_in = humanizeDays(TEXT_INTERVIEW_EXP_DAYS);
 
     await sg.send({
@@ -1133,6 +1133,12 @@ adminRouter.post('/accommodation-requests/:id/send-text-link', requireAuth, requ
         interview_link,
         expires_in,
       },
+    });
+
+    console.log('email_link_sent', {
+      request_id: reqRow.id,
+      role_id: reqRow.role_id,
+      candidate_email: redactEmail(reqRow.candidate_email),
     });
 
     await supabaseAdmin

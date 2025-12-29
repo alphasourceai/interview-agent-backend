@@ -3,6 +3,7 @@ const express = require('express');
 const crypto = require('crypto');
 const multer = require('multer');
 const sg = require('@sendgrid/mail');
+const analyzeResume = require('../analyzeResume');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { redactEmail } = require('../src/lib/recoveryHelper');
 
@@ -132,7 +133,7 @@ router.post('/request', upload.any(), async (req, res) => {
     if (role_id_in) {
       const { data, error } = await supabaseAdmin
         .from('roles')
-        .select('id, title, client_id')
+        .select('id, title, client_id, description, job_description_text')
         .eq('id', role_id_in)
         .maybeSingle();
       if (error || !data) {
@@ -154,7 +155,7 @@ router.post('/request', upload.any(), async (req, res) => {
     } else {
       const { data: roleById, error: idErr } = await supabaseAdmin
         .from('roles')
-        .select('id, title, client_id, slug_or_token')
+        .select('id, title, client_id, slug_or_token, description, job_description_text')
         .eq('id', role_token)
         .limit(1)
         .maybeSingle();
@@ -178,7 +179,7 @@ router.post('/request', upload.any(), async (req, res) => {
       } else {
         const { data: roleBySlug, error: slugErr } = await supabaseAdmin
           .from('roles')
-          .select('id, title, client_id, slug_or_token')
+          .select('id, title, client_id, slug_or_token, description, job_description_text')
           .eq('slug_or_token', role_token)
           .limit(1)
           .maybeSingle();
@@ -239,6 +240,8 @@ router.post('/request', upload.any(), async (req, res) => {
 
     let resume_url = null;
     let resume_received_at = null;
+    let resumeBuffer = null;
+    let resumeMime = null;
     const file = (req.files || []).find(f =>
       ['resume', 'resume_file', 'file', 'resumeFile', 'pdf'].includes(f.fieldname)
     );
@@ -246,6 +249,8 @@ router.post('/request', upload.any(), async (req, res) => {
       try {
         const bucket = getAccommodationResumeBucket();
         const fileType = file.mimetype || 'application/pdf';
+        resumeBuffer = file.buffer;
+        resumeMime = fileType;
         const ext = /pdf/i.test(fileType) ? 'pdf' : 'docx';
         const path = `accommodations/${reqRow.id}.${ext}`;
         const up = await supabaseAdmin.storage.from(bucket).upload(path, file.buffer, {
@@ -304,6 +309,23 @@ router.post('/request', upload.any(), async (req, res) => {
         if (candUpdateErr) {
           logSupabaseError('[accommodation] candidate resume update failed', reqRow.id, candUpdateErr);
         }
+      }
+    }
+
+    if (resumeBuffer && candidate_id) {
+      const roleForResume = {
+        ...role,
+        description: role.description || role.job_description_text || ''
+      };
+      try {
+        const analysis = await analyzeResume(resumeBuffer, resumeMime, roleForResume, candidate_id);
+        await supabaseAdmin
+          .from('candidates')
+          .update({ analysis_summary: analysis })
+          .eq('id', candidate_id);
+        console.log('resume_scored', { request_id: reqRow.id, candidate_id, role_id: role.id });
+      } catch (e) {
+        console.warn('[accommodation] resume scoring failed', { request_id: reqRow.id, error: e?.message || e });
       }
     }
 

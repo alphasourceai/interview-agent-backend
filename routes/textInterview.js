@@ -3,6 +3,8 @@ const express = require('express');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
+const { OpenAI } = require('openai');
+const analyzeResume = require('../analyzeResume');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 
 const router = express.Router();
@@ -14,6 +16,7 @@ const upload = multer({
 
 const TOKEN_SECRET = process.env.TEXT_INTERVIEW_JWT_SECRET || process.env.SUPABASE_JWT_SECRET || '';
 const TEXT_COMPLETION_NOTE = 'Completed via accommodation pathway (text).';
+const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 
 const parseQuestions = (rubric) => {
   if (!rubric) return [];
@@ -37,6 +40,68 @@ const parseQuestions = (rubric) => {
     })
     .filter(Boolean);
 };
+
+const clampScore = (value) => {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(100, Math.round(n)));
+};
+
+const toScoreOrNull = (value) => {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : null;
+};
+
+async function scoreTextInterview({ role, answers }) {
+  if (!openai) {
+    const err = new Error('OpenAI not configured');
+    err.code = 'openai_missing';
+    throw err;
+  }
+
+  const roleDesc = String(role?.description || role?.job_description_text || '').trim();
+  const qa = (answers || [])
+    .map((item, idx) => {
+      const q = String(item?.question || '').trim();
+      const a = String(item?.answer || '').trim();
+      return `${idx + 1}. Q: ${q || '[question missing]'}\nA: ${a || '[no answer provided]'}`;
+    })
+    .join('\n\n');
+
+  const sysPrompt = 'You are an unbiased hiring evaluator. Score the written interview answers against the role criteria. Do not infer protected attributes.';
+  const userPrompt = `
+Role Title: ${role?.title || '[unknown]'}
+Role Description: ${roleDesc || '[none provided]'}
+
+Interview Q&A:
+${qa || '[no answers provided]'}
+
+Return strict JSON:
+{"interview_score":0-100,"summary":"2-4 sentences explaining strengths/weaknesses against the role."}
+`;
+
+  const resp = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: sysPrompt },
+      { role: 'user', content: userPrompt }
+    ],
+    response_format: { type: 'json_object' },
+    temperature: 0.2
+  });
+
+  const raw = resp.choices?.[0]?.message?.content || '{}';
+  let parsed = {};
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = {};
+  }
+
+  const interview_score = clampScore(parsed.interview_score ?? parsed.score ?? parsed.total_score);
+  const summary = String(parsed.summary || '').trim();
+  return { interview_score, summary };
+}
 
 function getAccommodationResumeBucket() {
   const bucket = String(process.env.SUPABASE_ACCOMMODATION_RESUMES_BUCKET || '').trim();
@@ -286,10 +351,41 @@ router.post('/resume', upload.any(), async (req, res) => {
       }
     }
 
+    if (reqRow.candidate_id) {
+      const { data: role, error: roleErr } = await supabaseAdmin
+        .from('roles')
+        .select('id, title, client_id, description, job_description_text')
+        .eq('id', reqRow.role_id)
+        .maybeSingle();
+      if (roleErr || !role) {
+        return sendError(res, 404, {
+          error: 'role_not_found',
+          code: roleErr?.code || 'role_not_found',
+          detail: roleErr?.message || null,
+          hint: roleErr?.hint || null,
+          request_id,
+        });
+      }
+      const roleForResume = {
+        ...role,
+        description: role.description || role.job_description_text || ''
+      };
+      try {
+        const analysis = await analyzeResume(file.buffer, fileType, roleForResume, reqRow.candidate_id);
+        await supabaseAdmin
+          .from('candidates')
+          .update({ analysis_summary: analysis })
+          .eq('id', reqRow.candidate_id);
+        console.log('resume_scored', { request_id, candidate_id: reqRow.candidate_id, role_id: reqRow.role_id });
+      } catch (e) {
+        console.warn('[text-interview] resume scoring failed', { request_id, error: e?.message || e });
+      }
+    }
+
     return res.json({ ok: true });
   } catch (e) {
     if (e?.code) {
-      const status = e.code === 'request_not_approved' ? 403 : 400;
+      const status = e.code === 'request_not_approved' ? 403 : (e.code === 'openai_missing' ? 500 : 400);
       return sendError(res, status, {
         error: e?.message || 'Invalid request',
         code: e?.code || 'invalid_request',
@@ -370,7 +466,7 @@ router.post('/answers', async (req, res) => {
 
     const { data: role } = await supabaseAdmin
       .from('roles')
-      .select('id, title, rubric, client_id')
+      .select('id, title, rubric, client_id, description, job_description_text')
       .eq('id', reqRow.role_id)
       .maybeSingle();
     if (!role) {
@@ -383,18 +479,63 @@ router.post('/answers', async (req, res) => {
       });
     }
 
-    const nowIso = new Date().toISOString();
     const firstSubmit = !reqRow.text_completed_at;
 
     await supabaseAdmin
       .from('accommodation_requests')
-      .update({ text_answers: answers, text_completed_at: nowIso })
+      .update({ text_answers: answers })
       .eq('id', reqRow.id);
 
     if (firstSubmit && reqRow.candidate_id) {
+      const scoring = await scoreTextInterview({ role, answers });
+      const summaryNote = scoring.summary
+        ? `${TEXT_COMPLETION_NOTE} ${scoring.summary}`.trim()
+        : TEXT_COMPLETION_NOTE;
+
+      const { data: latestReport } = await supabaseAdmin
+        .from('reports')
+        .select('id, resume_score, resume_breakdown, analysis')
+        .eq('candidate_id', reqRow.candidate_id)
+        .eq('role_id', role.id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      let resumeScore = toScoreOrNull(latestReport?.resume_score);
+      let resumeBreakdown = latestReport?.resume_breakdown || null;
+
+      if (resumeScore == null) {
+        const { data: cand } = await supabaseAdmin
+          .from('candidates')
+          .select('analysis_summary')
+          .eq('id', reqRow.candidate_id)
+          .maybeSingle();
+        const candResume = cand?.analysis_summary || null;
+        resumeScore = toScoreOrNull(candResume?.resume_score);
+        if (!resumeBreakdown && candResume) resumeBreakdown = candResume;
+      }
+
+      const interviewScore = clampScore(scoring.interview_score);
+      const overallScore = resumeScore == null
+        ? interviewScore
+        : clampScore((resumeScore + interviewScore) / 2);
+
+      const interview_breakdown = {
+        clarity: null,
+        confidence: null,
+        body_language: null,
+        summary: summaryNote,
+      };
+
       const interviewAnalysis = {
         mode: 'text',
-        summary: TEXT_COMPLETION_NOTE,
+        summary: summaryNote,
+        scores: {
+          interview_score: interviewScore,
+          clarity: null,
+          confidence: null,
+          body_language: null,
+        },
         answers,
       };
 
@@ -407,27 +548,53 @@ router.post('/answers', async (req, res) => {
         status: 'completed',
       });
 
-      const interview_breakdown = {
-        clarity: null,
-        confidence: null,
-        body_language: null,
-        summary: TEXT_COMPLETION_NOTE,
-      };
+      if (latestReport?.id) {
+        const reportAnalysis = {
+          ...(latestReport.analysis || {}),
+          mode: 'text',
+          summary: summaryNote,
+          interview_score: interviewScore,
+        };
+        await supabaseAdmin
+          .from('reports')
+          .update({
+            interview_score: interviewScore,
+            overall_score: overallScore,
+            interview_breakdown,
+            analysis: reportAnalysis,
+          })
+          .eq('id', latestReport.id);
+      } else {
+        await supabaseAdmin.from('reports').insert({
+          candidate_id: reqRow.candidate_id,
+          role_id: role.id,
+          client_id: role.client_id || null,
+          resume_score: resumeScore,
+          resume_breakdown: resumeBreakdown,
+          interview_score: interviewScore,
+          overall_score: overallScore,
+          interview_breakdown,
+          analysis: { summary: summaryNote, mode: 'text', interview_score: interviewScore },
+        });
+      }
 
-      await supabaseAdmin.from('reports').insert({
-        candidate_id: reqRow.candidate_id,
-        role_id: role.id,
-        client_id: role.client_id || null,
-        resume_score: null,
-        interview_score: null,
-        overall_score: null,
-        interview_breakdown,
-        analysis: { summary: TEXT_COMPLETION_NOTE, mode: 'text' },
-      });
+      await supabaseAdmin
+        .from('accommodation_requests')
+        .update({ text_completed_at: new Date().toISOString() })
+        .eq('id', reqRow.id);
 
-      await supabaseAdmin.from('candidates')
+      await supabaseAdmin
+        .from('candidates')
         .update({ status: 'Interview Completed (Text)', interview_status: 'Interview Completed (Text)' })
         .eq('id', reqRow.candidate_id);
+
+      console.log('text_interview_scored', {
+        request_id,
+        candidate_id: reqRow.candidate_id,
+        role_id: role.id,
+        interview_score: interviewScore,
+        overall_score: overallScore,
+      });
     }
 
     return res.json({ ok: true });
