@@ -96,6 +96,7 @@ async function findOrCreateCandidate({ role, name, email, phone }) {
  */
 router.post('/request', upload.any(), async (req, res) => {
   const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+  console.log('[accommodation] handler_file', { file: __filename });
   try {
     const candidate_name = safeText(req.body?.candidate_name || req.body?.name);
     const candidate_email = safeText(req.body?.candidate_email || req.body?.email).toLowerCase();
@@ -103,6 +104,15 @@ router.post('/request', upload.any(), async (req, res) => {
     const request_text = safeText(req.body?.accommodation_request_text || req.body?.request_text);
     const role_token = safeText(req.body?.role_token);
     const role_id_in = safeText(req.body?.role_id);
+    const lookup = role_id_in
+      ? 'id'
+      : (role_token ? (isUuid(role_token) ? 'id' : 'slug_or_token') : null);
+
+    console.log('[accommodation] role lookup', {
+      request_id,
+      lookup,
+      role_token: role_token ? String(role_token).slice(0, 40) : null,
+    });
 
     if (!candidate_name || !candidate_email || !request_text || (!role_token && !role_id_in)) {
       return sendError(res, 400, {

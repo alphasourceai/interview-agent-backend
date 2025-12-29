@@ -67,6 +67,10 @@ const TEXT_INTERVIEW_TOKEN_SECRET =
 const TEXT_INTERVIEW_EXP_DAYS = 7
 const app = express()
 
+console.log('[boot] entrypoint =', __filename)
+console.log('[boot] accommodationRequests =', require.resolve('./routes/accommodationRequests'))
+console.log('[boot] createTavusInterview =', require.resolve('./routes/createTavusInterview'))
+
 if (SENDGRID_KEY) {
   sg.setApiKey(SENDGRID_KEY)
 }
@@ -269,6 +273,15 @@ app.use('/api/feedback', require('./routes/feedback'))
 app.use('/create-tavus-interview', require('./routes/createTavusInterview'))
 
 // ---------- Simple test endpoint ----------
+app.get('/__version', (_req, res) => {
+  res.json({
+    service: 'ia-backend-prod',
+    commit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null,
+    node: process.version,
+    now: new Date().toISOString()
+  })
+})
+
 app.get('/auth/ping', requireAuth, withClientScope, (req, res) => {
   res.json({ ok: true, user: req.user, client_ids: req.clientIds })
 })
