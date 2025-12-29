@@ -7,9 +7,6 @@ const { createTavusInterviewHandler } = require('../handlers/createTavusIntervie
 
 const router = express.Router();
 
-const isUuid = (value) =>
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || '').trim());
-
 function sendError(res, status, code, detail, context = {}, hint = null) {
   const payload = {
     error: code,
@@ -53,19 +50,32 @@ router.post('/', async (req, res) => {
 
     // If no explicit role id, try token from body
     if (!roleId && roleTokenFromBody) {
-      const lookup = isUuid(roleTokenFromBody) ? 'id' : 'slug_or_token';
-      const { data: roleByToken, error: rtErr } = await supabase
+      const { data: roleById, error: idErr } = await supabase
         .from('roles')
         .select('*')
-        .eq(lookup, roleTokenFromBody)
+        .eq('id', roleTokenFromBody)
         .limit(1)
-        .single();
-      if (rtErr && rtErr.code !== 'PGRST116') {
-        return sendError(res, 500, 'role_lookup_failed', rtErr.message || 'Failed to lookup role by token', { candidate_id, role_id: roleId });
+        .maybeSingle();
+      if (idErr) {
+        return sendError(res, 500, 'role_lookup_failed', idErr.message || 'Failed to lookup role by id', { candidate_id, role_id: roleId });
       }
-      if (roleByToken) {
-        role = roleByToken;
-        roleId = roleByToken.id;
+      if (roleById) {
+        role = roleById;
+        roleId = roleById.id;
+      } else {
+        const { data: roleBySlug, error: slugErr } = await supabase
+          .from('roles')
+          .select('*')
+          .eq('slug_or_token', roleTokenFromBody)
+          .limit(1)
+          .maybeSingle();
+        if (slugErr) {
+          return sendError(res, 500, 'role_lookup_failed', slugErr.message || 'Failed to lookup role by token', { candidate_id, role_id: roleId });
+        }
+        if (roleBySlug) {
+          role = roleBySlug;
+          roleId = roleBySlug.id;
+        }
       }
     }
 
