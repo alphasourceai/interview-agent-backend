@@ -46,6 +46,8 @@ if (SENTRY_ENABLED) {
 const express = require('express')
 const cors = require('cors')
 const crypto = require('crypto')
+const jwt = require('jsonwebtoken')
+const sg = require('@sendgrid/mail')
 const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
 const { generateRubricAndKBForRole } = require('./generateRubric')
 const { ensureUserAndSendRecovery, redactEmail } = require('./src/lib/recoveryHelper')
@@ -53,7 +55,27 @@ const { ensureUserAndSendRecovery, redactEmail } = require('./src/lib/recoveryHe
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || FRONTEND_URL || '').replace(/\/+$/, '')
 const INTERVIEW_FAVICON_URL = (process.env.INTERVIEW_HOST_FAVICON_URL || 'https://ia-frontend-prod.onrender.com/alpha-symbol.png').trim()
+const SENDGRID_KEY = process.env.SENDGRID_API_KEY || ''
+const SENDGRID_FROM = process.env.SENDGRID_FROM || ''
+const APP_NAME = process.env.APP_NAME || 'Interview Agent'
+const TEXT_INTERVIEW_TEMPLATE_ID = process.env.TEXT_INTERVIEW_SENDGRID_TEMPLATE_ID || ''
+const TEXT_INTERVIEW_TOKEN_SECRET =
+  process.env.TEXT_INTERVIEW_JWT_SECRET ||
+  process.env.SUPABASE_JWT_SECRET ||
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  ''
+const TEXT_INTERVIEW_EXP_DAYS = 7
 const app = express()
+
+if (SENDGRID_KEY) {
+  sg.setApiKey(SENDGRID_KEY)
+}
+
+function humanizeDays(days) {
+  const d = Number(days || 0)
+  if (d <= 1) return '1 day'
+  return `${d} days`
+}
 
 const normalizeOrigin = (input) => {
   try {
@@ -240,6 +262,8 @@ async function withClientScope(req, res, next) {
 // ---------- Public candidate endpoints (MOUNTED) ----------
 app.use('/api/candidate/submit', require('./routes/candidateSubmit'))
 app.use('/api/candidate/verify-otp', require('./routes/verifyOtp'))
+app.use('/api/accommodations', require('./routes/accommodationRequests'))
+app.use('/api/text-interview', require('./routes/textInterview'))
 app.use('/api/payments', require('./routes/payments'))
 app.use('/api/feedback', require('./routes/feedback'))
 app.use('/create-tavus-interview', require('./routes/createTavusInterview'))
@@ -953,6 +977,173 @@ adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, 
     const detail = e?.responseData?.error_description || e?.response?.data?.error_description || e?.response?.data?.msg || e?.message || 'Failed to send password reset email';
     console.error('[admin/send-password-reset] failed', { request_id, email: redactEmail(email), status: e?.status || e?.response?.status || null, error: detail });
     return res.status(500).json({ error: 'password_reset_failed', code: e?.code || 'password_reset_failed', detail, request_id });
+  }
+});
+
+// Accommodation requests (admin)
+adminRouter.get('/accommodation-requests', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+  try {
+    const status = String(req.query?.status || 'pending').toLowerCase();
+    const client_id = String(req.query?.client_id || '').trim();
+    let q = supabaseAdmin
+      .from('accommodation_requests')
+      .select('id, role_id, candidate_id, candidate_name, candidate_email, candidate_phone, request_text, resume_url, status, admin_notes, created_at, approved_at, sent_at, resume_received_at, text_completed_at, role:roles(id,title,client_id)')
+      .order('created_at', { ascending: false });
+
+    if (status && status !== 'all') {
+      q = q.eq('status', status);
+    }
+    if (client_id) {
+      q = q.eq('role.client_id', client_id);
+    }
+
+    const { data, error } = await q;
+    if (error) {
+      console.error('[admin/accommodations] list failed', { request_id, error: error.message });
+      return res.status(500).json({ error: 'list_failed', request_id });
+    }
+    return res.json({ items: data || [], request_id });
+  } catch (e) {
+    console.error('[admin/accommodations] unexpected', { request_id, error: e?.message || e });
+    return res.status(500).json({ error: 'server_error', request_id });
+  }
+});
+
+adminRouter.patch('/accommodation-requests/:id', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+  const id = req.params.id;
+  try {
+    const { data: existing } = await supabaseAdmin
+      .from('accommodation_requests')
+      .select('id, status, candidate_id')
+      .eq('id', id)
+      .maybeSingle();
+    if (!existing) return res.status(404).json({ error: 'not_found', request_id });
+
+    const status = req.body?.status ? String(req.body.status).toLowerCase() : null;
+    const admin_notes = typeof req.body?.admin_notes === 'string' ? req.body.admin_notes : null;
+    const allowed = new Set(['pending', 'approved', 'denied', 'sent']);
+    if (status && !allowed.has(status)) {
+      return res.status(400).json({ error: 'invalid_status', request_id });
+    }
+
+    const updates = {};
+    if (status) updates.status = status;
+    if (admin_notes !== null) updates.admin_notes = admin_notes;
+    if (status === 'approved' && existing.status !== 'approved') {
+      updates.approved_at = new Date().toISOString();
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('accommodation_requests')
+      .update(updates)
+      .eq('id', id)
+      .select('*')
+      .single();
+    if (error) return res.status(500).json({ error: 'update_failed', request_id });
+
+    if (status === 'approved' && existing.status !== 'approved') {
+      console.log('accommodation_approved', { request_id: id });
+      if (existing.candidate_id) {
+        await supabaseAdmin
+          .from('candidates')
+          .update({ status: 'Accommodation Approved', interview_status: 'Accommodation Approved' })
+          .eq('id', existing.candidate_id);
+      }
+    }
+    if (status === 'denied' && existing.candidate_id) {
+      await supabaseAdmin
+        .from('candidates')
+        .update({ status: 'Accommodation Denied', interview_status: 'Accommodation Denied' })
+        .eq('id', existing.candidate_id);
+    }
+
+    return res.json({ item: data, request_id });
+  } catch (e) {
+    console.error('[admin/accommodations] update failed', { request_id, error: e?.message || e });
+    return res.status(500).json({ error: 'server_error', request_id });
+  }
+});
+
+adminRouter.post('/accommodation-requests/:id/send-text-link', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+  const id = req.params.id;
+  try {
+    if (!TEXT_INTERVIEW_TOKEN_SECRET) {
+      return res.status(500).json({ error: 'token_secret_missing', request_id });
+    }
+    if (!SENDGRID_KEY || !SENDGRID_FROM || !TEXT_INTERVIEW_TEMPLATE_ID) {
+      return res.status(500).json({ error: 'sendgrid_not_configured', request_id });
+    }
+
+    const { data: reqRow, error: reqErr } = await supabaseAdmin
+      .from('accommodation_requests')
+      .select('id, role_id, candidate_id, candidate_name, candidate_email, status')
+      .eq('id', id)
+      .maybeSingle();
+    if (reqErr || !reqRow) return res.status(404).json({ error: 'not_found', request_id });
+    if (String(reqRow.status).toLowerCase() !== 'approved') {
+      return res.status(400).json({ error: 'not_approved', request_id });
+    }
+
+    const { data: role, error: roleErr } = await supabaseAdmin
+      .from('roles')
+      .select('id, title, client_id')
+      .eq('id', reqRow.role_id)
+      .maybeSingle();
+    if (roleErr || !role) return res.status(404).json({ error: 'role_not_found', request_id });
+
+    const expiresIn = `${TEXT_INTERVIEW_EXP_DAYS}d`;
+    const token = jwt.sign(
+      {
+        mode: 'text',
+        request_id: reqRow.id,
+        role_id: reqRow.role_id,
+        candidate_email: reqRow.candidate_email,
+        candidate_name: reqRow.candidate_name,
+      },
+      TEXT_INTERVIEW_TOKEN_SECRET,
+      { expiresIn }
+    );
+
+    const interview_link = `${FRONTEND_BASE}/text-interview/${encodeURIComponent(token)}`;
+    const expires_in = humanizeDays(TEXT_INTERVIEW_EXP_DAYS);
+
+    await sg.send({
+      to: reqRow.candidate_email,
+      from: { email: SENDGRID_FROM, name: APP_NAME },
+      templateId: TEXT_INTERVIEW_TEMPLATE_ID,
+      dynamic_template_data: {
+        candidate_name: reqRow.candidate_name,
+        role_title: role.title || '',
+        interview_link,
+        expires_in,
+      },
+    });
+
+    await supabaseAdmin
+      .from('accommodation_requests')
+      .update({ status: 'sent', sent_at: new Date().toISOString() })
+      .eq('id', reqRow.id);
+
+    if (reqRow.candidate_id) {
+      await supabaseAdmin
+        .from('candidates')
+        .update({ status: 'Text Interview Sent', interview_status: 'Text Interview Sent' })
+        .eq('id', reqRow.candidate_id);
+    }
+
+    console.log('text_link_sent', {
+      request_id: reqRow.id,
+      role_id: reqRow.role_id,
+      candidate_email: redactEmail(reqRow.candidate_email),
+    });
+
+    return res.json({ ok: true, request_id });
+  } catch (e) {
+    console.error('[admin/accommodations] send link failed', { request_id, error: e?.message || e });
+    return res.status(500).json({ error: 'send_failed', request_id });
   }
 });
 
