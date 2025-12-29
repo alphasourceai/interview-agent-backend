@@ -21,6 +21,8 @@ const NOTIFY_EMAIL = process.env.ACCOMMODATION_NOTIFY_EMAIL || 'info@alphasource
 if (SENDGRID_KEY) sg.setApiKey(SENDGRID_KEY);
 
 const isValidEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+const isUuid = (value) =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || '').trim());
 
 function safeText(v) {
   return String(v || '').trim();
@@ -129,6 +131,11 @@ router.post('/request', upload.any(), async (req, res) => {
         .eq('id', role_id_in)
         .maybeSingle();
       if (error || !data) {
+        console.warn('[accommodation] role lookup failed', {
+          request_id,
+          lookup: 'id',
+          error: error?.message || null,
+        });
         return sendError(res, 404, {
           error: 'Role not found.',
           code: 'role_not_found',
@@ -138,13 +145,21 @@ router.post('/request', upload.any(), async (req, res) => {
         });
       }
       role = data;
+      console.log('[accommodation] role lookup success', { request_id, role_id: role.id, lookup: 'id' });
     } else {
-      const { data, error } = await supabaseAdmin
+      const lookup = isUuid(role_token) ? 'id' : 'slug_or_token';
+      let roleQ = supabaseAdmin
         .from('roles')
         .select('id, title, client_id, slug_or_token')
-        .or(`slug_or_token.eq.${role_token},token.eq.${role_token}`)
-        .maybeSingle();
+        .limit(1);
+      roleQ = roleQ.eq(lookup, role_token);
+      const { data, error } = await roleQ.maybeSingle();
       if (error || !data) {
+        console.warn('[accommodation] role lookup failed', {
+          request_id,
+          lookup,
+          error: error?.message || null,
+        });
         return sendError(res, 404, {
           error: 'Role not found.',
           code: 'role_not_found',
@@ -154,6 +169,7 @@ router.post('/request', upload.any(), async (req, res) => {
         });
       }
       role = data;
+      console.log('[accommodation] role lookup success', { request_id, role_id: role.id, lookup });
     }
 
     const { id: candidate_id, resume_url: existingResumeUrl } = await findOrCreateCandidate({

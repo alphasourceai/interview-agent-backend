@@ -7,6 +7,9 @@ const { createTavusInterviewHandler } = require('../handlers/createTavusIntervie
 
 const router = express.Router();
 
+const isUuid = (value) =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || '').trim());
+
 function sendError(res, status, code, detail, context = {}, hint = null) {
   const payload = {
     error: code,
@@ -50,10 +53,11 @@ router.post('/', async (req, res) => {
 
     // If no explicit role id, try token from body
     if (!roleId && roleTokenFromBody) {
+      const lookup = isUuid(roleTokenFromBody) ? 'id' : 'slug_or_token';
       const { data: roleByToken, error: rtErr } = await supabase
         .from('roles')
         .select('*')
-        .or(`slug_or_token.eq.${roleTokenFromBody},token.eq.${roleTokenFromBody}`)
+        .eq(lookup, roleTokenFromBody)
         .limit(1)
         .single();
       if (rtErr && rtErr.code !== 'PGRST116') {
