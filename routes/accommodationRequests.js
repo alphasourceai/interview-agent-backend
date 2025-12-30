@@ -6,6 +6,7 @@ const sg = require('@sendgrid/mail');
 const analyzeResume = require('../analyzeResume');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { redactEmail } = require('../src/lib/recoveryHelper');
+const { checkDuplicateCandidate, normalizeEmail, normalizePhone } = require('../src/lib/duplicateCandidate');
 
 const router = express.Router();
 
@@ -97,8 +98,9 @@ router.post('/request', upload.any(), async (req, res) => {
   console.log('[accommodation] handler_file', { file: __filename });
   try {
     const candidate_name = safeText(req.body?.candidate_name || req.body?.name);
-    const candidate_email = safeText(req.body?.candidate_email || req.body?.email).toLowerCase();
-    const candidate_phone = safeText(req.body?.candidate_phone || req.body?.phone);
+    const candidate_email = normalizeEmail(req.body?.candidate_email || req.body?.email);
+    const candidate_phone_raw = safeText(req.body?.candidate_phone || req.body?.phone);
+    const candidate_phone = normalizePhone(candidate_phone_raw);
     const request_text = safeText(req.body?.accommodation_request_text || req.body?.request_text);
     const role_token = safeText(req.body?.role_token);
     const role_id_in = safeText(req.body?.role_id);
@@ -110,7 +112,7 @@ router.post('/request', upload.any(), async (req, res) => {
       role_token: role_token ? String(role_token).slice(0, 40) : null,
     });
 
-    if (!candidate_name || !candidate_email || !request_text || (!role_token && !role_id_in)) {
+    if (!candidate_name || !candidate_email || !candidate_phone || !request_text || (!role_token && !role_id_in)) {
       return sendError(res, 400, {
         error: 'Missing required fields.',
         code: 'missing_fields',
@@ -200,6 +202,30 @@ router.post('/request', upload.any(), async (req, res) => {
         role = roleBySlug;
         console.log('[accommodation] role lookup success', { request_id, role_id: role.id, lookup: 'slug_or_token' });
       }
+    }
+
+    const dup = await checkDuplicateCandidate({
+      supabase: supabaseAdmin,
+      roleId: role.id,
+      email: candidate_email,
+      fullName: candidate_name,
+      phone: candidate_phone,
+      allowPhoneEnrich: true,
+    });
+    if (dup.duplicate) {
+      console.warn('[accommodation] duplicate candidate blocked', {
+        request_id,
+        role_id: role.id,
+        candidate_id: dup.candidateId || null,
+        reason: dup.reason || null,
+      });
+      return sendError(res, 409, {
+        error: 'Already interviewed for this role.',
+        code: 'duplicate_candidate',
+        detail: dup.reason || null,
+        hint: null,
+        request_id,
+      });
     }
 
     const { id: candidate_id, resume_url: existingResumeUrl } = await findOrCreateCandidate({

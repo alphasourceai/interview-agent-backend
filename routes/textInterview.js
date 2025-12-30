@@ -6,6 +6,7 @@ const multer = require('multer');
 const { OpenAI } = require('openai');
 const analyzeResume = require('../analyzeResume');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
+const { checkDuplicateCandidate } = require('../src/lib/duplicateCandidate');
 
 const router = express.Router();
 
@@ -182,6 +183,31 @@ router.post('/session', async (req, res) => {
 
     const reqRow = await loadRequest(decoded.request_id);
     ensureApprovedStatus(reqRow.status);
+
+    const dup = await checkDuplicateCandidate({
+      supabase: supabaseAdmin,
+      roleId: reqRow.role_id,
+      email: reqRow.candidate_email,
+      fullName: reqRow.candidate_name,
+      phone: reqRow.candidate_phone,
+      excludeCandidateId: reqRow.candidate_id || null,
+      allowPhoneEnrich: false,
+    });
+    if (dup.duplicate) {
+      console.warn('[text-interview] duplicate candidate blocked', {
+        request_id,
+        role_id: reqRow.role_id,
+        candidate_id: dup.candidateId || null,
+        reason: dup.reason || null,
+      });
+      return sendError(res, 409, {
+        error: 'Already interviewed for this role.',
+        code: 'duplicate_candidate',
+        detail: dup.reason || null,
+        hint: null,
+        request_id,
+      });
+    }
 
     if (decoded.role_id && decoded.role_id !== reqRow.role_id) {
       return sendError(res, 403, {

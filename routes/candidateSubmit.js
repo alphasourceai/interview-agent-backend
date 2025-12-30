@@ -5,6 +5,7 @@ const multer = require('multer');
 const sg = require('@sendgrid/mail');
 const { supabase } = require('../src/lib/supabaseClient');
 const analyzeResume = require('../analyzeResume'); // resume analyzer
+const { checkDuplicateCandidate, normalizeEmail, normalizePhone } = require('../src/lib/duplicateCandidate');
 
 // uploads: keep in memory; 10MB limit
 const upload = multer({
@@ -24,14 +25,6 @@ function six() {
 }
 
 // normalize helpers
-function normEmail(v = '') {
-  return String(v || '').trim().toLowerCase();
-}
-function normPhone(v = '') {
-  const digits = String(v || '').replace(/\D/g, '');
-  // Keep only last 10 digits (NANP style), chopping country codes/leading 1
-  return digits.length > 10 ? digits.slice(-10) : digits;
-}
 function normName(v = '') {
   return String(v || '').trim().replace(/\s+/g, ' ').toLowerCase();
 }
@@ -55,8 +48,8 @@ router.post('/', upload.any(), async (req, res) => {
 
     const fullName = rawName || [first_name, last_name].filter(Boolean).join(' ').trim();
 
-    const email = normEmail(emailRaw);
-    const phone = normPhone(phoneRaw);
+    const email = normalizeEmail(emailRaw);
+    const phone = normalizePhone(phoneRaw);
     const nameNorm = normName(fullName);
 
     if (!email || !fullName || (!role_token && !role_id_in)) {
@@ -89,52 +82,19 @@ router.post('/', upload.any(), async (req, res) => {
     // 2) If email does NOT match, but (name + phone) BOTH match for this role -> BLOCK (409). Enrich phone on the existing record if missing.
     // 3) Otherwise, ALLOW (create candidate, upload, send OTP).
 
-    // 1) Email match
-    let existingByEmail = null;
-    {
-      const { data, error } = await supabase
-        .from('candidates')
-        .select('id, name, email, phone')
-        .eq('role_id', roleId)
-        .eq('email', email)
-        .limit(1)
-        .maybeSingle();
-      if (!error && data) existingByEmail = data;
-    }
-    if (existingByEmail) {
-      // Enrich phone if missing
-      if (phone && !existingByEmail.phone) {
-        await supabase.from('candidates').update({ phone }).eq('id', existingByEmail.id);
-      }
+    const dup = await checkDuplicateCandidate({
+      supabase,
+      roleId,
+      email,
+      fullName,
+      phone,
+      allowPhoneEnrich: true,
+    });
+    if (dup.duplicate) {
       return res.status(409).json({
         error:
           "You’ve already interviewed for this role with this information. If you believe this is an error, contact support at info@alphasourceai.com",
       });
-    }
-
-    // 2) Name + phone match (only if we have both a name and a phone)
-    if (fullName && phone) {
-      let existingByNamePhone = null;
-      const { data, error } = await supabase
-        .from('candidates')
-        .select('id, phone')
-        .eq('role_id', roleId)
-        .eq('phone', phone)
-        .ilike('name', fullName) // case-insensitive exact match
-        .limit(1)
-        .maybeSingle();
-      if (!error && data) existingByNamePhone = data;
-
-      if (existingByNamePhone) {
-        // Enrich phone if the stored record is missing it (defensive; may already be set)
-        if (!existingByNamePhone.phone && phone) {
-          await supabase.from('candidates').update({ phone }).eq('id', existingByNamePhone.id);
-        }
-        return res.status(409).json({
-          error:
-            "You’ve already interviewed for this role with this information. If you believe this is an error, contact support at info@alphasourceai.com",
-        });
-      }
     }
 
     // --- create candidate (denormalize client_id) ---

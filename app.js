@@ -51,6 +51,7 @@ const sg = require('@sendgrid/mail')
 const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
 const { generateRubricAndKBForRole } = require('./generateRubric')
 const { ensureUserAndSendRecovery, redactEmail } = require('./src/lib/recoveryHelper')
+const { checkDuplicateCandidate } = require('./src/lib/duplicateCandidate')
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || FRONTEND_URL || '').replace(/\/+$/, '')
@@ -1090,9 +1091,9 @@ adminRouter.post('/accommodation-requests/:id/send-text-link', requireAuth, requ
       return res.status(500).json({ error: 'sendgrid_not_configured', request_id });
     }
 
-    const { data: reqRow, error: reqErr } = await supabaseAdmin
+  const { data: reqRow, error: reqErr } = await supabaseAdmin
       .from('accommodation_requests')
-      .select('id, role_id, candidate_id, candidate_name, candidate_email, status')
+      .select('id, role_id, candidate_id, candidate_name, candidate_email, candidate_phone, status')
       .eq('id', id)
       .maybeSingle();
     if (reqErr || !reqRow) return res.status(404).json({ error: 'not_found', request_id });
@@ -1106,6 +1107,31 @@ adminRouter.post('/accommodation-requests/:id/send-text-link', requireAuth, requ
       .eq('id', reqRow.role_id)
       .maybeSingle();
     if (roleErr || !role) return res.status(404).json({ error: 'role_not_found', request_id });
+
+    const dup = await checkDuplicateCandidate({
+      supabase: supabaseAdmin,
+      roleId: reqRow.role_id,
+      email: reqRow.candidate_email,
+      fullName: reqRow.candidate_name,
+      phone: reqRow.candidate_phone,
+      excludeCandidateId: reqRow.candidate_id || null,
+      allowPhoneEnrich: false,
+    });
+    if (dup.duplicate) {
+      console.warn('[admin/accommodations] duplicate candidate blocked', {
+        request_id,
+        role_id: reqRow.role_id,
+        candidate_id: dup.candidateId || null,
+        reason: dup.reason || null,
+      });
+      return res.status(409).json({
+        error: 'Already interviewed for this role.',
+        code: 'duplicate_candidate',
+        detail: dup.reason || null,
+        hint: null,
+        request_id,
+      });
+    }
 
     const expiresIn = `${TEXT_INTERVIEW_EXP_DAYS}d`;
     const token = jwt.sign(
