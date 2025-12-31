@@ -9,6 +9,7 @@ const router = express.Router();
 const SENDGRID_KEY = process.env.SENDGRID_API_KEY || '';
 const FROM_EMAIL = process.env.SENDGRID_FROM || '';
 const NOTIFY_EMAIL = 'info@alphasourceai.com';
+const JD_BUCKET = (process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || process.env.SUPABASE_JD_BUCKET || 'job-descriptions').trim();
 const SIGNED_URL_TTL_SECONDS = Number(process.env.SIGNED_URL_TTL_SECONDS || 300);
 
 if (SENDGRID_KEY) {
@@ -40,26 +41,56 @@ function parseBucketPath(value) {
   if (!value || typeof value !== 'string') return null;
   const raw = value.trim().replace(/^\/+/, '');
   if (!raw) return null;
-  if (!isHttpUrl(raw)) {
-    const idx = raw.indexOf('/');
-    if (idx > 0) {
-      return { bucket: raw.slice(0, idx), path: raw.slice(idx + 1) };
+  if (isHttpUrl(raw)) {
+    try {
+      const u = new URL(raw);
+      const parts = u.pathname.split('/').filter(Boolean);
+      const idx = parts.findIndex((p) => p === 'public' || p === 'sign');
+      if (idx >= 0 && parts[idx + 1]) {
+        const bucket = parts[idx + 1];
+        const path = parts.slice(idx + 2).join('/');
+        if (bucket && path) return { bucket, path };
+      }
+    } catch (_) {
+      return null;
     }
     return null;
   }
-  try {
-    const u = new URL(raw);
-    const parts = u.pathname.split('/').filter(Boolean);
-    const idx = parts.findIndex((p) => p === 'public' || p === 'sign');
-    if (idx >= 0 && parts[idx + 1]) {
-      const bucket = parts[idx + 1];
-      const path = parts.slice(idx + 2).join('/');
-      if (bucket && path) return { bucket, path };
-    }
-  } catch (_) {
-    return null;
+
+  const parts = raw.split('/').filter(Boolean);
+  if (parts.length >= 2 && parts[0] === JD_BUCKET) {
+    return { bucket: JD_BUCKET, path: parts.slice(1).join('/') };
   }
-  return null;
+  if (parts.length >= 2 && parts[0] === 'job-descriptions') {
+    return { bucket: JD_BUCKET || 'job-descriptions', path: parts.slice(1).join('/') };
+  }
+
+  return { bucket: JD_BUCKET || 'job-descriptions', path: raw };
+}
+
+function buildJdCandidates(raw, role) {
+  const cleaned = String(raw || '').trim().replace(/^\/+/, '');
+  const parsed = parseBucketPath(cleaned) || { bucket: JD_BUCKET || 'job-descriptions', path: cleaned };
+  const bucket = parsed.bucket || JD_BUCKET || 'job-descriptions';
+
+  let basePath = parsed.path || '';
+  if (cleaned && cleaned.startsWith(`${bucket}/`)) {
+    basePath = cleaned.slice(bucket.length + 1);
+  }
+
+  const candidates = new Set();
+  if (basePath) candidates.add(basePath);
+  if (cleaned && cleaned !== basePath) candidates.add(cleaned);
+
+  const parts = String(basePath || '').split('/').filter(Boolean);
+  const filename = parts.length ? parts[parts.length - 1] : '';
+  if (filename && role?.client_id && role?.id) {
+    candidates.add(`${role.client_id}/${role.id}/${filename}`);
+  }
+  if (filename && role?.id) candidates.add(`${role.id}/${filename}`);
+  if (filename && role?.client_id) candidates.add(`${role.client_id}/${filename}`);
+
+  return { bucket, candidates: Array.from(candidates).filter(Boolean), parsed };
 }
 
 function normalizeQuestions(input) {
@@ -137,30 +168,24 @@ router.get('/:role_id/jd-signed-url', async (req, res) => {
       return res.json({ url: raw, request_id });
     }
 
-    const parsed = parseBucketPath(raw);
-    if (!parsed) {
+    const { bucket, candidates, parsed } = buildJdCandidates(raw, role);
+    if (!bucket || !candidates.length) {
       return sendError(res, 400, {
         error: 'Invalid job description path.',
         code: 'jd_path_invalid',
         detail: 'Unrecognized storage path.',
-        hint: 'Expected bucket/path.',
+        hint: 'Expected bucket/path or path-only.',
         request_id,
       });
     }
 
-    const rawNormalized = String(raw || '').trim().replace(/^\/+/, '');
-    const candidatePath1 = parsed.path;
-    const candidatePath2 =
-      parsed.bucket === 'job-descriptions' && rawNormalized.startsWith('job-descriptions/')
-        ? rawNormalized
-        : null;
-
     console.log('[roles/jd] sign_attempt', {
       request_id,
+      role_id: role.id,
       raw,
-      bucket: parsed.bucket,
-      candidatePath1,
-      candidatePath2,
+      bucket,
+      parsed,
+      candidates,
       ttl: SIGNED_URL_TTL_SECONDS,
     });
 
@@ -168,82 +193,61 @@ router.get('/:role_id/jd-signed-url', async (req, res) => {
       if (!pathValue) return { signed: null, error: new Error('empty_path') };
       const { data: signed, error: signErr } = await supabaseAdmin
         .storage
-        .from(parsed.bucket)
+        .from(bucket)
         .createSignedUrl(pathValue, SIGNED_URL_TTL_SECONDS);
       return { signed, error: signErr };
     };
 
-    const attempt1 = await signWithPath(candidatePath1);
-    if (!attempt1.error && attempt1.signed?.signedUrl) {
-      console.log('[roles/jd] sign_success', { request_id, bucket: parsed.bucket, path: candidatePath1 });
-      return res.json({ url: attempt1.signed.signedUrl, request_id });
-    }
-
-    const err1Message = attempt1.error?.message || '';
-    const notFound1 = /object not found/i.test(err1Message);
-    console.log('[roles/jd] sign_failed', {
-      request_id,
-      bucket: parsed.bucket,
-      path: candidatePath1,
-      error: attempt1.error?.message || attempt1.error,
-      detail: attempt1.error?.detail || null,
-      hint: attempt1.error?.hint || null,
-    });
-
-    if (candidatePath2 && notFound1) {
-      const attempt2 = await signWithPath(candidatePath2);
-      if (!attempt2.error && attempt2.signed?.signedUrl) {
-        console.log('[roles/jd] sign_success', { request_id, bucket: parsed.bucket, path: candidatePath2 });
-        return res.json({ url: attempt2.signed.signedUrl, request_id });
+    let notFoundCount = 0;
+    const tried = [];
+    for (const pathValue of candidates) {
+      tried.push(pathValue);
+      const attempt = await signWithPath(pathValue);
+      if (!attempt.error && attempt.signed?.signedUrl) {
+        console.log('[roles/jd] sign_success', { request_id, role_id: role.id, bucket, path: pathValue });
+        return res.json({ url: attempt.signed.signedUrl, request_id });
       }
 
-      const err2Message = attempt2.error?.message || '';
-      const notFound2 = /object not found/i.test(err2Message);
+      const errMessage = attempt.error?.message || '';
+      const notFound = /object not found/i.test(errMessage);
+      if (notFound) notFoundCount += 1;
       console.log('[roles/jd] sign_failed', {
         request_id,
-        bucket: parsed.bucket,
-        path: candidatePath2,
-        error: attempt2.error?.message || attempt2.error,
-        detail: attempt2.error?.detail || null,
-        hint: attempt2.error?.hint || null,
+        role_id: role.id,
+        bucket,
+        path: pathValue,
+        error: attempt.error?.message || attempt.error,
+        detail: attempt.error?.detail || null,
+        hint: attempt.error?.hint || null,
       });
 
-      if (notFound2) {
-        return sendError(res, 404, {
-          error: 'Job description file not found.',
-          code: 'jd_object_not_found',
-          detail: { bucket: parsed.bucket, tried: [candidatePath1, candidatePath2].filter(Boolean) },
-          hint: null,
+      if (!notFound) {
+        logSupabaseError('[roles/jd] sign failed', request_id, attempt.error);
+        return sendError(res, 500, {
+          error: 'Signed URL creation failed.',
+          code: attempt.error?.code || 'signed_url_failed',
+          detail: attempt.error?.message || 'Signed URL creation failed.',
+          hint: attempt.error?.hint || null,
           request_id,
         });
       }
-
-      logSupabaseError('[roles/jd] sign failed', request_id, attempt2.error);
-      return sendError(res, 500, {
-        error: 'Signed URL creation failed.',
-        code: attempt2.error?.code || 'signed_url_failed',
-        detail: attempt2.error?.message || 'Signed URL creation failed.',
-        hint: attempt2.error?.hint || null,
-        request_id,
-      });
     }
 
-    if (notFound1) {
+    if (notFoundCount === candidates.length) {
       return sendError(res, 404, {
         error: 'Job description file not found.',
         code: 'jd_object_not_found',
-        detail: { bucket: parsed.bucket, tried: [candidatePath1].filter(Boolean) },
+        detail: { bucket, tried },
         hint: null,
         request_id,
       });
     }
 
-    logSupabaseError('[roles/jd] sign failed', request_id, attempt1.error);
     return sendError(res, 500, {
       error: 'Signed URL creation failed.',
-      code: attempt1.error?.code || 'signed_url_failed',
-      detail: attempt1.error?.message || 'Signed URL creation failed.',
-      hint: attempt1.error?.hint || null,
+      code: 'signed_url_failed',
+      detail: 'Unknown signing error.',
+      hint: null,
       request_id,
     });
   } catch (e) {

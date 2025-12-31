@@ -8,7 +8,8 @@ const crypto = require('crypto');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { parseBufferToText } = require('../utils/jdParser');
 
-const JD_BUCKET = process.env.SUPABASE_JD_BUCKET || 'job-descriptions';
+// Canonical JD storage bucket; store job_description_url as "<bucket>/<path>".
+const JD_BUCKET = (process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || process.env.SUPABASE_JD_BUCKET || 'job-descriptions').trim();
 
 const router = express.Router();
 
