@@ -23,6 +23,8 @@ const NOTIFY_EMAIL = process.env.ACCOMMODATION_NOTIFY_EMAIL || 'info@alphasource
 if (SENDGRID_KEY) sg.setApiKey(SENDGRID_KEY);
 
 const isValidEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const isUuid = (value) => UUID_RE.test(String(value || '').trim());
 function safeText(v) {
   return String(v || '').trim();
 }
@@ -104,12 +106,14 @@ router.post('/request', upload.any(), async (req, res) => {
     const request_text = safeText(req.body?.accommodation_request_text || req.body?.request_text);
     const role_token = safeText(req.body?.role_token);
     const role_id_in = safeText(req.body?.role_id);
-    const lookupAttempts = role_id_in ? ['id'] : (role_token ? ['id', 'slug_or_token'] : []);
+    const role_lookup_value = role_id_in || role_token;
+    const role_lookup_is_uuid = isUuid(role_lookup_value);
+    const lookupAttempts = role_lookup_value ? (role_lookup_is_uuid ? ['id', 'slug_or_token'] : ['slug_or_token']) : [];
 
     console.log('[accommodation] role lookup', {
       request_id,
       attempts: lookupAttempts,
-      role_token: role_token ? String(role_token).slice(0, 40) : null,
+      role_token: role_lookup_value ? String(role_lookup_value).slice(0, 40) : null,
     });
 
     if (!candidate_name || !candidate_email || !candidate_phone || !request_text || (!role_token && !role_id_in)) {
@@ -132,76 +136,58 @@ router.post('/request', upload.any(), async (req, res) => {
     }
 
     let role = null;
-    if (role_id_in) {
-      const { data, error } = await supabaseAdmin
-        .from('roles')
-        .select('id, title, client_id, description, job_description_text')
-        .eq('id', role_id_in)
-        .maybeSingle();
-      if (error || !data) {
-        console.warn('[accommodation] role lookup failed', {
-          request_id,
-          lookup: 'id',
-          error: error?.message || null,
-        });
-        return sendError(res, 404, {
-          error: 'Role not found.',
-          code: 'role_not_found',
-          detail: error?.message || null,
-          hint: error?.hint || null,
-          request_id,
-        });
-      }
-      role = data;
-      console.log('[accommodation] role lookup success', { request_id, role_id: role.id, lookup: 'id' });
-    } else {
+    const attempted = [];
+    const roleTokenForLog = role_lookup_value ? String(role_lookup_value).slice(0, 40) : null;
+    if (role_lookup_value && role_lookup_is_uuid) {
+      attempted.push('id');
       const { data: roleById, error: idErr } = await supabaseAdmin
         .from('roles')
         .select('id, title, client_id, slug_or_token, description, job_description_text')
-        .eq('id', role_token)
+        .eq('id', role_lookup_value)
         .limit(1)
         .maybeSingle();
-      if (idErr) {
+      if (idErr || !roleById) {
         console.warn('[accommodation] role lookup failed', {
           request_id,
           lookup: 'id',
+          role_token: roleTokenForLog,
+          attempted,
           error: idErr?.message || null,
         });
-        return sendError(res, 404, {
-          error: 'Role not found.',
-          code: 'role_not_found',
-          detail: idErr?.message || null,
-          hint: idErr?.hint || null,
-          request_id,
-        });
-      }
-      if (roleById) {
+      } else {
         role = roleById;
         console.log('[accommodation] role lookup success', { request_id, role_id: role.id, lookup: 'id' });
+      }
+    }
+    if (!role && role_lookup_value) {
+      attempted.push('slug_or_token');
+      const { data: roleBySlug, error: slugErr } = await supabaseAdmin
+        .from('roles')
+        .select('id, title, client_id, slug_or_token, description, job_description_text')
+        .eq('slug_or_token', role_lookup_value)
+        .limit(1)
+        .maybeSingle();
+      if (slugErr || !roleBySlug) {
+        console.warn('[accommodation] role lookup failed', {
+          request_id,
+          lookup: 'slug_or_token',
+          role_token: roleTokenForLog,
+          attempted,
+          error: slugErr?.message || null,
+        });
       } else {
-        const { data: roleBySlug, error: slugErr } = await supabaseAdmin
-          .from('roles')
-          .select('id, title, client_id, slug_or_token, description, job_description_text')
-          .eq('slug_or_token', role_token)
-          .limit(1)
-          .maybeSingle();
-        if (slugErr || !roleBySlug) {
-          console.warn('[accommodation] role lookup failed', {
-            request_id,
-            lookup: 'slug_or_token',
-            error: slugErr?.message || null,
-          });
-          return sendError(res, 404, {
-            error: 'Role not found.',
-            code: 'role_not_found',
-            detail: slugErr?.message || null,
-            hint: slugErr?.hint || null,
-            request_id,
-          });
-        }
         role = roleBySlug;
         console.log('[accommodation] role lookup success', { request_id, role_id: role.id, lookup: 'slug_or_token' });
       }
+    }
+    if (!role) {
+      return sendError(res, 404, {
+        error: 'role_not_found',
+        code: 'role_not_found',
+        detail: { role_token: role_lookup_value, attempted },
+        hint: 'Use the role link provided for this request.',
+        request_id,
+      });
     }
 
     const dup = await checkDuplicateCandidate({
