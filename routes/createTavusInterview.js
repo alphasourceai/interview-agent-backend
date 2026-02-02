@@ -2,6 +2,7 @@
 'use strict';
 
 const express = require('express');
+const crypto = require('crypto');
 const { supabase } = require('../src/lib/supabaseClient');
 const { createTavusInterviewHandler } = require('../handlers/createTavusInterview');
 
@@ -20,6 +21,7 @@ function sendError(res, status, code, detail, context = {}, hint = null) {
 }
 
 router.post('/', async (req, res) => {
+  const request_id = req.request_id || req.requestId || req.id || crypto.randomUUID?.() || String(Date.now());
   let candidate_id;
   let roleIdFromBody;
   let roleToken;
@@ -208,7 +210,7 @@ router.post('/', async (req, res) => {
       return sendError(res, e.status || 502, 'tavus_request_failed', e.detail || e.message || 'Failed to create Tavus conversation', context, 'Check Tavus logs or retry shortly');
     }
     if (e?.code === 'missing_env') {
-      return sendError(res, e.status || 500, 'missing_env', e.message || 'Missing Tavus configuration', context);
+      return res.status(e.status || 500).json({ error: 'missing_env', code: 'missing_env', request_id });
     }
     return sendError(res, e.status || 500, e.code || 'unexpected_error', e.message || 'Server error', context);
   }

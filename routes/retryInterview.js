@@ -2,6 +2,7 @@
 'use strict';
 
 const express = require('express');
+const crypto = require('crypto');
 const { supabase } = require('../src/lib/supabaseClient');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 const { createTavusInterviewHandler } = require('../handlers/createTavusInterview');
@@ -31,7 +32,9 @@ function deriveBaseUrl(req) {
  * yet have a video_url. Enforces auth + client scope.
  */
 router.post('/:id/retry-create', requireAuth, withClientScope, async (req, res) => {
+  const request_id = req.request_id || req.requestId || req.id || crypto.randomUUID?.() || String(Date.now());
   try {
+
     const { id } = req.params;
 
     const envBase = (process.env.PUBLIC_BACKEND_URL || '').replace(/\/+$/, '');
@@ -119,6 +122,9 @@ router.post('/:id/retry-create', requireAuth, withClientScope, async (req, res) 
         detail: e.message,
         role_id: e.role_id || null
       });
+    }
+    if (e?.code === 'missing_env') {
+      return res.status(e.status || 500).json({ error: 'missing_env', code: 'missing_env', request_id });
     }
     return res.status(500).json({ error: e.message || 'Server error' });
   }

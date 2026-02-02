@@ -18,7 +18,7 @@ const { ensureTavusDocumentForRole, missingTavusKbError } = require('../lib/tavu
  */
 async function createTavusInterviewHandler(candidate, role, webhookUrl, options = {}) {
   const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
-  const REPLICA_ID = String(process.env.TAVUS_REPLICA_ID || '').trim();
+  const PERSONA_ID = String(process.env.TAVUS_PERSONA_ID || '').trim();
   const RETRIEVAL = String(process.env.TAVUS_DOCUMENT_STRATEGY || 'balanced').trim();
 
   if (!API_KEY) {
@@ -27,8 +27,8 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     err.status = 500;
     throw err;
   }
-  if (!REPLICA_ID) {
-    const err = new Error('Tavus requires replica_id. Set TAVUS_REPLICA_ID.');
+  if (!PERSONA_ID) {
+    const err = new Error('Tavus requires persona_id. Set TAVUS_PERSONA_ID.');
     err.code = 'missing_env';
     err.status = 500;
     throw err;
@@ -36,7 +36,7 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
 
   const envFlags = {
     TAVUS_API_KEY: !!process.env.TAVUS_API_KEY,
-    TAVUS_REPLICA_ID: !!process.env.TAVUS_REPLICA_ID
+    TAVUS_PERSONA_ID: !!process.env.TAVUS_PERSONA_ID
   };
   console.log('[tavus-interview-debug]', {
     stage: 'handler_start',
@@ -58,7 +58,7 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
 
   // Build the payload Tavus expects
   const payload = {
-    replica_id: REPLICA_ID || undefined,
+    persona_id: PERSONA_ID || undefined,
     callback_url: webhookUrl || undefined,
     conversation_name: conversationName,
     conversational_context: context,
@@ -72,7 +72,7 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     role_id: role?.id,
     role_title: roleTitle,
     company: companyName,
-    replica_id: payload.replica_id,
+    persona_present: !!payload.persona_id,
     tavus_document_id: role?.tavus_document_id || null,
     prompt: context,
     custom_greeting: customGreeting
@@ -91,7 +91,7 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   if (tavusDocumentId) {
     console.log('[tavus-interview]', {
       role_id: role?.id || null,
-      replica_id: payload.replica_id || null,
+      persona_present: !!payload.persona_id,
       tavus_document_id: tavusDocumentId
     });
     payload.document_ids = [tavusDocumentId];
@@ -163,7 +163,8 @@ function extractFirstQuestion(rubric) {
 }
 
 function buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestion) {
-  const greeting = `Hi ${candidateName}, it's nice to meet you today. My name is Alex, and I'll be conducting your interview for the ${roleTitle} position at ${companyName}. I'm looking forward to our conversation. Let's get started.`;
+  // Persona default replica is Olivia; keep greeting aligned with the persona identity.
+  const greeting = `Hi ${candidateName}, it's nice to meet you today. My name is Olivia, and I'll be conducting your interview for the ${roleTitle} position at ${companyName}. I'm looking forward to our conversation. Let's get started.`;
   return `${greeting} ${firstQuestion}`;
 }
 
