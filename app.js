@@ -1196,18 +1196,37 @@ adminRouter.post('/accommodation-requests/:id/send-text-link', requireAuth, requ
 app.use('/admin', adminRouter)
 
 // ======================= Client-scoped roles (authenticated) =======================
-app.get('/roles', requireAuth, withClientScope, async (req, res) => {
-  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+function logRolesHit(req, request_id, client_id) {
+  console.log('[roles] hit', {
+    method: req.method,
+    path: req.originalUrl || req.path,
+    request_id,
+    client_id: client_id || null
+  });
+}
+
+function getRoleMembership(req, client_id) {
+  const memberships = Array.isArray(req.memberships) ? req.memberships : [];
+  const membership = memberships.find((m) => m.client_id === client_id) || null;
+  const role = (membership?.role || '').toLowerCase();
+  return { membership, role };
+}
+
+async function listRolesHandler(req, res) {
+  const request_id = req.request_id || req.requestId || req.id || crypto.randomUUID?.() || String(Date.now());
   try {
+    const requested = req.query?.client_id || null;
     const allowedIds = Array.isArray(req.clientIds) ? req.clientIds.filter(Boolean) : [];
+    const logClientId = requested || (allowedIds.length === 1 ? allowedIds[0] : null);
+    logRolesHit(req, request_id, logClientId);
+
     if (!allowedIds.length) {
       return res.json({ items: [], request_id });
     }
 
-    const requestedClientId = req.query?.client_id || null;
     let finalIds = allowedIds;
-    if (requestedClientId) {
-      if (!allowedIds.includes(requestedClientId)) {
+    if (requested) {
+      if (!allowedIds.includes(requested)) {
         return res.status(403).json({
           error: 'forbidden',
           code: 'client_scope_mismatch',
@@ -1216,7 +1235,7 @@ app.get('/roles', requireAuth, withClientScope, async (req, res) => {
           request_id
         });
       }
-      finalIds = [requestedClientId];
+      finalIds = [requested];
     }
 
     const { data, error } = await supabaseAdmin
@@ -1251,7 +1270,149 @@ app.get('/roles', requireAuth, withClientScope, async (req, res) => {
       request_id
     });
   }
-});
+}
+
+async function createRoleHandler(req, res) {
+  const request_id = req.request_id || req.requestId || req.id || crypto.randomUUID?.() || String(Date.now());
+  const client_id = req.body?.client_id || req.query?.client_id || null;
+  logRolesHit(req, request_id, client_id);
+  try {
+    if (!client_id) {
+      return res.status(400).json({
+        error: 'invalid_payload',
+        code: 'client_id_required',
+        detail: 'client_id is required',
+        request_id
+      });
+    }
+
+    const { membership, role } = getRoleMembership(req, client_id);
+    if (!membership || !['manager', 'admin', 'tester'].includes(role)) {
+      return res.status(403).json({
+        error: 'forbidden',
+        code: 'insufficient_permissions',
+        detail: 'Insufficient permissions to create roles for this client',
+        request_id
+      });
+    }
+
+    const title = String(req.body?.title || 'Untitled Role').trim();
+    let interview_type = req.body?.interview_type || null;
+    const IT = String(interview_type || '').toUpperCase();
+    const VALID = new Set(['BASIC', 'DETAILED', 'TECHNICAL']);
+    interview_type = VALID.has(IT) ? IT : null;
+
+    const payload = { client_id, title };
+    if (interview_type) payload.interview_type = interview_type;
+
+    const { data, error } = await supabaseAdmin
+      .from('roles')
+      .insert(payload)
+      .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
+      .single();
+
+    if (error) {
+      console.error('[roles:create] supabase error', {
+        request_id,
+        code: error.code,
+        hint: error.hint,
+        message: error.message
+      });
+      return res.status(500).json({
+        error: 'create_role_failed',
+        code: error.code || 'create_role_failed',
+        detail: error.message,
+        hint: error.hint,
+        request_id
+      });
+    }
+
+    return res.json({ role: data, request_id });
+  } catch (e) {
+    console.error('[roles:create] unexpected', { request_id, error: e?.message || e });
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'server_error',
+      detail: e?.message || 'Server error',
+      request_id
+    });
+  }
+}
+
+async function deleteRoleHandler(req, res) {
+  const request_id = req.request_id || req.requestId || req.id || crypto.randomUUID?.() || String(Date.now());
+  const client_id = req.query?.client_id || req.body?.client_id || null;
+  const role_id = req.query?.id || req.body?.id || null;
+  logRolesHit(req, request_id, client_id);
+  try {
+    if (!client_id || !role_id) {
+      return res.status(400).json({
+        error: 'invalid_payload',
+        code: 'missing_role_id',
+        detail: 'client_id and id are required',
+        request_id
+      });
+    }
+
+    const { membership, role } = getRoleMembership(req, client_id);
+    if (!membership || !['manager', 'admin', 'tester'].includes(role)) {
+      return res.status(403).json({
+        error: 'forbidden',
+        code: 'insufficient_permissions',
+        detail: 'Insufficient permissions to delete roles for this client',
+        request_id
+      });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('roles')
+      .delete()
+      .eq('id', role_id)
+      .eq('client_id', client_id)
+      .select('id')
+      .maybeSingle();
+
+    if (error) {
+      console.error('[roles:delete] supabase error', {
+        request_id,
+        code: error.code,
+        hint: error.hint,
+        message: error.message
+      });
+      return res.status(500).json({
+        error: 'delete_role_failed',
+        code: error.code || 'delete_role_failed',
+        detail: error.message,
+        hint: error.hint,
+        request_id
+      });
+    }
+
+    if (!data) {
+      return res.status(404).json({
+        error: 'not_found',
+        code: 'role_not_found',
+        detail: 'Role not found for this client',
+        request_id
+      });
+    }
+
+    return res.json({ ok: true, id: data.id, request_id });
+  } catch (e) {
+    console.error('[roles:delete] unexpected', { request_id, error: e?.message || e });
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'server_error',
+      detail: e?.message || 'Server error',
+      request_id
+    });
+  }
+}
+
+const rolesPaths = ['/roles', '/api/roles'];
+app.get(rolesPaths, requireAuth, withClientScope, listRolesHandler);
+app.post(rolesPaths, requireAuth, withClientScope, createRoleHandler);
+app.delete(rolesPaths, requireAuth, withClientScope, deleteRoleHandler);
 
 /* ======================= END: Admin guard + Admin API ======================= */
 
