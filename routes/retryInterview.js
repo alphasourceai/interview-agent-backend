@@ -2,7 +2,6 @@
 'use strict';
 
 const express = require('express');
-const crypto = require('crypto');
 const { supabase } = require('../src/lib/supabaseClient');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 const { createTavusInterviewHandler } = require('../handlers/createTavusInterview');
@@ -32,9 +31,7 @@ function deriveBaseUrl(req) {
  * yet have a video_url. Enforces auth + client scope.
  */
 router.post('/:id/retry-create', requireAuth, withClientScope, async (req, res) => {
-  const request_id = req.request_id || req.requestId || req.id || crypto.randomUUID?.() || String(Date.now());
   try {
-
     const { id } = req.params;
 
     const envBase = (process.env.PUBLIC_BACKEND_URL || '').replace(/\/+$/, '');
@@ -74,27 +71,14 @@ router.post('/:id/retry-create', requireAuth, withClientScope, async (req, res) 
 
     const { data: role, error: rErr } = await supabase
       .from('roles')
-      .select('id, title, kb_document_id, tavus_document_id, client_id')
+      .select('id, kb_document_id')
       .eq('id', interview.role_id)
       .single();
     if (rErr || !role) return res.status(404).json({ error: rErr?.message || 'Role not found' });
 
     // Create Tavus conversation (keeping your existing webhook path)
     const webhookUrl = `${base}/webhook/recording-ready`;
-
-    let companyName = 'the hiring organization';
-    try {
-      const { data: clientRow } = await supabase
-        .from('clients')
-        .select('id, name')
-        .eq('id', interview.client_id || role.client_id)
-        .single();
-      if (clientRow?.name) companyName = clientRow.name.trim();
-    } catch (err) {
-      console.warn('[retry-interview] client_lookup_failed', err?.message || err);
-    }
-
-    const result = await createTavusInterviewHandler(candidate, role, webhookUrl, { companyName });
+    const result = await createTavusInterviewHandler(candidate, role, webhookUrl);
 
     if (!result?.conversation_url) {
       return res.status(502).json({ error: 'Failed to create conversation' });
@@ -115,17 +99,6 @@ router.post('/:id/retry-create', requireAuth, withClientScope, async (req, res) 
     return res.status(200).json({ video_url: result.conversation_url });
   } catch (e) {
     console.error('[POST /interviews/retry/:id/retry-create] error:', e);
-    if (e?.code === 'missing_tavus_kb' || e?.code === 'kb_not_ready') {
-      const status = e.code === 'kb_not_ready' ? 409 : 500;
-      return res.status(status).json({
-        error: e.code,
-        detail: e.message,
-        role_id: e.role_id || null
-      });
-    }
-    if (e?.code === 'missing_env') {
-      return res.status(e.status || 500).json({ error: 'missing_env', code: 'missing_env', request_id });
-    }
     return res.status(500).json({ error: e.message || 'Server error' });
   }
 });

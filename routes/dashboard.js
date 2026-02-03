@@ -7,6 +7,11 @@ const { requireAuth, withClientScope } = require('../src/middleware/auth');
 
 const router = express.Router();
 
+const DAILY_ROOM_RE = /(^https?:\/\/)?([a-z0-9-]+\.)?(tavus\.daily\.co|c\.daily\.co)(\/|\?|$)/i;
+function isDailyRoomUrl(url) {
+  return !!url && DAILY_ROOM_RE.test(String(url));
+}
+
 /**
  * GET /dashboard/rows
  * One row per candidate (for the scoped client).
@@ -63,7 +68,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
     if (candIds.length) {
       const { data: ivs, error: iErr } = await supabase
         .from('interviews')
-        .select('id, candidate_id, client_id, created_at, video_url, transcript_url, analysis_url, analysis')
+        .select('id, candidate_id, client_id, created_at, video_url, transcript_url, transcript, analysis_url, analysis')
         .eq('client_id', clientId)
         .in('candidate_id', candIds)
         .order('created_at', { ascending: false });
@@ -99,7 +104,6 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
           'resume_breakdown',
           'interview_breakdown',
           'analysis',
-          'unanswered_candidate_questions',
           // common names I've seen/used for a public PDF URL:
           'report_url',
           'latest_report_url',
@@ -179,9 +183,8 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
 
       // PDF URL preference: explicit latest_report_url, else report_url
       const latest_report_url = rep?.latest_report_url || rep?.report_url || null;
-      const unanswered_candidate_questions = Array.isArray(rep?.unanswered_candidate_questions)
-        ? rep.unanswered_candidate_questions
-        : [];
+      const safeVideoUrl = iv?.video_url && !isDailyRoomUrl(iv.video_url) ? iv.video_url : null;
+      const hasTranscript = !!iv?.transcript_url || !!iv?.transcript;
 
       return {
         // row identity is the candidate (FE now uses latest_interview_id for actions)
@@ -194,11 +197,11 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
 
         // latest interview bits for the expanded area + transcript button
         latest_interview_id: iv?.id || null,
-        video_url: iv?.video_url || null,
+        video_url: safeVideoUrl,
         transcript_url: iv?.transcript_url || null,
         analysis_url: iv?.analysis_url || null,
-        has_video: !!iv?.video_url,
-        has_transcript: !!iv?.transcript_url,
+        has_video: !!safeVideoUrl,
+        has_transcript: hasTranscript,
         has_analysis: !!iv?.analysis_url,
 
         // report-driven bits
@@ -208,7 +211,6 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         resume_analysis,
         interview_analysis,
         latest_report_url,
-        unanswered_candidate_questions,
         report_generated_at: rep?.created_at || null,
       };
     });
@@ -235,7 +237,7 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
 
     const { data: rows, error: iErr } = await supabase
       .from('interviews')
-      .select('id, created_at, client_id, candidate_id, role_id, video_url, transcript_url, analysis_url, resume_score, interview_score, overall_score, resume_analysis, interview_analysis, latest_report_url, report_generated_at, unanswered_candidate_questions')
+      .select('id, created_at, client_id, candidate_id, role_id, video_url, transcript_url, transcript, analysis_url, resume_score, interview_score, overall_score, resume_analysis, interview_analysis, latest_report_url, report_generated_at')
       .eq('client_id', clientId)
       .order('created_at', { ascending: false })
       .limit(500);
@@ -282,17 +284,20 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
 
     const items = (rows || [])
       .filter(r => r.candidate_id && candidatesById[r.candidate_id])
-      .map(r => ({
+      .map(r => {
+        const safeVideoUrl = r.video_url && !isDailyRoomUrl(r.video_url) ? r.video_url : null;
+        const hasTranscript = !!r.transcript_url || !!r.transcript;
+        return {
         id: r.id,
         created_at: r.created_at,
         client_id: r.client_id,
         candidate: candidatesById[r.candidate_id],
         role: r.role_id ? (rolesById[r.role_id] || null) : null,
-        video_url: r.video_url || null,
+        video_url: safeVideoUrl,
         transcript_url: r.transcript_url || null,
         analysis_url: r.analysis_url || null,
-        has_video: !!r.video_url,
-        has_transcript: !!r.transcript_url,
+        has_video: !!safeVideoUrl,
+        has_transcript: hasTranscript,
         has_analysis: !!r.analysis_url,
         resume_score: isFinite(r.resume_score) ? Number(r.resume_score) : null,
         interview_score: isFinite(r.interview_score) ? Number(r.interview_score) : null,
@@ -301,8 +306,8 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
         interview_analysis: r.interview_analysis || { clarity: null, confidence: null, body_language: null },
         latest_report_url: r.latest_report_url || null,
         report_generated_at: r.report_generated_at || null,
-        unanswered_candidate_questions: Array.isArray(r.unanswered_candidate_questions) ? r.unanswered_candidate_questions : []
-      }));
+      };
+      });
 
     return res.json({ items });
   } catch (e) {

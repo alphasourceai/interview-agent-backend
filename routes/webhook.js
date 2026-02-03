@@ -6,7 +6,8 @@ const router = express.Router();
 const { supabase } = require('../src/lib/supabaseClient');
 
 const TRANSCRIPTS_BUCKET = process.env.SUPABASE_TRANSCRIPTS_BUCKET || 'transcripts';
-const ANALYSIS_BUCKET    = process.env.SUPABASE_ANALYSIS_BUCKET    || 'analysis';
+
+const DAILY_ROOM_RE = /(^https?:\/\/)?([a-z0-9-]+\.)?(tavus\.daily\.co|c\.daily\.co)(\/|\?|$)/i;
 
 // --- utilities ---
 function pickFirst(...vals) {
@@ -26,14 +27,29 @@ function fromAny(obj, ...paths) {
   return undefined;
 }
 
-async function getInterviewByAnyId(anyId) {
-  if (!anyId) return null;
-  // Try by id
-  let { data } = await supabase.from('interviews').select('*').eq('id', anyId).maybeSingle();
-  if (data) return data;
-  // Try by conversation_id
-  ({ data } = await supabase.from('interviews').select('*').eq('conversation_id', anyId).maybeSingle());
-  if (data) return data;
+function isDailyRoomUrl(url) {
+  return !!url && DAILY_ROOM_RE.test(String(url));
+}
+
+async function getInterviewByIds(interviewId, conversationId) {
+  if (interviewId) {
+    const { data } = await supabase
+      .from('interviews')
+      .select('*')
+      .eq('id', interviewId)
+      .maybeSingle();
+    return data || null;
+  }
+
+  if (conversationId) {
+    const { data } = await supabase
+      .from('interviews')
+      .select('*')
+      .eq('tavus_application_id', conversationId)
+      .maybeSingle();
+    return data || null;
+  }
+
   return null;
 }
 
@@ -46,14 +62,13 @@ async function ensureBucket(name) {
   }
 }
 
-async function putJsonToStorage(bucket, path, jsonOrUrl) {
+async function putJsonToStorage(bucket, pathName, jsonOrUrl) {
   await ensureBucket(bucket);
 
   let buf;
   let contentType = 'application/json';
 
   if (typeof jsonOrUrl === 'string' && /^https?:\/\//i.test(jsonOrUrl)) {
-    // fetch from remote URL
     const r = await fetch(jsonOrUrl);
     if (!r.ok) throw new Error(`fetch ${jsonOrUrl} failed: ${r.status}`);
     const ct = r.headers.get('content-type') || '';
@@ -69,10 +84,48 @@ async function putJsonToStorage(bucket, path, jsonOrUrl) {
   const { error } = await supabase
     .storage
     .from(bucket)
-    .upload(path, buf, { upsert: true, contentType });
+    .upload(pathName, buf, { upsert: true, contentType });
   if (error) throw new Error(error.message);
 
-  return `${bucket}/${path}`;
+  return `${bucket}/${pathName}`;
+}
+
+function extractSanitizedContent(item) {
+  if (!item) return null;
+
+  const role = typeof item.role === 'string' ? item.role.trim().toLowerCase() : '';
+  if (role === 'system') return null;
+
+  let content = item.content ?? item.text ?? item.message ?? item.value;
+  if (content == null) return null;
+  if (typeof content !== 'string') {
+    try {
+      content = JSON.stringify(content);
+    } catch {
+      content = String(content);
+    }
+  }
+
+  let text = String(content).trim();
+  if (!text) return null;
+
+  if (!/USER_SPEECH:/i.test(text)) return null;
+
+  const match = text.match(/USER_SPEECH:\s*([\s\S]*?)(?:VISUAL_SCENE:|$)/i);
+  if (!match || !match[1]) return null;
+
+  text = match[1].trim();
+  return text || null;
+}
+
+function sanitizeTranscriptArray(arr) {
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const item of arr) {
+    const line = extractSanitizedContent(item);
+    if (line) out.push(line);
+  }
+  return out;
 }
 
 router.get('/_ping', (_req, res) => res.json({ ok: true }));
@@ -82,74 +135,114 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
   try {
     const body = req.body || {};
 
-    // Find an interview identifier from the payload
-    const anyId = pickFirst(
+    const eventTypeRaw = pickFirst(
+      fromAny(body, 'event_type'),
+      fromAny(body, 'eventType'),
+      fromAny(body, 'event'),
+      fromAny(body, 'type'),
+      fromAny(body, 'status'),
+      fromAny(body, 'payload.event_type'),
+      fromAny(body, 'payload.eventType'),
+      fromAny(body, 'payload.type')
+    );
+
+    const eventType = String(eventTypeRaw || '').toLowerCase();
+    const isTranscriptionReady = eventType === 'application.transcription_ready';
+    const isRecordingReady = eventType === 'application.recording_ready';
+
+    if (!isTranscriptionReady && !isRecordingReady) {
+      return res.status(200).json({ ok: true });
+    }
+
+    const interviewId = pickFirst(
       fromAny(body, 'interview_id'),
       fromAny(body, 'interviewId'),
+      fromAny(body, 'metadata.interview_id')
+    );
+
+    const conversationId = pickFirst(
       fromAny(body, 'conversation_id'),
-      fromAny(body, 'conversationId'),
-      fromAny(body, 'metadata.interview_id'),
+      fromAny(body, 'properties.conversation_id'),
+      fromAny(body, 'properties.conversationId'),
       fromAny(body, 'metadata.conversation_id')
     );
-    if (!anyId) return res.status(400).json({ error: 'No interview identifier in payload' });
 
-    const interview = await getInterviewByAnyId(anyId);
-    if (!interview) return res.status(404).json({ error: 'Interview not found' });
+    if (!interviewId && !conversationId) {
+      return res.status(200).json({ ok: true });
+    }
 
-    // Determine event type loosely
-    const event =
-      pickFirst(fromAny(body, 'event'), fromAny(body, 'type'), fromAny(body, 'status')) || '';
-
-    // Possible blobs/links
-    const transcriptObj = pickFirst(fromAny(body, 'transcript'), fromAny(body, 'payload.transcript'));
-    const transcriptUrl = pickFirst(fromAny(body, 'transcript_url'), fromAny(body, 'payload.transcript_url'));
-    const analysisObj   = pickFirst(fromAny(body, 'analysis'), fromAny(body, 'payload.analysis'));
-    const analysisUrl   = pickFirst(fromAny(body, 'analysis_url'), fromAny(body, 'payload.analysis_url'));
-    const videoUrl      = pickFirst(
-      fromAny(body, 'video_url'),
-      fromAny(body, 'payload.video_url'),
-      fromAny(body, 'output.video_url')
-    );
+    const interview = await getInterviewByIds(interviewId, conversationId);
+    if (!interview) {
+      return res.status(200).json({ ok: true });
+    }
 
     const updates = {};
 
-    // If video URL present, persist it
-    if (videoUrl && !interview.video_url) {
-      updates.video_url = videoUrl;
-    }
+    if (isTranscriptionReady) {
+      const rawTranscript = pickFirst(
+        fromAny(body, 'properties.transcript'),
+        fromAny(body, 'transcript'),
+        fromAny(body, 'payload.transcript')
+      );
 
-    // If transcript present (object or url), upload privately and store bucket/path
-    if (transcriptObj || transcriptUrl) {
-      const path = `${interview.id}.json`;
-      const stored = await putJsonToStorage(TRANSCRIPTS_BUCKET, path, transcriptObj || transcriptUrl);
+      const isArray = Array.isArray(rawTranscript);
+      const transcriptJson = {
+        conversation_id: conversationId || interview.tavus_application_id || null,
+        event_type: String(eventTypeRaw || ''),
+        ...(isArray ? { transcript: rawTranscript } : { raw_transcript: rawTranscript ?? null })
+      };
+
+      const pathName = `interviews/${interview.id}.json`;
+      const stored = await putJsonToStorage(TRANSCRIPTS_BUCKET, pathName, transcriptJson);
+
       updates.transcript_url = stored;
+
+      if (isArray) {
+        const sanitizedLines = sanitizeTranscriptArray(rawTranscript);
+        const transcriptText = sanitizedLines.join('\n').trim();
+        updates.transcript = transcriptText || null;
+      } else {
+        updates.transcript = null;
+      }
+
+      if (updates.transcript) {
+        updates.status = 'Transcribed';
+      }
     }
 
-    // If analysis present (object or url), upload privately and store bucket/path
-    if (analysisObj || analysisUrl) {
-      const path = `${interview.id}.json`;
-      const stored = await putJsonToStorage(ANALYSIS_BUCKET, path, analysisObj || analysisUrl);
-      updates.analysis_url = stored;
-    }
+    if (isRecordingReady) {
+      const recordingUrl = pickFirst(
+        fromAny(body, 'properties.recording_url'),
+        fromAny(body, 'properties.video_url'),
+        fromAny(body, 'recording_url'),
+        fromAny(body, 'video_url'),
+        fromAny(body, 'payload.recording_url'),
+        fromAny(body, 'payload.video_url'),
+        fromAny(body, 'output.video_url')
+      );
 
-    // Optional status update heuristics
-    if (updates.analysis_url) {
-      updates.status = 'Analyzed';
-    } else if (updates.transcript_url) {
-      updates.status = 'Transcribed';
-    } else if (updates.video_url) {
-      updates.status = 'VideoReady';
+      if (recordingUrl) {
+        if (isDailyRoomUrl(recordingUrl)) {
+          const existingVideoUrl = interview.video_url || null;
+          if (!existingVideoUrl || isDailyRoomUrl(existingVideoUrl)) {
+            updates.video_url = null;
+          }
+        } else {
+          updates.video_url = recordingUrl;
+          if (!updates.status) updates.status = 'VideoReady';
+        }
+      }
     }
 
     if (Object.keys(updates).length) {
       await supabase.from('interviews').update(updates).eq('id', interview.id);
     }
 
-    res.json({ ok: true, interview_id: interview.id, event });
+    return res.status(200).json({ ok: true });
   } catch (e) {
-    console.error('[webhook] error:', e.message);
+    console.error('[webhook] error:', e.message || e);
     // Be lenient to avoid provider retries storms
-    res.status(200).json({ ok: true });
+    return res.status(200).json({ ok: true });
   }
 });
 
