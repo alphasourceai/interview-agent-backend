@@ -5,12 +5,18 @@ const fetch = require('node-fetch');
 const { createClient } = require('@supabase/supabase-js');
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  // Service role key so we can write to any row
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-
+const TRANSCRIPTS_BUCKET = process.env.SUPABASE_TRANSCRIPTS_BUCKET || 'transcripts';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
+const BACKFILL_LIMIT = Number(process.env.BACKFILL_LIMIT || 500);
+const BACKFILL_DRY_RUN = String(process.env.BACKFILL_DRY_RUN || 'true').toLowerCase() === 'true';
+const BACKFILL_START_AFTER_ID = process.env.BACKFILL_START_AFTER_ID || null;
+const BACKFILL_HYDRATE_TRANSCRIPT = String(process.env.BACKFILL_HYDRATE_TRANSCRIPT || 'false').toLowerCase() === 'true';
+const BACKFILL_CURSOR_CREATED_AT = process.env.BACKFILL_CURSOR_CREATED_AT || null;
+const BACKFILL_CURSOR_ID = process.env.BACKFILL_CURSOR_ID || null;
 
 function pickFirst(...vals) {
   for (const v of vals) if (v !== undefined && v !== null) return v;
@@ -32,7 +38,7 @@ function fromAny(obj, ...paths) {
 function extractSanitizedContent(item) {
   if (!item) return null;
   const role = typeof item.role === 'string' ? item.role.trim().toLowerCase() : '';
-  if (role !== 'user') return null;
+  if (!role || role === 'system') return null;
 
   let content = item.content ?? item.text ?? item.message ?? item.value;
   if (content == null) return null;
@@ -45,22 +51,26 @@ function extractSanitizedContent(item) {
   }
 
   const text = String(content).trim();
-  return text || null;
+  if (!text) return null;
+
+  if (role === 'user') return `CANDIDATE: ${text}`;
+  if (role === 'assistant' || role === 'interviewer' || role === 'agent') {
+    return `INTERVIEWER: ${text}`;
+  }
+  return null;
 }
 
 function sanitizeTranscriptArray(arr) {
-  if (!Array.isArray(arr)) return [];
+  if (!Array.isArray(arr)) return '';
   const out = [];
   for (const item of arr) {
     const line = extractSanitizedContent(item);
     if (line) out.push(line);
   }
-  return out;
+  return out.join('\n\n');
 }
 
-// Helpers to read private Supabase Storage objects
 function parsePublicStorageUrl(u) {
-  // matches /storage/v1/object/{public|sign}/<bucket>/<path...>
   const m = u?.match(/\/storage\/v1\/object\/(?:public|sign)\/([^/]+)\/(.+)$/);
   return m ? { bucket: m[1], path: m[2] } : null;
 }
@@ -71,10 +81,14 @@ function parseStoredRef(ref) {
   if (!trimmed) return null;
   if (/^https?:\/\//i.test(trimmed)) return null;
   let path = trimmed.replace(/^\/+/, '');
-  if (path.startsWith('transcripts/')) {
-    path = path.slice('transcripts/'.length);
+  if (path.startsWith(`${TRANSCRIPTS_BUCKET}/`)) {
+    path = path.slice(`${TRANSCRIPTS_BUCKET}/`.length);
+  } else if (path.startsWith(`${TRANSCRIPTS_BUCKET}`)) {
+    path = path.slice(`${TRANSCRIPTS_BUCKET}`.length);
+    path = path.replace(/^\/+/, '');
   }
-  return { bucket: 'transcripts', path };
+  if (path.startsWith('/')) path = path.replace(/^\/+/, '');
+  return { bucket: TRANSCRIPTS_BUCKET, path };
 }
 
 function resolveTranscriptRef(ref) {
@@ -99,38 +113,32 @@ async function downloadTranscriptPayload(ref) {
 
   if (resolved.source === 'storage-url' || resolved.source === 'path') {
     const { data, error } = await supabase.storage.from(resolved.bucket).download(resolved.path);
-    if (error || !data) {
-      console.warn('[transcript] storage download failed', {
-        bucket: resolved.bucket,
-        path: resolved.path,
-        error: error?.message || error
-      });
-      if (resolved.source === 'storage-url' && /^https?:\/\//i.test(String(ref || ''))) {
-        // fallback to HTTP fetch for public/signed URLs
-        try {
-          const res = await fetch(ref);
-          if (!res.ok) return null;
-          const text = await res.text();
-          try {
-            return JSON.parse(text);
-          } catch {
-            return text;
-          }
-        } catch (err) {
-          console.warn('[transcript] fetch fallback failed', { error: err?.message || err });
-          return null;
-        }
+    if (!error && data) {
+      const buf = Buffer.from(await data.arrayBuffer());
+      const raw = buf.toString('utf8');
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return raw;
       }
-      return null;
     }
 
-    const buf = Buffer.from(await data.arrayBuffer());
-    const raw = buf.toString('utf8');
-    try {
-      return JSON.parse(raw);
-    } catch {
-      return raw;
+    if (resolved.source === 'storage-url' && /^https?:\/\//i.test(String(ref || ''))) {
+      try {
+        const res = await fetch(ref);
+        if (!res.ok) return null;
+        const text = await res.text();
+        try {
+          return JSON.parse(text);
+        } catch {
+          return text;
+        }
+      } catch {
+        return null;
+      }
     }
+
+    return null;
   }
 
   if (resolved.source === 'http') {
@@ -143,8 +151,7 @@ async function downloadTranscriptPayload(ref) {
       } catch {
         return text;
       }
-    } catch (err) {
-      console.warn('[transcript] fetch failed', { error: err?.message || err });
+    } catch {
       return null;
     }
   }
@@ -185,21 +192,20 @@ function sanitizeTranscriptPayload(payload) {
   }
 
   if (Array.isArray(payload)) {
-    const lines = sanitizeTranscriptArray(payload);
-    return lines.join('\n').trim();
+    const text = sanitizeTranscriptArray(payload);
+    return text.trim();
   }
 
   if (typeof payload === 'object') {
     const items = extractTranscriptItemsFromPayload(payload);
     if (!items) return '';
-    const lines = sanitizeTranscriptArray(items);
-    return lines.join('\n').trim();
+    const text = sanitizeTranscriptArray(items);
+    return text.trim();
   }
 
   return '';
 }
 
-/** Fetch transcript text from either DB column or transcript_url using Storage SDK (private bucket safe). */
 async function getTranscriptText(row) {
   if (row.transcript && row.transcript.trim().length > 0) {
     return row.transcript.trim();
@@ -211,22 +217,20 @@ async function getTranscriptText(row) {
   return sanitizeTranscriptPayload(payload);
 }
 
-/** Ask OpenAI to score + summarize the transcript */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function scoreTranscriptWithOpenAI(transcript) {
   if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY missing');
 
-  const prompt = `
-You are an interview evaluator. Read the interview transcript and return JSON with:
-
-- clarity (0-100)
-- confidence (0-100)
-- body_language (0-100)  // estimate from wording (pace, hesitations, etc.)
-- overall (0-100)        // not a simple average; your holistic score
-- summary (1–3 sentences)
-
-Transcript:
-"""${transcript.slice(0, 12000)}"""
-`;
+  const prompt = `You are an interview evaluator. Return ONLY valid JSON with these exact keys:\n\n{
+  "overall": 0-100,
+  "summary": "1-3 sentences",
+  "clarity": 0-100,
+  "confidence": 0-100,
+  "body_language": 0-100
+}\n\nRules:\n- Summary must be 1-3 sentences max.\n- Do NOT include any additional keys.\n- Compliance: Do NOT infer protected traits (age, race, gender, disability, etc.). Evaluate only job-relevant communication quality and content.\n\nTranscript:\n"""${transcript.slice(0, 12000)}"""`;
 
   const resp = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
@@ -240,7 +244,7 @@ Transcript:
         { role: 'system', content: 'Return only JSON.' },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.2,
+      temperature: 0,
       response_format: { type: 'json_object' }
     })
   });
@@ -257,69 +261,115 @@ Transcript:
     parsed = {};
   }
 
-  // Normalize & clamp
   function num(v) {
     const n = Number(v);
-    if (Number.isNaN(n)) return 0;
+    if (!Number.isFinite(n)) return null;
     return Math.max(0, Math.min(100, Math.round(n)));
   }
-  const scores = {
-    clarity: num(parsed.clarity),
-    confidence: num(parsed.confidence),
-    body_language: num(parsed.body_language),
-    overall: num(parsed.overall)
-  };
-  const summary = String(parsed.summary || '').trim();
 
-  return { scores, summary };
+  const overall = num(parsed.overall);
+  const summary = String(parsed.summary || '').trim();
+  if (!summary || overall === null || overall === undefined) {
+    throw new Error('invalid_model_output');
+  }
+
+  const transcript_scores = {};
+  if (overall !== null) transcript_scores.overall = overall;
+  const clarity = num(parsed.clarity);
+  const confidence = num(parsed.confidence);
+  const bodyLanguage = num(parsed.body_language);
+  if (clarity !== null) transcript_scores.clarity = clarity;
+  if (confidence !== null) transcript_scores.confidence = confidence;
+  if (bodyLanguage !== null) transcript_scores.body_language = bodyLanguage;
+
+  return { summary, transcript_scores };
+}
+
+async function scoreWithRetry(transcript, maxAttempts = 3) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await scoreTranscriptWithOpenAI(transcript);
+    } catch (err) {
+      lastErr = err;
+      const delay = 500 * Math.pow(2, attempt - 1);
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
+
+function normalizeAnalysis(analysis) {
+  if (!analysis) return {};
+  if (typeof analysis === 'object' && !Array.isArray(analysis)) return analysis;
+  if (typeof analysis === 'string') {
+    try {
+      const parsed = JSON.parse(analysis);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function hasMissingTranscriptAnalysis(analysis) {
+  const obj = normalizeAnalysis(analysis);
+  const summary = typeof obj.summary === 'string' ? obj.summary.trim() : '';
+  const overall = obj.transcript_scores && typeof obj.transcript_scores === 'object'
+    ? obj.transcript_scores.overall
+    : undefined;
+  return !summary || overall === undefined || overall === null;
 }
 
 async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
   const requestId = opts?.request_id || null;
-  const logContext = { request_id: requestId || null, interview_id: interviewId || null };
 
   try {
     if (!interviewId) {
       return { ok: false, error: 'missing_interview_id', request_id: requestId || null };
     }
 
-    console.log('[analyze-interview-transcript] start', logContext);
-
     const { data: row, error } = await supabase
       .from('interviews')
-      .select('id, transcript, transcript_url, analysis, status')
+      .select('id, transcript, transcript_url, analysis')
       .eq('id', interviewId)
       .maybeSingle();
     if (error || !row) {
       return { ok: false, error: error?.message || 'interview_not_found', request_id: requestId || null };
     }
 
-    let transcriptText = '';
-    if (row.transcript && row.transcript.trim().length > 0) {
-      transcriptText = row.transcript.trim();
-    } else if (row.transcript_url) {
-      const payload = await downloadTranscriptPayload(row.transcript_url);
-      transcriptText = sanitizeTranscriptPayload(payload);
+    if (!hasMissingTranscriptAnalysis(row.analysis)) {
+      return { ok: true, skipped: true, reason: 'already_analyzed', request_id: requestId || null };
     }
 
+    const transcriptText = await getTranscriptText(row);
     if (!transcriptText) {
-      console.log('[analyze-interview-transcript] skipped', {
-        ...logContext,
-        reason: 'empty_transcript'
-      });
       return { ok: true, skipped: true, reason: 'empty_transcript', request_id: requestId || null };
     }
 
-    const { scores, summary } = await scoreTranscriptWithOpenAI(transcriptText);
+    const { summary, transcript_scores } = await scoreWithRetry(transcriptText, 3);
 
-    const nextAnalysis =
-      row.analysis && typeof row.analysis === 'object'
-        ? { ...row.analysis, scores, summary }
-        : { scores, summary };
+    const baseAnalysis = normalizeAnalysis(row.analysis);
+
+    const nextAnalysis = {
+      ...baseAnalysis,
+      summary: baseAnalysis.summary ? baseAnalysis.summary : summary,
+      transcript_scores: {
+        ...(baseAnalysis.transcript_scores && typeof baseAnalysis.transcript_scores === 'object'
+          ? baseAnalysis.transcript_scores
+          : {}),
+        ...(transcript_scores || {})
+      }
+    };
 
     const updatePayload = { analysis: nextAnalysis };
-    if (!row.transcript || row.transcript.trim().length === 0) {
+    if (BACKFILL_HYDRATE_TRANSCRIPT && (!row.transcript || row.transcript.trim().length === 0)) {
       updatePayload.transcript = transcriptText;
+    }
+
+    if (BACKFILL_DRY_RUN) {
+      return { ok: true, updated: false, dry_run: true, request_id: requestId || null };
     }
 
     const { error: upErr } = await supabase
@@ -330,77 +380,126 @@ async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
       return { ok: false, error: upErr.message, request_id: requestId || null };
     }
 
-    console.log('[analyze-interview-transcript] updated', {
-      ...logContext,
-      updated: true
-    });
     return { ok: true, updated: true, request_id: requestId || null };
   } catch (err) {
-    console.error('[analyze-interview-transcript] error', {
-      ...logContext,
-      error: err?.message || err
-    });
     return { ok: false, error: err?.message || String(err), request_id: requestId || null };
   }
 }
 
 async function main() {
-  console.log('Backfill: scanning…');
+  let scanned = 0;
+  let skipped = 0;
+  let would_update = 0;
+  let updated = 0;
+  let failed = 0;
 
-  // Only rows missing scores
-  const { data: rows, error } = await supabase
+  let query = supabase
     .from('interviews')
-    .select('id, transcript, transcript_url, analysis')
-    .or('transcript.is.null,transcript.eq.,analysis.is.null,analysis->>summary.is.null')
-    .limit(5000);
+    .select('id, created_at, transcript, transcript_url, analysis')
+    .order('created_at', { ascending: true })
+    .order('id', { ascending: true })
+    .limit(BACKFILL_LIMIT);
 
+  if (BACKFILL_CURSOR_CREATED_AT) {
+    query = query.gte('created_at', BACKFILL_CURSOR_CREATED_AT);
+  } else if (BACKFILL_START_AFTER_ID) {
+    query = query.gt('id', BACKFILL_START_AFTER_ID);
+  }
+
+  const { data: rows, error } = await query;
   if (error) throw error;
   if (!rows || rows.length === 0) {
-    console.log('Nothing to do (no rows with NULL transcript_scores).');
+    console.log('No rows to process.');
+    console.log(`scanned=${scanned} skipped=${skipped} would_update=${would_update} updated=${updated} failed=${failed}`);
     return;
   }
 
+  const cursorTime = BACKFILL_CURSOR_CREATED_AT ? Date.parse(BACKFILL_CURSOR_CREATED_AT) : null;
+
   for (const row of rows) {
+    scanned += 1;
+
+    if (BACKFILL_CURSOR_CREATED_AT) {
+      const rowTime = Date.parse(row.created_at);
+      if (Number.isFinite(rowTime) && Number.isFinite(cursorTime)) {
+        if (rowTime < cursorTime) {
+          skipped += 1;
+          console.log(`[backfill] skip ${row.id} cursor_before`);
+          continue;
+        }
+        if (rowTime === cursorTime && BACKFILL_CURSOR_ID) {
+          const rowIdNum = Number(row.id);
+          const cursorIdNum = Number(BACKFILL_CURSOR_ID);
+          let shouldSkip = false;
+          if (Number.isFinite(rowIdNum) && Number.isFinite(cursorIdNum)) {
+            shouldSkip = rowIdNum <= cursorIdNum;
+          } else {
+            shouldSkip = String(row.id) <= String(BACKFILL_CURSOR_ID);
+          }
+          if (shouldSkip) {
+            skipped += 1;
+            console.log(`[backfill] skip ${row.id} cursor_tie`);
+            continue;
+          }
+        }
+      }
+    }
+
     try {
-      const transcript = await getTranscriptText(row);
-      const hydratedFromUrl = (!row.transcript || row.transcript.trim().length === 0) && !!row.transcript_url;
-      if (!transcript || transcript.trim().length < 10) {
-        console.log(`Skip ${row.id}: empty transcript`);
+      if (!hasMissingTranscriptAnalysis(row.analysis)) {
+        skipped += 1;
+        console.log(`[backfill] skip ${row.id} already_analyzed`);
         continue;
       }
 
-      const { scores, summary } = await scoreTranscriptWithOpenAI(transcript);
+      const transcriptText = await getTranscriptText(row);
+      if (!transcriptText) {
+        skipped += 1;
+        console.log(`[backfill] skip ${row.id} empty_transcript`);
+        continue;
+      }
 
-      // Merge summary into analysis JSONB (don’t wipe other fields)
-      const nextAnalysis =
-        row.analysis && typeof row.analysis === 'object'
-          ? { ...row.analysis, summary: summary || row.analysis.summary }
-          : { summary };
+      const { summary, transcript_scores } = await scoreWithRetry(transcriptText, 3);
 
-      const updatePayload = {
-        analysis: {
-          ...(row.analysis && typeof row.analysis === 'object' ? row.analysis : {}),
-          scores,
-          summary
+      const baseAnalysis = normalizeAnalysis(row.analysis);
+
+      const nextAnalysis = {
+        ...baseAnalysis,
+        summary: baseAnalysis.summary ? baseAnalysis.summary : summary,
+        transcript_scores: {
+          ...(baseAnalysis.transcript_scores && typeof baseAnalysis.transcript_scores === 'object'
+            ? baseAnalysis.transcript_scores
+            : {}),
+          ...(transcript_scores || {})
         }
       };
-      if (hydratedFromUrl) {
-        updatePayload.transcript = transcript;
+
+      const updatePayload = { analysis: nextAnalysis };
+      if (BACKFILL_HYDRATE_TRANSCRIPT && (!row.transcript || row.transcript.trim().length === 0)) {
+        updatePayload.transcript = transcriptText;
+      }
+
+      if (BACKFILL_DRY_RUN) {
+        would_update += 1;
+        console.log(`[backfill] dry_run ${row.id}`);
+        continue;
       }
 
       const { error: upErr } = await supabase
         .from('interviews')
         .update(updatePayload)
         .eq('id', row.id);
-
       if (upErr) throw upErr;
-      console.log(`Updated ${row.id}: overall=${scores.overall}${hydratedFromUrl ? ' (hydrated transcript)' : ''}`);
+
+      updated += 1;
+      console.log(`[backfill] updated ${row.id}`);
     } catch (e) {
-      console.warn(`Row ${row.id} failed:`, e.message);
+      failed += 1;
+      console.log(`[backfill] failed ${row.id}: ${e?.message || e}`);
     }
   }
 
-  console.log('Backfill complete.');
+  console.log(`scanned=${scanned} skipped=${skipped} would_update=${would_update} updated=${updated} failed=${failed}`);
 }
 
 module.exports = { analyzeInterviewTranscriptById };
