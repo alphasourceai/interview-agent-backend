@@ -12,6 +12,52 @@ const supabase = createClient(
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
+function pickFirst(...vals) {
+  for (const v of vals) if (v !== undefined && v !== null) return v;
+  return undefined;
+}
+
+function fromAny(obj, ...paths) {
+  for (const p of paths) {
+    try {
+      const parts = p.split('.');
+      let cur = obj;
+      for (const key of parts) cur = cur?.[key];
+      if (cur !== undefined) return cur;
+    } catch {}
+  }
+  return undefined;
+}
+
+function extractSanitizedContent(item) {
+  if (!item) return null;
+  const role = typeof item.role === 'string' ? item.role.trim().toLowerCase() : '';
+  if (role !== 'user') return null;
+
+  let content = item.content ?? item.text ?? item.message ?? item.value;
+  if (content == null) return null;
+  if (typeof content !== 'string') {
+    try {
+      content = JSON.stringify(content);
+    } catch {
+      content = String(content);
+    }
+  }
+
+  const text = String(content).trim();
+  return text || null;
+}
+
+function sanitizeTranscriptArray(arr) {
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const item of arr) {
+    const line = extractSanitizedContent(item);
+    if (line) out.push(line);
+  }
+  return out;
+}
+
 // Helpers to read private Supabase Storage objects
 function parsePublicStorageUrl(u) {
   // matches /storage/v1/object/{public|sign}/<bucket>/<path...>
@@ -21,12 +67,136 @@ function parsePublicStorageUrl(u) {
 
 function parseStoredRef(ref) {
   if (!ref) return null;
-  // Accept "bucket/path/to/file.json" or just "path..." (we'll assume transcripts bucket)
-  if (ref.includes('/')) {
-    const [bucket, ...rest] = ref.split('/');
-    return { bucket, path: rest.join('/') };
+  const trimmed = String(ref).trim();
+  if (!trimmed) return null;
+  if (/^https?:\/\//i.test(trimmed)) return null;
+  let path = trimmed.replace(/^\/+/, '');
+  if (path.startsWith('transcripts/')) {
+    path = path.slice('transcripts/'.length);
   }
-  return { bucket: 'transcripts', path: ref }; // default bucket guess
+  return { bucket: 'transcripts', path };
+}
+
+function resolveTranscriptRef(ref) {
+  if (!ref) return null;
+  const trimmed = String(ref).trim();
+  if (!trimmed) return null;
+
+  const storage = parsePublicStorageUrl(trimmed);
+  if (storage) return { ...storage, source: 'storage-url' };
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    return { url: trimmed, source: 'http' };
+  }
+
+  const stored = parseStoredRef(trimmed);
+  return stored ? { ...stored, source: 'path' } : null;
+}
+
+async function downloadTranscriptPayload(ref) {
+  const resolved = resolveTranscriptRef(ref);
+  if (!resolved) return null;
+
+  if (resolved.source === 'storage-url' || resolved.source === 'path') {
+    const { data, error } = await supabase.storage.from(resolved.bucket).download(resolved.path);
+    if (error || !data) {
+      console.warn('[transcript] storage download failed', {
+        bucket: resolved.bucket,
+        path: resolved.path,
+        error: error?.message || error
+      });
+      if (resolved.source === 'storage-url' && /^https?:\/\//i.test(String(ref || ''))) {
+        // fallback to HTTP fetch for public/signed URLs
+        try {
+          const res = await fetch(ref);
+          if (!res.ok) return null;
+          const text = await res.text();
+          try {
+            return JSON.parse(text);
+          } catch {
+            return text;
+          }
+        } catch (err) {
+          console.warn('[transcript] fetch fallback failed', { error: err?.message || err });
+          return null;
+        }
+      }
+      return null;
+    }
+
+    const buf = Buffer.from(await data.arrayBuffer());
+    const raw = buf.toString('utf8');
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
+  }
+
+  if (resolved.source === 'http') {
+    try {
+      const res = await fetch(resolved.url);
+      if (!res.ok) return null;
+      const text = await res.text();
+      try {
+        return JSON.parse(text);
+      } catch {
+        return text;
+      }
+    } catch (err) {
+      console.warn('[transcript] fetch failed', { error: err?.message || err });
+      return null;
+    }
+  }
+
+  return null;
+}
+
+function extractTranscriptItemsFromPayload(payload) {
+  if (!payload) return null;
+  const rawTranscript = pickFirst(
+    fromAny(payload, 'properties.transcript'),
+    fromAny(payload, 'transcript'),
+    fromAny(payload, 'payload.transcript')
+  );
+
+  if (Array.isArray(rawTranscript)) return rawTranscript;
+  if (Array.isArray(rawTranscript?.messages)) return rawTranscript.messages;
+  if (Array.isArray(fromAny(payload, 'messages'))) return fromAny(payload, 'messages');
+  if (Array.isArray(fromAny(payload, 'transcript'))) return fromAny(payload, 'transcript');
+  return null;
+}
+
+function sanitizeTranscriptPayload(payload) {
+  if (payload == null) return '';
+
+  if (typeof payload === 'string') {
+    const trimmed = payload.trim();
+    if (!trimmed) return '';
+    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        return sanitizeTranscriptPayload(parsed);
+      } catch {
+        return trimmed;
+      }
+    }
+    return trimmed;
+  }
+
+  if (Array.isArray(payload)) {
+    const lines = sanitizeTranscriptArray(payload);
+    return lines.join('\n').trim();
+  }
+
+  if (typeof payload === 'object') {
+    const items = extractTranscriptItemsFromPayload(payload);
+    if (!items) return '';
+    const lines = sanitizeTranscriptArray(items);
+    return lines.join('\n').trim();
+  }
+
+  return '';
 }
 
 /** Fetch transcript text from either DB column or transcript_url using Storage SDK (private bucket safe). */
@@ -37,42 +207,8 @@ async function getTranscriptText(row) {
 
   const ref = row.transcript_url;
   if (!ref) return '';
-
-  const parsed =
-    parsePublicStorageUrl(ref) ||
-    parseStoredRef(ref);
-
-  if (!parsed) return '';
-
-  const { data, error } = await supabase.storage.from(parsed.bucket).download(parsed.path);
-  if (error) {
-    // As a last resort, try direct fetch (will fail for private buckets, but keeps old behavior)
-    try {
-      const res = await fetch(ref);
-      if (!res.ok) throw new Error(`fetch transcript_url failed: ${res.status}`);
-      const fallbackText = await res.text();
-      try {
-        const j = JSON.parse(fallbackText);
-        if (typeof j === 'string') return j;
-        if (j && typeof j.text === 'string') return j.text;
-      } catch {}
-      return fallbackText;
-    } catch (e) {
-      throw new Error(`storage.download failed (${parsed.bucket}/${parsed.path}): ${error.message || e.message}`);
-    }
-  }
-
-  const buf = Buffer.from(await data.arrayBuffer());
-  const raw = buf.toString('utf8');
-  try {
-    const j = JSON.parse(raw);
-    if (typeof j === 'string') return j;
-    if (Array.isArray(j)) return j.join('\n');
-    if (j && typeof j.text === 'string') return j.text;
-    return JSON.stringify(j);
-  } catch {
-    return raw;
-  }
+  const payload = await downloadTranscriptPayload(ref);
+  return sanitizeTranscriptPayload(payload);
 }
 
 /** Ask OpenAI to score + summarize the transcript */
@@ -138,6 +274,76 @@ Transcript:
   return { scores, summary };
 }
 
+async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
+  const requestId = opts?.request_id || null;
+  const logContext = { request_id: requestId || null, interview_id: interviewId || null };
+
+  try {
+    if (!interviewId) {
+      return { ok: false, error: 'missing_interview_id', request_id: requestId || null };
+    }
+
+    console.log('[analyze-interview-transcript] start', logContext);
+
+    const { data: row, error } = await supabase
+      .from('interviews')
+      .select('id, transcript, transcript_url, analysis, status')
+      .eq('id', interviewId)
+      .maybeSingle();
+    if (error || !row) {
+      return { ok: false, error: error?.message || 'interview_not_found', request_id: requestId || null };
+    }
+
+    let transcriptText = '';
+    if (row.transcript && row.transcript.trim().length > 0) {
+      transcriptText = row.transcript.trim();
+    } else if (row.transcript_url) {
+      const payload = await downloadTranscriptPayload(row.transcript_url);
+      transcriptText = sanitizeTranscriptPayload(payload);
+    }
+
+    if (!transcriptText) {
+      console.log('[analyze-interview-transcript] skipped', {
+        ...logContext,
+        reason: 'empty_transcript'
+      });
+      return { ok: true, skipped: true, reason: 'empty_transcript', request_id: requestId || null };
+    }
+
+    const { scores, summary } = await scoreTranscriptWithOpenAI(transcriptText);
+
+    const nextAnalysis =
+      row.analysis && typeof row.analysis === 'object'
+        ? { ...row.analysis, scores, summary }
+        : { scores, summary };
+
+    const updatePayload = { analysis: nextAnalysis };
+    if (!row.transcript || row.transcript.trim().length === 0) {
+      updatePayload.transcript = transcriptText;
+    }
+
+    const { error: upErr } = await supabase
+      .from('interviews')
+      .update(updatePayload)
+      .eq('id', row.id);
+    if (upErr) {
+      return { ok: false, error: upErr.message, request_id: requestId || null };
+    }
+
+    console.log('[analyze-interview-transcript] updated', {
+      ...logContext,
+      updated: true
+    });
+    return { ok: true, updated: true, request_id: requestId || null };
+  } catch (err) {
+    console.error('[analyze-interview-transcript] error', {
+      ...logContext,
+      error: err?.message || err
+    });
+    return { ok: false, error: err?.message || String(err), request_id: requestId || null };
+  }
+}
+
 async function main() {
   console.log('Backfill: scanning…');
 
@@ -197,7 +403,11 @@ async function main() {
   console.log('Backfill complete.');
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+module.exports = { analyzeInterviewTranscriptById };
+
+if (require.main === module) {
+  main().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}
