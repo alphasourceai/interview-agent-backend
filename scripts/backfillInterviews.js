@@ -227,9 +227,9 @@ async function scoreTranscriptWithOpenAI(transcript) {
   const prompt = `You are an interview evaluator. Return ONLY valid JSON with these exact keys:\n\n{
   "overall": 0-100,
   "summary": "1-3 sentences",
-  "clarity": 0-100,
-  "confidence": 0-100,
-  "body_language": 0-100
+  "role_fit": 0-100,
+  "technical_strength": 0-100,
+  "communication_quality": 0-100
 }\n\nRules:\n- Summary must be 1-3 sentences max.\n- Do NOT include any additional keys.\n- Compliance: Do NOT infer protected traits (age, race, gender, disability, etc.). Evaluate only job-relevant communication quality and content.\n\nTranscript:\n"""${transcript.slice(0, 12000)}"""`;
 
   const resp = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -275,12 +275,12 @@ async function scoreTranscriptWithOpenAI(transcript) {
 
   const transcript_scores = {};
   if (overall !== null) transcript_scores.overall = overall;
-  const clarity = num(parsed.clarity);
-  const confidence = num(parsed.confidence);
-  const bodyLanguage = num(parsed.body_language);
-  if (clarity !== null) transcript_scores.clarity = clarity;
-  if (confidence !== null) transcript_scores.confidence = confidence;
-  if (bodyLanguage !== null) transcript_scores.body_language = bodyLanguage;
+  const roleFit = num(parsed.role_fit);
+  const technicalStrength = num(parsed.technical_strength);
+  const communicationQuality = num(parsed.communication_quality);
+  if (roleFit !== null) transcript_scores.role_fit = roleFit;
+  if (technicalStrength !== null) transcript_scores.technical_strength = technicalStrength;
+  if (communicationQuality !== null) transcript_scores.communication_quality = communicationQuality;
 
   return { summary, transcript_scores };
 }
@@ -313,21 +313,6 @@ function normalizeAnalysis(analysis) {
   return {};
 }
 
-function isTranscriptAnalysisComplete(analysis) {
-  const obj = normalizeAnalysis(analysis);
-  const overallNew = obj.transcript_scores && typeof obj.transcript_scores === 'object'
-    ? obj.transcript_scores.overall
-    : undefined;
-  const overallLegacy = obj.scores && typeof obj.scores === 'object'
-    ? obj.scores.overall
-    : undefined;
-  return Number.isFinite(overallNew) || Number.isFinite(overallLegacy);
-}
-
-function hasMissingTranscriptAnalysis(analysis) {
-  return !isTranscriptAnalysisComplete(analysis);
-}
-
 async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
   const requestId = opts?.request_id || null;
   const dryRun = opts?.dry_run === true;
@@ -339,14 +324,18 @@ async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
 
     const { data: row, error } = await supabase
       .from('interviews')
-      .select('id, transcript, transcript_url, analysis, transcript_scores, status')
+      .select('id, transcript, transcript_url, analysis, transcript_scores, interview_summary, status')
       .eq('id', interviewId)
       .maybeSingle();
     if (error || !row) {
       return { ok: false, error: error?.message || 'interview_not_found', request_id: requestId || null };
     }
 
-    if (!hasMissingTranscriptAnalysis(row.analysis)) {
+    const existingOverall = row.transcript_scores && typeof row.transcript_scores === 'object'
+      ? row.transcript_scores.overall
+      : undefined;
+    const existingSummary = typeof row.interview_summary === 'string' ? row.interview_summary.trim() : '';
+    if (Number.isFinite(existingOverall) && existingSummary) {
       return { ok: true, skipped: true, reason: 'already_analyzed', request_id: requestId || null };
     }
 
@@ -357,37 +346,13 @@ async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
 
     const { summary, transcript_scores } = await scoreWithRetry(transcriptText, 3);
 
-    const baseAnalysis = normalizeAnalysis(row.analysis);
-
-    const existingTranscriptScores = baseAnalysis.transcript_scores && typeof baseAnalysis.transcript_scores === 'object'
-      ? baseAnalysis.transcript_scores
-      : {};
-    const existingLegacyScores = baseAnalysis.scores && typeof baseAnalysis.scores === 'object'
-      ? baseAnalysis.scores
-      : {};
-    const mergedTranscriptScores = {
-      ...existingTranscriptScores,
-      ...(transcript_scores || {})
-    };
-    const mergedLegacyScores = {
-      ...existingLegacyScores,
-      ...(transcript_scores || {})
-    };
-
-    const nextAnalysis = {
-      ...baseAnalysis,
-      summary: baseAnalysis.summary ? baseAnalysis.summary : summary,
-      transcript_scores: mergedTranscriptScores,
-      scores: mergedLegacyScores
-    };
-
     const existingTopScores = row.transcript_scores && typeof row.transcript_scores === 'object'
       ? row.transcript_scores
       : {};
     const updatePayload = {
-      analysis: nextAnalysis,
       transcript_scores: { ...existingTopScores, ...(transcript_scores || {}) }
     };
+    updatePayload.interview_summary = summary;
     if (BACKFILL_HYDRATE_TRANSCRIPT && (!row.transcript || row.transcript.trim().length === 0)) {
       updatePayload.transcript = transcriptText;
     }
@@ -419,7 +384,7 @@ async function main() {
 
   let query = supabase
     .from('interviews')
-    .select('id, created_at, transcript, transcript_url, analysis, transcript_scores')
+    .select('id, created_at, transcript, transcript_url, analysis, transcript_scores, interview_summary')
     .order('created_at', { ascending: true })
     .order('id', { ascending: true })
     .limit(BACKFILL_LIMIT);
@@ -470,7 +435,11 @@ async function main() {
     }
 
     try {
-      if (!hasMissingTranscriptAnalysis(row.analysis)) {
+      const existingOverall = row.transcript_scores && typeof row.transcript_scores === 'object'
+        ? row.transcript_scores.overall
+        : undefined;
+      const existingSummary = typeof row.interview_summary === 'string' ? row.interview_summary.trim() : '';
+      if (Number.isFinite(existingOverall) && existingSummary) {
         skipped += 1;
         console.log(`[backfill] skip ${row.id} already_analyzed`);
         continue;
@@ -485,37 +454,13 @@ async function main() {
 
       const { summary, transcript_scores } = await scoreWithRetry(transcriptText, 3);
 
-      const baseAnalysis = normalizeAnalysis(row.analysis);
-
-      const existingTranscriptScores = baseAnalysis.transcript_scores && typeof baseAnalysis.transcript_scores === 'object'
-        ? baseAnalysis.transcript_scores
-        : {};
-      const existingLegacyScores = baseAnalysis.scores && typeof baseAnalysis.scores === 'object'
-        ? baseAnalysis.scores
-        : {};
-      const mergedTranscriptScores = {
-        ...existingTranscriptScores,
-        ...(transcript_scores || {})
-      };
-      const mergedLegacyScores = {
-        ...existingLegacyScores,
-        ...(transcript_scores || {})
-      };
-
-      const nextAnalysis = {
-        ...baseAnalysis,
-        summary: baseAnalysis.summary ? baseAnalysis.summary : summary,
-        transcript_scores: mergedTranscriptScores,
-        scores: mergedLegacyScores
-      };
-
       const existingTopScores = row.transcript_scores && typeof row.transcript_scores === 'object'
         ? row.transcript_scores
         : {};
       const updatePayload = {
-        analysis: nextAnalysis,
         transcript_scores: { ...existingTopScores, ...(transcript_scores || {}) }
       };
+      updatePayload.interview_summary = summary;
       if (BACKFILL_HYDRATE_TRANSCRIPT && (!row.transcript || row.transcript.trim().length === 0)) {
         updatePayload.transcript = transcriptText;
       }

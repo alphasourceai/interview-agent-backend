@@ -110,34 +110,34 @@ function extractPerceptionScores(payload) {
     fromAny(payload, 'analysis.confidence'),
     fromAny(payload, 'analysis.scores.confidence')
   );
-  const bodyLanguageRaw = pickFirst(
+  const engagementRaw = pickFirst(
+    fromAny(payload, 'engagement'),
+    fromAny(payload, 'engagement_score'),
     fromAny(payload, 'body_language'),
     fromAny(payload, 'bodyLanguage'),
     fromAny(payload, 'body_language_score'),
     fromAny(payload, 'bodyLanguageScore'),
-    fromAny(payload, 'engagement'),
-    fromAny(payload, 'engagement_score'),
     fromAny(payload, 'nonverbal'),
     fromAny(payload, 'non_verbal'),
     fromAny(payload, 'nonVerbal'),
     fromAny(payload, 'nonverbal_score'),
     fromAny(payload, 'nonVerbalScore'),
+    fromAny(payload, 'scores.engagement'),
     fromAny(payload, 'scores.body_language'),
     fromAny(payload, 'scores.bodyLanguage'),
     fromAny(payload, 'scores.bodyLanguageScore'),
-    fromAny(payload, 'scores.engagement'),
     fromAny(payload, 'scores.nonverbal'),
     fromAny(payload, 'scores.nonVerbal'),
+    fromAny(payload, 'analysis.engagement'),
     fromAny(payload, 'analysis.body_language'),
     fromAny(payload, 'analysis.bodyLanguage'),
     fromAny(payload, 'analysis.bodyLanguageScore'),
-    fromAny(payload, 'analysis.engagement'),
     fromAny(payload, 'analysis.nonverbal'),
     fromAny(payload, 'analysis.nonVerbal'),
+    fromAny(payload, 'analysis.scores.engagement'),
     fromAny(payload, 'analysis.scores.body_language'),
     fromAny(payload, 'analysis.scores.bodyLanguage'),
     fromAny(payload, 'analysis.scores.bodyLanguageScore'),
-    fromAny(payload, 'analysis.scores.engagement'),
     fromAny(payload, 'analysis.scores.nonverbal'),
     fromAny(payload, 'analysis.scores.nonVerbal')
   );
@@ -145,7 +145,27 @@ function extractPerceptionScores(payload) {
   const out = {};
   const clarity = clampScore(clarityRaw);
   const confidence = clampScore(confidenceRaw);
-  const bodyLanguage = clampScore(bodyLanguageRaw);
+  const engagement = clampScore(engagementRaw);
+  if (clarity !== null) out.clarity = clarity;
+  if (confidence !== null) out.confidence = confidence;
+  if (engagement !== null) out.engagement = engagement;
+  return out;
+}
+
+function extractPerceptionScoresFromText(text) {
+  if (!text || typeof text !== 'string') return {};
+  const readNum = (re) => {
+    const match = re.exec(text);
+    if (!match) return null;
+    return clampScore(match[1]);
+  };
+  const clarity = readNum(/CLARITY\s*[:=]\s*(\d{1,3})/i);
+  const confidence = readNum(/CONFIDENCE\s*[:=]\s*(\d{1,3})/i);
+  let bodyLanguage = readNum(/BODY[_\s-]*LANGUAGE\s*[:=]\s*(\d{1,3})/i);
+  if (bodyLanguage === null) bodyLanguage = readNum(/NONVERBAL\s*[:=]\s*(\d{1,3})/i);
+  if (bodyLanguage === null) bodyLanguage = readNum(/ENGAGEMENT\s*[:=]\s*(\d{1,3})/i);
+
+  const out = {};
   if (clarity !== null) out.clarity = clarity;
   if (confidence !== null) out.confidence = confidence;
   if (bodyLanguage !== null) out.body_language = bodyLanguage;
@@ -202,6 +222,42 @@ function isTranscriptAnalysisComplete(analysis) {
   return Number.isFinite(overallNew) || Number.isFinite(overallLegacy);
 }
 
+function isTranscriptAnalysisCompleteForRow(row) {
+  if (!row) return false;
+  if (row.transcript_scores && typeof row.transcript_scores === 'object') {
+    if (Number.isFinite(row.transcript_scores.overall)) return true;
+  }
+  return isTranscriptAnalysisComplete(row.analysis);
+}
+
+function extractAnswerScoresFromAnalysis(analysis) {
+  let obj = analysis;
+  if (typeof obj === 'string') {
+    try {
+      obj = JSON.parse(obj);
+    } catch {
+      return {};
+    }
+  }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return {};
+  const src = obj.transcript_scores && typeof obj.transcript_scores === 'object'
+    ? obj.transcript_scores
+    : obj.scores && typeof obj.scores === 'object'
+      ? obj.scores
+      : null;
+  if (!src) return {};
+  const out = {};
+  if (Number.isFinite(src.overall)) out.overall = src.overall;
+  if (Number.isFinite(src.role_fit ?? src.roleFit)) out.role_fit = Number.isFinite(src.role_fit) ? src.role_fit : src.roleFit;
+  if (Number.isFinite(src.technical_strength ?? src.technicalStrength)) {
+    out.technical_strength = Number.isFinite(src.technical_strength) ? src.technical_strength : src.technicalStrength;
+  }
+  if (Number.isFinite(src.communication_quality ?? src.communicationQuality)) {
+    out.communication_quality = Number.isFinite(src.communication_quality) ? src.communication_quality : src.communicationQuality;
+  }
+  return out;
+}
+
 function getRequestId(req, body) {
   return pickFirst(
     req?.headers?.['x-request-id'],
@@ -250,7 +306,7 @@ function extractCandidateQuestions(transcriptText) {
   const lines = transcriptText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   const out = new Set();
   const interrogativeRe = /^(who|what|when|where|why|how|can|could|would|do|does|is|are|should)\b/i;
-  const refusalRe = /note it for the hiring manager/i;
+  const refusalRe = /note it for the hiring manager|i don't have that information|i do not have that information|i can't answer|i cannot answer|i will pass it to the hiring manager|i'll pass it to the hiring manager|i will note it for the hiring manager|i'll note it for the hiring manager/i;
   let lastCandidate = '';
   for (const line of lines) {
     const upper = line.toUpperCase();
@@ -334,173 +390,54 @@ async function updatePerceptionAnalysis(interview, analysisText, requestId) {
     trimmed = String(analysisText || '');
   }
   trimmed = String(trimmed || '').trim();
-  if (!trimmed) return false;
+  if (!trimmed) return { stored: false, perception_scores: {} };
   const conversationId = interview?.tavus_application_id || interview?.conversation_id || null;
 
-  let stored = false;
-  let analysisUpdated = false;
-  let transcriptScoresUpdated = false;
   let perceptionScores = {};
-
-  if (!stored && hasColumn(interview, 'perception_analysis')) {
-    const { error } = await supabaseAdmin
-      .from('interviews')
-      .update({ perception_analysis: trimmed })
-      .eq('id', interview.id);
-    if (!error) {
-      stored = true;
-    } else if (!isMissingColumnError(error)) {
-      console.error('[webhook] perception_analysis update failed', {
-        request_id: requestId || null,
-        interview_id: interview.id,
-        conversation_id: conversationId,
-        error: error.message || error,
-        details: error.details || null,
-        hint: error.hint || null
-      });
-    }
-  }
-
-  if (!stored && hasColumn(interview, 'metadata')) {
-    const baseMeta = interview.metadata && typeof interview.metadata === 'object' ? interview.metadata : {};
-    const { error } = await supabaseAdmin
-      .from('interviews')
-      .update({ metadata: { ...baseMeta, perception_analysis: trimmed } })
-      .eq('id', interview.id);
-    if (!error) {
-      stored = true;
-    } else if (!isMissingColumnError(error)) {
-      console.error('[webhook] perception_analysis metadata update failed', {
-        request_id: requestId || null,
-        interview_id: interview.id,
-        conversation_id: conversationId,
-        error: error.message || error,
-        details: error.details || null,
-        hint: error.hint || null
-      });
-    }
-  }
-
-  if (!stored && hasColumn(interview, 'perception_json')) {
-    const { error } = await supabaseAdmin
-      .from('interviews')
-      .update({ perception_json: { analysis: trimmed } })
-      .eq('id', interview.id);
-    if (!error) {
-      stored = true;
-    } else if (!isMissingColumnError(error)) {
-      console.error('[webhook] perception_analysis perception_json update failed', {
-        request_id: requestId || null,
-        interview_id: interview.id,
-        conversation_id: conversationId,
-        error: error.message || error,
-        details: error.details || null,
-        hint: error.hint || null
-      });
-    }
-  }
-
-  if (!stored && hasColumn(interview, 'notes')) {
-    const { error } = await supabaseAdmin
-      .from('interviews')
-      .update({ notes: trimmed })
-      .eq('id', interview.id);
-    if (!error) {
-      stored = true;
-    } else if (!isMissingColumnError(error)) {
-      console.error('[webhook] perception_analysis notes update failed', {
-        request_id: requestId || null,
-        interview_id: interview.id,
-        conversation_id: conversationId,
-        error: error.message || error,
-        details: error.details || null,
-        hint: error.hint || null
-      });
-    }
-  }
-
-  if (!stored) {
-    console.log('[webhook] perception_analysis skipped (no column)', {
-      request_id: requestId || null,
-      interview_id: interview.id
-    });
-  }
-
-  // Best-effort: extract structured scores into interviews.analysis
-  if (looksLikeJson(trimmed)) {
+  if (analysisText && typeof analysisText === 'object') {
+    perceptionScores = extractPerceptionScores(analysisText);
+  } else if (looksLikeJson(trimmed)) {
     try {
       const parsed = JSON.parse(trimmed);
       perceptionScores = extractPerceptionScores(parsed);
-      if (Object.keys(perceptionScores).length) {
-        const baseAnalysis =
-          interview.analysis && typeof interview.analysis === 'object' && !Array.isArray(interview.analysis)
-            ? interview.analysis
-            : {};
-        const nextAnalysis = {
-          ...baseAnalysis,
-          perception_scores: {
-            ...(baseAnalysis.perception_scores && typeof baseAnalysis.perception_scores === 'object'
-              ? baseAnalysis.perception_scores
-              : {}),
-            ...perceptionScores
-          }
-        };
-        const { error: analysisErr } = await supabaseAdmin
-          .from('interviews')
-          .update({ analysis: nextAnalysis })
-          .eq('id', interview.id);
-        if (!analysisErr) {
-          analysisUpdated = true;
-        } else if (!isMissingColumnError(analysisErr)) {
-          console.error('[webhook] perception_analysis structured update failed', {
-            request_id: requestId || null,
-            interview_id: interview.id,
-            conversation_id: conversationId,
-            error: analysisErr.message || analysisErr,
-            details: analysisErr.details || null,
-            hint: analysisErr.hint || null
-          });
-        }
-
-        if (Number.isFinite(perceptionScores.body_language)) {
-          const existingTopScores =
-            interview.transcript_scores && typeof interview.transcript_scores === 'object'
-              ? interview.transcript_scores
-              : {};
-          const topScores = { ...existingTopScores, body_language: perceptionScores.body_language };
-          const { error: topErr } = await supabaseAdmin
-            .from('interviews')
-            .update({ transcript_scores: topScores })
-            .eq('id', interview.id);
-          if (!topErr) {
-            transcriptScoresUpdated = true;
-          } else if (!isMissingColumnError(topErr)) {
-            console.error('[webhook] perception_analysis transcript_scores update failed', {
-              request_id: requestId || null,
-              interview_id: interview.id,
-              conversation_id: conversationId,
-              error: topErr.message || topErr,
-              details: topErr.details || null,
-              hint: topErr.hint || null
-            });
-          }
-        }
-      }
     } catch (err) {
       console.error('[webhook] perception_analysis JSON parse failed', {
         request_id: requestId || null,
         interview_id: interview.id,
-        error: err?.message || err
+        conversation_id: conversationId,
+        error: err?.message || err,
+        details: err?.details || null,
+        hint: err?.hint || null
       });
     }
   }
 
-  return {
-    stored,
-    perception_scores: perceptionScores,
-    analysis_updated: analysisUpdated,
-    transcript_scores_updated: transcriptScoresUpdated
-  };
+  const updates = { perception_analysis_text: trimmed };
+  if (Object.keys(perceptionScores).length) {
+    const existingScores =
+      interview.perception_scores && typeof interview.perception_scores === 'object'
+        ? interview.perception_scores
+        : {};
+    updates.perception_scores = { ...existingScores, ...perceptionScores };
+  }
+
+  const { error } = await supabaseAdmin
+    .from('interviews')
+    .update(updates)
+    .eq('id', interview.id);
+  if (error) {
+    console.error('[webhook] perception_analysis update failed', {
+      request_id: requestId || null,
+      interview_id: interview.id,
+      conversation_id: conversationId,
+      error: error.message || error,
+      details: error.details || null,
+      hint: error.hint || null
+    });
+    return { stored: false, perception_scores: perceptionScores };
+  }
+
+  return { stored: true, perception_scores: perceptionScores };
 }
 
 async function getInterviewByIds(interviewId, conversationId) {
@@ -747,7 +684,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
         updates.transcript = transcriptText;
         updates.status = 'Transcribed';
         transcriptNonEmpty = true;
-        analysisMissing = !isTranscriptAnalysisComplete(interview.analysis);
+        analysisMissing = !isTranscriptAnalysisCompleteForRow(interview);
         shouldTriggerAnalysisRun = analysisMissing;
       } else {
         updates.transcript = null;
@@ -761,7 +698,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
         transcriptText = existingTranscript;
         if (!transcriptNonEmpty) {
           transcriptNonEmpty = true;
-          analysisMissing = !isTranscriptAnalysisComplete(interview.analysis);
+          analysisMissing = !isTranscriptAnalysisCompleteForRow(interview);
           shouldTriggerAnalysisRun = analysisMissing;
         }
       }
@@ -841,9 +778,24 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
     }
 
     if (isPerceptionAnalysis) {
+      let perceptionRawPath = null;
       try {
         const perceptionPath = `interviews/${interview.id}-perception.json`;
-        await putJsonToStorage(TRANSCRIPTS_BUCKET, perceptionPath, body);
+        perceptionRawPath = await putJsonToStorage(TRANSCRIPTS_BUCKET, perceptionPath, body);
+        const { error: rawErr } = await supabaseAdmin
+          .from('interviews')
+          .update({ perception_raw_path: perceptionRawPath })
+          .eq('id', interview.id);
+        if (rawErr) {
+          console.error('[webhook] perception_raw_path update failed', {
+            request_id: requestId || null,
+            interview_id: interview.id,
+            conversation_id: conversationId || null,
+            error: rawErr.message || rawErr,
+            details: rawErr.details || null,
+            hint: rawErr.hint || null
+          });
+        }
       } catch (err) {
         console.error('[webhook] perception_analysis storage failed', {
           request_id: requestId || null,
@@ -861,13 +813,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
         fromAny(body, 'payload.analysis'),
         fromAny(body, 'properties.perception_analysis'),
         fromAny(body, 'perception_analysis'),
-        fromAny(body, 'payload.perception_analysis'),
-        fromAny(body, 'properties.perception'),
-        fromAny(body, 'perception'),
-        fromAny(body, 'payload.perception'),
-        fromAny(body, 'output'),
-        fromAny(body, 'payload'),
-        fromAny(body, 'properties')
+        fromAny(body, 'payload.perception_analysis')
       );
       if (analysisText && typeof analysisText === 'object') {
         try {
@@ -886,9 +832,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
           interview_id: interview.id,
           conversation_id: conversationId || null,
           extracted_keys: extractedKeys,
-          stored: perceptionResult?.stored ?? null,
-          analysis_updated: perceptionResult?.analysis_updated ?? null,
-          transcript_scores_updated: perceptionResult?.transcript_scores_updated ?? null
+          stored: perceptionResult?.stored ?? null
         });
       } else {
         perceptionKeysCount = 0;
@@ -925,7 +869,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
     if (isTranscriptionReady) {
       const { data: fresh, error: freshErr } = await supabaseAdmin
         .from('interviews')
-        .select('id, status, analysis, transcript_scores, transcript, unanswered_candidate_questions')
+        .select('id, status, analysis, transcript_scores, transcript, interview_summary, unanswered_candidate_questions')
         .eq('id', interview.id)
         .maybeSingle();
       if (freshErr) {
@@ -945,7 +889,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
           transcriptNonEmpty = true;
         }
 
-        const analysisComplete = isTranscriptAnalysisComplete(fresh.analysis);
+        const analysisComplete = isTranscriptAnalysisCompleteForRow(fresh);
         analysisCompleteSummary = analysisComplete;
         if (transcriptNonEmpty) {
           analysisMissing = !analysisComplete;
@@ -960,32 +904,23 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
               analysisObj = null;
             }
           }
-          const normalized = {};
-          if (analysisObj && typeof analysisObj === 'object' && !Array.isArray(analysisObj)) {
-            const primaryScores =
-              analysisObj.transcript_scores && typeof analysisObj.transcript_scores === 'object'
-                ? analysisObj.transcript_scores
-                : analysisObj.scores && typeof analysisObj.scores === 'object'
-                  ? analysisObj.scores
-                  : null;
-            if (primaryScores) {
-              if (Number.isFinite(primaryScores.overall)) normalized.overall = primaryScores.overall;
-              if (Number.isFinite(primaryScores.clarity)) normalized.clarity = primaryScores.clarity;
-              if (Number.isFinite(primaryScores.confidence)) normalized.confidence = primaryScores.confidence;
-              if (Number.isFinite(primaryScores.body_language)) normalized.body_language = primaryScores.body_language;
-            }
-          }
+          const normalized = extractAnswerScoresFromAnalysis(analysisObj);
 
           const normalizedKeys = Object.keys(normalized);
-          if (normalizedKeys.length) {
+          const summaryText = typeof analysisObj?.summary === 'string' ? analysisObj.summary.trim() : '';
+          const needsSummary = summaryText && (!fresh.interview_summary || !String(fresh.interview_summary).trim());
+          if (normalizedKeys.length || needsSummary) {
             const existingTopScores =
               fresh.transcript_scores && typeof fresh.transcript_scores === 'object'
                 ? fresh.transcript_scores
                 : {};
-            const mergedTopScores = { ...existingTopScores, ...normalized };
+            const mergedTopScores = normalizedKeys.length ? { ...existingTopScores, ...normalized } : existingTopScores;
+            const updateFields = {};
+            if (normalizedKeys.length) updateFields.transcript_scores = mergedTopScores;
+            if (needsSummary) updateFields.interview_summary = summaryText;
             const { error: scoreErr } = await supabaseAdmin
               .from('interviews')
-              .update({ transcript_scores: mergedTopScores })
+              .update(updateFields)
               .eq('id', interview.id);
             if (scoreErr) {
               console.error('[webhook] transcript_scores update failed', {
@@ -1123,56 +1058,46 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
           if (result?.ok) {
             const { data: fresh, error: freshErr } = await supabaseAdmin
               .from('interviews')
-              .select('id, status, analysis, transcript_scores, transcript')
+              .select('id, status, analysis, transcript_scores, transcript, interview_summary')
               .eq('id', interview.id)
               .maybeSingle();
             if (!freshErr && fresh) {
-              analysisComplete = isTranscriptAnalysisComplete(fresh.analysis);
-              statusFrom = fresh.status || null;
-              let analysisObj = fresh.analysis;
-              if (typeof analysisObj === 'string') {
-                try {
-                  analysisObj = JSON.parse(analysisObj);
-                } catch {
-                  analysisObj = null;
-                }
-              }
-              if (analysisObj && typeof analysisObj === 'object' && !Array.isArray(analysisObj)) {
-                const primaryScores =
-                  analysisObj.transcript_scores && typeof analysisObj.transcript_scores === 'object'
-                    ? analysisObj.transcript_scores
-                    : analysisObj.scores && typeof analysisObj.scores === 'object'
-                      ? analysisObj.scores
-                      : null;
-                if (primaryScores) {
-                  const normalized = {};
-                  if (Number.isFinite(primaryScores.overall)) normalized.overall = primaryScores.overall;
-                  if (Number.isFinite(primaryScores.clarity)) normalized.clarity = primaryScores.clarity;
-                  if (Number.isFinite(primaryScores.confidence)) normalized.confidence = primaryScores.confidence;
-                  if (Number.isFinite(primaryScores.body_language)) normalized.body_language = primaryScores.body_language;
-                  if (Object.keys(normalized).length) {
-                    const existingTopScores =
-                      fresh.transcript_scores && typeof fresh.transcript_scores === 'object'
-                        ? fresh.transcript_scores
-                        : {};
-                    const mergedTopScores = { ...existingTopScores, ...normalized };
-                    const { error: scoreErr } = await supabaseAdmin
-                      .from('interviews')
-                      .update({ transcript_scores: mergedTopScores })
-                      .eq('id', interview.id);
-                    if (scoreErr) {
-                      console.error('[webhook] transcript_scores update failed', {
-                        request_id: requestId || null,
-                        interview_id: interview.id,
-                        conversation_id: conversationId || null,
-                        error: scoreErr.message || scoreErr,
-                        details: scoreErr.details || null,
-                        hint: scoreErr.hint || null
-                      });
-                    }
-                  }
-                }
-              }
+          analysisComplete = isTranscriptAnalysisCompleteForRow(fresh);
+          statusFrom = fresh.status || null;
+          let analysisObj = fresh.analysis;
+          if (typeof analysisObj === 'string') {
+            try {
+              analysisObj = JSON.parse(analysisObj);
+            } catch {
+              analysisObj = null;
+            }
+          }
+          const normalized = extractAnswerScoresFromAnalysis(analysisObj);
+          if (Object.keys(normalized).length) {
+            const existingTopScores =
+              fresh.transcript_scores && typeof fresh.transcript_scores === 'object'
+                ? fresh.transcript_scores
+                : {};
+            const mergedTopScores = { ...existingTopScores, ...normalized };
+            const summaryText = typeof analysisObj?.summary === 'string' ? analysisObj.summary.trim() : '';
+            const needsSummary = summaryText && (!fresh.interview_summary || !String(fresh.interview_summary).trim());
+            const updateFields = { transcript_scores: mergedTopScores };
+            if (needsSummary) updateFields.interview_summary = summaryText;
+            const { error: scoreErr } = await supabaseAdmin
+              .from('interviews')
+              .update(updateFields)
+              .eq('id', interview.id);
+            if (scoreErr) {
+              console.error('[webhook] transcript_scores update failed', {
+                request_id: requestId || null,
+                interview_id: interview.id,
+                conversation_id: conversationId || null,
+                error: scoreErr.message || scoreErr,
+                details: scoreErr.details || null,
+                hint: scoreErr.hint || null
+              });
+            }
+          }
 
               const allowed = [
                 'ReadyForAnalysis',
@@ -1244,7 +1169,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
     }
 
     if (analysisCompleteSummary === null) {
-      analysisCompleteSummary = isTranscriptAnalysisComplete(interview.analysis);
+      analysisCompleteSummary = isTranscriptAnalysisCompleteForRow(interview);
     }
 
     console.log('[webhook] summary', {

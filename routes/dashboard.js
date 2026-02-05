@@ -68,7 +68,21 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
     if (candIds.length) {
       const { data: ivs, error: iErr } = await supabase
         .from('interviews')
-        .select('id, candidate_id, client_id, created_at, video_url, transcript_url, transcript, analysis_url, analysis')
+        .select([
+          'id',
+          'candidate_id',
+          'client_id',
+          'created_at',
+          'video_url',
+          'transcript_url',
+          'transcript',
+          'analysis_url',
+          'analysis',
+          'perception_scores',
+          'transcript_scores',
+          'interview_summary',
+          'unanswered_candidate_questions'
+        ].join(', '))
         .eq('client_id', clientId)
         .in('candidate_id', candIds)
         .order('created_at', { ascending: false });
@@ -147,44 +161,22 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         summary:    (typeof repRA.summary === 'string' ? repRA.summary : '')
       };
 
-      // Start from report's interview_analysis or interview_breakdown
-      const repIA = rep?.interview_analysis ?? rep?.interview_breakdown ?? {};
-      let interview_analysis = {
-        clarity:       Number.isFinite(Number(repIA.clarity)) ? Number(repIA.clarity) : null,
-        confidence:    Number.isFinite(Number(repIA.confidence)) ? Number(repIA.confidence) : null,
-        body_language: Number.isFinite(Number(repIA.body_language)) ? Number(repIA.body_language) : null,
-        summary:       (typeof repIA.summary === 'string' ? repIA.summary : '')
+      const interview_analysis = {
+        clarity: Number.isFinite(Number(iv?.perception_scores?.clarity)) ? Number(iv.perception_scores.clarity) : null,
+        confidence: Number.isFinite(Number(iv?.perception_scores?.confidence)) ? Number(iv.perception_scores.confidence) : null,
+        engagement: Number.isFinite(Number(iv?.perception_scores?.engagement))
+          ? Number(iv.perception_scores.engagement)
+          : (Number.isFinite(Number(iv?.perception_scores?.body_language)) ? Number(iv.perception_scores.body_language) : null),
+        summary: (typeof iv?.interview_summary === 'string' ? iv.interview_summary : '')
       };
-
-      // If summary missing, try reports.analysis.summary
-      if ((!interview_analysis.summary || !interview_analysis.summary.trim()) && typeof rep?.analysis?.summary === 'string') {
-        interview_analysis.summary = rep.analysis.summary;
-      }
-
-      // Fallbacks from latest interview JSON analysis (if report lacks pieces)
-      const ivAnalysis = iv?.analysis || null;
-      if (ivAnalysis) {
-        // scores fallback
-        const scores = ivAnalysis.scores || {};
-        if (interview_analysis.clarity == null && Number.isFinite(Number(scores.clarity))) {
-          interview_analysis.clarity = Number(scores.clarity);
-        }
-        if (interview_analysis.confidence == null && Number.isFinite(Number(scores.confidence))) {
-          interview_analysis.confidence = Number(scores.confidence);
-        }
-        if (interview_analysis.body_language == null && Number.isFinite(Number(scores.body_language))) {
-          interview_analysis.body_language = Number(scores.body_language);
-        }
-        // summary fallback
-        if (!interview_analysis.summary && typeof ivAnalysis.summary === 'string') {
-          interview_analysis.summary = ivAnalysis.summary;
-        }
-      }
 
       // PDF URL preference: explicit latest_report_url, else report_url
       const latest_report_url = rep?.latest_report_url || rep?.report_url || null;
       const safeVideoUrl = iv?.video_url && !isDailyRoomUrl(iv.video_url) ? iv.video_url : null;
-      const hasTranscript = !!iv?.transcript_url || !!iv?.transcript;
+      const hasTranscript = !!iv?.transcript;
+      const transcriptOverall = Number.isFinite(Number(iv?.transcript_scores?.overall))
+        ? Number(iv.transcript_scores.overall)
+        : null;
 
       return {
         // row identity is the candidate (FE now uses latest_interview_id for actions)
@@ -200,13 +192,18 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         video_url: safeVideoUrl,
         transcript_url: iv?.transcript_url || null,
         analysis_url: iv?.analysis_url || null,
+        transcript_scores: iv?.transcript_scores || null,
+        perception_scores: iv?.perception_scores || null,
+        interview_summary: iv?.interview_summary || '',
+        unanswered_candidate_questions: iv?.unanswered_candidate_questions || [],
+        transcript: typeof iv?.transcript === 'string' ? iv.transcript : '',
         has_video: !!safeVideoUrl,
         has_transcript: hasTranscript,
         has_analysis: !!iv?.analysis_url,
 
         // report-driven bits
         resume_score,
-        interview_score,
+        interview_score: transcriptOverall ?? null,
         overall_score,
         resume_analysis,
         interview_analysis,
@@ -237,7 +234,7 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
 
     const { data: rows, error: iErr } = await supabase
       .from('interviews')
-      .select('id, created_at, client_id, candidate_id, role_id, video_url, transcript_url, transcript, analysis_url, resume_score, interview_score, overall_score, resume_analysis, interview_analysis, latest_report_url, report_generated_at')
+      .select('id, created_at, client_id, candidate_id, role_id, video_url, transcript_url, transcript, analysis_url, resume_score, interview_score, overall_score, resume_analysis, interview_analysis, latest_report_url, report_generated_at, perception_scores, transcript_scores, interview_summary, unanswered_candidate_questions')
       .eq('client_id', clientId)
       .order('created_at', { ascending: false })
       .limit(500);
@@ -287,6 +284,9 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
       .map(r => {
         const safeVideoUrl = r.video_url && !isDailyRoomUrl(r.video_url) ? r.video_url : null;
         const hasTranscript = !!r.transcript_url || !!r.transcript;
+        const transcriptOverall = Number.isFinite(Number(r?.transcript_scores?.overall))
+          ? Number(r.transcript_scores.overall)
+          : null;
         return {
         id: r.id,
         created_at: r.created_at,
@@ -295,15 +295,26 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
         role: r.role_id ? (rolesById[r.role_id] || null) : null,
         video_url: safeVideoUrl,
         transcript_url: r.transcript_url || null,
+        transcript_scores: r.transcript_scores || null,
+        perception_scores: r.perception_scores || null,
+        interview_summary: r.interview_summary || '',
+        unanswered_candidate_questions: r.unanswered_candidate_questions || [],
         analysis_url: r.analysis_url || null,
         has_video: !!safeVideoUrl,
         has_transcript: hasTranscript,
         has_analysis: !!r.analysis_url,
         resume_score: isFinite(r.resume_score) ? Number(r.resume_score) : null,
-        interview_score: isFinite(r.interview_score) ? Number(r.interview_score) : null,
+        interview_score: transcriptOverall ?? null,
         overall_score: isFinite(r.overall_score) ? Number(r.overall_score) : null,
         resume_analysis: r.resume_analysis || { experience: null, skills: null, education: null, summary: '' },
-        interview_analysis: r.interview_analysis || { clarity: null, confidence: null, body_language: null },
+        interview_analysis: {
+          clarity: Number.isFinite(Number(r?.perception_scores?.clarity)) ? Number(r.perception_scores.clarity) : null,
+          confidence: Number.isFinite(Number(r?.perception_scores?.confidence)) ? Number(r.perception_scores.confidence) : null,
+          engagement: Number.isFinite(Number(r?.perception_scores?.engagement))
+            ? Number(r.perception_scores.engagement)
+            : (Number.isFinite(Number(r?.perception_scores?.body_language)) ? Number(r.perception_scores.body_language) : null),
+          summary: typeof r.interview_summary === 'string' ? r.interview_summary : ''
+        },
         latest_report_url: r.latest_report_url || null,
         report_generated_at: r.report_generated_at || null,
       };
