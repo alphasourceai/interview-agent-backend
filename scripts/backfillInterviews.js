@@ -313,17 +313,24 @@ function normalizeAnalysis(analysis) {
   return {};
 }
 
-function hasMissingTranscriptAnalysis(analysis) {
+function isTranscriptAnalysisComplete(analysis) {
   const obj = normalizeAnalysis(analysis);
-  const summary = typeof obj.summary === 'string' ? obj.summary.trim() : '';
-  const overall = obj.transcript_scores && typeof obj.transcript_scores === 'object'
+  const overallNew = obj.transcript_scores && typeof obj.transcript_scores === 'object'
     ? obj.transcript_scores.overall
     : undefined;
-  return !summary || overall === undefined || overall === null;
+  const overallLegacy = obj.scores && typeof obj.scores === 'object'
+    ? obj.scores.overall
+    : undefined;
+  return Number.isFinite(overallNew) || Number.isFinite(overallLegacy);
+}
+
+function hasMissingTranscriptAnalysis(analysis) {
+  return !isTranscriptAnalysisComplete(analysis);
 }
 
 async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
   const requestId = opts?.request_id || null;
+  const dryRun = opts?.dry_run === true;
 
   try {
     if (!interviewId) {
@@ -332,7 +339,7 @@ async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
 
     const { data: row, error } = await supabase
       .from('interviews')
-      .select('id, transcript, transcript_url, analysis')
+      .select('id, transcript, transcript_url, analysis, transcript_scores, status')
       .eq('id', interviewId)
       .maybeSingle();
     if (error || !row) {
@@ -352,23 +359,40 @@ async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
 
     const baseAnalysis = normalizeAnalysis(row.analysis);
 
+    const existingTranscriptScores = baseAnalysis.transcript_scores && typeof baseAnalysis.transcript_scores === 'object'
+      ? baseAnalysis.transcript_scores
+      : {};
+    const existingLegacyScores = baseAnalysis.scores && typeof baseAnalysis.scores === 'object'
+      ? baseAnalysis.scores
+      : {};
+    const mergedTranscriptScores = {
+      ...existingTranscriptScores,
+      ...(transcript_scores || {})
+    };
+    const mergedLegacyScores = {
+      ...existingLegacyScores,
+      ...(transcript_scores || {})
+    };
+
     const nextAnalysis = {
       ...baseAnalysis,
       summary: baseAnalysis.summary ? baseAnalysis.summary : summary,
-      transcript_scores: {
-        ...(baseAnalysis.transcript_scores && typeof baseAnalysis.transcript_scores === 'object'
-          ? baseAnalysis.transcript_scores
-          : {}),
-        ...(transcript_scores || {})
-      }
+      transcript_scores: mergedTranscriptScores,
+      scores: mergedLegacyScores
     };
 
-    const updatePayload = { analysis: nextAnalysis };
+    const existingTopScores = row.transcript_scores && typeof row.transcript_scores === 'object'
+      ? row.transcript_scores
+      : {};
+    const updatePayload = {
+      analysis: nextAnalysis,
+      transcript_scores: { ...existingTopScores, ...(transcript_scores || {}) }
+    };
     if (BACKFILL_HYDRATE_TRANSCRIPT && (!row.transcript || row.transcript.trim().length === 0)) {
       updatePayload.transcript = transcriptText;
     }
 
-    if (BACKFILL_DRY_RUN) {
+    if (dryRun) {
       return { ok: true, updated: false, dry_run: true, request_id: requestId || null };
     }
 
@@ -395,7 +419,7 @@ async function main() {
 
   let query = supabase
     .from('interviews')
-    .select('id, created_at, transcript, transcript_url, analysis')
+    .select('id, created_at, transcript, transcript_url, analysis, transcript_scores')
     .order('created_at', { ascending: true })
     .order('id', { ascending: true })
     .limit(BACKFILL_LIMIT);
@@ -463,18 +487,35 @@ async function main() {
 
       const baseAnalysis = normalizeAnalysis(row.analysis);
 
+      const existingTranscriptScores = baseAnalysis.transcript_scores && typeof baseAnalysis.transcript_scores === 'object'
+        ? baseAnalysis.transcript_scores
+        : {};
+      const existingLegacyScores = baseAnalysis.scores && typeof baseAnalysis.scores === 'object'
+        ? baseAnalysis.scores
+        : {};
+      const mergedTranscriptScores = {
+        ...existingTranscriptScores,
+        ...(transcript_scores || {})
+      };
+      const mergedLegacyScores = {
+        ...existingLegacyScores,
+        ...(transcript_scores || {})
+      };
+
       const nextAnalysis = {
         ...baseAnalysis,
         summary: baseAnalysis.summary ? baseAnalysis.summary : summary,
-        transcript_scores: {
-          ...(baseAnalysis.transcript_scores && typeof baseAnalysis.transcript_scores === 'object'
-            ? baseAnalysis.transcript_scores
-            : {}),
-          ...(transcript_scores || {})
-        }
+        transcript_scores: mergedTranscriptScores,
+        scores: mergedLegacyScores
       };
 
-      const updatePayload = { analysis: nextAnalysis };
+      const existingTopScores = row.transcript_scores && typeof row.transcript_scores === 'object'
+        ? row.transcript_scores
+        : {};
+      const updatePayload = {
+        analysis: nextAnalysis,
+        transcript_scores: { ...existingTopScores, ...(transcript_scores || {}) }
+      };
       if (BACKFILL_HYDRATE_TRANSCRIPT && (!row.transcript || row.transcript.trim().length === 0)) {
         updatePayload.transcript = transcriptText;
       }
