@@ -12,6 +12,56 @@ function isDailyRoomUrl(url) {
   return !!url && DAILY_ROOM_RE.test(String(url));
 }
 
+function parseJsonObject(value) {
+  if (!value) return null;
+  if (typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function toFiniteOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function getTranscriptOverall(interviewRow) {
+  const scores = parseJsonObject(interviewRow?.transcript_scores);
+  return scores ? toFiniteOrNull(scores.overall) : null;
+}
+
+function getPerceptionShape(interviewRow) {
+  const scores = parseJsonObject(interviewRow?.perception_scores) || {};
+  const clarity = toFiniteOrNull(scores.clarity);
+  const confidence = toFiniteOrNull(scores.confidence);
+  const engagementCanonical = toFiniteOrNull(scores.engagement);
+  const engagementFallback = toFiniteOrNull(scores.body_language);
+  const engagement = engagementCanonical !== null ? engagementCanonical : engagementFallback;
+  const presentKeys = [];
+  if (clarity !== null) presentKeys.push('clarity');
+  if (confidence !== null) presentKeys.push('confidence');
+  if (engagementCanonical !== null) presentKeys.push('engagement');
+  else if (engagementFallback !== null) presentKeys.push('body_language');
+  return { clarity, confidence, engagement, presentKeys, raw: scores };
+}
+
+function hasCanonicalAnalysis(interviewRow) {
+  const transcriptOverall = getTranscriptOverall(interviewRow);
+  if (transcriptOverall !== null) return true;
+  const summary = typeof interviewRow?.interview_summary === 'string' ? interviewRow.interview_summary.trim() : '';
+  if (summary) return true;
+  const { clarity, confidence, engagement, raw } = getPerceptionShape(interviewRow);
+  if (clarity !== null || confidence !== null || engagement !== null) return true;
+  const legacyBody = toFiniteOrNull(raw?.body_language);
+  return legacyBody !== null;
+}
+
 /**
  * GET /dashboard/rows
  * One row per candidate (for the scoped client).
@@ -161,22 +211,28 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         summary:    (typeof repRA.summary === 'string' ? repRA.summary : '')
       };
 
+      const perception = getPerceptionShape(iv);
+      const interviewSummary = typeof iv?.interview_summary === 'string' ? iv.interview_summary : '';
       const interview_analysis = {
-        clarity: Number.isFinite(Number(iv?.perception_scores?.clarity)) ? Number(iv.perception_scores.clarity) : null,
-        confidence: Number.isFinite(Number(iv?.perception_scores?.confidence)) ? Number(iv.perception_scores.confidence) : null,
-        engagement: Number.isFinite(Number(iv?.perception_scores?.engagement))
-          ? Number(iv.perception_scores.engagement)
-          : (Number.isFinite(Number(iv?.perception_scores?.body_language)) ? Number(iv.perception_scores.body_language) : null),
-        summary: (typeof iv?.interview_summary === 'string' ? iv.interview_summary : '')
+        clarity: perception.clarity,
+        confidence: perception.confidence,
+        engagement: perception.engagement,
+        summary: interviewSummary
       };
 
       // PDF URL preference: explicit latest_report_url, else report_url
       const latest_report_url = rep?.latest_report_url || rep?.report_url || null;
       const safeVideoUrl = iv?.video_url && !isDailyRoomUrl(iv.video_url) ? iv.video_url : null;
       const hasTranscript = !!iv?.transcript;
-      const transcriptOverall = Number.isFinite(Number(iv?.transcript_scores?.overall))
-        ? Number(iv.transcript_scores.overall)
-        : null;
+      const transcriptOverall = getTranscriptOverall(iv);
+      const canonicalHasAnalysis = hasCanonicalAnalysis(iv);
+      console.log('[dashboard/rows] row', {
+        interview_id: iv?.id || null,
+        has_analysis: canonicalHasAnalysis,
+        transcript_overall: transcriptOverall,
+        perception_keys_present: perception.presentKeys,
+        interview_summary_len: interviewSummary.trim().length
+      });
 
       return {
         // row identity is the candidate (FE now uses latest_interview_id for actions)
@@ -192,14 +248,14 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         video_url: safeVideoUrl,
         transcript_url: iv?.transcript_url || null,
         analysis_url: iv?.analysis_url || null,
-        transcript_scores: iv?.transcript_scores || null,
-        perception_scores: iv?.perception_scores || null,
-        interview_summary: iv?.interview_summary || '',
-        unanswered_candidate_questions: iv?.unanswered_candidate_questions || [],
+        transcript_scores: parseJsonObject(iv?.transcript_scores) || null,
+        perception_scores: parseJsonObject(iv?.perception_scores) || null,
+        interview_summary: interviewSummary || '',
+        unanswered_candidate_questions: Array.isArray(iv?.unanswered_candidate_questions) ? iv.unanswered_candidate_questions : [],
         transcript: typeof iv?.transcript === 'string' ? iv.transcript : '',
         has_video: !!safeVideoUrl,
         has_transcript: hasTranscript,
-        has_analysis: !!iv?.analysis_url,
+        has_analysis: canonicalHasAnalysis,
 
         // report-driven bits
         resume_score,
@@ -284,9 +340,17 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
       .map(r => {
         const safeVideoUrl = r.video_url && !isDailyRoomUrl(r.video_url) ? r.video_url : null;
         const hasTranscript = !!r.transcript_url || !!r.transcript;
-        const transcriptOverall = Number.isFinite(Number(r?.transcript_scores?.overall))
-          ? Number(r.transcript_scores.overall)
-          : null;
+        const transcriptOverall = getTranscriptOverall(r);
+        const perception = getPerceptionShape(r);
+        const interviewSummary = typeof r?.interview_summary === 'string' ? r.interview_summary : '';
+        const canonicalHasAnalysis = hasCanonicalAnalysis(r);
+        console.log('[dashboard/interviews] row', {
+          interview_id: r?.id || null,
+          has_analysis: canonicalHasAnalysis,
+          transcript_overall: transcriptOverall,
+          perception_keys_present: perception.presentKeys,
+          interview_summary_len: interviewSummary.trim().length
+        });
         return {
         id: r.id,
         created_at: r.created_at,
@@ -295,25 +359,23 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
         role: r.role_id ? (rolesById[r.role_id] || null) : null,
         video_url: safeVideoUrl,
         transcript_url: r.transcript_url || null,
-        transcript_scores: r.transcript_scores || null,
-        perception_scores: r.perception_scores || null,
-        interview_summary: r.interview_summary || '',
-        unanswered_candidate_questions: r.unanswered_candidate_questions || [],
+        transcript_scores: parseJsonObject(r.transcript_scores) || null,
+        perception_scores: parseJsonObject(r.perception_scores) || null,
+        interview_summary: interviewSummary || '',
+        unanswered_candidate_questions: Array.isArray(r.unanswered_candidate_questions) ? r.unanswered_candidate_questions : [],
         analysis_url: r.analysis_url || null,
         has_video: !!safeVideoUrl,
         has_transcript: hasTranscript,
-        has_analysis: !!r.analysis_url,
+        has_analysis: canonicalHasAnalysis,
         resume_score: isFinite(r.resume_score) ? Number(r.resume_score) : null,
         interview_score: transcriptOverall ?? null,
         overall_score: isFinite(r.overall_score) ? Number(r.overall_score) : null,
         resume_analysis: r.resume_analysis || { experience: null, skills: null, education: null, summary: '' },
         interview_analysis: {
-          clarity: Number.isFinite(Number(r?.perception_scores?.clarity)) ? Number(r.perception_scores.clarity) : null,
-          confidence: Number.isFinite(Number(r?.perception_scores?.confidence)) ? Number(r.perception_scores.confidence) : null,
-          engagement: Number.isFinite(Number(r?.perception_scores?.engagement))
-            ? Number(r.perception_scores.engagement)
-            : (Number.isFinite(Number(r?.perception_scores?.body_language)) ? Number(r.perception_scores.body_language) : null),
-          summary: typeof r.interview_summary === 'string' ? r.interview_summary : ''
+          clarity: perception.clarity,
+          confidence: perception.confidence,
+          engagement: perception.engagement,
+          summary: interviewSummary
         },
         latest_report_url: r.latest_report_url || null,
         report_generated_at: r.report_generated_at || null,
