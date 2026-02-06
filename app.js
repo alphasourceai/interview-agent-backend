@@ -1,4 +1,4 @@
-// app.js (drop-in)
+// app.js
 require('dotenv').config()
 
 // --- Sentry MUST be initialized before requiring Express to instrument it ---
