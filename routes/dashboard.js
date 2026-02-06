@@ -48,7 +48,11 @@ router.use((req, res, next) => {
 
 router.get('/ping', (req, res) => {
   console.log('[dashboard] ping hit');
-  return res.json({ ok: true, ts: new Date().toISOString() });
+  return res.json({
+    ok: true,
+    ts: new Date().toISOString(),
+    build_id: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null
+  });
 });
 
 const DAILY_ROOM_RE = /(^https?:\/\/)?([a-z0-9-]+\.)?(tavus\.daily\.co|c\.daily\.co)(\/|\?|$)/i;
@@ -116,10 +120,12 @@ function hasCanonicalAnalysis(interviewRow) {
  */
 router.get('/rows', requireAuth, withClientScope, async (req, res) => {
   try {
+    const request_id = getRequestId(req);
+    const debug = String(req.query.debug || '') === '1';
     console.log('[dashboard/rows] hit', {
       method: req.method,
       path: req.originalUrl,
-      request_id: req.headers['x-request-id'] || null,
+      request_id,
       client_id: req.query.client_id || null
     });
 
@@ -134,7 +140,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
     // 1) Candidates for this client
     const { data: cands, error: cErr } = await supabase
       .from('candidates')
-      .select('id, first_name, last_name, name, email, role_id, created_at, client_id')
+      .select('id, first_name, last_name, name, email, role_id, created_at, client_id, analysis_summary')
       .eq('client_id', clientId)
       .order('created_at', { ascending: false })
       .limit(1000);
@@ -208,7 +214,6 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         .select([
           'id',
           'candidate_id',
-          'interview_id',
           'client_id',
           'created_at',
           'resume_score',
@@ -228,7 +233,14 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         .order('created_at', { ascending: false });
 
       if (repErr) {
-        console.error('[dashboard/rows] reports error', repErr);
+        console.error('[dashboard/rows] reports error', {
+          request_id,
+          client_id: clientId,
+          code: repErr.code,
+          message: repErr.message,
+          details: repErr.details,
+          hint: repErr.hint
+        });
       } else {
         for (const r of reps || []) {
           const k = r.candidate_id;
@@ -248,19 +260,40 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const iv = latestInterviewByCand[c.id] || null;
       const rep = latestReportByCand[c.id] || null;
 
-      // Scores + analyses from latest report (if present)
-      const resume_score    = isFinite(rep?.resume_score)    ? Number(rep.resume_score)    : null;
+      const parsed = parseJsonObject(c?.analysis_summary) || {};
+      const rs = parsed.resume_score ?? parsed.resume ?? parsed.resume_match_percent ?? parsed.resumeMatchPercent ?? null;
+      const resume_score = Number.isFinite(Number(rs)) ? Number(rs) : null;
       const interview_score = isFinite(rep?.interview_score) ? Number(rep.interview_score) : null;
       const overall_score   = isFinite(rep?.overall_score)   ? Number(rep.overall_score)   : null;
 
-      // Prefer *_analysis then *_breakdown. Ensure stable shape & summary string.
-      const repRA = rep?.resume_analysis ?? rep?.resume_breakdown ?? {};
+      const resume_summary =
+        (typeof parsed.summary === 'string' && parsed.summary) ||
+        (typeof parsed.resume_summary === 'string' && parsed.resume_summary) ||
+        (typeof parsed.resumeSummary === 'string' && parsed.resumeSummary) ||
+        (typeof parsed.resume_analysis?.summary === 'string' && parsed.resume_analysis.summary) ||
+        '';
       const resume_analysis = {
-        experience: repRA.experience ?? null,
-        skills:     repRA.skills ?? null,
-        education:  repRA.education ?? null,
-        summary:    (typeof repRA.summary === 'string' ? repRA.summary : '')
+        experience: Number.isFinite(Number(parsed.experience_match_percent ?? parsed.experienceMatchPercent)) ? Number(parsed.experience_match_percent ?? parsed.experienceMatchPercent) : null,
+        skills:     Number.isFinite(Number(parsed.skills_match_percent ?? parsed.skillsMatchPercent)) ? Number(parsed.skills_match_percent ?? parsed.skillsMatchPercent) : null,
+        education:  Number.isFinite(Number(parsed.education_match_percent ?? parsed.educationMatchPercent)) ? Number(parsed.education_match_percent ?? parsed.educationMatchPercent) : null,
+        summary: resume_summary
       };
+      const resume_debug = debug ? {
+          analysis_summary_type: typeof c.analysis_summary,
+          analysis_summary_is_null: c.analysis_summary == null,
+          analysis_summary_keys: (c.analysis_summary && typeof c.analysis_summary === 'object' && !Array.isArray(c.analysis_summary)) ? Object.keys(c.analysis_summary) : [],
+          parsed_keys: Object.keys(parsed || {}),
+          resume_score_raw: rs ?? null,
+          summary_len_raw: resume_summary.length
+        } : {};
+      if (resume_score === null || !resume_summary) {
+        console.log('[dashboard/rows] resume debug', {
+          candidate_id: c.id,
+          analysis_summary_type: typeof c.analysis_summary,
+          analysis_summary_len: String(c.analysis_summary || '').length,
+          parsed_keys: Object.keys(parsed || {})
+        });
+      }
 
       const perception = getPerceptionShape(iv);
       const interviewSummary = typeof iv?.interview_summary === 'string' ? iv.interview_summary : '';
@@ -313,6 +346,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         interview_score: transcriptOverall ?? null,
         overall_score,
         resume_analysis,
+        resume_debug,
         interview_analysis,
         latest_report_url,
         report_generated_at: rep?.created_at || null,
