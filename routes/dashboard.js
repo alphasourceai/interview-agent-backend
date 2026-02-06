@@ -264,7 +264,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const rs = parsed.resume_score ?? parsed.resume ?? parsed.resume_match_percent ?? parsed.resumeMatchPercent ?? null;
       const resume_score = Number.isFinite(Number(rs)) ? Number(rs) : null;
       const interview_score = isFinite(rep?.interview_score) ? Number(rep.interview_score) : null;
-      const overall_score   = isFinite(rep?.overall_score)   ? Number(rep.overall_score)   : null;
+      const repOverallScore = isFinite(rep?.overall_score) ? Number(rep.overall_score) : null;
 
       const resume_summary =
         (typeof parsed.summary === 'string' && parsed.summary) ||
@@ -309,6 +309,12 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const safeVideoUrl = iv?.video_url && !isDailyRoomUrl(iv.video_url) ? iv.video_url : null;
       const hasTranscript = !!iv?.transcript;
       const transcriptOverall = getTranscriptOverall(iv);
+      const overall_score =
+        Number.isFinite(repOverallScore)
+          ? repOverallScore
+          : (Number.isFinite(resume_score) && Number.isFinite(transcriptOverall)
+              ? Math.round((resume_score + transcriptOverall) / 2)
+              : null);
       const canonicalHasAnalysis = hasCanonicalAnalysis(iv);
       console.log('[dashboard/rows] row', {
         interview_id: iv?.id || null,
