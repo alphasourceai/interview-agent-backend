@@ -5,7 +5,50 @@ const express = require('express');
 const { supabase } = require('../src/lib/supabaseClient');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 
+
 const router = express.Router();
+
+function getRequestId(req) {
+  return (
+    (req.headers['x-request-id'] || req.headers['x-correlation-id'] || req.headers['x-amzn-trace-id'] || null) &&
+    String(req.headers['x-request-id'] || req.headers['x-correlation-id'] || req.headers['x-amzn-trace-id'])
+  ) || null;
+}
+
+router.use((req, res, next) => {
+  const start = Date.now();
+  const request_id = getRequestId(req);
+
+  // Avoid cached dashboard payloads while we debug wiring.
+  res.set('Cache-Control', 'no-store, max-age=0');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.set('Surrogate-Control', 'no-store');
+
+  console.log('[dashboard] hit', {
+    request_id,
+    method: req.method,
+    path: req.originalUrl,
+    client_id: req.query?.client_id || null,
+    scope_client_id: req.client?.id || req.clientScope?.defaultClientId || null
+  });
+
+  res.on('finish', () => {
+    console.log('[dashboard] done', {
+      request_id,
+      method: req.method,
+      path: req.originalUrl,
+      status: res.statusCode,
+      ms: Date.now() - start
+    });
+  });
+
+  next();
+});
+
+router.get('/ping', (req, res) => {
+  return res.json({ ok: true, ts: new Date().toISOString() });
+});
 
 const DAILY_ROOM_RE = /(^https?:\/\/)?([a-z0-9-]+\.)?(tavus\.daily\.co|c\.daily\.co)(\/|\?|$)/i;
 function isDailyRoomUrl(url) {
