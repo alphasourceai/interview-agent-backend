@@ -116,6 +116,13 @@ function hasCanonicalAnalysis(interviewRow) {
  */
 router.get('/rows', requireAuth, withClientScope, async (req, res) => {
   try {
+    console.log('[dashboard/rows] hit', {
+      method: req.method,
+      path: req.originalUrl,
+      request_id: req.headers['x-request-id'] || null,
+      client_id: req.query.client_id || null
+    });
+
     const clientId =
       req.client?.id ||
       req.clientScope?.defaultClientId ||
