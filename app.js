@@ -253,6 +253,10 @@ app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
   }
 })
 
+const clientMembersScopedRouter = require('./routes/clientMembersScoped')
+app.use('/api/client-members', clientMembersScopedRouter)
+app.use('/client-members', clientMembersScopedRouter)
+
 app.use('/dashboard', dashboardRouter)
 app.use('/api/dashboard', dashboardRouter)
 

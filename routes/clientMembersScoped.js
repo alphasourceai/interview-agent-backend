@@ -10,6 +10,83 @@ const FRONTEND_BASE = ((process.env.FRONTEND_BASE || process.env.FRONTEND_URL ||
 
 const router = express.Router();
 
+function parseAccepted(value) {
+  if (value === undefined || value === null) return true;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value === 1;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on';
+  }
+  return false;
+}
+
+function readTesterAckAt(row) {
+  if (!row || typeof row !== 'object') return null;
+  return row.tester_ack_at || row.tester_acknowledged_at || null;
+}
+
+function hasCol(row, col) {
+  return !!row && Object.prototype.hasOwnProperty.call(row, col);
+}
+
+async function ensureMembershipRow(clientId, userId) {
+  const { data: existing, error: existingError } = await supabaseAdmin
+    .from('client_members')
+    .select('*')
+    .eq('client_id', clientId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (existingError) throw existingError;
+  if (existing) return existing;
+
+  let inserted = null;
+  let insertError = null;
+
+  ({ data: inserted, error: insertError } = await supabaseAdmin
+    .from('client_members')
+    .insert({ client_id: clientId, user_id: userId, role: 'tester' })
+    .select('*')
+    .single());
+
+  if (insertError && insertError.code === '23514') {
+    ({ data: inserted, error: insertError } = await supabaseAdmin
+      .from('client_members')
+      .insert({ client_id: clientId, user_id: userId, role: 'member' })
+      .select('*')
+      .single());
+  }
+
+  if (insertError) throw insertError;
+  return inserted;
+}
+
+async function applyTesterAck(clientId, userId) {
+  const nowIso = new Date().toISOString();
+  const row = await ensureMembershipRow(clientId, userId);
+
+  const updatePayload = {};
+  if (hasCol(row, 'tester_ack_at')) updatePayload.tester_ack_at = nowIso;
+  if (hasCol(row, 'tester_ack')) updatePayload.tester_ack = true;
+  if (hasCol(row, 'tester_ack_version')) updatePayload.tester_ack_version = 'v1';
+  if (hasCol(row, 'tester_acknowledged_at')) updatePayload.tester_acknowledged_at = nowIso;
+
+  if (Object.keys(updatePayload).length === 0) {
+    return row;
+  }
+
+  const { data: updated, error: updateError } = await supabaseAdmin
+    .from('client_members')
+    .update(updatePayload)
+    .eq('client_id', clientId)
+    .eq('user_id', userId)
+    .select('*')
+    .single();
+
+  if (updateError) throw updateError;
+  return updated;
+}
+
 router.get('/', requireAuth, withClientScope, async (req, res) => {
   try {
     const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
@@ -180,37 +257,75 @@ router.delete('/:id', requireAuth, withClientScope, async (req, res) => {
   }
 });
 
+router.get('/tester-ack', requireAuth, withClientScope, async (req, res) => {
+  try {
+    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+    const clientId = req.client?.id || req.clientScope?.defaultClientId || req.query.client_id || req.body?.client_id || null;
+    const userId = req.user?.id || null;
+
+    console.log('[client-members] tester-ack hit', {
+      method: req.method,
+      path: req.originalUrl || req.path,
+      request_id,
+      client_id: clientId,
+      user_id: userId
+    });
+
+    if (!clientId) return res.status(400).json({ error: 'client_id_required', request_id });
+    if (!userId) return res.status(401).json({ error: 'unauthorized', request_id });
+
+    const { data: row, error } = await supabaseAdmin
+      .from('client_members')
+      .select('*')
+      .eq('client_id', clientId)
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (error) {
+      console.error('[tester-ack] get failed', error.message);
+      return res.status(500).json({ error: 'tester_ack_fetch_failed', detail: error.message, request_id });
+    }
+
+    const testerAckAt = readTesterAckAt(row);
+    const acknowledged = Boolean((row && row.tester_ack === true) || testerAckAt);
+    return res.json({ ok: true, acknowledged, tester_ack_at: testerAckAt || null, request_id });
+  } catch (e) {
+    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+    console.error('[tester-ack] unexpected', e?.message || e);
+    return res.status(500).json({ error: 'server_error', request_id });
+  }
+});
+
 // Tester NDA acknowledgement
 router.post('/tester-ack', requireAuth, withClientScope, async (req, res) => {
   try {
     const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
-    const clientId = req.body?.client_id || req.query.client_id || req.client?.id || req.clientScope?.defaultClientId || null;
+    const clientId = req.client?.id || req.clientScope?.defaultClientId || req.query.client_id || req.body?.client_id || null;
+    const userId = req.user?.id || null;
+    const accepted = parseAccepted(req.body?.accepted);
+
+    console.log('[client-members] tester-ack hit', {
+      method: req.method,
+      path: req.originalUrl || req.path,
+      request_id,
+      client_id: clientId,
+      user_id: userId
+    });
+
     if (!clientId) return res.status(400).json({ error: 'client_id_required', request_id });
+    if (!userId) return res.status(401).json({ error: 'unauthorized', request_id });
+    if (!accepted) return res.status(400).json({ error: 'accepted_required', request_id });
 
-    const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
-    if (!membership) return res.status(403).json({ error: 'forbidden', request_id });
-    if ((membership.role || '').toLowerCase() !== 'tester') {
-      return res.status(403).json({ error: 'forbidden', request_id });
+    const updateRow = await applyTesterAck(clientId, userId);
+    if (!updateRow) {
+      return res.status(500).json({ error: 'tester_ack_failed', request_id });
     }
-    if (membership.tester_acknowledged_at) {
-      return res.json({ ok: true, tester_acknowledged_at: membership.tester_acknowledged_at, tester_acknowledged_ip: membership.tester_acknowledged_ip || null, request_id });
-    }
-
-    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || null;
-    const { data, error } = await supabaseAdmin
-      .from('client_members')
-      .update({ tester_acknowledged_at: new Date().toISOString(), tester_acknowledged_ip: ip || null })
-      .eq('client_id', clientId)
-      .eq('user_id', req.user.id)
-      .select('tester_acknowledged_at,tester_acknowledged_ip')
-      .maybeSingle();
-    if (error) {
-      console.error('[tester-ack] update failed', error.message);
-      return res.status(500).json({ error: 'tester_ack_failed', detail: error.message, request_id });
-    }
-    return res.json({ ok: true, tester_acknowledged_at: data?.tester_acknowledged_at || null, tester_acknowledged_ip: data?.tester_acknowledged_ip || ip || null, request_id });
+    return res.json({ ok: true });
   } catch (e) {
     const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+    if (e?.message) {
+      console.error('[tester-ack] update failed', e.message);
+      return res.status(500).json({ error: 'tester_ack_failed', detail: e.message, request_id });
+    }
     console.error('[tester-ack] unexpected', e?.message || e);
     return res.status(500).json({ error: 'server_error', request_id });
   }
