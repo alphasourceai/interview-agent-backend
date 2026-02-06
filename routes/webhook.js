@@ -161,14 +161,59 @@ function extractPerceptionScoresFromText(text) {
   };
   const clarity = readNum(/CLARITY\s*[:=]\s*(\d{1,3})/i);
   const confidence = readNum(/CONFIDENCE\s*[:=]\s*(\d{1,3})/i);
-  let bodyLanguage = readNum(/BODY[_\s-]*LANGUAGE\s*[:=]\s*(\d{1,3})/i);
-  if (bodyLanguage === null) bodyLanguage = readNum(/NONVERBAL\s*[:=]\s*(\d{1,3})/i);
-  if (bodyLanguage === null) bodyLanguage = readNum(/ENGAGEMENT\s*[:=]\s*(\d{1,3})/i);
+  let engagement = readNum(/ENGAGEMENT\s*[:=]\s*(\d{1,3})/i);
+  if (engagement === null) engagement = readNum(/BODY[_\s-]*LANGUAGE\s*[:=]\s*(\d{1,3})/i);
+  if (engagement === null) engagement = readNum(/NONVERBAL\s*[:=]\s*(\d{1,3})/i);
 
   const out = {};
   if (clarity !== null) out.clarity = clarity;
   if (confidence !== null) out.confidence = confidence;
-  if (bodyLanguage !== null) out.body_language = bodyLanguage;
+  if (engagement !== null) out.engagement = engagement;
+  return out;
+}
+
+function extractJsonFromText(text) {
+  if (!text || typeof text !== 'string') return null;
+  const fenced = text.match(/```json\s*([\s\S]*?)```/i);
+  const candidate = fenced?.[1] || null;
+  if (candidate) {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      return null;
+    }
+  }
+  const first = text.indexOf('{');
+  const last = text.lastIndexOf('}');
+  if (first >= 0 && last > first) {
+    const snippet = text.slice(first, last + 1);
+    try {
+      return JSON.parse(snippet);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function sanitizePerceptionText(text) {
+  if (!text) return '';
+  let out = String(text);
+  const patterns = [
+    /\b(\d{1,2}\s*-\s*year\s*-\s*old|\d{1,2}\s*year\s*old|\d{2}s|teen(ager|age)?|young|younger|middle[-\s]?aged|elderly|senior|old|older)\b/gi,
+    /\b(male|female|man|woman|boy|girl|nonbinary|non-binary|transgender|cisgender|trans|cis)\b/gi,
+    /\b(white|black|african\s*american|asian|latino|latina|latinx|hispanic|indigenous|native\s*american|middle\s*eastern|arab|pacific\s*islander)\b/gi,
+    /\b(christian|muslim|jewish|hindu|buddhist|sikh|atheist|agnostic|catholic|protestant|mormon)\b/gi,
+    /\b(disabled|disability|wheelchair|blind|deaf|autistic|adhd|amputee|bipolar|schizophrenia|ptsd|paralyzed)\b/gi,
+    /\b(pregnant|pregnancy)\b/gi,
+    /\b(in|around)\s+(his|her|their)\s+\d{2}s\b/gi,
+    /\b(appears|appeared|seems|seemed|looks|looked)\s+(?:to\s+be\s+)?(young|older|middle[-\s]?aged|elderly|\d{2}s)\b/gi
+  ];
+  for (const re of patterns) {
+    out = out.replace(re, '[REDACTED]');
+  }
+  out = out.replace(/\[REDACTED\](\s+\[REDACTED\])+/g, '[REDACTED]');
+  out = out.replace(/\s{2,}/g, ' ').trim();
   return out;
 }
 
@@ -379,27 +424,28 @@ async function applyInterviewUpdates(interviewId, updates, recordingMeta) {
 }
 
 async function updatePerceptionAnalysis(interview, analysisText, requestId) {
-  let trimmed;
+  let rawText;
   if (analysisText && typeof analysisText === 'object') {
     try {
-      trimmed = JSON.stringify(analysisText);
+      rawText = JSON.stringify(analysisText);
     } catch {
-      trimmed = String(analysisText);
+      rawText = String(analysisText);
     }
   } else {
-    trimmed = String(analysisText || '');
+    rawText = String(analysisText || '');
   }
-  trimmed = String(trimmed || '').trim();
-  if (!trimmed) return { stored: false, perception_scores: {} };
+  rawText = String(rawText || '').trim();
+  if (!rawText) return { stored: false, perception_scores: {} };
+  const sanitizedText = sanitizePerceptionText(rawText);
   const conversationId = interview?.tavus_application_id || interview?.conversation_id || null;
 
   let perceptionScores = {};
+  let parsedDirect = null;
   if (analysisText && typeof analysisText === 'object') {
-    perceptionScores = extractPerceptionScores(analysisText);
-  } else if (looksLikeJson(trimmed)) {
+    parsedDirect = analysisText;
+  } else if (looksLikeJson(rawText)) {
     try {
-      const parsed = JSON.parse(trimmed);
-      perceptionScores = extractPerceptionScores(parsed);
+      parsedDirect = JSON.parse(rawText);
     } catch (err) {
       console.error('[webhook] perception_analysis JSON parse failed', {
         request_id: requestId || null,
@@ -412,7 +458,22 @@ async function updatePerceptionAnalysis(interview, analysisText, requestId) {
     }
   }
 
-  const updates = { perception_analysis_text: trimmed };
+  if (parsedDirect) {
+    perceptionScores = extractPerceptionScores(parsedDirect);
+  }
+
+  if (!Object.keys(perceptionScores).length) {
+    const blockJson = extractJsonFromText(rawText);
+    if (blockJson) {
+      perceptionScores = extractPerceptionScores(blockJson);
+    }
+  }
+
+  if (!Object.keys(perceptionScores).length) {
+    perceptionScores = extractPerceptionScoresFromText(rawText);
+  }
+
+  const updates = { perception_analysis_text: sanitizedText };
   if (Object.keys(perceptionScores).length) {
     const existingScores =
       interview.perception_scores && typeof interview.perception_scores === 'object'
@@ -832,6 +893,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
           interview_id: interview.id,
           conversation_id: conversationId || null,
           extracted_keys: extractedKeys,
+          extracted_count: extractedKeys.length,
           stored: perceptionResult?.stored ?? null
         });
       } else {

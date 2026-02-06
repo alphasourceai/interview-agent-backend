@@ -19,6 +19,7 @@ const { ensureTavusDocumentForRole, missingTavusKbError } = require('../lib/tavu
 async function createTavusInterviewHandler(candidate, role, webhookUrl, options = {}) {
   const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
   const REPLICA_ID = String(process.env.TAVUS_REPLICA_ID || '').trim();
+  const PERSONA_ID = String(process.env.TAVUS_PERSONA_ID || '').trim();
   const RETRIEVAL = String(process.env.TAVUS_DOCUMENT_STRATEGY || 'balanced').trim();
   const INTERVIEWER_NAME = String(process.env.TAVUS_INTERVIEWER_NAME || 'Alex').trim() || 'Alex';
 
@@ -28,16 +29,11 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     err.status = 500;
     throw err;
   }
-  if (!REPLICA_ID) {
-    const err = new Error('Tavus requires replica_id. Set TAVUS_REPLICA_ID.');
-    err.code = 'missing_env';
-    err.status = 500;
-    throw err;
-  }
 
   const envFlags = {
     TAVUS_API_KEY: !!process.env.TAVUS_API_KEY,
-    TAVUS_REPLICA_ID: !!process.env.TAVUS_REPLICA_ID
+    TAVUS_REPLICA_ID: !!process.env.TAVUS_REPLICA_ID,
+    TAVUS_PERSONA_ID: !!process.env.TAVUS_PERSONA_ID
   };
   console.log('[tavus-interview-debug]', {
     stage: 'handler_start',
@@ -60,7 +56,8 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
 
   // Build the payload Tavus expects
   const payload = {
-    replica_id: REPLICA_ID || undefined,
+    ...(PERSONA_ID ? { persona_id: PERSONA_ID } : {}),
+    ...(REPLICA_ID ? { replica_id: REPLICA_ID } : {}),
     callback_url: webhookUrl || undefined,
     conversation_name: conversationName,
     conversational_context: context,
@@ -75,6 +72,7 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     role_title: roleTitle,
     company: companyName,
     replica_id: payload.replica_id,
+    persona_id: payload.persona_id,
     tavus_document_id: role?.tavus_document_id || null,
     prompt: context,
     custom_greeting: customGreeting
