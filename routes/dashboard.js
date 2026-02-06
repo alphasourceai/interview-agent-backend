@@ -47,6 +47,7 @@ router.use((req, res, next) => {
 });
 
 router.get('/ping', (req, res) => {
+  console.log('[dashboard] ping hit');
   return res.json({ ok: true, ts: new Date().toISOString() });
 });
 

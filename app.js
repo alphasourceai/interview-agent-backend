@@ -46,75 +46,14 @@ if (SENTRY_ENABLED) {
 const express = require('express')
 const cors = require('cors')
 const crypto = require('crypto')
-const jwt = require('jsonwebtoken')
-const sg = require('@sendgrid/mail')
 const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
 const { generateRubricAndKBForRole } = require('./generateRubric')
-const { ensureUserAndSendRecovery, redactEmail } = require('./src/lib/recoveryHelper')
-const { checkDuplicateCandidate } = require('./src/lib/duplicateCandidate')
+const axios = require('axios')
+const dashboardRouter = require('./routes/dashboard')
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || FRONTEND_URL || '').replace(/\/+$/, '')
-const INTERVIEW_FAVICON_URL = (process.env.INTERVIEW_HOST_FAVICON_URL || 'https://ia-frontend-prod.onrender.com/alpha-symbol.png').trim()
-const SENDGRID_KEY = process.env.SENDGRID_API_KEY || ''
-const SENDGRID_FROM = process.env.SENDGRID_FROM || ''
-const APP_NAME = process.env.APP_NAME || 'Interview Agent'
-const TEXT_INTERVIEW_TEMPLATE_ID = process.env.TEXT_INTERVIEW_SENDGRID_TEMPLATE_ID || ''
-const TEXT_INTERVIEW_TOKEN_SECRET =
-  process.env.TEXT_INTERVIEW_JWT_SECRET ||
-  process.env.SUPABASE_JWT_SECRET ||
-  process.env.SUPABASE_SERVICE_ROLE_KEY ||
-  ''
-const TEXT_INTERVIEW_EXP_DAYS = 7
 const app = express()
-
-console.log('[boot] entrypoint =', __filename)
-console.log('[boot] accommodationRequests =', require.resolve('./routes/accommodationRequests'))
-console.log('[boot] createTavusInterview =', require.resolve('./routes/createTavusInterview'))
-
-if (SENDGRID_KEY) {
-  sg.setApiKey(SENDGRID_KEY)
-}
-
-function humanizeDays(days) {
-  const d = Number(days || 0)
-  if (d <= 1) return '1 day'
-  return `${d} days`
-}
-
-const normalizeOrigin = (input) => {
-  try {
-    if (!input) return null;
-    return new URL(input).origin;
-  } catch (_) {
-    return null;
-  }
-};
-
-// Origins that need delegated camera/mic access when the Daily/Tavus player is nested
-const INTERVIEW_FRONTEND_ORIGINS = Array.from(new Set([
-  FRONTEND_BASE,
-  process.env.FRONTEND_URL,
-  process.env.FRONTEND_BASE,
-  'https://ia-frontend-prod.onrender.com',
-  'https://ia-frontend-staging.onrender.com',
-  'https://ia-frontend-qa.onrender.com',
-  'https://interview-agent-frontend.onrender.com'
-].map(normalizeOrigin).filter(Boolean)));
-
-const DAILY_ORIGINS = ['https://tavus.daily.co', 'https://c.daily.co'];
-const INTERVIEW_FEATURE_ORIGINS = Array.from(new Set(['self', ...INTERVIEW_FRONTEND_ORIGINS, ...DAILY_ORIGINS]));
-const formatPolicyOrigins = (origins) => `(${origins.map((origin) => (origin === 'self' ? 'self' : `"${origin}"`)).join(' ')})`;
-const INTERVIEW_PERMISSIONS_POLICY = [
-  'camera',
-  'microphone',
-  'display-capture',
-  'fullscreen',
-  'autoplay',
-  'storage-access'
-].map((feature) => `${feature}=${formatPolicyOrigins(INTERVIEW_FEATURE_ORIGINS)}`)
-  .concat(['clipboard-read=(self)', 'clipboard-write=(self)'])
-  .join(', ');
 
 // Sentry request middleware (must be before other app.use and routes)
 if (SENTRY_ENABLED) {
@@ -185,6 +124,17 @@ app.use((req, res, next) => {
   } catch (_) {}
   next();
 });
+// ---------- Permissions-Policy: allow Tavus (daily.co) to access camera/mic in nested iframes ----------
+app.use((req, res, next) => {
+  try {
+    res.setHeader(
+      'Permissions-Policy',
+      'camera=(self "https://tavus.daily.co" "https://c.daily.co"), microphone=(self "https://tavus.daily.co" "https://c.daily.co"), display-capture=(self "https://tavus.daily.co" "https://c.daily.co"), fullscreen=(self "https://tavus.daily.co" "https://c.daily.co"), autoplay=(self "https://tavus.daily.co" "https://c.daily.co"), clipboard-read=(self), clipboard-write=(self)'
+    );
+  } catch (_) {}
+  next();
+});
+
 // Per-request context (request_id + basic tags)
 app.use((req, _res, next) => {
   try {
@@ -251,7 +201,7 @@ async function withClientScope(req, res, next) {
     // Regular users: scope to their memberships
     const { data, error } = await supabaseAdmin
       .from('client_members')
-      .select('client_id, role, tester_acknowledged_at, tester_acknowledged_ip')
+      .select('client_id, role')
       .eq('user_id', req.user.id);
     if (error) return res.status(500).json({ error: 'Failed to load memberships', detail: error.message });
 
@@ -267,34 +217,16 @@ async function withClientScope(req, res, next) {
 // ---------- Public candidate endpoints (MOUNTED) ----------
 app.use('/api/candidate/submit', require('./routes/candidateSubmit'))
 app.use('/api/candidate/verify-otp', require('./routes/verifyOtp'))
-app.use('/api/accommodations', require('./routes/accommodationRequests'))
-app.use('/api/text-interview', require('./routes/textInterview'))
-app.use('/api/roles', requireAuth, withClientScope, require('./routes/roleAssets'))
-app.use('/api/payments', require('./routes/payments'))
-app.use('/api/feedback', require('./routes/feedback'))
 app.use('/create-tavus-interview', require('./routes/createTavusInterview'))
 
 // ---------- Simple test endpoint ----------
-app.get('/__version', (_req, res) => {
-  res.json({
-    service: 'ia-backend-prod',
-    commit: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || null,
-    node: process.version,
-    now: new Date().toISOString()
-  })
-})
-
 app.get('/auth/ping', requireAuth, withClientScope, (req, res) => {
   res.json({ ok: true, user: req.user, client_ids: req.clientIds })
 })
 
 // ---------- Auth me ----------
 app.get('/auth/me', requireAuth, withClientScope, (req, res) => {
-  res.json({
-    user: req.user,
-    memberships: req.memberships,
-    default_client_id: req.clientScope?.defaultClientId || null
-  })
+  res.json({ user: req.user, memberships: req.memberships })
 })
 
 // ---------- Clients: my ----------
@@ -320,6 +252,9 @@ app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
     res.status(500).json({ error: 'Server error' })
   }
 })
+
+app.use('/dashboard', dashboardRouter)
+app.use('/api/dashboard', dashboardRouter)
 
 // ---------- Dashboard: scoped rows ----------
 async function buildDashboardRows(req, res) {
@@ -380,7 +315,6 @@ async function buildDashboardRows(req, res) {
           id, candidate_id, role_id,
           resume_score, interview_score, overall_score,
           resume_breakdown, interview_breakdown, analysis,
-          unanswered_candidate_questions,
           report_url, created_at
         `)
         .in('candidate_id', candidateIds)
@@ -439,9 +373,6 @@ async function buildDashboardRows(req, res) {
         body_language: numOrNull(ib.body_language),
         summary:       typeof interview_summary === 'string' ? interview_summary : ''
       };
-      const unanswered_candidate_questions = Array.isArray(rep?.unanswered_candidate_questions)
-        ? rep.unanswered_candidate_questions
-        : [];
 
       return {
         id: latest?.id ?? null,
@@ -467,8 +398,7 @@ async function buildDashboardRows(req, res) {
         interview_analysis,
 
         latest_report_url: rep?.report_url ?? null,
-        report_generated_at: rep?.created_at ?? null,
-        unanswered_candidate_questions
+        report_generated_at: rep?.created_at ?? null
       };
     });
 
@@ -491,49 +421,21 @@ app.get('/dashboard/rows', requireAuth, withClientScope, (req, res) => {
 // ---------- Optional: invites ----------
 app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
   try {
-    const { email, role = 'member', client_id, name } = req.body || {}
-    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now())
-    if (!email || !client_id) return res.status(400).json({ error: 'email and client_id are required', request_id })
-    if (!(req.clientIds || []).includes(client_id)) return res.status(403).json({ error: 'Forbidden', request_id })
-    const r = String(role || '').toLowerCase()
-    if (!['member', 'manager'].includes(r)) return res.status(400).json({ error: 'invalid_role', request_id })
+    const { email, role = 'member', client_id } = req.body || {}
+    if (!email || !client_id) return res.status(400).json({ error: 'email and client_id are required' })
+    if (!(req.clientIds || []).includes(client_id)) return res.status(403).json({ error: 'Forbidden' })
 
-    try {
-      const { userId, method, recovery_sent } = await ensureUserIdAndInvite({
-        email,
-        redirectTo: `${FRONTEND_BASE}/pwreset`,
-        request_id,
-        loggerPrefix: '[clients/invite]'
-      })
-      if (!userId) {
-        console.error('client_invite_no_user_id', { request_id, email: redactEmail(email), method })
-        return res.status(400).json({ error: 'invite_failed', detail: 'Could not create or locate user.', request_id })
-      }
+    const token = crypto.randomBytes(16).toString('hex')
+    const { error } = await supabaseAdmin
+      .from('client_invites')
+      .insert({ client_id, email, role, token, invited_by: req.user.id })
+    if (error) return res.status(500).json({ error: 'Failed to create invite', detail: error.message })
 
-      const payload = { client_id, email, name: name || email, role: r, user_id: userId }
-      const { error } = await supabaseAdmin.from('client_members').insert(payload).select('client_id').single();
-      if (error) {
-        console.error('client_invite_insert_failed', { request_id, error: error.message, code: error.code })
-        if (error.code === '23505' || error.code === 'PGRST116') {
-          return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
-        }
-        return res.status(500).json({ error: 'invite_failed', detail: error.message, code: error.code, request_id })
-      }
-      const accept_url = `${FRONTEND_BASE}/pwreset`;
-      res.json({ ok: true, accept_url, request_id, recovery_sent: !!recovery_sent })
-    } catch (e) {
-      if (e?.code === 'misconfigured_supabase_auth') {
-        return res.status(500).json({ error: 'misconfigured_supabase_auth', detail: e.detail || 'Missing SUPABASE_PUBLIC_ANON_KEY', request_id })
-      }
-      if (e?.code === 'email_in_use') {
-        return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
-      }
-      console.error('client_invite_error', { request_id, error: e?.message || e, status: e?.status || null })
-      res.status(500).json({ error: 'invite_failed', detail: e?.message || 'Invite failed', request_id, code: e?.code || 'invite_failed' })
-    }
+    const acceptUrlBase = (process.env.FRONTEND_URL || FRONTEND_URL).replace(/\/+$/, '')
+    const accept_url = `${acceptUrlBase}/accept-invite?token=${encodeURIComponent(token)}`
+    res.json({ ok: true, accept_url })
   } catch (e) {
-    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now())
-    res.status(500).json({ error: 'Server error', request_id })
+    res.status(500).json({ error: 'Server error' })
   }
 })
 
@@ -591,24 +493,57 @@ async function requireAdmin(req, res, next) {
 
 const adminRouter = express.Router()
 
-// Helper: ensure a user exists and send a recovery email (used for onboarding + resets)
-async function ensureUserIdAndInvite({ email, redirectTo, request_id, loggerPrefix }) {
-  const reqId = request_id || crypto.randomUUID?.() || String(Date.now())
-  const effectiveRedirect = redirectTo || `${FRONTEND_BASE}/pwreset`
-  const result = await ensureUserAndSendRecovery({
-    email,
-    redirectTo: effectiveRedirect,
-    request_id: reqId,
-    loggerPrefix: loggerPrefix || '[invite-helper]'
-  })
-  return {
-    userId: result?.userId || null,
-    actionLink: null,
-    method: result?.method || null,
-    inviteActionLink: null,
-    recovery_sent: !!result?.recovery_sent,
-    request_id: reqId
+// Helper: ensure a user exists/invite; return user_id + optional action_link
+async function ensureUserIdAndInvite(email, redirectTo) {
+  let userId = null
+  let actionLink = null
+  let method = null
+
+  try {
+    const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo })
+    userId = invited?.data?.user?.id || null
+    method = 'invite'
+  } catch (e) {
+    console.error('inviteUserByEmail failed:', e?.message || e)
   }
+
+  if (!userId) {
+    try {
+      const link = await supabaseAdmin.auth.admin.generateLink({
+        type: 'magiclink',
+        email,
+        options: { redirectTo }
+      })
+      userId = link?.data?.user?.id || null
+      actionLink = link?.data?.action_link || null
+      method = method || 'magiclink'
+    } catch (e) {
+      console.error('generateLink(magiclink) failed:', e?.message || e)
+    }
+  }
+
+  if (!userId) {
+    try {
+      const created = await supabaseAdmin.auth.admin.createUser({
+        email,
+        email_confirm: true
+      })
+      userId = created?.data?.user?.id || null
+      method = method || 'createUser'
+    } catch (e) {
+      console.error('createUser failed:', e?.message || e)
+    }
+    if (userId) {
+      try {
+        await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo })
+        method = 'createUser+invite'
+      } catch (e) {
+        console.error('second invite after createUser failed:', e?.message || e)
+      }
+    }
+  }
+
+  return { userId, actionLink, method }
 }
 
 // List all clients
@@ -623,86 +558,15 @@ adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
 
 // Create client (writes email to satisfy NOT NULL)
 adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
-  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now())
   const name = (req.body?.name || '').trim()
   const adminName  = (req.body?.admin_name  || '').trim()
   const adminEmail = (req.body?.admin_email || '').trim()
   const explicitClientEmail = (req.body?.email || '').trim()
-  const adminRole = (req.body?.admin_role || 'manager').toLowerCase()
-  if (!['manager', 'tester'].includes(adminRole)) {
-    return res.status(400).json({ error: 'admin_role_invalid', detail: 'admin_role must be manager or tester', request_id })
-  }
-  if (!name) return res.status(400).json({ error: 'name_required', request_id })
+  if (!name) return res.status(400).json({ error: 'name_required' })
 
   const emailForClient = explicitClientEmail || adminEmail
   if (!emailForClient) {
-    return res.status(400).json({ error: 'email_required_for_client', request_id })
-  }
-
-  console.log('[admin/create-client] start', { request_id, name, adminRole, adminEmail: redactEmail(adminEmail), emailForClient: redactEmail(emailForClient), redirectTo: `${FRONTEND_BASE}/pwreset` })
-
-  // Block duplicate admin emails before proceeding
-  if (adminEmail) {
-    try {
-      const { data: dupClient, error: dupClientErr } = await supabaseAdmin
-        .from('clients')
-        .select('id')
-        .ilike('email', adminEmail)
-        .maybeSingle()
-      if (dupClient) {
-        console.warn('[admin/create-client] duplicate client email', { request_id, adminEmail: redactEmail(adminEmail) })
-        return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
-      }
-      if (dupClientErr && dupClientErr.code !== 'PGRST116') {
-        console.error('[admin/create-client] duplicate_client_lookup_failed', { request_id, error: dupClientErr.message, code: dupClientErr.code, hint: dupClientErr.hint })
-        return res.status(500).json({ error: 'duplicate_check_failed', detail: dupClientErr.message, hint: dupClientErr.hint, code: dupClientErr.code, request_id })
-      }
-
-      const { data: dupMember, error: dupMemberErr } = await supabaseAdmin
-        .from('client_members')
-        .select('client_id')
-        .eq('email', adminEmail)
-        .in('role', ['manager', 'tester'])
-        .limit(1)
-      if (dupMember && dupMember.length > 0) {
-        console.warn('[admin/create-client] duplicate client member email', { request_id, adminEmail: redactEmail(adminEmail) })
-        return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
-      }
-      if (dupMemberErr) {
-        console.error('[admin/create-client] duplicate_member_lookup_failed', { request_id, error: dupMemberErr.message, code: dupMemberErr.code, hint: dupMemberErr.hint })
-        return res.status(500).json({ error: 'duplicate_check_failed', detail: dupMemberErr.message, hint: dupMemberErr.hint, code: dupMemberErr.code, request_id })
-      }
-    } catch (e) {
-      console.error('[admin/create-client] duplicate_admin_email_check_failed', { request_id, error: e?.message || e })
-      return res.status(500).json({ error: 'duplicate_check_failed', detail: e?.message || 'Duplicate check failed', request_id })
-    }
-  }
-
-  let inviteResult = null
-  if (adminEmail) {
-    try {
-      inviteResult = await ensureUserIdAndInvite({
-        email: adminEmail,
-        redirectTo: `${FRONTEND_BASE}/pwreset`,
-        request_id,
-        loggerPrefix: '[admin/create-client]'
-      })
-    } catch (e) {
-      if (e?.code === 'misconfigured_supabase_auth') {
-        return res.status(500).json({ error: 'misconfigured_supabase_auth', detail: e.detail || 'Missing SUPABASE_PUBLIC_ANON_KEY', request_id })
-      }
-      if (e?.code === 'email_in_use') {
-        console.warn('[admin/create-client] invite email_in_use', { request_id, adminEmail: redactEmail(adminEmail) })
-        return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
-      }
-      const detail = e?.responseData?.error_description || e?.message || e
-      console.error('[admin/create-client] seed_member_invite_failed', { request_id, error: detail, status: e?.status || null })
-      return res.status(500).json({ error: 'invite_failed', detail: detail || 'Invite failed', request_id, code: 'invite_failed' })
-    }
-    if (!inviteResult?.userId) {
-      console.error('[admin/create-client] invite returned no userId', { request_id, adminEmail: redactEmail(adminEmail), method: inviteResult?.method })
-      return res.status(500).json({ error: 'invite_failed', detail: 'Could not create or locate user for this email.', request_id, code: 'invite_failed' })
-    }
+    return res.status(400).json({ error: 'email_required_for_client' })
   }
 
   const { data: client, error: cErr } = await supabaseAdmin
@@ -711,50 +575,43 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
     .select('id,name,created_at')
     .single()
   if (cErr) {
-    console.error('[admin/create-client] create_client_failed', { request_id, error: cErr.message, code: cErr.code, hint: cErr.hint })
-    if (cErr.code === '23505' || cErr.code === 'PGRST116') {
-      return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
-    }
-    return res.status(500).json({ error: 'create_client_failed', detail: cErr.message, hint: cErr.hint, code: cErr.code, request_id })
+    console.error('create_client_failed:', cErr.message)
+    return res.status(500).json({ error: 'create_client_failed', detail: cErr.message, hint: cErr.hint })
   }
 
   // Optionally seed an admin member
   let seeded_member = null
-  if (adminEmail && inviteResult?.userId) {
-    try {
-      const payload = {
-        client_id: client.id,
-        email: adminEmail,
-        name: adminName || adminEmail,
-        role: adminRole,
-        user_id: inviteResult.userId
-      }
+  if (adminEmail) {
+    const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
+    const { userId, actionLink, method } = await ensureUserIdAndInvite(adminEmail, redirectTo)
 
-      const { data: inserted, error: insErr } = await supabaseAdmin
-        .from('client_members')
-        .insert(payload)
-        .select('client_id,user_id,email,name,role,created_at,tester_acknowledged_at,tester_acknowledged_ip')
-        .single()
+    if (!userId) {
+      console.error('seed_member_no_user_id', { email: adminEmail, method })
+      return res.json({ item: client, seeded_member: null, note: 'client_created_invite_failed', action_link: actionLink || null })
+    }
 
-      if (insErr) {
-        console.error('[admin/create-client] seed_member_insert_failed', { request_id, error: insErr.message, code: insErr.code, hint: insErr.hint })
-        try { await supabaseAdmin.from('clients').delete().eq('id', client.id) } catch (_) {}
-        if (insErr.code === '23505' || insErr.code === 'PGRST116') {
-          return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
-        }
-        return res.status(500).json({ error: 'seed_member_failed', detail: insErr.message, hint: insErr.hint, code: insErr.code, request_id })
-      } else {
-        seeded_member = { ...inserted, id: inserted.user_id || inserted.email }
-      }
-    } catch (e) {
-      console.error('[admin/create-client] seed_member_invite_failed', { request_id, error: e?.message || e })
-      try { await supabaseAdmin.from('clients').delete().eq('id', client.id) } catch (_) {}
-      return res.status(500).json({ error: 'invite_failed', detail: e?.message || 'Invite failed', request_id })
+    const payload = {
+      client_id: client.id,
+      email: adminEmail,
+      name: adminName || adminEmail,
+      role: 'admin',
+      user_id: userId
+    }
+
+    const { data: inserted, error: insErr } = await supabaseAdmin
+      .from('client_members')
+      .insert(payload)
+      .select('client_id,user_id,email,name,role,created_at')
+      .single()
+
+    if (insErr) {
+      console.error('seed_member_insert_failed:', insErr.message)
+    } else {
+      seeded_member = { ...inserted, id: inserted.user_id || inserted.email }
     }
   }
 
-  console.log('[admin/create-client] success', { request_id, client_id: client.id, adminRole, adminEmail: redactEmail(adminEmail), invite_method: inviteResult?.method || null, hasInviteActionLink: !!inviteResult?.inviteActionLink })
-  res.json({ item: client, seeded_member, action_link: inviteResult?.actionLink || null, invite_action_link: inviteResult?.inviteActionLink || null, request_id })
+  res.json({ item: client, seeded_member })
 })
 
 // Delete client
@@ -883,7 +740,7 @@ adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) =
   if (!client_id) return res.status(400).json({ error: 'client_id_required' })
   const { data, error } = await supabaseAdmin
     .from('client_members')
-    .select('client_id,user_id,email,name,role,created_at,tester_acknowledged_at,tester_acknowledged_ip')
+    .select('client_id,user_id,email,name,role,created_at')
     .eq('client_id', client_id)
     .order('created_at', { ascending: false })
   if (error) return res.status(500).json({ error: 'list_members_failed', detail: error.message })
@@ -895,64 +752,37 @@ adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) =
 // Add a client member
 adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) => {
   const { client_id, email, name } = req.body || {}
-  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now())
   const role = (req.body?.role || 'member').toLowerCase()
-  if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required', request_id })
-  if (!['member', 'manager', 'tester'].includes(role)) {
-    return res.status(400).json({ error: 'invalid_role', request_id })
-  }
-  console.log('[admin/add-member] start', { request_id, client_id, role, email: redactEmail(email), redirectTo: `${FRONTEND_BASE}/pwreset` })
+  if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
 
-  try {
-    const { userId, method, inviteActionLink, recovery_sent } = await ensureUserIdAndInvite({
-      email,
-      redirectTo: `${FRONTEND_BASE}/pwreset`,
-      request_id,
-      loggerPrefix: '[admin/add-member]'
+  const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
+  const { userId, actionLink, method } = await ensureUserIdAndInvite(email, redirectTo)
+
+  if (!userId) {
+    console.error('add_member_no_user_id', { email, method })
+    return res.status(400).json({
+      error: 'add_member_failed',
+      detail: 'Could not create or locate user for this email.',
+      hint: 'Try again or send the magic link manually.',
+      action_link: actionLink || null
     })
-    console.log('[admin/add-member] invite-result', { request_id, email: redactEmail(email), method, userIdPresent: !!userId, hasInviteActionLink: !!inviteActionLink, redirectTo: `${FRONTEND_BASE}/pwreset`, recovery_sent: !!recovery_sent })
-
-    if (!userId) {
-      console.error('[admin/add-member] add_member_no_user_id', { request_id, email: redactEmail(email), method })
-      return res.status(400).json({
-        error: 'add_member_failed',
-        detail: 'Could not create or locate user for this email.',
-        hint: 'Try again or send the magic link manually.',
-        action_link: null,
-        request_id,
-      })
-    }
-
-    const payload = { client_id, email, name, role, user_id: userId }
-
-    const { data, error } = await supabaseAdmin
-      .from('client_members')
-      .insert(payload)
-      .select('client_id,user_id,email,name,role,created_at,tester_acknowledged_at,tester_acknowledged_ip')
-      .single()
-
-    if (error) {
-      console.error('[admin/add-member] add_member_insert_failed', { request_id, error: error.message, code: error.code, hint: error.hint })
-      if (error.code === '23505' || error.code === 'PGRST116') {
-        return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
-      }
-      return res.status(500).json({ error: 'add_member_failed', detail: error.message, hint: error.hint, code: error.code, request_id })
-    }
-
-    const m = data
-    console.log('[admin/add-member] success', { request_id, client_id, role, email: redactEmail(email), method })
-    res.json({ item: { ...m, id: m.user_id || m.email }, request_id, invite_action_link: inviteActionLink || null })
-  } catch (e) {
-    if (e?.code === 'misconfigured_supabase_auth') {
-      return res.status(500).json({ error: 'misconfigured_supabase_auth', detail: e.detail || 'Missing SUPABASE_PUBLIC_ANON_KEY', request_id })
-    }
-    if (e?.code === 'email_in_use') {
-      console.warn('[admin/add-member] email_in_use', { request_id, email: redactEmail(email) })
-      return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id })
-    }
-    console.error('[admin/add-member] add_member_invite_failed', { request_id, error: e?.message || e })
-    return res.status(500).json({ error: 'add_member_failed', detail: e?.message || 'Invite failed', request_id, code: 'add_member_failed' })
   }
+
+  const payload = { client_id, email, name, role, user_id: userId }
+
+  const { data, error } = await supabaseAdmin
+    .from('client_members')
+    .insert(payload)
+    .select('client_id,user_id,email,name,role,created_at')
+    .single()
+
+  if (error) {
+    console.error('add_member_insert_failed:', error.message)
+    return res.status(500).json({ error: 'add_member_failed', detail: error.message })
+  }
+
+  const m = data
+  res.json({ item: { ...m, id: m.user_id || m.email } })
 })
 
 // Remove a client member
@@ -970,449 +800,7 @@ adminRouter.delete('/client-members/:id', requireAuth, requireAdmin, async (req,
   res.json({ ok: true })
 })
 
-// Send password reset (admin only) for a given email
-adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, res) => {
-  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
-  const email = (req.body?.email || '').trim();
-  if (!email) return res.status(400).json({ error: 'email_required', code: 'email_required', request_id });
-  const redirectTo = `${FRONTEND_BASE}/pwreset`;
-  console.log('[admin/send-password-reset] start', { request_id, email: redactEmail(email), redirectTo });
-  try {
-    await ensureUserAndSendRecovery({
-      email,
-      redirectTo,
-      request_id,
-      loggerPrefix: '[admin/send-password-reset]'
-    });
-    return res.json({ ok: true, request_id });
-  } catch (e) {
-    if (e?.code === 'misconfigured_supabase_auth') {
-      return res.status(500).json({ error: 'misconfigured_supabase_auth', detail: e.detail || 'Missing SUPABASE_PUBLIC_ANON_KEY', request_id });
-    }
-    const detail = e?.responseData?.error_description || e?.response?.data?.error_description || e?.response?.data?.msg || e?.message || 'Failed to send password reset email';
-    console.error('[admin/send-password-reset] failed', { request_id, email: redactEmail(email), status: e?.status || e?.response?.status || null, error: detail });
-    return res.status(500).json({ error: 'password_reset_failed', code: e?.code || 'password_reset_failed', detail, request_id });
-  }
-});
-
-// Accommodation requests (admin)
-adminRouter.get('/accommodation-requests', requireAuth, requireAdmin, async (req, res) => {
-  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
-  try {
-    const status = String(req.query?.status || 'pending').toLowerCase();
-    const client_id = String(req.query?.client_id || '').trim();
-    let q = supabaseAdmin
-      .from('accommodation_requests')
-      .select('id, role_id, candidate_id, candidate_name, candidate_email, candidate_phone, request_text, resume_url, status, admin_notes, created_at, approved_at, sent_at, resume_received_at, text_completed_at, role:roles(id,title,client_id)')
-      .order('created_at', { ascending: false });
-
-    if (status && status !== 'all') {
-      q = q.eq('status', status);
-    }
-    if (client_id) {
-      q = q.eq('role.client_id', client_id);
-    }
-
-    const { data, error } = await q;
-    if (error) {
-      console.error('[admin/accommodations] list failed', { request_id, error: error.message });
-      return res.status(500).json({ error: 'list_failed', request_id });
-    }
-    return res.json({ items: data || [], request_id });
-  } catch (e) {
-    console.error('[admin/accommodations] unexpected', { request_id, error: e?.message || e });
-    return res.status(500).json({ error: 'server_error', request_id });
-  }
-});
-
-adminRouter.patch('/accommodation-requests/:id', requireAuth, requireAdmin, async (req, res) => {
-  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
-  const id = req.params.id;
-  try {
-    const { data: existing } = await supabaseAdmin
-      .from('accommodation_requests')
-      .select('id, status, candidate_id')
-      .eq('id', id)
-      .maybeSingle();
-    if (!existing) return res.status(404).json({ error: 'not_found', request_id });
-
-    const status = req.body?.status ? String(req.body.status).toLowerCase() : null;
-    const admin_notes = typeof req.body?.admin_notes === 'string' ? req.body.admin_notes : null;
-    const allowed = new Set(['pending', 'approved', 'denied', 'sent']);
-    if (status && !allowed.has(status)) {
-      return res.status(400).json({ error: 'invalid_status', request_id });
-    }
-
-    const updates = {};
-    if (status) updates.status = status;
-    if (admin_notes !== null) updates.admin_notes = admin_notes;
-    if (status === 'approved' && existing.status !== 'approved') {
-      updates.approved_at = new Date().toISOString();
-    }
-
-    const { data, error } = await supabaseAdmin
-      .from('accommodation_requests')
-      .update(updates)
-      .eq('id', id)
-      .select('*')
-      .single();
-    if (error) return res.status(500).json({ error: 'update_failed', request_id });
-
-    if (status === 'approved' && existing.status !== 'approved') {
-      console.log('accommodation_approved', { request_id: id });
-      if (existing.candidate_id) {
-        await supabaseAdmin
-          .from('candidates')
-          .update({ status: 'Accommodation Approved', interview_status: 'Accommodation Approved' })
-          .eq('id', existing.candidate_id);
-      }
-    }
-    if (status === 'denied' && existing.candidate_id) {
-      await supabaseAdmin
-        .from('candidates')
-        .update({ status: 'Accommodation Denied', interview_status: 'Accommodation Denied' })
-        .eq('id', existing.candidate_id);
-    }
-
-    return res.json({ item: data, request_id });
-  } catch (e) {
-    console.error('[admin/accommodations] update failed', { request_id, error: e?.message || e });
-    return res.status(500).json({ error: 'server_error', request_id });
-  }
-});
-
-adminRouter.post('/accommodation-requests/:id/send-text-link', requireAuth, requireAdmin, async (req, res) => {
-  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
-  const id = req.params.id;
-  try {
-    if (!TEXT_INTERVIEW_TOKEN_SECRET) {
-      return res.status(500).json({ error: 'token_secret_missing', request_id });
-    }
-    if (!SENDGRID_KEY || !SENDGRID_FROM || !TEXT_INTERVIEW_TEMPLATE_ID) {
-      return res.status(500).json({ error: 'sendgrid_not_configured', request_id });
-    }
-
-  const { data: reqRow, error: reqErr } = await supabaseAdmin
-      .from('accommodation_requests')
-      .select('id, role_id, candidate_id, candidate_name, candidate_email, candidate_phone, status')
-      .eq('id', id)
-      .maybeSingle();
-    if (reqErr || !reqRow) return res.status(404).json({ error: 'not_found', request_id });
-    if (String(reqRow.status).toLowerCase() !== 'approved') {
-      return res.status(400).json({ error: 'not_approved', request_id });
-    }
-
-    const { data: role, error: roleErr } = await supabaseAdmin
-      .from('roles')
-      .select('id, title, client_id')
-      .eq('id', reqRow.role_id)
-      .maybeSingle();
-    if (roleErr || !role) return res.status(404).json({ error: 'role_not_found', request_id });
-
-    const dup = await checkDuplicateCandidate({
-      supabase: supabaseAdmin,
-      roleId: reqRow.role_id,
-      email: reqRow.candidate_email,
-      fullName: reqRow.candidate_name,
-      phone: reqRow.candidate_phone,
-      excludeCandidateId: reqRow.candidate_id || null,
-      allowPhoneEnrich: false,
-    });
-    if (dup.duplicate) {
-      console.warn('[admin/accommodations] duplicate candidate blocked', {
-        request_id,
-        role_id: reqRow.role_id,
-        candidate_id: dup.candidateId || null,
-        reason: dup.reason || null,
-      });
-      return res.status(409).json({
-        error: 'Already interviewed for this role.',
-        code: 'duplicate_candidate',
-        detail: dup.reason || null,
-        hint: null,
-        request_id,
-      });
-    }
-
-    const expiresIn = `${TEXT_INTERVIEW_EXP_DAYS}d`;
-    const token = jwt.sign(
-      {
-        mode: 'text',
-        request_id: reqRow.id,
-        role_id: reqRow.role_id,
-        candidate_email: reqRow.candidate_email,
-        candidate_name: reqRow.candidate_name,
-      },
-      TEXT_INTERVIEW_TOKEN_SECRET,
-      { expiresIn }
-    );
-
-    const interview_link = `${FRONTEND_BASE}/text-interview/${encodeURIComponent(token)}`.replace(/\s+/g, '');
-    const expires_in = humanizeDays(TEXT_INTERVIEW_EXP_DAYS);
-
-    await sg.send({
-      to: reqRow.candidate_email,
-      from: { email: SENDGRID_FROM, name: APP_NAME },
-      templateId: TEXT_INTERVIEW_TEMPLATE_ID,
-      dynamic_template_data: {
-        candidate_name: reqRow.candidate_name,
-        role_title: role.title || '',
-        interview_link,
-        expires_in,
-      },
-    });
-
-    console.log('email_link_sent', {
-      request_id: reqRow.id,
-      role_id: reqRow.role_id,
-      candidate_email: redactEmail(reqRow.candidate_email),
-    });
-
-    await supabaseAdmin
-      .from('accommodation_requests')
-      .update({ status: 'sent', sent_at: new Date().toISOString() })
-      .eq('id', reqRow.id);
-
-    if (reqRow.candidate_id) {
-      await supabaseAdmin
-        .from('candidates')
-        .update({ status: 'Text Interview Sent', interview_status: 'Text Interview Sent' })
-        .eq('id', reqRow.candidate_id);
-    }
-
-    console.log('text_link_sent', {
-      request_id: reqRow.id,
-      role_id: reqRow.role_id,
-      candidate_email: redactEmail(reqRow.candidate_email),
-    });
-
-    return res.json({ ok: true, request_id });
-  } catch (e) {
-    console.error('[admin/accommodations] send link failed', { request_id, error: e?.message || e });
-    return res.status(500).json({ error: 'send_failed', request_id });
-  }
-});
-
 app.use('/admin', adminRouter)
-
-// ======================= Client-scoped roles (authenticated) =======================
-function logRolesHit(req, request_id, client_id) {
-  console.log('[roles] hit', {
-    method: req.method,
-    path: req.originalUrl || req.path,
-    request_id,
-    client_id: client_id || null
-  });
-}
-
-function getRoleMembership(req, client_id) {
-  const memberships = Array.isArray(req.memberships) ? req.memberships : [];
-  const membership = memberships.find((m) => m.client_id === client_id) || null;
-  const role = (membership?.role || '').toLowerCase();
-  return { membership, role };
-}
-
-async function listRolesHandler(req, res) {
-  const request_id = req.request_id || req.requestId || req.id || crypto.randomUUID?.() || String(Date.now());
-  try {
-    const requested = req.query?.client_id || null;
-    const allowedIds = Array.isArray(req.clientIds) ? req.clientIds.filter(Boolean) : [];
-    const logClientId = requested || (allowedIds.length === 1 ? allowedIds[0] : null);
-    logRolesHit(req, request_id, logClientId);
-
-    if (!allowedIds.length) {
-      return res.json({ items: [], request_id });
-    }
-
-    let finalIds = allowedIds;
-    if (requested) {
-      if (!allowedIds.includes(requested)) {
-        return res.status(403).json({
-          error: 'forbidden',
-          code: 'client_scope_mismatch',
-          detail: 'You do not have access to this client',
-          hint: 'Join the client to view roles.',
-          request_id
-        });
-      }
-      finalIds = [requested];
-    }
-
-    const { data, error } = await supabaseAdmin
-      .from('roles')
-      .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
-      .in('client_id', finalIds)
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      console.error('[roles:list] supabase error', {
-        request_id,
-        code: error.code,
-        hint: error.hint,
-        message: error.message
-      });
-      return res.status(500).json({
-        error: 'list_roles_failed',
-        code: error.code || 'list_roles_failed',
-        detail: error.message,
-        hint: error.hint,
-        request_id
-      });
-    }
-
-    return res.json({ items: data || [], request_id });
-  } catch (e) {
-    console.error('[roles:list] unexpected', { request_id, error: e?.message || e });
-    return res.status(500).json({
-      error: 'server_error',
-      code: 'server_error',
-      detail: e?.message || 'Server error',
-      request_id
-    });
-  }
-}
-
-async function createRoleHandler(req, res) {
-  const request_id = req.request_id || req.requestId || req.id || crypto.randomUUID?.() || String(Date.now());
-  const client_id = req.body?.client_id || req.query?.client_id || null;
-  logRolesHit(req, request_id, client_id);
-  try {
-    if (!client_id) {
-      return res.status(400).json({
-        error: 'invalid_payload',
-        code: 'client_id_required',
-        detail: 'client_id is required',
-        request_id
-      });
-    }
-
-    const { membership, role } = getRoleMembership(req, client_id);
-    if (!membership || !['manager', 'admin', 'tester'].includes(role)) {
-      return res.status(403).json({
-        error: 'forbidden',
-        code: 'insufficient_permissions',
-        detail: 'Insufficient permissions to create roles for this client',
-        request_id
-      });
-    }
-
-    const title = String(req.body?.title || 'Untitled Role').trim();
-    let interview_type = req.body?.interview_type || null;
-    const IT = String(interview_type || '').toUpperCase();
-    const VALID = new Set(['BASIC', 'DETAILED', 'TECHNICAL']);
-    interview_type = VALID.has(IT) ? IT : null;
-
-    const payload = { client_id, title };
-    if (interview_type) payload.interview_type = interview_type;
-
-    const { data, error } = await supabaseAdmin
-      .from('roles')
-      .insert(payload)
-      .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
-      .single();
-
-    if (error) {
-      console.error('[roles:create] supabase error', {
-        request_id,
-        code: error.code,
-        hint: error.hint,
-        message: error.message
-      });
-      return res.status(500).json({
-        error: 'create_role_failed',
-        code: error.code || 'create_role_failed',
-        detail: error.message,
-        hint: error.hint,
-        request_id
-      });
-    }
-
-    return res.json({ role: data, request_id });
-  } catch (e) {
-    console.error('[roles:create] unexpected', { request_id, error: e?.message || e });
-    return res.status(500).json({
-      error: 'server_error',
-      code: 'server_error',
-      detail: e?.message || 'Server error',
-      request_id
-    });
-  }
-}
-
-async function deleteRoleHandler(req, res) {
-  const request_id = req.request_id || req.requestId || req.id || crypto.randomUUID?.() || String(Date.now());
-  const client_id = req.query?.client_id || req.body?.client_id || null;
-  const role_id = req.query?.id || req.body?.id || null;
-  logRolesHit(req, request_id, client_id);
-  try {
-    if (!client_id || !role_id) {
-      return res.status(400).json({
-        error: 'invalid_payload',
-        code: 'missing_role_id',
-        detail: 'client_id and id are required',
-        request_id
-      });
-    }
-
-    const { membership, role } = getRoleMembership(req, client_id);
-    if (!membership || !['manager', 'admin', 'tester'].includes(role)) {
-      return res.status(403).json({
-        error: 'forbidden',
-        code: 'insufficient_permissions',
-        detail: 'Insufficient permissions to delete roles for this client',
-        request_id
-      });
-    }
-
-    const { data, error } = await supabaseAdmin
-      .from('roles')
-      .delete()
-      .eq('id', role_id)
-      .eq('client_id', client_id)
-      .select('id')
-      .maybeSingle();
-
-    if (error) {
-      console.error('[roles:delete] supabase error', {
-        request_id,
-        code: error.code,
-        hint: error.hint,
-        message: error.message
-      });
-      return res.status(500).json({
-        error: 'delete_role_failed',
-        code: error.code || 'delete_role_failed',
-        detail: error.message,
-        hint: error.hint,
-        request_id
-      });
-    }
-
-    if (!data) {
-      return res.status(404).json({
-        error: 'not_found',
-        code: 'role_not_found',
-        detail: 'Role not found for this client',
-        request_id
-      });
-    }
-
-    return res.json({ ok: true, id: data.id, request_id });
-  } catch (e) {
-    console.error('[roles:delete] unexpected', { request_id, error: e?.message || e });
-    return res.status(500).json({
-      error: 'server_error',
-      code: 'server_error',
-      detail: e?.message || 'Server error',
-      request_id
-    });
-  }
-}
-
-const rolesPaths = ['/roles', '/api/roles'];
-app.get(rolesPaths, requireAuth, withClientScope, listRolesHandler);
-app.post(rolesPaths, requireAuth, withClientScope, createRoleHandler);
-app.delete(rolesPaths, requireAuth, withClientScope, deleteRoleHandler);
 
 /* ======================= END: Admin guard + Admin API ======================= */
 
@@ -1426,8 +814,6 @@ function mountIfExists(relPath, urlPath) {
 mountIfExists('./routes/kb', '/kb')
 mountIfExists('./routes/webhook', '/webhook')
 mountIfExists('./routes/tavus', '/')
-mountIfExists('./routes/clientMembersScoped', '/client-members')
-mountIfExists('./routes/adminBilling', '/admin/billing')
 
 // ---------- JD upload route (authenticated + scoped) ----------
 try {
@@ -1487,14 +873,6 @@ try {
   console.error('[mount] Failed to load routes/reportsPdf:', e?.message || e);
 }
 
-// Serve favicon for interview host (Chrome eagerly requests /favicon.ico)
-app.get('/favicon.ico', (req, res, next) => {
-  const host = (req.headers.host || '').toLowerCase();
-  if (!/^interviews\.alphasourceai\.com(?::\d+)?$/.test(host)) return next();
-  if (!INTERVIEW_FAVICON_URL) return res.status(404).end();
-  res.redirect(302, INTERVIEW_FAVICON_URL);
-});
-
 // ---------- Interview host shim (serve container HTML that embeds FE interview with permission headers) ----------
 app.get(['/interview-host', '/interview-host/:token'], async (req, res) => {
   try {
@@ -1502,8 +880,11 @@ app.get(['/interview-host', '/interview-host/:token'], async (req, res) => {
     const targetPath = token ? `/interview-access/${token}` : '/interview-access';
     const targetUrl = `${FRONTEND_BASE}${targetPath}`;
 
-    // Chrome only surfaces camera/mic prompts when the parent explicitly delegates
-    res.setHeader('Permissions-Policy', INTERVIEW_PERMISSIONS_POLICY);
+    // Ensure required permission delegation headers are present on the document
+    res.setHeader(
+      'Permissions-Policy',
+      'camera=(self "https://tavus.daily.co" "https://c.daily.co"), microphone=(self "https://tavus.daily.co" "https://c.daily.co"), display-capture=(self "https://tavus.daily.co" "https://c.daily.co"), fullscreen=(self "https://tavus.daily.co" "https://c.daily.co"), autoplay=(self "https://tavus.daily.co" "https://c.daily.co"), clipboard-read=(self), clipboard-write=(self)'
+    );
 
     const html = `<!doctype html>
 <html lang="en">
@@ -1511,7 +892,6 @@ app.get(['/interview-host', '/interview-host/:token'], async (req, res) => {
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Interview</title>
-    ${INTERVIEW_FAVICON_URL ? `<link rel="icon" type="image/png" href="${INTERVIEW_FAVICON_URL}" />` : ''}
     <style>
       html, body { margin:0; padding:0; height:100%; background:#0000; }
       #iv { width:100%; min-height:100vh; height:2000px; border:0; display:block; }
