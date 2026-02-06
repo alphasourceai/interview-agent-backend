@@ -19,17 +19,18 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
       req.query.client_id ||
       null;
 
-    if (!clientId) return res.json({ items: [] });
+    if (!clientId) return res.status(400).json({ error: 'client_id required' });
 
     const { data, error } = await supabase
       .from('roles')
-      .select('id,title,type,created_at,client_id')
+      .select('id,client_id,title,interview_type,created_at')
       .eq('client_id', clientId)
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: false })
+      .limit(500);
 
     if (error) {
       console.error('[GET /roles] supabase error', error);
-      return res.status(500).json({ error: 'Failed to fetch roles' });
+      return res.status(500).json({ error: 'query failed (roles)' });
     }
 
     return res.json({ items: data || [] });
