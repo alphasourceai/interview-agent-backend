@@ -1,4 +1,4 @@
-// routes/dashboard.js
+// routes/dashboard.js (drop in)
 // Express router mounted at /dashboard
 
 const express = require('express');
