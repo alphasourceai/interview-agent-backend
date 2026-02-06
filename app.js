@@ -50,6 +50,7 @@ const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
 const { generateRubricAndKBForRole } = require('./generateRubric')
 const axios = require('axios')
 const dashboardRouter = require('./routes/dashboard')
+const rolesRouter = require('./routes/roles')
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || FRONTEND_URL || '').replace(/\/+$/, '')
@@ -259,6 +260,8 @@ app.use('/client-members', clientMembersScopedRouter)
 
 app.use('/dashboard', dashboardRouter)
 app.use('/api/dashboard', dashboardRouter)
+app.use('/roles', rolesRouter)
+app.use('/api/roles', rolesRouter)
 
 // ---------- Dashboard: scoped rows ----------
 async function buildDashboardRows(req, res) {

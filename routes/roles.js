@@ -14,16 +14,16 @@ const router = express.Router();
 router.get('/', requireAuth, withClientScope, async (req, res) => {
   try {
     const clientId =
-      req.query.client_id ||
       req.client?.id ||
       req.clientScope?.defaultClientId ||
+      req.query.client_id ||
       null;
 
-    if (!clientId) return res.json({ roles: [] });
+    if (!clientId) return res.json({ items: [] });
 
     const { data, error } = await supabase
       .from('roles')
-      .select('*')
+      .select('id,title,type,created_at,client_id')
       .eq('client_id', clientId)
       .order('created_at', { ascending: false });
 
@@ -32,7 +32,7 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch roles' });
     }
 
-    return res.json({ roles: data || [] });
+    return res.json({ items: data || [] });
   } catch (e) {
     console.error('[GET /roles] unexpected', e);
     return res.status(500).json({ error: 'Server error' });
@@ -53,13 +53,6 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
       null;
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
-
-    const membership = (req.memberships || []).find((m) => m.client_id === clientId);
-    const role = (membership?.role || '').toLowerCase();
-    if (!membership) return res.status(403).json({ error: 'forbidden' });
-    if (!['manager', 'admin', 'tester'].includes(role)) {
-      return res.status(403).json({ error: 'forbidden' });
-    }
 
     const payload = {
       client_id: clientId,
@@ -153,47 +146,6 @@ router.post('/admin/roles/delete', requireAuth, async (req, res) => {
     return res.json({ ok: true, id: data.id });
   } catch (e) {
     console.error('[POST /admin/roles/delete] unexpected', e);
-    return res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// Allow client managers/admins to delete a role for their client
-router.delete('/', requireAuth, withClientScope, async (req, res) => {
-  try {
-    const clientId =
-      req.query.client_id ||
-      req.client?.id ||
-      req.clientScope?.defaultClientId ||
-      null;
-    const roleId = req.query.id || null;
-
-    if (!clientId || !roleId) {
-      return res.status(400).json({ error: 'Missing id or client_id' });
-    }
-
-    const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
-    const role = (membership?.role || '').toLowerCase();
-    if (!membership || !['manager', 'admin', 'tester'].includes(role)) {
-      return res.status(403).json({ error: 'forbidden' });
-    }
-
-    const { data, error } = await supabase
-      .from('roles')
-      .delete()
-      .eq('id', roleId)
-      .eq('client_id', clientId)
-      .select('id')
-      .maybeSingle();
-
-    if (error) {
-      console.error('[DELETE /roles] supabase error', error);
-      return res.status(500).json({ error: 'Failed to delete role' });
-    }
-    if (!data) return res.status(404).json({ error: 'Not found' });
-
-    return res.json({ ok: true, id: data.id });
-  } catch (e) {
-    console.error('[DELETE /roles] unexpected', e);
     return res.status(500).json({ error: 'Server error' });
   }
 });

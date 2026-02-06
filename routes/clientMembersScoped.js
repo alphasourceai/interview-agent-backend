@@ -23,7 +23,7 @@ function parseAccepted(value) {
 
 function readTesterAckAt(row) {
   if (!row || typeof row !== 'object') return null;
-  return row.tester_ack_at || row.tester_acknowledged_at || null;
+  return row.tester_acknowledged_at || row.tester_ack_at || null;
 }
 
 function hasCol(row, col) {
@@ -61,15 +61,33 @@ async function ensureMembershipRow(clientId, userId) {
   return inserted;
 }
 
-async function applyTesterAck(clientId, userId) {
+function getClientIp(req) {
+  const cf = req.headers['cf-connecting-ip'];
+  if (typeof cf === 'string' && cf.trim()) return cf.trim();
+
+  const xff = req.headers['x-forwarded-for'];
+  if (typeof xff === 'string' && xff.trim()) {
+    const first = xff.split(',')[0];
+    if (first && first.trim()) return first.trim();
+  }
+
+  if (Array.isArray(xff) && xff.length > 0 && String(xff[0] || '').trim()) {
+    return String(xff[0]).trim();
+  }
+
+  return req.ip || null;
+}
+
+async function applyTesterAck(clientId, userId, ipAddress) {
   const nowIso = new Date().toISOString();
   const row = await ensureMembershipRow(clientId, userId);
 
   const updatePayload = {};
-  if (hasCol(row, 'tester_ack_at')) updatePayload.tester_ack_at = nowIso;
+  if (hasCol(row, 'tester_acknowledged_at')) updatePayload.tester_acknowledged_at = nowIso;
+  if (hasCol(row, 'tester_acknowledged_ip')) updatePayload.tester_acknowledged_ip = ipAddress;
   if (hasCol(row, 'tester_ack')) updatePayload.tester_ack = true;
   if (hasCol(row, 'tester_ack_version')) updatePayload.tester_ack_version = 'v1';
-  if (hasCol(row, 'tester_acknowledged_at')) updatePayload.tester_acknowledged_at = nowIso;
+  if (hasCol(row, 'tester_ack_at')) updatePayload.tester_ack_at = nowIso;
 
   if (Object.keys(updatePayload).length === 0) {
     return row;
@@ -119,28 +137,41 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
 router.get('/me', requireAuth, withClientScope, async (req, res) => {
   const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
   try {
-    const clientId = req.query.client_id || req.client?.id || req.clientScope?.defaultClientId || null;
+    const clientId = req.client?.id || req.clientScope?.defaultClientId || req.query.client_id || null;
+    const userId = req.user?.id || null;
+    console.log('[client-members] me hit', {
+      method: req.method,
+      path: req.originalUrl || req.path,
+      request_id,
+      client_id: clientId,
+      user_id: userId
+    });
     if (!clientId) return res.status(400).json({ error: 'client_id_required', request_id });
+    if (!userId) return res.status(401).json({ error: 'unauthorized', request_id });
 
     const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
     if (!membership) return res.status(403).json({ error: 'forbidden', request_id });
 
     const { data, error } = await supabaseAdmin
       .from('client_members')
-      .select('client_id,user_id,email,name,role,created_at,tester_acknowledged_at,tester_acknowledged_ip')
+      .select('client_id,user_id,role,created_at,tester_acknowledged_at,tester_acknowledged_ip')
       .eq('client_id', clientId)
-      .eq('user_id', req.user.id)
+      .eq('user_id', userId)
       .maybeSingle();
 
     if (error) {
       console.error('[client-members/me] fetch_failed', { request_id, error: error.message, code: error.code });
       return res.status(500).json({ error: 'fetch_member_failed', detail: error.message, code: error.code, request_id });
     }
-    if (!data) {
-      return res.status(404).json({ error: 'membership_not_found', request_id });
-    }
-    const item = { ...data, id: data.user_id || data.email };
-    return res.json({ item, request_id });
+    const member = data || null;
+    return res.json({
+      ok: true,
+      member,
+      role: member?.role || null,
+      tester_acknowledged_at: member?.tester_acknowledged_at || null,
+      tester_acknowledged_ip: member?.tester_acknowledged_ip || null,
+      request_id
+    });
   } catch (e) {
     console.error('[client-members/me] unexpected', { request_id, error: e?.message || e });
     return res.status(500).json({ error: 'server_error', request_id });
@@ -276,7 +307,7 @@ router.get('/tester-ack', requireAuth, withClientScope, async (req, res) => {
 
     const { data: row, error } = await supabaseAdmin
       .from('client_members')
-      .select('*')
+      .select('tester_acknowledged_at,tester_acknowledged_ip,tester_ack,tester_ack_at')
       .eq('client_id', clientId)
       .eq('user_id', userId)
       .maybeSingle();
@@ -286,8 +317,15 @@ router.get('/tester-ack', requireAuth, withClientScope, async (req, res) => {
     }
 
     const testerAckAt = readTesterAckAt(row);
-    const acknowledged = Boolean((row && row.tester_ack === true) || testerAckAt);
-    return res.json({ ok: true, acknowledged, tester_ack_at: testerAckAt || null, request_id });
+    const acknowledged = Boolean(testerAckAt);
+    return res.json({
+      ok: true,
+      acknowledged,
+      tester_acknowledged_at: testerAckAt || null,
+      tester_acknowledged_ip: row?.tester_acknowledged_ip || null,
+      tester_ack_at: testerAckAt || null,
+      request_id
+    });
   } catch (e) {
     const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
     console.error('[tester-ack] unexpected', e?.message || e);
@@ -302,6 +340,7 @@ router.post('/tester-ack', requireAuth, withClientScope, async (req, res) => {
     const clientId = req.client?.id || req.clientScope?.defaultClientId || req.query.client_id || req.body?.client_id || null;
     const userId = req.user?.id || null;
     const accepted = parseAccepted(req.body?.accepted);
+    const ipAddress = getClientIp(req);
 
     console.log('[client-members] tester-ack hit', {
       method: req.method,
@@ -315,7 +354,7 @@ router.post('/tester-ack', requireAuth, withClientScope, async (req, res) => {
     if (!userId) return res.status(401).json({ error: 'unauthorized', request_id });
     if (!accepted) return res.status(400).json({ error: 'accepted_required', request_id });
 
-    const updateRow = await applyTesterAck(clientId, userId);
+    const updateRow = await applyTesterAck(clientId, userId, ipAddress);
     if (!updateRow) {
       return res.status(500).json({ error: 'tester_ack_failed', request_id });
     }
