@@ -3,7 +3,21 @@
 
 const express = require('express');
 const { supabase } = require('../src/lib/supabaseClient');
+
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
+
+// SendGrid setup for rubric change notification
+const sg = require('@sendgrid/mail');
+
+const SENDGRID_KEY = process.env.SENDGRID_API_KEY || '';
+const RUBRIC_CHANGE_TO = process.env.RUBRIC_CHANGE_TO || 'info@alphasourceai.com';
+const RUBRIC_CHANGE_FROM = process.env.RUBRIC_CHANGE_FROM || process.env.SENDGRID_FROM_EMAIL || 'info@alphasourceai.com';
+
+if (SENDGRID_KEY) {
+  try { sg.setApiKey(SENDGRID_KEY); } catch (e) { console.error('[rubric-change] sendgrid init failed', e?.message || e); }
+} else {
+  console.warn('[rubric-change] SENDGRID_API_KEY not set; rubric change emails will be skipped');
+}
 
 const router = express.Router();
 
@@ -155,7 +169,7 @@ router.post('/:id/rubric-request-changes', requireAuth, withClientScope, async (
 
     const { data: roleData, error: roleError } = await supabase
       .from('roles')
-      .select('id')
+      .select('id,title,client_id')
       .eq('id', roleId)
       .eq('client_id', clientId)
       .maybeSingle();
@@ -175,7 +189,88 @@ router.post('/:id/rubric-request-changes', requireAuth, withClientScope, async (
       questions_count: Array.isArray(req.body?.questions) ? req.body.questions.length : 0,
     });
 
-    return res.json({ ok: true });
+    // Persist rubric change request (audit trail)
+    let changeRequestId = null;
+    try {
+      const requestId = req.request_id || req.requestId || req.headers['x-request-id'] || null;
+      const requestedByUserId = req.user?.id || req.auth?.user_id || null;
+      const requestedByEmail = req.user?.email || req.auth?.email || null;
+      const requestedByName =
+        req.user?.user_metadata?.full_name ||
+        req.user?.user_metadata?.name ||
+        req.user?.name ||
+        null;
+
+      const auditPayload = {
+        client_id: clientId,
+        role_id: roleId,
+        requested_by_user_id: requestedByUserId,
+        requested_by_email: requestedByEmail,
+        requested_by_name: requestedByName,
+        notes: req.body?.notes || null,
+        questions: Array.isArray(req.body?.questions) ? req.body.questions : null,
+        status: 'new',
+        metadata: requestId ? { request_id: requestId } : null,
+      };
+
+      const { data: auditRow, error: auditError } = await supabase
+        .from('rubric_change_requests')
+        .insert(auditPayload)
+        .select('id')
+        .limit(1)
+        .single();
+
+      if (auditError) {
+        console.error('[POST /roles/:id/rubric-request-changes] audit insert error', {
+          code: auditError.code,
+          message: auditError.message,
+          details: auditError.details,
+          hint: auditError.hint,
+        });
+      } else {
+        changeRequestId = auditRow?.id || null;
+      }
+    } catch (e) {
+      console.error('[POST /roles/:id/rubric-request-changes] audit insert unexpected', e);
+    }
+
+    // Send rubric change notification email
+    try {
+      if (SENDGRID_KEY) {
+        const requestId = req.request_id || req.requestId || req.headers['x-request-id'] || '';
+        const userEmail = req.user?.email || req.auth?.email || '';
+        const notes = String(req.body?.notes || '').slice(0, 2000);
+        const questions = Array.isArray(req.body?.questions) ? req.body.questions.slice(0, 50) : [];
+
+        const subject = `Rubric change request — ${roleData?.title || roleId}`;
+        const text =
+`Rubric change request received
+
+role_id: ${roleId}
+role_title: ${roleData?.title || ''}
+client_id: ${clientId}
+user_email: ${userEmail}
+request_id: ${requestId}
+
+notes:
+${notes}
+
+questions:
+${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}
+`;
+
+        await sg.send({
+          to: RUBRIC_CHANGE_TO,
+          from: RUBRIC_CHANGE_FROM,
+          subject,
+          text
+        });
+      }
+    } catch (e) {
+      console.error('[POST /roles/:id/rubric-request-changes] email failed', e?.message || e);
+    }
+
+    return res.json({ ok: true, change_request_id: changeRequestId || undefined });
   } catch (e) {
     console.error('[POST /roles/:id/rubric-request-changes] unexpected', e);
     return res.status(500).json({ error: 'Server error' });
