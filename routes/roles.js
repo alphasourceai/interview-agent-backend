@@ -88,9 +88,9 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
 router.get('/:id/jd-signed-url', requireAuth, withClientScope, async (req, res) => {
   try {
     const clientId =
+      req.query.client_id ||
       req.client?.id ||
       req.clientScope?.defaultClientId ||
-      req.query.client_id ||
       null;
     const roleId = req.params.id;
 
@@ -142,10 +142,10 @@ router.get('/:id/jd-signed-url', requireAuth, withClientScope, async (req, res) 
 router.post('/:id/rubric-request-changes', requireAuth, withClientScope, async (req, res) => {
   try {
     const clientId =
-      req.client?.id ||
-      req.clientScope?.defaultClientId ||
       req.body.client_id ||
       req.query.client_id ||
+      req.client?.id ||
+      req.clientScope?.defaultClientId ||
       null;
     const roleId = req.params.id;
 
