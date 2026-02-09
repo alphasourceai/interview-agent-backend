@@ -262,6 +262,8 @@ app.use('/dashboard', dashboardRouter)
 app.use('/api/dashboard', dashboardRouter)
 app.use('/roles', rolesRouter)
 app.use('/api/roles', rolesRouter)
+app.use('/feedback', require('./routes/feedback'))
+app.use('/api/feedback', require('./routes/feedback'))
 
 // ---------- Dashboard: scoped rows ----------
 async function buildDashboardRows(req, res) {
