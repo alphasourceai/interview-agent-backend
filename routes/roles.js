@@ -23,7 +23,7 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
 
     const { data, error } = await supabase
       .from('roles')
-      .select('id,client_id,title,interview_type,created_at')
+      .select('id,client_id,title,interview_type,created_at,rubric,job_description_url')
       .eq('client_id', clientId)
       .order('created_at', { ascending: false })
       .limit(500);
