@@ -2,7 +2,7 @@
 // Direct-export Express router (standardized)
 
 const express = require('express');
-const { supabase } = require('../src/lib/supabaseClient');
+const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
 
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 
@@ -18,6 +18,8 @@ if (SENDGRID_KEY) {
 } else {
   console.warn('[rubric-change] SENDGRID_API_KEY not set; rubric change emails will be skipped');
 }
+
+const db = supabaseAdmin || supabase;
 
 const router = express.Router();
 
@@ -35,9 +37,9 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
 
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from('roles')
-      .select('id,client_id,title,interview_type,created_at,rubric,job_description_url')
+      .select('id,client_id,title,interview_type,created_at,rubric,job_description_url,slug_or_token')
       .eq('client_id', clientId)
       .order('created_at', { ascending: false })
       .limit(500);
@@ -76,7 +78,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
       interview_type: req.body.interview_type || 'BASIC',
     };
 
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from('roles')
       .insert(payload)
       .select()
@@ -112,7 +114,7 @@ router.get('/:id/jd-signed-url', requireAuth, withClientScope, async (req, res) 
       return res.status(400).json({ error: 'client_id and id required' });
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from('roles')
       .select('id,client_id,job_description_url')
       .eq('id', roleId)
@@ -167,7 +169,7 @@ router.post('/:id/rubric-request-changes', requireAuth, withClientScope, async (
       return res.status(400).json({ error: 'client_id and id required' });
     }
 
-    const { data: roleData, error: roleError } = await supabase
+    const { data: roleData, error: roleError } = await db
       .from('roles')
       .select('id,title,client_id')
       .eq('id', roleId)
@@ -213,7 +215,7 @@ router.post('/:id/rubric-request-changes', requireAuth, withClientScope, async (
         metadata: requestId ? { request_id: requestId } : null,
       };
 
-      const { data: auditRow, error: auditError } = await supabase
+      const { data: auditRow, error: auditError } = await db
         .from('rubric_change_requests')
         .insert(auditPayload)
         .select('id')
@@ -290,7 +292,7 @@ router.delete('/admin/roles', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Missing id or client_id' });
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from('roles')
       .delete()
       .eq('id', roleId)
@@ -325,7 +327,7 @@ router.post('/admin/roles/delete', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Missing id or client_id' });
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await db
       .from('roles')
       .delete()
       .eq('id', roleId)
