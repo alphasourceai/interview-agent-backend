@@ -98,7 +98,7 @@ async function handleGenerate(req, res) {
       return res.status(500).json({ error: 'Storage not configured (missing SUPABASE_URL/SUPABASE_SERVICE_KEY)' });
     }
 
-    const { candidate_id, report_id } = req.body || {};
+    const { candidate_id, report_id, interview_id } = req.body || {};
     if (!candidate_id && !report_id) {
       return res.status(400).json({ error: 'candidate_id or report_id is required' });
     }
@@ -131,17 +131,29 @@ async function handleGenerate(req, res) {
       Sentry.addBreadcrumb({ category: 'db', level: 'info', message: 'reports:loaded', data: { report_id: reportRow.id, candidate_id: reportRow.candidate_id } });
     }
 
-    // Load latest interview for this candidate (for fallbacks + status)
+    // Load interview row used for current dashboard values.
+    // Prefer explicit interview_id from FE; otherwise use latest by candidate.
     let latestInterview = null;
     {
-      const { data: ivs, error: ivErr } = await supabaseAdmin
-        .from('interviews')
-        .select('id, created_at, candidate_id, video_url, transcript_url, analysis_url, analysis')
-        .eq('candidate_id', reportRow.candidate_id)
-        .order('created_at', { ascending: false })
-        .limit(1);
-      if (ivErr) throw ivErr;
-      latestInterview = (ivs && ivs[0]) || null;
+      if (interview_id) {
+        const { data: ivById, error: ivByIdErr } = await supabaseAdmin
+          .from('interviews')
+          .select('id, created_at, candidate_id, video_url, transcript_url, analysis_url, analysis, transcript_scores, perception_scores, interview_summary, unanswered_candidate_questions')
+          .eq('id', interview_id)
+          .maybeSingle();
+        if (ivByIdErr) throw ivByIdErr;
+        latestInterview = ivById || null;
+      }
+      if (!latestInterview) {
+        const { data: ivs, error: ivErr } = await supabaseAdmin
+          .from('interviews')
+          .select('id, created_at, candidate_id, video_url, transcript_url, analysis_url, analysis, transcript_scores, perception_scores, interview_summary, unanswered_candidate_questions')
+          .eq('candidate_id', reportRow.candidate_id)
+          .order('created_at', { ascending: false })
+          .limit(1);
+        if (ivErr) throw ivErr;
+        latestInterview = (ivs && ivs[0]) || null;
+      }
     }
     if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
       Sentry.addBreadcrumb({ category: 'db', level: 'info', message: 'interviews:loaded', data: { latest_interview_id: latestInterview ? latestInterview.id : null } });
@@ -149,7 +161,7 @@ async function handleGenerate(req, res) {
 
     // 2) Load candidate + role
     const [{ data: cand, error: candErr }, { data: role, error: roleErr }] = await Promise.all([
-      supabaseAdmin.from('candidates').select('id,name,email,client_id').eq('id', reportRow.candidate_id).maybeSingle(),
+      supabaseAdmin.from('candidates').select('id,name,email,client_id,analysis_summary').eq('id', reportRow.candidate_id).maybeSingle(),
       supabaseAdmin.from('roles').select('id,title').eq('id', reportRow.role_id).maybeSingle(),
     ]);
     if (candErr) throw candErr;
@@ -196,6 +208,20 @@ async function handleGenerate(req, res) {
         const n = Number(m[0]);
         if (!Number.isFinite(n)) return null;
         return (n > 0 && n <= 1) ? Math.round(n * 100) : n;
+      }
+      return null;
+    }
+
+    function parseJsonObject(value) {
+      if (!value) return null;
+      if (typeof value === 'object' && !Array.isArray(value)) return value;
+      if (typeof value === 'string') {
+        try {
+          const parsed = JSON.parse(value);
+          return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+        } catch {
+          return null;
+        }
       }
       return null;
     }
@@ -363,58 +389,83 @@ async function handleGenerate(req, res) {
       console.log('[pdf.debug] interview_breakdown (final) =', redact(interview_breakdown));
     }
 
-    // Try to reuse the exact normalized row the dashboard uses (to guarantee parity)
-    const clientId = cand?.client_id || req.body?.client_id || null;
-    if (clientId) {
-      const dashRow = await getDashboardRowNormalized(clientId, reportRow.candidate_id);
-      if (dashRow) {
-        const dashResume = dashRow.resume_analysis || dashRow.resume_breakdown || {};
-        const dashInterview = dashRow.interview_analysis || dashRow.interview_breakdown || {};
-        const dashResumeScores = dashResume?.scores ? dashResume.scores : dashResume;
-        const dashInterviewScores = dashInterview?.scores ? dashInterview.scores : dashInterview;
+    let unansweredCandidateQuestions = Array.isArray(reportRow.unanswered_candidate_questions)
+      ? reportRow.unanswered_candidate_questions.filter(q => typeof q === 'string' && q.trim())
+      : [];
 
-        const dashResumeScore = coerceNumber(dashRow.resume_score ?? dashRow.resumeScore);
-        const dashInterviewScore = coerceNumber(dashRow.interview_score ?? dashRow.interviewScore);
-        const dashOverallScore = coerceNumber(dashRow.overall_score ?? dashRow.overallScore);
+    // Use the same source-of-truth fields as /dashboard/rows.
+    const candidateSummary = parseJsonObject(cand?.analysis_summary) || {};
+    const resumeFromCandidate =
+      coerceNumber(
+        candidateSummary.resume_score ??
+        candidateSummary.resume ??
+        candidateSummary.resume_match_percent ??
+        candidateSummary.resumeMatchPercent
+      );
+    const transcriptScores = parseJsonObject(latestInterview?.transcript_scores) || {};
+    const interviewFromTranscript = coerceNumber(transcriptScores.overall);
+    const overallFromReport = coerceNumber(reportRow.overall_score);
+    const overallFromCurrent =
+      (resumeFromCandidate !== null && interviewFromTranscript !== null)
+        ? Math.round((resumeFromCandidate + interviewFromTranscript) / 2)
+        : null;
 
-        // Overwrite summaries if dashboard has them
-        if (typeof dashResume.summary === 'string' && dashResume.summary.trim()) {
-          resume_breakdown.summary = dashResume.summary.trim();
-        }
-        if (typeof dashInterview.summary === 'string' && dashInterview.summary.trim()) {
-          interview_breakdown.summary = dashInterview.summary.trim();
-        }
+    if (resumeFromCandidate !== null) reportRow.resume_score = resumeFromCandidate;
+    if (interviewFromTranscript !== null) reportRow.interview_score = interviewFromTranscript;
+    if (overallFromReport !== null) {
+      reportRow.overall_score = overallFromReport;
+    } else if (overallFromCurrent !== null) {
+      reportRow.overall_score = overallFromCurrent;
+    }
 
-        // Overwrite category scores if dashboard has them
-        const exp = coerceNumber(dashResumeScores?.experience);
-        const skl = coerceNumber(dashResumeScores?.skills);
-        const edu = coerceNumber(dashResumeScores?.education);
-        if (exp !== null) resume_breakdown.experience = exp;
-        if (skl !== null) resume_breakdown.skills = skl;
-        if (edu !== null) resume_breakdown.education = edu;
+    const resumeSummaryFromCandidate =
+      (typeof candidateSummary.summary === 'string' && candidateSummary.summary.trim()) ||
+      (typeof candidateSummary.resume_summary === 'string' && candidateSummary.resume_summary.trim()) ||
+      (typeof candidateSummary.resumeSummary === 'string' && candidateSummary.resumeSummary.trim()) ||
+      (typeof candidateSummary.resume_analysis?.summary === 'string' && candidateSummary.resume_analysis.summary.trim()) ||
+      '';
+    if (resumeSummaryFromCandidate) {
+      resume_breakdown.summary = resumeSummaryFromCandidate;
+    }
 
-        const cla = coerceNumber(dashInterviewScores?.clarity);
-        const con = coerceNumber(dashInterviewScores?.confidence);
-        const bl  = coerceNumber(dashInterviewScores?.body_language);
-        if (cla !== null) interview_breakdown.clarity = cla;
-        if (con !== null) interview_breakdown.confidence = con;
-        if (bl  !== null) interview_breakdown.body_language = bl;
+    const experienceFromCandidate = coerceNumber(
+      candidateSummary.experience_match_percent ?? candidateSummary.experienceMatchPercent
+    );
+    const skillsFromCandidate = coerceNumber(
+      candidateSummary.skills_match_percent ?? candidateSummary.skillsMatchPercent
+    );
+    const educationFromCandidate = coerceNumber(
+      candidateSummary.education_match_percent ?? candidateSummary.educationMatchPercent
+    );
+    if (experienceFromCandidate !== null) resume_breakdown.experience = experienceFromCandidate;
+    if (skillsFromCandidate !== null) resume_breakdown.skills = skillsFromCandidate;
+    if (educationFromCandidate !== null) resume_breakdown.education = educationFromCandidate;
 
-        if (dashResumeScore !== null) reportRow.resume_score = dashResumeScore;
-        if (dashInterviewScore !== null) reportRow.interview_score = dashInterviewScore;
-        if (dashOverallScore !== null) reportRow.overall_score = dashOverallScore;
+    const perceptionScores = parseJsonObject(latestInterview?.perception_scores) || {};
+    const clarityFromInterview = coerceNumber(perceptionScores.clarity);
+    const confidenceFromInterview = coerceNumber(perceptionScores.confidence);
+    const engagementFromInterview = coerceNumber(
+      perceptionScores.engagement ?? perceptionScores.body_language
+    );
+    if (clarityFromInterview !== null) interview_breakdown.clarity = clarityFromInterview;
+    if (confidenceFromInterview !== null) interview_breakdown.confidence = confidenceFromInterview;
+    if (engagementFromInterview !== null) {
+      interview_breakdown.body_language = engagementFromInterview;
+      interview_breakdown.engagement = engagementFromInterview;
+    }
 
-        const dashQs = dashRow.unanswered_candidate_questions ?? dashRow.unansweredCandidateQuestions;
-        if (dashQs) {
-          const normalized = Array.isArray(dashQs)
-            ? dashQs
-            : (typeof dashQs === 'string' ? dashQs.split(/\r?\n/) : []);
-          const cleaned = normalized
-            .map((q) => (q == null ? '' : String(q).trim()))
-            .filter(Boolean);
-          if (cleaned.length) unansweredCandidateQuestions = cleaned;
-        }
-      }
+    const interviewSummaryFromInterview = typeof latestInterview?.interview_summary === 'string'
+      ? latestInterview.interview_summary.trim()
+      : '';
+    if (interviewSummaryFromInterview) {
+      interview_breakdown.summary = interviewSummaryFromInterview;
+    }
+
+    if (Array.isArray(latestInterview?.unanswered_candidate_questions)) {
+      const cleaned = latestInterview.unanswered_candidate_questions
+        .map((q) => (q == null ? '' : String(q).trim()))
+        .filter(Boolean);
+      unansweredCandidateQuestions = cleaned;
     }
 
     const status = latestInterview?.video_url ? 'Interview Completed' : 'Pending';
@@ -422,10 +473,6 @@ async function handleGenerate(req, res) {
     if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
       Sentry.addBreadcrumb({ category: 'reports', level: 'info', message: 'payload:build' });
     }
-    let unansweredCandidateQuestions = Array.isArray(reportRow.unanswered_candidate_questions)
-      ? reportRow.unanswered_candidate_questions.filter(q => typeof q === 'string' && q.trim())
-      : [];
-
     const payload = {
       name,
       email,
@@ -434,9 +481,9 @@ async function handleGenerate(req, res) {
       interview_score: coerceNumber(reportRow.interview_score) ?? 0,
       overall_score: coerceNumber(reportRow.overall_score) ?? 0,
       resume_breakdown,
-      resume_summary,
+      resume_summary: resume_breakdown.summary || resume_summary,
       interview_breakdown,
-      interview_summary,
+      interview_summary: interview_breakdown.summary || interview_summary,
       created_at: reportRow.created_at,
       unanswered_candidate_questions: unansweredCandidateQuestions
     };
