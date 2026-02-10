@@ -373,6 +373,10 @@ async function handleGenerate(req, res) {
         const dashResumeScores = dashResume?.scores ? dashResume.scores : dashResume;
         const dashInterviewScores = dashInterview?.scores ? dashInterview.scores : dashInterview;
 
+        const dashResumeScore = coerceNumber(dashRow.resume_score ?? dashRow.resumeScore);
+        const dashInterviewScore = coerceNumber(dashRow.interview_score ?? dashRow.interviewScore);
+        const dashOverallScore = coerceNumber(dashRow.overall_score ?? dashRow.overallScore);
+
         // Overwrite summaries if dashboard has them
         if (typeof dashResume.summary === 'string' && dashResume.summary.trim()) {
           resume_breakdown.summary = dashResume.summary.trim();
@@ -395,6 +399,21 @@ async function handleGenerate(req, res) {
         if (cla !== null) interview_breakdown.clarity = cla;
         if (con !== null) interview_breakdown.confidence = con;
         if (bl  !== null) interview_breakdown.body_language = bl;
+
+        if (dashResumeScore !== null) reportRow.resume_score = dashResumeScore;
+        if (dashInterviewScore !== null) reportRow.interview_score = dashInterviewScore;
+        if (dashOverallScore !== null) reportRow.overall_score = dashOverallScore;
+
+        const dashQs = dashRow.unanswered_candidate_questions ?? dashRow.unansweredCandidateQuestions;
+        if (dashQs) {
+          const normalized = Array.isArray(dashQs)
+            ? dashQs
+            : (typeof dashQs === 'string' ? dashQs.split(/\r?\n/) : []);
+          const cleaned = normalized
+            .map((q) => (q == null ? '' : String(q).trim()))
+            .filter(Boolean);
+          if (cleaned.length) unansweredCandidateQuestions = cleaned;
+        }
       }
     }
 
@@ -403,7 +422,7 @@ async function handleGenerate(req, res) {
     if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
       Sentry.addBreadcrumb({ category: 'reports', level: 'info', message: 'payload:build' });
     }
-    const unansweredCandidateQuestions = Array.isArray(reportRow.unanswered_candidate_questions)
+    let unansweredCandidateQuestions = Array.isArray(reportRow.unanswered_candidate_questions)
       ? reportRow.unanswered_candidate_questions.filter(q => typeof q === 'string' && q.trim())
       : [];
 
@@ -411,10 +430,9 @@ async function handleGenerate(req, res) {
       name,
       email,
       status,
-      resume_score: Number.isFinite(Number(reportRow.resume_score)) ? Number(reportRow.resume_score) : 0,
-      interview_score: Number.isFinite(Number(reportRow.interview_score)) ? Number(reportRow.interview_score)
-                        : (Number.isFinite(Number(rb.overall)) ? Number(rb.overall) : 0),
-      overall_score: Number.isFinite(Number(reportRow.overall_score)) ? Number(reportRow.overall_score) : 0,
+      resume_score: coerceNumber(reportRow.resume_score) ?? 0,
+      interview_score: coerceNumber(reportRow.interview_score) ?? 0,
+      overall_score: coerceNumber(reportRow.overall_score) ?? 0,
       resume_breakdown,
       resume_summary,
       interview_breakdown,
