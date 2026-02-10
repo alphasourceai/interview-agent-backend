@@ -8,7 +8,7 @@
     html { font-size: 80%; }
 
     body {
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      font-family: Raleway, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
       background: #ffffff;
       color: #252a34;
       padding: 24px;
@@ -123,7 +123,7 @@
   <div class="container">
 
     <div class="header">
-      <img src="No bg - color logo - dark text.png" alt="AlphaSource Logo" />
+      {{#if logo_src}}<img src="{{logo_src}}" alt="AlphaSource Logo" />{{/if}}
       <h2>Candidate Report</h2>
       <p><strong>Name:</strong> {{name}}</p>
       <p><strong>Email:</strong> {{email}}</p>
@@ -177,7 +177,11 @@
         {{#if interview_summary}}
           {{interview_summary}}
         {{else}}
-          <span class="muted">Summary not available.</span>
+          {{#if analysis.summary}}
+            {{analysis.summary}}
+          {{else}}
+            <span class="muted">Summary not available.</span>
+          {{/if}}
         {{/if}}
       </div>
     </div>
