@@ -171,6 +171,17 @@ async function handleGenerate(req, res) {
       Sentry.addBreadcrumb({ category: 'db', level: 'info', message: 'role:loaded', data: { role_id: role ? role.id : null } });
     }
 
+    let client = null;
+    if (cand?.client_id) {
+      const { data: clientRow, error: clientErr } = await supabaseAdmin
+        .from('clients')
+        .select('id,name')
+        .eq('id', cand.client_id)
+        .maybeSingle();
+      if (clientErr) throw clientErr;
+      client = clientRow || null;
+    }
+
     // Normalize to the template contract (flat keys expected by candidate-report.hbs)
     const analysis = reportRow.analysis || {};
     const rbRaw = analysis.interview || reportRow.interview_breakdown || {};
@@ -476,6 +487,8 @@ async function handleGenerate(req, res) {
     const payload = {
       name,
       email,
+      company_name: typeof client?.name === 'string' ? client.name.trim() : '',
+      role_name: typeof role?.title === 'string' ? role.title.trim() : '',
       status,
       resume_score: coerceNumber(reportRow.resume_score) ?? 0,
       interview_score: coerceNumber(reportRow.interview_score) ?? 0,

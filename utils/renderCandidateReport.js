@@ -159,6 +159,8 @@ function buildCandidateReportHtml(payload) {
   const renderData = {
     name: nonEmptyString(p.name),
     email: nonEmptyString(p.email),
+    company_name: nonEmptyString(p.company_name ?? p.client_name),
+    role_name: nonEmptyString(p.role_name),
     status: nonEmptyString(p.status),
 
     resume_score: coerceNumber(p.resume_score) ?? coerceNumber(p.resumeScore) ?? '',
