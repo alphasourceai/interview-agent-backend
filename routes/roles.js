@@ -103,6 +103,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
  */
 router.get('/:id/jd-signed-url', requireAuth, withClientScope, async (req, res) => {
   try {
+    const request_id = req.request_id || req.headers['x-request-id'] || req.headers['x-correlation-id'] || null;
     const roleId = req.params.id;
 
     if (!roleId) {
@@ -147,16 +148,21 @@ router.get('/:id/jd-signed-url', requireAuth, withClientScope, async (req, res) 
       process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET ||
       process.env.SUPABASE_JD_BUCKET ||
       'job-descriptions';
-    const rawPath = String(data.job_description_url || '').trim();
-    if (/^https?:\/\//i.test(rawPath)) {
-      return res.json({ url: rawPath });
+    const rawUrl = String(data.job_description_url || '').trim();
+    if (/^https?:\/\//i.test(rawUrl)) {
+      return res.json({ url: rawUrl });
     }
 
-    const normalizedPath = rawPath.replace(/^\/+/, '');
+    let strippedPath = rawUrl.replace(/^\/+/, '');
     const bucketPrefixed = `${bucket}/`;
-    const strippedBucketPath = normalizedPath.startsWith(bucketPrefixed)
-      ? normalizedPath.slice(bucketPrefixed.length)
-      : normalizedPath;
+    if (strippedPath.startsWith(bucketPrefixed)) {
+      strippedPath = strippedPath.slice(bucketPrefixed.length);
+    }
+    const bucketIdx = strippedPath.indexOf(bucketPrefixed);
+    if (bucketIdx >= 0) {
+      strippedPath = strippedPath.slice(bucketIdx + bucketPrefixed.length);
+    }
+    strippedPath = strippedPath.replace(/^\/+/, '');
 
     const candidatePaths = [];
     const pushCandidate = (value) => {
@@ -165,17 +171,17 @@ router.get('/:id/jd-signed-url', requireAuth, withClientScope, async (req, res) 
       if (!candidatePaths.includes(candidate)) candidatePaths.push(candidate);
     };
 
-    pushCandidate(normalizedPath);
-    pushCandidate(strippedBucketPath);
+    pushCandidate(strippedPath);
 
-    const filename = strippedBucketPath.split(/[?#]/)[0].split('/').filter(Boolean).pop();
+    const filename = strippedPath.split(/[?#]/)[0].split('/').filter(Boolean).pop();
     if (filename && roleClientId && data.id) {
       pushCandidate(`${roleClientId}/${data.id}/${filename}`);
+      pushCandidate(`${roleClientId}/${filename}`);
+      pushCandidate(`${data.id}/${filename}`);
     }
 
-    const storageClient = supabaseAdmin || supabase;
-    let lastStorageError = null;
-    let lastAttemptedPath = '';
+    const storageClient = supabaseAdmin;
+    let sawNonNotFound = false;
     for (const attemptedPath of candidatePaths) {
       const { data: urlData, error: storageError } = await storageClient
         .storage
@@ -184,26 +190,27 @@ router.get('/:id/jd-signed-url', requireAuth, withClientScope, async (req, res) 
       if (!storageError && urlData?.signedUrl) {
         return res.json({ url: urlData.signedUrl });
       }
-      lastStorageError = storageError || null;
-      lastAttemptedPath = attemptedPath;
-    }
-
-    const storageMsg = String(lastStorageError?.message || '').toLowerCase();
-    const missingObject =
-      storageMsg.includes('not found') ||
-      storageMsg.includes('does not exist') ||
-      storageMsg.includes('no such') ||
-      storageMsg.includes('404') ||
-      storageMsg.includes('object');
-    if (missingObject) {
-      return res.status(404).json({ error: 'Not found' });
+      const msg = String(storageError?.message || '').toLowerCase();
+      const notFound =
+        msg.includes('not found') ||
+        msg.includes('does not exist') ||
+        msg.includes('no such') ||
+        msg.includes('404') ||
+        msg.includes('object');
+      if (!notFound) {
+        sawNonNotFound = true;
+      }
     }
 
     console.error('[GET /roles/:id/jd-signed-url] storage error', {
-      roleId,
+      request_id,
       bucket,
-      attemptedPath: lastAttemptedPath
+      attemptedKeys: candidatePaths
     });
+
+    if (!sawNonNotFound) {
+      return res.status(404).json({ error: 'Not found' });
+    }
     return res.status(500).json({ error: 'Failed to sign url' });
   } catch (e) {
     console.error('[GET /roles/:id/jd-signed-url] unexpected', e);
