@@ -189,12 +189,29 @@ async function withClientScope(req, res, next) {
     } catch (_) {}
 
     if (isAdmin) {
+      const requestedClientId = req.query?.client_id || null;
+
+      if (requestedClientId) {
+        req.clientIds = [requestedClientId];
+        req.memberships = [{ client_id: requestedClientId, role: 'admin' }];
+        req.isAdmin = true;
+        return next();
+      }
+
       const { data: allClients, error: cErr } = await supabaseAdmin
         .from('clients')
         .select('id');
-      if (cErr) return res.status(500).json({ error: 'Failed to load clients', detail: cErr.message });
-      req.clientIds = (allClients || []).map(c => c.id);
-      req.memberships = (allClients || []).map(c => ({ client_id: c.id, role: 'admin' }));
+
+      if (cErr) {
+        return res.status(500).json({
+          error: 'Failed to load clients',
+          detail: cErr.message
+        });
+      }
+
+      const ids = (allClients || []).map(c => c.id);
+      req.clientIds = ids;
+      req.memberships = ids.map(id => ({ client_id: id, role: 'admin' }));
       req.isAdmin = true;
       return next();
     }
