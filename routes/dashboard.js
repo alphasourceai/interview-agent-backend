@@ -213,20 +213,19 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         .from('reports')
         .select([
           'id',
-          'candidate_id',
-          'client_id',
           'created_at',
+          'client_id',
+          'candidate_id',
+          'role_id',
           'resume_score',
           'interview_score',
           'overall_score',
-          'resume_analysis',
-          'interview_analysis',
           'resume_breakdown',
           'interview_breakdown',
           'analysis',
-          // common names I've seen/used for a public PDF URL:
           'report_url',
-          'latest_report_url',
+          'unanswered_candidate_questions',
+          'candidate_external_id',
         ].join(', '))
         .eq('client_id', clientId)
         .in('candidate_id', candIds)
