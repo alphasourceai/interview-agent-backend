@@ -103,29 +103,42 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
  */
 router.get('/:id/jd-signed-url', requireAuth, withClientScope, async (req, res) => {
   try {
-    const clientId =
-      req.query.client_id ||
-      req.client?.id ||
-      req.clientScope?.defaultClientId ||
-      null;
     const roleId = req.params.id;
 
-    if (!clientId || !roleId) {
-      return res.status(400).json({ error: 'client_id and id required' });
+    if (!roleId) {
+      return res.status(404).json({ error: 'Not found' });
     }
 
     const { data, error } = await db
       .from('roles')
       .select('id,client_id,job_description_url')
       .eq('id', roleId)
-      .eq('client_id', clientId)
       .maybeSingle();
 
     if (error) {
       console.error('[GET /roles/:id/jd-signed-url] supabase error', error);
       return res.status(500).json({ error: 'Server error' });
     }
-    if (!data || !data.job_description_url) {
+    if (!data) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+
+    const allowedClientIds = new Set();
+    const memberships = Array.isArray(req.clientScope?.memberships) ? req.clientScope.memberships : [];
+    for (const m of memberships) {
+      if (m?.client_id != null) allowedClientIds.add(String(m.client_id));
+    }
+    if (Array.isArray(req.clientIds)) {
+      for (const id of req.clientIds) {
+        if (id != null) allowedClientIds.add(String(id));
+      }
+    }
+    const roleClientId = data.client_id == null ? '' : String(data.client_id);
+    if (!roleClientId || !allowedClientIds.has(roleClientId)) {
+      return res.status(403).json({ error: 'forbidden', code: 'CLIENT_SCOPE_MISMATCH' });
+    }
+
+    if (!data.job_description_url) {
       return res.status(404).json({ error: 'Not found' });
     }
 
