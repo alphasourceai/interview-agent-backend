@@ -21,7 +21,6 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   const REPLICA_ID = String(process.env.TAVUS_REPLICA_ID || '').trim();
   const PERSONA_ID = String(process.env.TAVUS_PERSONA_ID || '').trim();
   const RETRIEVAL = String(process.env.TAVUS_DOCUMENT_STRATEGY || 'balanced').trim();
-  const INTERVIEWER_NAME = String(process.env.TAVUS_INTERVIEWER_NAME || 'Alex').trim() || 'Alex';
 
   if (!API_KEY) {
     const err = new Error('TAVUS_API_KEY is not set');
@@ -49,7 +48,7 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   const candidateName = (candidate?.name || '').trim() || 'there';
 
   const firstQuestion = extractFirstQuestion(role?.rubric);
-  const customGreeting = buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestion, INTERVIEWER_NAME);
+  const customGreeting = buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestion);
   const context = buildConversationalContext(candidateName, roleTitle, companyName);
 
   const conversationName = `${roleTitle} - ${candidate?.name || candidate?.email || 'Candidate'}`;
@@ -162,9 +161,9 @@ function extractFirstQuestion(rubric) {
   return fallback;
 }
 
-function buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestion, interviewerName) {
+function buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestion) {
   const companyClause = companyName ? ` at ${companyName}` : '';
-  const greeting = `Hi ${candidateName}, it's nice to meet you today. My name is ${interviewerName}, and I'll be conducting your interview for the ${roleTitle} position${companyClause}. I'm looking forward to our conversation. Let's get started.`;
+  const greeting = `Hi ${candidateName}, it's nice to meet you today. I'll be conducting your interview for the ${roleTitle} position${companyClause}. I'm looking forward to our conversation. Let's get started.`;
   return `${greeting} ${firstQuestion}`;
 }
 
@@ -180,6 +179,7 @@ function buildConversationalContext(candidateName, roleTitle, companyName) {
     'Instructions:',
     '- You are a structured interviewer.',
     '- YOU must speak first when the call connects: deliver the greeting and ask the first rubric question immediately. Do not wait in silence.',
+    '- Do not introduce yourself with any personal name.',
     '- Ask questions one at a time from the rubric.',
     '- Use ONLY the provided knowledge base (KB) and rubric when answering questions about the role, company, or process.',
     '- If the candidate asks about anything not covered in the KB, respond with exactly: "I don\'t have that information. I\'ll pass it to the hiring manager: [[UNANSWERED_QUESTION: <verbatim candidate question>]]" Then immediately ask the next rubric question.',
