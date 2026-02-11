@@ -882,46 +882,22 @@ try {
   console.error('[mount] Failed to load routes/reportsPdf:', e?.message || e);
 }
 
-// ---------- Interview host shim (serve container HTML that embeds FE interview with permission headers) ----------
-app.get(['/interview-host', '/interview-host/:token'], async (req, res) => {
+// ---------- Interview host shim (redirect to FE interview-access) ----------
+app.get(['/interview-host', '/interview-host/:token'], (req, res) => {
   try {
     const token = req.params.token ? encodeURIComponent(req.params.token) : '';
     const targetPath = token ? `/interview-access/${token}` : '/interview-access';
-    const targetUrl = `${FRONTEND_BASE}${targetPath}`;
 
-    // Ensure required permission delegation headers are present on the document
-    res.setHeader(
-      'Permissions-Policy',
-      'camera=(self "https://tavus.daily.co" "https://c.daily.co"), microphone=(self "https://tavus.daily.co" "https://c.daily.co"), display-capture=(self "https://tavus.daily.co" "https://c.daily.co"), fullscreen=(self "https://tavus.daily.co" "https://c.daily.co"), autoplay=(self "https://tavus.daily.co" "https://c.daily.co"), clipboard-read=(self), clipboard-write=(self)'
-    );
+    // Preserve any query string
+    const qsIndex = req.url.indexOf('?');
+    const qs = qsIndex >= 0 ? req.url.slice(qsIndex) : '';
 
-    const html = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Interview</title>
-    <style>
-      html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#0000; }
-      #iv { width:100vw; height:100dvh; border:0; display:block; }
-    </style>
-  </head>
-  <body>
-    <iframe id="iv"
-      src="${targetUrl}"
-      allow="camera; microphone; autoplay; clipboard-read; clipboard-write; display-capture; fullscreen; storage-access"
-      allowfullscreen
-      referrerpolicy="no-referrer"
-      scrolling="no"></iframe>
-  </body>
-</html>`;
-    res.status(200).type('html').send(html);
+    const targetUrl = `${FRONTEND_BASE}${targetPath}${qs}`;
+    return res.redirect(302, targetUrl);
   } catch (e) {
-    const status = e?.response?.status || 502;
-    const body = typeof e?.response?.data === 'string' ? e.response.data : 'Upstream error';
-    res.status(status).type('text/plain').send(body);
+    return res.status(500).type('text/plain').send('redirect_failed');
   }
-})
+});
 // Pretty link: https://interviews.alphasourceai.com/<token> -> /interview-host/<token>
 app.get('/:token', (req, res, next) => {
   const host = (req.headers.host || '').toLowerCase();
