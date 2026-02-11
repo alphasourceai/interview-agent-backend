@@ -143,22 +143,68 @@ router.get('/:id/jd-signed-url', requireAuth, withClientScope, async (req, res) 
       return res.status(404).json({ error: 'Not found' });
     }
 
-    let path = data.job_description_url;
-    if (path.startsWith('job-descriptions/')) {
-      path = path.substring('job-descriptions/'.length);
+    const bucket =
+      process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET ||
+      process.env.SUPABASE_JD_BUCKET ||
+      'job-descriptions';
+    const rawPath = String(data.job_description_url || '').trim();
+    if (/^https?:\/\//i.test(rawPath)) {
+      return res.json({ url: rawPath });
     }
 
-    const { data: urlData, error: storageError } = await supabase
-      .storage
-      .from('job-descriptions')
-      .createSignedUrl(path, 60 * 10);
+    const normalizedPath = rawPath.replace(/^\/+/, '');
+    const bucketPrefixed = `${bucket}/`;
+    const strippedBucketPath = normalizedPath.startsWith(bucketPrefixed)
+      ? normalizedPath.slice(bucketPrefixed.length)
+      : normalizedPath;
 
-    if (storageError) {
-      console.error('[GET /roles/:id/jd-signed-url] storage error', storageError);
-      return res.status(500).json({ error: 'Failed to sign url' });
+    const candidatePaths = [];
+    const pushCandidate = (value) => {
+      const candidate = String(value || '').trim().replace(/^\/+/, '');
+      if (!candidate) return;
+      if (!candidatePaths.includes(candidate)) candidatePaths.push(candidate);
+    };
+
+    pushCandidate(normalizedPath);
+    pushCandidate(strippedBucketPath);
+
+    const filename = strippedBucketPath.split(/[?#]/)[0].split('/').filter(Boolean).pop();
+    if (filename && roleClientId && data.id) {
+      pushCandidate(`${roleClientId}/${data.id}/${filename}`);
     }
 
-    return res.json({ url: urlData.signedUrl });
+    const storageClient = supabaseAdmin || supabase;
+    let lastStorageError = null;
+    let lastAttemptedPath = '';
+    for (const attemptedPath of candidatePaths) {
+      const { data: urlData, error: storageError } = await storageClient
+        .storage
+        .from(bucket)
+        .createSignedUrl(attemptedPath, 60 * 10);
+      if (!storageError && urlData?.signedUrl) {
+        return res.json({ url: urlData.signedUrl });
+      }
+      lastStorageError = storageError || null;
+      lastAttemptedPath = attemptedPath;
+    }
+
+    const storageMsg = String(lastStorageError?.message || '').toLowerCase();
+    const missingObject =
+      storageMsg.includes('not found') ||
+      storageMsg.includes('does not exist') ||
+      storageMsg.includes('no such') ||
+      storageMsg.includes('404') ||
+      storageMsg.includes('object');
+    if (missingObject) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+
+    console.error('[GET /roles/:id/jd-signed-url] storage error', {
+      roleId,
+      bucket,
+      attemptedPath: lastAttemptedPath
+    });
+    return res.status(500).json({ error: 'Failed to sign url' });
   } catch (e) {
     console.error('[GET /roles/:id/jd-signed-url] unexpected', e);
     return res.status(500).json({ error: 'Server error' });
