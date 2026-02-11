@@ -23,6 +23,7 @@ const db = supabaseAdmin || supabase;
 
 const router = express.Router();
 
+
 /**
  * GET /roles?client_id=...
  * Returns roles for the specified (or scoped) client.
@@ -134,84 +135,90 @@ router.get('/:id/jd-signed-url', requireAuth, withClientScope, async (req, res) 
         if (id != null) allowedClientIds.add(String(id));
       }
     }
-    const isGlobalAdmin = req.user?.role === 'admin' || req.user?.is_admin === true;
+    let isGlobalAdmin = false;
+
+    try {
+      const userEmail = req.user?.email || req.auth?.email || null;
+
+      if (userEmail) {
+        const { data: adminRow, error: adminErr } = await db
+          .from('admins')
+          .select('id')
+          .eq('email', userEmail)
+          .eq('is_active', true)
+          .maybeSingle();
+
+        if (!adminErr && adminRow) {
+          isGlobalAdmin = true;
+        }
+      }
+    } catch (e) {
+      console.error('[jd-signed-url] admin lookup failed', e);
+    }
     const roleClientId = data.client_id == null ? '' : String(data.client_id);
     if (!isGlobalAdmin && (!roleClientId || !allowedClientIds.has(roleClientId))) {
       return res.status(403).json({ error: 'forbidden', code: 'CLIENT_SCOPE_MISMATCH' });
     }
 
-    if (!data.job_description_url) {
+    const bucket = process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || 'job-descriptions';
+
+    const rawKey = String(data.job_description_url || '').trim();
+
+    if (!rawKey) {
       return res.status(404).json({ error: 'Not found' });
     }
 
-    const bucket =
-      process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET ||
-      process.env.SUPABASE_JD_BUCKET ||
-      'job-descriptions';
-    const rawUrl = String(data.job_description_url || '').trim();
-    if (/^https?:\/\//i.test(rawUrl)) {
-      return res.json({ url: rawUrl });
+    if (/^https?:\/\//i.test(rawKey)) {
+      return res.json({ url: rawKey });
     }
 
-    let strippedPath = rawUrl.replace(/^\/+/, '');
-    const bucketPrefixed = `${bucket}/`;
-    if (strippedPath.startsWith(bucketPrefixed)) {
-      strippedPath = strippedPath.slice(bucketPrefixed.length);
-    }
-    const bucketIdx = strippedPath.indexOf(bucketPrefixed);
-    if (bucketIdx >= 0) {
-      strippedPath = strippedPath.slice(bucketIdx + bucketPrefixed.length);
-    }
-    strippedPath = strippedPath.replace(/^\/+/, '');
+    let storageKey = rawKey.replace(/^\/+/, '');
 
-    const candidatePaths = [];
-    const pushCandidate = (value) => {
-      const candidate = String(value || '').trim().replace(/^\/+/, '');
-      if (!candidate) return;
-      if (!candidatePaths.includes(candidate)) candidatePaths.push(candidate);
-    };
-
-    pushCandidate(strippedPath);
-
-    const filename = strippedPath.split(/[?#]/)[0].split('/').filter(Boolean).pop();
-    if (filename && roleClientId && data.id) {
-      pushCandidate(`${roleClientId}/${data.id}/${filename}`);
-      pushCandidate(`${roleClientId}/${filename}`);
-      pushCandidate(`${data.id}/${filename}`);
+    const bucketPrefix = `${bucket}/`;
+    if (storageKey.startsWith(bucketPrefix)) {
+      storageKey = storageKey.slice(bucketPrefix.length);
     }
 
-    const storageClient = supabaseAdmin;
-    let sawNonNotFound = false;
-    for (const attemptedPath of candidatePaths) {
-      const { data: urlData, error: storageError } = await storageClient
-        .storage
-        .from(bucket)
-        .createSignedUrl(attemptedPath, 60 * 10);
-      if (!storageError && urlData?.signedUrl) {
-        return res.json({ url: urlData.signedUrl });
-      }
-      const msg = String(storageError?.message || '').toLowerCase();
-      const notFound =
-        msg.includes('not found') ||
-        msg.includes('does not exist') ||
-        msg.includes('no such') ||
-        msg.includes('404') ||
-        msg.includes('object');
-      if (!notFound) {
-        sawNonNotFound = true;
-      }
+    const expectedPrefix = `${roleClientId}/${data.id}/`;
+    if (!storageKey.startsWith(expectedPrefix)) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+
+    const { data: signed, error: signErr } = await supabaseAdmin
+      .storage
+      .from(bucket)
+      .createSignedUrl(storageKey, 600);
+
+    if (!signErr && signed?.signedUrl) {
+      return res.json({ url: signed.signedUrl });
+    }
+
+    const msg = String(signErr?.message || '').toLowerCase();
+    const notFound =
+      msg.includes('not found') ||
+      msg.includes('does not exist') ||
+      msg.includes('no such') ||
+      msg.includes('404') ||
+      msg.includes('object');
+
+    if (notFound) {
+      return res.status(404).json({ error: 'Not found' });
     }
 
     console.error('[GET /roles/:id/jd-signed-url] storage error', {
       request_id,
       bucket,
-      attemptedKeys: candidatePaths
+      storageKey,
+      detail: signErr?.message || signErr
     });
 
-    if (!sawNonNotFound) {
-      return res.status(404).json({ error: 'Not found' });
-    }
-    return res.status(500).json({ error: 'Failed to sign url' });
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'JD_SIGN_FAILED',
+      detail: signErr?.message || 'Failed to sign url',
+      hint: null,
+      request_id
+    });
   } catch (e) {
     console.error('[GET /roles/:id/jd-signed-url] unexpected', e);
     return res.status(500).json({ error: 'Server error' });
