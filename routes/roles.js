@@ -133,8 +133,9 @@ router.get('/:id/jd-signed-url', requireAuth, withClientScope, async (req, res) 
         if (id != null) allowedClientIds.add(String(id));
       }
     }
+    const isGlobalAdmin = req.user?.role === 'admin' || req.user?.is_admin === true;
     const roleClientId = data.client_id == null ? '' : String(data.client_id);
-    if (!roleClientId || !allowedClientIds.has(roleClientId)) {
+    if (!isGlobalAdmin && (!roleClientId || !allowedClientIds.has(roleClientId))) {
       return res.status(403).json({ error: 'forbidden', code: 'CLIENT_SCOPE_MISMATCH' });
     }
 
