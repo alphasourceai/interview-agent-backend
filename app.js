@@ -865,6 +865,72 @@ app.get('/:token', (req, res, next) => {
   return res.redirect(302, `/interview-host/${encodeURIComponent(token)}${qs}`);
 });
 // ---------- health ----------
+// /health remains a lightweight liveness check.
+// /healthz is a bounded readiness-ish probe that also tests Supabase Auth reachability.
+app.get('/healthz', async (req, res) => {
+  const request_id =
+    req.request_id ||
+    req.headers['x-request-id'] ||
+    req.headers['x-correlation-id'] ||
+    (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
+
+  const now = new Date().toISOString();
+  const supabaseUrl = String(process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+  const anonKey = String(process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_PUBLIC_ANON_KEY || '');
+
+  const supabase_auth = { ok: false, latency_ms: 0 };
+  const startedAt = Date.now();
+
+  if (!supabaseUrl || !anonKey || typeof fetch !== 'function' || typeof AbortController !== 'function') {
+    supabase_auth.latency_ms = Date.now() - startedAt;
+    if (!supabaseUrl) supabase_auth.error = 'Missing SUPABASE_URL';
+    else if (!anonKey) supabase_auth.error = 'Missing SUPABASE_ANON_KEY';
+    else if (typeof fetch !== 'function') supabase_auth.error = 'fetch unavailable';
+    else supabase_auth.error = 'AbortController unavailable';
+
+    return res.json({
+      ok: false,
+      degraded: true,
+      request_id,
+      now,
+      supabase_auth,
+    });
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+  try {
+    const response = await fetch(`${supabaseUrl}/auth/v1/health`, {
+      method: 'GET',
+      headers: { apikey: anonKey },
+      signal: controller.signal,
+    });
+
+    supabase_auth.ok = true;
+    supabase_auth.status = response.status;
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      supabase_auth.ok = false;
+      supabase_auth.timeout = true;
+    } else {
+      supabase_auth.ok = false;
+      supabase_auth.error = err?.message || String(err);
+    }
+  } finally {
+    clearTimeout(timeoutId);
+    supabase_auth.latency_ms = Date.now() - startedAt;
+  }
+
+  return res.json({
+    ok: supabase_auth.ok === true,
+    degraded: supabase_auth.ok !== true,
+    request_id,
+    now,
+    supabase_auth,
+  });
+});
+
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
 // ---------- 404 ----------
