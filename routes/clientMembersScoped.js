@@ -112,7 +112,7 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
     if (!clientId) return res.status(400).json({ error: 'client_id_required', request_id });
 
     const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
-    const isGlobalAdmin = req.user?.role === 'admin' || req.user?.is_admin === true || req.isAdmin === true;
+    const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
     if (!isGlobalAdmin && !membership) {
       return res.status(403).json({ error: 'forbidden', request_id });
     }
@@ -153,7 +153,7 @@ router.get('/me', requireAuth, withClientScope, async (req, res) => {
     if (!userId) return res.status(401).json({ error: 'unauthorized', request_id });
 
     const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
-    const isGlobalAdmin = req.user?.role === 'admin' || req.user?.is_admin === true || req.isAdmin === true;
+    const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
     if (!isGlobalAdmin && !membership) {
       return res.status(403).json({ error: 'forbidden', request_id });
     }
@@ -194,7 +194,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
     if (!clientId || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required', request_id });
 
     const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
-    const isGlobalAdmin = req.user?.role === 'admin' || req.user?.is_admin === true || req.isAdmin === true;
+    const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
     const userRole = (membership?.role || '').toLowerCase();
     if (!isGlobalAdmin && (!membership || !['manager', 'admin', 'tester'].includes(userRole))) {
       return res.status(403).json({ error: 'forbidden', request_id });
@@ -262,7 +262,7 @@ router.delete('/:id', requireAuth, withClientScope, async (req, res) => {
     if (!client_id) return res.status(400).json({ error: 'client_id_required', request_id });
 
     const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === client_id);
-    const isGlobalAdmin = req.user?.role === 'admin' || req.user?.is_admin === true || req.isAdmin === true;
+    const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
     const userRole = (membership?.role || '').toLowerCase();
     if (!isGlobalAdmin && (!membership || !['manager', 'admin', 'tester'].includes(userRole))) {
       return res.status(403).json({ error: 'forbidden', request_id });
