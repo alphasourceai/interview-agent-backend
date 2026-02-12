@@ -46,11 +46,12 @@ if (SENTRY_ENABLED) {
 const express = require('express')
 const cors = require('cors')
 const crypto = require('crypto')
-const { supabaseAnon, supabaseAdmin } = require('./src/lib/supabaseClient')
+const { supabaseAdmin } = require('./src/lib/supabaseClient')
 const { generateRubricAndKBForRole } = require('./generateRubric')
 const axios = require('axios')
 const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
+const { requireAuth, withClientScope } = require('./src/middleware/auth')
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || FRONTEND_URL || '').replace(/\/+$/, '')
@@ -149,88 +150,8 @@ app.use((req, _res, next) => {
   next();
 });
 
-// ---------- small util ----------
-function bearer(req) {
-  const h = req.headers['authorization'] || req.headers['Authorization']
-  if (!h) return null
-  const m = String(h).match(/^Bearer\s+(.+)$/i)
-  return m ? m[1] : null
-}
-
 // ---------- auth middlewares ----------
-async function requireAuth(req, res, next) {
-  try {
-    const token = bearer(req)
-    if (!token) return res.status(401).json({ error: 'Unauthorized' })
-    const { data, error } = await supabaseAnon.auth.getUser(token)
-    if (error || !data?.user) return res.status(401).json({ error: 'Unauthorized' })
-    req.user = { id: data.user.id, email: data.user.email }
-    next()
-  } catch (e) {
-    return res.status(401).json({ error: 'Unauthorized' })
-  }
-}
-
-// Replace the existing withClientScope with this version
-async function withClientScope(req, res, next) {
-  try {
-    if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
-
-    // Admins get global scope
-    let isAdmin = false;
-    try {
-      const { data: adm, error: admErr } = await supabaseAdmin
-        .from('admins')
-        .select('id')
-        .eq('email', req.user.email)
-        .eq('is_active', true)
-        .maybeSingle();
-      if (!admErr && adm) isAdmin = true;
-    } catch (_) {}
-
-    if (isAdmin) {
-      const requestedClientId = req.query?.client_id || null;
-
-      if (requestedClientId) {
-        req.clientIds = [requestedClientId];
-        req.memberships = [{ client_id: requestedClientId, role: 'admin' }];
-        req.isAdmin = true;
-        return next();
-      }
-
-      const { data: allClients, error: cErr } = await supabaseAdmin
-        .from('clients')
-        .select('id');
-
-      if (cErr) {
-        return res.status(500).json({
-          error: 'Failed to load clients',
-          detail: cErr.message
-        });
-      }
-
-      const ids = (allClients || []).map(c => c.id);
-      req.clientIds = ids;
-      req.memberships = ids.map(id => ({ client_id: id, role: 'admin' }));
-      req.isAdmin = true;
-      return next();
-    }
-
-    // Regular users: scope to their memberships
-    const { data, error } = await supabaseAdmin
-      .from('client_members')
-      .select('client_id, role')
-      .eq('user_id', req.user.id);
-    if (error) return res.status(500).json({ error: 'Failed to load memberships', detail: error.message });
-
-    req.clientIds = (data || []).map(r => r.client_id);
-    req.memberships = data || [];
-    req.isAdmin = false;
-    next();
-  } catch (e) {
-    return res.status(500).json({ error: 'Server error' });
-  }
-}
+// NOTE: Auth + client scoping are centralized in src/middleware/auth
 
 // ---------- Public candidate endpoints (MOUNTED) ----------
 app.use('/api/candidate/submit', require('./routes/candidateSubmit'))
@@ -244,7 +165,19 @@ app.get('/auth/ping', requireAuth, withClientScope, (req, res) => {
 
 // ---------- Auth me ----------
 app.get('/auth/me', requireAuth, withClientScope, (req, res) => {
-  res.json({ user: req.user, memberships: req.memberships })
+  return res.json({
+    user: {
+      id: req.user?.id || null,
+      email: req.user?.email || null,
+    },
+    isGlobalAdmin: req.isGlobalAdmin === true,
+    client_scope: {
+      client_ids: req.clientIds || [],
+      client_ids_count: (req.clientIds || []).length,
+      memberships: req.memberships || [],
+      default_client_id: req.query?.client_id || null,
+    }
+  })
 })
 
 // ---------- Clients: my ----------
