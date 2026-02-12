@@ -2,6 +2,7 @@
 // Direct-export Express router (standardized)
 
 const express = require('express');
+const { createClient } = require('@supabase/supabase-js');
 const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
 
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
@@ -20,6 +21,8 @@ if (SENDGRID_KEY) {
 }
 
 const db = supabaseAdmin || supabase;
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_PUBLIC_ANON_KEY || '';
 
 const router = express.Router();
 
@@ -106,21 +109,78 @@ router.get('/:id/jd-signed-url', requireAuth, withClientScope, async (req, res) 
   try {
     const request_id = req.request_id || req.headers['x-request-id'] || req.headers['x-correlation-id'] || null;
     const roleId = req.params.id;
+    const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
+    const bucket = process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || process.env.SUPABASE_JD_BUCKET || 'job-descriptions';
 
     if (!roleId) {
       return res.status(404).json({ error: 'Not found' });
     }
 
-    const { data, error } = await db
-      .from('roles')
-      .select('id,client_id,job_description_url')
-      .eq('id', roleId)
-      .maybeSingle();
+    let data = null;
 
-    if (error) {
-      console.error('[GET /roles/:id/jd-signed-url] supabase error', error);
-      return res.status(500).json({ error: 'Server error' });
+    if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !req.userToken) {
+      if (!isGlobalAdmin) {
+        return res.status(500).json({
+          error: 'server_error',
+          code: 'JD_ROLE_FETCH_FAILED',
+          detail: 'Missing Supabase anon config for user-scoped role lookup',
+          hint: null,
+          request_id
+        });
+      }
+    } else {
+      const userScopedSupabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        auth: { persistSession: false, autoRefreshToken: false },
+        global: {
+          headers: {
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${req.userToken}`,
+            'X-Client-Info': 'interview-agent-server'
+          }
+        }
+      });
+
+      const { data: roleData, error } = await userScopedSupabase
+        .from('roles')
+        .select('id,client_id,job_description_url')
+        .eq('id', roleId)
+        .maybeSingle();
+
+      if (error) {
+        console.error('[GET /roles/:id/jd-signed-url] user-scoped role fetch error', error);
+        return res.status(500).json({
+          error: 'server_error',
+          code: 'JD_ROLE_FETCH_FAILED',
+          detail: error?.message || 'Failed to fetch role',
+          hint: null,
+          request_id
+        });
+      }
+
+      data = roleData || null;
     }
+
+    if (!data && isGlobalAdmin) {
+      const { data: adminRole, error } = await supabaseAdmin
+        .from('roles')
+        .select('id,client_id,job_description_url')
+        .eq('id', roleId)
+        .maybeSingle();
+
+      if (error) {
+        console.error('[GET /roles/:id/jd-signed-url] admin role fetch error', error);
+        return res.status(500).json({
+          error: 'server_error',
+          code: 'JD_ROLE_FETCH_FAILED',
+          detail: error?.message || 'Failed to fetch role',
+          hint: null,
+          request_id
+        });
+      }
+
+      data = adminRole || null;
+    }
+
     if (!data) {
       return res.status(404).json({ error: 'Not found' });
     }
@@ -135,32 +195,10 @@ router.get('/:id/jd-signed-url', requireAuth, withClientScope, async (req, res) 
         if (id != null) allowedClientIds.add(String(id));
       }
     }
-    let isGlobalAdmin = false;
-
-    try {
-      const userEmail = req.user?.email || req.auth?.email || null;
-
-      if (userEmail) {
-        const { data: adminRow, error: adminErr } = await db
-          .from('admins')
-          .select('id')
-          .eq('email', userEmail)
-          .eq('is_active', true)
-          .maybeSingle();
-
-        if (!adminErr && adminRow) {
-          isGlobalAdmin = true;
-        }
-      }
-    } catch (e) {
-      console.error('[jd-signed-url] admin lookup failed', e);
-    }
     const roleClientId = data.client_id == null ? '' : String(data.client_id);
     if (!isGlobalAdmin && (!roleClientId || !allowedClientIds.has(roleClientId))) {
       return res.status(403).json({ error: 'forbidden', code: 'CLIENT_SCOPE_MISMATCH' });
     }
-
-    const bucket = process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || 'job-descriptions';
 
     const rawKey = String(data.job_description_url || '').trim();
 
@@ -179,8 +217,7 @@ router.get('/:id/jd-signed-url', requireAuth, withClientScope, async (req, res) 
       storageKey = storageKey.slice(bucketPrefix.length);
     }
 
-    const expectedPrefix = `${roleClientId}/${data.id}/`;
-    if (!storageKey.startsWith(expectedPrefix)) {
+    if (!storageKey) {
       return res.status(404).json({ error: 'Not found' });
     }
 
@@ -201,27 +238,103 @@ router.get('/:id/jd-signed-url', requireAuth, withClientScope, async (req, res) 
       msg.includes('404') ||
       msg.includes('object');
 
-    if (notFound) {
+    if (!notFound) {
+      console.error('[GET /roles/:id/jd-signed-url] storage error', {
+        request_id,
+        bucket,
+        storageKey,
+        detail: signErr?.message || signErr
+      });
+
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'JD_SIGN_FAILED',
+        detail: signErr?.message || 'Failed to sign url',
+        hint: null,
+        request_id
+      });
+    }
+
+    const prefix = `${roleClientId}/${data.id}/`;
+    const { data: listed, error: listErr } = await supabaseAdmin
+      .storage
+      .from(bucket)
+      .list(prefix, { limit: 100 });
+
+    if (listErr) {
+      console.error('[GET /roles/:id/jd-signed-url] storage list error', {
+        request_id,
+        bucket,
+        prefix,
+        detail: listErr?.message || listErr
+      });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'JD_SIGN_FAILED',
+        detail: listErr?.message || 'Failed to sign url',
+        hint: null,
+        request_id
+      });
+    }
+
+    const files = (listed || []).filter((item) => item && item.name && !item.name.endsWith('/'));
+    if (!files.length) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    files.sort((a, b) => {
+      const at = Date.parse(a.updated_at || a.created_at || 0) || 0;
+      const bt = Date.parse(b.updated_at || b.created_at || 0) || 0;
+      if (at !== bt) return bt - at;
+      return String(b.name || '').localeCompare(String(a.name || ''));
+    });
+    const selected = files[0];
+    const fallbackKey = `${prefix}${selected.name}`;
+
+    const { data: fallbackSigned, error: fallbackErr } = await supabaseAdmin
+      .storage
+      .from(bucket)
+      .createSignedUrl(fallbackKey, 600);
+
+    if (!fallbackErr && fallbackSigned?.signedUrl) {
+      return res.json({ url: fallbackSigned.signedUrl });
+    }
+
+    const fallbackMsg = String(fallbackErr?.message || '').toLowerCase();
+    const fallbackNotFound =
+      fallbackMsg.includes('not found') ||
+      fallbackMsg.includes('does not exist') ||
+      fallbackMsg.includes('no such') ||
+      fallbackMsg.includes('404') ||
+      fallbackMsg.includes('object');
+
+    if (fallbackNotFound) {
       return res.status(404).json({ error: 'Not found' });
     }
 
     console.error('[GET /roles/:id/jd-signed-url] storage error', {
       request_id,
       bucket,
-      storageKey,
-      detail: signErr?.message || signErr
+      storageKey: fallbackKey,
+      detail: fallbackErr?.message || fallbackErr
     });
 
     return res.status(500).json({
       error: 'server_error',
       code: 'JD_SIGN_FAILED',
-      detail: signErr?.message || 'Failed to sign url',
+      detail: fallbackErr?.message || 'Failed to sign url',
       hint: null,
       request_id
     });
   } catch (e) {
     console.error('[GET /roles/:id/jd-signed-url] unexpected', e);
-    return res.status(500).json({ error: 'Server error' });
+    const request_id = req.request_id || req.headers['x-request-id'] || req.headers['x-correlation-id'] || null;
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'JD_SIGN_FAILED',
+      detail: e?.message || 'Server error',
+      hint: null,
+      request_id
+    });
   }
 });
 
