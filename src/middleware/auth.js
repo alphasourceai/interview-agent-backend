@@ -102,7 +102,7 @@ async function withClientScope(req, res, next) {
         req.client_memberships = [explicit];
         req.clientIds = [explicit];
         req.memberships = [{ client_id: explicit, role: 'admin', name: null }];
-        req.clientScope = { user: req.user, memberships: req.memberships, defaultClientId: explicit };
+        req.clientScope = { user: req.user, memberships: req.memberships, defaultClientId: explicit, default_client_id: explicit };
         req.client = { id: explicit, name: null };
         req.membership = { role: 'admin' };
         return next();
@@ -131,7 +131,7 @@ async function withClientScope(req, res, next) {
       req.clientIds = ids;
       req.memberships = memberships;
       const defaultClientId = ids.length ? ids[0] : null;
-      req.clientScope = { user: req.user, memberships, defaultClientId };
+      req.clientScope = { user: req.user, memberships, defaultClientId, default_client_id: defaultClientId };
       if (defaultClientId) {
         const m = memberships.find(x => x.client_id === defaultClientId) || null;
         req.client = { id: defaultClientId, name: m?.name || null };
@@ -190,7 +190,7 @@ async function withClientScope(req, res, next) {
     }
 
     // Attach helpers for routes that expect them
-    req.clientScope = { user: req.user, memberships, defaultClientId };
+    req.clientScope = { user: req.user, memberships, defaultClientId, default_client_id: defaultClientId };
     if (defaultClientId) {
       const m = memberships.find(x => x.client_id === defaultClientId) || memberships[0] || null;
       req.client = { id: defaultClientId, name: m?.name || null };
