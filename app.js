@@ -1485,6 +1485,13 @@ adminRouter.delete('/client-members/:id', requireAuth, requireAdmin, async (req,
   res.json({ ok: true })
 })
 
+// Mount admin sub-routers (Billing + Accommodation Requests)
+try {
+  adminRouter.use('/billing', requireAuth, requireAdmin, require('./routes/adminBilling'))
+} catch (_) {}
+try {
+  adminRouter.use('/accommodation-requests', requireAuth, requireAdmin, require('./routes/accommodationRequests'))
+} catch (_) {}
 app.use('/admin', adminRouter)
 
 /* ======================= END: Admin guard + Admin API ======================= */
