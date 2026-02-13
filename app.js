@@ -157,6 +157,7 @@ app.use((req, _res, next) => {
 app.use('/api/candidate/submit', require('./routes/candidateSubmit'))
 app.use('/api/candidate/verify-otp', require('./routes/verifyOtp'))
 app.use('/create-tavus-interview', require('./routes/createTavusInterview'))
+app.use('/api/accommodations', require('./routes/accommodationRequests'))
 
 // ---------- Simple test endpoint ----------
 app.get('/auth/ping', requireAuth, withClientScope, (req, res) => {
@@ -870,6 +871,101 @@ adminRouter.get('/candidates', requireAuth, requireAdmin, async (req, res) => {
       error: 'server_error',
       code: 'LIST_CANDIDATES_FAILED',
       detail: e?.message || 'Failed to list candidates',
+      hint: null,
+      request_id
+    });
+  }
+});
+
+// Generate candidate report from Admin dashboard (mirrors client dashboard /reports/generate)
+adminRouter.post('/reports/generate', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null;
+  try {
+    const candidate_id = String(req.body?.candidate_id || '').trim();
+    if (!candidate_id) {
+      return res.status(400).json({
+        error: 'bad_request',
+        code: 'CANDIDATE_ID_REQUIRED',
+        detail: 'candidate_id is required',
+        hint: null,
+        request_id
+      });
+    }
+
+    const { data: cand, error: cErr } = await supabaseAdmin
+      .from('candidates')
+      .select('id, client_id')
+      .eq('id', candidate_id)
+      .maybeSingle();
+
+    if (cErr) {
+      console.error('[admin/reports/generate] candidate lookup failed', {
+        request_id,
+        candidate_id,
+        code: cErr.code,
+        message: cErr.message
+      });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'CANDIDATE_LOOKUP_FAILED',
+        detail: cErr.message,
+        hint: cErr.hint || null,
+        request_id
+      });
+    }
+
+    if (!cand?.client_id) {
+      return res.status(404).json({
+        error: 'not_found',
+        code: 'CANDIDATE_NOT_FOUND',
+        detail: 'Candidate not found',
+        hint: null,
+        request_id
+      });
+    }
+
+    // Provide the same scoped context that /reports/* routes expect.
+    req.clientIds = [cand.client_id];
+    req.client_memberships = [cand.client_id];
+    req.memberships = Array.isArray(req.memberships) && req.memberships.length
+      ? req.memberships
+      : [{ client_id: cand.client_id, role: 'admin' }];
+
+    let reportsPdfRoutes;
+    try {
+      reportsPdfRoutes = require('./routes/reportsPdf');
+    } catch (e) {
+      console.error('[admin/reports/generate] require reportsPdf failed', { request_id, error: e?.message || e });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'REPORTS_PDF_ROUTES_MISSING',
+        detail: e?.message || 'Failed to load reportsPdf routes',
+        hint: null,
+        request_id
+      });
+    }
+
+    const handler = reportsPdfRoutes && typeof reportsPdfRoutes._handleGenerate === 'function'
+      ? reportsPdfRoutes._handleGenerate
+      : null;
+
+    if (!handler) {
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'REPORTS_PDF_HANDLER_MISSING',
+        detail: 'reportsPdfRoutes._handleGenerate is not available',
+        hint: null,
+        request_id
+      });
+    }
+
+    return handler(req, res);
+  } catch (e) {
+    console.error('[admin/reports/generate] unexpected', { request_id, error: e?.message || e });
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'GENERATE_REPORT_FAILED',
+      detail: e?.message || 'Failed to generate report',
       hint: null,
       request_id
     });

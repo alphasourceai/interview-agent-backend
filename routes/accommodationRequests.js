@@ -92,6 +92,60 @@ async function findOrCreateCandidate({ role, name, email, phone }) {
 }
 
 /**
+ * GET /admin/accommodation-requests
+ * Admin list endpoint for accommodation requests.
+ */
+router.get('/', async (req, res) => {
+  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+  try {
+    const status = String(req.query.status || '').trim();
+    const clientId = String(req.query.client_id || '').trim();
+    let q = supabaseAdmin
+      .from('accommodation_requests')
+      .select('id, created_at, role_id, candidate_id, candidate_name, candidate_email, candidate_phone, request_text, status, resume_url, resume_received_at, admin_notes')
+      .order('created_at', { ascending: false });
+    if (status) {
+      q = q.eq('status', status);
+    }
+    if (clientId) {
+      const { data: roles, error: rErr } = await supabaseAdmin.from('roles').select('id').eq('client_id', clientId);
+      if (rErr) {
+        return sendError(res, 500, {
+          error: 'Failed to fetch roles for client.',
+          code: 'roles_lookup_failed',
+          detail: rErr.message || null,
+          hint: rErr.hint || null,
+          request_id,
+        });
+      }
+      if (!roles || roles.length === 0) {
+        return res.json({ ok: true, items: [] });
+      }
+      q = q.in('role_id', roles.map(r => r.id));
+    }
+    const { data, error } = await q;
+    if (error) {
+      return sendError(res, 500, {
+        error: 'Failed to fetch accommodation requests.',
+        code: 'accommodation_requests_fetch_failed',
+        detail: error.message || null,
+        hint: error.hint || null,
+        request_id,
+      });
+    }
+    return res.json({ ok: true, items: data || [] });
+  } catch (error) {
+    return sendError(res, 500, {
+      error: 'Server error.',
+      code: 'accommodation_requests_fetch_failed',
+      detail: error?.message || null,
+      hint: null,
+      request_id,
+    });
+  }
+});
+
+/**
  * POST /api/accommodations/request
  * Candidate-facing accommodation request form.
  */

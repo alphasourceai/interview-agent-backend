@@ -641,4 +641,5 @@ router.get('/:id/url', async (req, res) => {
   }
 });
 
+router._handleGenerate = handleGenerate;
 module.exports = router;
