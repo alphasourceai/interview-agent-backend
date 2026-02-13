@@ -764,10 +764,102 @@ adminRouter.get('/candidates', requireAuth, requireAdmin, async (req, res) => {
       }
     }
 
+    // Try to fill missing interview_score from latest interview analysis JSON (best-effort)
+    const latestInterviewByCandidateId = {};
+    const derivedInterviewScoreByCandidateId = {};
+
+    if (candidateIds.length) {
+      const { data: ivs, error: iErr } = await supabaseAdmin
+        .from('interviews')
+        .select('candidate_id,created_at,analysis_url')
+        .eq('client_id', client_id)
+        .in('candidate_id', candidateIds)
+        .order('created_at', { ascending: false });
+
+      if (iErr) {
+        console.error('[admin/candidates] interviews lookup failed', {
+          request_id,
+          client_id,
+          code: iErr.code,
+          message: iErr.message
+        });
+      } else {
+        for (const iv of (ivs || [])) {
+          if (iv?.candidate_id && !latestInterviewByCandidateId[iv.candidate_id]) {
+            latestInterviewByCandidateId[iv.candidate_id] = iv;
+          }
+        }
+
+        const extractScore = (payload) => {
+          if (!payload || typeof payload !== 'object') return null;
+          const candidates = [
+            payload.interview_score,
+            payload.overall_score,
+            payload.overall,
+            payload.score,
+            payload?.analysis?.interview_score,
+            payload?.analysis?.overall_score,
+            payload?.analysis?.overall,
+            payload?.summary?.interview_score,
+            payload?.summary?.overall_score,
+            payload?.breakdown?.overall,
+            payload?.breakdown?.overall_score,
+            payload?.result?.interview_score,
+            payload?.result?.overall_score
+          ];
+          for (const v of candidates) {
+            const n = Number(v);
+            if (Number.isFinite(n)) return n;
+          }
+          return null;
+        };
+
+        const clamp0to100Local = (v) => {
+          if (!Number.isFinite(Number(v))) return null;
+          const n = Number(v);
+          return Math.max(0, Math.min(100, n));
+        };
+
+        for (const cid of candidateIds) {
+          const iv = latestInterviewByCandidateId[cid];
+          const url = iv?.analysis_url ? String(iv.analysis_url) : '';
+          if (!url) continue;
+          if (typeof fetch !== 'function' || typeof AbortController !== 'function') continue;
+
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 3500);
+          try {
+            const resp = await fetch(url, { method: 'GET', signal: controller.signal });
+            if (!resp.ok) continue;
+            const text = await resp.text();
+            let json = null;
+            try {
+              json = JSON.parse(text);
+            } catch (_) {
+              json = null;
+            }
+            const extracted = clamp0to100Local(extractScore(json));
+            if (extracted !== null) {
+              derivedInterviewScoreByCandidateId[cid] = extracted;
+            }
+          } catch (_) {
+          } finally {
+            clearTimeout(timeoutId);
+          }
+        }
+      }
+    }
+
     const candidates = (cands || []).map((c) => {
       const rep = latestReportByCandidateId[c.id] || null;
       const resume_score = Number.isFinite(Number(rep?.resume_score)) ? Number(rep.resume_score) : null;
-      const interview_score = Number.isFinite(Number(rep?.interview_score)) ? Number(rep.interview_score) : null;
+      // PATCH: prefer report interview_score, else fill from derived interview analysis
+      const derivedInterview = Object.prototype.hasOwnProperty.call(derivedInterviewScoreByCandidateId, c.id)
+        ? derivedInterviewScoreByCandidateId[c.id]
+        : null;
+      const interview_score = Number.isFinite(Number(rep?.interview_score))
+        ? Number(rep.interview_score)
+        : (Number.isFinite(Number(derivedInterview)) ? Number(derivedInterview) : null);
       const rep_overall = Number.isFinite(Number(rep?.overall_score)) ? Number(rep.overall_score) : null;
 
       const clamp0to100 = (v) => {
