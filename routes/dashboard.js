@@ -309,11 +309,15 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const hasTranscript = !!iv?.transcript;
       const transcriptOverall = getTranscriptOverall(iv);
       const overall_score =
-        Number.isFinite(repOverallScore)
-          ? repOverallScore
-          : (Number.isFinite(resume_score) && Number.isFinite(transcriptOverall)
-              ? Math.round((resume_score + transcriptOverall) / 2)
-              : null);
+        Number.isFinite(resume_score) && Number.isFinite(transcriptOverall)
+          ? Math.max(0, Math.min(100, Math.round((resume_score + transcriptOverall) / 2)))
+          : Number.isFinite(transcriptOverall)
+            ? Math.max(0, Math.min(100, Math.round(transcriptOverall)))
+            : Number.isFinite(resume_score)
+              ? Math.max(0, Math.min(100, Math.round(resume_score)))
+              : Number.isFinite(repOverallScore)
+                ? Math.max(0, Math.min(100, Math.round(repOverallScore)))
+                : null;
       const canonicalHasAnalysis = hasCanonicalAnalysis(iv);
       console.log('[dashboard/rows] row', {
         interview_id: iv?.id || null,
