@@ -1061,7 +1061,7 @@ adminRouter.get('/roles/:id/interview-config', requireAuth, requireAdmin, async 
 
     const { data, error } = await supabaseAdmin
       .from('roles')
-      .select('id,client_id,title,tavus_prompt,rubric_questions')
+      .select('id,client_id,title,tavus_prompt,rubric_questions,rubric,manual_questions')
       .eq('id', roleId)
       .maybeSingle();
 
@@ -1092,6 +1092,62 @@ adminRouter.get('/roles/:id/interview-config', requireAuth, requireAdmin, async 
       });
     }
 
+    // --- BEGIN: rubric_questions_out computation ---
+    const directQuestions = Array.isArray(data.rubric_questions)
+      ? data.rubric_questions
+          .map((q) => (typeof q === 'string' ? q.trim() : ''))
+          .filter(Boolean)
+      : [];
+
+    let rubric_questions_out = directQuestions;
+
+    if (!rubric_questions_out.length) {
+      const out = [];
+      const seen = new Set();
+      const add = (value) => {
+        const text = typeof value === 'string' ? value.trim() : '';
+        if (!text || seen.has(text)) return;
+        seen.add(text);
+        out.push(text);
+      };
+
+      let parsed = data.rubric;
+      if (typeof parsed === 'string' && parsed.trim()) {
+        try {
+          parsed = JSON.parse(parsed);
+        } catch (_) {
+          parsed = null;
+        }
+      }
+
+      const parsedQuestions = parsed && typeof parsed === 'object'
+        ? (Array.isArray(parsed?.questions) ? parsed.questions : (Array.isArray(parsed) ? parsed : null))
+        : null;
+
+      if (Array.isArray(parsedQuestions) && parsedQuestions.length) {
+        for (const item of parsedQuestions) {
+          if (typeof item === 'string') {
+            add(item);
+          } else if (item && typeof item === 'object') {
+            if (typeof item.question === 'string') add(item.question);
+            else if (typeof item.text === 'string') add(item.text);
+            else if (typeof item.prompt === 'string') add(item.prompt);
+          }
+        }
+      }
+
+      if (!out.length && typeof data.manual_questions === 'string' && data.manual_questions.trim()) {
+        data.manual_questions
+          .split('\n')
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .forEach(add);
+      }
+
+      rubric_questions_out = out;
+    }
+    // --- END: rubric_questions_out computation ---
+
     return res.json({
       ok: true,
       item: {
@@ -1099,7 +1155,7 @@ adminRouter.get('/roles/:id/interview-config', requireAuth, requireAdmin, async 
         client_id: data.client_id,
         title: data.title,
         tavus_prompt: data.tavus_prompt || null,
-        rubric_questions: Array.isArray(data.rubric_questions) ? data.rubric_questions : null
+        rubric_questions: rubric_questions_out
       }
     });
   } catch (e) {
