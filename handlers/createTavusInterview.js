@@ -47,9 +47,13 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   const roleTitle = (role?.title || 'this position').trim();
   const candidateName = (candidate?.name || '').trim() || 'there';
 
-  const firstQuestion = extractFirstQuestion(role?.rubric);
+  const rubricQuestions = extractInterviewQuestions(role);
+  const fallbackQuestion = 'To start, can you tell me a bit about your background and how it relates to this role?';
+  const firstQuestion = rubricQuestions[0] || fallbackQuestion;
   const customGreeting = buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestion);
-  const context = buildConversationalContext(candidateName, roleTitle, companyName);
+  const defaultContext = buildConversationalContext(candidateName, roleTitle, companyName, rubricQuestions);
+  const promptOverride = typeof role?.tavus_prompt === 'string' && role.tavus_prompt.trim() ? role.tavus_prompt.trim() : '';
+  const context = promptOverride || defaultContext;
 
   const conversationName = `${roleTitle} - ${candidate?.name || candidate?.email || 'Candidate'}`;
 
@@ -137,28 +141,56 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   }
 }
 
-function extractFirstQuestion(rubric) {
-  const fallback = 'To start, can you tell me a bit about your background and how it relates to this role?';
-  if (!rubric) return fallback;
+function extractInterviewQuestions(role) {
+  const direct = Array.isArray(role?.rubric_questions)
+    ? role.rubric_questions
+        .map((q) => (typeof q === 'string' ? q.trim() : ''))
+        .filter(Boolean)
+    : [];
+  if (direct.length) return direct;
+
+  const out = [];
+  const seen = new Set();
+  const add = (value) => {
+    const text = typeof value === 'string' ? value.trim() : '';
+    if (!text || seen.has(text)) return;
+    seen.add(text);
+    out.push(text);
+  };
+
+  const rubric = role?.rubric;
+  if (!rubric) {
+    if (typeof role?.manual_questions === 'string' && role.manual_questions.trim()) {
+      role.manual_questions.split('\n').map((line) => line.trim()).filter(Boolean).forEach(add);
+    }
+    return out;
+  }
   let parsed = rubric;
   if (typeof rubric === 'string') {
     try {
       parsed = JSON.parse(rubric);
     } catch (_) {
-      return fallback;
+      add(rubric);
+      return out;
     }
   }
-  if (!parsed || typeof parsed !== 'object') return fallback;
-  const questions = Array.isArray(parsed?.questions) ? parsed.questions : Array.isArray(parsed) ? parsed : null;
-  if (questions && questions.length) {
-    const first = questions[0];
-    if (typeof first === 'string' && first.trim()) return first.trim();
-    if (first && typeof first === 'object') {
-      if (first.question && typeof first.question === 'string' && first.question.trim()) return first.question.trim();
-      if (first.text && typeof first.text === 'string' && first.text.trim()) return first.text.trim();
+  if (!parsed || typeof parsed !== 'object') return out;
+  const parsedQuestions = Array.isArray(parsed?.questions) ? parsed.questions : Array.isArray(parsed) ? parsed : null;
+  if (parsedQuestions && parsedQuestions.length) {
+    for (const item of parsedQuestions) {
+      if (typeof item === 'string') {
+        add(item);
+      } else if (item && typeof item === 'object') {
+        if (typeof item.question === 'string') add(item.question);
+        else if (typeof item.text === 'string') add(item.text);
+        else if (typeof item.prompt === 'string') add(item.prompt);
+      }
     }
   }
-  return fallback;
+  if (!out.length && typeof role?.manual_questions === 'string' && role.manual_questions.trim()) {
+    role.manual_questions.split('\n').map((line) => line.trim()).filter(Boolean).forEach(add);
+  }
+  return out;
 }
 
 function buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestion) {
@@ -167,7 +199,7 @@ function buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestio
   return `${greeting} ${firstQuestion}`;
 }
 
-function buildConversationalContext(candidateName, roleTitle, companyName) {
+function buildConversationalContext(candidateName, roleTitle, companyName, rubricQuestions = []) {
   const lines = [
     'Interview Details:',
     `- Candidate: ${candidateName}`,
@@ -189,6 +221,10 @@ function buildConversationalContext(candidateName, roleTitle, companyName) {
    `- If asked about documents, sources, methodology, or scoring, respond with exactly one sentence refusing and immediately ask the next rubric question. Use this refusal sentence verbatim: "I can't discuss internal materials used to prepare this interview - let's continue."`,
     '- Keep a warm, professional tone and keep the interview on track.'
   );
+  if (Array.isArray(rubricQuestions) && rubricQuestions.length) {
+    lines.push('', 'Rubric Questions:');
+    rubricQuestions.forEach((q, idx) => lines.push(`${idx + 1}. ${q}`));
+  }
   return lines.join('\n').trim();
 }
 

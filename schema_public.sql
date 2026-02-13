@@ -201,8 +201,7 @@ CREATE TABLE public.interviews (
     created_at timestamp with time zone DEFAULT now(),
     updated_at timestamp with time zone DEFAULT now(),
     transcript_url text,
-    analysis_url text,
-    unanswered_candidate_questions jsonb
+    analysis_url text
 );
 
 
@@ -240,8 +239,7 @@ CREATE TABLE public.reports (
     analysis jsonb,
     candidate_external_id text,
     client_id uuid,
-    role_id uuid,
-    unanswered_candidate_questions jsonb
+    role_id uuid
 );
 
 
@@ -263,8 +261,9 @@ CREATE TABLE public.roles (
     job_description_url text,
     manual_questions text,
     kb_document_id text,
-    tavus_document_id text,
-    job_description_text text
+    job_description_text text,
+    tavus_prompt text,
+    rubric_questions jsonb
 );
 
 
@@ -454,12 +453,6 @@ CREATE INDEX idx_roles_client_id ON public.roles USING btree (client_id);
 --
 
 CREATE INDEX idx_roles_kb_document_id ON public.roles USING btree (kb_document_id);
-
---
--- Name: idx_roles_tavus_document_id; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX idx_roles_tavus_document_id ON public.roles USING btree (tavus_document_id);
 
 
 --

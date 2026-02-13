@@ -693,6 +693,563 @@ adminRouter.post('/roles/delete', requireAuth, requireAdmin, async (req, res) =>
   }
 });
 
+// List candidates for admin dashboard (requires client selection)
+adminRouter.get('/candidates', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null;
+  try {
+    const client_id = String(req.query?.client_id || '').trim();
+    const role_id = String(req.query?.role_id || '').trim();
+
+    if (!client_id) {
+      return res.json({ candidates: [], message: 'Select a client to view candidates.' });
+    }
+
+    let cq = supabaseAdmin
+      .from('candidates')
+      .select('id,created_at,client_id,role_id,name,email,status,interview_status,resume_url,analysis_summary,candidate_id,first_name,last_name')
+      .eq('client_id', client_id)
+      .order('created_at', { ascending: false });
+
+    if (role_id) cq = cq.eq('role_id', role_id);
+
+    const { data: cands, error: cErr } = await cq;
+    if (cErr) {
+      console.error('[admin/candidates] list failed', {
+        request_id,
+        client_id,
+        role_id: role_id || null,
+        code: cErr.code,
+        message: cErr.message
+      });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'LIST_CANDIDATES_FAILED',
+        detail: cErr.message,
+        hint: cErr.hint || null,
+        request_id
+      });
+    }
+
+    const candidateIds = Array.from(new Set((cands || []).map(c => c.id).filter(Boolean)));
+    const latestReportByCandidateId = {};
+
+    if (candidateIds.length) {
+      const { data: reports, error: rErr } = await supabaseAdmin
+        .from('reports')
+        .select('candidate_id,resume_score,interview_score,overall_score,report_url,created_at')
+        .eq('client_id', client_id)
+        .in('candidate_id', candidateIds)
+        .order('created_at', { ascending: false });
+
+      if (rErr) {
+        console.error('[admin/candidates] reports lookup failed', {
+          request_id,
+          client_id,
+          code: rErr.code,
+          message: rErr.message
+        });
+        return res.status(500).json({
+          error: 'server_error',
+          code: 'LIST_CANDIDATES_FAILED',
+          detail: rErr.message,
+          hint: rErr.hint || null,
+          request_id
+        });
+      }
+
+      for (const rep of (reports || [])) {
+        if (rep?.candidate_id && !latestReportByCandidateId[rep.candidate_id]) {
+          latestReportByCandidateId[rep.candidate_id] = rep;
+        }
+      }
+    }
+
+    const candidates = (cands || []).map((c) => {
+      const rep = latestReportByCandidateId[c.id] || null;
+      const resume_score = Number.isFinite(Number(rep?.resume_score)) ? Number(rep.resume_score) : null;
+      const interview_score = Number.isFinite(Number(rep?.interview_score)) ? Number(rep.interview_score) : null;
+      const overall_score = Number.isFinite(Number(rep?.overall_score)) ? Number(rep.overall_score) : null;
+      return {
+        id: c.id,
+        created_at: c.created_at,
+        client_id: c.client_id,
+        role_id: c.role_id,
+        name: c.name || '',
+        email: c.email || '',
+        status: c.status || null,
+        interview_status: c.interview_status || null,
+        resume_url: c.resume_url || null,
+        analysis_summary: c.analysis_summary || null,
+        candidate_id: c.candidate_id || null,
+        first_name: c.first_name || null,
+        last_name: c.last_name || null,
+        resume_score,
+        interview_score,
+        overall_score,
+        latest_report_url: rep?.report_url || null,
+        report_generated_at: rep?.created_at || null
+      };
+    });
+
+    return res.json({ candidates });
+  } catch (e) {
+    console.error('[admin/candidates] unexpected', { request_id, error: e?.message || e });
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'LIST_CANDIDATES_FAILED',
+      detail: e?.message || 'Failed to list candidates',
+      hint: null,
+      request_id
+    });
+  }
+});
+
+// Delete candidate by id + client_id (safety guard)
+adminRouter.delete('/candidates/:id', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null;
+  try {
+    const id = req.params.id;
+    const client_id = String(req.query?.client_id || '').trim();
+
+    if (!client_id) {
+      return res.status(400).json({
+        error: 'bad_request',
+        code: 'CLIENT_ID_REQUIRED',
+        detail: 'client_id query param is required',
+        hint: null,
+        request_id
+      });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('candidates')
+      .delete()
+      .eq('id', id)
+      .eq('client_id', client_id)
+      .select('id')
+      .maybeSingle();
+
+    if (error) {
+      const blockedByDependencies = error.code === '23503';
+      console.error('[admin/candidates] delete failed', {
+        request_id,
+        id,
+        client_id,
+        code: error.code,
+        message: error.message
+      });
+      return res.status(blockedByDependencies ? 409 : 500).json({
+        error: blockedByDependencies ? 'conflict' : 'server_error',
+        code: blockedByDependencies ? 'CANDIDATE_DELETE_BLOCKED' : 'DELETE_CANDIDATE_FAILED',
+        detail: error.message,
+        hint: blockedByDependencies ? 'Candidate has dependent records; enable DB cascade or remove dependents first.' : (error.hint || null),
+        request_id
+      });
+    }
+
+    if (!data) {
+      return res.status(404).json({
+        error: 'not_found',
+        code: 'CANDIDATE_NOT_FOUND',
+        detail: 'Candidate not found for provided id/client_id',
+        hint: null,
+        request_id
+      });
+    }
+
+    return res.json({ ok: true, id: data.id });
+  } catch (e) {
+    console.error('[admin/candidates] delete unexpected', { request_id, error: e?.message || e });
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'DELETE_CANDIDATE_FAILED',
+      detail: e?.message || 'Failed to delete candidate',
+      hint: null,
+      request_id
+    });
+  }
+});
+
+// Get editable role config
+adminRouter.get('/roles/:id/config', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null;
+  try {
+    const roleId = req.params.id;
+    const { data, error } = await supabaseAdmin
+      .from('roles')
+      .select('id,client_id,title,rubric,manual_questions,job_description_text')
+      .eq('id', roleId)
+      .maybeSingle();
+
+    if (error) {
+      console.error('[admin/roles/config] fetch failed', {
+        request_id,
+        role_id: roleId,
+        code: error.code,
+        message: error.message
+      });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'FETCH_ROLE_CONFIG_FAILED',
+        detail: error.message,
+        hint: error.hint || null,
+        request_id
+      });
+    }
+
+    if (!data) {
+      return res.status(404).json({
+        error: 'not_found',
+        code: 'ROLE_NOT_FOUND',
+        detail: 'Role not found',
+        hint: null,
+        request_id
+      });
+    }
+
+    return res.json({
+      ok: true,
+      item: {
+        id: data.id,
+        client_id: data.client_id,
+        title: data.title,
+        rubric: data.rubric || null,
+        manual_questions: data.manual_questions || null,
+        job_description_text: data.job_description_text || null
+      }
+    });
+  } catch (e) {
+    console.error('[admin/roles/config] unexpected', { request_id, role_id: req.params?.id || null, error: e?.message || e });
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'FETCH_ROLE_CONFIG_FAILED',
+      detail: e?.message || 'Failed to fetch role config',
+      hint: null,
+      request_id
+    });
+  }
+});
+
+// Update editable role config
+adminRouter.patch('/roles/:id/config', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null;
+  try {
+    const roleId = req.params.id;
+    const client_id = String(req.query?.client_id || '').trim();
+    if (!client_id) {
+      return res.status(400).json({
+        error: 'bad_request',
+        code: 'CLIENT_ID_REQUIRED',
+        detail: 'client_id query param is required',
+        hint: null,
+        request_id
+      });
+    }
+
+    const { data: existing, error: existingErr } = await supabaseAdmin
+      .from('roles')
+      .select('id,client_id')
+      .eq('id', roleId)
+      .maybeSingle();
+
+    if (existingErr) {
+      console.error('[admin/roles/config] lookup failed', {
+        request_id,
+        role_id: roleId,
+        client_id,
+        code: existingErr.code,
+        message: existingErr.message
+      });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'UPDATE_ROLE_CONFIG_FAILED',
+        detail: existingErr.message,
+        hint: existingErr.hint || null,
+        request_id
+      });
+    }
+    if (!existing || String(existing.client_id) !== client_id) {
+      return res.status(404).json({
+        error: 'not_found',
+        code: 'ROLE_NOT_FOUND',
+        detail: 'Role not found for provided client_id',
+        hint: null,
+        request_id
+      });
+    }
+
+    const updates = {};
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'rubric')) {
+      updates.rubric = req.body.rubric;
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'manual_questions')) {
+      updates.manual_questions = req.body.manual_questions;
+    }
+
+    if (!Object.keys(updates).length) {
+      return res.status(400).json({
+        error: 'bad_request',
+        code: 'NO_EDITABLE_FIELDS',
+        detail: 'No editable fields provided',
+        hint: 'Provide rubric and/or manual_questions',
+        request_id
+      });
+    }
+
+    const { data: updated, error: updateErr } = await supabaseAdmin
+      .from('roles')
+      .update(updates)
+      .eq('id', roleId)
+      .eq('client_id', client_id)
+      .select('id,client_id,title,rubric,manual_questions,job_description_text')
+      .single();
+
+    if (updateErr) {
+      console.error('[admin/roles/config] update failed', {
+        request_id,
+        role_id: roleId,
+        client_id,
+        code: updateErr.code,
+        message: updateErr.message
+      });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'UPDATE_ROLE_CONFIG_FAILED',
+        detail: updateErr.message,
+        hint: updateErr.hint || null,
+        request_id
+      });
+    }
+
+    return res.json({
+      ok: true,
+      item: {
+        id: updated.id,
+        client_id: updated.client_id,
+        title: updated.title,
+        rubric: updated.rubric || null,
+        manual_questions: updated.manual_questions || null,
+        job_description_text: updated.job_description_text || null
+      }
+    });
+  } catch (e) {
+    console.error('[admin/roles/config] update unexpected', { request_id, role_id: req.params?.id || null, error: e?.message || e });
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'UPDATE_ROLE_CONFIG_FAILED',
+      detail: e?.message || 'Failed to update role config',
+      hint: null,
+      request_id
+    });
+  }
+});
+
+adminRouter.get('/roles/:id/interview-config', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null;
+  try {
+    const roleId = req.params.id;
+    const client_id = String(req.query?.client_id || '').trim();
+    if (!client_id) {
+      return res.status(400).json({
+        error: 'bad_request',
+        code: 'CLIENT_ID_REQUIRED',
+        detail: 'client_id query param is required',
+        hint: null,
+        request_id
+      });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('roles')
+      .select('id,client_id,title,tavus_prompt,rubric_questions')
+      .eq('id', roleId)
+      .maybeSingle();
+
+    if (error) {
+      console.error('[admin/roles/interview-config] fetch failed', {
+        request_id,
+        role_id: roleId,
+        client_id,
+        code: error.code,
+        message: error.message
+      });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'FETCH_INTERVIEW_CONFIG_FAILED',
+        detail: error.message,
+        hint: error.hint || null,
+        request_id
+      });
+    }
+
+    if (!data || String(data.client_id) !== client_id) {
+      return res.status(404).json({
+        error: 'not_found',
+        code: 'ROLE_NOT_FOUND',
+        detail: 'Role not found for provided client_id',
+        hint: null,
+        request_id
+      });
+    }
+
+    return res.json({
+      ok: true,
+      item: {
+        id: data.id,
+        client_id: data.client_id,
+        title: data.title,
+        tavus_prompt: data.tavus_prompt || null,
+        rubric_questions: Array.isArray(data.rubric_questions) ? data.rubric_questions : null
+      }
+    });
+  } catch (e) {
+    console.error('[admin/roles/interview-config] unexpected', { request_id, role_id: req.params?.id || null, error: e?.message || e });
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'FETCH_INTERVIEW_CONFIG_FAILED',
+      detail: e?.message || 'Failed to fetch interview config',
+      hint: null,
+      request_id
+    });
+  }
+});
+
+adminRouter.patch('/roles/:id/interview-config', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null;
+  try {
+    const roleId = req.params.id;
+    const client_id = String(req.query?.client_id || '').trim();
+    if (!client_id) {
+      return res.status(400).json({
+        error: 'bad_request',
+        code: 'CLIENT_ID_REQUIRED',
+        detail: 'client_id query param is required',
+        hint: null,
+        request_id
+      });
+    }
+
+    const { data: existing, error: existingErr } = await supabaseAdmin
+      .from('roles')
+      .select('id,client_id')
+      .eq('id', roleId)
+      .maybeSingle();
+
+    if (existingErr) {
+      console.error('[admin/roles/interview-config] lookup failed', {
+        request_id,
+        role_id: roleId,
+        client_id,
+        code: existingErr.code,
+        message: existingErr.message
+      });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'UPDATE_INTERVIEW_CONFIG_FAILED',
+        detail: existingErr.message,
+        hint: existingErr.hint || null,
+        request_id
+      });
+    }
+    if (!existing || String(existing.client_id) !== client_id) {
+      return res.status(404).json({
+        error: 'not_found',
+        code: 'ROLE_NOT_FOUND',
+        detail: 'Role not found for provided client_id',
+        hint: null,
+        request_id
+      });
+    }
+
+    const updates = {};
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'tavus_prompt')) {
+      const v = req.body.tavus_prompt;
+      if (v !== null && typeof v !== 'string') {
+        return res.status(400).json({
+          error: 'bad_request',
+          code: 'INVALID_TAVUS_PROMPT',
+          detail: 'tavus_prompt must be a string or null',
+          hint: null,
+          request_id
+        });
+      }
+      updates.tavus_prompt = v;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'rubric_questions')) {
+      const rq = req.body.rubric_questions;
+      if (rq !== null) {
+        if (!Array.isArray(rq) || rq.some((q) => typeof q !== 'string')) {
+          return res.status(400).json({
+            error: 'bad_request',
+            code: 'INVALID_RUBRIC_QUESTIONS',
+            detail: 'rubric_questions must be null or an array of strings',
+            hint: null,
+            request_id
+          });
+        }
+      }
+      updates.rubric_questions = rq;
+    }
+
+    if (!Object.keys(updates).length) {
+      return res.status(400).json({
+        error: 'bad_request',
+        code: 'NO_EDITABLE_FIELDS',
+        detail: 'No editable fields provided',
+        hint: 'Provide tavus_prompt and/or rubric_questions',
+        request_id
+      });
+    }
+
+    const { data: updated, error: updateErr } = await supabaseAdmin
+      .from('roles')
+      .update(updates)
+      .eq('id', roleId)
+      .eq('client_id', client_id)
+      .select('id,client_id,title,tavus_prompt,rubric_questions')
+      .single();
+
+    if (updateErr) {
+      console.error('[admin/roles/interview-config] update failed', {
+        request_id,
+        role_id: roleId,
+        client_id,
+        code: updateErr.code,
+        message: updateErr.message
+      });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'UPDATE_INTERVIEW_CONFIG_FAILED',
+        detail: updateErr.message,
+        hint: updateErr.hint || null,
+        request_id
+      });
+    }
+
+    return res.json({
+      ok: true,
+      item: {
+        id: updated.id,
+        client_id: updated.client_id,
+        title: updated.title,
+        tavus_prompt: updated.tavus_prompt || null,
+        rubric_questions: Array.isArray(updated.rubric_questions) ? updated.rubric_questions : null
+      }
+    });
+  } catch (e) {
+    console.error('[admin/roles/interview-config] update unexpected', { request_id, role_id: req.params?.id || null, error: e?.message || e });
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'UPDATE_INTERVIEW_CONFIG_FAILED',
+      detail: e?.message || 'Failed to update interview config',
+      hint: null,
+      request_id
+    });
+  }
+});
+
 // List members for a client (synthetic id)
 adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) => {
   const { client_id } = req.query
