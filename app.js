@@ -853,13 +853,18 @@ adminRouter.get('/candidates', requireAuth, requireAdmin, async (req, res) => {
     const candidates = (cands || []).map((c) => {
       const rep = latestReportByCandidateId[c.id] || null;
       const resume_score = Number.isFinite(Number(rep?.resume_score)) ? Number(rep.resume_score) : null;
-      // PATCH: prefer report interview_score, else fill from derived interview analysis
+
       const derivedInterview = Object.prototype.hasOwnProperty.call(derivedInterviewScoreByCandidateId, c.id)
         ? derivedInterviewScoreByCandidateId[c.id]
         : null;
-      const interview_score = Number.isFinite(Number(rep?.interview_score))
-        ? Number(rep.interview_score)
-        : (Number.isFinite(Number(derivedInterview)) ? Number(derivedInterview) : null);
+
+      const repInterview = Number.isFinite(Number(rep?.interview_score)) ? Number(rep.interview_score) : null;
+      const derivedInterviewNum = Number.isFinite(Number(derivedInterview)) ? Number(derivedInterview) : null;
+
+      const interview_score = (derivedInterviewNum !== null && (repInterview === null || repInterview === 0))
+        ? derivedInterviewNum
+        : repInterview;
+
       const rep_overall = Number.isFinite(Number(rep?.overall_score)) ? Number(rep.overall_score) : null;
 
       const clamp0to100 = (v) => {
