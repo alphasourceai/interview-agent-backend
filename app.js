@@ -768,7 +768,28 @@ adminRouter.get('/candidates', requireAuth, requireAdmin, async (req, res) => {
       const rep = latestReportByCandidateId[c.id] || null;
       const resume_score = Number.isFinite(Number(rep?.resume_score)) ? Number(rep.resume_score) : null;
       const interview_score = Number.isFinite(Number(rep?.interview_score)) ? Number(rep.interview_score) : null;
-      const overall_score = Number.isFinite(Number(rep?.overall_score)) ? Number(rep.overall_score) : null;
+      const rep_overall = Number.isFinite(Number(rep?.overall_score)) ? Number(rep.overall_score) : null;
+
+      const clamp0to100 = (v) => {
+        if (!Number.isFinite(Number(v))) return null;
+        const n = Number(v);
+        return Math.max(0, Math.min(100, n));
+      };
+
+      const resumeClamped = clamp0to100(resume_score);
+      const interviewClamped = clamp0to100(interview_score);
+      const repOverallClamped = clamp0to100(rep_overall);
+
+      let overall_score = null;
+      if (resumeClamped !== null && interviewClamped !== null) {
+        overall_score = clamp0to100((resumeClamped + interviewClamped) / 2);
+      } else if (interviewClamped !== null) {
+        overall_score = interviewClamped;
+      } else if (resumeClamped !== null) {
+        overall_score = resumeClamped;
+      } else if (repOverallClamped !== null) {
+        overall_score = repOverallClamped;
+      }
       return {
         id: c.id,
         created_at: c.created_at,
