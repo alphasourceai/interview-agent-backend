@@ -697,7 +697,17 @@ function extractSanitizedContent(item) {
     }
   }
 
-  const text = String(content).trim();
+  let text = String(content).trim();
+  if (!text) return null;
+
+  // Strip the "unanswered" marker artifacts so they don't appear in stored transcripts or get read aloud in reports.
+  // NOTE: We still capture unanswered questions via `extractCandidateQuestions(...)` using refusal heuristics.
+  text = text
+    .replace(/\[\[UNANSWERED_QUESTION:[^\]]*\]\]/g, '')
+    .replace(/\[\s*\]/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
   if (!text) return null;
 
   if (role === 'user') {

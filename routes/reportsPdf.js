@@ -367,14 +367,19 @@ async function handleGenerate(req, res) {
       education: educationScore,
       summary: resume_summary
     };
+    const transcriptScores = parseJsonObject(latestInterview?.transcript_scores) || {};
+    const evidenceStrengthFromTranscript = coerceNumber(transcriptScores.confidence);
+    const aiAidedRiskFromTranscript = typeof transcriptScores.ai_aided_risk === 'string' ? transcriptScores.ai_aided_risk.trim().toLowerCase() : '';
+    const aiAidedRiskReasonFromTranscript = typeof transcriptScores.ai_aided_risk_reason === 'string' ? transcriptScores.ai_aided_risk_reason.trim() : '';
 
     const interview_breakdown = {
       clarity: Number.isFinite(Number(rb.clarity)) ? Number(rb.clarity)
               : (Number.isFinite(Number(ivScores.clarity)) ? Number(ivScores.clarity) : 0),
       confidence: Number.isFinite(Number(rb.confidence)) ? Number(rb.confidence)
                  : (Number.isFinite(Number(ivScores.confidence)) ? Number(ivScores.confidence) : 0),
-      body_language: Number.isFinite(Number(rb.body_language)) ? Number(rb.body_language)
-                    : (Number.isFinite(Number(ivScores.body_language)) ? Number(ivScores.body_language) : 0),
+      evidence_strength: evidenceStrengthFromTranscript !== null ? evidenceStrengthFromTranscript : 0,
+      ai_aided_risk: aiAidedRiskFromTranscript,
+      ai_aided_risk_reason: aiAidedRiskReasonFromTranscript,
       summary: interview_summary
     };
 
@@ -413,7 +418,6 @@ async function handleGenerate(req, res) {
         candidateSummary.resume_match_percent ??
         candidateSummary.resumeMatchPercent
       );
-    const transcriptScores = parseJsonObject(latestInterview?.transcript_scores) || {};
     const interviewFromTranscript = coerceNumber(transcriptScores.overall);
     const overallFromReport = coerceNumber(reportRow.overall_score);
     const overallFromCurrent =
@@ -455,13 +459,10 @@ async function handleGenerate(req, res) {
     const perceptionScores = parseJsonObject(latestInterview?.perception_scores) || {};
     const clarityFromInterview = coerceNumber(perceptionScores.clarity);
     const confidenceFromInterview = coerceNumber(perceptionScores.confidence);
-    const engagementFromInterview = coerceNumber(
-      perceptionScores.engagement ?? perceptionScores.body_language
-    );
+    const engagementFromInterview = coerceNumber(perceptionScores.engagement);
     if (clarityFromInterview !== null) interview_breakdown.clarity = clarityFromInterview;
     if (confidenceFromInterview !== null) interview_breakdown.confidence = confidenceFromInterview;
     if (engagementFromInterview !== null) {
-      interview_breakdown.body_language = engagementFromInterview;
       interview_breakdown.engagement = engagementFromInterview;
     }
 

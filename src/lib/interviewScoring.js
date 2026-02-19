@@ -2,7 +2,7 @@
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-const INSUFFICIENT_SUMMARY = 'Interview ended before any substantive responses were recorded.\nConfidence: 0%';
+const INSUFFICIENT_SUMMARY = 'Interview ended before any substantive responses were recorded.\nEvidence strength: 0%\nAI-aided interview risk: Low';
 
 function clampScore(value) {
   const n = Number(value);
@@ -57,10 +57,33 @@ function normalizePerceptionScores(input) {
   return out;
 }
 
-function ensureConfidenceLine(summary, confidenceScore) {
+function normalizeAiAidedRisk(value) {
+  const v = String(value || '').trim().toLowerCase();
+  if (v === 'low' || v === 'medium' || v === 'high') return v;
+  return 'low';
+}
+
+function ensureEvidenceStrengthLine(summary, evidenceStrength) {
   const trimmed = String(summary || '').trim();
-  const withoutConfidence = trimmed.replace(/\n?Confidence:\s*\d{1,3}%\s*$/i, '').trim();
-  return `${withoutConfidence}\nConfidence: ${confidenceScore}%`;
+  const withoutLine = trimmed.replace(/\n?Evidence strength:\s*(\d{1,3}%|Unknown)\s*$/i, '').trim();
+  const label = Number.isFinite(Number(evidenceStrength)) ? `${clampScore(evidenceStrength)}%` : 'Unknown';
+  return `${withoutLine}\nEvidence strength: ${label}`;
+}
+
+function ensureAiRiskLine(summary, risk) {
+  const trimmed = String(summary || '').trim();
+  const withoutLine = trimmed.replace(/\n?AI-aided interview risk:\s*(low|medium|high)\s*$/i, '').trim();
+  const label = risk === 'low' ? 'Low' : risk === 'medium' ? 'Medium' : 'High';
+  return `${withoutLine}\nAI-aided interview risk: ${label}`;
+}
+
+function ensureSummaryFooter(summary, { evidenceStrength, risk } = {}) {
+  let out = String(summary || '').trim();
+  out = out.replace(/\n?Evidence strength:\s*(\d{1,3}%|Unknown)\s*$/i, '').trim();
+  out = out.replace(/\n?AI-aided interview risk:\s*(low|medium|high)\s*$/i, '').trim();
+  out = ensureEvidenceStrengthLine(out, evidenceStrength);
+  out = ensureAiRiskLine(out, risk);
+  return out;
 }
 
 function buildInsufficientResult() {
@@ -71,7 +94,9 @@ function buildInsufficientResult() {
       role_fit: null,
       technical_strength: null,
       communication_quality: null,
-      confidence: 0
+      confidence: 0,
+      ai_aided_risk: 'low',
+      ai_aided_risk_reason: 'Insufficient transcript to assess.'
     }
   };
 }
@@ -102,7 +127,9 @@ Return ONLY valid JSON with exactly these keys:
   "role_fit": 0-100,
   "technical_strength": 0-100,
   "communication_quality": 0-100,
-  "confidence": 0-100
+  "evidence_strength": 0-100,
+  "ai_aided_risk": "low|medium|high",
+  "ai_aided_risk_reason": "one short sentence"
 }
 
 Scoring rules:
@@ -110,7 +137,10 @@ Scoring rules:
 - Use perception/non-verbal signals only as secondary supporting evidence.
 - Do not infer protected traits.
 - Keep scores conservative and evidence-based.
-
+- evidence_strength is how strong the transcript evidence is for the scores you gave (NOT how "confident" you feel).
+- ai_aided_risk is a conservative heuristic based ONLY on observable transcript evidence; it is NOT proof.
+- Default ai_aided_risk to "low" unless there are multiple clear indicators; keep the reason neutral and non-accusatory.
+  
 Job description context:
 """${jdGrounding}"""
 
@@ -160,13 +190,17 @@ Transcript:
   const roleFit = clampScore(parsed.role_fit);
   const technicalStrength = clampScore(parsed.technical_strength);
   const communicationQuality = clampScore(parsed.communication_quality);
-  const confidence = clampScore(parsed.confidence) ?? overall;
+  const evidenceStrength = clampScore(parsed.evidence_strength);
+  const aiAidedRisk = normalizeAiAidedRisk(parsed.ai_aided_risk);
+  const aiAidedRiskReason = typeof parsed.ai_aided_risk_reason === 'string'
+    ? parsed.ai_aided_risk_reason.trim().slice(0, 300)
+    : '';
 
   const rawSummary = String(parsed.summary || '').trim();
   if (!rawSummary) {
     throw new Error('invalid_model_output_summary');
   }
-  const summary = ensureConfidenceLine(rawSummary, confidence);
+  const summary = ensureSummaryFooter(rawSummary, { evidenceStrength, risk: aiAidedRisk });
 
   return {
     summary,
@@ -175,7 +209,9 @@ Transcript:
       role_fit: roleFit ?? overall,
       technical_strength: technicalStrength ?? overall,
       communication_quality: communicationQuality ?? overall,
-      confidence
+      confidence: evidenceStrength !== null ? evidenceStrength : null,
+      ai_aided_risk: aiAidedRisk,
+      ai_aided_risk_reason: aiAidedRiskReason
     }
   };
 }
@@ -183,6 +219,7 @@ Transcript:
 module.exports = {
   INSUFFICIENT_SUMMARY,
   isSubstantiveTranscript,
-  scoreInterview
+  scoreInterview,
+  normalizeAiAidedRisk,
+  ensureSummaryFooter
 };
-
