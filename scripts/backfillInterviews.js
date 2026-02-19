@@ -3,14 +3,13 @@ require('dotenv').config();
 const fetch = require('node-fetch');
 
 const { createClient } = require('@supabase/supabase-js');
+const { isSubstantiveTranscript, scoreInterview, INSUFFICIENT_SUMMARY } = require('../src/lib/interviewScoring');
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 const TRANSCRIPTS_BUCKET = process.env.SUPABASE_TRANSCRIPTS_BUCKET || 'transcripts';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
 const BACKFILL_LIMIT = Number(process.env.BACKFILL_LIMIT || 500);
 const BACKFILL_DRY_RUN = String(process.env.BACKFILL_DRY_RUN || 'true').toLowerCase() === 'true';
 const BACKFILL_START_AFTER_ID = process.env.BACKFILL_START_AFTER_ID || null;
@@ -221,75 +220,32 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function scoreTranscriptWithOpenAI(transcript) {
-  if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY missing');
-
-  const prompt = `You are an interview evaluator. Return ONLY valid JSON with these exact keys:\n\n{
-  "overall": 0-100,
-  "summary": "1-3 sentences",
-  "role_fit": 0-100,
-  "technical_strength": 0-100,
-  "communication_quality": 0-100
-}\n\nRules:\n- Summary must be 1-3 sentences max.\n- Do NOT include any additional keys.\n- Compliance: Do NOT infer protected traits (age, race, gender, disability, etc.). Evaluate only job-relevant communication quality and content.\n\nTranscript:\n"""${transcript.slice(0, 12000)}"""`;
-
-  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: 'Return only JSON.' },
-        { role: 'user', content: prompt }
-      ],
-      temperature: 0,
-      response_format: { type: 'json_object' }
-    })
-  });
-
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => '');
-    throw new Error(`OpenAI ${resp.status}: ${txt}`);
+const roleJdCache = new Map();
+async function getRoleJdText(roleId) {
+  if (!roleId) return '';
+  const cacheKey = String(roleId);
+  if (roleJdCache.has(cacheKey)) return roleJdCache.get(cacheKey);
+  const { data, error } = await supabase
+    .from('roles')
+    .select('id, job_description_text, job_description_url')
+    .eq('id', roleId)
+    .maybeSingle();
+  if (error) {
+    roleJdCache.set(cacheKey, '');
+    return '';
   }
-  const data = await resp.json();
-  let parsed = {};
-  try {
-    parsed = JSON.parse(data.choices?.[0]?.message?.content || '{}');
-  } catch {
-    parsed = {};
-  }
-
-  function num(v) {
-    const n = Number(v);
-    if (!Number.isFinite(n)) return null;
-    return Math.max(0, Math.min(100, Math.round(n)));
-  }
-
-  const overall = num(parsed.overall);
-  const summary = String(parsed.summary || '').trim();
-  if (!summary || overall === null || overall === undefined) {
-    throw new Error('invalid_model_output');
-  }
-
-  const transcript_scores = {};
-  if (overall !== null) transcript_scores.overall = overall;
-  const roleFit = num(parsed.role_fit);
-  const technicalStrength = num(parsed.technical_strength);
-  const communicationQuality = num(parsed.communication_quality);
-  if (roleFit !== null) transcript_scores.role_fit = roleFit;
-  if (technicalStrength !== null) transcript_scores.technical_strength = technicalStrength;
-  if (communicationQuality !== null) transcript_scores.communication_quality = communicationQuality;
-
-  return { summary, transcript_scores };
+  const text = typeof data?.job_description_text === 'string' && data.job_description_text.trim()
+    ? data.job_description_text.trim()
+    : (typeof data?.job_description_url === 'string' ? data.job_description_url.trim() : '');
+  roleJdCache.set(cacheKey, text || '');
+  return text || '';
 }
 
-async function scoreWithRetry(transcript, maxAttempts = 3) {
+async function scoreWithRetry(input, maxAttempts = 3) {
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      return await scoreTranscriptWithOpenAI(transcript);
+      return await scoreInterview(input);
     } catch (err) {
       lastErr = err;
       const delay = 500 * Math.pow(2, attempt - 1);
@@ -324,18 +280,22 @@ async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
 
     const { data: row, error } = await supabase
       .from('interviews')
-      .select('id, transcript, transcript_url, analysis, transcript_scores, interview_summary, status')
+      .select('id, role_id, transcript, transcript_url, analysis, transcript_scores, interview_summary, perception_scores, status')
       .eq('id', interviewId)
       .maybeSingle();
     if (error || !row) {
       return { ok: false, error: error?.message || 'interview_not_found', request_id: requestId || null };
     }
 
-    const existingOverall = row.transcript_scores && typeof row.transcript_scores === 'object'
-      ? row.transcript_scores.overall
-      : undefined;
+    const existingTopScores = row.transcript_scores && typeof row.transcript_scores === 'object'
+      ? row.transcript_scores
+      : {};
+    const existingOverall = existingTopScores.overall;
+    const existingConfidence = existingTopScores.confidence;
     const existingSummary = typeof row.interview_summary === 'string' ? row.interview_summary.trim() : '';
-    if (Number.isFinite(existingOverall) && existingSummary) {
+    const alreadyMarkedInsufficient = Number(existingConfidence) === 0 &&
+      (existingSummary === INSUFFICIENT_SUMMARY || existingSummary.includes('Interview ended before any substantive responses were recorded.'));
+    if ((Number.isFinite(existingOverall) && existingSummary) || alreadyMarkedInsufficient) {
       return { ok: true, skipped: true, reason: 'already_analyzed', request_id: requestId || null };
     }
 
@@ -344,11 +304,19 @@ async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
       return { ok: true, skipped: true, reason: 'empty_transcript', request_id: requestId || null };
     }
 
-    const { summary, transcript_scores } = await scoreWithRetry(transcriptText, 3);
-
-    const existingTopScores = row.transcript_scores && typeof row.transcript_scores === 'object'
-      ? row.transcript_scores
+    const substantive = isSubstantiveTranscript(transcriptText);
+    const jdText = await getRoleJdText(row.role_id);
+    const perceptionScores = row.perception_scores && typeof row.perception_scores === 'object'
+      ? row.perception_scores
       : {};
+    const { summary, transcript_scores } = await scoreWithRetry({
+      transcriptText,
+      jdText,
+      perceptionScores,
+      mode: 'backfill',
+      request_id: requestId || null
+    }, 3);
+
     const updatePayload = {
       transcript_scores: { ...existingTopScores, ...(transcript_scores || {}) }
     };
@@ -369,6 +337,10 @@ async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
       return { ok: false, error: upErr.message, request_id: requestId || null };
     }
 
+    if (!substantive.ok) {
+      return { ok: true, updated: true, skipped: true, reason: `insufficient_${substantive.reason}`, request_id: requestId || null };
+    }
+
     return { ok: true, updated: true, request_id: requestId || null };
   } catch (err) {
     return { ok: false, error: err?.message || String(err), request_id: requestId || null };
@@ -378,13 +350,15 @@ async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
 async function main() {
   let scanned = 0;
   let skipped = 0;
+  let scored = 0;
+  let insufficient = 0;
   let would_update = 0;
   let updated = 0;
   let failed = 0;
 
   let query = supabase
     .from('interviews')
-    .select('id, created_at, transcript, transcript_url, analysis, transcript_scores, interview_summary')
+    .select('id, role_id, created_at, transcript, transcript_url, analysis, transcript_scores, interview_summary, perception_scores')
     .order('created_at', { ascending: true })
     .order('id', { ascending: true })
     .limit(BACKFILL_LIMIT);
@@ -399,7 +373,7 @@ async function main() {
   if (error) throw error;
   if (!rows || rows.length === 0) {
     console.log('No rows to process.');
-    console.log(`scanned=${scanned} skipped=${skipped} would_update=${would_update} updated=${updated} failed=${failed}`);
+    console.log(`scanned=${scanned} skipped=${skipped} scored=${scored} insufficient=${insufficient} would_update=${would_update} updated=${updated} failed=${failed}`);
     return;
   }
 
@@ -435,11 +409,15 @@ async function main() {
     }
 
     try {
-      const existingOverall = row.transcript_scores && typeof row.transcript_scores === 'object'
-        ? row.transcript_scores.overall
-        : undefined;
+      const existingTopScores = row.transcript_scores && typeof row.transcript_scores === 'object'
+        ? row.transcript_scores
+        : {};
+      const existingOverall = existingTopScores.overall;
+      const existingConfidence = existingTopScores.confidence;
       const existingSummary = typeof row.interview_summary === 'string' ? row.interview_summary.trim() : '';
-      if (Number.isFinite(existingOverall) && existingSummary) {
+      const alreadyMarkedInsufficient = Number(existingConfidence) === 0 &&
+        (existingSummary === INSUFFICIENT_SUMMARY || existingSummary.includes('Interview ended before any substantive responses were recorded.'));
+      if ((Number.isFinite(existingOverall) && existingSummary) || alreadyMarkedInsufficient) {
         skipped += 1;
         console.log(`[backfill] skip ${row.id} already_analyzed`);
         continue;
@@ -452,11 +430,25 @@ async function main() {
         continue;
       }
 
-      const { summary, transcript_scores } = await scoreWithRetry(transcriptText, 3);
-
-      const existingTopScores = row.transcript_scores && typeof row.transcript_scores === 'object'
-        ? row.transcript_scores
+      const substantive = isSubstantiveTranscript(transcriptText);
+      if (!substantive.ok) {
+        insufficient += 1;
+        console.log(`[backfill] insufficient ${row.id} ${substantive.reason}`);
+      } else {
+        scored += 1;
+      }
+      const jdText = await getRoleJdText(row.role_id);
+      const perceptionScores = row.perception_scores && typeof row.perception_scores === 'object'
+        ? row.perception_scores
         : {};
+      const { summary, transcript_scores } = await scoreWithRetry({
+        transcriptText,
+        jdText,
+        perceptionScores,
+        mode: 'backfill',
+        request_id: null
+      }, 3);
+
       const updatePayload = {
         transcript_scores: { ...existingTopScores, ...(transcript_scores || {}) }
       };
@@ -485,7 +477,7 @@ async function main() {
     }
   }
 
-  console.log(`scanned=${scanned} skipped=${skipped} would_update=${would_update} updated=${updated} failed=${failed}`);
+  console.log(`scanned=${scanned} skipped=${skipped} scored=${scored} insufficient=${insufficient} would_update=${would_update} updated=${updated} failed=${failed}`);
 }
 
 module.exports = { analyzeInterviewTranscriptById };
