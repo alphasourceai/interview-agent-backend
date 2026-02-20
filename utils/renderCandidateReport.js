@@ -65,7 +65,10 @@ function normalizeBreakdown(input) {
 
     confidence: coerceNumber(src.confidence),
     clarity: coerceNumber(src.clarity),
-    engagement: coerceNumber(src.engagement ?? src.body_language),
+    engagement: coerceNumber(src.engagement),
+    evidence_strength: coerceNumber(src.evidence_strength),
+    ai_aided_risk: nonEmptyString(src.ai_aided_risk),
+    ai_aided_risk_reason: nonEmptyString(src.ai_aided_risk_reason),
 
     summary: nonEmptyString(obj.summary || src.summary)
   };
