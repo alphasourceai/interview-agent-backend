@@ -27,9 +27,33 @@ async function analyzeResume(fileBuffer, mimeType, role, candidateId) {
     resumeText = resumeText.slice(0, 15000) + '\n\n[Truncated for analysis]';
   }
 
-  const systemPrompt = `You are an unbiased, compliance-aware assistant. Do not infer protected attributes.`;
+  let clientName = '';
+  try {
+    if (role?.client_id) {
+      const { data: clientRow, error: clientErr } = await supabase
+        .from('clients')
+        .select('name')
+        .eq('id', role.client_id)
+        .maybeSingle();
+      if (!clientErr && clientRow?.name) clientName = String(clientRow.name).trim();
+    }
+  } catch (_) {}
+
+  const systemPrompt = `You are an unbiased, compliance-aware assistant. Do not infer protected attributes.
+Never invent employer/company names, role titles, dates, credentials, tools, or claims not present in the resume text.
+If information is missing, write "Not provided in resume."
+Do not use company names from the role description/job description.
+The only authoritative hiring company name is client_name (if provided).
+If client_name is empty, do not name any hiring company; refer to "the hiring company" or "the role".
+In the summary, refer to "the candidate"; if you mention the hiring company, use client_name only.`;
   const userPrompt = `
-Role Description:
+Hiring Company Name (authoritative):
+${clientName || '[not provided]'}
+
+Role Title:
+${role?.title || '[none provided]'}
+
+Role Description (requirements only; company names in this section are not trustworthy for hiring company naming):
 ${role?.description || '[none provided]'}
 
 Resume:
