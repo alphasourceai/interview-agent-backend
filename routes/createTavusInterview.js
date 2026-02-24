@@ -127,6 +127,7 @@ router.post('/', async (req, res) => {
       return res.status(200).json({
         message: 'Interview created',
         conversation_url: result.conversation_url || null,
+        conversation_id: result.conversation_id || null,
         interview_id: iData.id
       });
     } else {
@@ -144,6 +145,7 @@ router.post('/', async (req, res) => {
       return res.status(200).json({
         message: 'Interview updated',
         conversation_url: result.conversation_url || null,
+        conversation_id: result.conversation_id || existing.tavus_application_id || null,
         interview_id: existing.id
       });
     }
