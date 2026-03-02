@@ -1561,6 +1561,7 @@ function mountIfExists(relPath, urlPath) {
 mountIfExists('./routes/kb', '/kb')
 mountIfExists('./routes/webhook', '/webhook')
 mountIfExists('./routes/tavus', '/')
+mountIfExists('./routes/publicInterviewStatus', '/')
 
 // ---------- JD upload route (authenticated + scoped) ----------
 try {

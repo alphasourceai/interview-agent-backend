@@ -832,6 +832,15 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
     let shouldTriggerAnalysisRun = false;
     let transcriptText = '';
 
+    if (isShutdown) {
+      updates.status = 'Ended';
+      console.log('[webhook] interview ended', {
+        request_id: requestId || null,
+        interview_id: interview.id,
+        tavus_application_id: interview.tavus_application_id || conversationId || null
+      });
+    }
+
     if (isTranscriptionReady) {
       const rawTranscript = pickFirst(
         fromAny(body, 'properties.transcript'),
