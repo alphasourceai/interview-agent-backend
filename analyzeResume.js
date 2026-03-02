@@ -91,6 +91,16 @@ resume_score, skills_match_percent, experience_match_percent, education_match_pe
     console.warn('OpenAI resume analysis failed (non-fatal):', e?.message || e);
   }
 
+  if (clientName && typeof result.summary === 'string') {
+    result.summary = result.summary.replace(/\bclient_name\b/gi, clientName);
+  }
+  if (clientName && typeof result.resume_summary === 'string') {
+    result.resume_summary = result.resume_summary.replace(/\bclient_name\b/gi, clientName);
+  }
+  if (clientName && result.resume_analysis && typeof result.resume_analysis.summary === 'string') {
+    result.resume_analysis.summary = result.resume_analysis.summary.replace(/\bclient_name\b/gi, clientName);
+  }
+
   try {
     await supabase.from('reports').insert([{
       candidate_id: candidateId,
