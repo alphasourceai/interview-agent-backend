@@ -756,9 +756,10 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
     const isPerceptionAnalysis =
       eventType === 'conversation.perception_analysis' ||
       eventType === 'application.perception_analysis';
+    const isToolCall = eventType === 'conversation.tool_call';
     const isReplicaJoined = eventType === 'system.replica_joined';
     const isShutdown = eventType === 'system.shutdown';
-    const isKnownEvent = isReplicaJoined || isShutdown || isTranscriptionReady || isRecordingReady || isPerceptionAnalysis;
+    const isKnownEvent = isReplicaJoined || isShutdown || isTranscriptionReady || isRecordingReady || isPerceptionAnalysis || isToolCall;
 
     const interviewId = pickFirst(
       fromAny(body, 'interview_id'),
@@ -825,12 +826,106 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
     let analysisCompleteSummary = null;
     let perceptionKeysCount = null;
     let unansweredQuestionsCount = null;
+    const toolNameRaw = pickFirst(
+      fromAny(body, 'tool_name'),
+      fromAny(body, 'tool.name'),
+      fromAny(body, 'name'),
+      fromAny(body, 'payload.tool_name'),
+      fromAny(body, 'payload.tool.name'),
+      fromAny(body, 'properties.tool_name'),
+      fromAny(body, 'properties.tool.name')
+    );
+    const toolArgs = pickFirst(
+      fromAny(body, 'tool_arguments'),
+      fromAny(body, 'tool.arguments'),
+      fromAny(body, 'arguments'),
+      fromAny(body, 'payload.tool_arguments'),
+      fromAny(body, 'payload.tool.arguments'),
+      fromAny(body, 'properties.tool_arguments'),
+      fromAny(body, 'properties.tool.arguments')
+    );
+    const toolName = String(toolNameRaw || '').trim().toLowerCase();
 
     const updates = {};
     let transcriptNonEmpty = false;
     let analysisMissing = false;
     let shouldTriggerAnalysisRun = false;
     let transcriptText = '';
+
+    if (isToolCall && toolName === 'end_interview' && conversationId && interview?.id) {
+      try {
+        const apiKey = String(process.env.TAVUS_API_KEY || '').trim();
+        if (!apiKey) {
+          console.error('[webhook] tool_call missing tavus api key', {
+            request_id: requestId || null,
+            conversation_id: conversationId || null,
+            interview_id: interview.id,
+            tool_name: toolName
+          });
+        } else {
+          const endResp = await fetch(
+            `https://tavusapi.com/v2/conversations/${encodeURIComponent(conversationId)}/end`,
+            {
+              method: 'POST',
+              headers: {
+                'x-api-key': apiKey,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({})
+            }
+          );
+
+          if (!endResp.ok) {
+            const detail = await endResp.text().catch(() => '');
+            console.error('[webhook] tool_call tavus end failed', {
+              request_id: requestId || null,
+              conversation_id: conversationId || null,
+              interview_id: interview.id,
+              tool_name: toolName,
+              status: endResp.status,
+              detail: detail || null
+            });
+          } else {
+            const { error: toolUpdateError } = await supabaseAdmin
+              .from('interviews')
+              .update({
+                status: 'ending_requested',
+                updated_at: new Date().toISOString()
+              })
+              .eq('id', interview.id);
+
+            if (toolUpdateError) {
+              console.error('[webhook] tool_call status update failed', {
+                request_id: requestId || null,
+                conversation_id: conversationId || null,
+                interview_id: interview.id,
+                tool_name: toolName,
+                error: toolUpdateError.message || toolUpdateError,
+                details: toolUpdateError.details || null,
+                hint: toolUpdateError.hint || null
+              });
+            } else {
+              statusAfter = 'ending_requested';
+              console.log('[webhook] tool_call end_interview processed', {
+                request_id: requestId || null,
+                conversation_id: conversationId || null,
+                interview_id: interview.id,
+                tool_name: toolName,
+                tool_arguments: toolArgs ?? null
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[webhook] tool_call end_interview failed', {
+          request_id: requestId || null,
+          conversation_id: conversationId || null,
+          interview_id: interview.id,
+          tool_name: toolName,
+          error: err?.message || err
+        });
+      }
+    }
 
     if (isShutdown) {
       updates.status = 'Ended';
