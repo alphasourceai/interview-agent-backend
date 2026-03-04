@@ -65,26 +65,6 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     conversation_name: conversationName,
     conversational_context: context,
     custom_greeting: customGreeting,
-    llm: {
-      tools: [
-        {
-          type: 'function',
-          function: {
-            name: 'end_interview',
-            description: 'End the interview immediately after the closing sentence has been delivered.',
-            parameters: {
-              type: 'object',
-              properties: {
-                reason: {
-                  type: 'string'
-                }
-              },
-              required: ['reason']
-            }
-          }
-        }
-      ]
-    },
     properties: {
       max_call_duration: 3600,
       participant_left_timeout: 60
@@ -235,7 +215,7 @@ function buildConversationalContext(candidateName, roleTitle, companyName, rubri
     '- Ask questions one at a time from the rubric.',
     '- END OF INTERVIEW PROTOCOL: After the final rubric question is answered, ask exactly once: "Do you have any questions for me before we wrap up?"',
     '- If the candidate asks a question at the end, answer it briefly in no more than 2 sentences, then ask exactly once: "Any other questions? If not, just say \'no\'."',
-    '- If the candidate indicates they have no further questions (including no, nope, that\'s all, I\'m good, or similar), say exactly: "Thanks for your time today - this concludes the interview. I\'m ending the session now." Immediately call the end_interview tool with a brief reason, then end the call/session immediately with no additional prompts, silence, or follow-up questions.',
+    '- If the candidate indicates they have no further questions (including no, nope, that\'s all, I\'m good, or similar), say exactly: "Thanks for your time today - this concludes the interview. I\'m ending the session now." Then end the call/session immediately with no additional prompts, silence, or follow-up questions.',
     '- Do not ask the end-of-interview questions more than twice total: the initial "Do you have any questions for me before we wrap up?" plus one "Any other questions? If not, just say \'no\'." follow-up maximum.',
     '- Do not sit silently waiting after the candidate says no. End immediately.',
     '- Use ONLY the provided knowledge base (KB) and rubric when answering questions about the role, company, or process.',
