@@ -63,10 +63,15 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
       });
     }
 
-    const { error: updateError } = await supabaseAdmin
+    const { data: updatedInterview, error: updateError } = await supabaseAdmin
       .from('interviews')
-      .update({ status: 'ending_requested' })
-      .eq('tavus_application_id', conversation_id);
+      .update({
+        status: 'ending_requested',
+        updated_at: new Date().toISOString()
+      })
+      .eq('tavus_application_id', conversation_id)
+      .select('id, status')
+      .maybeSingle();
 
     if (updateError) {
       console.error('[tavus/end-conversation] status_update_failed', {
@@ -83,6 +88,13 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
         request_id
       });
     }
+
+    console.log('[tavus/end-conversation] status_updated', {
+      request_id,
+      conversation_id,
+      interview_id: updatedInterview?.id || null,
+      status: updatedInterview?.status || 'ending_requested'
+    });
 
     return res.json({ ok: true, request_id });
   } catch (e) {
