@@ -5,7 +5,6 @@ const multer = require('multer');
 const sg = require('@sendgrid/mail');
 const { supabase } = require('../src/lib/supabaseClient');
 const analyzeResume = require('../analyzeResume'); // resume analyzer
-const { checkDuplicateCandidate, normalizeEmail, normalizePhone } = require('../src/lib/duplicateCandidate');
 
 // uploads: keep in memory; 10MB limit
 const upload = multer({
@@ -17,6 +16,8 @@ const upload = multer({
 const FROM_EMAIL = process.env.SENDGRID_FROM;
 const SENDGRID_KEY = process.env.SENDGRID_API_KEY;
 const APP_NAME = process.env.APP_NAME || 'Interview Agent';
+const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
+const BILLING_ENFORCED = BILLING_MODE === 'enforce';
 if (SENDGRID_KEY) sg.setApiKey(SENDGRID_KEY);
 
 // 6-digit OTP
@@ -25,6 +26,14 @@ function six() {
 }
 
 // normalize helpers
+function normEmail(v = '') {
+  return String(v || '').trim().toLowerCase();
+}
+function normPhone(v = '') {
+  const digits = String(v || '').replace(/\D/g, '');
+  // Keep only last 10 digits (NANP style), chopping country codes/leading 1
+  return digits.length > 10 ? digits.slice(-10) : digits;
+}
 function normName(v = '') {
   return String(v || '').trim().replace(/\s+/g, ' ').toLowerCase();
 }
@@ -36,6 +45,7 @@ function normName(v = '') {
  */
 router.post('/', upload.any(), async (req, res) => {
   try {
+    const request_id = req.request_id || null;
     // --- normalize inputs ---
     const role_token   = (req.body.role_token || '').trim();
     const role_id_in   = (req.body.role_id || '').trim();
@@ -48,8 +58,8 @@ router.post('/', upload.any(), async (req, res) => {
 
     const fullName = rawName || [first_name, last_name].filter(Boolean).join(' ').trim();
 
-    const email = normalizeEmail(emailRaw);
-    const phone = normalizePhone(phoneRaw);
+    const email = normEmail(emailRaw);
+    const phone = normPhone(phoneRaw);
     const nameNorm = normName(fullName);
 
     if (!email || !fullName || (!role_token && !role_id_in)) {
@@ -76,25 +86,86 @@ router.post('/', upload.any(), async (req, res) => {
     if (rErr || !role) return res.status(404).json({ error: 'Role not found.' });
     const roleId = role.id;
 
+    if (BILLING_ENFORCED && role.client_id) {
+      const { data: client, error: clientErr } = await supabase
+        .from('clients')
+        .select('id,billing_status,manual_active_override,candidate_assistance_contact')
+        .eq('id', role.client_id)
+        .maybeSingle();
+
+      if (clientErr || !client) {
+        return res.status(500).json({
+          error: 'server_error',
+          code: 'CLIENT_LOOKUP_FAILED',
+          detail: clientErr?.message || 'Failed to load client record',
+          hint: clientErr?.hint || null,
+          request_id
+        });
+      }
+
+      if (client.manual_active_override === false && client.billing_status !== 'active') {
+        return res.status(403).json({
+          error: 'forbidden',
+          code: 'CLIENT_INACTIVE',
+          detail: 'Interviewing service is currently inactive for this employer.',
+          hint: client.candidate_assistance_contact || 'Please contact the employer.',
+          request_id
+        });
+      }
+    }
+
     // --- duplicate & enrichment policy ---
     // RULES:
     // 1) Email match for this role -> BLOCK (409). Enrich phone if missing, then stop (no OTP, no resume upload, no analysis).
     // 2) If email does NOT match, but (name + phone) BOTH match for this role -> BLOCK (409). Enrich phone on the existing record if missing.
     // 3) Otherwise, ALLOW (create candidate, upload, send OTP).
 
-    const dup = await checkDuplicateCandidate({
-      supabase,
-      roleId,
-      email,
-      fullName,
-      phone,
-      allowPhoneEnrich: true,
-    });
-    if (dup.duplicate) {
+    // 1) Email match
+    let existingByEmail = null;
+    {
+      const { data, error } = await supabase
+        .from('candidates')
+        .select('id, name, email, phone')
+        .eq('role_id', roleId)
+        .eq('email', email)
+        .limit(1)
+        .maybeSingle();
+      if (!error && data) existingByEmail = data;
+    }
+    if (existingByEmail) {
+      // Enrich phone if missing
+      if (phone && !existingByEmail.phone) {
+        await supabase.from('candidates').update({ phone }).eq('id', existingByEmail.id);
+      }
       return res.status(409).json({
         error:
           "You’ve already interviewed for this role with this information. If you believe this is an error, contact support at info@alphasourceai.com",
       });
+    }
+
+    // 2) Name + phone match (only if we have both a name and a phone)
+    if (fullName && phone) {
+      let existingByNamePhone = null;
+      const { data, error } = await supabase
+        .from('candidates')
+        .select('id, phone')
+        .eq('role_id', roleId)
+        .eq('phone', phone)
+        .ilike('name', fullName) // case-insensitive exact match
+        .limit(1)
+        .maybeSingle();
+      if (!error && data) existingByNamePhone = data;
+
+      if (existingByNamePhone) {
+        // Enrich phone if the stored record is missing it (defensive; may already be set)
+        if (!existingByNamePhone.phone && phone) {
+          await supabase.from('candidates').update({ phone }).eq('id', existingByNamePhone.id);
+        }
+        return res.status(409).json({
+          error:
+            "You’ve already interviewed for this role with this information. If you believe this is an error, contact support at info@alphasourceai.com",
+        });
+      }
     }
 
     // --- create candidate (denormalize client_id) ---
