@@ -1147,6 +1147,7 @@ adminRouter.patch('/roles/:id/config', requireAuth, requireAdmin, async (req, re
     }
 
     const updates = {};
+    let responseRubricQuestions;
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'rubric')) {
       updates.rubric = req.body.rubric;
     }
@@ -1403,6 +1404,7 @@ adminRouter.patch('/roles/:id/interview-config', requireAuth, requireAdmin, asyn
 
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'rubric_questions')) {
       const rq = req.body.rubric_questions;
+      responseRubricQuestions = rq;
       if (rq !== null) {
         if (!Array.isArray(rq) || rq.some((q) => typeof q !== 'string')) {
           return res.status(400).json({
@@ -1443,7 +1445,6 @@ adminRouter.patch('/roles/:id/interview-config', requireAuth, requireAdmin, asyn
         };
         updates.rubric = newRubricObject;
       }
-      updates.rubric_questions = rq;
     }
 
     if (!Object.keys(updates).length) {
@@ -1461,7 +1462,7 @@ adminRouter.patch('/roles/:id/interview-config', requireAuth, requireAdmin, asyn
       .update(updates)
       .eq('id', roleId)
       .eq('client_id', client_id)
-      .select('id,client_id,title,tavus_prompt,rubric_questions')
+      .select('id,client_id,title,tavus_prompt,rubric')
       .single();
 
     if (updateErr) {
@@ -1488,7 +1489,19 @@ adminRouter.patch('/roles/:id/interview-config', requireAuth, requireAdmin, asyn
         client_id: updated.client_id,
         title: updated.title,
         tavus_prompt: updated.tavus_prompt || null,
-        rubric_questions: Array.isArray(updated.rubric_questions) ? updated.rubric_questions : null
+        rubric_questions: responseRubricQuestions === undefined
+          ? (() => {
+              const questions = Array.isArray(updated?.rubric?.questions) ? updated.rubric.questions : [];
+              const out = questions
+                .map((item) => {
+                  if (!item || typeof item !== 'object') return '';
+                  const text = item.text || item.question || item.prompt;
+                  return typeof text === 'string' ? text.trim() : '';
+                })
+                .filter(Boolean);
+              return out.length ? out : null;
+            })()
+          : (Array.isArray(responseRubricQuestions) ? responseRubricQuestions : null)
       }
     });
   } catch (e) {
