@@ -1441,7 +1441,7 @@ adminRouter.patch('/roles/:id/interview-config', requireAuth, requireAdmin, asyn
             category: existingCategoryByQuestion.get(normalizeQuestion(q)) || 'Custom'
           }))
         };
-        updates.rubric = JSON.stringify(newRubricObject);
+        updates.rubric = newRubricObject;
       }
       updates.rubric_questions = rq;
     }
