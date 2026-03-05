@@ -1116,7 +1116,7 @@ adminRouter.patch('/roles/:id/config', requireAuth, requireAdmin, async (req, re
 
     const { data: existing, error: existingErr } = await supabaseAdmin
       .from('roles')
-      .select('id,client_id')
+      .select('id,client_id,rubric')
       .eq('id', roleId)
       .maybeSingle();
 
@@ -1413,6 +1413,35 @@ adminRouter.patch('/roles/:id/interview-config', requireAuth, requireAdmin, asyn
             request_id
           });
         }
+        let parsedRubric = null;
+        if (typeof existing?.rubric === 'string' && existing.rubric.trim()) {
+          try {
+            parsedRubric = JSON.parse(existing.rubric);
+          } catch {}
+        } else if (existing?.rubric && typeof existing.rubric === 'object') {
+          parsedRubric = existing.rubric;
+        }
+
+        const normalizeQuestion = (value) => String(value || '').trim().toLowerCase();
+        const existingCategoryByQuestion = new Map();
+        const existingQuestions = Array.isArray(parsedRubric?.questions) ? parsedRubric.questions : [];
+        for (const item of existingQuestions) {
+          if (!item || typeof item !== 'object') continue;
+          const questionText = normalizeQuestion(item.text || item.question || item.prompt);
+          if (!questionText) continue;
+          const category = typeof item.category === 'string' && item.category.trim() ? item.category : 'Custom';
+          if (!existingCategoryByQuestion.has(questionText)) {
+            existingCategoryByQuestion.set(questionText, category);
+          }
+        }
+
+        const newRubricObject = {
+          questions: rq.map((q) => ({
+            text: q,
+            category: existingCategoryByQuestion.get(normalizeQuestion(q)) || 'Custom'
+          }))
+        };
+        updates.rubric = JSON.stringify(newRubricObject);
       }
       updates.rubric_questions = rq;
     }
