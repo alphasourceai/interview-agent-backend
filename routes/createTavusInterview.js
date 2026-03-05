@@ -6,9 +6,12 @@ const { supabase } = require('../src/lib/supabaseClient');
 const { createTavusInterviewHandler } = require('../handlers/createTavusInterview');
 
 const router = express.Router();
+const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
+const BILLING_ENFORCED = BILLING_MODE === 'enforce';
 
 router.post('/', async (req, res) => {
   try {
+    const request_id = req.request_id || null;
     const computedBase = `${req.protocol}://${req.get('host')}`;
     const base = (process.env.PUBLIC_BACKEND_URL || computedBase).replace(/\/+$/, '');
 
@@ -71,6 +74,32 @@ router.post('/', async (req, res) => {
     const clientId = role.client_id || candidate.client_id || null;
     if (!clientId) {
       return res.status(400).json({ error: 'client_id could not be determined from role or candidate' });
+    }
+    if (BILLING_ENFORCED) {
+      const { data: client, error: clientErr } = await supabase
+        .from('clients')
+        .select('id,billing_status,manual_active_override,candidate_assistance_contact')
+        .eq('id', clientId)
+        .maybeSingle();
+
+      if (clientErr || !client) {
+        return res.status(500).json({
+          error: 'server_error',
+          code: 'CLIENT_LOOKUP_FAILED',
+          detail: clientErr?.message || 'Failed to load client record',
+          hint: clientErr?.hint || null,
+          request_id
+        });
+      }
+      if (client.manual_active_override === false && client.billing_status !== 'active') {
+        return res.status(403).json({
+          error: 'forbidden',
+          code: 'CLIENT_INACTIVE',
+          detail: 'Interviewing service is currently inactive for this employer.',
+          hint: client.candidate_assistance_contact || 'Please contact the employer.',
+          request_id
+        });
+      }
     }
 
     const webhookUrl = `${base}/webhook/tavus`;
