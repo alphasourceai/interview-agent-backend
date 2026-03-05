@@ -3,6 +3,8 @@ const express = require("express");
 const { supabase } = require("../src/lib/supabaseClient");
 
 const router = express.Router();
+const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
+const BILLING_ENFORCED = BILLING_MODE === 'enforce';
 
 /**
  * POST /api/candidate/verify-otp
@@ -12,6 +14,7 @@ const router = express.Router();
  */
 router.post("/", async (req, res) => {
   try {
+    const request_id = req.request_id || null;
     const email = String(req.body?.email || "").trim().toLowerCase();
     const code  = String(req.body?.code  || "").trim();
     const candidateIdIn = req.body?.candidate_id ? String(req.body.candidate_id).trim() : "";
@@ -41,6 +44,47 @@ router.post("/", async (req, res) => {
     if (cErr || !cand) return res.status(404).json({ error: "Candidate not found." });
 
     const roleId = roleIdIn || cand.role_id;
+
+    const { data: role, error: roleErr } = await supabase
+      .from('roles')
+      .select('id,client_id')
+      .eq('id', roleId)
+      .maybeSingle();
+    if (roleErr || !role) {
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'ROLE_LOOKUP_FAILED',
+        detail: roleErr?.message || 'Failed to load role record',
+        hint: roleErr?.hint || null,
+        request_id
+      });
+    }
+
+    if (BILLING_ENFORCED && role.client_id) {
+      const { data: client, error: clientErr } = await supabase
+        .from('clients')
+        .select('id,billing_status,manual_active_override,candidate_assistance_contact')
+        .eq('id', role.client_id)
+        .maybeSingle();
+      if (clientErr || !client) {
+        return res.status(500).json({
+          error: 'server_error',
+          code: 'CLIENT_LOOKUP_FAILED',
+          detail: clientErr?.message || 'Failed to load client record',
+          hint: clientErr?.hint || null,
+          request_id
+        });
+      }
+      if (client.manual_active_override === false && client.billing_status !== 'active') {
+        return res.status(403).json({
+          error: 'forbidden',
+          code: 'CLIENT_INACTIVE',
+          detail: 'Interviewing service is currently inactive for this employer.',
+          hint: client.candidate_assistance_contact || 'Please contact the employer.',
+          request_id
+        });
+      }
+    }
 
     // 2) Newest OTP for (candidate_email, role_id)
     const { data: token, error: tErr } = await supabase
