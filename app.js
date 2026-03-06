@@ -110,6 +110,8 @@ app.use(cors({
   exposedHeaders: ['Content-Range', 'Range-Unit']
 }))
 
+app.use('/webhook/stripe', express.raw({ type: 'application/json' }), require('./routes/webhookStripe'))
+
 app.use(express.json({ limit: '10mb' }))
 
 // ---------- CSP: allow Wix to embed (frame-ancestors) ----------
