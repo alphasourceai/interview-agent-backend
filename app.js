@@ -697,7 +697,8 @@ adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAd
     const allowedReturnOrigins = new Set([
       'https://alphasourceai.com',
       'https://www.alphasourceai.com',
-      'https://clients.alphasourceai.com'
+      'https://clients.alphasourceai.com',
+      'https://ia-frontend-prod.onrender.com'
     ])
     let returnBase = `${fallbackBase}/admin-dashboard`
     if (returnUrlRaw) {
