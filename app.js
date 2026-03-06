@@ -512,7 +512,7 @@ async function ensureUserIdAndInvite(email, redirectTo) {
 adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
   const { data, error } = await supabaseAdmin
     .from('clients')
-    .select('id,name,created_at')
+    .select('id,name,email,created_at,plan_tier,billing_status,manual_active_override,candidate_assistance_contact,stripe_customer_id,stripe_subscription_id,subscription_status,current_term_end,cancel_at_term_end')
     .order('created_at', { ascending: false })
   if (error) return res.status(500).json({ error: 'list_clients_failed', detail: error.message })
   res.json({ items: data || [] })
@@ -574,6 +574,149 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   }
 
   res.json({ item: client, seeded_member })
+})
+
+adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  const clientId = req.params?.id
+  const billingCycle = String(req.body?.billing_cycle || '')
+  if (!clientId) {
+    return res.status(400).json({
+      error: 'invalid_request',
+      code: 'CLIENT_ID_REQUIRED',
+      detail: 'Client id is required.',
+      hint: null,
+      request_id
+    })
+  }
+  if (billingCycle !== 'monthly' && billingCycle !== 'annual') {
+    return res.status(400).json({
+      error: 'invalid_request',
+      code: 'INVALID_BILLING_CYCLE',
+      detail: 'billing_cycle must be monthly or annual.',
+      hint: null,
+      request_id
+    })
+  }
+
+  const { data: client, error: clientError } = await supabaseAdmin
+    .from('clients')
+    .select('id,name,email,plan_tier,stripe_customer_id')
+    .eq('id', clientId)
+    .maybeSingle()
+
+  if (clientError) {
+    return res.status(500).json({
+      error: 'internal_error',
+      code: 'CLIENT_LOOKUP_FAILED',
+      detail: clientError.message || 'Failed to load client.',
+      hint: clientError.hint || null,
+      request_id
+    })
+  }
+  if (!client) {
+    return res.status(404).json({
+      error: 'not_found',
+      code: 'CLIENT_NOT_FOUND',
+      detail: 'Client not found.',
+      hint: null,
+      request_id
+    })
+  }
+
+  const planTier = String(client.plan_tier || 'basic').toLowerCase()
+  if (planTier === 'enterprise') {
+    return res.status(400).json({
+      error: 'invalid_request',
+      code: 'ENTERPRISE_CHECKOUT_NOT_CONFIGURED',
+      detail: 'Enterprise checkout is not configured.',
+      hint: null,
+      request_id
+    })
+  }
+
+  let resolvedPriceId = ''
+  if (planTier === 'basic') {
+    resolvedPriceId = billingCycle === 'annual'
+      ? String(process.env.STRIPE_PRICE_BASIC_ANNUAL || '')
+      : String(process.env.STRIPE_PRICE_BASIC_MONTHLY || '')
+  } else if (planTier === 'pro') {
+    resolvedPriceId = billingCycle === 'annual'
+      ? String(process.env.STRIPE_PRICE_PRO_ANNUAL || '')
+      : String(process.env.STRIPE_PRICE_PRO_MONTHLY || '')
+  }
+  if (!resolvedPriceId) {
+    return res.status(500).json({
+      error: 'internal_error',
+      code: 'STRIPE_PRICE_NOT_CONFIGURED',
+      detail: `Missing Stripe price configuration for plan_tier=${planTier} billing_cycle=${billingCycle}.`,
+      hint: null,
+      request_id
+    })
+  }
+
+  try {
+    const Stripe = require('stripe')
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
+    let stripeCustomerId = client.stripe_customer_id || null
+
+    if (!stripeCustomerId) {
+      const createdCustomer = await stripe.customers.create({
+        name: client.name || undefined,
+        email: client.email || undefined,
+        metadata: { client_id: client.id }
+      })
+      stripeCustomerId = createdCustomer?.id || null
+      if (!stripeCustomerId) {
+        return res.status(500).json({
+          error: 'internal_error',
+          code: 'STRIPE_CUSTOMER_CREATE_FAILED',
+          detail: 'Failed to create Stripe customer.',
+          hint: null,
+          request_id
+        })
+      }
+
+      const { error: saveCustomerError } = await supabaseAdmin
+        .from('clients')
+        .update({ stripe_customer_id: stripeCustomerId })
+        .eq('id', client.id)
+      if (saveCustomerError) {
+        return res.status(500).json({
+          error: 'internal_error',
+          code: 'CLIENT_UPDATE_FAILED',
+          detail: saveCustomerError.message || 'Failed to persist Stripe customer.',
+          hint: saveCustomerError.hint || null,
+          request_id
+        })
+      }
+    }
+
+    const baseUrl = String(process.env.PUBLIC_FRONTEND_URL || 'https://clients.alphasourceai.com').replace(/\/+$/, '')
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: stripeCustomerId,
+      line_items: [{ price: resolvedPriceId, quantity: 1 }],
+      success_url: `${baseUrl}/admin-dashboard?checkout=success&client_id=${client.id}`,
+      cancel_url: `${baseUrl}/admin-dashboard?checkout=cancel&client_id=${client.id}`,
+      allow_promotion_codes: true,
+      metadata: {
+        client_id: client.id,
+        billing_cycle: billingCycle,
+        plan_tier: client.plan_tier || 'basic'
+      }
+    })
+
+    return res.json({ ok: true, url: session.url, session_id: session.id })
+  } catch (e) {
+    return res.status(500).json({
+      error: 'internal_error',
+      code: 'STRIPE_CHECKOUT_SESSION_FAILED',
+      detail: e?.message || 'Failed to create Stripe checkout session.',
+      hint: null,
+      request_id
+    })
+  }
 })
 
 // Delete client
