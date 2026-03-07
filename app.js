@@ -580,7 +580,7 @@ adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAd
   const request_id = req.request_id || null
   const clientId = req.params?.id
   const billingCycle = String(req.body?.billing_cycle || '')
-  const returnUrlRaw = String(req.body?.return_url || '').trim()
+  const returnTarget = String(req.body?.return_target || '').trim().toLowerCase()
   if (!clientId) {
     return res.status(400).json({
       error: 'invalid_request',
@@ -693,23 +693,11 @@ adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAd
       }
     }
 
-    const fallbackBase = String(process.env.PUBLIC_FRONTEND_URL || 'https://clients.alphasourceai.com').replace(/\/+$/, '')
-    const allowedReturnOrigins = new Set([
-      'https://alphasourceai.com',
-      'https://www.alphasourceai.com',
-      'https://clients.alphasourceai.com',
-      'https://ia-frontend-prod.onrender.com'
-    ])
-    let returnBase = `${fallbackBase}/admin-dashboard`
-    if (returnUrlRaw) {
-      try {
-        const parsedReturnUrl = new URL(returnUrlRaw)
-        if (allowedReturnOrigins.has(parsedReturnUrl.origin)) {
-          returnBase = `${parsedReturnUrl.origin}${parsedReturnUrl.pathname || '/'}`
-        }
-      } catch (_) {}
-    }
-    returnBase = returnBase.replace(/\/+$/, '')
+    const canonicalSiteBase = 'https://www.alphasourceai.com'
+    const returnBase =
+      returnTarget === 'client'
+        ? `${canonicalSiteBase}/account`
+        : `${canonicalSiteBase}/admin-dashboard`
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
