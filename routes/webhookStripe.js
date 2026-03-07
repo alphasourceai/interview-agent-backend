@@ -92,11 +92,15 @@ router.post('/', async (req, res) => {
         if (clientErr) throw new Error(clientErr.message || 'Client lookup failed');
         if (client?.id) {
           const subStatus = String(eventObject?.status || '').toLowerCase();
+          const periodEnd =
+            eventObject?.current_period_end ??
+            eventObject?.items?.data?.[0]?.current_period_end ??
+            null;
           const updates = {
             stripe_subscription_id: pickId(eventObject?.id) || pickId(eventObject?.subscription) || null,
             stripe_subscription_schedule_id: pickId(eventObject?.schedule) || null,
             subscription_status: subStatus || null,
-            current_term_end: toIsoFromUnixSeconds(eventObject?.current_period_end),
+            current_term_end: toIsoFromUnixSeconds(periodEnd),
             cancel_at_term_end: eventObject?.cancel_at_period_end === true,
             billing_status: ACTIVE_SUB_STATUSES.has(subStatus) ? 'active' : 'inactive'
           };
