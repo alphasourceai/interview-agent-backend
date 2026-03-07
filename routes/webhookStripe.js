@@ -117,15 +117,39 @@ router.post('/', async (req, res) => {
           .maybeSingle();
         if (clientErr) throw new Error(clientErr.message || 'Client lookup failed');
         if (client?.id) {
-          const subStatus = String(client.subscription_status || '').toLowerCase();
-          const billingStatus = event.type === 'invoice.payment_failed'
-            ? 'inactive'
-            : (subStatus && !ACTIVE_SUB_STATUSES.has(subStatus) ? 'inactive' : 'active');
-          const { error: updateErr } = await supabaseAdmin
-            .from('clients')
-            .update({ billing_status: billingStatus })
-            .eq('id', client.id);
-          if (updateErr) throw new Error(updateErr.message || 'Client update failed');
+          const subscriptionId = pickId(eventObject?.subscription);
+          if (subscriptionId) {
+            const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+            const subStatus = String(subscription?.status || '').toLowerCase();
+            const currentTermEnd = toIsoFromUnixSeconds(subscription?.current_period_end);
+            const cancelAtTermEnd = subscription?.cancel_at_period_end === true;
+            const scheduleId = pickId(subscription?.schedule) || null;
+            const billingStatus = event.type === 'invoice.payment_failed'
+              ? 'inactive'
+              : (ACTIVE_SUB_STATUSES.has(subStatus) ? 'active' : 'inactive');
+            const { error: updateErr } = await supabaseAdmin
+              .from('clients')
+              .update({
+                stripe_subscription_id: subscriptionId,
+                stripe_subscription_schedule_id: scheduleId,
+                subscription_status: subStatus || client.subscription_status || null,
+                current_term_end: currentTermEnd,
+                cancel_at_term_end: cancelAtTermEnd,
+                billing_status: billingStatus
+              })
+              .eq('id', client.id);
+            if (updateErr) throw new Error(updateErr.message || 'Client update failed');
+          } else {
+            const subStatus = String(client.subscription_status || '').toLowerCase();
+            const billingStatus = event.type === 'invoice.payment_failed'
+              ? 'inactive'
+              : (subStatus && !ACTIVE_SUB_STATUSES.has(subStatus) ? 'inactive' : 'active');
+            const { error: updateErr } = await supabaseAdmin
+              .from('clients')
+              .update({ billing_status: billingStatus })
+              .eq('id', client.id);
+            if (updateErr) throw new Error(updateErr.message || 'Client update failed');
+          }
         }
       }
     }
