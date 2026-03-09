@@ -508,6 +508,14 @@ async function ensureUserIdAndInvite(email, redirectTo) {
   return { userId, actionLink, method }
 }
 
+function addMonthsToIso(isoString, monthsToAdd = 12) {
+  const base = new Date(isoString)
+  if (Number.isNaN(base.getTime())) return null
+  const next = new Date(base.getTime())
+  next.setUTCMonth(next.getUTCMonth() + monthsToAdd)
+  return next.toISOString()
+}
+
 // List all clients
 adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
   const { data, error } = await supabaseAdmin
@@ -589,6 +597,142 @@ adminRouter.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (r
     .maybeSingle()
   if (error) return res.status(500).json({ error: 'update_client_failed', detail: error.message })
   return res.json({ ok: true, item: data || null })
+})
+
+adminRouter.post('/contracts/process-renewals', requireAuth, requireAdmin, async (_req, res) => {
+  const now = new Date()
+  const nowMs = now.getTime()
+
+  const { data: clients, error } = await supabaseAdmin
+    .from('clients')
+    .select('id,name,billing_status,manual_active_override,contract_start_at,contract_end_at,auto_renew,cancel_effective_at')
+
+  if (error) {
+    return res.status(500).json({ error: 'process_contracts_failed', detail: error.message })
+  }
+
+  const summary = {
+    scanned: (clients || []).length,
+    due: 0,
+    renewed: 0,
+    deactivated: 0,
+    skipped_manual_override: 0,
+    skipped_no_action: 0,
+    errors: 0
+  }
+  const items = []
+
+  for (const client of (clients || [])) {
+    const oldContractEnd = client?.contract_end_at || null
+    if (!oldContractEnd) continue
+
+    const oldEndDate = new Date(oldContractEnd)
+    if (Number.isNaN(oldEndDate.getTime())) continue
+    if (oldEndDate.getTime() > nowMs) continue
+
+    summary.due += 1
+
+    if (client?.manual_active_override === true) {
+      summary.skipped_manual_override += 1
+      items.push({
+        id: client.id,
+        name: client.name || null,
+        action: 'skipped_manual_override',
+        contract_end_at_before: oldContractEnd
+      })
+      continue
+    }
+
+    if (client?.auto_renew === true) {
+      const newContractStart = oldEndDate.toISOString()
+      const newContractEnd = addMonthsToIso(newContractStart, 12)
+      if (!newContractEnd) {
+        summary.errors += 1
+        items.push({
+          id: client.id,
+          name: client.name || null,
+          action: 'error',
+          contract_end_at_before: oldContractEnd,
+          detail: 'invalid_contract_end_at'
+        })
+        continue
+      }
+
+      const { error: renewError } = await supabaseAdmin
+        .from('clients')
+        .update({
+          contract_start_at: newContractStart,
+          contract_end_at: newContractEnd
+        })
+        .eq('id', client.id)
+
+      if (renewError) {
+        summary.errors += 1
+        items.push({
+          id: client.id,
+          name: client.name || null,
+          action: 'error',
+          contract_end_at_before: oldContractEnd,
+          detail: renewError.message || 'renew_update_failed'
+        })
+        continue
+      }
+
+      summary.renewed += 1
+      items.push({
+        id: client.id,
+        name: client.name || null,
+        action: 'renewed',
+        contract_end_at_before: oldContractEnd,
+        contract_end_at_after: newContractEnd
+      })
+      continue
+    }
+
+    if (String(client?.billing_status || '').toLowerCase() === 'inactive' && client?.cancel_effective_at) {
+      summary.skipped_no_action += 1
+      items.push({
+        id: client.id,
+        name: client.name || null,
+        action: 'skipped_no_action',
+        contract_end_at_before: oldContractEnd,
+        detail: 'already_inactive'
+      })
+      continue
+    }
+
+    const cancelEffectiveAt = oldEndDate.toISOString()
+    const { error: deactivateError } = await supabaseAdmin
+      .from('clients')
+      .update({
+        billing_status: 'inactive',
+        cancel_effective_at: cancelEffectiveAt
+      })
+      .eq('id', client.id)
+
+    if (deactivateError) {
+      summary.errors += 1
+      items.push({
+        id: client.id,
+        name: client.name || null,
+        action: 'error',
+        contract_end_at_before: oldContractEnd,
+        detail: deactivateError.message || 'deactivate_update_failed'
+      })
+      continue
+    }
+
+    summary.deactivated += 1
+    items.push({
+      id: client.id,
+      name: client.name || null,
+      action: 'deactivated',
+      contract_end_at_before: oldContractEnd,
+      billing_status_after: 'inactive'
+    })
+  }
+
+  return res.json({ ok: true, summary, items })
 })
 
 adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAdmin, async (req, res) => {
