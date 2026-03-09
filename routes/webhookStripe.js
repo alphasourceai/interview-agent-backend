@@ -19,6 +19,14 @@ function toIsoFromUnixSeconds(value) {
   return new Date(n * 1000).toISOString();
 }
 
+function addMonthsToIso(isoString, months) {
+  if (!isoString) return null;
+  const d = new Date(isoString);
+  if (Number.isNaN(d.getTime())) return null;
+  d.setUTCMonth(d.getUTCMonth() + Number(months || 0));
+  return d.toISOString();
+}
+
 function pickId(value) {
   if (!value) return null;
   if (typeof value === 'string') return value;
@@ -92,6 +100,17 @@ router.post('/', async (req, res) => {
         if (clientErr) throw new Error(clientErr.message || 'Client lookup failed');
         if (client?.id) {
           const subStatus = String(eventObject?.status || '').toLowerCase();
+          const intervalRaw = String(
+            eventObject?.items?.data?.[0]?.price?.recurring?.interval ||
+            eventObject?.plan?.interval ||
+            ''
+          ).toLowerCase();
+          const billingInterval =
+            intervalRaw === 'month' ? 'monthly' :
+            intervalRaw === 'year' ? 'annual' :
+            null;
+          const contractStartIso = toIsoFromUnixSeconds(eventObject?.start_date);
+          const contractEndIso = addMonthsToIso(contractStartIso, 12);
           const periodEnd =
             eventObject?.current_period_end ??
             eventObject?.items?.data?.[0]?.current_period_end ??
@@ -102,7 +121,11 @@ router.post('/', async (req, res) => {
             subscription_status: subStatus || null,
             current_term_end: toIsoFromUnixSeconds(periodEnd),
             cancel_at_term_end: eventObject?.cancel_at_period_end === true,
-            billing_status: ACTIVE_SUB_STATUSES.has(subStatus) ? 'active' : 'inactive'
+            billing_status: ACTIVE_SUB_STATUSES.has(subStatus) ? 'active' : 'inactive',
+            billing_interval: billingInterval,
+            contract_start_at: contractStartIso,
+            contract_end_at: contractEndIso,
+            auto_renew: true
           };
           const { error: updateErr } = await supabaseAdmin
             .from('clients')
@@ -125,6 +148,17 @@ router.post('/', async (req, res) => {
           if (subscriptionId) {
             const subscription = await stripe.subscriptions.retrieve(subscriptionId);
             const subStatus = String(subscription?.status || '').toLowerCase();
+            const intervalRaw = String(
+              subscription?.items?.data?.[0]?.price?.recurring?.interval ||
+              subscription?.plan?.interval ||
+              ''
+            ).toLowerCase();
+            const billingInterval =
+              intervalRaw === 'month' ? 'monthly' :
+              intervalRaw === 'year' ? 'annual' :
+              null;
+            const contractStartIso = toIsoFromUnixSeconds(subscription?.start_date);
+            const contractEndIso = addMonthsToIso(contractStartIso, 12);
             const currentTermEnd = toIsoFromUnixSeconds(subscription?.current_period_end);
             const cancelAtTermEnd = subscription?.cancel_at_period_end === true;
             const scheduleId = pickId(subscription?.schedule) || null;
@@ -139,7 +173,11 @@ router.post('/', async (req, res) => {
                 subscription_status: subStatus || client.subscription_status || null,
                 current_term_end: currentTermEnd,
                 cancel_at_term_end: cancelAtTermEnd,
-                billing_status: billingStatus
+                billing_status: billingStatus,
+                billing_interval: billingInterval,
+                contract_start_at: contractStartIso,
+                contract_end_at: contractEndIso,
+                auto_renew: true
               })
               .eq('id', client.id);
             if (updateErr) throw new Error(updateErr.message || 'Client update failed');
