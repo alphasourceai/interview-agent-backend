@@ -576,6 +576,21 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   res.json({ item: client, seeded_member })
 })
 
+adminRouter.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (req, res) => {
+  const autoRenew = req.body?.auto_renew
+  if (typeof autoRenew !== 'boolean') {
+    return res.status(400).json({ error: 'invalid_auto_renew' })
+  }
+  const { data, error } = await supabaseAdmin
+    .from('clients')
+    .update({ auto_renew: autoRenew })
+    .eq('id', req.params.id)
+    .select('id,auto_renew')
+    .maybeSingle()
+  if (error) return res.status(500).json({ error: 'update_client_failed', detail: error.message })
+  return res.json({ ok: true, item: data || null })
+})
+
 adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAdmin, async (req, res) => {
   const request_id = req.request_id || null
   const clientId = req.params?.id
