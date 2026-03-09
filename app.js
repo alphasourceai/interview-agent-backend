@@ -516,90 +516,7 @@ function addMonthsToIso(isoString, monthsToAdd = 12) {
   return next.toISOString()
 }
 
-// List all clients
-adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
-  const { data, error } = await supabaseAdmin
-    .from('clients')
-    .select('id,name,email,created_at,plan_tier,billing_status,manual_active_override,candidate_assistance_contact,stripe_customer_id,stripe_subscription_id,subscription_status,current_term_end,cancel_at_term_end,billing_interval,contract_start_at,contract_end_at,auto_renew')
-    .order('created_at', { ascending: false })
-  if (error) return res.status(500).json({ error: 'list_clients_failed', detail: error.message })
-  res.json({ items: data || [] })
-})
-
-// Create client (writes email to satisfy NOT NULL)
-adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
-  const name = (req.body?.name || '').trim()
-  const adminName  = (req.body?.admin_name  || '').trim()
-  const adminEmail = (req.body?.admin_email || '').trim()
-  const explicitClientEmail = (req.body?.email || '').trim()
-  if (!name) return res.status(400).json({ error: 'name_required' })
-
-  const emailForClient = explicitClientEmail || adminEmail
-  if (!emailForClient) {
-    return res.status(400).json({ error: 'email_required_for_client' })
-  }
-
-  const { data: client, error: cErr } = await supabaseAdmin
-    .from('clients')
-    .insert({ name, email: emailForClient })
-    .select('id,name,created_at')
-    .single()
-  if (cErr) {
-    console.error('create_client_failed:', cErr.message)
-    return res.status(500).json({ error: 'create_client_failed', detail: cErr.message, hint: cErr.hint })
-  }
-
-  // Optionally seed an admin member
-  let seeded_member = null
-  if (adminEmail) {
-    const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
-    const { userId, actionLink, method } = await ensureUserIdAndInvite(adminEmail, redirectTo)
-
-    if (!userId) {
-      console.error('seed_member_no_user_id', { email: adminEmail, method })
-      return res.json({ item: client, seeded_member: null, note: 'client_created_invite_failed', action_link: actionLink || null })
-    }
-
-    const payload = {
-      client_id: client.id,
-      email: adminEmail,
-      name: adminName || adminEmail,
-      role: 'admin',
-      user_id: userId
-    }
-
-    const { data: inserted, error: insErr } = await supabaseAdmin
-      .from('client_members')
-      .insert(payload)
-      .select('client_id,user_id,email,name,role,created_at')
-      .single()
-
-    if (insErr) {
-      console.error('seed_member_insert_failed:', insErr.message)
-    } else {
-      seeded_member = { ...inserted, id: inserted.user_id || inserted.email }
-    }
-  }
-
-  res.json({ item: client, seeded_member })
-})
-
-adminRouter.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (req, res) => {
-  const autoRenew = req.body?.auto_renew
-  if (typeof autoRenew !== 'boolean') {
-    return res.status(400).json({ error: 'invalid_auto_renew' })
-  }
-  const { data, error } = await supabaseAdmin
-    .from('clients')
-    .update({ auto_renew: autoRenew })
-    .eq('id', req.params.id)
-    .select('id,auto_renew')
-    .maybeSingle()
-  if (error) return res.status(500).json({ error: 'update_client_failed', detail: error.message })
-  return res.json({ ok: true, item: data || null })
-})
-
-adminRouter.post('/contracts/process-renewals', requireAuth, requireAdmin, async (_req, res) => {
+async function processContractRenewals() {
   const now = new Date()
   const nowMs = now.getTime()
 
@@ -608,7 +525,9 @@ adminRouter.post('/contracts/process-renewals', requireAuth, requireAdmin, async
     .select('id,name,billing_status,manual_active_override,contract_start_at,contract_end_at,auto_renew,cancel_effective_at')
 
   if (error) {
-    return res.status(500).json({ error: 'process_contracts_failed', detail: error.message })
+    const e = new Error(error.message || 'process_contracts_failed')
+    e.detail = error.message || 'process_contracts_failed'
+    throw e
   }
 
   const summary = {
@@ -732,7 +651,99 @@ adminRouter.post('/contracts/process-renewals', requireAuth, requireAdmin, async
     })
   }
 
-  return res.json({ ok: true, summary, items })
+  return { ok: true, summary, items }
+}
+
+// List all clients
+adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
+  const { data, error } = await supabaseAdmin
+    .from('clients')
+    .select('id,name,email,created_at,plan_tier,billing_status,manual_active_override,candidate_assistance_contact,stripe_customer_id,stripe_subscription_id,subscription_status,current_term_end,cancel_at_term_end,billing_interval,contract_start_at,contract_end_at,auto_renew')
+    .order('created_at', { ascending: false })
+  if (error) return res.status(500).json({ error: 'list_clients_failed', detail: error.message })
+  res.json({ items: data || [] })
+})
+
+// Create client (writes email to satisfy NOT NULL)
+adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
+  const name = (req.body?.name || '').trim()
+  const adminName  = (req.body?.admin_name  || '').trim()
+  const adminEmail = (req.body?.admin_email || '').trim()
+  const explicitClientEmail = (req.body?.email || '').trim()
+  if (!name) return res.status(400).json({ error: 'name_required' })
+
+  const emailForClient = explicitClientEmail || adminEmail
+  if (!emailForClient) {
+    return res.status(400).json({ error: 'email_required_for_client' })
+  }
+
+  const { data: client, error: cErr } = await supabaseAdmin
+    .from('clients')
+    .insert({ name, email: emailForClient })
+    .select('id,name,created_at')
+    .single()
+  if (cErr) {
+    console.error('create_client_failed:', cErr.message)
+    return res.status(500).json({ error: 'create_client_failed', detail: cErr.message, hint: cErr.hint })
+  }
+
+  // Optionally seed an admin member
+  let seeded_member = null
+  if (adminEmail) {
+    const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
+    const { userId, actionLink, method } = await ensureUserIdAndInvite(adminEmail, redirectTo)
+
+    if (!userId) {
+      console.error('seed_member_no_user_id', { email: adminEmail, method })
+      return res.json({ item: client, seeded_member: null, note: 'client_created_invite_failed', action_link: actionLink || null })
+    }
+
+    const payload = {
+      client_id: client.id,
+      email: adminEmail,
+      name: adminName || adminEmail,
+      role: 'admin',
+      user_id: userId
+    }
+
+    const { data: inserted, error: insErr } = await supabaseAdmin
+      .from('client_members')
+      .insert(payload)
+      .select('client_id,user_id,email,name,role,created_at')
+      .single()
+
+    if (insErr) {
+      console.error('seed_member_insert_failed:', insErr.message)
+    } else {
+      seeded_member = { ...inserted, id: inserted.user_id || inserted.email }
+    }
+  }
+
+  res.json({ item: client, seeded_member })
+})
+
+adminRouter.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (req, res) => {
+  const autoRenew = req.body?.auto_renew
+  if (typeof autoRenew !== 'boolean') {
+    return res.status(400).json({ error: 'invalid_auto_renew' })
+  }
+  const { data, error } = await supabaseAdmin
+    .from('clients')
+    .update({ auto_renew: autoRenew })
+    .eq('id', req.params.id)
+    .select('id,auto_renew')
+    .maybeSingle()
+  if (error) return res.status(500).json({ error: 'update_client_failed', detail: error.message })
+  return res.json({ ok: true, item: data || null })
+})
+
+adminRouter.post('/contracts/process-renewals', requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    const result = await processContractRenewals()
+    return res.json(result)
+  } catch (e) {
+    return res.status(500).json({ error: 'process_contracts_failed', detail: e?.detail || e?.message || 'process_contracts_failed' })
+  }
 })
 
 adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAdmin, async (req, res) => {
@@ -1899,6 +1910,21 @@ try {
 try {
   adminRouter.use('/accommodation-requests', requireAuth, requireAdmin, require('./routes/accommodationRequests'))
 } catch (_) {}
+
+app.post('/internal/contracts/process-renewals', async (req, res) => {
+  const expectedSecret = String(process.env.CONTRACTS_CRON_SECRET || '')
+  const providedSecret = String(req.get('x-cron-secret') || '')
+  if (!expectedSecret || providedSecret !== expectedSecret) {
+    return res.status(403).json({ error: 'forbidden' })
+  }
+  try {
+    const result = await processContractRenewals()
+    return res.json(result)
+  } catch (e) {
+    return res.status(500).json({ error: 'process_contracts_failed', detail: e?.detail || e?.message || 'process_contracts_failed' })
+  }
+})
+
 app.use('/admin', adminRouter)
 
 /* ======================= END: Admin guard + Admin API ======================= */
