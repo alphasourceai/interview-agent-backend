@@ -516,142 +516,226 @@ function addMonthsToIso(isoString, monthsToAdd = 12) {
   return next.toISOString()
 }
 
-async function processContractRenewals() {
+async function processContractRenewals(context = {}) {
+  const triggerSource = String(context?.triggerSource || 'admin')
+  const requestId = context?.requestId || null
+  const triggeredByUserId = context?.triggeredByUserId || null
+  const triggeredByEmail = context?.triggeredByEmail || null
   const now = new Date()
   const nowMs = now.getTime()
+  const startedAt = now.toISOString()
+  let runId = null
 
-  const { data: clients, error } = await supabaseAdmin
-    .from('clients')
-    .select('id,name,billing_status,manual_active_override,contract_start_at,contract_end_at,auto_renew,cancel_effective_at')
-
-  if (error) {
-    const e = new Error(error.message || 'process_contracts_failed')
-    e.detail = error.message || 'process_contracts_failed'
-    throw e
-  }
-
-  const summary = {
-    scanned: (clients || []).length,
-    due: 0,
-    renewed: 0,
-    deactivated: 0,
-    skipped_manual_override: 0,
-    skipped_no_action: 0,
-    errors: 0
-  }
-  const items = []
-
-  for (const client of (clients || [])) {
-    const oldContractEnd = client?.contract_end_at || null
-    if (!oldContractEnd) continue
-
-    const oldEndDate = new Date(oldContractEnd)
-    if (Number.isNaN(oldEndDate.getTime())) continue
-    if (oldEndDate.getTime() > nowMs) continue
-
-    summary.due += 1
-
-    if (client?.manual_active_override === true) {
-      summary.skipped_manual_override += 1
-      items.push({
-        id: client.id,
-        name: client.name || null,
-        action: 'skipped_manual_override',
-        contract_end_at_before: oldContractEnd
+  try {
+    const { data: startedRun, error: startedRunError } = await supabaseAdmin
+      .from('contract_processing_runs')
+      .insert({
+        trigger_source: triggerSource,
+        started_at: startedAt,
+        request_id: requestId,
+        triggered_by_user_id: triggeredByUserId,
+        triggered_by_email: triggeredByEmail
       })
-      continue
+      .select('id')
+      .maybeSingle()
+    if (!startedRunError) {
+      runId = startedRun?.id || null
+    }
+  } catch (_) {}
+
+  try {
+    const { data: clients, error } = await supabaseAdmin
+      .from('clients')
+      .select('id,name,billing_status,manual_active_override,contract_start_at,contract_end_at,auto_renew,cancel_effective_at')
+
+    if (error) {
+      const e = new Error(error.message || 'process_contracts_failed')
+      e.detail = error.message || 'process_contracts_failed'
+      throw e
     }
 
-    if (client?.auto_renew === true) {
-      const newContractStart = oldEndDate.toISOString()
-      const newContractEnd = addMonthsToIso(newContractStart, 12)
-      if (!newContractEnd) {
-        summary.errors += 1
+    const summary = {
+      scanned: (clients || []).length,
+      due: 0,
+      renewed: 0,
+      deactivated: 0,
+      skipped_manual_override: 0,
+      skipped_no_action: 0,
+      errors: 0
+    }
+    const items = []
+
+    for (const client of (clients || [])) {
+      const oldContractEnd = client?.contract_end_at || null
+      if (!oldContractEnd) continue
+
+      const oldEndDate = new Date(oldContractEnd)
+      if (Number.isNaN(oldEndDate.getTime())) continue
+      if (oldEndDate.getTime() > nowMs) continue
+
+      summary.due += 1
+
+      if (client?.manual_active_override === true) {
+        summary.skipped_manual_override += 1
         items.push({
           id: client.id,
           name: client.name || null,
-          action: 'error',
-          contract_end_at_before: oldContractEnd,
-          detail: 'invalid_contract_end_at'
+          action: 'skipped_manual_override',
+          contract_end_at_before: oldContractEnd
         })
         continue
       }
 
-      const { error: renewError } = await supabaseAdmin
+      if (client?.auto_renew === true) {
+        const newContractStart = oldEndDate.toISOString()
+        const newContractEnd = addMonthsToIso(newContractStart, 12)
+        if (!newContractEnd) {
+          summary.errors += 1
+          items.push({
+            id: client.id,
+            name: client.name || null,
+            action: 'error',
+            contract_end_at_before: oldContractEnd,
+            detail: 'invalid_contract_end_at'
+          })
+          continue
+        }
+
+        const { error: renewError } = await supabaseAdmin
+          .from('clients')
+          .update({
+            contract_start_at: newContractStart,
+            contract_end_at: newContractEnd
+          })
+          .eq('id', client.id)
+
+        if (renewError) {
+          summary.errors += 1
+          items.push({
+            id: client.id,
+            name: client.name || null,
+            action: 'error',
+            contract_end_at_before: oldContractEnd,
+            detail: renewError.message || 'renew_update_failed'
+          })
+          continue
+        }
+
+        summary.renewed += 1
+        items.push({
+          id: client.id,
+          name: client.name || null,
+          action: 'renewed',
+          contract_end_at_before: oldContractEnd,
+          contract_end_at_after: newContractEnd
+        })
+        continue
+      }
+
+      if (String(client?.billing_status || '').toLowerCase() === 'inactive' && client?.cancel_effective_at) {
+        summary.skipped_no_action += 1
+        items.push({
+          id: client.id,
+          name: client.name || null,
+          action: 'skipped_no_action',
+          contract_end_at_before: oldContractEnd,
+          detail: 'already_inactive'
+        })
+        continue
+      }
+
+      const cancelEffectiveAt = oldEndDate.toISOString()
+      const { error: deactivateError } = await supabaseAdmin
         .from('clients')
         .update({
-          contract_start_at: newContractStart,
-          contract_end_at: newContractEnd
+          billing_status: 'inactive',
+          cancel_effective_at: cancelEffectiveAt
         })
         .eq('id', client.id)
 
-      if (renewError) {
+      if (deactivateError) {
         summary.errors += 1
         items.push({
           id: client.id,
           name: client.name || null,
           action: 'error',
           contract_end_at_before: oldContractEnd,
-          detail: renewError.message || 'renew_update_failed'
+          detail: deactivateError.message || 'deactivate_update_failed'
         })
         continue
       }
 
-      summary.renewed += 1
+      summary.deactivated += 1
       items.push({
         id: client.id,
         name: client.name || null,
-        action: 'renewed',
+        action: 'deactivated',
         contract_end_at_before: oldContractEnd,
-        contract_end_at_after: newContractEnd
+        billing_status_after: 'inactive'
       })
-      continue
     }
 
-    if (String(client?.billing_status || '').toLowerCase() === 'inactive' && client?.cancel_effective_at) {
-      summary.skipped_no_action += 1
-      items.push({
-        id: client.id,
-        name: client.name || null,
-        action: 'skipped_no_action',
-        contract_end_at_before: oldContractEnd,
-        detail: 'already_inactive'
-      })
-      continue
-    }
+    const result = { ok: true, summary, items }
+    const completedAt = new Date().toISOString()
+    try {
+      if (runId) {
+        await supabaseAdmin
+          .from('contract_processing_runs')
+          .update({
+            completed_at: completedAt,
+            processed_ok: true,
+            summary,
+            items
+          })
+          .eq('id', runId)
+      } else {
+        await supabaseAdmin
+          .from('contract_processing_runs')
+          .insert({
+            trigger_source: triggerSource,
+            started_at: startedAt,
+            completed_at: completedAt,
+            processed_ok: true,
+            summary,
+            items,
+            request_id: requestId,
+            triggered_by_user_id: triggeredByUserId,
+            triggered_by_email: triggeredByEmail
+          })
+      }
+    } catch (_) {}
 
-    const cancelEffectiveAt = oldEndDate.toISOString()
-    const { error: deactivateError } = await supabaseAdmin
-      .from('clients')
-      .update({
-        billing_status: 'inactive',
-        cancel_effective_at: cancelEffectiveAt
-      })
-      .eq('id', client.id)
-
-    if (deactivateError) {
-      summary.errors += 1
-      items.push({
-        id: client.id,
-        name: client.name || null,
-        action: 'error',
-        contract_end_at_before: oldContractEnd,
-        detail: deactivateError.message || 'deactivate_update_failed'
-      })
-      continue
-    }
-
-    summary.deactivated += 1
-    items.push({
-      id: client.id,
-      name: client.name || null,
-      action: 'deactivated',
-      contract_end_at_before: oldContractEnd,
-      billing_status_after: 'inactive'
-    })
+    return result
+  } catch (e) {
+    const completedAt = new Date().toISOString()
+    const detail = e?.detail || e?.message || 'process_contracts_failed'
+    try {
+      if (runId) {
+        await supabaseAdmin
+          .from('contract_processing_runs')
+          .update({
+            completed_at: completedAt,
+            processed_ok: false,
+            error: detail
+          })
+          .eq('id', runId)
+      } else {
+        await supabaseAdmin
+          .from('contract_processing_runs')
+          .insert({
+            trigger_source: triggerSource,
+            started_at: startedAt,
+            completed_at: completedAt,
+            processed_ok: false,
+            error: detail,
+            request_id: requestId,
+            triggered_by_user_id: triggeredByUserId,
+            triggered_by_email: triggeredByEmail
+          })
+      }
+    } catch (_) {}
+    throw e
   }
-
-  return { ok: true, summary, items }
 }
 
 // List all clients
@@ -737,9 +821,14 @@ adminRouter.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (r
   return res.json({ ok: true, item: data || null })
 })
 
-adminRouter.post('/contracts/process-renewals', requireAuth, requireAdmin, async (_req, res) => {
+adminRouter.post('/contracts/process-renewals', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const result = await processContractRenewals()
+    const result = await processContractRenewals({
+      triggerSource: 'admin',
+      requestId: req.request_id || null,
+      triggeredByUserId: req.user?.id || null,
+      triggeredByEmail: req.user?.email || null
+    })
     return res.json(result)
   } catch (e) {
     return res.status(500).json({ error: 'process_contracts_failed', detail: e?.detail || e?.message || 'process_contracts_failed' })
@@ -1918,7 +2007,10 @@ app.post('/internal/contracts/process-renewals', async (req, res) => {
     return res.status(403).json({ error: 'forbidden' })
   }
   try {
-    const result = await processContractRenewals()
+    const result = await processContractRenewals({
+      triggerSource: 'cron',
+      requestId: req.request_id || null
+    })
     return res.json(result)
   } catch (e) {
     return res.status(500).json({ error: 'process_contracts_failed', detail: e?.detail || e?.message || 'process_contracts_failed' })
