@@ -835,6 +835,16 @@ adminRouter.post('/contracts/process-renewals', requireAuth, requireAdmin, async
   }
 })
 
+adminRouter.get('/audit/contract-processing-runs', requireAuth, requireAdmin, async (_req, res) => {
+  const { data, error } = await supabaseAdmin
+    .from('contract_processing_runs')
+    .select('id,trigger_source,started_at,completed_at,processed_ok,summary,error,request_id,triggered_by_email,created_at')
+    .order('created_at', { ascending: false })
+    .limit(25)
+  if (error) return res.status(500).json({ error: 'list_contract_processing_runs_failed', detail: error.message })
+  return res.json({ items: data || [] })
+})
+
 adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAdmin, async (req, res) => {
   const request_id = req.request_id || null
   const clientId = req.params?.id
