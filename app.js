@@ -544,9 +544,18 @@ async function processContractRenewals(context = {}) {
   } catch (_) {}
 
   try {
+    let stripe = null
+    try {
+      const stripeKey = String(process.env.STRIPE_SECRET_KEY || '')
+      if (stripeKey) {
+        const Stripe = require('stripe')
+        stripe = new Stripe(stripeKey)
+      }
+    } catch (_) {}
+
     const { data: clients, error } = await supabaseAdmin
       .from('clients')
-      .select('id,name,billing_status,manual_active_override,contract_start_at,contract_end_at,auto_renew,cancel_effective_at')
+      .select('id,name,billing_status,manual_active_override,contract_start_at,contract_end_at,auto_renew,cancel_effective_at,stripe_subscription_id,subscription_status,cancel_at_term_end')
 
     if (error) {
       const e = new Error(error.message || 'process_contracts_failed')
@@ -632,7 +641,16 @@ async function processContractRenewals(context = {}) {
         continue
       }
 
-      if (String(client?.billing_status || '').toLowerCase() === 'inactive' && client?.cancel_effective_at) {
+      const localSubStatus = String(client?.subscription_status || '').toLowerCase()
+      const stripeAlignmentNeeded =
+        !!client?.stripe_subscription_id &&
+        (localSubStatus === 'active' || localSubStatus === 'trialing') &&
+        client?.cancel_at_term_end !== true
+      const alreadyInactiveProcessed =
+        String(client?.billing_status || '').toLowerCase() === 'inactive' &&
+        !!client?.cancel_effective_at
+
+      if (alreadyInactiveProcessed && !stripeAlignmentNeeded) {
         summary.skipped_no_action += 1
         items.push({
           id: client.id,
@@ -644,35 +662,79 @@ async function processContractRenewals(context = {}) {
         continue
       }
 
-      const cancelEffectiveAt = oldEndDate.toISOString()
-      const { error: deactivateError } = await supabaseAdmin
-        .from('clients')
-        .update({
-          billing_status: 'inactive',
-          cancel_effective_at: cancelEffectiveAt
-        })
-        .eq('id', client.id)
+      if (!alreadyInactiveProcessed) {
+        const cancelEffectiveAt = oldEndDate.toISOString()
+        const { error: deactivateError } = await supabaseAdmin
+          .from('clients')
+          .update({
+            billing_status: 'inactive',
+            cancel_effective_at: cancelEffectiveAt
+          })
+          .eq('id', client.id)
 
-      if (deactivateError) {
-        summary.errors += 1
-        items.push({
+        if (deactivateError) {
+          summary.errors += 1
+          items.push({
+            id: client.id,
+            name: client.name || null,
+            action: 'error',
+            contract_end_at_before: oldContractEnd,
+            detail: deactivateError.message || 'deactivate_update_failed'
+          })
+          continue
+        }
+      }
+
+      let stripeAlignmentError = null
+      let stripeCancelAtTermEnd = false
+      if (stripeAlignmentNeeded) {
+        if (!stripe) {
+          stripeAlignmentError = 'stripe_client_unavailable'
+          summary.errors += 1
+        } else {
+          try {
+            await stripe.subscriptions.update(client.stripe_subscription_id, { cancel_at_period_end: true })
+            const { error: localStripeFlagError } = await supabaseAdmin
+              .from('clients')
+              .update({ cancel_at_term_end: true })
+              .eq('id', client.id)
+            if (localStripeFlagError) {
+              stripeAlignmentError = localStripeFlagError.message || 'cancel_at_term_end_update_failed'
+              summary.errors += 1
+            } else {
+              stripeCancelAtTermEnd = true
+            }
+          } catch (e) {
+            stripeAlignmentError = e?.message || 'stripe_cancel_at_period_end_failed'
+            summary.errors += 1
+          }
+        }
+      }
+
+      if (alreadyInactiveProcessed) {
+        const alignedItem = {
           id: client.id,
           name: client.name || null,
-          action: 'error',
-          contract_end_at_before: oldContractEnd,
-          detail: deactivateError.message || 'deactivate_update_failed'
-        })
+          action: 'aligned_stripe_cancel',
+          contract_end_at_before: oldContractEnd
+        }
+        if (stripeAlignmentError) alignedItem.stripe_alignment_error = stripeAlignmentError
+        if (stripeCancelAtTermEnd) alignedItem.stripe_cancel_at_term_end = true
+        items.push(alignedItem)
         continue
       }
 
       summary.deactivated += 1
-      items.push({
+      const deactivatedItem = {
         id: client.id,
         name: client.name || null,
         action: 'deactivated',
         contract_end_at_before: oldContractEnd,
         billing_status_after: 'inactive'
-      })
+      }
+      if (stripeAlignmentError) deactivatedItem.stripe_alignment_error = stripeAlignmentError
+      if (stripeCancelAtTermEnd) deactivatedItem.stripe_cancel_at_term_end = true
+      items.push(deactivatedItem)
     }
 
     const result = { ok: true, summary, items }
