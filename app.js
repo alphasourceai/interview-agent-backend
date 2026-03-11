@@ -936,6 +936,16 @@ adminRouter.get('/audit/contract-processing-runs', requireAuth, requireAdmin, as
   return res.json({ items: data || [] })
 })
 
+adminRouter.get('/audit/contract-cancellation-runs', requireAuth, requireAdmin, async (_req, res) => {
+  const { data, error } = await supabaseAdmin
+    .from('contract_cancellation_runs')
+    .select('id,client_id,client_name,triggered_by_email,started_at,completed_at,status,final_invoice_amount,stripe_invoice_id,stripe_subscription_id,note,request_id,error,created_at')
+    .order('created_at', { ascending: false })
+    .limit(25)
+  if (error) return res.status(500).json({ error: 'list_contract_cancellation_runs_failed', detail: error.message })
+  return res.json({ items: data || [] })
+})
+
 adminRouter.get('/audit/billing-reconciliation', requireAuth, requireAdmin, async (_req, res) => {
   const nowMs = Date.now()
   const { data, error } = await supabaseAdmin
