@@ -883,6 +883,47 @@ adminRouter.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (r
   return res.json({ ok: true, item: data || null })
 })
 
+adminRouter.post('/clients/:id/resume-subscription', requireAuth, requireAdmin, async (req, res) => {
+  const clientId = req.params?.id
+  if (!clientId) return res.status(404).json({ error: 'client_not_found' })
+
+  const { data: client, error: clientError } = await supabaseAdmin
+    .from('clients')
+    .select('id,name,stripe_subscription_id,subscription_status,billing_status,cancel_at_term_end,cancel_effective_at')
+    .eq('id', clientId)
+    .maybeSingle()
+
+  if (clientError) return res.status(500).json({ error: 'resume_subscription_failed', detail: clientError.message })
+  if (!client) return res.status(404).json({ error: 'client_not_found' })
+  if (!client.stripe_subscription_id) return res.status(400).json({ error: 'missing_stripe_subscription' })
+  const subscriptionStatus = String(client.subscription_status || '').toLowerCase()
+  if (subscriptionStatus !== 'active' && subscriptionStatus !== 'trialing') {
+    return res.status(400).json({ error: 'subscription_not_resumable' })
+  }
+
+  try {
+    const Stripe = require('stripe')
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
+    await stripe.subscriptions.update(client.stripe_subscription_id, { cancel_at_period_end: false })
+  } catch (e) {
+    return res.status(500).json({ error: 'resume_subscription_failed', detail: e?.message || 'stripe_update_failed' })
+  }
+
+  const { data: updatedClient, error: updateError } = await supabaseAdmin
+    .from('clients')
+    .update({
+      billing_status: 'active',
+      cancel_effective_at: null,
+      cancel_at_term_end: false
+    })
+    .eq('id', client.id)
+    .select('id,billing_status,cancel_effective_at,cancel_at_term_end')
+    .maybeSingle()
+
+  if (updateError) return res.status(500).json({ error: 'resume_subscription_failed', detail: updateError.message })
+  return res.json({ ok: true, item: updatedClient || null })
+})
+
 adminRouter.post('/contracts/process-renewals', requireAuth, requireAdmin, async (req, res) => {
   try {
     const result = await processContractRenewals({
