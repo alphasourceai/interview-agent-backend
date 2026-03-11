@@ -5,7 +5,6 @@ const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const router = express.Router();
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');
-const ACTIVE_SUB_STATUSES = new Set(['active', 'trialing']);
 
 function isUniqueViolation(error) {
   const code = String(error?.code || '');
@@ -17,14 +16,6 @@ function toIsoFromUnixSeconds(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return null;
   return new Date(n * 1000).toISOString();
-}
-
-function addMonthsToIso(isoString, months) {
-  if (!isoString) return null;
-  const d = new Date(isoString);
-  if (Number.isNaN(d.getTime())) return null;
-  d.setUTCMonth(d.getUTCMonth() + Number(months || 0));
-  return d.toISOString();
 }
 
 function pickId(value) {
@@ -109,8 +100,6 @@ router.post('/', async (req, res) => {
             intervalRaw === 'month' ? 'monthly' :
             intervalRaw === 'year' ? 'annual' :
             null;
-          const contractStartIso = toIsoFromUnixSeconds(eventObject?.start_date);
-          const contractEndIso = addMonthsToIso(contractStartIso, 12);
           const periodEnd =
             eventObject?.current_period_end ??
             eventObject?.items?.data?.[0]?.current_period_end ??
@@ -121,11 +110,7 @@ router.post('/', async (req, res) => {
             subscription_status: subStatus || null,
             current_term_end: toIsoFromUnixSeconds(periodEnd),
             cancel_at_term_end: eventObject?.cancel_at_period_end === true,
-            billing_status: ACTIVE_SUB_STATUSES.has(subStatus) ? 'active' : 'inactive',
-            billing_interval: billingInterval,
-            contract_start_at: contractStartIso,
-            contract_end_at: contractEndIso,
-            auto_renew: true
+            billing_interval: billingInterval
           };
           const { error: updateErr } = await supabaseAdmin
             .from('clients')
@@ -157,14 +142,9 @@ router.post('/', async (req, res) => {
               intervalRaw === 'month' ? 'monthly' :
               intervalRaw === 'year' ? 'annual' :
               null;
-            const contractStartIso = toIsoFromUnixSeconds(subscription?.start_date);
-            const contractEndIso = addMonthsToIso(contractStartIso, 12);
             const currentTermEnd = toIsoFromUnixSeconds(subscription?.current_period_end);
             const cancelAtTermEnd = subscription?.cancel_at_period_end === true;
             const scheduleId = pickId(subscription?.schedule) || null;
-            const billingStatus = event.type === 'invoice.payment_failed'
-              ? 'inactive'
-              : (ACTIVE_SUB_STATUSES.has(subStatus) ? 'active' : 'inactive');
             const { error: updateErr } = await supabaseAdmin
               .from('clients')
               .update({
@@ -173,22 +153,8 @@ router.post('/', async (req, res) => {
                 subscription_status: subStatus || client.subscription_status || null,
                 current_term_end: currentTermEnd,
                 cancel_at_term_end: cancelAtTermEnd,
-                billing_status: billingStatus,
-                billing_interval: billingInterval,
-                contract_start_at: contractStartIso,
-                contract_end_at: contractEndIso,
-                auto_renew: true
+                billing_interval: billingInterval
               })
-              .eq('id', client.id);
-            if (updateErr) throw new Error(updateErr.message || 'Client update failed');
-          } else {
-            const subStatus = String(client.subscription_status || '').toLowerCase();
-            const billingStatus = event.type === 'invoice.payment_failed'
-              ? 'inactive'
-              : (subStatus && !ACTIVE_SUB_STATUSES.has(subStatus) ? 'inactive' : 'active');
-            const { error: updateErr } = await supabaseAdmin
-              .from('clients')
-              .update({ billing_status: billingStatus })
               .eq('id', client.id);
             if (updateErr) throw new Error(updateErr.message || 'Client update failed');
           }
