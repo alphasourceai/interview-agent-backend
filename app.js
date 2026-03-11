@@ -912,6 +912,150 @@ adminRouter.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (r
   return res.json({ ok: true, item: data || null })
 })
 
+adminRouter.post('/clients/:id/cancel-contract', requireAuth, requireAdmin, async (req, res) => {
+  const requestId = req.request_id || null
+  const clientId = req.params?.id
+  const note = String(req.body?.note || '').trim() || null
+  const rawFinalInvoiceAmount = req.body?.final_invoice_amount
+  const parsedFinalInvoiceAmount = Number(rawFinalInvoiceAmount)
+  const finalInvoiceAmount = Number.isFinite(parsedFinalInvoiceAmount) && parsedFinalInvoiceAmount > 0
+    ? parsedFinalInvoiceAmount
+    : null
+  const nowIso = new Date().toISOString()
+
+  const { data: client, error: clientError } = await supabaseAdmin
+    .from('clients')
+    .select('id,name,email,stripe_customer_id,stripe_subscription_id,subscription_status,billing_status,auto_renew,cancel_at_term_end,cancel_effective_at')
+    .eq('id', clientId)
+    .maybeSingle()
+  if (clientError) return res.status(500).json({ error: 'cancel_contract_failed', detail: clientError.message })
+  if (!client) return res.status(404).json({ error: 'client_not_found' })
+  if (!client.stripe_subscription_id) return res.status(400).json({ error: 'missing_stripe_subscription' })
+  const subscriptionStatus = String(client.subscription_status || '').toLowerCase()
+  if (subscriptionStatus !== 'active' && subscriptionStatus !== 'trialing') {
+    return res.status(400).json({ error: 'subscription_not_cancelable' })
+  }
+
+  const { data: startedRun, error: startedRunError } = await supabaseAdmin
+    .from('contract_cancellation_runs')
+    .insert({
+      client_id: client.id,
+      client_name: client.name || null,
+      triggered_by_user_id: req.user?.id || null,
+      triggered_by_email: req.user?.email || null,
+      started_at: nowIso,
+      status: 'started',
+      final_invoice_amount: finalInvoiceAmount,
+      stripe_subscription_id: client.stripe_subscription_id,
+      note,
+      request_id: requestId
+    })
+    .select('id')
+    .maybeSingle()
+  if (startedRunError || !startedRun?.id) {
+    return res.status(500).json({ error: 'cancel_contract_failed', detail: startedRunError?.message || 'audit_start_failed' })
+  }
+  const runId = startedRun.id
+
+  const completeRunWithFailure = async (status, detail, extra = {}) => {
+    try {
+      await supabaseAdmin
+        .from('contract_cancellation_runs')
+        .update({
+          completed_at: new Date().toISOString(),
+          status,
+          error: detail,
+          ...extra
+        })
+        .eq('id', runId)
+    } catch (_) {}
+  }
+
+  try {
+    const Stripe = require('stripe')
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
+    let stripeInvoiceId = null
+
+    if (finalInvoiceAmount && finalInvoiceAmount > 0) {
+      try {
+        let stripeCustomerId = client.stripe_customer_id || null
+        if (!stripeCustomerId) {
+          const sub = await stripe.subscriptions.retrieve(client.stripe_subscription_id)
+          stripeCustomerId = sub?.customer || null
+        }
+        if (!stripeCustomerId) throw new Error('missing_stripe_customer')
+
+        const amountCents = Math.round(finalInvoiceAmount * 100)
+        const createdInvoice = await stripe.invoices.create({
+          customer: stripeCustomerId,
+          collection_method: 'send_invoice',
+          days_until_due: 0,
+          auto_advance: false,
+          description: 'Final contract cancellation invoice'
+        })
+        await stripe.invoiceItems.create({
+          customer: stripeCustomerId,
+          invoice: createdInvoice.id,
+          amount: amountCents,
+          currency: 'usd',
+          description: 'Final contract cancellation invoice'
+        })
+        await stripe.invoices.finalizeInvoice(createdInvoice.id)
+        const sentInvoice = await stripe.invoices.sendInvoice(createdInvoice.id)
+        stripeInvoiceId = sentInvoice?.id || createdInvoice?.id || null
+      } catch (e) {
+        const detail = e?.message || 'invoice_creation_failed'
+        await completeRunWithFailure('invoice_failed', detail)
+        return res.status(500).json({ error: 'cancel_contract_failed', detail })
+      }
+    }
+
+    try {
+      await stripe.subscriptions.cancel(client.stripe_subscription_id)
+    } catch (e) {
+      const detail = e?.message || 'stripe_cancel_failed'
+      await completeRunWithFailure('stripe_cancel_failed', detail, { stripe_invoice_id: stripeInvoiceId })
+      return res.status(500).json({ error: 'cancel_contract_failed', detail })
+    }
+
+    const cancelEffectiveAt = new Date().toISOString()
+    const { data: updatedClient, error: updateError } = await supabaseAdmin
+      .from('clients')
+      .update({
+        billing_status: 'inactive',
+        auto_renew: false,
+        cancel_at_term_end: false,
+        cancel_effective_at: cancelEffectiveAt
+      })
+      .eq('id', client.id)
+      .select('id,billing_status,auto_renew,cancel_at_term_end,cancel_effective_at')
+      .maybeSingle()
+    if (updateError || !updatedClient) {
+      const detail = updateError?.message || 'local_update_failed'
+      await completeRunWithFailure('local_update_failed', detail, { stripe_invoice_id: stripeInvoiceId })
+      return res.status(500).json({ error: 'cancel_contract_failed', detail })
+    }
+
+    try {
+      await supabaseAdmin
+        .from('contract_cancellation_runs')
+        .update({
+          completed_at: new Date().toISOString(),
+          status: 'completed',
+          stripe_invoice_id: stripeInvoiceId,
+          error: null
+        })
+        .eq('id', runId)
+    } catch (_) {}
+
+    return res.json({ ok: true, item: updatedClient })
+  } catch (e) {
+    const detail = e?.message || 'cancel_contract_failed'
+    await completeRunWithFailure('failed', detail)
+    return res.status(500).json({ error: 'cancel_contract_failed', detail })
+  }
+})
+
 adminRouter.post('/contracts/process-renewals', requireAuth, requireAdmin, async (req, res) => {
   try {
     const result = await processContractRenewals({
