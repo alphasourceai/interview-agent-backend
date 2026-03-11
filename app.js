@@ -875,7 +875,7 @@ adminRouter.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (r
   }
   const { data: client, error: clientError } = await supabaseAdmin
     .from('clients')
-    .select('id,stripe_subscription_id,subscription_status,auto_renew,cancel_at_term_end')
+    .select('id,stripe_subscription_id,subscription_status,auto_renew,cancel_at_term_end,billing_interval')
     .eq('id', req.params.id)
     .maybeSingle()
   if (clientError) return res.status(500).json({ error: 'update_client_failed', detail: clientError.message })
@@ -886,19 +886,24 @@ adminRouter.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (r
     return res.status(400).json({ error: 'subscription_not_mutable' })
   }
 
-  try {
-    const Stripe = require('stripe')
-    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
-    await stripe.subscriptions.update(client.stripe_subscription_id, { cancel_at_period_end: autoRenew !== true })
-  } catch (e) {
-    return res.status(500).json({ error: 'update_client_failed', detail: e?.message || 'stripe_update_failed' })
+  const billingInterval = String(client.billing_interval || '').toLowerCase()
+  const isMonthly = billingInterval === 'monthly'
+  const isAnnual = billingInterval === 'annual'
+  if (isAnnual || !isMonthly) {
+    try {
+      const Stripe = require('stripe')
+      const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
+      await stripe.subscriptions.update(client.stripe_subscription_id, { cancel_at_period_end: autoRenew !== true })
+    } catch (e) {
+      return res.status(500).json({ error: 'update_client_failed', detail: e?.message || 'stripe_update_failed' })
+    }
   }
 
   const { data, error } = await supabaseAdmin
     .from('clients')
     .update({
       auto_renew: autoRenew,
-      cancel_at_term_end: autoRenew ? false : true
+      cancel_at_term_end: isMonthly ? false : (autoRenew ? false : true)
     })
     .eq('id', req.params.id)
     .select('id,auto_renew,cancel_at_term_end')
