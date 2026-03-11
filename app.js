@@ -924,6 +924,35 @@ adminRouter.post('/clients/:id/resume-subscription', requireAuth, requireAdmin, 
   return res.json({ ok: true, item: updatedClient || null })
 })
 
+adminRouter.post('/clients/:id/cancel-at-contract-end', requireAuth, requireAdmin, async (req, res) => {
+  const clientId = req.params?.id
+  if (!clientId) return res.status(404).json({ error: 'client_not_found' })
+
+  const { data: client, error: clientError } = await supabaseAdmin
+    .from('clients')
+    .select('id,name,stripe_subscription_id,subscription_status,billing_status,auto_renew,contract_end_at')
+    .eq('id', clientId)
+    .maybeSingle()
+
+  if (clientError) return res.status(500).json({ error: 'cancel_at_contract_end_failed', detail: clientError.message })
+  if (!client) return res.status(404).json({ error: 'client_not_found' })
+  if (!client.stripe_subscription_id) return res.status(400).json({ error: 'missing_stripe_subscription' })
+  const subscriptionStatus = String(client.subscription_status || '').toLowerCase()
+  if (subscriptionStatus !== 'active' && subscriptionStatus !== 'trialing') {
+    return res.status(400).json({ error: 'subscription_not_cancelable' })
+  }
+
+  const { data: updatedClient, error: updateError } = await supabaseAdmin
+    .from('clients')
+    .update({ auto_renew: false })
+    .eq('id', client.id)
+    .select('id,auto_renew')
+    .maybeSingle()
+
+  if (updateError) return res.status(500).json({ error: 'cancel_at_contract_end_failed', detail: updateError.message })
+  return res.json({ ok: true, item: updatedClient || null })
+})
+
 adminRouter.post('/contracts/process-renewals', requireAuth, requireAdmin, async (req, res) => {
   try {
     const result = await processContractRenewals({
