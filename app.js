@@ -907,6 +907,48 @@ adminRouter.get('/audit/contract-processing-runs', requireAuth, requireAdmin, as
   return res.json({ items: data || [] })
 })
 
+adminRouter.get('/audit/billing-reconciliation', requireAuth, requireAdmin, async (_req, res) => {
+  const nowMs = Date.now()
+  const { data, error } = await supabaseAdmin
+    .from('clients')
+    .select('id,name,billing_status,manual_active_override,contract_end_at,auto_renew,subscription_status,cancel_at_term_end,current_term_end')
+  if (error) return res.status(500).json({ error: 'list_billing_reconciliation_failed', detail: error.message })
+
+  const items = (data || []).map((client) => {
+    const billingStatus = String(client?.billing_status || '').toLowerCase()
+    const subscriptionStatus = String(client?.subscription_status || '').toLowerCase()
+    const liveSubscription = subscriptionStatus === 'active' || subscriptionStatus === 'trialing'
+    const contractEndMs = client?.contract_end_at ? new Date(client.contract_end_at).getTime() : NaN
+
+    let reason = null
+    if (billingStatus === 'inactive' && liveSubscription && client?.cancel_at_term_end !== true) {
+      reason = 'inactive_without_stripe_cancel'
+    } else if (billingStatus === 'active' && client?.manual_active_override !== true && !liveSubscription) {
+      reason = 'active_without_live_subscription'
+    } else if (client?.cancel_at_term_end === true && !liveSubscription) {
+      reason = 'stripe_cancel_flag_without_live_subscription'
+    } else if (client?.manual_active_override === true && Number.isFinite(contractEndMs) && contractEndMs < nowMs) {
+      reason = 'manual_override_on_expired_contract'
+    }
+
+    if (!reason) return null
+    return {
+      id: client.id,
+      name: client.name,
+      billing_status: client.billing_status,
+      manual_active_override: client.manual_active_override,
+      contract_end_at: client.contract_end_at,
+      auto_renew: client.auto_renew,
+      subscription_status: client.subscription_status,
+      cancel_at_term_end: client.cancel_at_term_end,
+      current_term_end: client.current_term_end,
+      reason
+    }
+  }).filter(Boolean)
+
+  return res.json({ items })
+})
+
 adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAdmin, async (req, res) => {
   const request_id = req.request_id || null
   const clientId = req.params?.id
