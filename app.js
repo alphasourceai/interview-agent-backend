@@ -873,84 +873,38 @@ adminRouter.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (r
   if (typeof autoRenew !== 'boolean') {
     return res.status(400).json({ error: 'invalid_auto_renew' })
   }
-  const { data, error } = await supabaseAdmin
-    .from('clients')
-    .update({ auto_renew: autoRenew })
-    .eq('id', req.params.id)
-    .select('id,auto_renew')
-    .maybeSingle()
-  if (error) return res.status(500).json({ error: 'update_client_failed', detail: error.message })
-  return res.json({ ok: true, item: data || null })
-})
-
-adminRouter.post('/clients/:id/resume-subscription', requireAuth, requireAdmin, async (req, res) => {
-  const clientId = req.params?.id
-  if (!clientId) return res.status(404).json({ error: 'client_not_found' })
-
   const { data: client, error: clientError } = await supabaseAdmin
     .from('clients')
-    .select('id,name,stripe_subscription_id,subscription_status,billing_status,cancel_at_term_end,cancel_effective_at')
-    .eq('id', clientId)
+    .select('id,stripe_subscription_id,subscription_status,auto_renew,cancel_at_term_end')
+    .eq('id', req.params.id)
     .maybeSingle()
-
-  if (clientError) return res.status(500).json({ error: 'resume_subscription_failed', detail: clientError.message })
+  if (clientError) return res.status(500).json({ error: 'update_client_failed', detail: clientError.message })
   if (!client) return res.status(404).json({ error: 'client_not_found' })
   if (!client.stripe_subscription_id) return res.status(400).json({ error: 'missing_stripe_subscription' })
   const subscriptionStatus = String(client.subscription_status || '').toLowerCase()
   if (subscriptionStatus !== 'active' && subscriptionStatus !== 'trialing') {
-    return res.status(400).json({ error: 'subscription_not_resumable' })
+    return res.status(400).json({ error: 'subscription_not_mutable' })
   }
 
   try {
     const Stripe = require('stripe')
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
-    await stripe.subscriptions.update(client.stripe_subscription_id, { cancel_at_period_end: false })
+    await stripe.subscriptions.update(client.stripe_subscription_id, { cancel_at_period_end: autoRenew !== true })
   } catch (e) {
-    return res.status(500).json({ error: 'resume_subscription_failed', detail: e?.message || 'stripe_update_failed' })
+    return res.status(500).json({ error: 'update_client_failed', detail: e?.message || 'stripe_update_failed' })
   }
 
-  const { data: updatedClient, error: updateError } = await supabaseAdmin
+  const { data, error } = await supabaseAdmin
     .from('clients')
     .update({
-      billing_status: 'active',
-      cancel_effective_at: null,
-      cancel_at_term_end: false
+      auto_renew: autoRenew,
+      cancel_at_term_end: autoRenew ? false : true
     })
-    .eq('id', client.id)
-    .select('id,billing_status,cancel_effective_at,cancel_at_term_end')
+    .eq('id', req.params.id)
+    .select('id,auto_renew,cancel_at_term_end')
     .maybeSingle()
-
-  if (updateError) return res.status(500).json({ error: 'resume_subscription_failed', detail: updateError.message })
-  return res.json({ ok: true, item: updatedClient || null })
-})
-
-adminRouter.post('/clients/:id/cancel-at-contract-end', requireAuth, requireAdmin, async (req, res) => {
-  const clientId = req.params?.id
-  if (!clientId) return res.status(404).json({ error: 'client_not_found' })
-
-  const { data: client, error: clientError } = await supabaseAdmin
-    .from('clients')
-    .select('id,name,stripe_subscription_id,subscription_status,billing_status,auto_renew,contract_end_at')
-    .eq('id', clientId)
-    .maybeSingle()
-
-  if (clientError) return res.status(500).json({ error: 'cancel_at_contract_end_failed', detail: clientError.message })
-  if (!client) return res.status(404).json({ error: 'client_not_found' })
-  if (!client.stripe_subscription_id) return res.status(400).json({ error: 'missing_stripe_subscription' })
-  const subscriptionStatus = String(client.subscription_status || '').toLowerCase()
-  if (subscriptionStatus !== 'active' && subscriptionStatus !== 'trialing') {
-    return res.status(400).json({ error: 'subscription_not_cancelable' })
-  }
-
-  const { data: updatedClient, error: updateError } = await supabaseAdmin
-    .from('clients')
-    .update({ auto_renew: false })
-    .eq('id', client.id)
-    .select('id,auto_renew')
-    .maybeSingle()
-
-  if (updateError) return res.status(500).json({ error: 'cancel_at_contract_end_failed', detail: updateError.message })
-  return res.json({ ok: true, item: updatedClient || null })
+  if (error) return res.status(500).json({ error: 'update_client_failed', detail: error.message })
+  return res.json({ ok: true, item: data || null })
 })
 
 adminRouter.post('/contracts/process-renewals', requireAuth, requireAdmin, async (req, res) => {
