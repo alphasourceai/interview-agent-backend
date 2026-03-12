@@ -1332,21 +1332,54 @@ adminRouter.post('/clients/:id/subscription-invoice', requireAuth, requireAdmin,
     .maybeSingle()
   if (clientError) return res.status(500).json({ error: 'client_lookup_failed', detail: clientError.message })
   if (!client) return res.status(404).json({ error: 'client_not_found' })
-  if (!client.stripe_customer_id) return res.status(400).json({ error: 'missing_billing_customer' })
 
   const { data: billingCustomerRows, error: billingCustomerError } = await supabaseAdmin
     .from('billing_customers')
     .select('id,name,primary_contact_email,stripe_customer_id')
     .eq('client_id', client.id)
     .order('created_at', { ascending: false })
-    .limit(1)
   if (billingCustomerError) return res.status(500).json({ error: 'customer_lookup_failed', detail: billingCustomerError.message })
-  const billingCustomer = Array.isArray(billingCustomerRows) ? (billingCustomerRows[0] || null) : null
-  if (!billingCustomer || !billingCustomer.stripe_customer_id) return res.status(400).json({ error: 'missing_billing_customer' })
+  const billingCustomerList = Array.isArray(billingCustomerRows) ? billingCustomerRows : []
+  const billingCustomer = billingCustomerList[0] || null
+  if (!billingCustomer) return res.status(400).json({ error: 'missing_billing_customer' })
 
   try {
     const Stripe = require('stripe')
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
+    const candidateStripeCustomerIds = []
+    for (const row of billingCustomerList) {
+      const id = String(row?.stripe_customer_id || '').trim()
+      if (!id) continue
+      if (!candidateStripeCustomerIds.includes(id)) candidateStripeCustomerIds.push(id)
+    }
+    const fallbackCustomerId = String(client?.stripe_customer_id || '').trim()
+    if (fallbackCustomerId && !candidateStripeCustomerIds.includes(fallbackCustomerId)) {
+      candidateStripeCustomerIds.push(fallbackCustomerId)
+    }
+
+    let resolvedStripeCustomerId = null
+    for (const candidateId of candidateStripeCustomerIds) {
+      try {
+        await stripe.customers.retrieve(candidateId)
+        resolvedStripeCustomerId = candidateId
+        break
+      } catch (e) {
+        const message = String(e?.message || '').toLowerCase()
+        const code = String(e?.code || '').toLowerCase()
+        if (code === 'resource_missing' || message.includes('no such customer')) continue
+        throw e
+      }
+    }
+    if (!resolvedStripeCustomerId) return res.status(400).json({ error: 'missing_billing_customer' })
+    if (billingCustomer?.id && String(billingCustomer?.stripe_customer_id || '').trim() !== resolvedStripeCustomerId) {
+      try {
+        await supabaseAdmin
+          .from('billing_customers')
+          .update({ stripe_customer_id: resolvedStripeCustomerId })
+          .eq('id', billingCustomer.id)
+      } catch (_) {}
+    }
+
     const lineItems = []
     let invoiceTitle = ''
     const invoiceDescription = null
@@ -1408,7 +1441,7 @@ adminRouter.post('/clients/:id/subscription-invoice', requireAuth, requireAdmin,
     const computedSumCents = normalizedItems.reduce((sum, item) => sum + item.line_total_cents, 0)
 
     const draftInvoice = await stripe.invoices.create({
-      customer: billingCustomer.stripe_customer_id,
+      customer: resolvedStripeCustomerId,
       collection_method: 'send_invoice',
       days_until_due: daysUntilDue,
       auto_advance: false,
@@ -1424,7 +1457,7 @@ adminRouter.post('/clients/:id/subscription-invoice', requireAuth, requireAdmin,
 
     for (const item of normalizedItems) {
       await stripe.invoiceItems.create({
-        customer: billingCustomer.stripe_customer_id,
+        customer: resolvedStripeCustomerId,
         invoice: draftInvoice.id,
         description: item.description,
         amount: item.line_total_cents,
