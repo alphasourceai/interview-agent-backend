@@ -804,7 +804,7 @@ async function processContractRenewals(context = {}) {
 adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
   const { data, error } = await supabaseAdmin
     .from('clients')
-    .select('id,name,email,created_at,plan_tier,billing_status,manual_active_override,candidate_assistance_contact,stripe_customer_id,stripe_subscription_id,subscription_status,current_term_end,cancel_at_term_end,billing_interval,contract_start_at,contract_end_at,auto_renew')
+    .select('id,name,email,created_at,plan_tier,billing_status,manual_active_override,access_override_mode,candidate_assistance_contact,stripe_customer_id,stripe_subscription_id,subscription_status,current_term_end,cancel_at_term_end,billing_interval,contract_start_at,contract_end_at,auto_renew')
     .order('created_at', { ascending: false })
   if (error) return res.status(500).json({ error: 'list_clients_failed', detail: error.message })
   res.json({ items: data || [] })
@@ -907,6 +907,30 @@ adminRouter.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (r
     })
     .eq('id', req.params.id)
     .select('id,auto_renew,cancel_at_term_end')
+    .maybeSingle()
+  if (error) return res.status(500).json({ error: 'update_client_failed', detail: error.message })
+  return res.json({ ok: true, item: data || null })
+})
+
+adminRouter.patch('/clients/:id/access-override', requireAuth, requireAdmin, async (req, res) => {
+  const accessOverrideMode = String(req.body?.access_override_mode || '').trim().toLowerCase()
+  if (accessOverrideMode !== 'inherit' && accessOverrideMode !== 'force_active' && accessOverrideMode !== 'force_inactive') {
+    return res.status(400).json({ error: 'invalid_access_override_mode' })
+  }
+
+  const { data: existingClient, error: existingClientError } = await supabaseAdmin
+    .from('clients')
+    .select('id')
+    .eq('id', req.params.id)
+    .maybeSingle()
+  if (existingClientError) return res.status(500).json({ error: 'update_client_failed', detail: existingClientError.message })
+  if (!existingClient) return res.status(404).json({ error: 'client_not_found' })
+
+  const { data, error } = await supabaseAdmin
+    .from('clients')
+    .update({ access_override_mode: accessOverrideMode })
+    .eq('id', req.params.id)
+    .select('id,access_override_mode')
     .maybeSingle()
   if (error) return res.status(500).json({ error: 'update_client_failed', detail: error.message })
   return res.json({ ok: true, item: data || null })
