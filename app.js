@@ -1118,17 +1118,24 @@ adminRouter.get('/audit/billing-reconciliation', requireAuth, requireAdmin, asyn
   const nowMs = Date.now()
   const { data, error } = await supabaseAdmin
     .from('clients')
-    .select('id,name,billing_status,manual_active_override,contract_end_at,auto_renew,subscription_status,cancel_at_term_end,current_term_end')
+    .select('id,name,billing_status,manual_active_override,access_override_mode,contract_end_at,auto_renew,subscription_status,cancel_at_term_end,current_term_end')
   if (error) return res.status(500).json({ error: 'list_billing_reconciliation_failed', detail: error.message })
 
   const items = (data || []).map((client) => {
     const billingStatus = String(client?.billing_status || '').toLowerCase()
+    const accessOverrideMode = String(client?.access_override_mode || 'inherit').toLowerCase()
     const subscriptionStatus = String(client?.subscription_status || '').toLowerCase()
     const liveSubscription = subscriptionStatus === 'active' || subscriptionStatus === 'trialing'
     const contractEndMs = client?.contract_end_at ? new Date(client.contract_end_at).getTime() : NaN
 
     let reason = null
-    if (billingStatus === 'inactive' && liveSubscription && client?.cancel_at_term_end !== true) {
+    if (accessOverrideMode === 'force_active' && billingStatus !== 'active') {
+      reason = 'force_active_on_inactive_account'
+    } else if (accessOverrideMode === 'force_inactive' && billingStatus === 'active') {
+      reason = 'force_inactive_on_active_account'
+    } else if (accessOverrideMode === 'force_active' && Number.isFinite(contractEndMs) && contractEndMs < nowMs) {
+      reason = 'force_active_on_expired_contract'
+    } else if (billingStatus === 'inactive' && liveSubscription && client?.cancel_at_term_end !== true) {
       reason = 'inactive_without_stripe_cancel'
     } else if (billingStatus === 'active' && client?.manual_active_override !== true && !liveSubscription) {
       reason = 'active_without_live_subscription'
@@ -1144,6 +1151,7 @@ adminRouter.get('/audit/billing-reconciliation', requireAuth, requireAdmin, asyn
       name: client.name,
       billing_status: client.billing_status,
       manual_active_override: client.manual_active_override,
+      access_override_mode: client.access_override_mode,
       contract_end_at: client.contract_end_at,
       auto_renew: client.auto_renew,
       subscription_status: client.subscription_status,
