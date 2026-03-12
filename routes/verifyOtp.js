@@ -63,7 +63,7 @@ router.post("/", async (req, res) => {
     if (BILLING_ENFORCED && role.client_id) {
       const { data: client, error: clientErr } = await supabase
         .from('clients')
-        .select('id,billing_status,manual_active_override,candidate_assistance_contact')
+        .select('id,billing_status,manual_active_override,access_override_mode,candidate_assistance_contact')
         .eq('id', role.client_id)
         .maybeSingle();
       if (clientErr || !client) {
@@ -75,7 +75,8 @@ router.post("/", async (req, res) => {
           request_id
         });
       }
-      if (client.manual_active_override === false && client.billing_status !== 'active') {
+      const accessOverrideMode = String(client.access_override_mode || 'inherit').toLowerCase();
+      if (accessOverrideMode === 'force_inactive' || (accessOverrideMode !== 'force_active' && client.billing_status !== 'active')) {
         return res.status(403).json({
           error: 'forbidden',
           code: 'CLIENT_INACTIVE',
