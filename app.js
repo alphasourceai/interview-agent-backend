@@ -1313,6 +1313,166 @@ adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAd
   }
 })
 
+adminRouter.post('/clients/:id/subscription-invoice', requireAuth, requireAdmin, async (req, res) => {
+  const clientId = req.params?.id
+  const planTier = String(req.body?.plan_tier || '').trim().toLowerCase()
+  const billingInterval = String(req.body?.billing_interval || '').trim().toLowerCase()
+
+  if (!['basic', 'pro', 'enterprise'].includes(planTier)) {
+    return res.status(400).json({ error: 'invalid_plan_tier' })
+  }
+  if (!['monthly', 'annual'].includes(billingInterval)) {
+    return res.status(400).json({ error: 'invalid_billing_interval' })
+  }
+
+  const { data: client, error: clientError } = await supabaseAdmin
+    .from('clients')
+    .select('id,name,email,stripe_customer_id')
+    .eq('id', clientId)
+    .maybeSingle()
+  if (clientError) return res.status(500).json({ error: 'client_lookup_failed', detail: clientError.message })
+  if (!client) return res.status(404).json({ error: 'client_not_found' })
+  if (!client.stripe_customer_id) return res.status(400).json({ error: 'missing_billing_customer' })
+
+  const { data: billingCustomerRows, error: billingCustomerError } = await supabaseAdmin
+    .from('billing_customers')
+    .select('id,name,primary_contact_email,stripe_customer_id')
+    .eq('client_id', client.id)
+    .order('created_at', { ascending: false })
+    .limit(1)
+  if (billingCustomerError) return res.status(500).json({ error: 'customer_lookup_failed', detail: billingCustomerError.message })
+  const billingCustomer = Array.isArray(billingCustomerRows) ? (billingCustomerRows[0] || null) : null
+  if (!billingCustomer || !billingCustomer.stripe_customer_id) return res.status(400).json({ error: 'missing_billing_customer' })
+
+  try {
+    const Stripe = require('stripe')
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
+    const lineItems = []
+    let invoiceTitle = ''
+    const invoiceDescription = null
+    const daysUntilDue = 7
+
+    if (planTier === 'enterprise') {
+      const platformFee = Number(req.body?.platform_fee)
+      const perRoleFee = Number(req.body?.per_role_fee)
+      if (!Number.isFinite(platformFee) || platformFee < 0 || !Number.isFinite(perRoleFee) || perRoleFee < 0) {
+        return res.status(400).json({ error: 'invalid_enterprise_fees' })
+      }
+      const platformCents = Math.round(platformFee * 100)
+      const perRoleCents = Math.round(perRoleFee * 100)
+      invoiceTitle = `Enterprise subscription (${billingInterval})`
+      if (platformCents > 0) lineItems.push({ description: 'Enterprise platform fee', quantity: 1, unit_amount_cents: platformCents })
+      if (perRoleCents > 0) lineItems.push({ description: 'Enterprise per-role fee', quantity: 1, unit_amount_cents: perRoleCents })
+      if (!lineItems.length) return res.status(400).json({ error: 'invalid_enterprise_fees' })
+    } else {
+      let priceId = ''
+      if (planTier === 'basic') {
+        priceId = billingInterval === 'annual'
+          ? String(process.env.STRIPE_PRICE_BASIC_ANNUAL || '')
+          : String(process.env.STRIPE_PRICE_BASIC_MONTHLY || '')
+      } else if (planTier === 'pro') {
+        priceId = billingInterval === 'annual'
+          ? String(process.env.STRIPE_PRICE_PRO_ANNUAL || '')
+          : String(process.env.STRIPE_PRICE_PRO_MONTHLY || '')
+      }
+      if (!priceId) return res.status(500).json({ error: 'stripe_price_not_configured' })
+
+      const price = await stripe.prices.retrieve(priceId)
+      const unitAmount = Number(price?.unit_amount)
+      if (!Number.isFinite(unitAmount) || unitAmount <= 0) {
+        return res.status(500).json({ error: 'invalid_price_configuration' })
+      }
+      const planLabel = planTier === 'basic' ? 'Basic' : 'Pro'
+      const intervalLabel = billingInterval === 'annual' ? 'annual' : 'monthly'
+      invoiceTitle = `${planLabel} subscription (${intervalLabel})`
+      lineItems.push({
+        description: `${planLabel} subscription (${intervalLabel})`,
+        quantity: 1,
+        unit_amount_cents: unitAmount
+      })
+    }
+
+    const normalizedItems = lineItems.map((item) => {
+      const quantity = Number.isFinite(Number(item?.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1
+      const unitAmountCents = Number(item?.unit_amount_cents)
+      return {
+        description: String(item?.description || '').trim(),
+        quantity,
+        unit_amount_cents: unitAmountCents,
+        line_total_cents: Number.isFinite(unitAmountCents) ? unitAmountCents * quantity : NaN
+      }
+    })
+    if (!normalizedItems.length || normalizedItems.some((item) => !item.description || !Number.isFinite(item.line_total_cents) || item.line_total_cents <= 0)) {
+      return res.status(400).json({ error: 'invalid_line_items' })
+    }
+    const computedSumCents = normalizedItems.reduce((sum, item) => sum + item.line_total_cents, 0)
+
+    const draftInvoice = await stripe.invoices.create({
+      customer: billingCustomer.stripe_customer_id,
+      collection_method: 'send_invoice',
+      days_until_due: daysUntilDue,
+      auto_advance: false,
+      description: invoiceDescription || undefined,
+      metadata: {
+        billing_customer_id: billingCustomer.id,
+        client_id: client.id,
+        invoice_title: invoiceTitle,
+        plan_tier: planTier,
+        billing_interval: billingInterval
+      }
+    })
+
+    for (const item of normalizedItems) {
+      await stripe.invoiceItems.create({
+        customer: billingCustomer.stripe_customer_id,
+        invoice: draftInvoice.id,
+        description: item.description,
+        amount: item.line_total_cents,
+        currency: 'usd'
+      })
+    }
+
+    const finalized = await stripe.invoices.finalizeInvoice(draftInvoice.id)
+    const sent = await stripe.invoices.sendInvoice(finalized.id)
+    const invoice = sent || finalized
+    let amountTotalCents = computedSumCents
+    try {
+      const afterSend = await stripe.invoices.retrieve(finalized.id)
+      amountTotalCents = Number.isFinite(afterSend?.amount_due)
+        ? afterSend.amount_due
+        : Number.isFinite(afterSend?.total)
+          ? afterSend.total
+          : computedSumCents
+    } catch (_) {}
+
+    const { data: inserted, error: persistError } = await supabaseAdmin
+      .from('billing_invoices')
+      .insert({
+        billing_customer_id: billingCustomer.id,
+        title: invoiceTitle,
+        invoice_title: invoiceTitle,
+        invoice_description: invoiceDescription,
+        amount_total_cents: amountTotalCents,
+        currency: 'usd',
+        status: invoice?.status || null,
+        hosted_invoice_url: invoice?.hosted_invoice_url || null,
+        stripe_invoice_id: invoice?.id || null,
+        customer_name: billingCustomer.name || null,
+        customer_email: billingCustomer.primary_contact_email || null
+      })
+      .select('id,stripe_invoice_id,status,hosted_invoice_url,invoice_description,amount_total_cents,customer_name,customer_email')
+      .single()
+    if (persistError) return res.status(500).json({ error: 'persist_failed', detail: persistError.message })
+
+    return res.json({
+      ok: true,
+      invoice: inserted
+    })
+  } catch (e) {
+    return res.status(500).json({ error: 'send_subscription_invoice_failed', detail: e?.message || 'send_subscription_invoice_failed' })
+  }
+})
+
 // Delete client
 adminRouter.delete('/clients/:id', requireAuth, requireAdmin, async (req, res) => {
   const { error } = await supabaseAdmin.from('clients').delete().eq('id', req.params.id)
