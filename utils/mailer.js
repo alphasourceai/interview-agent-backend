@@ -31,15 +31,91 @@ async function sendInvite(to, acceptUrl, inviterEmail) {
 
 async function sendSubscriptionCheckoutEmail(to, checkoutUrl) {
   if (!API_KEY) return { skipped: true }
+  const safeCheckoutUrl = String(checkoutUrl || '').trim()
   const msg = {
     to,
     from: FROM,
-    subject: 'Complete your subscription checkout',
+    subject: 'Complete your alphaScreen subscription',
     html: `
-      <p>Please complete your subscription checkout using the secure Stripe link below.</p>
-      <p><a href="${checkoutUrl}" target="_blank" rel="noopener">Complete subscription checkout</a></p>
-      <p>If the button does not work, copy and paste this URL into your browser:</p>
-      <p>${checkoutUrl}</p>
+      <!doctype html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>Complete your alphaScreen subscription</title>
+        <style>
+          body { margin: 0; padding: 0; background: #0A1547; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+          table { border-collapse: collapse; }
+          a { text-decoration: none; }
+          @media (max-width: 640px) {
+            .container { width: 100% !important; padding: 16px !important; }
+            .card { padding: 20px !important; border-radius: 14px !important; }
+            .cta { display: block !important; width: 100% !important; text-align: center !important; box-sizing: border-box !important; }
+          }
+        </style>
+      </head>
+      <body>
+        <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
+          Complete your secure subscription checkout to activate your account.
+        </div>
+        <table role="presentation" width="100%" style="background:#0A1547;">
+          <tr>
+            <td align="center" style="padding: 28px 16px;">
+              <table role="presentation" width="100%" class="container" style="max-width: 640px;">
+                <tr>
+                  <td>
+                    <table role="presentation" width="100%" class="card" style="background:#0F1E5D;border:1px solid rgba(255,255,255,0.08);border-radius:16px;box-shadow:0 16px 40px rgba(1,6,30,0.36);padding:28px;">
+                      <tr>
+                        <td align="left" style="padding-bottom:18px;">
+                          <img src="http://cdn.mcauto-images-production.sendgrid.net/fe2f293446641ea1/9d2d6663-bd5f-4b91-8bf2-5704f37cbc78/3163x752.png" alt="AlphaSource" width="220" style="display:block;border:0;outline:none;text-decoration:none;height:auto;max-width:100%;" />
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="color:#E6EBFF;font-size:26px;line-height:1.2;font-weight:700;padding-bottom:12px;">
+                          Complete your alphaScreen subscription
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="color:#C9D3FF;font-size:16px;line-height:1.6;padding-bottom:14px;">
+                          Hi,
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="color:#C9D3FF;font-size:16px;line-height:1.6;padding-bottom:22px;">
+                          Your subscription setup is almost complete. Use the button below to finish secure checkout and activate your account.
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding-bottom:22px;">
+                          <a class="cta" href="${safeCheckoutUrl}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#A78BFA;color:#0A1547;border:1px solid #CFCBFF;border-radius:10px;padding:12px 20px;font-size:15px;font-weight:700;line-height:1;">
+                            Complete subscription checkout
+                          </a>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="color:#C9D3FF;font-size:14px;line-height:1.6;padding-bottom:6px;">
+                          If the button doesn’t work, copy and paste this link into your browser:
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding-bottom:20px;">
+                          <a href="${safeCheckoutUrl}" target="_blank" rel="noopener noreferrer" style="color:#CFCBFF;font-size:14px;line-height:1.5;word-break:break-all;">${safeCheckoutUrl}</a>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="border-top:1px solid rgba(255,255,255,0.10);padding-top:16px;color:#6B77C9;font-size:13px;line-height:1.6;">
+                          Need help? Email <a href="mailto:info@alphasourceai.com" style="color:#A78BFA;">info@alphasourceai.com</a>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+      </html>
     `,
   }
   const [resp] = await sg.send(msg)
