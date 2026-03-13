@@ -45,6 +45,9 @@ function normalizeBillingInterval(raw, fallback = null) {
 
 function buildClientSubscriptionUpdatesFromStripe(subscription, options = {}) {
   const subStatus = String(subscription?.status || '').toLowerCase();
+  const metadata = subscription?.metadata && typeof subscription?.metadata === 'object' ? subscription.metadata : {};
+  const metadataSource = String(metadata?.source || options.fallbackSource || '').trim().toLowerCase();
+  const metadataPlanTier = String(metadata?.plan_tier || options.fallbackPlanTier || '').trim().toLowerCase();
   const currentTermEnd = toIsoFromUnixSeconds(
     subscription?.current_period_end ??
     subscription?.items?.data?.[0]?.current_period_end ??
@@ -58,7 +61,7 @@ function buildClientSubscriptionUpdatesFromStripe(subscription, options = {}) {
     subscription?.items?.data?.[0]?.price?.recurring?.interval ||
     subscription?.plan?.interval ||
     '';
-  return {
+  const updates = {
     stripe_customer_id: pickId(subscription?.customer) || options.fallbackCustomerId || null,
     stripe_subscription_id: pickId(subscription?.id) || options.fallbackSubscriptionId || null,
     stripe_subscription_schedule_id: pickId(subscription?.schedule) || null,
@@ -72,6 +75,10 @@ function buildClientSubscriptionUpdatesFromStripe(subscription, options = {}) {
     contract_start_at: contractStartAt,
     contract_end_at: contractEndAt
   };
+  if (metadataSource === 'admin_subscription_checkout' && ['basic', 'pro', 'enterprise'].includes(metadataPlanTier)) {
+    updates.plan_tier = metadataPlanTier;
+  }
+  return updates;
 }
 
 router.post('/', async (req, res) => {
@@ -153,6 +160,7 @@ router.post('/', async (req, res) => {
     } else if (event.type === 'checkout.session.completed') {
       if (String(eventObject?.mode || '').toLowerCase() === 'subscription') {
         const metadata = eventObject?.metadata && typeof eventObject.metadata === 'object' ? eventObject.metadata : {};
+        const metadataSource = String(metadata?.source || '').trim().toLowerCase();
         const metadataClientId = String(metadata?.client_id || '').trim();
         const metadataPlanTier = String(metadata?.plan_tier || '').trim().toLowerCase();
         const metadataBillingInterval = String(metadata?.billing_interval || '').trim().toLowerCase();
@@ -184,11 +192,10 @@ router.post('/', async (req, res) => {
             const updates = buildClientSubscriptionUpdatesFromStripe(subscription, {
               fallbackCustomerId: customerId,
               fallbackSubscriptionId: subscriptionId,
-              fallbackBillingInterval: metadataBillingInterval
+              fallbackBillingInterval: metadataBillingInterval,
+              fallbackSource: metadataSource,
+              fallbackPlanTier: metadataPlanTier
             });
-            if (['basic', 'pro', 'enterprise'].includes(metadataPlanTier)) {
-              updates.plan_tier = metadataPlanTier;
-            }
             const { error: updateErr } = await supabaseAdmin
               .from('clients')
               .update(updates)
