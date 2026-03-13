@@ -64,7 +64,7 @@ async function sendSubscriptionCheckoutEmail(to, checkoutUrl) {
               <table role="presentation" width="100%" class="container" style="max-width: 640px;">
                 <tr>
                   <td>
-                    <table role="presentation" width="100%" class="card" style="background:#0F1E5D;border:1px solid rgba(255,255,255,0.08);border-radius:16px;box-shadow:0 16px 40px rgba(1,6,30,0.36);padding:24px;">
+                    <table role="presentation" width="100%" class="card" style="background:#0F1E5D;border:0;border-radius:0;box-shadow:none;padding:24px;">
                       <tr>
                         <td align="left" style="padding-bottom:16px;">
                           <img src="http://cdn.mcauto-images-production.sendgrid.net/fe2f293446641ea1/9d2d6663-bd5f-4b91-8bf2-5704f37cbc78/3163x752.png" alt="AlphaSource" width="208" style="display:block;border:0;outline:none;text-decoration:none;height:auto;max-width:100%;" />
