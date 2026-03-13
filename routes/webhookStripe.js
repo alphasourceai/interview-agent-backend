@@ -18,6 +18,14 @@ function toIsoFromUnixSeconds(value) {
   return new Date(n * 1000).toISOString();
 }
 
+function addMonthsToIso(isoValue, monthsToAdd) {
+  if (!isoValue) return null;
+  const d = new Date(isoValue);
+  if (!Number.isFinite(d.getTime())) return null;
+  d.setMonth(d.getMonth() + Number(monthsToAdd || 0));
+  return d.toISOString();
+}
+
 function pickId(value) {
   if (!value) return null;
   if (typeof value === 'string') return value;
@@ -121,6 +129,49 @@ router.post('/', async (req, res) => {
       }
     } else if (event.type === 'invoice.payment_succeeded' || event.type === 'invoice.payment_failed') {
       const customerId = pickId(eventObject?.customer);
+      const subscriptionId = pickId(eventObject?.subscription);
+      const metadata = eventObject?.metadata && typeof eventObject.metadata === 'object' ? eventObject.metadata : {};
+      const metadataClientId = String(metadata?.client_id || '').trim();
+      const metadataPlanTier = String(metadata?.plan_tier || '').trim().toLowerCase();
+      const metadataBillingInterval = String(metadata?.billing_interval || '').trim().toLowerCase();
+      const isAdminSubscriptionInvoice =
+        event.type === 'invoice.payment_succeeded' &&
+        !!metadataClientId &&
+        ['basic', 'pro', 'enterprise'].includes(metadataPlanTier) &&
+        ['monthly', 'annual'].includes(metadataBillingInterval);
+
+      if (isAdminSubscriptionInvoice) {
+        const { data: activationClient, error: activationClientErr } = await supabaseAdmin
+          .from('clients')
+          .select('id')
+          .eq('id', metadataClientId)
+          .maybeSingle();
+        if (activationClientErr) throw new Error(activationClientErr.message || 'Client lookup failed');
+        if (!activationClient?.id) throw new Error('Client lookup failed');
+
+        const contractStartAt = new Date().toISOString();
+        const contractEndAt = addMonthsToIso(contractStartAt, 12);
+        const invoicePeriodEnd = toIsoFromUnixSeconds(eventObject?.lines?.data?.[0]?.period?.end);
+        const activationUpdates = {
+          plan_tier: metadataPlanTier,
+          billing_status: 'active',
+          billing_interval: metadataBillingInterval,
+          auto_renew: true,
+          cancel_at_term_end: false,
+          cancel_effective_at: null,
+          contract_start_at: contractStartAt,
+          contract_end_at: contractEndAt
+        };
+        if (!subscriptionId || invoicePeriodEnd) {
+          activationUpdates.current_term_end = invoicePeriodEnd || contractEndAt;
+        }
+        const { error: activationErr } = await supabaseAdmin
+          .from('clients')
+          .update(activationUpdates)
+          .eq('id', activationClient.id);
+        if (activationErr) throw new Error(activationErr.message || 'Client activation update failed');
+      }
+
       if (customerId) {
         const { data: client, error: clientErr } = await supabaseAdmin
           .from('clients')
@@ -129,7 +180,6 @@ router.post('/', async (req, res) => {
           .maybeSingle();
         if (clientErr) throw new Error(clientErr.message || 'Client lookup failed');
         if (client?.id) {
-          const subscriptionId = pickId(eventObject?.subscription);
           if (subscriptionId) {
             const subscription = await stripe.subscriptions.retrieve(subscriptionId);
             const subStatus = String(subscription?.status || '').toLowerCase();
