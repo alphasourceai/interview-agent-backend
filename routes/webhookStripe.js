@@ -33,6 +33,47 @@ function pickId(value) {
   return null;
 }
 
+const LIVE_SUB_STATUSES = new Set(['active', 'trialing']);
+
+function normalizeBillingInterval(raw, fallback = null) {
+  const intervalRaw = String(raw || '').toLowerCase();
+  if (intervalRaw === 'month') return 'monthly';
+  if (intervalRaw === 'year') return 'annual';
+  if (fallback === 'monthly' || fallback === 'annual') return fallback;
+  return null;
+}
+
+function buildClientSubscriptionUpdatesFromStripe(subscription, options = {}) {
+  const subStatus = String(subscription?.status || '').toLowerCase();
+  const currentTermEnd = toIsoFromUnixSeconds(
+    subscription?.current_period_end ??
+    subscription?.items?.data?.[0]?.current_period_end ??
+    null
+  );
+  const cancelAtTermEnd = subscription?.cancel_at_period_end === true;
+  const isLive = LIVE_SUB_STATUSES.has(subStatus);
+  const contractStartAt = toIsoFromUnixSeconds(subscription?.start_date) || null;
+  const contractEndAt = contractStartAt ? addMonthsToIso(contractStartAt, 12) : null;
+  const intervalRaw =
+    subscription?.items?.data?.[0]?.price?.recurring?.interval ||
+    subscription?.plan?.interval ||
+    '';
+  return {
+    stripe_customer_id: pickId(subscription?.customer) || options.fallbackCustomerId || null,
+    stripe_subscription_id: pickId(subscription?.id) || options.fallbackSubscriptionId || null,
+    stripe_subscription_schedule_id: pickId(subscription?.schedule) || null,
+    subscription_status: subStatus || null,
+    current_term_end: currentTermEnd,
+    cancel_at_term_end: cancelAtTermEnd,
+    billing_interval: normalizeBillingInterval(intervalRaw, options.fallbackBillingInterval || null),
+    billing_status: isLive ? 'active' : 'inactive',
+    auto_renew: isLive ? !cancelAtTermEnd : false,
+    cancel_effective_at: isLive ? null : (currentTermEnd || new Date().toISOString()),
+    contract_start_at: contractStartAt,
+    contract_end_at: contractEndAt
+  };
+}
+
 router.post('/', async (req, res) => {
   const request_id = req.request_id || null;
   const sig = req.headers['stripe-signature'];
@@ -98,28 +139,10 @@ router.post('/', async (req, res) => {
           .maybeSingle();
         if (clientErr) throw new Error(clientErr.message || 'Client lookup failed');
         if (client?.id) {
-          const subStatus = String(eventObject?.status || '').toLowerCase();
-          const intervalRaw = String(
-            eventObject?.items?.data?.[0]?.price?.recurring?.interval ||
-            eventObject?.plan?.interval ||
-            ''
-          ).toLowerCase();
-          const billingInterval =
-            intervalRaw === 'month' ? 'monthly' :
-            intervalRaw === 'year' ? 'annual' :
-            null;
-          const periodEnd =
-            eventObject?.current_period_end ??
-            eventObject?.items?.data?.[0]?.current_period_end ??
-            null;
-          const updates = {
-            stripe_subscription_id: pickId(eventObject?.id) || pickId(eventObject?.subscription) || null,
-            stripe_subscription_schedule_id: pickId(eventObject?.schedule) || null,
-            subscription_status: subStatus || null,
-            current_term_end: toIsoFromUnixSeconds(periodEnd),
-            cancel_at_term_end: eventObject?.cancel_at_period_end === true,
-            billing_interval: billingInterval
-          };
+          const updates = buildClientSubscriptionUpdatesFromStripe(eventObject, {
+            fallbackCustomerId: customerId,
+            fallbackSubscriptionId: pickId(eventObject?.id) || pickId(eventObject?.subscription) || null
+          });
           const { error: updateErr } = await supabaseAdmin
             .from('clients')
             .update(updates)
@@ -158,36 +181,11 @@ router.post('/', async (req, res) => {
           }
           if (targetClientId) {
             const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-            const subStatus = String(subscription?.status || '').toLowerCase();
-            const intervalRaw = String(
-              subscription?.items?.data?.[0]?.price?.recurring?.interval ||
-              subscription?.plan?.interval ||
-              ''
-            ).toLowerCase();
-            const billingInterval =
-              intervalRaw === 'month' ? 'monthly' :
-              intervalRaw === 'year' ? 'annual' :
-              (metadataBillingInterval === 'monthly' || metadataBillingInterval === 'annual' ? metadataBillingInterval : null);
-            const subscriptionCustomerId = pickId(subscription?.customer) || customerId || null;
-            const contractStartAt = toIsoFromUnixSeconds(subscription?.start_date) || new Date().toISOString();
-            const updates = {
-              stripe_customer_id: subscriptionCustomerId,
-              stripe_subscription_id: subscriptionId,
-              stripe_subscription_schedule_id: pickId(subscription?.schedule) || null,
-              subscription_status: subStatus || null,
-              current_term_end: toIsoFromUnixSeconds(
-                subscription?.current_period_end ??
-                subscription?.items?.data?.[0]?.current_period_end ??
-                null
-              ),
-              cancel_at_term_end: subscription?.cancel_at_period_end === true,
-              billing_interval: billingInterval,
-              billing_status: subStatus === 'active' || subStatus === 'trialing' ? 'active' : 'inactive',
-              auto_renew: subscription?.cancel_at_period_end === true ? false : true,
-              cancel_effective_at: null,
-              contract_start_at: contractStartAt,
-              contract_end_at: addMonthsToIso(contractStartAt, 12)
-            };
+            const updates = buildClientSubscriptionUpdatesFromStripe(subscription, {
+              fallbackCustomerId: customerId,
+              fallbackSubscriptionId: subscriptionId,
+              fallbackBillingInterval: metadataBillingInterval
+            });
             if (['basic', 'pro', 'enterprise'].includes(metadataPlanTier)) {
               updates.plan_tier = metadataPlanTier;
             }
@@ -249,36 +247,20 @@ router.post('/', async (req, res) => {
       if (customerId) {
         const { data: client, error: clientErr } = await supabaseAdmin
           .from('clients')
-          .select('id,subscription_status')
+          .select('id')
           .eq('stripe_customer_id', customerId)
           .maybeSingle();
         if (clientErr) throw new Error(clientErr.message || 'Client lookup failed');
         if (client?.id) {
           if (subscriptionId) {
             const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-            const subStatus = String(subscription?.status || '').toLowerCase();
-            const intervalRaw = String(
-              subscription?.items?.data?.[0]?.price?.recurring?.interval ||
-              subscription?.plan?.interval ||
-              ''
-            ).toLowerCase();
-            const billingInterval =
-              intervalRaw === 'month' ? 'monthly' :
-              intervalRaw === 'year' ? 'annual' :
-              null;
-            const currentTermEnd = toIsoFromUnixSeconds(subscription?.current_period_end);
-            const cancelAtTermEnd = subscription?.cancel_at_period_end === true;
-            const scheduleId = pickId(subscription?.schedule) || null;
+            const updates = buildClientSubscriptionUpdatesFromStripe(subscription, {
+              fallbackCustomerId: customerId,
+              fallbackSubscriptionId: subscriptionId
+            });
             const { error: updateErr } = await supabaseAdmin
               .from('clients')
-              .update({
-                stripe_subscription_id: subscriptionId,
-                stripe_subscription_schedule_id: scheduleId,
-                subscription_status: subStatus || client.subscription_status || null,
-                current_term_end: currentTermEnd,
-                cancel_at_term_end: cancelAtTermEnd,
-                billing_interval: billingInterval
-              })
+              .update(updates)
               .eq('id', client.id);
             if (updateErr) throw new Error(updateErr.message || 'Client update failed');
           }
