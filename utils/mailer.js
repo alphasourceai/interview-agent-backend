@@ -44,7 +44,7 @@ async function sendSubscriptionCheckoutEmail(to, checkoutUrl) {
         <meta name="viewport" content="width=device-width,initial-scale=1" />
         <title>Complete your alphaScreen subscription</title>
         <style>
-          body { margin: 0; padding: 0; background: #0A1547; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+          body { margin: 0; padding: 0; background: #0F1E5D; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
           table { border-collapse: collapse; }
           a { text-decoration: none; }
           @media (max-width: 640px) {
@@ -58,7 +58,7 @@ async function sendSubscriptionCheckoutEmail(to, checkoutUrl) {
         <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
           Complete your secure subscription checkout to activate your account.
         </div>
-        <table role="presentation" width="100%" style="background:#0A1547;">
+        <table role="presentation" width="100%" style="background:#0F1E5D;">
           <tr>
             <td align="center" style="padding: 24px 16px;">
               <table role="presentation" width="100%" class="container" style="max-width: 640px;">
@@ -94,7 +94,7 @@ async function sendSubscriptionCheckoutEmail(to, checkoutUrl) {
                       </tr>
                       <tr>
                         <td style="color:#C9D3FF;font-size:14px;line-height:1.55;padding-bottom:16px;">
-                          If the button doesn’t work, <a href="${safeCheckoutUrl}" target="_blank" rel="noopener noreferrer" style="color:#CFCBFF;">click here</a> to complete your subscription checkout.
+                          If the button doesn’t work, <a href="${safeCheckoutUrl}" target="_blank" rel="noopener noreferrer" style="color:#FFFFFF;">click here</a> to complete your subscription checkout.
                         </td>
                       </tr>
                       <tr>
