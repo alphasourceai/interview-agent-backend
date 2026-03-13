@@ -1413,17 +1413,16 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
     const lineItems = []
     if (planTier === 'enterprise') {
       const platformFee = Number(req.body?.platform_fee)
-      const perRoleFee = Number(req.body?.per_role_fee)
-      if (!Number.isFinite(platformFee) || platformFee < 0 || !Number.isFinite(perRoleFee) || perRoleFee < 0) {
+      if (!Number.isFinite(platformFee) || platformFee <= 0) {
         return res.status(400).json({ error: 'invalid_enterprise_fees' })
       }
-      const totalCents = Math.round((platformFee + perRoleFee) * 100)
-      if (!Number.isFinite(totalCents) || totalCents <= 0) {
+      const platformCents = Math.round(platformFee * 100)
+      if (!Number.isFinite(platformCents) || platformCents <= 0) {
         return res.status(400).json({ error: 'invalid_enterprise_fees' })
       }
       const enterprisePrice = await stripe.prices.create({
         currency: 'usd',
-        unit_amount: totalCents,
+        unit_amount: platformCents,
         recurring: { interval: billingInterval === 'annual' ? 'year' : 'month' },
         product_data: { name: 'Enterprise subscription' },
         metadata: {
