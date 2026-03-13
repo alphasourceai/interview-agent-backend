@@ -52,6 +52,7 @@ const axios = require('axios')
 const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
+const { sendSubscriptionCheckoutEmail } = require('./utils/mailer')
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || FRONTEND_URL || '').replace(/\/+$/, '')
@@ -1310,6 +1311,187 @@ adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAd
       hint: null,
       request_id
     })
+  }
+})
+
+adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin, async (req, res) => {
+  const clientId = req.params?.id
+  const planTier = String(req.body?.plan_tier || '').trim().toLowerCase()
+  const billingInterval = String(req.body?.billing_interval || '').trim().toLowerCase()
+
+  if (!['basic', 'pro', 'enterprise'].includes(planTier)) {
+    return res.status(400).json({ error: 'invalid_plan_tier' })
+  }
+  if (!['monthly', 'annual'].includes(billingInterval)) {
+    return res.status(400).json({ error: 'invalid_billing_interval' })
+  }
+
+  const { data: client, error: clientError } = await supabaseAdmin
+    .from('clients')
+    .select('id,name,email,stripe_customer_id')
+    .eq('id', clientId)
+    .maybeSingle()
+  if (clientError) return res.status(500).json({ error: 'client_lookup_failed', detail: clientError.message })
+  if (!client) return res.status(404).json({ error: 'client_not_found' })
+
+  const clientEmail = String(client.email || '').trim()
+  if (!clientEmail) return res.status(400).json({ error: 'missing_client_email' })
+
+  const { data: billingCustomerRows, error: billingCustomerError } = await supabaseAdmin
+    .from('billing_customers')
+    .select('id,stripe_customer_id')
+    .eq('client_id', client.id)
+    .order('created_at', { ascending: false })
+  if (billingCustomerError) return res.status(500).json({ error: 'customer_lookup_failed', detail: billingCustomerError.message })
+  const billingCustomerList = Array.isArray(billingCustomerRows) ? billingCustomerRows : []
+  const billingCustomer = billingCustomerList[0] || null
+
+  try {
+    const Stripe = require('stripe')
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
+
+    const candidateStripeCustomerIds = []
+    for (const row of billingCustomerList) {
+      const id = String(row?.stripe_customer_id || '').trim()
+      if (!id) continue
+      if (!candidateStripeCustomerIds.includes(id)) candidateStripeCustomerIds.push(id)
+    }
+    const fallbackCustomerId = String(client?.stripe_customer_id || '').trim()
+    if (fallbackCustomerId && !candidateStripeCustomerIds.includes(fallbackCustomerId)) {
+      candidateStripeCustomerIds.push(fallbackCustomerId)
+    }
+
+    let resolvedStripeCustomerId = null
+    for (const candidateId of candidateStripeCustomerIds) {
+      try {
+        await stripe.customers.retrieve(candidateId)
+        resolvedStripeCustomerId = candidateId
+        break
+      } catch (e) {
+        const message = String(e?.message || '').toLowerCase()
+        const code = String(e?.code || '').toLowerCase()
+        if (code === 'resource_missing' || message.includes('no such customer')) continue
+        throw e
+      }
+    }
+
+    if (!resolvedStripeCustomerId) {
+      const createdCustomer = await stripe.customers.create({
+        name: client.name || undefined,
+        email: clientEmail,
+        metadata: { client_id: client.id }
+      })
+      resolvedStripeCustomerId = createdCustomer?.id || null
+    } else {
+      try {
+        await stripe.customers.update(resolvedStripeCustomerId, {
+          name: client.name || undefined,
+          email: clientEmail,
+          metadata: { client_id: client.id }
+        })
+      } catch (_) {}
+    }
+    if (!resolvedStripeCustomerId) return res.status(400).json({ error: 'missing_billing_customer' })
+
+    if (String(client?.stripe_customer_id || '').trim() !== resolvedStripeCustomerId) {
+      try {
+        await supabaseAdmin
+          .from('clients')
+          .update({ stripe_customer_id: resolvedStripeCustomerId })
+          .eq('id', client.id)
+      } catch (_) {}
+    }
+    if (billingCustomer?.id && String(billingCustomer?.stripe_customer_id || '').trim() !== resolvedStripeCustomerId) {
+      try {
+        await supabaseAdmin
+          .from('billing_customers')
+          .update({ stripe_customer_id: resolvedStripeCustomerId })
+          .eq('id', billingCustomer.id)
+      } catch (_) {}
+    }
+
+    const lineItems = []
+    if (planTier === 'enterprise') {
+      const platformFee = Number(req.body?.platform_fee)
+      const perRoleFee = Number(req.body?.per_role_fee)
+      if (!Number.isFinite(platformFee) || platformFee < 0 || !Number.isFinite(perRoleFee) || perRoleFee < 0) {
+        return res.status(400).json({ error: 'invalid_enterprise_fees' })
+      }
+      const totalCents = Math.round((platformFee + perRoleFee) * 100)
+      if (!Number.isFinite(totalCents) || totalCents <= 0) {
+        return res.status(400).json({ error: 'invalid_enterprise_fees' })
+      }
+      const enterprisePrice = await stripe.prices.create({
+        currency: 'usd',
+        unit_amount: totalCents,
+        recurring: { interval: billingInterval === 'annual' ? 'year' : 'month' },
+        product_data: { name: 'Enterprise subscription' },
+        metadata: {
+          source: 'admin_subscription_checkout',
+          client_id: client.id,
+          plan_tier: 'enterprise',
+          billing_interval: billingInterval
+        }
+      })
+      lineItems.push({
+        price: enterprisePrice.id,
+        quantity: 1
+      })
+    } else {
+      let priceId = ''
+      if (planTier === 'basic') {
+        priceId = billingInterval === 'annual'
+          ? String(process.env.STRIPE_PRICE_BASIC_ANNUAL || '')
+          : String(process.env.STRIPE_PRICE_BASIC_MONTHLY || '')
+      } else if (planTier === 'pro') {
+        priceId = billingInterval === 'annual'
+          ? String(process.env.STRIPE_PRICE_PRO_ANNUAL || '')
+          : String(process.env.STRIPE_PRICE_PRO_MONTHLY || '')
+      }
+      if (!priceId) return res.status(500).json({ error: 'stripe_price_not_configured' })
+      lineItems.push({ price: priceId, quantity: 1 })
+    }
+
+    const canonicalSiteBase = 'https://www.alphasourceai.com'
+    const checkoutMetadata = {
+      source: 'admin_subscription_checkout',
+      client_id: client.id,
+      plan_tier: planTier,
+      billing_interval: billingInterval
+    }
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: resolvedStripeCustomerId,
+      line_items: lineItems,
+      success_url: `${canonicalSiteBase}/account?checkout=success&client_id=${client.id}`,
+      cancel_url: `${canonicalSiteBase}/account?checkout=cancel&client_id=${client.id}`,
+      allow_promotion_codes: true,
+      metadata: checkoutMetadata,
+      subscription_data: {
+        metadata: checkoutMetadata
+      }
+    })
+
+    let email_sent = false
+    let email_error = null
+    try {
+      const emailResult = await sendSubscriptionCheckoutEmail(clientEmail, session?.url || '')
+      email_sent = emailResult?.statusCode === 202
+      if (!email_sent && emailResult?.skipped) email_error = 'email_skipped'
+    } catch (e) {
+      email_error = e?.message || 'email_send_failed'
+    }
+
+    return res.json({
+      ok: true,
+      url: session?.url || null,
+      session_id: session?.id || null,
+      client_email: clientEmail,
+      email_sent,
+      email_error
+    })
+  } catch (e) {
+    return res.status(500).json({ error: 'create_subscription_checkout_failed', detail: e?.message || 'create_subscription_checkout_failed' })
   }
 })
 

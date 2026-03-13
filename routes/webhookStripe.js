@@ -127,15 +127,89 @@ router.post('/', async (req, res) => {
           if (updateErr) throw new Error(updateErr.message || 'Client update failed');
         }
       }
+    } else if (event.type === 'checkout.session.completed') {
+      if (String(eventObject?.mode || '').toLowerCase() === 'subscription') {
+        const metadata = eventObject?.metadata && typeof eventObject.metadata === 'object' ? eventObject.metadata : {};
+        const metadataClientId = String(metadata?.client_id || '').trim();
+        const metadataPlanTier = String(metadata?.plan_tier || '').trim().toLowerCase();
+        const metadataBillingInterval = String(metadata?.billing_interval || '').trim().toLowerCase();
+        const subscriptionId = pickId(eventObject?.subscription);
+        const customerId = pickId(eventObject?.customer);
+
+        if (subscriptionId) {
+          let targetClientId = null;
+          if (metadataClientId) {
+            const { data: metadataClient, error: metadataClientErr } = await supabaseAdmin
+              .from('clients')
+              .select('id')
+              .eq('id', metadataClientId)
+              .maybeSingle();
+            if (metadataClientErr) throw new Error(metadataClientErr.message || 'Client lookup failed');
+            targetClientId = metadataClient?.id || null;
+          }
+          if (!targetClientId && customerId) {
+            const { data: customerClient, error: customerClientErr } = await supabaseAdmin
+              .from('clients')
+              .select('id')
+              .eq('stripe_customer_id', customerId)
+              .maybeSingle();
+            if (customerClientErr) throw new Error(customerClientErr.message || 'Client lookup failed');
+            targetClientId = customerClient?.id || null;
+          }
+          if (targetClientId) {
+            const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+            const subStatus = String(subscription?.status || '').toLowerCase();
+            const intervalRaw = String(
+              subscription?.items?.data?.[0]?.price?.recurring?.interval ||
+              subscription?.plan?.interval ||
+              ''
+            ).toLowerCase();
+            const billingInterval =
+              intervalRaw === 'month' ? 'monthly' :
+              intervalRaw === 'year' ? 'annual' :
+              (metadataBillingInterval === 'monthly' || metadataBillingInterval === 'annual' ? metadataBillingInterval : null);
+            const subscriptionCustomerId = pickId(subscription?.customer) || customerId || null;
+            const contractStartAt = toIsoFromUnixSeconds(subscription?.start_date) || new Date().toISOString();
+            const updates = {
+              stripe_customer_id: subscriptionCustomerId,
+              stripe_subscription_id: subscriptionId,
+              stripe_subscription_schedule_id: pickId(subscription?.schedule) || null,
+              subscription_status: subStatus || null,
+              current_term_end: toIsoFromUnixSeconds(
+                subscription?.current_period_end ??
+                subscription?.items?.data?.[0]?.current_period_end ??
+                null
+              ),
+              cancel_at_term_end: subscription?.cancel_at_period_end === true,
+              billing_interval: billingInterval,
+              billing_status: subStatus === 'active' || subStatus === 'trialing' ? 'active' : 'inactive',
+              auto_renew: subscription?.cancel_at_period_end === true ? false : true,
+              cancel_effective_at: null,
+              contract_start_at: contractStartAt,
+              contract_end_at: addMonthsToIso(contractStartAt, 12)
+            };
+            if (['basic', 'pro', 'enterprise'].includes(metadataPlanTier)) {
+              updates.plan_tier = metadataPlanTier;
+            }
+            const { error: updateErr } = await supabaseAdmin
+              .from('clients')
+              .update(updates)
+              .eq('id', targetClientId);
+            if (updateErr) throw new Error(updateErr.message || 'Client update failed');
+          }
+        }
+      }
     } else if (event.type === 'invoice.payment_succeeded' || event.type === 'invoice.payment_failed') {
       const customerId = pickId(eventObject?.customer);
       const subscriptionId = pickId(eventObject?.subscription);
       const metadata = eventObject?.metadata && typeof eventObject.metadata === 'object' ? eventObject.metadata : {};
+      const metadataSource = String(metadata?.source || '').trim().toLowerCase();
       const metadataClientId = String(metadata?.client_id || '').trim();
       const metadataPlanTier = String(metadata?.plan_tier || '').trim().toLowerCase();
       const metadataBillingInterval = String(metadata?.billing_interval || '').trim().toLowerCase();
       const isAdminSubscriptionInvoice =
         event.type === 'invoice.payment_succeeded' &&
+        metadataSource !== 'admin_subscription_checkout' &&
         !!metadataClientId &&
         ['basic', 'pro', 'enterprise'].includes(metadataPlanTier) &&
         ['monthly', 'annual'].includes(metadataBillingInterval);

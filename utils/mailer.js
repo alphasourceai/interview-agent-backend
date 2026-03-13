@@ -29,4 +29,21 @@ async function sendInvite(to, acceptUrl, inviterEmail) {
   return { statusCode: resp?.statusCode || 0 }
 }
 
-module.exports = { sendInvite }
+async function sendSubscriptionCheckoutEmail(to, checkoutUrl) {
+  if (!API_KEY) return { skipped: true }
+  const msg = {
+    to,
+    from: FROM,
+    subject: 'Complete your subscription checkout',
+    html: `
+      <p>Please complete your subscription checkout using the secure Stripe link below.</p>
+      <p><a href="${checkoutUrl}" target="_blank" rel="noopener">Complete subscription checkout</a></p>
+      <p>If the button does not work, copy and paste this URL into your browser:</p>
+      <p>${checkoutUrl}</p>
+    `,
+  }
+  const [resp] = await sg.send(msg)
+  return { statusCode: resp?.statusCode || 0 }
+}
+
+module.exports = { sendInvite, sendSubscriptionCheckoutEmail }
