@@ -49,7 +49,7 @@ async function sendSubscriptionCheckoutEmail(to, checkoutUrl) {
           a { text-decoration: none; }
           @media (max-width: 640px) {
             .container { width: 100% !important; padding: 16px !important; }
-            .card { padding: 20px !important; border-radius: 14px !important; }
+            .card { padding: 18px !important; border-radius: 14px !important; }
             .cta { display: block !important; width: 100% !important; text-align: center !important; box-sizing: border-box !important; }
           }
         </style>
@@ -60,50 +60,45 @@ async function sendSubscriptionCheckoutEmail(to, checkoutUrl) {
         </div>
         <table role="presentation" width="100%" style="background:#0A1547;">
           <tr>
-            <td align="center" style="padding: 28px 16px;">
+            <td align="center" style="padding: 24px 16px;">
               <table role="presentation" width="100%" class="container" style="max-width: 640px;">
                 <tr>
                   <td>
-                    <table role="presentation" width="100%" class="card" style="background:#0F1E5D;border:1px solid rgba(255,255,255,0.08);border-radius:16px;box-shadow:0 16px 40px rgba(1,6,30,0.36);padding:28px;">
+                    <table role="presentation" width="100%" class="card" style="background:#0F1E5D;border:1px solid rgba(255,255,255,0.08);border-radius:16px;box-shadow:0 16px 40px rgba(1,6,30,0.36);padding:24px;">
                       <tr>
-                        <td align="left" style="padding-bottom:18px;">
-                          <img src="http://cdn.mcauto-images-production.sendgrid.net/fe2f293446641ea1/9d2d6663-bd5f-4b91-8bf2-5704f37cbc78/3163x752.png" alt="AlphaSource" width="220" style="display:block;border:0;outline:none;text-decoration:none;height:auto;max-width:100%;" />
+                        <td align="left" style="padding-bottom:16px;">
+                          <img src="http://cdn.mcauto-images-production.sendgrid.net/fe2f293446641ea1/9d2d6663-bd5f-4b91-8bf2-5704f37cbc78/3163x752.png" alt="AlphaSource" width="208" style="display:block;border:0;outline:none;text-decoration:none;height:auto;max-width:100%;" />
                         </td>
                       </tr>
                       <tr>
-                        <td style="color:#E6EBFF;font-size:26px;line-height:1.2;font-weight:700;padding-bottom:12px;">
+                        <td style="color:#E6EBFF;font-size:24px;line-height:1.25;font-weight:700;padding-bottom:10px;">
                           Complete your alphaScreen subscription
                         </td>
                       </tr>
                       <tr>
-                        <td style="color:#C9D3FF;font-size:16px;line-height:1.6;padding-bottom:14px;">
+                        <td style="color:#C9D3FF;font-size:15px;line-height:1.6;padding-bottom:12px;">
                           Hi,
                         </td>
                       </tr>
                       <tr>
-                        <td style="color:#C9D3FF;font-size:16px;line-height:1.6;padding-bottom:22px;">
+                        <td style="color:#C9D3FF;font-size:15px;line-height:1.6;padding-bottom:20px;">
                           Your subscription setup is almost complete. Use the button below to finish secure checkout and activate your account.
                         </td>
                       </tr>
                       <tr>
-                        <td style="padding-bottom:22px;">
-                          <a class="cta" href="${safeCheckoutUrl}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#A78BFA;color:#0A1547;border:1px solid #CFCBFF;border-radius:10px;padding:12px 20px;font-size:15px;font-weight:700;line-height:1;">
+                        <td style="padding-bottom:18px;">
+                          <a class="cta" href="${safeCheckoutUrl}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#A78BFA;color:#0A1547;border:1px solid #CFCBFF;border-radius:10px;padding:11px 18px;font-size:14px;font-weight:700;line-height:1;">
                             Complete subscription checkout
                           </a>
                         </td>
                       </tr>
                       <tr>
-                        <td style="color:#C9D3FF;font-size:14px;line-height:1.6;padding-bottom:6px;">
-                          If the button doesn’t work, copy and paste this link into your browser:
+                        <td style="color:#C9D3FF;font-size:14px;line-height:1.55;padding-bottom:16px;">
+                          If the button doesn’t work, <a href="${safeCheckoutUrl}" target="_blank" rel="noopener noreferrer" style="color:#CFCBFF;">click here</a> to complete your subscription checkout.
                         </td>
                       </tr>
                       <tr>
-                        <td style="padding-bottom:20px;">
-                          <a href="${safeCheckoutUrl}" target="_blank" rel="noopener noreferrer" style="color:#CFCBFF;font-size:14px;line-height:1.5;word-break:break-all;">${safeCheckoutUrl}</a>
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="border-top:1px solid rgba(255,255,255,0.10);padding-top:16px;color:#6B77C9;font-size:13px;line-height:1.6;">
+                        <td style="border-top:1px solid rgba(255,255,255,0.10);padding-top:14px;color:#6B77C9;font-size:13px;line-height:1.55;">
                           Need help? Email <a href="mailto:info@alphasourceai.com" style="color:#A78BFA;">info@alphasourceai.com</a>
                         </td>
                       </tr>
