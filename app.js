@@ -878,7 +878,35 @@ adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
     .select('id,name,email,created_at,plan_tier,billing_status,manual_active_override,access_override_mode,candidate_assistance_contact,stripe_customer_id,stripe_subscription_id,subscription_status,current_term_end,cancel_at_term_end,billing_interval,contract_start_at,contract_end_at,auto_renew')
     .order('created_at', { ascending: false })
   if (error) return res.status(500).json({ error: 'list_clients_failed', detail: error.message })
-  res.json({ items: data || [] })
+  const items = data || []
+  const clientIds = items.map((item) => item?.id).filter(Boolean)
+  if (!clientIds.length) return res.json({ items })
+
+  const { data: planSettingsRows, error: planSettingsError } = await supabaseAdmin
+    .from('client_plan_settings')
+    .select('client_id,plan_tier,per_role_fee,included_interviews_per_role,additional_interview_fee,updated_at')
+    .in('client_id', clientIds)
+    .order('updated_at', { ascending: false })
+  if (planSettingsError) return res.status(500).json({ error: 'list_clients_failed', detail: planSettingsError.message })
+
+  const planSettingsByClientId = {}
+  for (const row of planSettingsRows || []) {
+    const key = row?.client_id
+    if (!key || planSettingsByClientId[key]) continue
+    planSettingsByClientId[key] = row
+  }
+
+  const enrichedItems = items.map((item) => {
+    const settings = planSettingsByClientId[item.id] || null
+    return {
+      ...item,
+      plan_settings_plan_tier: settings?.plan_tier || null,
+      plan_settings_per_role_fee: settings?.per_role_fee ?? null,
+      plan_settings_included_interviews_per_role: settings?.included_interviews_per_role ?? null,
+      plan_settings_additional_interview_fee: settings?.additional_interview_fee ?? null
+    }
+  })
+  res.json({ items: enrichedItems })
 })
 
 // Create client (writes email to satisfy NOT NULL)
