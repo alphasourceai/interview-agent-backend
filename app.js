@@ -208,6 +208,76 @@ app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
   }
 })
 
+app.get('/clients/billing/summary', requireAuth, withClientScope, async (req, res) => {
+  try {
+    const ids = Array.isArray(req.client_memberships) ? req.client_memberships : []
+    if (ids.length === 0) return res.json({ items: [] })
+
+    const wantedClientId = String(req.query?.client_id || '').trim()
+    if (wantedClientId && !ids.includes(wantedClientId)) {
+      return res.status(403).json({ error: 'forbidden' })
+    }
+
+    let q = supabaseAdmin
+      .from('clients')
+      .select('id,name,plan_tier,billing_status,billing_interval,auto_renew,current_term_end,subscription_status,cancel_at_term_end,access_override_mode,stripe_customer_id')
+      .in('id', ids)
+      .order('name', { ascending: true })
+    if (wantedClientId) q = q.eq('id', wantedClientId)
+
+    const { data, error } = await q
+    if (error) return res.status(500).json({ error: 'list_billing_summary_failed', detail: error.message })
+
+    const items = (data || []).map((client) => ({
+      id: client.id,
+      name: client.name,
+      plan_tier: client.plan_tier,
+      billing_status: client.billing_status,
+      billing_interval: client.billing_interval,
+      auto_renew: client.auto_renew,
+      current_term_end: client.current_term_end,
+      subscription_status: client.subscription_status,
+      cancel_at_term_end: client.cancel_at_term_end,
+      access_override_mode: client.access_override_mode,
+      has_stripe_customer: !!client.stripe_customer_id
+    }))
+    return res.json({ items })
+  } catch (e) {
+    return res.status(500).json({ error: 'server_error' })
+  }
+})
+
+app.post('/clients/billing/portal-session', requireAuth, withClientScope, async (req, res) => {
+  try {
+    const ids = Array.isArray(req.client_memberships) ? req.client_memberships : []
+    const clientId = String(req.body?.client_id || '').trim()
+    if (!clientId) return res.status(400).json({ error: 'client_id_required' })
+    if (!ids.includes(clientId)) return res.status(403).json({ error: 'forbidden' })
+
+    const { data: client, error: clientErr } = await supabaseAdmin
+      .from('clients')
+      .select('id,stripe_customer_id')
+      .eq('id', clientId)
+      .maybeSingle()
+    if (clientErr) return res.status(500).json({ error: 'client_lookup_failed', detail: clientErr.message })
+    if (!client) return res.status(404).json({ error: 'client_not_found' })
+
+    const stripeCustomerId = String(client.stripe_customer_id || '').trim()
+    if (!stripeCustomerId) return res.status(400).json({ error: 'missing_stripe_customer' })
+
+    const Stripe = require('stripe')
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
+    const accountBase = (FRONTEND_BASE || 'https://www.alphasourceai.com').replace(/\/+$/, '')
+    const session = await stripe.billingPortal.sessions.create({
+      customer: stripeCustomerId,
+      return_url: `${accountBase}/dashboard`
+    })
+    return res.json({ ok: true, url: session?.url || null })
+  } catch (e) {
+    return res.status(500).json({ error: 'create_portal_session_failed', detail: e?.message || 'create_portal_session_failed' })
+  }
+})
+
 const clientMembersScopedRouter = require('./routes/clientMembersScoped')
 app.use('/api/client-members', clientMembersScopedRouter)
 app.use('/client-members', clientMembersScopedRouter)
