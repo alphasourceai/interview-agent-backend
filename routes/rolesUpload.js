@@ -50,8 +50,8 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
     if (!client_id) return res.status(400).json({ error: 'Missing client_id' });
     if (!role_id) return res.status(400).json({ error: 'Missing role_id' });
 
-    // Scope check: withClientScope added by app.js sets req.clientIds
-    const scopedIds = Array.isArray(req.clientIds) ? req.clientIds : [];
+    // Scope check: withClientScope added by app.js sets req.client_memberships
+    const scopedIds = Array.isArray(req.client_memberships) ? req.client_memberships : [];
     if (!scopedIds.includes(client_id)) return res.status(403).json({ error: 'Forbidden' });
 
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
