@@ -74,6 +74,105 @@ function parseWholeNumber(raw, options = {}) {
   return n;
 }
 
+function getSubscriptionMetadataSources(subscription) {
+  const subscriptionMetadata = subscription?.metadata && typeof subscription?.metadata === 'object' ? subscription.metadata : {};
+  const priceMetadata = subscription?.items?.data?.[0]?.price?.metadata && typeof subscription?.items?.data?.[0]?.price?.metadata === 'object'
+    ? subscription.items.data[0].price.metadata
+    : {};
+  const planMetadata = subscription?.items?.data?.[0]?.plan?.metadata && typeof subscription?.items?.data?.[0]?.plan?.metadata === 'object'
+    ? subscription.items.data[0].plan.metadata
+    : {};
+  return { subscriptionMetadata, priceMetadata, planMetadata };
+}
+
+function getSubscriptionMetadataValue(metadataSources, key, fallback = null) {
+  const pick = (obj) => {
+    const value = obj?.[key];
+    if (value == null) return null;
+    const text = String(value).trim();
+    return text ? text : null;
+  };
+  return (
+    pick(metadataSources?.subscriptionMetadata) ||
+    pick(metadataSources?.priceMetadata) ||
+    pick(metadataSources?.planMetadata) ||
+    fallback
+  );
+}
+
+function buildClientPlanSettingsPayloadFromSubscription(subscription, clientId, options = {}) {
+  if (!clientId) return null;
+  const subStatus = String(subscription?.status || '').toLowerCase();
+  if (!LIVE_SUB_STATUSES.has(subStatus)) return null;
+
+  const metadataSources = getSubscriptionMetadataSources(subscription);
+  const metadataSource = String(getSubscriptionMetadataValue(metadataSources, 'source', options.fallbackSource || '') || '').trim().toLowerCase();
+  if (metadataSource !== 'admin_subscription_checkout') return null;
+
+  const planTier = String(getSubscriptionMetadataValue(metadataSources, 'plan_tier', options.fallbackPlanTier || '') || '').trim().toLowerCase();
+  if (!['basic', 'pro', 'enterprise'].includes(planTier)) return null;
+
+  const metadataBillingInterval = String(getSubscriptionMetadataValue(metadataSources, 'billing_interval', options.fallbackBillingInterval || '') || '').trim().toLowerCase();
+  const intervalRaw =
+    subscription?.items?.data?.[0]?.price?.recurring?.interval ||
+    subscription?.plan?.interval ||
+    '';
+  const billingInterval = ['monthly', 'annual'].includes(metadataBillingInterval)
+    ? metadataBillingInterval
+    : normalizeBillingInterval(intervalRaw, options.fallbackBillingInterval || null);
+  if (!['monthly', 'annual'].includes(String(billingInterval || '').toLowerCase())) return null;
+
+  if (planTier === 'enterprise') {
+    const platformFee = parseMoneyValue(getSubscriptionMetadataValue(metadataSources, 'platform_fee', options.fallbackPlatformFee), { allowZero: false });
+    const perRoleFee = parseMoneyValue(getSubscriptionMetadataValue(metadataSources, 'per_role_fee', options.fallbackPerRoleFee));
+    const includedInterviewsPerRole = parseWholeNumber(getSubscriptionMetadataValue(metadataSources, 'included_interviews_per_role', options.fallbackIncludedInterviewsPerRole));
+    const additionalInterviewFee = parseMoneyValue(getSubscriptionMetadataValue(metadataSources, 'additional_interview_fee', options.fallbackAdditionalInterviewFee));
+
+    if (
+      platformFee === null ||
+      perRoleFee === null ||
+      includedInterviewsPerRole === null ||
+      additionalInterviewFee === null
+    ) {
+      return null;
+    }
+
+    return {
+      client_id: clientId,
+      plan_tier: 'enterprise',
+      billing_interval: billingInterval,
+      platform_fee: platformFee,
+      per_role_fee: perRoleFee,
+      included_interviews_per_role: includedInterviewsPerRole,
+      additional_interview_fee: additionalInterviewFee,
+      max_interview_minutes: 15
+    };
+  }
+
+  const defaults = PLAN_SETTINGS_DEFAULTS[planTier];
+  if (!defaults) return null;
+  return {
+    client_id: clientId,
+    plan_tier: planTier,
+    billing_interval: billingInterval,
+    platform_fee: null,
+    per_role_fee: defaults.per_role_fee,
+    included_interviews_per_role: defaults.included_interviews_per_role,
+    additional_interview_fee: defaults.additional_interview_fee,
+    max_interview_minutes: defaults.max_interview_minutes
+  };
+}
+
+async function upsertClientPlanSettingsFromSubscription(subscription, clientId, options = {}) {
+  const payload = buildClientPlanSettingsPayloadFromSubscription(subscription, clientId, options);
+  if (!payload) return false;
+  const { error } = await supabaseAdmin
+    .from('client_plan_settings')
+    .upsert(payload, { onConflict: 'client_id' });
+  if (error) throw new Error(error.message || 'Client plan settings upsert failed');
+  return true;
+}
+
 function buildClientSubscriptionUpdatesFromStripe(subscription, options = {}) {
   const subStatus = String(subscription?.status || '').toLowerCase();
   const metadata = subscription?.metadata && typeof subscription?.metadata === 'object' ? subscription.metadata : {};
@@ -186,6 +285,12 @@ router.post('/', async (req, res) => {
             .update(updates)
             .eq('id', client.id);
           if (updateErr) throw new Error(updateErr.message || 'Client update failed');
+          if (event.type !== 'customer.subscription.deleted') {
+            await upsertClientPlanSettingsFromSubscription(eventObject, client.id, {
+              fallbackPlanTier: updates?.plan_tier || null,
+              fallbackBillingInterval: updates?.billing_interval || null
+            });
+          }
         }
       }
     } else if (event.type === 'checkout.session.completed') {
