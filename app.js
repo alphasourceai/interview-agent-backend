@@ -368,9 +368,27 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, async 
       }
     }
 
+    const { data: pendingRolePurchase, error: pendingRolePurchaseErr } = await supabaseAdmin
+      .from('pending_role_purchases')
+      .insert({
+        client_id: client.id,
+        stripe_customer_id: stripeCustomerId || null,
+        status: 'pending',
+        role_title: roleTitle,
+        interview_type: interviewType,
+        plan_tier: String(planSettings.plan_tier || '').trim() || null,
+        billing_interval: String(planSettings.billing_interval || '').trim() || null
+      })
+      .select('id')
+      .single()
+    if (pendingRolePurchaseErr) {
+      return res.status(500).json({ error: 'create_pending_role_purchase_failed', detail: pendingRolePurchaseErr.message })
+    }
+
     const sessionMetadata = {
       source: 'client_role_purchase',
       client_id: client.id,
+      pending_role_purchase_id: pendingRolePurchase.id,
       role_title: roleTitle,
       interview_type: interviewType,
       plan_tier: String(planSettings.plan_tier || ''),
@@ -392,6 +410,17 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, async 
       cancel_url: `${canonicalSiteBase}/account?role_checkout=cancel&client_id=${client.id}`,
       metadata: sessionMetadata
     })
+
+    const { error: pendingRolePurchaseUpdateErr } = await supabaseAdmin
+      .from('pending_role_purchases')
+      .update({
+        stripe_checkout_session_id: session?.id || null,
+        stripe_customer_id: stripeCustomerId || null
+      })
+      .eq('id', pendingRolePurchase.id)
+    if (pendingRolePurchaseUpdateErr) {
+      return res.status(500).json({ error: 'update_pending_role_purchase_failed', detail: pendingRolePurchaseUpdateErr.message })
+    }
 
     return res.json({ ok: true, url: session?.url || null, session_id: session?.id || null })
   } catch (e) {

@@ -294,14 +294,83 @@ router.post('/', async (req, res) => {
         }
       }
     } else if (event.type === 'checkout.session.completed') {
-      if (String(eventObject?.mode || '').toLowerCase() === 'subscription') {
-        const metadata = eventObject?.metadata && typeof eventObject.metadata === 'object' ? eventObject.metadata : {};
-        const metadataSource = String(metadata?.source || '').trim().toLowerCase();
-        const metadataClientId = String(metadata?.client_id || '').trim();
-        const metadataPlanTier = String(metadata?.plan_tier || '').trim().toLowerCase();
-        const metadataBillingInterval = String(metadata?.billing_interval || '').trim().toLowerCase();
+      const metadata = eventObject?.metadata && typeof eventObject.metadata === 'object' ? eventObject.metadata : {};
+      const metadataSource = String(metadata?.source || '').trim().toLowerCase();
+      const metadataClientId = String(metadata?.client_id || '').trim();
+      const metadataPlanTier = String(metadata?.plan_tier || '').trim().toLowerCase();
+      const metadataBillingInterval = String(metadata?.billing_interval || '').trim().toLowerCase();
+      const customerId = pickId(eventObject?.customer);
+
+      if (metadataSource === 'client_role_purchase') {
+        const pendingRolePurchaseId = String(metadata?.pending_role_purchase_id || '').trim();
+        if (!pendingRolePurchaseId) throw new Error('Pending role purchase id missing');
+        const { data: pendingRolePurchase, error: pendingRolePurchaseErr } = await supabaseAdmin
+          .from('pending_role_purchases')
+          .select('id,client_id,status,role_title,interview_type,finalized_role_id')
+          .eq('id', pendingRolePurchaseId)
+          .maybeSingle();
+        if (pendingRolePurchaseErr) throw new Error(pendingRolePurchaseErr.message || 'Pending role purchase lookup failed');
+        if (!pendingRolePurchase) throw new Error('Pending role purchase not found');
+
+        if (!pendingRolePurchase.finalized_role_id) {
+          const amountTotal = Number(eventObject?.amount_total);
+          const { error: markPaidErr } = await supabaseAdmin
+            .from('pending_role_purchases')
+            .update({
+              status: 'paid',
+              stripe_checkout_session_id: pickId(eventObject?.id) || null,
+              stripe_payment_intent_id: pickId(eventObject?.payment_intent) || null,
+              stripe_customer_id: customerId || null,
+              amount_paid: Number.isFinite(amountTotal) ? (amountTotal / 100) : null,
+              paid_at: new Date().toISOString()
+            })
+            .is('finalized_role_id', null)
+            .in('status', ['pending', 'paid'])
+            .eq('id', pendingRolePurchase.id);
+          if (markPaidErr) throw new Error(markPaidErr.message || 'Pending role purchase paid update failed');
+
+          const { data: claimedPendingRolePurchase, error: claimFinalizeErr } = await supabaseAdmin
+            .from('pending_role_purchases')
+            .update({ status: 'finalizing' })
+            .eq('id', pendingRolePurchase.id)
+            .is('finalized_role_id', null)
+            .in('status', ['pending', 'paid'])
+            .select('id,client_id,role_title,interview_type')
+            .maybeSingle();
+          if (claimFinalizeErr) throw new Error(claimFinalizeErr.message || 'Pending role purchase claim failed');
+          if (claimedPendingRolePurchase) {
+            const roleTitle = String(claimedPendingRolePurchase.role_title || '').trim();
+            if (!roleTitle) throw new Error('Pending role title missing');
+            const interviewTypeRaw = String(claimedPendingRolePurchase.interview_type || '').trim().toUpperCase();
+            const interviewType = ['BASIC', 'DETAILED', 'TECHNICAL'].includes(interviewTypeRaw) ? interviewTypeRaw : null;
+            const { data: createdRole, error: createdRoleErr } = await supabaseAdmin
+              .from('roles')
+              .insert({
+                client_id: claimedPendingRolePurchase.client_id,
+                title: roleTitle,
+                interview_type: interviewType
+              })
+              .select('id')
+              .single();
+            if (createdRoleErr) throw new Error(createdRoleErr.message || 'Role creation failed');
+
+            const { data: finalizedPendingRolePurchase, error: finalizeErr } = await supabaseAdmin
+              .from('pending_role_purchases')
+              .update({
+                finalized_role_id: createdRole.id,
+                status: 'finalized',
+                finalized_at: new Date().toISOString()
+              })
+              .eq('id', claimedPendingRolePurchase.id)
+              .is('finalized_role_id', null)
+              .eq('status', 'finalizing')
+              .select('id')
+              .maybeSingle();
+            if (finalizeErr || !finalizedPendingRolePurchase) throw new Error(finalizeErr?.message || 'Pending role purchase finalize failed');
+          }
+        }
+      } else if (String(eventObject?.mode || '').toLowerCase() === 'subscription') {
         const subscriptionId = pickId(eventObject?.subscription);
-        const customerId = pickId(eventObject?.customer);
 
         if (subscriptionId) {
           let targetClientId = null;
