@@ -267,10 +267,10 @@ app.post('/clients/billing/portal-session', requireAuth, withClientScope, async 
 
     const Stripe = require('stripe')
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
-    const accountBase = (FRONTEND_BASE || 'https://www.alphasourceai.com').replace(/\/+$/, '')
+    const accountReturnUrl = 'https://www.alphasourceai.com/account'
     const session = await stripe.billingPortal.sessions.create({
       customer: stripeCustomerId,
-      return_url: `${accountBase}/dashboard`
+      return_url: accountReturnUrl
     })
     return res.json({ ok: true, url: session?.url || null })
   } catch (e) {
