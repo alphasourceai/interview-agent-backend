@@ -278,6 +278,127 @@ app.post('/clients/billing/portal-session', requireAuth, withClientScope, async 
   }
 })
 
+app.post('/clients/roles/checkout-session', requireAuth, withClientScope, async (req, res) => {
+  try {
+    const ids = Array.isArray(req.client_memberships) ? req.client_memberships : []
+    const clientId = String(req.body?.client_id || '').trim()
+    const roleTitle = String(req.body?.role_title || '').trim()
+    const interviewType = String(req.body?.interview_type || '').trim().toUpperCase()
+
+    if (!clientId) return res.status(400).json({ error: 'client_id_required' })
+    if (!ids.includes(clientId)) return res.status(403).json({ error: 'forbidden' })
+    if (!roleTitle) return res.status(400).json({ error: 'role_title_required' })
+    if (!['BASIC', 'DETAILED', 'TECHNICAL'].includes(interviewType)) {
+      return res.status(400).json({ error: 'invalid_interview_type' })
+    }
+
+    const { data: client, error: clientErr } = await supabaseAdmin
+      .from('clients')
+      .select('id,name,email,billing_status,access_override_mode,stripe_customer_id')
+      .eq('id', clientId)
+      .maybeSingle()
+    if (clientErr) return res.status(500).json({ error: 'client_lookup_failed', detail: clientErr.message })
+    if (!client) return res.status(404).json({ error: 'client_not_found' })
+
+    const accessOverrideMode = String(client.access_override_mode || '').toLowerCase()
+    const billingStatus = String(client.billing_status || '').toLowerCase()
+    const allowedByBilling =
+      accessOverrideMode === 'force_active' ||
+      (accessOverrideMode !== 'force_inactive' && billingStatus === 'active')
+    if (!allowedByBilling) return res.status(403).json({ error: 'client_inactive' })
+
+    const { data: planSettings, error: planSettingsErr } = await supabaseAdmin
+      .from('client_plan_settings')
+      .select('plan_tier,billing_interval,per_role_fee')
+      .eq('client_id', client.id)
+      .maybeSingle()
+    if (planSettingsErr) return res.status(500).json({ error: 'plan_settings_lookup_failed', detail: planSettingsErr.message })
+    if (!planSettings) return res.status(400).json({ error: 'missing_plan_settings' })
+
+    const perRoleFee = Number(planSettings.per_role_fee)
+    if (!Number.isFinite(perRoleFee) || perRoleFee <= 0) {
+      return res.status(400).json({ error: 'invalid_per_role_fee' })
+    }
+    const perRoleCents = Math.round(perRoleFee * 100)
+    if (!Number.isFinite(perRoleCents) || perRoleCents <= 0) {
+      return res.status(400).json({ error: 'invalid_per_role_fee' })
+    }
+
+    const Stripe = require('stripe')
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
+
+    let stripeCustomerId = String(client.stripe_customer_id || '').trim()
+    if (stripeCustomerId) {
+      try {
+        await stripe.customers.retrieve(stripeCustomerId)
+      } catch (e) {
+        const code = String(e?.code || '').toLowerCase()
+        const message = String(e?.message || '').toLowerCase()
+        if (code === 'resource_missing' || message.includes('no such customer')) {
+          stripeCustomerId = ''
+        } else {
+          throw e
+        }
+      }
+    }
+    if (!stripeCustomerId) {
+      const email = String(client.email || '').trim()
+      if (email) {
+        const found = await stripe.customers.list({ email, limit: 1 })
+        stripeCustomerId = String(found?.data?.[0]?.id || '').trim()
+      }
+      if (!stripeCustomerId) {
+        const createdCustomer = await stripe.customers.create({
+          name: client.name || undefined,
+          email: String(client.email || '').trim() || undefined,
+          metadata: { client_id: client.id }
+        })
+        stripeCustomerId = String(createdCustomer?.id || '').trim()
+      }
+      if (!stripeCustomerId) return res.status(500).json({ error: 'stripe_customer_create_failed' })
+
+      if (stripeCustomerId !== String(client.stripe_customer_id || '').trim()) {
+        const { error: saveCustomerError } = await supabaseAdmin
+          .from('clients')
+          .update({ stripe_customer_id: stripeCustomerId })
+          .eq('id', client.id)
+        if (saveCustomerError) {
+          return res.status(500).json({ error: 'client_update_failed', detail: saveCustomerError.message })
+        }
+      }
+    }
+
+    const sessionMetadata = {
+      source: 'client_role_purchase',
+      client_id: client.id,
+      role_title: roleTitle,
+      interview_type: interviewType,
+      plan_tier: String(planSettings.plan_tier || ''),
+      billing_interval: String(planSettings.billing_interval || '')
+    }
+    const rolePrice = await stripe.prices.create({
+      currency: 'usd',
+      unit_amount: perRoleCents,
+      product_data: { name: 'Role creation fee' },
+      metadata: sessionMetadata
+    })
+
+    const canonicalSiteBase = 'https://www.alphasourceai.com'
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      customer: stripeCustomerId,
+      line_items: [{ price: rolePrice.id, quantity: 1 }],
+      success_url: `${canonicalSiteBase}/account?role_checkout=success&client_id=${client.id}`,
+      cancel_url: `${canonicalSiteBase}/account?role_checkout=cancel&client_id=${client.id}`,
+      metadata: sessionMetadata
+    })
+
+    return res.json({ ok: true, url: session?.url || null, session_id: session?.id || null })
+  } catch (e) {
+    return res.status(500).json({ error: 'create_role_checkout_session_failed', detail: e?.message || 'create_role_checkout_session_failed' })
+  }
+})
+
 const clientMembersScopedRouter = require('./routes/clientMembersScoped')
 app.use('/api/client-members', clientMembersScopedRouter)
 app.use('/client-members', clientMembersScopedRouter)
