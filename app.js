@@ -1481,14 +1481,31 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
     }
 
     const lineItems = []
+    let enterpriseCheckoutMetadata = null
     if (planTier === 'enterprise') {
       const platformFee = Number(req.body?.platform_fee)
+      const perRoleFee = Number(req.body?.per_role_fee)
+      const includedInterviewsPerRole = Number(req.body?.included_interviews_per_role)
+      const additionalInterviewFee = Number(req.body?.additional_interview_fee)
       if (!Number.isFinite(platformFee) || platformFee <= 0) {
+        return res.status(400).json({ error: 'invalid_enterprise_fees' })
+      }
+      if (
+        !Number.isFinite(perRoleFee) || perRoleFee < 0 ||
+        !Number.isFinite(includedInterviewsPerRole) || !Number.isInteger(includedInterviewsPerRole) || includedInterviewsPerRole < 0 ||
+        !Number.isFinite(additionalInterviewFee) || additionalInterviewFee < 0
+      ) {
         return res.status(400).json({ error: 'invalid_enterprise_fees' })
       }
       const platformCents = Math.round(platformFee * 100)
       if (!Number.isFinite(platformCents) || platformCents <= 0) {
         return res.status(400).json({ error: 'invalid_enterprise_fees' })
+      }
+      enterpriseCheckoutMetadata = {
+        platform_fee: String(Math.round(platformFee * 100) / 100),
+        per_role_fee: String(Math.round(perRoleFee * 100) / 100),
+        included_interviews_per_role: String(includedInterviewsPerRole),
+        additional_interview_fee: String(Math.round(additionalInterviewFee * 100) / 100)
       }
       const enterprisePrice = await stripe.prices.create({
         currency: 'usd',
@@ -1499,7 +1516,8 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
           source: 'admin_subscription_checkout',
           client_id: client.id,
           plan_tier: 'enterprise',
-          billing_interval: billingInterval
+          billing_interval: billingInterval,
+          ...enterpriseCheckoutMetadata
         }
       })
       lineItems.push({
@@ -1526,7 +1544,8 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
       source: 'admin_subscription_checkout',
       client_id: client.id,
       plan_tier: planTier,
-      billing_interval: billingInterval
+      billing_interval: billingInterval,
+      ...(enterpriseCheckoutMetadata || {})
     }
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',

@@ -34,6 +34,20 @@ function pickId(value) {
 }
 
 const LIVE_SUB_STATUSES = new Set(['active', 'trialing']);
+const PLAN_SETTINGS_DEFAULTS = {
+  basic: {
+    per_role_fee: 399,
+    included_interviews_per_role: 25,
+    additional_interview_fee: 35,
+    max_interview_minutes: 8
+  },
+  pro: {
+    per_role_fee: 699,
+    included_interviews_per_role: 50,
+    additional_interview_fee: 45,
+    max_interview_minutes: 10
+  }
+};
 
 function normalizeBillingInterval(raw, fallback = null) {
   const intervalRaw = String(raw || '').toLowerCase();
@@ -41,6 +55,23 @@ function normalizeBillingInterval(raw, fallback = null) {
   if (intervalRaw === 'year') return 'annual';
   if (fallback === 'monthly' || fallback === 'annual') return fallback;
   return null;
+}
+
+function parseMoneyValue(raw, options = {}) {
+  const allowZero = options.allowZero !== false;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return null;
+  const rounded = Math.round(n * 100) / 100;
+  if (allowZero ? rounded < 0 : rounded <= 0) return null;
+  return rounded;
+}
+
+function parseWholeNumber(raw, options = {}) {
+  const allowZero = options.allowZero !== false;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return null;
+  if (allowZero ? n < 0 : n <= 0) return null;
+  return n;
 }
 
 function buildClientSubscriptionUpdatesFromStripe(subscription, options = {}) {
@@ -201,6 +232,57 @@ router.post('/', async (req, res) => {
               .update(updates)
               .eq('id', targetClientId);
             if (updateErr) throw new Error(updateErr.message || 'Client update failed');
+
+            if (metadataSource === 'admin_subscription_checkout') {
+              const planTierForSettings = String(updates?.plan_tier || metadataPlanTier || '').trim().toLowerCase();
+              const billingIntervalForSettings = String(updates?.billing_interval || metadataBillingInterval || '').trim().toLowerCase();
+              let planSettingsPayload = null;
+
+              if (['basic', 'pro'].includes(planTierForSettings) && ['monthly', 'annual'].includes(billingIntervalForSettings)) {
+                const defaults = PLAN_SETTINGS_DEFAULTS[planTierForSettings];
+                planSettingsPayload = {
+                  client_id: targetClientId,
+                  plan_tier: planTierForSettings,
+                  billing_interval: billingIntervalForSettings,
+                  platform_fee: null,
+                  per_role_fee: defaults.per_role_fee,
+                  included_interviews_per_role: defaults.included_interviews_per_role,
+                  additional_interview_fee: defaults.additional_interview_fee,
+                  max_interview_minutes: defaults.max_interview_minutes
+                };
+              } else if (planTierForSettings === 'enterprise' && ['monthly', 'annual'].includes(billingIntervalForSettings)) {
+                const subscriptionMetadata = subscription?.metadata && typeof subscription?.metadata === 'object' ? subscription.metadata : {};
+                const platformFee = parseMoneyValue(subscriptionMetadata?.platform_fee ?? metadata?.platform_fee, { allowZero: false });
+                const perRoleFee = parseMoneyValue(subscriptionMetadata?.per_role_fee ?? metadata?.per_role_fee);
+                const includedInterviewsPerRole = parseWholeNumber(subscriptionMetadata?.included_interviews_per_role ?? metadata?.included_interviews_per_role);
+                const additionalInterviewFee = parseMoneyValue(subscriptionMetadata?.additional_interview_fee ?? metadata?.additional_interview_fee);
+
+                if (
+                  platformFee !== null &&
+                  perRoleFee !== null &&
+                  includedInterviewsPerRole !== null &&
+                  additionalInterviewFee !== null
+                ) {
+                  planSettingsPayload = {
+                    client_id: targetClientId,
+                    plan_tier: 'enterprise',
+                    billing_interval: billingIntervalForSettings,
+                    platform_fee: platformFee,
+                    per_role_fee: perRoleFee,
+                    included_interviews_per_role: includedInterviewsPerRole,
+                    additional_interview_fee: additionalInterviewFee,
+                    max_interview_minutes: 15
+                  };
+                }
+              }
+
+              if (planSettingsPayload) {
+                const { error: planSettingsErr } = await supabaseAdmin
+                  .from('client_plan_settings')
+                  .upsert(planSettingsPayload, { onConflict: 'client_id' });
+                if (planSettingsErr) throw new Error(planSettingsErr.message || 'Client plan settings upsert failed');
+              }
+            }
           }
         }
       }
