@@ -46,6 +46,8 @@ if (SENTRY_ENABLED) {
 const express = require('express')
 const cors = require('cors')
 const crypto = require('crypto')
+const multer = require('multer')
+const path = require('path')
 const { supabaseAdmin } = require('./src/lib/supabaseClient')
 const { generateRubricAndKBForRole } = require('./generateRubric')
 const axios = require('axios')
@@ -56,6 +58,11 @@ const { sendSubscriptionCheckoutEmail } = require('./utils/mailer')
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || FRONTEND_URL || '').replace(/\/+$/, '')
+const ROLE_CHECKOUT_JD_BUCKET = (process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || process.env.SUPABASE_JD_BUCKET || 'job-descriptions').trim()
+const roleCheckoutUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 }
+})
 const app = express()
 
 // Sentry request middleware (must be before other app.use and routes)
@@ -278,12 +285,13 @@ app.post('/clients/billing/portal-session', requireAuth, withClientScope, async 
   }
 })
 
-app.post('/clients/roles/checkout-session', requireAuth, withClientScope, async (req, res) => {
+app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCheckoutUpload.single('file'), async (req, res) => {
   try {
     const ids = Array.isArray(req.client_memberships) ? req.client_memberships : []
     const clientId = String(req.body?.client_id || '').trim()
     const roleTitle = String(req.body?.role_title || '').trim()
     const interviewType = String(req.body?.interview_type || '').trim().toUpperCase()
+    const jdFile = req.file || null
 
     if (!clientId) return res.status(400).json({ error: 'client_id_required' })
     if (!ids.includes(clientId)) return res.status(403).json({ error: 'forbidden' })
@@ -291,6 +299,23 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, async 
     if (!['BASIC', 'DETAILED', 'TECHNICAL'].includes(interviewType)) {
       return res.status(400).json({ error: 'invalid_interview_type' })
     }
+    if (!jdFile) return res.status(400).json({ error: 'file_required' })
+
+    const originalFilename = String(jdFile.originalname || '').trim()
+    const ext = path.extname(originalFilename).toLowerCase()
+    if (!['.pdf', '.docx'].includes(ext)) {
+      return res.status(400).json({ error: 'invalid_file_type' })
+    }
+    if (!jdFile.buffer || !jdFile.buffer.length) {
+      return res.status(400).json({ error: 'invalid_file' })
+    }
+    const rawName = path.basename(originalFilename, ext)
+    const safeBase = rawName.replace(/[^a-z0-9._-]+/gi, '-').replace(/^-+|-+$/g, '') || `jd-${Date.now()}`
+    const safeFilename = `${safeBase}${ext}`
+    const contentType =
+      ext === '.pdf'
+        ? 'application/pdf'
+        : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 
     const { data: client, error: clientErr } = await supabaseAdmin
       .from('clients')
@@ -385,6 +410,25 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, async 
       return res.status(500).json({ error: 'create_pending_role_purchase_failed', detail: pendingRolePurchaseErr.message })
     }
 
+    const pendingJdObjectKey = `pending/${client.id}/${pendingRolePurchase.id}/${safeFilename}`
+    const pendingJdUpload = await supabaseAdmin.storage
+      .from(ROLE_CHECKOUT_JD_BUCKET)
+      .upload(pendingJdObjectKey, jdFile.buffer, { contentType, upsert: true })
+    if (pendingJdUpload.error) {
+      return res.status(500).json({ error: 'pending_jd_upload_failed', detail: pendingJdUpload.error.message })
+    }
+
+    const pendingJdStoragePath = `${ROLE_CHECKOUT_JD_BUCKET}/${pendingJdObjectKey}`
+    const { error: pendingRolePurchaseJdUpdateErr } = await supabaseAdmin
+      .from('pending_role_purchases')
+      .update({
+        jd_storage_path: pendingJdStoragePath
+      })
+      .eq('id', pendingRolePurchase.id)
+    if (pendingRolePurchaseJdUpdateErr) {
+      return res.status(500).json({ error: 'update_pending_role_purchase_failed', detail: pendingRolePurchaseJdUpdateErr.message })
+    }
+
     const sessionMetadata = {
       source: 'client_role_purchase',
       client_id: client.id,
@@ -406,6 +450,7 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, async 
       mode: 'payment',
       customer: stripeCustomerId,
       line_items: [{ price: rolePrice.id, quantity: 1 }],
+      allow_promotion_codes: true,
       success_url: `${canonicalSiteBase}/account?role_checkout=success&client_id=${client.id}`,
       cancel_url: `${canonicalSiteBase}/account?role_checkout=cancel&client_id=${client.id}`,
       metadata: sessionMetadata
