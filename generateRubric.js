@@ -4,79 +4,12 @@ const OpenAI = require('openai')
 const { randomUUID } = require('crypto')
 const path = require('path')
 const { parseBufferToText } = require('./utils/jdParser')
-const { ensureTavusDocumentForRole } = require('./lib/tavusDocuments')
 
 // Create internal clients with SR key (server-side only)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false }
 })
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-
-const INTERVIEW_TYPE_PROMPTS = {
-  BASIC: 'Create 5 short, screening-style questions that quickly assess overall fit, communication, and motivation. Keep them grounded in the job description and highlight day-to-day expectations.',
-  DETAILED: 'Create 6-8 deeper behavioral and leadership questions. Encourage STAR-style answers and tie each question to responsibilities or success metrics pulled from the job description.',
-  TECHNICAL: 'Create 8-10 technical or skill-based questions focused on the specific tools, systems, and requirements in the job description. Include scenario-based or problem-solving prompts when appropriate.'
-}
-
-function normalizeInterviewType(type) {
-  const key = String(type || 'BASIC').trim().toUpperCase()
-  if (!['BASIC', 'DETAILED', 'TECHNICAL'].includes(key)) {
-    console.warn(`[rubric] unknown_interview_type type=${type}; falling back to BASIC`)
-    return 'BASIC'
-  }
-  return key
-}
-
-function buildPrompt({ role, jdText, manualQuestions }) {
-  const type = normalizeInterviewType(role.interview_type)
-  const guidance = INTERVIEW_TYPE_PROMPTS[type] || INTERVIEW_TYPE_PROMPTS.BASIC
-  return `You are an AI interview designer. Using the role details below, craft a JSON rubric that Interview Agent will feed into Tavus.
-
-Return ONLY valid JSON with this shape:
-{
-  "questions": [
-    { "text": "Question text...", "category": "skill_or_theme" }
-  ]
-}
-
-Rules:
-- Every question MUST reference the responsibilities, skills, or context from the job description.
-- Include clear categories (skill areas) so downstream scoring can bucket responses.
-- ${guidance}
-
-Role Title: ${role.title || 'Unknown Role'}
-Interview Type: ${type}
-
-Job Description Text:
-${jdText || 'N/A'}
-
-Custom / Manual Questions Provided By The Client (use or adapt as needed):
-${manualQuestions || 'None'}
-`
-}
-
-function validateRubric(rubricObj, context) {
-  if (!rubricObj || typeof rubricObj !== 'object') {
-    console.error('[rubric] invalid_structure', context)
-    throw new Error('rubric_invalid_structure')
-  }
-  if (!Array.isArray(rubricObj.questions) || rubricObj.questions.length === 0) {
-    console.error('[rubric] empty_rubric', context)
-    throw new Error('rubric_empty')
-  }
-  return rubricObj
-}
-
-function buildFallbackRubric(role) {
-  const title = role?.title || 'this role'
-  return {
-    questions: [
-      { text: `What experience makes you a strong fit for the ${title} position?`, category: 'experience' },
-      { text: `Tell me about a recent accomplishment that best demonstrates your impact for ${title}.`, category: 'impact' },
-      { text: `What motivates you most about contributing to ${title}?`, category: 'motivation' }
-    ]
-  }
-}
 
 function splitBucketAndKey(full) {
   // Expects strings like "job-descriptions/<objectPath>"
@@ -119,13 +52,10 @@ async function generateRubricAndKBForRole(roleId) {
   // 1) Load role
   const { data: role, error: roleErr } = await supabase
     .from('roles')
-    .select('id, title, interview_type, manual_questions, job_description_url, tavus_document_id')
+    .select('id, title, interview_type, manual_questions, job_description_url')
     .eq('id', roleId)
     .single()
   if (roleErr || !role) throw new Error(`role_lookup_failed: ${roleErr?.message || 'not found'}`)
-
-  const interviewType = normalizeInterviewType(role.interview_type)
-  console.log(`[rubric] generate role=${roleId} type=${interviewType}`)
 
   // 2) Pull + parse JD (if present)
   let jdText = ''
@@ -139,16 +69,27 @@ async function generateRubricAndKBForRole(roleId) {
       jdText = await parseBufferToText(buf, mime, key)
     }
   }
-  if (!jdText) {
-    console.warn(`[rubric] missing_job_description role=${roleId} type=${interviewType} url=${role.job_description_url || 'none'}`)
-  }
 
   // 3) Build LLM prompt
-  const prompt = buildPrompt({
-    role: { ...role, interview_type: interviewType },
-    jdText,
-    manualQuestions: role.manual_questions || 'None'
-  })
+  const prompt = `
+You are an AI interview designer. Create a JSON rubric based on the job description and any custom questions.
+
+Return ONLY valid JSON. Shape:
+{
+  "questions": [
+    { "text": "Question text...", "category": "skill_or_theme" }
+  ]
+}
+
+Interview Type: ${role.interview_type || 'BASIC'}
+Role Title: ${role.title}
+
+Job Description (may be empty):
+${jdText || 'N/A'}
+
+Manual Questions:
+${role.manual_questions || 'None'}
+`.trim()
 
   // 4) Call OpenAI
   let rubricObj = null
@@ -160,38 +101,27 @@ async function generateRubricAndKBForRole(roleId) {
     })
     const raw = resp?.choices?.[0]?.message?.content || ''
     rubricObj = safeJSONParse(raw)
-    if (!rubricObj) {
-      console.error('[rubric] openai_parse_failed', { role_id: roleId, interview_type: interviewType, raw })
-      throw new Error('rubric_parse_failed')
-    }
   } catch (e) {
-    console.error('[rubric] openai_rubric_failed', { role_id: roleId, interview_type: interviewType, error: e?.message || e })
-    throw e
+    // Keep going; we'll fallback to basic KB if needed
+    console.error('openai_rubric_failed:', e?.message || e)
   }
 
-  try {
-    rubricObj = validateRubric(rubricObj, { role_id: roleId, interview_type: interviewType })
-  } catch (err) {
-    if (!jdText) {
-      console.warn('[rubric] empty_rubric_fallback', { role_id: roleId, interview_type: interviewType, reason: 'missing_jd' })
-      rubricObj = validateRubric(buildFallbackRubric(role), { role_id: roleId, interview_type: interviewType, fallback: true })
-    } else {
-      throw err
-    }
+  // Fallback rubric if parsing failed
+  if (!rubricObj || !Array.isArray(rubricObj.questions)) {
+    const fallbackQ = role.title
+      ? [`What experience makes you a strong fit for the ${role.title} role?`]
+      : [`Tell me about your most relevant experience for this role.`]
+    rubricObj = { questions: fallbackQ.map(t => ({ text: t, category: 'auto' })) }
   }
 
-  // 5) Write rubric to roles.rubric + description (first chunk of JD text)
-  const description = jdText ? jdText.slice(0, 2000) : null
+  // 5) Write rubric to roles.rubric + canonical parsed JD text
   await supabase.from('roles').update({
     rubric: rubricObj,
-    ...(description ? { description } : {})
+    ...(jdText ? { job_description_text: jdText } : {})
   }).eq('id', roleId)
 
   // 6) Create + upload KB JSON (kbs/<uuid>.json), store <uuid> in roles.kb_document_id
   const kbJson = makeKBFromRubric(rubricObj)
-  if (!Array.isArray(kbJson.questions) || kbJson.questions.length === 0) {
-    throw new Error('kb_generation_failed: rubric produced no questions')
-  }
   const kbId = randomUUID()
   const kbKey = `${kbId}.json`
   const { error: upErr } = await supabase.storage
@@ -216,15 +146,6 @@ async function generateRubricAndKBForRole(roleId) {
     .update({ kb_document_id: kbId })
     .eq('id', roleId)
   if (updErr) throw new Error(`kb_id_update_failed: ${updErr.message}`)
-
-  try {
-    await ensureTavusDocumentForRole(
-      { id: roleId, title: role.title, kb_document_id: kbId, tavus_document_id: role.tavus_document_id },
-      { supabase, rubric: kbJson }
-    )
-  } catch (e) {
-    console.error('[tavus-doc] ensure failed after KB generation:', e?.message || e)
-  }
 
   return { role_id: roleId, kb_document_id: kbId }
 }

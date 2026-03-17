@@ -39,7 +39,7 @@ function okContentType(filename) {
  * Side effects:
  *  - Uploads JD file to JD_BUCKET
  *  - Parses text (pdf/docx)
- *  - Updates role: job_description_url, description
+ *  - Updates role: job_description_url, job_description_text
  *  - (NEW) Conditionally enriches rubric/KB if role has neither rubric nor KB yet
  * Returns: { ok, role, parsed_text_preview }
  */
@@ -73,7 +73,7 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
 
     const job_description_url = `${JD_BUCKET}/${objectKey}`;
 
-    // 2) Parse JD text to populate roles.description (best-effort)
+    // 2) Parse JD text to populate roles.job_description_text (best-effort)
     let parsedText = '';
     try {
       parsedText = await parseBufferToText(buffer, contentType, originalname);
@@ -82,14 +82,14 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
     }
 
     const updates = { job_description_url };
-    if (parsedText) updates.description = parsedText.slice(0, 15000);
+    if (parsedText) updates.job_description_text = parsedText;
 
-    // 3) Update role with JD path (+ optional description)
+    // 3) Update role with JD path (+ optional parsed JD text)
     let { data: updated, error: updErr } = await supabaseAdmin
       .from('roles')
       .update(updates)
       .eq('id', role_id)
-      .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,tavus_document_id,created_at')
+      .select('id,title,client_id,slug_or_token,interview_type,job_description_url,job_description_text,description,rubric,kb_document_id,tavus_document_id,created_at')
       .single();
 
     if (updErr) {
@@ -109,7 +109,7 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
         // Re-fetch the role so FE gets fresh rubric/kb fields in the response
         const refetch = await supabaseAdmin
           .from('roles')
-          .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,tavus_document_id,created_at')
+          .select('id,title,client_id,slug_or_token,interview_type,job_description_url,job_description_text,description,rubric,kb_document_id,tavus_document_id,created_at')
           .eq('id', role_id)
           .single();
         if (!refetch.error && refetch.data) {
@@ -117,7 +117,7 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
         }
       } catch (e) {
         console.error('[upload-jd] post-upload enrichment failed:', e?.message || e);
-        // Do not fail the upload response—JD is saved and description set.
+        // Do not fail the upload response—JD is saved and parsed text set.
       }
     }
 

@@ -355,32 +355,24 @@ router.post('/', async (req, res) => {
             if (!roleTitle) throw new Error('Pending role title missing');
             const interviewTypeRaw = String(claimedPendingRolePurchase.interview_type || '').trim().toUpperCase();
             const interviewType = ['BASIC', 'DETAILED', 'TECHNICAL'].includes(interviewTypeRaw) ? interviewTypeRaw : null;
-            const purchaseWindowAnchorRaw = claimedPendingRolePurchase.paid_at || claimedPendingRolePurchase.created_at || null;
-            const purchaseWindowAnchorMs = Date.parse(purchaseWindowAnchorRaw || '');
-            const recoveryWindowMs = 15 * 60 * 1000;
-            const { data: candidateRecoveryRoles, error: candidateRecoveryRolesErr } = await supabaseAdmin
+            const { data: linkedRole, error: linkedRoleErr } = await supabaseAdmin
               .from('roles')
-              .select('id,created_at')
+              .select('id')
               .eq('client_id', claimedPendingRolePurchase.client_id)
-              .eq('title', roleTitle)
-              .eq('interview_type', interviewType)
+              .eq('pending_role_purchase_id', claimedPendingRolePurchase.id)
               .order('created_at', { ascending: false })
-              .limit(10);
-            if (candidateRecoveryRolesErr) throw new Error(candidateRecoveryRolesErr.message || 'Role recovery lookup failed');
-            const recoveredRole = Number.isFinite(purchaseWindowAnchorMs)
-              ? (candidateRecoveryRoles || []).find((role) => {
-                  const roleCreatedAtMs = Date.parse(role?.created_at || '');
-                  return Number.isFinite(roleCreatedAtMs) && Math.abs(roleCreatedAtMs - purchaseWindowAnchorMs) <= recoveryWindowMs;
-                }) || null
-              : null;
-            let createdRole = recoveredRole ? { id: recoveredRole.id } : null;
+              .limit(1)
+              .maybeSingle();
+            if (linkedRoleErr) throw new Error(linkedRoleErr.message || 'Role recovery lookup failed');
+            let createdRole = linkedRole ? { id: linkedRole.id } : null;
             if (!createdRole) {
               const { data: insertedRole, error: createdRoleErr } = await supabaseAdmin
                 .from('roles')
                 .insert({
                   client_id: claimedPendingRolePurchase.client_id,
                   title: roleTitle,
-                  interview_type: interviewType
+                  interview_type: interviewType,
+                  pending_role_purchase_id: claimedPendingRolePurchase.id
                 })
                 .select('id')
                 .single();
