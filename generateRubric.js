@@ -4,6 +4,7 @@ const OpenAI = require('openai')
 const { randomUUID } = require('crypto')
 const path = require('path')
 const { parseBufferToText } = require('./utils/jdParser')
+const { ensureTavusDocumentForRole } = require('./lib/tavusDocuments')
 
 // Create internal clients with SR key (server-side only)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
@@ -148,6 +149,18 @@ ${role.manual_questions || 'None'}
     .update({ kb_document_id: kbId })
     .eq('id', roleId)
   if (updErr) throw new Error(`kb_id_update_failed: ${updErr.message}`)
+
+  try {
+    await ensureTavusDocumentForRole(
+      { id: roleId, title: role.title, kb_document_id: kbId },
+      { supabase, rubric: rubricObj }
+    )
+  } catch (tavusErr) {
+    console.error(
+      `[generateRubric] tavus_document_creation_failed role=${roleId} kb_document_id=${kbId}:`,
+      tavusErr?.message || tavusErr
+    )
+  }
 
   return { role_id: roleId, kb_document_id: kbId }
 }
