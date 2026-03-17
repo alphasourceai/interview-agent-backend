@@ -115,9 +115,11 @@ ${role.manual_questions || 'None'}
   }
 
   // 5) Write rubric to roles.rubric + canonical parsed JD text
+  const descriptionExcerpt = jdText ? jdText.replace(/\s+/g, ' ').trim().slice(0, 400) : ''
   await supabase.from('roles').update({
     rubric: rubricObj,
-    ...(jdText ? { job_description_text: jdText } : {})
+    rubric_questions: Array.isArray(rubricObj?.questions) ? rubricObj.questions : [],
+    ...(jdText ? { job_description_text: jdText, description: descriptionExcerpt || null } : {})
   }).eq('id', roleId)
 
   // 6) Create + upload KB JSON (kbs/<uuid>.json), store <uuid> in roles.kb_document_id

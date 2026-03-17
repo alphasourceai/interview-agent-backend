@@ -82,7 +82,11 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
     }
 
     const updates = { job_description_url };
-    if (parsedText) updates.job_description_text = parsedText;
+    if (parsedText) {
+      const descriptionExcerpt = parsedText.replace(/\s+/g, ' ').trim().slice(0, 400);
+      updates.job_description_text = parsedText;
+      updates.description = descriptionExcerpt || null;
+    }
 
     // 3) Update role with JD path (+ optional parsed JD text)
     let { data: updated, error: updErr } = await supabaseAdmin
