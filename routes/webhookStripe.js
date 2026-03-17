@@ -306,7 +306,7 @@ router.post('/', async (req, res) => {
         if (!pendingRolePurchaseId) throw new Error('Pending role purchase id missing');
         const { data: pendingRolePurchase, error: pendingRolePurchaseErr } = await supabaseAdmin
           .from('pending_role_purchases')
-          .select('id,client_id,status,role_title,interview_type,jd_storage_path,finalized_role_id')
+          .select('id,client_id,status,role_title,interview_type,jd_storage_path,created_at,paid_at,finalized_role_id')
           .eq('id', pendingRolePurchaseId)
           .maybeSingle();
         if (pendingRolePurchaseErr) throw new Error(pendingRolePurchaseErr.message || 'Pending role purchase lookup failed');
@@ -329,30 +329,64 @@ router.post('/', async (req, res) => {
             .eq('id', pendingRolePurchase.id);
           if (markPaidErr) throw new Error(markPaidErr.message || 'Pending role purchase paid update failed');
 
-          const { data: claimedPendingRolePurchase, error: claimFinalizeErr } = await supabaseAdmin
+          const { data: initialClaimedPendingRolePurchase, error: claimFinalizeErr } = await supabaseAdmin
             .from('pending_role_purchases')
             .update({ status: 'finalizing' })
             .eq('id', pendingRolePurchase.id)
             .is('finalized_role_id', null)
             .in('status', ['pending', 'paid'])
-            .select('id,client_id,role_title,interview_type,jd_storage_path')
+            .select('id,client_id,role_title,interview_type,jd_storage_path,created_at,paid_at')
             .maybeSingle();
           if (claimFinalizeErr) throw new Error(claimFinalizeErr.message || 'Pending role purchase claim failed');
+          let claimedPendingRolePurchase = initialClaimedPendingRolePurchase || null;
+          if (!claimedPendingRolePurchase) {
+            const { data: inProgressPendingRolePurchase, error: inProgressClaimErr } = await supabaseAdmin
+              .from('pending_role_purchases')
+              .select('id,client_id,role_title,interview_type,jd_storage_path,created_at,paid_at')
+              .eq('id', pendingRolePurchase.id)
+              .is('finalized_role_id', null)
+              .eq('status', 'finalizing')
+              .maybeSingle();
+            if (inProgressClaimErr) throw new Error(inProgressClaimErr.message || 'Pending role purchase claim failed');
+            claimedPendingRolePurchase = inProgressPendingRolePurchase || null;
+          }
           if (claimedPendingRolePurchase) {
             const roleTitle = String(claimedPendingRolePurchase.role_title || '').trim();
             if (!roleTitle) throw new Error('Pending role title missing');
             const interviewTypeRaw = String(claimedPendingRolePurchase.interview_type || '').trim().toUpperCase();
             const interviewType = ['BASIC', 'DETAILED', 'TECHNICAL'].includes(interviewTypeRaw) ? interviewTypeRaw : null;
-            const { data: createdRole, error: createdRoleErr } = await supabaseAdmin
+            const purchaseWindowAnchorRaw = claimedPendingRolePurchase.paid_at || claimedPendingRolePurchase.created_at || null;
+            const purchaseWindowAnchorMs = Date.parse(purchaseWindowAnchorRaw || '');
+            const recoveryWindowMs = 15 * 60 * 1000;
+            const { data: candidateRecoveryRoles, error: candidateRecoveryRolesErr } = await supabaseAdmin
               .from('roles')
-              .insert({
-                client_id: claimedPendingRolePurchase.client_id,
-                title: roleTitle,
-                interview_type: interviewType
-              })
-              .select('id')
-              .single();
-            if (createdRoleErr) throw new Error(createdRoleErr.message || 'Role creation failed');
+              .select('id,created_at')
+              .eq('client_id', claimedPendingRolePurchase.client_id)
+              .eq('title', roleTitle)
+              .eq('interview_type', interviewType)
+              .order('created_at', { ascending: false })
+              .limit(10);
+            if (candidateRecoveryRolesErr) throw new Error(candidateRecoveryRolesErr.message || 'Role recovery lookup failed');
+            const recoveredRole = Number.isFinite(purchaseWindowAnchorMs)
+              ? (candidateRecoveryRoles || []).find((role) => {
+                  const roleCreatedAtMs = Date.parse(role?.created_at || '');
+                  return Number.isFinite(roleCreatedAtMs) && Math.abs(roleCreatedAtMs - purchaseWindowAnchorMs) <= recoveryWindowMs;
+                }) || null
+              : null;
+            let createdRole = recoveredRole ? { id: recoveredRole.id } : null;
+            if (!createdRole) {
+              const { data: insertedRole, error: createdRoleErr } = await supabaseAdmin
+                .from('roles')
+                .insert({
+                  client_id: claimedPendingRolePurchase.client_id,
+                  title: roleTitle,
+                  interview_type: interviewType
+                })
+                .select('id')
+                .single();
+              if (createdRoleErr) throw new Error(createdRoleErr.message || 'Role creation failed');
+              createdRole = insertedRole;
+            }
 
             const jdStoragePath = String(claimedPendingRolePurchase.jd_storage_path || '').trim();
             if (jdStoragePath) {
