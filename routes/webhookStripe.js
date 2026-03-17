@@ -306,7 +306,7 @@ router.post('/', async (req, res) => {
         if (!pendingRolePurchaseId) throw new Error('Pending role purchase id missing');
         const { data: pendingRolePurchase, error: pendingRolePurchaseErr } = await supabaseAdmin
           .from('pending_role_purchases')
-          .select('id,client_id,status,role_title,interview_type,finalized_role_id')
+          .select('id,client_id,status,role_title,interview_type,jd_storage_path,finalized_role_id')
           .eq('id', pendingRolePurchaseId)
           .maybeSingle();
         if (pendingRolePurchaseErr) throw new Error(pendingRolePurchaseErr.message || 'Pending role purchase lookup failed');
@@ -335,7 +335,7 @@ router.post('/', async (req, res) => {
             .eq('id', pendingRolePurchase.id)
             .is('finalized_role_id', null)
             .in('status', ['pending', 'paid'])
-            .select('id,client_id,role_title,interview_type')
+            .select('id,client_id,role_title,interview_type,jd_storage_path')
             .maybeSingle();
           if (claimFinalizeErr) throw new Error(claimFinalizeErr.message || 'Pending role purchase claim failed');
           if (claimedPendingRolePurchase) {
@@ -353,6 +353,18 @@ router.post('/', async (req, res) => {
               .select('id')
               .single();
             if (createdRoleErr) throw new Error(createdRoleErr.message || 'Role creation failed');
+
+            const jdStoragePath = String(claimedPendingRolePurchase.jd_storage_path || '').trim();
+            if (jdStoragePath) {
+              const { error: roleJdUpdateErr } = await supabaseAdmin
+                .from('roles')
+                .update({ job_description_url: jdStoragePath })
+                .eq('id', createdRole.id)
+                .eq('client_id', claimedPendingRolePurchase.client_id);
+              if (roleJdUpdateErr) throw new Error(roleJdUpdateErr.message || 'Role JD update failed');
+              const { generateRubricAndKBForRole } = require('../generateRubric');
+              await generateRubricAndKBForRole(createdRole.id);
+            }
 
             const { data: finalizedPendingRolePurchase, error: finalizeErr } = await supabaseAdmin
               .from('pending_role_purchases')
