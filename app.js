@@ -1796,7 +1796,7 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
     let email_sent = false
     let email_error = null
     try {
-      const emailResult = await sendSubscriptionCheckoutEmail(clientEmail, session?.url || '')
+      const emailResult = await sendSubscriptionCheckoutEmail(clientEmail, session?.url || '', client.name || '')
       email_sent = emailResult?.statusCode === 202
       if (!email_sent && emailResult?.skipped) email_error = 'email_skipped'
     } catch (e) {

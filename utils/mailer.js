@@ -29,9 +29,12 @@ async function sendInvite(to, acceptUrl, inviterEmail) {
   return { statusCode: resp?.statusCode || 0 }
 }
 
-async function sendSubscriptionCheckoutEmail(to, checkoutUrl) {
+async function sendSubscriptionCheckoutEmail(to, checkoutUrl, recipientName) {
   if (!API_KEY) return { skipped: true }
   const safeCheckoutUrl = String(checkoutUrl || '').trim()
+  const firstNameRaw = String(recipientName || '').trim().split(/\s+/).filter(Boolean)[0] || ''
+  const safeFirstName = firstNameRaw.replace(/[^A-Za-z0-9'.-]/g, '').slice(0, 40)
+  const greeting = /[A-Za-z0-9]/.test(safeFirstName) ? `Hi ${safeFirstName},` : 'Hi there,'
   const msg = {
     to,
     from: FROM,
@@ -42,6 +45,8 @@ async function sendSubscriptionCheckoutEmail(to, checkoutUrl) {
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <meta name="color-scheme" content="light dark" />
+        <meta name="supported-color-schemes" content="light dark" />
         <title>Complete your alphaScreen subscription</title>
         <style>
           body { margin: 0; padding: 0; background: #0F1E5D; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
@@ -58,13 +63,13 @@ async function sendSubscriptionCheckoutEmail(to, checkoutUrl) {
         <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
           Complete your secure subscription checkout to activate your account.
         </div>
-        <table role="presentation" width="100%" style="background:#0F1E5D;">
+        <table role="presentation" width="100%" style="background:#0F1E5D;color:#C9D3FF;">
           <tr>
             <td align="center" style="padding: 24px 16px;">
               <table role="presentation" width="100%" class="container" style="max-width: 640px;">
                 <tr>
                   <td>
-                    <table role="presentation" width="100%" class="card" style="background:#0F1E5D;border:0;border-radius:0;box-shadow:none;padding:24px;">
+                    <table role="presentation" width="100%" class="card" style="background:#0F1E5D;color:#C9D3FF;border:0;border-radius:0;box-shadow:none;padding:24px;">
                       <tr>
                         <td align="left" style="padding-bottom:16px;">
                           <img src="http://cdn.mcauto-images-production.sendgrid.net/fe2f293446641ea1/9d2d6663-bd5f-4b91-8bf2-5704f37cbc78/3163x752.png" alt="AlphaSource" width="208" style="display:block;border:0;outline:none;text-decoration:none;height:auto;max-width:100%;" />
@@ -77,7 +82,7 @@ async function sendSubscriptionCheckoutEmail(to, checkoutUrl) {
                       </tr>
                       <tr>
                         <td style="color:#C9D3FF;font-size:15px;line-height:1.6;padding-bottom:12px;">
-                          Hi,
+                          ${greeting}
                         </td>
                       </tr>
                       <tr>
