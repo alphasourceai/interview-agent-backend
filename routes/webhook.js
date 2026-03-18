@@ -98,6 +98,15 @@ function clampScore(value) {
   return Math.max(0, Math.min(100, Math.round(n)));
 }
 
+function elapsedSecondsSince(isoLike, endAt) {
+  if (!isoLike) return null;
+  const started = new Date(isoLike);
+  if (Number.isNaN(started.getTime())) return null;
+  const ended = endAt instanceof Date ? endAt : new Date(endAt || Date.now());
+  if (Number.isNaN(ended.getTime())) return null;
+  return Math.max(0, Math.round((ended.getTime() - started.getTime()) / 1000));
+}
+
 function extractPerceptionScores(payload) {
   if (!payload || typeof payload !== 'object') return {};
 
@@ -767,6 +776,8 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
   try {
     const body = req.body || {};
     const requestId = getRequestId(req, body);
+    const eventReceivedAt = new Date();
+    const eventReceivedAtIso = eventReceivedAt.toISOString();
 
     const eventTypeRaw = pickFirst(
       fromAny(body, 'event_type'),
@@ -819,6 +830,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
 
     console.log('[webhook] received', {
       request_id: requestId || null,
+      received_at: eventReceivedAtIso,
       event_type_raw: eventTypeRaw ?? null,
       event_type: eventType || null,
       interview_id: interviewId || null,
@@ -848,6 +860,19 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
     if (!interview) {
       console.error(`[webhook] interview not found conversation_id=${conversationId || 'null'}`);
       return res.status(200).json({ ok: true });
+    }
+    const interviewCreatedAt = interview?.created_at || null;
+    const elapsedFromInterviewCreatedSec = elapsedSecondsSince(interviewCreatedAt, eventReceivedAt);
+    if (isTranscriptionReady || isPerceptionAnalysis) {
+      console.log('[webhook] event_timing', {
+        request_id: requestId || null,
+        event_type: eventType || null,
+        interview_id: interview.id || null,
+        conversation_id: conversationId || null,
+        interview_created_at: interviewCreatedAt,
+        received_at: eventReceivedAtIso,
+        elapsed_seconds_from_interview_created: elapsedFromInterviewCreatedSec
+      });
     }
 
     const statusBefore = interview.status || null;
@@ -1149,6 +1174,8 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
           event_type: eventType || null,
           interview_id: interview.id,
           conversation_id: conversationId || null,
+          interview_created_at: interviewCreatedAt,
+          elapsed_seconds_from_interview_created: elapsedFromInterviewCreatedSec,
           extracted_keys: extractedKeys,
           extracted_count: extractedKeys.length,
           stored: perceptionResult?.stored ?? null
@@ -1157,8 +1184,11 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
         perceptionKeysCount = 0;
         console.log('[webhook] perception_analysis missing analysis', {
           request_id: requestId || null,
+          event_type: eventType || null,
           interview_id: interview.id,
           conversation_id: conversationId || null,
+          interview_created_at: interviewCreatedAt,
+          elapsed_seconds_from_interview_created: elapsedFromInterviewCreatedSec,
           top_keys: Object.keys(body || {}),
           payload_keys: Object.keys(body?.payload || {})
         });
@@ -1257,8 +1287,13 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
             }
           }
 
-          console.log('[webhook] post-transcription status normalization', {
+        console.log('[webhook] post-transcription status normalization', {
+            request_id: requestId || null,
+            event_type: eventType || null,
             interview_id: interview.id,
+            conversation_id: conversationId || null,
+            interview_created_at: interviewCreatedAt,
+            elapsed_seconds_from_interview_created: elapsedFromInterviewCreatedSec,
             status_from: statusFrom,
             status_to: statusTo,
             scoring_updated: scoringResult?.updated || false
