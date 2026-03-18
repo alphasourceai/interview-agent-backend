@@ -1112,6 +1112,10 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   const name = (req.body?.name || '').trim()
   const adminName  = (req.body?.admin_name  || '').trim()
   const adminEmail = (req.body?.admin_email || '').trim()
+  const requestedInitialRole = String(req.body?.admin_role || '').trim().toLowerCase()
+  const seededMemberRole = ['admin', 'tester', 'member'].includes(requestedInitialRole)
+    ? requestedInitialRole
+    : (requestedInitialRole === 'manager' ? 'admin' : 'admin')
   const explicitClientEmail = (req.body?.email || '').trim()
   if (!name) return res.status(400).json({ error: 'name_required' })
 
@@ -1145,7 +1149,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
       client_id: client.id,
       email: adminEmail,
       name: adminName || adminEmail,
-      role: 'admin',
+      role: seededMemberRole,
       user_id: userId
     }
 
