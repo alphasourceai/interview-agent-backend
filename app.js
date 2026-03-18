@@ -1122,7 +1122,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
 
   const { data: client, error: cErr } = await supabaseAdmin
     .from('clients')
-    .insert({ name, email: emailForClient })
+    .insert({ name, email: emailForClient, plan_tier: null, billing_interval: null })
     .select('id,name,created_at')
     .single()
   if (cErr) {
