@@ -1,6 +1,7 @@
 // routes/verifyOtp.js
 const express = require("express");
-const { supabase } = require("../src/lib/supabaseClient");
+const { supabase, supabaseAdmin } = require("../src/lib/supabaseClient");
+const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 
 const router = express.Router();
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
@@ -85,6 +86,28 @@ router.post("/", async (req, res) => {
           request_id
         });
       }
+    }
+
+    const availability = await getRoleInterviewAvailability({
+      db: supabaseAdmin,
+      roleId,
+      clientId: role.client_id || null
+    });
+    await syncRoleInterviewLimitNotification({
+      db: supabaseAdmin,
+      roleId,
+      clientId: role.client_id || null,
+      remainingInterviews: availability.remaining_interviews,
+      roleTitle: ''
+    });
+    if (availability.remaining_interviews != null && availability.remaining_interviews <= 0) {
+      return res.status(403).json({
+        error: 'forbidden',
+        code: 'interview_limit_reached',
+        detail: 'This role has no interviews remaining under the current plan.',
+        hint: null,
+        request_id
+      });
     }
 
     // 2) Newest OTP for (candidate_email, role_id)

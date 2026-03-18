@@ -2,7 +2,7 @@
 'use strict';
 
 const express = require('express');
-const { supabase } = require('../src/lib/supabaseClient');
+const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
 const { createTavusInterviewHandler } = require('../handlers/createTavusInterview');
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 
@@ -117,12 +117,12 @@ router.post('/', async (req, res) => {
 
     if (!existing) {
       const availability = await getRoleInterviewAvailability({
-        db: supabase,
+        db: supabaseAdmin,
         roleId,
         clientId
       });
       await syncRoleInterviewLimitNotification({
-        db: supabase,
+        db: supabaseAdmin,
         roleId,
         clientId,
         remainingInterviews: availability.remaining_interviews,

@@ -3,7 +3,8 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const sg = require('@sendgrid/mail');
-const { supabase } = require('../src/lib/supabaseClient');
+const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
+const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 const analyzeResume = require('../analyzeResume'); // resume analyzer
 
 // uploads: keep in memory; 10MB limit
@@ -113,6 +114,28 @@ router.post('/', upload.any(), async (req, res) => {
           request_id
         });
       }
+    }
+
+    const availability = await getRoleInterviewAvailability({
+      db: supabaseAdmin,
+      roleId,
+      clientId: role.client_id || null
+    });
+    await syncRoleInterviewLimitNotification({
+      db: supabaseAdmin,
+      roleId,
+      clientId: role.client_id || null,
+      remainingInterviews: availability.remaining_interviews,
+      roleTitle: role?.title || ''
+    });
+    if (availability.remaining_interviews != null && availability.remaining_interviews <= 0) {
+      return res.status(403).json({
+        error: 'forbidden',
+        code: 'interview_limit_reached',
+        detail: 'This role has no interviews remaining under the current plan.',
+        hint: null,
+        request_id
+      });
     }
 
     // --- duplicate & enrichment policy ---
