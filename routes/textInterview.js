@@ -596,6 +596,18 @@ router.post('/answers', async (req, res) => {
         analysis: interviewAnalysis,
         status: 'completed',
       });
+      const postInsertAvailability = await getRoleInterviewAvailability({
+        db: supabaseAdmin,
+        roleId: role.id,
+        clientId: role.client_id || null
+      });
+      await syncRoleInterviewLimitNotification({
+        db: supabaseAdmin,
+        roleId: role.id,
+        clientId: role.client_id || null,
+        remainingInterviews: postInsertAvailability.remaining_interviews,
+        roleTitle: role.title || ''
+      });
 
       if (latestReport?.id) {
         const reportAnalysis = {

@@ -6,6 +6,7 @@ const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
 const { analyzeInterviewTranscriptById } = require('../scripts/backfillInterviews.js');
 const { INSUFFICIENT_SUMMARY, isSubstantiveTranscript, scoreInterview } = require('../src/lib/interviewScoring');
+const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -446,6 +447,34 @@ async function applyTranscriptScoringForInterview({ interview, fresh, transcript
       hint: scoreErr.hint || null
     });
     return { updated: false, substantive: substantiveCheck.ok, reason: 'update_failed' };
+  }
+
+  const roleIdForAvailability = fresh?.role_id || interview?.role_id || null;
+  const clientIdForAvailability = fresh?.client_id || interview?.client_id || null;
+  if (roleIdForAvailability && clientIdForAvailability) {
+    try {
+      const availability = await getRoleInterviewAvailability({
+        db: supabaseAdmin,
+        roleId: roleIdForAvailability,
+        clientId: clientIdForAvailability
+      });
+      await syncRoleInterviewLimitNotification({
+        db: supabaseAdmin,
+        roleId: roleIdForAvailability,
+        clientId: clientIdForAvailability,
+        remainingInterviews: availability.remaining_interviews,
+        roleTitle: ''
+      });
+    } catch (syncErr) {
+      console.error('[webhook] role limit sync failed', {
+        request_id: requestId || null,
+        interview_id: interview?.id || null,
+        conversation_id: conversationId || null,
+        role_id: roleIdForAvailability,
+        client_id: clientIdForAvailability,
+        error: syncErr?.message || syncErr
+      });
+    }
   }
 
   return { updated: true, substantive: substantiveCheck.ok, reason: substantiveCheck.reason };
