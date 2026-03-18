@@ -4,6 +4,7 @@
 const express = require('express');
 const { supabase } = require('../src/lib/supabaseClient');
 const { createTavusInterviewHandler } = require('../handlers/createTavusInterview');
+const { getRoleInterviewAvailability } = require('../src/lib/roleInterviewAvailability');
 
 const router = express.Router();
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
@@ -103,6 +104,34 @@ router.post('/', async (req, res) => {
       }
     }
 
+    // Check for existing interview row
+    const { data: existing, error: eErr } = await supabase
+      .from('interviews')
+      .select('id, tavus_application_id')
+      .eq('candidate_id', candidate_id)
+      .eq('role_id', roleId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (eErr) return res.status(500).json({ error: eErr.message });
+
+    if (!existing) {
+      const availability = await getRoleInterviewAvailability({
+        db: supabase,
+        roleId,
+        clientId
+      });
+      if (availability.remaining_interviews != null && availability.remaining_interviews <= 0) {
+        return res.status(403).json({
+          error: 'forbidden',
+          code: 'interview_limit_reached',
+          detail: 'This role has no interviews remaining under the current plan.',
+          hint: null,
+          request_id
+        });
+      }
+    }
+
     const webhookUrl = `${base}/webhook/tavus`;
 
     // Tavus
@@ -127,17 +156,6 @@ router.post('/', async (req, res) => {
         candidate_external_id: result.conversation_id || null
       })
       .eq('candidate_id', candidate_id);
-
-    // Check for existing interview row
-    const { data: existing, error: eErr } = await supabase
-      .from('interviews')
-      .select('id, tavus_application_id')
-      .eq('candidate_id', candidate_id)
-      .eq('role_id', roleId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (eErr) return res.status(500).json({ error: eErr.message });
 
     if (!existing) {
       const { error: iErr, data: iData } = await supabase
