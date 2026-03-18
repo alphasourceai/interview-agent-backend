@@ -508,7 +508,7 @@ router.post('/', async (req, res) => {
       const metadataBillingInterval = String(metadata?.billing_interval || '').trim().toLowerCase();
       const isAdminSubscriptionInvoice =
         event.type === 'invoice.payment_succeeded' &&
-        metadataSource !== 'admin_subscription_checkout' &&
+        metadataSource === 'admin_subscription_checkout' &&
         !!metadataClientId &&
         ['basic', 'pro', 'enterprise'].includes(metadataPlanTier) &&
         ['monthly', 'annual'].includes(metadataBillingInterval);
