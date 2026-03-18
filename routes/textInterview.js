@@ -7,7 +7,7 @@ const { OpenAI } = require('openai');
 const analyzeResume = require('../analyzeResume');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { checkDuplicateCandidate } = require('../src/lib/duplicateCandidate');
-const { getRoleInterviewAvailability } = require('../src/lib/roleInterviewAvailability');
+const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 
 const router = express.Router();
 
@@ -518,6 +518,13 @@ router.post('/answers', async (req, res) => {
         db: supabaseAdmin,
         roleId: role.id,
         clientId: role.client_id || null
+      });
+      await syncRoleInterviewLimitNotification({
+        db: supabaseAdmin,
+        roleId: role.id,
+        clientId: role.client_id || null,
+        remainingInterviews: availability.remaining_interviews,
+        roleTitle: role.title || ''
       });
       if (availability.remaining_interviews != null && availability.remaining_interviews <= 0) {
         return sendError(res, 403, {

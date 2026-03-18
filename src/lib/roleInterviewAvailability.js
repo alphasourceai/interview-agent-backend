@@ -1,5 +1,9 @@
 'use strict';
 
+const { sendRoleInterviewLimitReachedEmail } = require('../../utils/mailer');
+
+const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || 'https://www.alphasourceai.com').replace(/\/+$/, '');
+
 function parseWholeNonNegative(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return null;
@@ -89,6 +93,73 @@ async function getRoleInterviewAvailability({ db, roleId, clientId }) {
   };
 }
 
+function buildRoleBillingUrl(clientId, roleId) {
+  const params = new URLSearchParams({
+    tab: 'billing',
+    intent: 'role_capacity',
+    client_id: String(clientId || ''),
+    role_id: String(roleId || '')
+  });
+  return `${FRONTEND_BASE}/account?${params.toString()}`;
+}
+
+async function syncRoleInterviewLimitNotification({
+  db,
+  roleId,
+  clientId,
+  remainingInterviews,
+  roleTitle
+}) {
+  if (!db || !roleId || !clientId) return;
+  if (remainingInterviews == null) return;
+
+  if (remainingInterviews > 0) {
+    await db
+      .from('roles')
+      .update({ interview_limit_notified_at: null })
+      .eq('id', roleId)
+      .eq('client_id', clientId)
+      .not('interview_limit_notified_at', 'is', null);
+    return;
+  }
+
+  const notifiedAt = new Date().toISOString();
+  const { data: markedRows, error: markError } = await db
+    .from('roles')
+    .update({ interview_limit_notified_at: notifiedAt })
+    .eq('id', roleId)
+    .eq('client_id', clientId)
+    .is('interview_limit_notified_at', null)
+    .select('id,title')
+    .limit(1);
+  if (markError) return;
+  if (!Array.isArray(markedRows) || markedRows.length === 0) return;
+
+  const effectiveRoleTitle = String(roleTitle || markedRows[0]?.title || 'Role').trim() || 'Role';
+
+  const { data: client, error: clientError } = await db
+    .from('clients')
+    .select('id,email,name,client_admin_name')
+    .eq('id', clientId)
+    .maybeSingle();
+  if (clientError || !client) return;
+
+  const clientEmail = String(client.email || '').trim();
+  if (!clientEmail) return;
+  const recipientName = String(client.client_admin_name || client.name || '').trim();
+  const billingUrl = buildRoleBillingUrl(clientId, roleId);
+
+  try {
+    await sendRoleInterviewLimitReachedEmail(
+      clientEmail,
+      billingUrl,
+      recipientName,
+      effectiveRoleTitle
+    );
+  } catch (_) {}
+}
+
 module.exports = {
-  getRoleInterviewAvailability
+  getRoleInterviewAvailability,
+  syncRoleInterviewLimitNotification
 };

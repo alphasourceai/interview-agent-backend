@@ -4,7 +4,7 @@
 const express = require('express');
 const { supabase } = require('../src/lib/supabaseClient');
 const { createTavusInterviewHandler } = require('../handlers/createTavusInterview');
-const { getRoleInterviewAvailability } = require('../src/lib/roleInterviewAvailability');
+const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 
 const router = express.Router();
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
@@ -120,6 +120,13 @@ router.post('/', async (req, res) => {
         db: supabase,
         roleId,
         clientId
+      });
+      await syncRoleInterviewLimitNotification({
+        db: supabase,
+        roleId,
+        clientId,
+        remainingInterviews: availability.remaining_interviews,
+        roleTitle: role?.title || ''
       });
       if (availability.remaining_interviews != null && availability.remaining_interviews <= 0) {
         return res.status(403).json({
