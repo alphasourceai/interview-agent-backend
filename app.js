@@ -1126,7 +1126,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
 
   const { data: client, error: cErr } = await supabaseAdmin
     .from('clients')
-    .insert({ name, email: emailForClient, plan_tier: null, billing_interval: null })
+    .insert({ name, email: emailForClient, client_admin_name: adminName || null, plan_tier: null, billing_interval: null })
     .select('id,name,created_at')
     .single()
   if (cErr) {
@@ -1628,7 +1628,7 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
 
   const { data: client, error: clientError } = await supabaseAdmin
     .from('clients')
-    .select('id,name,email,stripe_customer_id')
+    .select('id,name,email,client_admin_name,stripe_customer_id')
     .eq('id', clientId)
     .maybeSingle()
   if (clientError) return res.status(500).json({ error: 'client_lookup_failed', detail: clientError.message })
@@ -1800,7 +1800,11 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
     let email_sent = false
     let email_error = null
     try {
-      const emailResult = await sendSubscriptionCheckoutEmail(clientEmail, session?.url || '', client.name || '')
+      const emailResult = await sendSubscriptionCheckoutEmail(
+        clientEmail,
+        session?.url || '',
+        client.client_admin_name || client.name || ''
+      )
       email_sent = emailResult?.statusCode === 202
       if (!email_sent && emailResult?.skipped) email_error = 'email_skipped'
     } catch (e) {
