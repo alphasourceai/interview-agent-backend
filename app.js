@@ -3044,6 +3044,7 @@ app.post('/internal/contracts/process-renewals', async (req, res) => {
 
 app.get('/checkout/subscription-success', async (req, res) => {
   const canonicalSiteBase = 'https://www.alphasourceai.com'
+  const clientAuthBase = String(process.env.CLIENT_AUTH_FRONTEND_BASE || 'https://clients.alphasourceai.com').replace(/\/+$/, '')
   const makeAccountSuccessUrl = (clientId) => `${canonicalSiteBase}/account?checkout=success${clientId ? `&client_id=${encodeURIComponent(clientId)}` : ''}`
   const fallbackClientId = String(req.query?.client_id || '').trim()
   const sessionId = String(req.query?.session_id || '').trim()
@@ -3083,7 +3084,7 @@ app.get('/checkout/subscription-success', async (req, res) => {
     const clientEmail = String(client.email || '').trim()
     if (!clientEmail) return res.redirect(302, successUrl)
 
-    const recoveryRedirectUrl = `${canonicalSiteBase}/pwreset?origin=client&checkout=success&client_id=${client.id}`
+    const recoveryRedirectUrl = `${clientAuthBase}/pwreset?origin=client&checkout=success&client_id=${client.id}`
     const generateRecoveryActionLink = async () => {
       const link = await supabaseAdmin.auth.admin.generateLink({
         type: 'recovery',
