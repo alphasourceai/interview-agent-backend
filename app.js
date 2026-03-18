@@ -1766,6 +1766,13 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
     }
 
     const canonicalSiteBase = 'https://www.alphasourceai.com'
+    const forwardedProto = String(req.headers?.['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim()
+    const forwardedHost = String(req.headers?.['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim()
+    const computedBackendBase = forwardedHost ? `${forwardedProto || 'https'}://${forwardedHost}` : ''
+    const publicBackendBase = String(process.env.PUBLIC_BACKEND_URL || computedBackendBase || '').replace(/\/+$/, '')
+    const checkoutSuccessUrl = publicBackendBase
+      ? `${publicBackendBase}/checkout/subscription-success?session_id={CHECKOUT_SESSION_ID}&client_id=${encodeURIComponent(client.id)}`
+      : `${canonicalSiteBase}/account?checkout=success&client_id=${client.id}`
     const checkoutMetadata = {
       source: 'admin_subscription_checkout',
       client_id: client.id,
@@ -1777,7 +1784,7 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
       mode: 'subscription',
       customer: resolvedStripeCustomerId,
       line_items: lineItems,
-      success_url: `${canonicalSiteBase}/account?checkout=success&client_id=${client.id}`,
+      success_url: checkoutSuccessUrl,
       cancel_url: `${canonicalSiteBase}/account?checkout=cancel&client_id=${client.id}`,
       allow_promotion_codes: true,
       metadata: checkoutMetadata,
@@ -3032,6 +3039,91 @@ app.post('/internal/contracts/process-renewals', async (req, res) => {
     return res.json(result)
   } catch (e) {
     return res.status(500).json({ error: 'process_contracts_failed', detail: e?.detail || e?.message || 'process_contracts_failed' })
+  }
+})
+
+app.get('/checkout/subscription-success', async (req, res) => {
+  const canonicalSiteBase = 'https://www.alphasourceai.com'
+  const makeAccountSuccessUrl = (clientId) => `${canonicalSiteBase}/account?checkout=success${clientId ? `&client_id=${encodeURIComponent(clientId)}` : ''}`
+  const fallbackClientId = String(req.query?.client_id || '').trim()
+  const sessionId = String(req.query?.session_id || '').trim()
+  const fallbackUrl = makeAccountSuccessUrl(fallbackClientId)
+  if (!sessionId) return res.redirect(302, fallbackUrl)
+
+  try {
+    const Stripe = require('stripe')
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
+    const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['subscription'] })
+    const metadata = session?.metadata && typeof session.metadata === 'object' ? session.metadata : {}
+    const metadataSource = String(metadata?.source || '').trim().toLowerCase()
+    const metadataClientId = String(metadata?.client_id || '').trim()
+    const clientId = metadataClientId || fallbackClientId
+    const successUrl = makeAccountSuccessUrl(clientId)
+
+    if (metadataSource !== 'admin_subscription_checkout') return res.redirect(302, successUrl)
+    if (String(session?.status || '').toLowerCase() !== 'complete') return res.redirect(302, successUrl)
+    const paymentStatus = String(session?.payment_status || '').toLowerCase()
+    if (paymentStatus && !['paid', 'no_payment_required'].includes(paymentStatus)) return res.redirect(302, successUrl)
+    const subscriptionObj = session?.subscription && typeof session.subscription === 'object' ? session.subscription : null
+    const subscriptionStatus = String(subscriptionObj?.status || '').toLowerCase()
+    if (subscriptionStatus && !['active', 'trialing'].includes(subscriptionStatus)) return res.redirect(302, successUrl)
+
+    let client = null
+    if (clientId) {
+      const { data: clientRow, error: clientErr } = await supabaseAdmin
+        .from('clients')
+        .select('id,email')
+        .eq('id', clientId)
+        .maybeSingle()
+      if (clientErr) throw new Error(clientErr.message || 'client_lookup_failed')
+      client = clientRow || null
+    }
+    if (!client?.id) return res.redirect(302, successUrl)
+
+    const clientEmail = String(client.email || '').trim()
+    if (!clientEmail) return res.redirect(302, successUrl)
+
+    const recoveryRedirectUrl = `${canonicalSiteBase}/pwreset?origin=client&checkout=success&client_id=${client.id}`
+    const generateRecoveryActionLink = async () => {
+      const link = await supabaseAdmin.auth.admin.generateLink({
+        type: 'recovery',
+        email: clientEmail,
+        options: { redirectTo: recoveryRedirectUrl }
+      })
+      return link?.data?.action_link || link?.data?.properties?.action_link || null
+    }
+
+    let recoveryActionLink = null
+    try {
+      recoveryActionLink = await generateRecoveryActionLink()
+    } catch (recoveryErr) {
+      console.error('subscription_checkout_generate_recovery_link_failed:', recoveryErr?.message || recoveryErr)
+    }
+
+    if (!recoveryActionLink) {
+      try {
+        await supabaseAdmin.auth.admin.createUser({
+          email: clientEmail,
+          email_confirm: true
+        })
+      } catch (createErr) {
+        const msg = String(createErr?.message || '').toLowerCase()
+        if (!msg.includes('already') && !msg.includes('exists')) {
+          console.error('subscription_checkout_create_user_failed:', createErr?.message || createErr)
+        }
+      }
+      try {
+        recoveryActionLink = await generateRecoveryActionLink()
+      } catch (recoveryRetryErr) {
+        console.error('subscription_checkout_generate_recovery_link_retry_failed:', recoveryRetryErr?.message || recoveryRetryErr)
+      }
+    }
+
+    if (recoveryActionLink) return res.redirect(302, recoveryActionLink)
+    return res.redirect(302, successUrl)
+  } catch (e) {
+    console.error('subscription_checkout_success_handoff_failed:', e?.message || e)
+    return res.redirect(302, fallbackUrl)
   }
 })
 
