@@ -110,16 +110,36 @@ async function syncRoleInterviewLimitNotification({
   remainingInterviews,
   roleTitle
 }) {
+  console.log('[role-limit-notify] entry', {
+    role_id: roleId || null,
+    client_id: clientId || null,
+    remaining_interviews: remainingInterviews
+  });
   if (!db || !roleId || !clientId) return;
   if (remainingInterviews == null) return;
 
   if (remainingInterviews > 0) {
-    await db
+    const { error: resetError } = await db
       .from('roles')
       .update({ interview_limit_notified_at: null })
       .eq('id', roleId)
       .eq('client_id', clientId)
       .not('interview_limit_notified_at', 'is', null);
+    if (resetError) {
+      console.error('[role-limit-notify] reset_failed', {
+        role_id: roleId,
+        client_id: clientId,
+        error: resetError?.message || resetError,
+        details: resetError?.details || null,
+        hint: resetError?.hint || null
+      });
+    } else {
+      console.log('[role-limit-notify] reset_marker', {
+        role_id: roleId,
+        client_id: clientId,
+        remaining_interviews: remainingInterviews
+      });
+    }
     return;
   }
 
@@ -132,8 +152,28 @@ async function syncRoleInterviewLimitNotification({
     .is('interview_limit_notified_at', null)
     .select('id,title')
     .limit(1);
-  if (markError) return;
-  if (!Array.isArray(markedRows) || markedRows.length === 0) return;
+  if (markError) {
+    console.error('[role-limit-notify] mark_failed', {
+      role_id: roleId,
+      client_id: clientId,
+      error: markError?.message || markError,
+      details: markError?.details || null,
+      hint: markError?.hint || null
+    });
+    return;
+  }
+  if (!Array.isArray(markedRows) || markedRows.length === 0) {
+    console.log('[role-limit-notify] mark_skipped_already_notified', {
+      role_id: roleId,
+      client_id: clientId
+    });
+    return;
+  }
+  console.log('[role-limit-notify] mark_success', {
+    role_id: markedRows[0]?.id || roleId,
+    client_id: clientId,
+    notified_at: notifiedAt
+  });
 
   const effectiveRoleTitle = String(roleTitle || markedRows[0]?.title || 'Role').trim() || 'Role';
 
@@ -142,21 +182,56 @@ async function syncRoleInterviewLimitNotification({
     .select('id,email,name,client_admin_name')
     .eq('id', clientId)
     .maybeSingle();
-  if (clientError || !client) return;
+  if (clientError) {
+    console.error('[role-limit-notify] client_lookup_failed', {
+      role_id: roleId,
+      client_id: clientId,
+      error: clientError?.message || clientError,
+      details: clientError?.details || null,
+      hint: clientError?.hint || null
+    });
+    return;
+  }
+  if (!client) {
+    console.warn('[role-limit-notify] client_missing', {
+      role_id: roleId,
+      client_id: clientId
+    });
+    return;
+  }
 
   const clientEmail = String(client.email || '').trim();
-  if (!clientEmail) return;
+  if (!clientEmail) {
+    console.warn('[role-limit-notify] client_email_missing', {
+      role_id: roleId,
+      client_id: clientId
+    });
+    return;
+  }
   const recipientName = String(client.client_admin_name || client.name || '').trim();
   const billingUrl = buildRoleBillingUrl(clientId, roleId);
 
   try {
-    await sendRoleInterviewLimitReachedEmail(
+    const emailResult = await sendRoleInterviewLimitReachedEmail(
       clientEmail,
       billingUrl,
       recipientName,
       effectiveRoleTitle
     );
-  } catch (_) {}
+    console.log('[role-limit-notify] email_sent', {
+      role_id: roleId,
+      client_id: clientId,
+      to: clientEmail,
+      result: emailResult || null
+    });
+  } catch (emailErr) {
+    console.error('[role-limit-notify] email_send_failed', {
+      role_id: roleId,
+      client_id: clientId,
+      to: clientEmail,
+      error: emailErr?.message || emailErr
+    });
+  }
 }
 
 module.exports = {

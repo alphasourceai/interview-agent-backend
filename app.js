@@ -119,6 +119,7 @@ app.use(cors({
 }))
 
 app.use('/webhook/stripe', express.raw({ type: 'application/json' }), require('./routes/webhookStripe'))
+app.use('/webhook', require('./routes/webhook'))
 
 app.use(express.json({ limit: '10mb' }))
 
@@ -3149,7 +3150,6 @@ function mountIfExists(relPath, urlPath) {
   } catch (_) {}
 }
 mountIfExists('./routes/kb', '/kb')
-mountIfExists('./routes/webhook', '/webhook')
 mountIfExists('./routes/tavus', '/')
 mountIfExists('./routes/publicInterviewStatus', '/')
 
