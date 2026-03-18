@@ -722,17 +722,20 @@ async function requireAdmin(req, res, next) {
 const adminRouter = express.Router()
 
 // Helper: ensure a user exists/invite; return user_id + optional action_link
-async function ensureUserIdAndInvite(email, redirectTo) {
+async function ensureUserIdAndInvite(email, redirectTo, opts = {}) {
+  const suppressInvite = opts?.suppressInvite === true
   let userId = null
   let actionLink = null
   let method = null
 
-  try {
-    const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo })
-    userId = invited?.data?.user?.id || null
-    method = 'invite'
-  } catch (e) {
-    console.error('inviteUserByEmail failed:', e?.message || e)
+  if (!suppressInvite) {
+    try {
+      const invited = await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo })
+      userId = invited?.data?.user?.id || null
+      method = 'invite'
+    } catch (e) {
+      console.error('inviteUserByEmail failed:', e?.message || e)
+    }
   }
 
   if (!userId) {
@@ -761,7 +764,7 @@ async function ensureUserIdAndInvite(email, redirectTo) {
     } catch (e) {
       console.error('createUser failed:', e?.message || e)
     }
-    if (userId) {
+    if (userId && !suppressInvite) {
       try {
         await supabaseAdmin.auth.admin.inviteUserByEmail(email, { redirectTo })
         method = 'createUser+invite'
@@ -1131,7 +1134,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   let seeded_member = null
   if (adminEmail) {
     const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
-    const { userId, actionLink, method } = await ensureUserIdAndInvite(adminEmail, redirectTo)
+    const { userId, actionLink, method } = await ensureUserIdAndInvite(adminEmail, redirectTo, { suppressInvite: true })
 
     if (!userId) {
       console.error('seed_member_no_user_id', { email: adminEmail, method })
