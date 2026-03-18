@@ -22,7 +22,7 @@ if (SENDGRID_KEY) {
 
 const db = supabaseAdmin || supabase;
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_PUBLIC_ANON_KEY || '';
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 
 const router = express.Router();
 
@@ -53,7 +53,76 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
       return res.status(500).json({ error: 'query failed (roles)' });
     }
 
-    return res.json({ items: data || [] });
+    const roles = data || [];
+    const parseWholeNonNegative = (value) => {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return null;
+      return Math.max(0, Math.floor(n));
+    };
+
+    let includedInterviewsPerRole = null;
+    let maxInterviewMinutes = null;
+    const { data: planSettings, error: planSettingsError } = await db
+      .from('client_plan_settings')
+      .select('included_interviews_per_role,max_interview_minutes')
+      .eq('client_id', clientId)
+      .maybeSingle();
+    if (planSettingsError) {
+      console.warn('[GET /roles] plan settings lookup failed', planSettingsError?.message || planSettingsError);
+    } else if (planSettings) {
+      includedInterviewsPerRole = parseWholeNonNegative(planSettings.included_interviews_per_role);
+      maxInterviewMinutes = parseWholeNonNegative(planSettings.max_interview_minutes);
+    }
+
+    const roleIds = roles.map((r) => r.id).filter(Boolean);
+    const usedInterviewsByRoleId = {};
+    if (roleIds.length) {
+      const { data: interviewRows, error: interviewsError } = await db
+        .from('interviews')
+        .select('role_id,status,transcript_scores,interview_summary')
+        .eq('client_id', clientId)
+        .in('role_id', roleIds);
+      if (interviewsError) {
+        console.warn('[GET /roles] interviews usage lookup failed', interviewsError?.message || interviewsError);
+      } else {
+        for (const row of (interviewRows || [])) {
+          const roleId = row?.role_id;
+          if (!roleId) continue;
+          const normalizedStatus = String(row?.status || '').trim().toLowerCase();
+          const summary = typeof row?.interview_summary === 'string' ? row.interview_summary.trim() : '';
+          let transcriptScores = row?.transcript_scores;
+          if (typeof transcriptScores === 'string' && transcriptScores.trim()) {
+            try { transcriptScores = JSON.parse(transcriptScores); } catch { transcriptScores = null; }
+          }
+          const transcriptOverall = transcriptScores && typeof transcriptScores === 'object'
+            ? Number(transcriptScores.overall)
+            : NaN;
+          const isUsed =
+            normalizedStatus === 'completed' ||
+            normalizedStatus === 'analyzed' ||
+            !!summary ||
+            Number.isFinite(transcriptOverall);
+          if (!isUsed) continue;
+          usedInterviewsByRoleId[roleId] = (usedInterviewsByRoleId[roleId] || 0) + 1;
+        }
+      }
+    }
+
+    const items = roles.map((role) => {
+      const usedInterviews = Number(usedInterviewsByRoleId[role.id] || 0);
+      const remainingInterviews = includedInterviewsPerRole == null
+        ? null
+        : Math.max(0, includedInterviewsPerRole - usedInterviews);
+      return {
+        ...role,
+        included_interviews_per_role: includedInterviewsPerRole,
+        used_interviews: usedInterviews,
+        remaining_interviews: remainingInterviews,
+        max_interview_minutes: maxInterviewMinutes
+      };
+    });
+
+    return res.json({ items });
   } catch (e) {
     console.error('[GET /roles] unexpected', e);
     return res.status(500).json({ error: 'Server error' });
