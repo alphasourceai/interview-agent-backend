@@ -227,7 +227,7 @@ app.get('/clients/billing/summary', requireAuth, withClientScope, async (req, re
 
     let q = supabaseAdmin
       .from('clients')
-      .select('id,name,plan_tier,billing_status,billing_interval,auto_renew,current_term_end,subscription_status,cancel_at_term_end,access_override_mode,stripe_customer_id')
+      .select('id,name,plan_tier,billing_status,billing_interval,auto_renew,current_term_end,contract_end_at,subscription_status,cancel_at_term_end,access_override_mode,stripe_customer_id')
       .in('id', ids)
       .order('name', { ascending: true })
     if (wantedClientId) q = q.eq('id', wantedClientId)
@@ -243,6 +243,7 @@ app.get('/clients/billing/summary', requireAuth, withClientScope, async (req, re
       billing_interval: client.billing_interval,
       auto_renew: client.auto_renew,
       current_term_end: client.current_term_end,
+      contract_end_at: client.contract_end_at,
       subscription_status: client.subscription_status,
       cancel_at_term_end: client.cancel_at_term_end,
       access_override_mode: client.access_override_mode,
