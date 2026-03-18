@@ -166,10 +166,16 @@ function extractPerceptionScores(payload) {
 
 function extractPerceptionScoresFromText(text) {
   if (!text || typeof text !== 'string') return {};
+  const markdownNormalized = String(text)
+    .replace(/^\s*[-*+]\s+/gm, '')
+    .replace(/\*/g, '')
+    .replace(/`/g, '');
   const readNum = (re) => {
-    const match = re.exec(text);
-    if (!match) return null;
-    return clampScore(match[1]);
+    const direct = re.exec(text);
+    if (direct) return clampScore(direct[1]);
+    const normalized = re.exec(markdownNormalized);
+    if (!normalized) return null;
+    return clampScore(normalized[1]);
   };
   const clarity = readNum(/CLARITY\s*[:=]\s*(\d{1,3})/i);
   const confidence = readNum(/CONFIDENCE\s*[:=]\s*(\d{1,3})/i);
