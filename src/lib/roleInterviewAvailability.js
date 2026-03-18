@@ -150,8 +150,7 @@ async function syncRoleInterviewLimitNotification({
     .eq('id', roleId)
     .eq('client_id', clientId)
     .is('interview_limit_notified_at', null)
-    .select('id,title')
-    .limit(1);
+    .select('id,title');
   if (markError) {
     console.error('[role-limit-notify] mark_failed', {
       role_id: roleId,
