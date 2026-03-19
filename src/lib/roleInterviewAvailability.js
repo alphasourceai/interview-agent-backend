@@ -40,6 +40,7 @@ async function getRoleInterviewAvailability({ db, roleId, clientId }) {
   if (!db || !roleId || !clientId) {
     return {
       included_interviews_per_role: null,
+      purchased_interviews: null,
       used_interviews: null,
       remaining_interviews: null
     };
@@ -53,6 +54,7 @@ async function getRoleInterviewAvailability({ db, roleId, clientId }) {
   if (planSettingsError) {
     return {
       included_interviews_per_role: null,
+      purchased_interviews: null,
       used_interviews: null,
       remaining_interviews: null
     };
@@ -62,9 +64,31 @@ async function getRoleInterviewAvailability({ db, roleId, clientId }) {
   if (includedInterviewsPerRole == null) {
     return {
       included_interviews_per_role: null,
+      purchased_interviews: null,
       used_interviews: null,
       remaining_interviews: null
     };
+  }
+
+  const { data: purchaseRows, error: purchasesError } = await db
+    .from('role_interview_purchases')
+    .select('quantity')
+    .eq('client_id', clientId)
+    .eq('role_id', roleId)
+    .eq('status', 'paid');
+  if (purchasesError) {
+    return {
+      included_interviews_per_role: null,
+      purchased_interviews: null,
+      used_interviews: null,
+      remaining_interviews: null
+    };
+  }
+
+  let purchasedInterviews = 0;
+  for (const row of (purchaseRows || [])) {
+    const quantity = parseWholeNonNegative(row?.quantity);
+    if (quantity != null) purchasedInterviews += quantity;
   }
 
   const { data: interviewRows, error: interviewsError } = await db
@@ -75,6 +99,7 @@ async function getRoleInterviewAvailability({ db, roleId, clientId }) {
   if (interviewsError) {
     return {
       included_interviews_per_role: null,
+      purchased_interviews: null,
       used_interviews: null,
       remaining_interviews: null
     };
@@ -85,9 +110,10 @@ async function getRoleInterviewAvailability({ db, roleId, clientId }) {
     if (isUsedInterviewRow(row)) usedInterviews += 1;
   }
 
-  const remainingInterviews = Math.max(0, includedInterviewsPerRole - usedInterviews);
+  const remainingInterviews = Math.max(0, includedInterviewsPerRole + purchasedInterviews - usedInterviews);
   return {
     included_interviews_per_role: includedInterviewsPerRole,
+    purchased_interviews: purchasedInterviews,
     used_interviews: usedInterviews,
     remaining_interviews: remainingInterviews
   };
