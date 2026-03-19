@@ -400,7 +400,7 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
       role_id: roleId,
       quantity: String(quantity)
     }
-    const canonicalSiteBase = FRONTEND_BASE || 'https://www.alphasourceai.com'
+    const canonicalSiteBase = 'https://www.alphasourceai.com'
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       customer: stripeCustomerId || undefined,
