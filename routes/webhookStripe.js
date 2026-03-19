@@ -2,6 +2,7 @@
 const express = require('express');
 const Stripe = require('stripe');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
+const { getRoleInterviewAvailability } = require('../src/lib/roleInterviewAvailability');
 const router = express.Router();
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');
@@ -295,13 +296,125 @@ router.post('/', async (req, res) => {
       }
     } else if (event.type === 'checkout.session.completed') {
       const metadata = eventObject?.metadata && typeof eventObject.metadata === 'object' ? eventObject.metadata : {};
+      const purchaseType = String(metadata?.purchase_type || '').trim().toLowerCase();
       const metadataSource = String(metadata?.source || '').trim().toLowerCase();
       const metadataClientId = String(metadata?.client_id || '').trim();
       const metadataPlanTier = String(metadata?.plan_tier || '').trim().toLowerCase();
       const metadataBillingInterval = String(metadata?.billing_interval || '').trim().toLowerCase();
       const customerId = pickId(eventObject?.customer);
 
-      if (metadataSource === 'client_role_purchase') {
+      if (purchaseType === 'additional_interviews') {
+        const purchaseId = String(metadata?.role_interview_purchase_id || '').trim();
+        const metadataRoleId = String(metadata?.role_id || '').trim();
+        const metadataQuantity = Number(metadata?.quantity);
+        let purchase = null;
+
+        if (purchaseId) {
+          const { data: purchaseById, error: purchaseByIdErr } = await supabaseAdmin
+            .from('role_interview_purchases')
+            .select('id,client_id,role_id,quantity,status')
+            .eq('id', purchaseId)
+            .maybeSingle();
+          if (purchaseByIdErr) throw new Error(purchaseByIdErr.message || 'Role interview purchase lookup failed');
+          purchase = purchaseById || null;
+        } else if (metadataClientId && metadataRoleId) {
+          const { data: purchaseByMeta, error: purchaseByMetaErr } = await supabaseAdmin
+            .from('role_interview_purchases')
+            .select('id,client_id,role_id,quantity,status')
+            .eq('client_id', metadataClientId)
+            .eq('role_id', metadataRoleId)
+            .eq('status', 'pending')
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (purchaseByMetaErr) throw new Error(purchaseByMetaErr.message || 'Role interview purchase lookup failed');
+          purchase = purchaseByMeta || null;
+        }
+
+        if (!purchase) {
+          console.warn('[stripe-webhook][additional-interviews] purchase_not_found', {
+            role_interview_purchase_id: purchaseId || null,
+            client_id: metadataClientId || null,
+            role_id: metadataRoleId || null
+          });
+          throw new Error('Role interview purchase not found');
+        }
+
+        console.log('[stripe-webhook][additional-interviews] purchase_found', {
+          role_interview_purchase_id: purchase.id,
+          client_id: purchase.client_id,
+          role_id: purchase.role_id,
+          status: purchase.status
+        });
+
+        if (metadataClientId && purchase.client_id !== metadataClientId) {
+          throw new Error('Role interview purchase client mismatch');
+        }
+        if (metadataRoleId && purchase.role_id !== metadataRoleId) {
+          throw new Error('Role interview purchase role mismatch');
+        }
+        if (Number.isFinite(metadataQuantity) && Number.isInteger(metadataQuantity) && metadataQuantity > 0) {
+          if (Number(purchase.quantity) !== metadataQuantity) {
+            throw new Error('Role interview purchase quantity mismatch');
+          }
+        }
+
+        if (String(purchase.status || '').trim().toLowerCase() === 'paid') {
+          console.log('[stripe-webhook][additional-interviews] already_paid', {
+            role_interview_purchase_id: purchase.id,
+            client_id: purchase.client_id,
+            role_id: purchase.role_id
+          });
+        } else {
+          const { error: markPaidErr } = await supabaseAdmin
+            .from('role_interview_purchases')
+            .update({
+              status: 'paid',
+              stripe_payment_intent_id: pickId(eventObject?.payment_intent) || null,
+              stripe_invoice_id: pickId(eventObject?.invoice) || null
+            })
+            .eq('id', purchase.id)
+            .in('status', ['pending', 'paid']);
+          if (markPaidErr) throw new Error(markPaidErr.message || 'Role interview purchase paid update failed');
+
+          console.log('[stripe-webhook][additional-interviews] marked_paid', {
+            role_interview_purchase_id: purchase.id,
+            client_id: purchase.client_id,
+            role_id: purchase.role_id,
+            stripe_payment_intent_id: pickId(eventObject?.payment_intent) || null,
+            stripe_invoice_id: pickId(eventObject?.invoice) || null
+          });
+        }
+
+        const availability = await getRoleInterviewAvailability({
+          db: supabaseAdmin,
+          roleId: purchase.role_id,
+          clientId: purchase.client_id
+        });
+        if (availability.remaining_interviews != null && availability.remaining_interviews > 0) {
+          const { error: resetNotifyErr } = await supabaseAdmin
+            .from('roles')
+            .update({ interview_limit_notified_at: null })
+            .eq('id', purchase.role_id)
+            .eq('client_id', purchase.client_id)
+            .not('interview_limit_notified_at', 'is', null);
+          if (resetNotifyErr) throw new Error(resetNotifyErr.message || 'Role interview limit notify reset failed');
+
+          console.log('[stripe-webhook][additional-interviews] notify_marker_reset', {
+            role_interview_purchase_id: purchase.id,
+            client_id: purchase.client_id,
+            role_id: purchase.role_id,
+            remaining_interviews: availability.remaining_interviews
+          });
+        } else {
+          console.log('[stripe-webhook][additional-interviews] notify_marker_reset_skipped', {
+            role_interview_purchase_id: purchase.id,
+            client_id: purchase.client_id,
+            role_id: purchase.role_id,
+            remaining_interviews: availability.remaining_interviews
+          });
+        }
+      } else if (metadataSource === 'client_role_purchase') {
         const pendingRolePurchaseId = String(metadata?.pending_role_purchase_id || '').trim();
         if (!pendingRolePurchaseId) throw new Error('Pending role purchase id missing');
         const { data: pendingRolePurchase, error: pendingRolePurchaseErr } = await supabaseAdmin
