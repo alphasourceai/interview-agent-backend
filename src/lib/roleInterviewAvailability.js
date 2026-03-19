@@ -2,7 +2,7 @@
 
 const { sendRoleInterviewLimitReachedEmail } = require('../../utils/mailer');
 
-const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || 'https://www.alphasourceai.com').replace(/\/+$/, '');
+const FRONTEND_BASE = 'https://www.alphasourceai.com';
 
 function parseWholeNonNegative(value) {
   const n = Number(value);
