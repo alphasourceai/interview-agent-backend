@@ -1896,7 +1896,7 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
         currency: 'usd',
         unit_amount: platformCents,
         recurring: { interval: billingInterval === 'annual' ? 'year' : 'month' },
-        product_data: { name: 'Enterprise subscription' },
+        product_data: { name: 'Enterprise membership' },
         metadata: {
           source: 'admin_subscription_checkout',
           client_id: client.id,
@@ -2059,8 +2059,8 @@ adminRouter.post('/clients/:id/subscription-invoice', requireAuth, requireAdmin,
       }
       const platformCents = Math.round(platformFee * 100)
       const perRoleCents = Math.round(perRoleFee * 100)
-      invoiceTitle = `Enterprise subscription (${billingInterval})`
-      if (platformCents > 0) lineItems.push({ description: 'Enterprise platform fee', quantity: 1, unit_amount_cents: platformCents })
+      invoiceTitle = `Enterprise membership (${billingInterval})`
+      if (platformCents > 0) lineItems.push({ description: 'Enterprise membership fee', quantity: 1, unit_amount_cents: platformCents })
       if (perRoleCents > 0) lineItems.push({ description: 'Enterprise per-role fee', quantity: 1, unit_amount_cents: perRoleCents })
       if (!lineItems.length) return res.status(400).json({ error: 'invalid_enterprise_fees' })
     } else {
@@ -2083,9 +2083,9 @@ adminRouter.post('/clients/:id/subscription-invoice', requireAuth, requireAdmin,
       }
       const planLabel = planTier === 'basic' ? 'Basic' : 'Pro'
       const intervalLabel = billingInterval === 'annual' ? 'annual' : 'monthly'
-      invoiceTitle = `${planLabel} subscription (${intervalLabel})`
+      invoiceTitle = `${planLabel} membership (${intervalLabel})`
       lineItems.push({
-        description: `${planLabel} subscription (${intervalLabel})`,
+        description: `${planLabel} membership (${intervalLabel})`,
         quantity: 1,
         unit_amount_cents: unitAmount
       })

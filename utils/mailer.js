@@ -38,7 +38,7 @@ async function sendSubscriptionCheckoutEmail(to, checkoutUrl, recipientName) {
   const msg = {
     to,
     from: FROM,
-    subject: 'Complete your alphaScreen subscription',
+    subject: 'Complete your alphaScreen membership',
     html: `
       <!doctype html>
       <html lang="en">
@@ -47,7 +47,7 @@ async function sendSubscriptionCheckoutEmail(to, checkoutUrl, recipientName) {
         <meta name="viewport" content="width=device-width,initial-scale=1" />
         <meta name="color-scheme" content="light dark" />
         <meta name="supported-color-schemes" content="light dark" />
-        <title>Complete your alphaScreen subscription</title>
+        <title>Complete your alphaScreen membership</title>
         <style>
           body { margin: 0; padding: 0; background: #0F1E5D; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
           table { border-collapse: collapse; }
@@ -61,7 +61,7 @@ async function sendSubscriptionCheckoutEmail(to, checkoutUrl, recipientName) {
       </head>
       <body>
         <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
-          Complete your secure subscription checkout to activate your account.
+          Complete your secure membership checkout to activate your account.
         </div>
         <table role="presentation" width="100%" style="background:#0F1E5D;color:#C9D3FF;">
           <tr>
@@ -77,7 +77,7 @@ async function sendSubscriptionCheckoutEmail(to, checkoutUrl, recipientName) {
                       </tr>
                       <tr>
                         <td style="color:#E6EBFF;font-size:24px;line-height:1.25;font-weight:700;padding-bottom:10px;">
-                          Complete your alphaScreen subscription
+                          Complete your alphaScreen membership
                         </td>
                       </tr>
                       <tr>
@@ -87,19 +87,19 @@ async function sendSubscriptionCheckoutEmail(to, checkoutUrl, recipientName) {
                       </tr>
                       <tr>
                         <td style="color:#C9D3FF;font-size:15px;line-height:1.6;padding-bottom:20px;">
-                          Your subscription setup is almost complete. Use the button below to finish secure checkout and activate your account.
+                          Your membership setup is almost complete. Use the button below to finish secure checkout and activate your account.
                         </td>
                       </tr>
                       <tr>
                         <td style="padding-bottom:18px;">
                           <a class="cta" href="${safeCheckoutUrl}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#A78BFA;color:#0A1547;border:1px solid #CFCBFF;border-radius:10px;padding:11px 18px;font-size:14px;font-weight:700;line-height:1;">
-                            Complete subscription checkout
+                            Complete membership checkout
                           </a>
                         </td>
                       </tr>
                       <tr>
                         <td style="color:#C9D3FF;font-size:14px;line-height:1.55;padding-bottom:16px;">
-                          If the button doesn’t work, <a href="${safeCheckoutUrl}" target="_blank" rel="noopener noreferrer" style="color:#FFFFFF;">click here</a> to complete your subscription checkout.
+                          If the button doesn’t work, <a href="${safeCheckoutUrl}" target="_blank" rel="noopener noreferrer" style="color:#FFFFFF;">click here</a> to complete your membership checkout.
                         </td>
                       </tr>
                       <tr>
