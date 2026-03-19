@@ -4,6 +4,7 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
+const { getRoleInterviewAvailability } = require('../src/lib/roleInterviewAvailability');
 
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 
@@ -60,64 +61,41 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
       return Math.max(0, Math.floor(n));
     };
 
-    let includedInterviewsPerRole = null;
     let maxInterviewMinutes = null;
     const { data: planSettings, error: planSettingsError } = await db
       .from('client_plan_settings')
-      .select('included_interviews_per_role,max_interview_minutes')
+      .select('max_interview_minutes')
       .eq('client_id', clientId)
       .maybeSingle();
     if (planSettingsError) {
       console.warn('[GET /roles] plan settings lookup failed', planSettingsError?.message || planSettingsError);
     } else if (planSettings) {
-      includedInterviewsPerRole = parseWholeNonNegative(planSettings.included_interviews_per_role);
       maxInterviewMinutes = parseWholeNonNegative(planSettings.max_interview_minutes);
     }
 
-    const roleIds = roles.map((r) => r.id).filter(Boolean);
-    const usedInterviewsByRoleId = {};
-    if (roleIds.length) {
-      const { data: interviewRows, error: interviewsError } = await db
-        .from('interviews')
-        .select('role_id,status,transcript_scores,interview_summary')
-        .eq('client_id', clientId)
-        .in('role_id', roleIds);
-      if (interviewsError) {
-        console.warn('[GET /roles] interviews usage lookup failed', interviewsError?.message || interviewsError);
-      } else {
-        for (const row of (interviewRows || [])) {
-          const roleId = row?.role_id;
-          if (!roleId) continue;
-          const normalizedStatus = String(row?.status || '').trim().toLowerCase();
-          const summary = typeof row?.interview_summary === 'string' ? row.interview_summary.trim() : '';
-          let transcriptScores = row?.transcript_scores;
-          if (typeof transcriptScores === 'string' && transcriptScores.trim()) {
-            try { transcriptScores = JSON.parse(transcriptScores); } catch { transcriptScores = null; }
-          }
-          const transcriptOverall = transcriptScores && typeof transcriptScores === 'object'
-            ? Number(transcriptScores.overall)
-            : NaN;
-          const isUsed =
-            normalizedStatus === 'completed' ||
-            normalizedStatus === 'analyzed' ||
-            !!summary ||
-            Number.isFinite(transcriptOverall);
-          if (!isUsed) continue;
-          usedInterviewsByRoleId[roleId] = (usedInterviewsByRoleId[roleId] || 0) + 1;
+    const availabilityByRoleId = {};
+    if (roles.length) {
+      const availabilityRows = await Promise.all(roles.map(async (role) => {
+        if (!role?.id) {
+          return [null, null];
         }
+        const availability = await getRoleInterviewAvailability({ db, roleId: role.id, clientId });
+        return [role.id, availability];
+      }));
+      for (const [roleId, availability] of availabilityRows) {
+        if (!roleId) continue;
+        availabilityByRoleId[roleId] = availability || null;
       }
     }
 
     const items = roles.map((role) => {
-      const usedInterviews = Number(usedInterviewsByRoleId[role.id] || 0);
-      const remainingInterviews = includedInterviewsPerRole == null
-        ? null
-        : Math.max(0, includedInterviewsPerRole - usedInterviews);
+      const availability = availabilityByRoleId[role.id] || null;
       return {
         ...role,
-        included_interviews_per_role: includedInterviewsPerRole,
-        used_interviews: usedInterviews,
-        remaining_interviews: remainingInterviews,
+        included_interviews_per_role: availability?.included_interviews_per_role ?? null,
+        purchased_interviews: availability?.purchased_interviews ?? null,
+        used_interviews: availability?.used_interviews ?? null,
+        remaining_interviews: availability?.remaining_interviews ?? null,
         max_interview_minutes: maxInterviewMinutes
       };
     });
