@@ -287,6 +287,159 @@ app.post('/clients/billing/portal-session', requireAuth, withClientScope, async 
   }
 })
 
+app.post('/clients/billing/additional-interviews/checkout-session', requireAuth, withClientScope, async (req, res) => {
+  try {
+    const ids = Array.isArray(req.client_memberships) ? req.client_memberships : []
+    const clientId = String(req.body?.client_id || '').trim()
+    const roleId = String(req.body?.role_id || '').trim()
+    const parsedQuantity = Number(req.body?.quantity)
+    const quantity = Number.isInteger(parsedQuantity) ? parsedQuantity : NaN
+
+    if (!clientId) return res.status(400).json({ error: 'client_id_required' })
+    if (!ids.includes(clientId)) return res.status(403).json({ error: 'forbidden' })
+    if (!roleId) return res.status(400).json({ error: 'role_id_required' })
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      return res.status(400).json({ error: 'invalid_quantity' })
+    }
+
+    const { data: role, error: roleErr } = await supabaseAdmin
+      .from('roles')
+      .select('id,client_id,title')
+      .eq('id', roleId)
+      .eq('client_id', clientId)
+      .maybeSingle()
+    if (roleErr) return res.status(500).json({ error: 'role_lookup_failed', detail: roleErr.message })
+    if (!role) return res.status(404).json({ error: 'role_not_found' })
+
+    const { data: client, error: clientErr } = await supabaseAdmin
+      .from('clients')
+      .select('id,name,email,stripe_customer_id')
+      .eq('id', clientId)
+      .maybeSingle()
+    if (clientErr) return res.status(500).json({ error: 'client_lookup_failed', detail: clientErr.message })
+    if (!client) return res.status(404).json({ error: 'client_not_found' })
+
+    const { data: planSettings, error: planSettingsErr } = await supabaseAdmin
+      .from('client_plan_settings')
+      .select('additional_interview_fee')
+      .eq('client_id', clientId)
+      .maybeSingle()
+    if (planSettingsErr) return res.status(500).json({ error: 'plan_settings_lookup_failed', detail: planSettingsErr.message })
+
+    const additionalInterviewFee = Number(planSettings?.additional_interview_fee)
+    if (!Number.isFinite(additionalInterviewFee) || additionalInterviewFee <= 0) {
+      return res.status(400).json({ error: 'invalid_additional_interview_fee' })
+    }
+    const additionalInterviewCents = Math.round(additionalInterviewFee * 100)
+    if (!Number.isFinite(additionalInterviewCents) || additionalInterviewCents <= 0) {
+      return res.status(400).json({ error: 'invalid_additional_interview_fee' })
+    }
+
+    const { data: pendingPurchase, error: pendingPurchaseErr } = await supabaseAdmin
+      .from('role_interview_purchases')
+      .insert({
+        client_id: clientId,
+        role_id: roleId,
+        quantity,
+        status: 'pending'
+      })
+      .select('id')
+      .single()
+    if (pendingPurchaseErr) {
+      return res.status(500).json({ error: 'create_role_interview_purchase_failed', detail: pendingPurchaseErr.message })
+    }
+
+    const Stripe = require('stripe')
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
+
+    let stripeCustomerId = String(client.stripe_customer_id || '').trim()
+    if (stripeCustomerId) {
+      try {
+        await stripe.customers.retrieve(stripeCustomerId)
+      } catch (e) {
+        const code = String(e?.code || '').toLowerCase()
+        const message = String(e?.message || '').toLowerCase()
+        if (code === 'resource_missing' || message.includes('no such customer')) {
+          stripeCustomerId = ''
+        } else {
+          throw e
+        }
+      }
+    }
+    if (!stripeCustomerId) {
+      const email = String(client.email || '').trim()
+      if (email) {
+        const found = await stripe.customers.list({ email, limit: 1 })
+        stripeCustomerId = String(found?.data?.[0]?.id || '').trim()
+      }
+      if (!stripeCustomerId) {
+        const createdCustomer = await stripe.customers.create({
+          name: client.name || undefined,
+          email: String(client.email || '').trim() || undefined,
+          metadata: { client_id: client.id }
+        })
+        stripeCustomerId = String(createdCustomer?.id || '').trim()
+      }
+      if (!stripeCustomerId) return res.status(500).json({ error: 'stripe_customer_create_failed' })
+
+      if (stripeCustomerId !== String(client.stripe_customer_id || '').trim()) {
+        const { error: saveCustomerError } = await supabaseAdmin
+          .from('clients')
+          .update({ stripe_customer_id: stripeCustomerId })
+          .eq('id', client.id)
+        if (saveCustomerError) {
+          return res.status(500).json({ error: 'client_update_failed', detail: saveCustomerError.message })
+        }
+      }
+    }
+
+    const sessionMetadata = {
+      purchase_type: 'additional_interviews',
+      role_interview_purchase_id: String(pendingPurchase.id || ''),
+      client_id: clientId,
+      role_id: roleId,
+      quantity: String(quantity)
+    }
+    const canonicalSiteBase = FRONTEND_BASE || 'https://www.alphasourceai.com'
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      customer: stripeCustomerId || undefined,
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          unit_amount: additionalInterviewCents,
+          product_data: {
+            name: 'Additional interviews'
+          }
+        },
+        quantity
+      }],
+      allow_promotion_codes: true,
+      success_url: `${canonicalSiteBase}/account?tab=billing&intent=role_capacity&purchase=success&client_id=${encodeURIComponent(clientId)}&role_id=${encodeURIComponent(roleId)}`,
+      cancel_url: `${canonicalSiteBase}/account?tab=billing&intent=role_capacity&purchase=cancel&client_id=${encodeURIComponent(clientId)}&role_id=${encodeURIComponent(roleId)}`,
+      metadata: sessionMetadata
+    })
+
+    const { error: updatePurchaseErr } = await supabaseAdmin
+      .from('role_interview_purchases')
+      .update({
+        stripe_checkout_session_id: session?.id || null
+      })
+      .eq('id', pendingPurchase.id)
+    if (updatePurchaseErr) {
+      return res.status(500).json({ error: 'update_role_interview_purchase_failed', detail: updatePurchaseErr.message })
+    }
+
+    return res.json({
+      ok: true,
+      url: session?.url || null,
+      role_interview_purchase_id: pendingPurchase.id
+    })
+  } catch (e) {
+    return res.status(500).json({ error: 'create_additional_interviews_checkout_session_failed', detail: e?.message || 'create_additional_interviews_checkout_session_failed' })
+  }
+})
+
 app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCheckoutUpload.single('file'), async (req, res) => {
   try {
     const ids = Array.isArray(req.client_memberships) ? req.client_memberships : []
