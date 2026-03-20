@@ -23,7 +23,7 @@ router.get('/public/interview-status', async (req, res) => {
 
     const { data: role, error: roleError } = await supabase
       .from('roles')
-      .select('id')
+      .select('id, client_id')
       .eq('slug_or_token', role_token)
       .maybeSingle();
 
@@ -53,11 +53,25 @@ router.get('/public/interview-status', async (req, res) => {
       });
     }
 
+    let max_interview_minutes = null;
+    if (role?.client_id) {
+      const { data: plan } = await supabase
+        .from('client_plan_settings')
+        .select('max_interview_minutes')
+        .eq('client_id', role.client_id)
+        .maybeSingle();
+      const raw = Number(plan?.max_interview_minutes);
+      if (Number.isFinite(raw) && raw > 0) {
+        max_interview_minutes = Math.floor(raw);
+      }
+    }
+
     return res.status(200).json({
       ok: true,
       interview_id: interview.id,
       status: interview.status || null,
       updated_at: interview.updated_at || null,
+      max_interview_minutes,
       request_id
     });
   } catch (err) {
