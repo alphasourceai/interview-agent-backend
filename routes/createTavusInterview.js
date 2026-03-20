@@ -76,6 +76,18 @@ router.post('/', async (req, res) => {
     if (!clientId) {
       return res.status(400).json({ error: 'client_id could not be determined from role or candidate' });
     }
+    let maxInterviewMinutes = null;
+    try {
+      const { data: planSettings } = await supabaseAdmin
+        .from('client_plan_settings')
+        .select('max_interview_minutes')
+        .eq('client_id', clientId)
+        .maybeSingle();
+      const parsedMaxInterviewMinutes = Number(planSettings?.max_interview_minutes);
+      if (Number.isFinite(parsedMaxInterviewMinutes) && parsedMaxInterviewMinutes > 0) {
+        maxInterviewMinutes = Math.floor(parsedMaxInterviewMinutes);
+      }
+    } catch (_) {}
     if (BILLING_ENFORCED) {
       const { data: client, error: clientErr } = await supabase
         .from('clients')
@@ -142,7 +154,9 @@ router.post('/', async (req, res) => {
     const webhookUrl = `${base}/webhook/tavus`;
 
     // Tavus
-    const result = await createTavusInterviewHandler(candidate, role, webhookUrl);
+    const result = await createTavusInterviewHandler(candidate, role, webhookUrl, {
+      maxInterviewMinutes
+    });
 
     // Immediately reflect on candidate
     await supabase
@@ -183,7 +197,8 @@ router.post('/', async (req, res) => {
         message: 'Interview created',
         conversation_url: result.conversation_url || null,
         conversation_id: result.conversation_id || null,
-        interview_id: iData.id
+        interview_id: iData.id,
+        max_interview_minutes: maxInterviewMinutes
       });
     } else {
       const { error: uErr } = await supabase
@@ -201,7 +216,8 @@ router.post('/', async (req, res) => {
         message: 'Interview updated',
         conversation_url: result.conversation_url || null,
         conversation_id: result.conversation_id || existing.tavus_application_id || null,
-        interview_id: existing.id
+        interview_id: existing.id,
+        max_interview_minutes: maxInterviewMinutes
       });
     }
   } catch (e) {

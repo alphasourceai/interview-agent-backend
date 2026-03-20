@@ -14,7 +14,7 @@ const { ensureTavusDocumentForRole, missingTavusKbError } = require('../lib/tavu
  * @param {Object} candidate - { id, role_id, email, name }
  * @param {Object} role - { id, kb_document_id, tavus_document_id }
  * @param {string} [webhookUrl] - Full URL to /webhook/recording-ready
- * @param {Object} [options] - { companyName }
+ * @param {Object} [options] - { companyName, maxInterviewMinutes }
  */
 async function createTavusInterviewHandler(candidate, role, webhookUrl, options = {}) {
   const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
@@ -42,6 +42,12 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     env: envFlags
   });
 
+  const parsedMaxInterviewMinutes = Number(options?.maxInterviewMinutes);
+  const maxInterviewMinutes = Number.isFinite(parsedMaxInterviewMinutes) && parsedMaxInterviewMinutes > 0
+    ? Math.floor(parsedMaxInterviewMinutes)
+    : null;
+  const maxCallDurationSeconds = maxInterviewMinutes != null ? maxInterviewMinutes * 60 : 3600;
+
   const companyNameRaw = (options.companyName || role.company_name || '').trim();
   const companyName = /^the hiring organization$/i.test(companyNameRaw) ? '' : companyNameRaw;
   const roleTitle = (role?.title || 'this position').trim();
@@ -66,7 +72,7 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     conversational_context: context,
     custom_greeting: customGreeting,
     properties: {
-      max_call_duration: 3600,
+      max_call_duration: maxCallDurationSeconds,
       participant_left_timeout: 60
     }
   };
