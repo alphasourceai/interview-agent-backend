@@ -2948,6 +2948,7 @@ adminRouter.get('/roles/:id/interview-config', requireAuth, requireAdmin, async 
 
 adminRouter.patch('/roles/:id/interview-config', requireAuth, requireAdmin, async (req, res) => {
   const request_id = req.request_id || null;
+  let responseRubricQuestions;
   try {
     const roleId = req.params.id;
     const client_id = String(req.query?.client_id || '').trim();
@@ -2963,7 +2964,7 @@ adminRouter.patch('/roles/:id/interview-config', requireAuth, requireAdmin, asyn
 
     const { data: existing, error: existingErr } = await supabaseAdmin
       .from('roles')
-      .select('id,client_id')
+      .select('id,client_id,rubric')
       .eq('id', roleId)
       .maybeSingle();
 
@@ -3022,6 +3023,34 @@ adminRouter.patch('/roles/:id/interview-config', requireAuth, requireAdmin, asyn
             request_id
           });
         }
+        const cleanedQuestions = rq.map((q) => String(q || '').trim()).filter(Boolean);
+        const normalizeQuestionKey = (value) => String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+        const closedEndedStartRe = /^(do you|are you|did you|have you|can you|will you|would you|were you|is there|is it)\b/i;
+        const openEndedContinuationRe = /^(do you|are you|did you|have you|can you|will you|would you|were you|is there|is it)\b[\s,:-]*(please\s+)?(tell me about|walk me through|describe\b|how have you\b|what was your approach to\b|explain\b|share\b|give me an example\b)/i;
+        const seenQuestionKeys = new Set();
+        for (const question of cleanedQuestions) {
+          const key = normalizeQuestionKey(question);
+          if (seenQuestionKeys.has(key)) {
+            return res.status(400).json({
+              error: 'bad_request',
+              code: 'INVALID_RUBRIC_QUESTIONS',
+              detail: 'rubric_questions contains duplicate questions',
+              hint: null,
+              request_id
+            });
+          }
+          seenQuestionKeys.add(key);
+          if (closedEndedStartRe.test(question) && !openEndedContinuationRe.test(question)) {
+            return res.status(400).json({
+              error: 'bad_request',
+              code: 'INVALID_RUBRIC_QUESTIONS',
+              detail: 'rubric_questions must be open-ended and not yes/no style',
+              hint: null,
+              request_id
+            });
+          }
+        }
+        responseRubricQuestions = cleanedQuestions;
         let parsedRubric = null;
         if (typeof existing?.rubric === 'string' && existing.rubric.trim()) {
           try {
@@ -3045,7 +3074,7 @@ adminRouter.patch('/roles/:id/interview-config', requireAuth, requireAdmin, asyn
         }
 
         const newRubricObject = {
-          questions: rq.map((q) => ({
+          questions: cleanedQuestions.map((q) => ({
             text: q,
             category: existingCategoryByQuestion.get(normalizeQuestion(q)) || 'Custom'
           }))
