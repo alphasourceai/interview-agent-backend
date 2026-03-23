@@ -477,7 +477,8 @@ router.post('/', async (req, res) => {
               .limit(1)
               .maybeSingle();
             if (linkedRoleErr) throw new Error(linkedRoleErr.message || 'Role recovery lookup failed');
-            let createdRole = linkedRole ? { id: linkedRole.id } : null;
+            const linkedRoleId = linkedRole?.id || null;
+            let createdRole = linkedRoleId ? { id: linkedRoleId } : null;
             if (!createdRole) {
               const { data: insertedRole, error: createdRoleErr } = await supabaseAdmin
                 .from('roles')
@@ -514,7 +515,7 @@ router.post('/', async (req, res) => {
               })
               .eq('id', claimedPendingRolePurchase.id)
               .is('finalized_role_id', null)
-              .eq('status', 'finalizing')
+              .in('status', linkedRoleId ? ['pending', 'paid', 'finalizing'] : ['finalizing'])
               .select('id')
               .maybeSingle();
             if (finalizeErr || !finalizedPendingRolePurchase) throw new Error(finalizeErr?.message || 'Pending role purchase finalize failed');
