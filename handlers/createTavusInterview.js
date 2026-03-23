@@ -194,7 +194,7 @@ function extractInterviewQuestions(role) {
 
 function buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestion) {
   const companyClause = companyName ? ` at ${companyName}` : '';
-  const greeting = `Hi ${candidateName}, it's nice to meet you today. I'll be conducting your interview for the ${roleTitle} position${companyClause}. I'm looking forward to our conversation. Let's get started.`;
+  const greeting = `Hi ${candidateName}, thank you for taking the time to speak with me today. I'll be conducting your interview for the ${roleTitle} position${companyClause}. I'll ask questions one at a time, and you can answer naturally. Let's get started.`;
   return `${greeting} ${firstQuestion}`;
 }
 
@@ -212,6 +212,9 @@ function buildConversationalContext(candidateName, roleTitle, companyName, rubri
     '- YOU must speak first when the call connects: deliver the greeting and ask the first rubric question immediately. Do not wait in silence.',
     '- Do not introduce yourself with any personal name.',
     '- Ask questions one at a time from the rubric.',
+    '- Maintain a warm, professional, slightly slower pace with natural pauses; avoid sounding mechanical or rapid-fire.',
+    '- If an answer is very short, vague, non-specific, or does not answer the question, briefly acknowledge it and ask exactly one short follow-up (for example, "Could you tell me a little more about that?").',
+    '- After one follow-up attempt, if the candidate still does not elaborate, move on to the next rubric question.',
     '- END OF INTERVIEW PROTOCOL: After the final rubric question is answered, ask exactly once: "Do you have any questions for me before we wrap up?"',
     '- If the candidate asks a question at the end, answer it briefly in no more than 2 sentences, then ask exactly once: "Any other questions? If not, just say \'no\'."',
     '- If the candidate indicates they have no further questions (including no, nope, that\'s all, I\'m good, or similar), say exactly: "Thanks for your time today - this concludes the interview. I\'m ending the session now." Then end the call/session immediately with no additional prompts, silence, or follow-up questions.',
