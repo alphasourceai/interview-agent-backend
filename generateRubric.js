@@ -85,6 +85,34 @@ Return ONLY valid JSON. Shape:
 Interview Type: ${role.interview_type || 'BASIC'}
 Role Title: ${role.title}
 
+Question requirements:
+- Every question must be open-ended and designed to elicit a substantive response.
+- Never generate yes/no questions or other closed-ended prompts.
+- Prefer formats like: "Tell me about...", "Walk me through...", "Describe a time when...", "How have you..."
+- Ground questions in the JD and Manual Questions.
+
+Interview-type guidance:
+- BASIC: short screening style; focus on core fit, relevant experience, motivation, and communication; lighter depth; use a smaller set of questions; target about 5-7 questions.
+- DETAILED: deeper behavioral and situational coverage; leadership, ownership, judgment, collaboration, problem-solving, and complexity; target about 7-10 questions.
+- TECHNICAL: skill-heavy and scenario-based; tools/processes/technical reasoning depth; require approach, tradeoffs, execution, and troubleshooting detail; target about 7-10 questions.
+
+Manual-question handling:
+- If Manual Questions are provided, incorporate them into the final rubric.
+- You may lightly clean wording for clarity, but preserve original intent.
+- Do not drop manual questions unless they are duplicative, closed-ended, or clearly low quality.
+- If adapted, convert them into stronger open-ended versions.
+
+Ordering:
+- Start with broad/core fit questions.
+- Then move into role-specific depth.
+- End with the most specialized, technical, or high-judgment questions.
+
+Avoid:
+- duplicate questions
+- overly generic filler questions
+- questions that can be answered with yes/no
+- questions unrelated to the JD or Manual Questions
+
 Job Description (may be empty):
 ${jdText || 'N/A'}
 

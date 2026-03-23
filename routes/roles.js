@@ -121,12 +121,16 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
       null;
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
+    const interviewTypeRaw = String(req.body.interview_type || '').trim().toUpperCase();
+    const interviewType = ['BASIC', 'DETAILED', 'TECHNICAL'].includes(interviewTypeRaw)
+      ? interviewTypeRaw
+      : 'BASIC';
 
     const payload = {
       client_id: clientId,
       title: req.body.title || 'Untitled Role',
       description: req.body.description || null,
-      interview_type: req.body.interview_type || 'BASIC',
+      interview_type: interviewType,
     };
 
     const { data, error } = await db
