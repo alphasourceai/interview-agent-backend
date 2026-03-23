@@ -129,7 +129,8 @@ Return ONLY valid JSON with exactly these keys:
   "communication_quality": 0-100,
   "evidence_strength": 0-100,
   "ai_aided_risk": "low|medium|high",
-  "ai_aided_risk_reason": "one short sentence"
+  "ai_aided_risk_reason": "one short sentence",
+  "ai_aided_signals": ["short observable signal", "..."]
 }
 
 Scoring rules:
@@ -138,8 +139,28 @@ Scoring rules:
 - Do not infer protected traits.
 - Keep scores conservative and evidence-based.
 - evidence_strength is how strong the transcript evidence is for the scores you gave (NOT how "confident" you feel).
-- ai_aided_risk is a conservative heuristic based ONLY on observable transcript evidence; it is NOT proof.
-- Default ai_aided_risk to "low" unless there are multiple clear indicators; keep the reason neutral and non-accusatory.
+- ai_aided_risk is a conservative heuristic based primarily on observable transcript evidence; it is NOT proof.
+- Evaluate AI-aided risk using concrete transcript patterns such as:
+  - overly polished or generic phrasing that sounds externally generated
+  - repeated scripted transitions across answers
+  - weak adaptation to the specific question being asked
+  - responses that read like pre-composed/read-aloud text rather than natural speech
+  - suspiciously uniform answer structure across different prompts
+  - mismatch between fluency and actual specificity
+  - evasive or padded polished answers that do not directly answer the question
+- Use perception/non-verbal cues only as secondary corroboration when they align with transcript evidence (never as stand-alone proof), such as:
+  - repeated off-screen eye tracking consistent with reading
+  - unusually fixed gaze to a specific region while giving polished answers
+  - visible read-aloud delivery pattern
+  - mismatch between polished delivery and weak specificity
+- Normal thinking pauses, nervousness, or occasional look-away behavior are not enough by themselves.
+- Rating guidance:
+  - low: little or no observable evidence of AI-aided delivery patterns
+  - medium: some meaningful indicators, but not enough to strongly conclude
+  - high: strong observable evidence of scripted/read-aloud/externally generated delivery patterns
+- Do not treat strong articulation alone as evidence of AI aid.
+- Keep ai_aided_risk_reason neutral and non-accusatory.
+- ai_aided_signals must contain only short observable evidence indicators (empty array if none).
   
 Job description context:
 """${jdGrounding}"""
@@ -195,6 +216,10 @@ Transcript:
   const aiAidedRiskReason = typeof parsed.ai_aided_risk_reason === 'string'
     ? parsed.ai_aided_risk_reason.trim().slice(0, 300)
     : '';
+  const _aiAidedSignals = Array.isArray(parsed.ai_aided_signals)
+    ? parsed.ai_aided_signals.map((v) => String(v || '').trim()).filter(Boolean).slice(0, 8)
+    : [];
+  void _aiAidedSignals;
 
   const rawSummary = String(parsed.summary || '').trim();
   if (!rawSummary) {
