@@ -1267,12 +1267,14 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   const name = (req.body?.name || '').trim()
   const adminName  = (req.body?.admin_name  || '').trim()
   const adminEmail = (req.body?.admin_email || '').trim()
+  const candidateAssistanceContact = (req.body?.candidate_assistance_contact || '').trim()
   const requestedInitialRole = String(req.body?.admin_role || '').trim().toLowerCase()
   const seededMemberRole = ['admin', 'tester', 'member'].includes(requestedInitialRole)
     ? requestedInitialRole
     : (requestedInitialRole === 'manager' ? 'admin' : 'admin')
   const explicitClientEmail = (req.body?.email || '').trim()
   if (!name) return res.status(400).json({ error: 'name_required' })
+  if (!candidateAssistanceContact) return res.status(400).json({ error: 'candidate_assistance_contact_required' })
 
   const emailForClient = explicitClientEmail || adminEmail
   if (!emailForClient) {
@@ -1281,7 +1283,14 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
 
   const { data: client, error: cErr } = await supabaseAdmin
     .from('clients')
-    .insert({ name, email: emailForClient, client_admin_name: adminName || null, plan_tier: null, billing_interval: null })
+    .insert({
+      name,
+      email: emailForClient,
+      client_admin_name: adminName || null,
+      candidate_assistance_contact: candidateAssistanceContact,
+      plan_tier: null,
+      billing_interval: null
+    })
     .select('id,name,created_at')
     .single()
   if (cErr) {

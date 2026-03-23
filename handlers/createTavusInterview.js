@@ -148,13 +148,6 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
 }
 
 function extractInterviewQuestions(role) {
-  const direct = Array.isArray(role?.rubric_questions)
-    ? role.rubric_questions
-        .map((q) => (typeof q === 'string' ? q.trim() : ''))
-        .filter(Boolean)
-    : [];
-  if (direct.length) return direct;
-
   const out = [];
   const seen = new Set();
   const add = (value) => {

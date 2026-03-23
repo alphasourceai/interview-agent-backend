@@ -390,6 +390,15 @@ async function getRoleJdText(roleId, requestId, interviewId, conversationId) {
 async function applyTranscriptScoringForInterview({ interview, fresh, transcriptText, requestId, conversationId }) {
   const transcript = typeof transcriptText === 'string' ? transcriptText.trim() : '';
   const substantiveCheck = isSubstantiveTranscript(transcript);
+  const transcriptWordCount = transcript ? transcript.split(/\s+/).filter(Boolean).length : 0;
+  const candidateResponseTurns = (transcript.match(/^(CANDIDATE|USER)\s*:/gim) || []).length;
+  const disconnectedLevel = !substantiveCheck.ok && (
+    substantiveCheck.reason === 'empty_transcript' ||
+    transcriptWordCount <= 10 ||
+    (candidateResponseTurns === 0 && transcriptWordCount <= 30)
+  );
+  const disconnectedSummary = 'Interview ended before substantive responses were captured.';
+  const disconnectedRiskReason = 'No substantive interview response was available to assess.';
   const existingTopScores =
     fresh?.transcript_scores && typeof fresh.transcript_scores === 'object'
       ? fresh.transcript_scores
@@ -402,6 +411,19 @@ async function applyTranscriptScoringForInterview({ interview, fresh, transcript
 
   if (substantiveCheck.ok && Number.isFinite(existingOverall) && Number.isFinite(existingConfidence) && existingSummary) {
     return { updated: false, substantive: true, reason: 'already_scored' };
+  }
+  if (
+    disconnectedLevel &&
+    existingSummary === disconnectedSummary &&
+    existingTopScores.overall == null &&
+    existingTopScores.role_fit == null &&
+    existingTopScores.technical_strength == null &&
+    existingTopScores.communication_quality == null &&
+    Number(existingTopScores.confidence) === 0 &&
+    String(existingTopScores.ai_aided_risk || '').toLowerCase() === 'low' &&
+    String(existingTopScores.ai_aided_risk_reason || '').trim() === disconnectedRiskReason
+  ) {
+    return { updated: false, substantive: false, reason: 'already_disconnected' };
   }
   if (!substantiveCheck.ok && Number(existingConfidence) === 0 && hasInsufficientSummary) {
     return { updated: false, substantive: false, reason: 'already_insufficient' };
@@ -418,15 +440,28 @@ async function applyTranscriptScoringForInterview({ interview, fresh, transcript
           : {}
       );
 
-  const scored = await scoreInterview({
-    transcriptText: transcript,
-    jdText,
-    perceptionScores,
-    mode: 'webhook',
-    request_id: requestId || null
-  });
+  const scored = disconnectedLevel
+    ? {
+      summary: disconnectedSummary,
+      transcript_scores: {
+        overall: null,
+        role_fit: null,
+        technical_strength: null,
+        communication_quality: null,
+        confidence: 0,
+        ai_aided_risk: 'low',
+        ai_aided_risk_reason: disconnectedRiskReason
+      }
+    }
+    : await scoreInterview({
+      transcriptText: transcript,
+      jdText,
+      perceptionScores,
+      mode: 'webhook',
+      request_id: requestId || null
+    });
 
-  if (!substantiveCheck.ok) {
+  if (!substantiveCheck.ok && !disconnectedLevel) {
     console.log('[webhook] transcript summary skipped insufficient', {
       request_id: requestId || null,
       interview_id: interview?.id || null,
@@ -444,6 +479,8 @@ async function applyTranscriptScoringForInterview({ interview, fresh, transcript
     if (!existingSummary || existingSummary === INSUFFICIENT_SUMMARY) {
       updateFields.interview_summary = scored.summary;
     }
+  } else if (disconnectedLevel) {
+    updateFields.interview_summary = scored.summary;
   } else if (!hasInsufficientSummary) {
     updateFields.interview_summary = scored.summary;
   }
