@@ -20,7 +20,7 @@ const handleResumeUpload = [
       const resumeFile = req.file;
       const fileExt = path.extname(resumeFile.originalname);
       const timestamp = Date.now();
-      const storagePath = `resumes/${email}-${timestamp}${fileExt}`;
+      const storagePath = `${email}-${timestamp}${fileExt}`;
 
       const { data: uploadData, error: uploadError } = await supabase.storage
         .from('resumes')
@@ -33,11 +33,19 @@ const handleResumeUpload = [
         return res.status(500).json({ error: 'Resume upload failed', details: uploadError });
       }
 
-      const publicURL = `https://${process.env.SUPABASE_URL.split('//')[1]}/storage/v1/object/public/${uploadData.path}`;
+      const resumeStoragePath = `resumes/${uploadData?.path || storagePath}`;
 
       const { data: candidate, error: dbError } = await supabase
         .from('candidates')
-        .insert([{ id: uuidv4(), name, email, role_id, upload_ts: new Date().toISOString(), status: 'Resume Uploaded' }])
+        .insert([{
+          id: uuidv4(),
+          name,
+          email,
+          role_id,
+          upload_ts: new Date().toISOString(),
+          status: 'Resume Uploaded',
+          resume_url: resumeStoragePath,
+        }])
         .select()
         .single();
 
@@ -91,7 +99,7 @@ Respond in JSON with:
         },
       ]);
 
-      return res.json({ message: 'Resume uploaded and analyzed', candidate, resume_url: publicURL, analysis });
+      return res.json({ message: 'Resume uploaded and analyzed', candidate, resume_url: resumeStoragePath, analysis });
     } catch (err) {
       console.error(err);
       return res.status(500).json({ error: 'Internal server error', details: err.message });

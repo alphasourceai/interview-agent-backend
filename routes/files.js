@@ -78,4 +78,52 @@ router.get('/signed-url', requireAuth, withClientScope, async (req, res) => {
   }
 });
 
+router.get('/resume-signed-url', requireAuth, withClientScope, async (req, res) => {
+  try {
+    const { candidate_id } = req.query;
+    if (!candidate_id) return res.status(400).json({ error: 'candidate_id is required' });
+
+    const scopedIds = Array.isArray(req?.clientScope?.memberships)
+      ? req.clientScope.memberships.map(m => m.client_id)
+      : [];
+    if (!scopedIds.length) return res.status(403).json({ error: 'No client scope' });
+
+    const { data: candidate, error } = await supabaseAdmin
+      .from('candidates')
+      .select('id, client_id, resume_url')
+      .eq('id', candidate_id)
+      .maybeSingle();
+
+    if (error) return res.status(400).json({ error: error.message });
+    if (!candidate) return res.status(404).json({ error: 'Candidate not found' });
+    if (!scopedIds.includes(candidate.client_id)) return res.status(403).json({ error: 'Forbidden' });
+
+    const raw = String(candidate.resume_url || '').trim();
+    if (!raw) return res.status(404).json({ error: 'resume not available' });
+
+    let parsed = parseBucketPath(raw);
+    if (!parsed && !/^https?:\/\//i.test(raw)) {
+      parsed = {
+        bucket: process.env.SUPABASE_RESUMES_BUCKET || 'resumes',
+        path: raw.replace(/^\/+/, ''),
+      };
+    }
+    if (!parsed) {
+      if (/^https?:\/\//i.test(raw)) return res.json({ ok: true, url: raw, mode: 'legacy_url' });
+      return res.status(400).json({ error: 'Unrecognized storage path/URL' });
+    }
+
+    const EXPIRES = Number(process.env.SIGNED_URL_TTL_SECONDS || 300);
+    const { data: signed, error: signErr } = await supabaseAdmin
+      .storage
+      .from(parsed.bucket)
+      .createSignedUrl(parsed.path, EXPIRES);
+
+    if (signErr) return res.status(400).json({ error: signErr.message });
+    return res.json({ ok: true, url: signed?.signedUrl, mode: 'signed', bucket: parsed.bucket });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

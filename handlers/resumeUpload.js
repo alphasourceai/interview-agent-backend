@@ -18,7 +18,7 @@ const handleResumeUpload = [
       const resumeFile = req.file;
       const fileExt = path.extname(resumeFile.originalname);
       const candidate_id = `cand-${uuidv4()}`;
-      const storagePath = `resumes/${candidate_id}${fileExt}`;
+      const storagePath = `${candidate_id}${fileExt}`;
 
       const { data: uploadData, error: uploadError } = await supabase.storage
         .from('resumes')
@@ -31,7 +31,7 @@ const handleResumeUpload = [
         return res.status(500).json({ error: 'Resume upload failed', details: uploadError });
       }
 
-      const publicURL = `https://${process.env.SUPABASE_URL.split('//')[1]}/storage/v1/object/public/${uploadData.path}`;
+      const resumeStoragePath = `resumes/${uploadData?.path || storagePath}`;
 
       const role = await supabase.from('roles').select('id, title, description, client_id').eq('id', role_id).single();
       let analysis;
@@ -74,7 +74,7 @@ const handleResumeUpload = [
           upload_ts: new Date().toISOString(),
           status: 'Resume Uploaded',
           interview_status: 'pending',
-          resume_url: publicURL,
+          resume_url: resumeStoragePath,
           analysis_summary: analysisSummary
         }])
         .select()
@@ -84,7 +84,7 @@ const handleResumeUpload = [
         return res.status(500).json({ error: 'Failed to save candidate metadata', dbError });
       }
 
-      return res.json({ message: 'Resume uploaded and analyzed', candidate, resume_url: publicURL, analysis });
+      return res.json({ message: 'Resume uploaded and analyzed', candidate, resume_url: resumeStoragePath, analysis });
     } catch (err) {
       console.error(err);
       return res.status(500).json({

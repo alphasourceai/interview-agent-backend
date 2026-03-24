@@ -235,8 +235,7 @@ router.post('/', upload.any(), async (req, res) => {
           upsert: true,
         });
         if (!up.error) {
-          const { data: pub } = supabase.storage.from(bucket).getPublicUrl(path);
-          resume_url = pub?.publicUrl || resume_url;
+          resume_url = `${bucket}/${path}`;
         }
       }
     } catch (e) {
