@@ -3,6 +3,7 @@
 const { sendRoleInterviewLimitReachedEmail } = require('../../utils/mailer');
 
 const FRONTEND_BASE = 'https://www.alphasourceai.com';
+const EARLY_ENDED_SENTINEL_SUMMARY = 'Interview ended before substantive responses were captured.';
 
 function parseWholeNonNegative(value) {
   const n = Number(value);
@@ -25,9 +26,22 @@ function isUsedInterviewRow(row) {
   const normalizedStatus = String(row?.status || '').trim().toLowerCase();
   const summary = typeof row?.interview_summary === 'string' ? row.interview_summary.trim() : '';
   const transcriptScores = parseTranscriptScores(row?.transcript_scores);
+  const transcriptOverallRaw = transcriptScores && typeof transcriptScores === 'object'
+    ? transcriptScores.overall
+    : undefined;
   const transcriptOverall = transcriptScores && typeof transcriptScores === 'object'
-    ? Number(transcriptScores.overall)
+    ? Number(transcriptOverallRaw)
     : NaN;
+  const hasNumericTranscriptOverall = (
+    transcriptOverallRaw != null &&
+    !(typeof transcriptOverallRaw === 'string' && transcriptOverallRaw.trim() === '') &&
+    Number.isFinite(Number(transcriptOverallRaw))
+  );
+  const isEarlyEndedSentinel =
+    normalizedStatus === 'ended' &&
+    summary === EARLY_ENDED_SENTINEL_SUMMARY &&
+    !hasNumericTranscriptOverall;
+  if (isEarlyEndedSentinel) return false;
   return (
     normalizedStatus === 'completed' ||
     normalizedStatus === 'analyzed' ||

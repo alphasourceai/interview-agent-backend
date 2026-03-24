@@ -5,6 +5,34 @@ const axios = require('axios');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 
 const router = express.Router();
+const EARLY_END_GRACE_MS = 15000;
+const EARLY_END_WINDOW_MS = 20 * 60 * 1000;
+const EARLY_END_SUMMARY = 'Interview ended before substantive responses were captured.';
+const EARLY_END_TRANSCRIPT_SCORES = {
+  overall: null,
+  role_fit: null,
+  technical_strength: null,
+  communication_quality: null,
+  confidence: 0,
+  ai_aided_risk: 'low',
+  ai_aided_risk_reason: 'No substantive interview response was available to assess.'
+};
+
+function hasNonEmptyText(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function hasAnalysisData(value) {
+  if (!value) return false;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return false;
+    return trimmed !== '{}' && trimmed !== '[]';
+  }
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === 'object') return Object.keys(value).length > 0;
+  return true;
+}
 
 router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (req, res) => {
   const request_id = req.request_id || req.headers['x-request-id'] || req.headers['x-correlation-id'] || null;
@@ -95,6 +123,77 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
       interview_id: updatedInterview?.id || null,
       status: updatedInterview?.status || 'ending_requested'
     });
+
+    if (updatedInterview?.id) {
+      const interviewId = updatedInterview.id;
+      setTimeout(async () => {
+        try {
+          const { data: fresh, error: freshError } = await supabaseAdmin
+            .from('interviews')
+            .select('id,status,created_at,transcript,analysis,interview_summary')
+            .eq('id', interviewId)
+            .maybeSingle();
+
+          if (freshError) {
+            console.error('[tavus/end-conversation] early_end_reconcile_read_failed', {
+              request_id,
+              interview_id: interviewId,
+              code: freshError.code,
+              detail: freshError.message
+            });
+            return;
+          }
+          if (!fresh) return;
+
+          const status = String(fresh.status || '').toLowerCase();
+          const createdAtMs = new Date(fresh.created_at || 0).getTime();
+          const isRecent = Number.isFinite(createdAtMs) && (Date.now() - createdAtMs <= EARLY_END_WINDOW_MS);
+          const transcriptEmpty = !hasNonEmptyText(fresh.transcript);
+          const summaryEmpty = !hasNonEmptyText(fresh.interview_summary);
+          const analysisEmpty = !hasAnalysisData(fresh.analysis);
+          const shouldFinalizeEarlyEnded =
+            status === 'ending_requested' &&
+            isRecent &&
+            transcriptEmpty &&
+            summaryEmpty &&
+            analysisEmpty;
+
+          if (!shouldFinalizeEarlyEnded) return;
+
+          const { error: finalizeError } = await supabaseAdmin
+            .from('interviews')
+            .update({
+              status: 'Ended',
+              interview_summary: EARLY_END_SUMMARY,
+              transcript_scores: EARLY_END_TRANSCRIPT_SCORES,
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', interviewId)
+            .eq('status', 'ending_requested');
+
+          if (finalizeError) {
+            console.error('[tavus/end-conversation] early_end_reconcile_finalize_failed', {
+              request_id,
+              interview_id: interviewId,
+              code: finalizeError.code,
+              detail: finalizeError.message
+            });
+            return;
+          }
+
+          console.log('[tavus/end-conversation] early_end_reconcile_finalized', {
+            request_id,
+            interview_id: interviewId
+          });
+        } catch (e) {
+          console.error('[tavus/end-conversation] early_end_reconcile_unexpected', {
+            request_id,
+            interview_id: interviewId,
+            error: e?.message || e
+          });
+        }
+      }, EARLY_END_GRACE_MS);
+    }
 
     return res.json({ ok: true, request_id });
   } catch (e) {
