@@ -526,10 +526,7 @@ async function handleGenerate(req, res) {
       Sentry.addBreadcrumb({ category: 'storage', level: 'info', message: 'storage:uploaded', data: { key } });
     }
 
-    // Derive a public-style URL (works if bucket is public; harmless otherwise)
-    const { data: pub } = supabaseAdmin.storage.from(REPORTS_BUCKET).getPublicUrl(key);
-
-    // Also create a short-lived signed URL for immediate download/open
+    // Create a short-lived signed URL for immediate download/open
     const expiresIn = Math.max(MIN_SIGNED_SECS, Math.min(MAX_SIGNED_SECS, Number(req.query.expires || DEFAULT_SIGNED_SECS)));
     const { data: signed, error: signErr } = await supabaseAdmin
       .storage
@@ -545,7 +542,7 @@ async function handleGenerate(req, res) {
       await supabaseAdmin
         .from('reports')
         .update({
-          report_url: pub?.publicUrl || null,
+          report_url: key,
           report_generated_at: new Date().toISOString()
         })
         .eq('id', reportRow.id);
@@ -559,7 +556,7 @@ async function handleGenerate(req, res) {
       ok: true,
       report_id: reportRow.id,
       key,
-      url: pub?.publicUrl || null,
+      report_url: key,
       signed_url: signed?.signedUrl || null,
       expires_in: expiresIn
     });
