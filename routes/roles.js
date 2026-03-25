@@ -522,33 +522,7 @@ ${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}
  * Also supports JSON body. Requires auth (global admin dashboard behavior).
  */
 router.delete('/admin/roles', requireAuth, async (req, res) => {
-  try {
-    const roleId = req.query.id || req.body?.id;
-    const clientId = req.query.client_id || req.body?.client_id;
-
-    if (!roleId || !clientId) {
-      return res.status(400).json({ error: 'Missing id or client_id' });
-    }
-
-    const { data, error } = await db
-      .from('roles')
-      .delete()
-      .eq('id', roleId)
-      .eq('client_id', clientId)
-      .select('id')
-      .maybeSingle();
-
-    if (error) {
-      console.error('[DELETE /admin/roles] supabase error', error);
-      return res.status(500).json({ error: 'Failed to delete role' });
-    }
-    if (!data) return res.status(404).json({ error: 'Not found' });
-
-    return res.json({ ok: true, id: data.id });
-  } catch (e) {
-    console.error('[DELETE /admin/roles] unexpected', e);
-    return res.status(500).json({ error: 'Server error' });
-  }
+  return res.status(403).json({ error: 'legacy_route_disabled' });
 });
 
 /**
@@ -557,33 +531,7 @@ router.delete('/admin/roles', requireAuth, async (req, res) => {
  * Mirrors FE fall-back call pattern.
  */
 router.post('/admin/roles/delete', requireAuth, async (req, res) => {
-  try {
-    const roleId = req.body?.id;
-    const clientId = req.body?.client_id;
-
-    if (!roleId || !clientId) {
-      return res.status(400).json({ error: 'Missing id or client_id' });
-    }
-
-    const { data, error } = await db
-      .from('roles')
-      .delete()
-      .eq('id', roleId)
-      .eq('client_id', clientId)
-      .select('id')
-      .maybeSingle();
-
-    if (error) {
-      console.error('[POST /admin/roles/delete] supabase error', error);
-      return res.status(500).json({ error: 'Failed to delete role' });
-    }
-    if (!data) return res.status(404).json({ error: 'Not found' });
-
-    return res.json({ ok: true, id: data.id });
-  } catch (e) {
-    console.error('[POST /admin/roles/delete] unexpected', e);
-    return res.status(500).json({ error: 'Server error' });
-  }
+  return res.status(403).json({ error: 'legacy_route_disabled' });
 });
 
 module.exports = router;
