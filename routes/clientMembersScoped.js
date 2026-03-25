@@ -218,7 +218,6 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
         error: 'add_member_failed',
         detail: 'Could not create or locate user for this email.',
         hint: 'Try again or send the magic link manually.',
-        action_link: null,
         request_id
       });
     }
@@ -240,7 +239,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
 
     const m = data;
     console.log('[client-members/scoped-add] success', { request_id, client_id: clientId, role, email: redactEmail(email), method });
-    res.json({ item: { ...m, id: m.user_id || m.email }, request_id, invite_action_link: inviteActionLink || null });
+    res.json({ item: { ...m, id: m.user_id || m.email }, request_id });
   } catch (e) {
     if (e?.code === 'misconfigured_supabase_auth') {
       return res.status(500).json({ error: 'misconfigured_supabase_auth', detail: e.detail || 'Missing SUPABASE_PUBLIC_ANON_KEY', request_id: req.request_id || request_id });

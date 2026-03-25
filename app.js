@@ -1306,7 +1306,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
 
     if (!userId) {
       console.error('seed_member_no_user_id', { email: adminEmail, method })
-      return res.json({ item: client, seeded_member: null, note: 'client_created_invite_failed', action_link: actionLink || null })
+      return res.json({ item: client, seeded_member: null, note: 'client_created_invite_failed' })
     }
 
     const payload = {
@@ -3181,8 +3181,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
     return res.status(400).json({
       error: 'add_member_failed',
       detail: 'Could not create or locate user for this email.',
-      hint: 'Try again or send the magic link manually.',
-      action_link: actionLink || null
+      hint: 'Try again or send the magic link manually.'
     })
   }
 
