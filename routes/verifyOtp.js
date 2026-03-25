@@ -221,7 +221,12 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
       email
     });
   } catch (e) {
-    console.error("verify-otp error:", e?.response?.data || e?.message || e);
+    console.error("verify-otp error", {
+      request_id: req.request_id || null,
+      message: e?.message || "Server error",
+      code: e?.code || null,
+      status: e?.response?.status || null
+    });
     return res.status(500).json({ error: e?.message || "Server error" });
   }
 });

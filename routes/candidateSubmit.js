@@ -297,7 +297,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
     if (otpErr) return res.status(500).json({ error: `Could not create OTP: ${otpErr.message}` });
 
     // --- email OTP (non-fatal) ---
-    let emailSent = false, emailError = null;
+    let emailSent = false;
     try {
       if (!SENDGRID_KEY || !FROM_EMAIL) throw new Error('SENDGRID_API_KEY or SENDGRID_FROM not configured');
       const [resp] = await sg.send({
@@ -310,18 +310,17 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       });
       emailSent = resp?.statusCode === 202;
     } catch (e) {
-      emailError = e?.response?.data || e?.message || String(e);
-      console.error('sendEmailOtp failed:', emailError);
+      const status = e?.response?.status || e?.code || null;
+      const message = e?.message || 'send_failed';
+      console.error('sendEmailOtp failed', { request_id, status, message });
     }
 
     // success
     return res.status(200).json({
       message: emailSent ? 'Candidate created. OTP emailed.' : 'Candidate created. OTP email failed.',
       email_sent: emailSent,
-      email_error: emailError,
       candidate_id,
       role_id: roleId,
-      email,
       resume_url: resume_url || null,
     });
   } catch (err) {
