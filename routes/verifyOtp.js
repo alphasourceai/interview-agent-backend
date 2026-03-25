@@ -6,6 +6,28 @@ const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = req
 const router = express.Router();
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
 const BILLING_ENFORCED = BILLING_MODE === 'enforce';
+const VERIFY_OTP_RATE_WINDOW_MS = 60 * 60 * 1000;
+const VERIFY_OTP_RATE_MAX = 20;
+const verifyOtpRateBuckets = new Map();
+
+function verifyOtpRateLimit(req, res, next) {
+  const now = Date.now();
+  const ip = String((req.headers['x-forwarded-for'] || req.ip || 'unknown')).split(',')[0].trim() || 'unknown';
+  const current = verifyOtpRateBuckets.get(ip);
+  const bucket = (!current || current.resetAt <= now)
+    ? { count: 0, resetAt: now + VERIFY_OTP_RATE_WINDOW_MS }
+    : current;
+  bucket.count += 1;
+  verifyOtpRateBuckets.set(ip, bucket);
+  if (bucket.count > VERIFY_OTP_RATE_MAX) {
+    return res.status(429).json({
+      error: 'rate_limited',
+      code: 'RATE_LIMIT_EXCEEDED',
+      detail: 'Too many requests. Please try again later.'
+    });
+  }
+  return next();
+}
 
 /**
  * POST /api/candidate/verify-otp
@@ -13,7 +35,7 @@ const BILLING_ENFORCED = BILLING_MODE === 'enforce';
  * - email and 6-digit code are required
  * - candidate_id/role_id remove ambiguity if the same email is used across roles
  */
-router.post("/", async (req, res) => {
+router.post("/", verifyOtpRateLimit, async (req, res) => {
   try {
     const request_id = req.request_id || null;
     const email = String(req.body?.email || "").trim().toLowerCase();

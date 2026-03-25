@@ -20,6 +20,28 @@ const APP_NAME = process.env.APP_NAME || 'Interview Agent';
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
 const BILLING_ENFORCED = BILLING_MODE === 'enforce';
 if (SENDGRID_KEY) sg.setApiKey(SENDGRID_KEY);
+const SUBMIT_RATE_WINDOW_MS = 60 * 60 * 1000;
+const SUBMIT_RATE_MAX = 10;
+const submitRateBuckets = new Map();
+
+function candidateSubmitRateLimit(req, res, next) {
+  const now = Date.now();
+  const ip = String((req.headers['x-forwarded-for'] || req.ip || 'unknown')).split(',')[0].trim() || 'unknown';
+  const current = submitRateBuckets.get(ip);
+  const bucket = (!current || current.resetAt <= now)
+    ? { count: 0, resetAt: now + SUBMIT_RATE_WINDOW_MS }
+    : current;
+  bucket.count += 1;
+  submitRateBuckets.set(ip, bucket);
+  if (bucket.count > SUBMIT_RATE_MAX) {
+    return res.status(429).json({
+      error: 'rate_limited',
+      code: 'RATE_LIMIT_EXCEEDED',
+      detail: 'Too many requests. Please try again later.'
+    });
+  }
+  return next();
+}
 
 // 6-digit OTP
 function six() {
@@ -44,7 +66,7 @@ function normName(v = '') {
  * Accepts multipart form (resume) or JSON (resume_url).
  * Required: email + (name OR first/last) + (role_id OR role_token)
  */
-router.post('/', upload.any(), async (req, res) => {
+router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
   try {
     const request_id = req.request_id || null;
     // --- normalize inputs ---
