@@ -49,7 +49,8 @@ const crypto = require('crypto')
 const multer = require('multer')
 const path = require('path')
 const { supabaseAdmin } = require('./src/lib/supabaseClient')
-const { generateRubricAndKBForRole } = require('./generateRubric')
+const { generateRubricAndKBForRole, makeKBFromRubric } = require('./generateRubric')
+const { ensureTavusDocumentForRole } = require('./lib/tavusDocuments')
 const axios = require('axios')
 const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
@@ -2949,6 +2950,8 @@ adminRouter.get('/roles/:id/interview-config', requireAuth, requireAdmin, async 
 adminRouter.patch('/roles/:id/interview-config', requireAuth, requireAdmin, async (req, res) => {
   const request_id = req.request_id || null;
   let responseRubricQuestions;
+  let rubricQuestionsEdited = false;
+  let updatedRubricForSync = null;
   try {
     const roleId = req.params.id;
     const client_id = String(req.query?.client_id || '').trim();
@@ -3080,6 +3083,9 @@ adminRouter.patch('/roles/:id/interview-config', requireAuth, requireAdmin, asyn
           }))
         };
         updates.rubric = newRubricObject;
+        updates.rubric_questions = newRubricObject.questions;
+        rubricQuestionsEdited = true;
+        updatedRubricForSync = newRubricObject;
       }
     }
 
@@ -3116,6 +3122,58 @@ adminRouter.patch('/roles/:id/interview-config', requireAuth, requireAdmin, asyn
         hint: updateErr.hint || null,
         request_id
       });
+    }
+
+    if (rubricQuestionsEdited && updatedRubricForSync) {
+      try {
+        const { data: roleForKbSync, error: roleForKbSyncErr } = await supabaseAdmin
+          .from('roles')
+          .select('id,title,kb_document_id')
+          .eq('id', roleId)
+          .eq('client_id', client_id)
+          .maybeSingle();
+
+        if (roleForKbSyncErr) throw roleForKbSyncErr;
+
+        if (roleForKbSync?.kb_document_id) {
+          const kbJson = makeKBFromRubric(updatedRubricForSync);
+          const kbKey = `${roleForKbSync.kb_document_id}.json`;
+          const kbPayload = JSON.stringify(kbJson, null, 2);
+          let kbUploadError = null;
+
+          const { error: kbUploadErr } = await supabaseAdmin.storage
+            .from('kbs')
+            .upload(kbKey, new Blob([kbPayload], { type: 'application/json' }), {
+              contentType: 'application/json',
+              upsert: true
+            });
+          kbUploadError = kbUploadErr || null;
+
+          if (kbUploadError) {
+            const { error: kbUploadErr2 } = await supabaseAdmin.storage
+              .from('kbs')
+              .upload(kbKey, Buffer.from(kbPayload), {
+                contentType: 'application/json',
+                upsert: true
+              });
+            kbUploadError = kbUploadErr2 || null;
+          }
+
+          if (kbUploadError) throw kbUploadError;
+
+          await ensureTavusDocumentForRole(
+            { id: roleForKbSync.id, title: roleForKbSync.title, kb_document_id: roleForKbSync.kb_document_id },
+            { supabase: supabaseAdmin, rubric: updatedRubricForSync, forceRefresh: true }
+          );
+        }
+      } catch (syncErr) {
+        console.error('[admin/roles/interview-config] kb_tavus_sync_failed', {
+          request_id,
+          role_id: roleId,
+          client_id,
+          error: syncErr?.message || syncErr
+        });
+      }
     }
 
     return res.json({

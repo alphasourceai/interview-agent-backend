@@ -193,4 +193,4 @@ ${role.manual_questions || 'None'}
   return { role_id: roleId, kb_document_id: kbId }
 }
 
-module.exports = { generateRubricAndKBForRole }
+module.exports = { generateRubricAndKBForRole, makeKBFromRubric }
