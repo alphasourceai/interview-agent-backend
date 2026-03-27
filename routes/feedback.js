@@ -29,6 +29,29 @@ const upload = multer({
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const BUCKET = process.env.SUPABASE_FEEDBACK_BUCKET || 'feedback-attachments';
+const FEEDBACK_SUBMIT_RATE_WINDOW_MS = 60 * 60 * 1000;
+const FEEDBACK_SUBMIT_RATE_MAX = 10;
+const feedbackSubmitRateBuckets = new Map();
+
+function feedbackSubmitRateLimit(req, res, next) {
+  const now = Date.now();
+  const ip = String((req.headers['x-forwarded-for'] || req.ip || 'unknown')).split(',')[0].trim() || 'unknown';
+  const current = feedbackSubmitRateBuckets.get(ip);
+  const bucket = (!current || current.resetAt <= now)
+    ? { count: 0, resetAt: now + FEEDBACK_SUBMIT_RATE_WINDOW_MS }
+    : current;
+  bucket.count += 1;
+  feedbackSubmitRateBuckets.set(ip, bucket);
+  if (bucket.count > FEEDBACK_SUBMIT_RATE_MAX) {
+    return res.status(429).json({
+      error: 'rate_limited',
+      code: 'RATE_LIMIT_EXCEEDED',
+      detail: 'Too many requests. Please try again later.',
+      request_id: req.request_id || null
+    });
+  }
+  return next();
+}
 
 router.get('/options', async (_req, res) => {
   try {
@@ -52,7 +75,7 @@ router.get('/options', async (_req, res) => {
   }
 });
 
-router.post('/submit', upload.array('screenshots', 5), async (req, res) => {
+router.post('/submit', feedbackSubmitRateLimit, upload.array('screenshots', 5), async (req, res) => {
   try {
     const {
       name,

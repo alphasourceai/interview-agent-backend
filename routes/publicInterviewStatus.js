@@ -4,8 +4,32 @@ const express = require('express');
 const { supabase } = require('../src/lib/supabaseClient');
 
 const router = express.Router();
+const PUBLIC_STATUS_RATE_WINDOW_MS = 5 * 60 * 1000;
+const PUBLIC_STATUS_RATE_MAX = 120;
+const publicStatusRateBuckets = new Map();
 
-router.get('/public/interview-status', async (req, res) => {
+function publicStatusRateLimit(req, res, next) {
+  const now = Date.now();
+  const ip = String((req.headers['x-forwarded-for'] || req.ip || 'unknown')).split(',')[0].trim() || 'unknown';
+  const current = publicStatusRateBuckets.get(ip);
+  const bucket = (!current || current.resetAt <= now)
+    ? { count: 0, resetAt: now + PUBLIC_STATUS_RATE_WINDOW_MS }
+    : current;
+  bucket.count += 1;
+  publicStatusRateBuckets.set(ip, bucket);
+  if (bucket.count > PUBLIC_STATUS_RATE_MAX) {
+    const request_id = req.request_id || req.headers['x-request-id'] || req.headers['x-correlation-id'] || null;
+    return res.status(429).json({
+      error: 'rate_limited',
+      code: 'RATE_LIMIT_EXCEEDED',
+      detail: 'Too many requests. Please try again later.',
+      request_id
+    });
+  }
+  return next();
+}
+
+router.get('/public/interview-status', publicStatusRateLimit, async (req, res) => {
   const request_id = req.request_id || req.headers['x-request-id'] || req.headers['x-correlation-id'] || null;
   try {
     const interview_id = String(req.query?.interview_id || '').trim();

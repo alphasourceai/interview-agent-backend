@@ -25,8 +25,31 @@ if (SENDGRID_KEY) sg.setApiKey(SENDGRID_KEY);
 const isValidEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const isUuid = (value) => UUID_RE.test(String(value || '').trim());
+const ACCOMMODATION_REQUEST_RATE_WINDOW_MS = 60 * 60 * 1000;
+const ACCOMMODATION_REQUEST_RATE_MAX = 10;
+const accommodationRequestRateBuckets = new Map();
 function safeText(v) {
   return String(v || '').trim();
+}
+
+function accommodationRequestRateLimit(req, res, next) {
+  const now = Date.now();
+  const ip = String((req.headers['x-forwarded-for'] || req.ip || 'unknown')).split(',')[0].trim() || 'unknown';
+  const current = accommodationRequestRateBuckets.get(ip);
+  const bucket = (!current || current.resetAt <= now)
+    ? { count: 0, resetAt: now + ACCOMMODATION_REQUEST_RATE_WINDOW_MS }
+    : current;
+  bucket.count += 1;
+  accommodationRequestRateBuckets.set(ip, bucket);
+  if (bucket.count > ACCOMMODATION_REQUEST_RATE_MAX) {
+    return res.status(429).json({
+      error: 'rate_limited',
+      code: 'RATE_LIMIT_EXCEEDED',
+      detail: 'Too many requests. Please try again later.',
+      request_id: req.request_id || null
+    });
+  }
+  return next();
 }
 
 function getAccommodationResumeBucket() {
@@ -149,7 +172,7 @@ router.get('/', async (req, res) => {
  * POST /api/accommodations/request
  * Candidate-facing accommodation request form.
  */
-router.post('/request', upload.any(), async (req, res) => {
+router.post('/request', accommodationRequestRateLimit, upload.any(), async (req, res) => {
   const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
   console.log('[accommodation] handler_file', { file: __filename });
   try {

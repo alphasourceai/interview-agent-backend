@@ -9,8 +9,30 @@ const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = req
 const router = express.Router();
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
 const BILLING_ENFORCED = BILLING_MODE === 'enforce';
+const CREATE_TAVUS_RATE_WINDOW_MS = 15 * 60 * 1000;
+const CREATE_TAVUS_RATE_MAX = 10;
+const createTavusRateBuckets = new Map();
 
-router.post('/', async (req, res) => {
+function createTavusRateLimit(req, res, next) {
+  const now = Date.now();
+  const ip = String((req.headers['x-forwarded-for'] || req.ip || 'unknown')).split(',')[0].trim() || 'unknown';
+  const current = createTavusRateBuckets.get(ip);
+  const bucket = (!current || current.resetAt <= now)
+    ? { count: 0, resetAt: now + CREATE_TAVUS_RATE_WINDOW_MS }
+    : current;
+  bucket.count += 1;
+  createTavusRateBuckets.set(ip, bucket);
+  if (bucket.count > CREATE_TAVUS_RATE_MAX) {
+    return res.status(429).json({
+      error: 'rate_limited',
+      code: 'RATE_LIMIT_EXCEEDED',
+      detail: 'Too many requests. Please try again later.'
+    });
+  }
+  return next();
+}
+
+router.post('/', createTavusRateLimit, async (req, res) => {
   try {
     const request_id = req.request_id || null;
     const computedBase = `${req.protocol}://${req.get('host')}`;
