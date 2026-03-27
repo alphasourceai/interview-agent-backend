@@ -38,11 +38,76 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
   const request_id = req.request_id || req.headers['x-request-id'] || req.headers['x-correlation-id'] || null;
   try {
     const conversation_id = typeof req.body?.conversation_id === 'string' ? req.body.conversation_id.trim() : '';
-    if (!conversation_id) {
+    const interview_id = typeof req.body?.interview_id === 'string' ? req.body.interview_id.trim() : '';
+    const role_token = typeof req.body?.role_token === 'string' ? req.body.role_token.trim() : '';
+    if (!conversation_id || !interview_id || !role_token) {
       return res.status(400).json({
         error: 'bad_request',
-        code: 'CONVERSATION_ID_REQUIRED',
-        detail: 'conversation_id is required',
+        code: 'MISSING_REQUIRED_PARAMS',
+        detail: 'conversation_id, interview_id, and role_token are required',
+        hint: null,
+        request_id
+      });
+    }
+
+    const { data: role, error: roleError } = await supabaseAdmin
+      .from('roles')
+      .select('id')
+      .eq('slug_or_token', role_token)
+      .maybeSingle();
+
+    if (roleError) {
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'ROLE_LOOKUP_FAILED',
+        detail: roleError.message || 'Failed to load role',
+        hint: roleError.hint || null,
+        request_id
+      });
+    }
+    if (!role) {
+      return res.status(404).json({
+        error: 'not_found',
+        code: 'ROLE_NOT_FOUND',
+        detail: 'Role not found',
+        hint: null,
+        request_id
+      });
+    }
+
+    const { data: interview, error: interviewError } = await supabaseAdmin
+      .from('interviews')
+      .select('id, role_id, tavus_application_id, status')
+      .eq('id', interview_id)
+      .maybeSingle();
+
+    if (interviewError) {
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'INTERVIEW_LOOKUP_FAILED',
+        detail: interviewError.message || 'Failed to load interview',
+        hint: interviewError.hint || null,
+        request_id
+      });
+    }
+    if (!interview) {
+      return res.status(404).json({
+        error: 'not_found',
+        code: 'INTERVIEW_NOT_FOUND',
+        detail: 'Interview not found',
+        hint: null,
+        request_id
+      });
+    }
+
+    if (
+      String(interview.role_id || '') !== String(role.id || '') ||
+      String(interview.tavus_application_id || '') !== conversation_id
+    ) {
+      return res.status(403).json({
+        error: 'forbidden',
+        code: 'INTERVIEW_BINDING_MISMATCH',
+        detail: 'Interview does not match supplied role_token and conversation_id',
         hint: null,
         request_id
       });
