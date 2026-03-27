@@ -52,8 +52,29 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
     if (candidateIdIn) {
       ({ data: cand, error: cErr } = await supabase
         .from("candidates")
-        .select("id, role_id")
+        .select("id, role_id, email")
         .eq("id", candidateIdIn)
+        .single());
+      if (!cErr && cand) {
+        const candidateEmail = String(cand.email || "").trim().toLowerCase();
+        if (candidateEmail !== email) {
+          return res.status(403).json({
+            error: 'forbidden',
+            code: 'CANDIDATE_EMAIL_MISMATCH',
+            detail: 'candidate_id does not match supplied email',
+            hint: null,
+            request_id
+          });
+        }
+      }
+    } else if (roleIdIn) {
+      ({ data: cand, error: cErr } = await supabase
+        .from("candidates")
+        .select("id, role_id")
+        .eq("email", email)
+        .eq("role_id", roleIdIn)
+        .order("created_at", { ascending: false })
+        .limit(1)
         .single());
     } else {
       ({ data: cand, error: cErr } = await supabase
@@ -66,7 +87,17 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
     }
     if (cErr || !cand) return res.status(404).json({ error: "Candidate not found." });
 
-    const roleId = roleIdIn || cand.role_id;
+    if (roleIdIn && String(cand.role_id || "") !== roleIdIn) {
+      return res.status(403).json({
+        error: 'forbidden',
+        code: 'CANDIDATE_ROLE_MISMATCH',
+        detail: 'candidate_id/email does not match supplied role_id',
+        hint: null,
+        request_id
+      });
+    }
+
+    const roleId = String(cand.role_id || "");
 
     const { data: role, error: roleErr } = await supabase
       .from('roles')
