@@ -3390,16 +3390,9 @@ app.use('/admin', adminRouter)
 
 /* ======================= END: Admin guard + Admin API ======================= */
 
-// ---------- Mount legacy/optional feature routes if present ----------
-function mountIfExists(relPath, urlPath) {
-  try {
-    const mod = require(relPath)
-    app.use(urlPath, mod)
-  } catch (_) {}
-}
-mountIfExists('./routes/kb', '/kb')
-mountIfExists('./routes/tavus', '/')
-mountIfExists('./routes/publicInterviewStatus', '/')
+app.use('/kb', require('./routes/kb'))
+app.use('/', require('./routes/tavus'))
+app.use('/', require('./routes/publicInterviewStatus'))
 
 // ---------- JD upload route (authenticated + scoped) ----------
 try {
