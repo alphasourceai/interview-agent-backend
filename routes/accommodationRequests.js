@@ -174,7 +174,6 @@ router.get('/', async (req, res) => {
  */
 router.post('/request', accommodationRequestRateLimit, upload.any(), async (req, res) => {
   const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
-  console.log('[accommodation] handler_file', { file: __filename });
   try {
     const candidate_name = safeText(req.body?.candidate_name || req.body?.name);
     const candidate_email = normalizeEmail(req.body?.candidate_email || req.body?.email);
@@ -186,12 +185,6 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
     const role_lookup_value = role_id_in || role_token;
     const role_lookup_is_uuid = isUuid(role_lookup_value);
     const lookupAttempts = role_lookup_value ? (role_lookup_is_uuid ? ['id', 'slug_or_token'] : ['slug_or_token']) : [];
-
-    console.log('[accommodation] role lookup', {
-      request_id,
-      attempts: lookupAttempts,
-      role_token: role_lookup_value ? String(role_lookup_value).slice(0, 40) : null,
-    });
 
     if (!candidate_name || !candidate_email || !candidate_phone || !request_text || (!role_token && !role_id_in)) {
       return sendError(res, 400, {
@@ -233,7 +226,6 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
         });
       } else {
         role = roleById;
-        console.log('[accommodation] role lookup success', { request_id, role_id: role.id, lookup: 'id' });
       }
     }
     if (!role && role_lookup_value) {
@@ -254,14 +246,13 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
         });
       } else {
         role = roleBySlug;
-        console.log('[accommodation] role lookup success', { request_id, role_id: role.id, lookup: 'slug_or_token' });
       }
     }
     if (!role) {
       return sendError(res, 404, {
         error: 'role_not_found',
         code: 'role_not_found',
-        detail: { role_token: role_lookup_value, attempted },
+        detail: 'Role not found for supplied request link.',
         hint: 'Use the role link provided for this request.',
         request_id,
       });

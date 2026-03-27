@@ -40,14 +40,11 @@ async function ensureUserAndSendRecovery({ email, redirectTo, request_id, logger
   console.log(`${loggerPrefix} start`, {
     request_id: requestId,
     email: safeEmail,
-    redirect_to: effectiveRedirect,
-    FRONTEND_BASE,
-    anon_env: anon.name,
     hasAnonKey
   });
 
   if (!hasAnonKey) {
-    console.error(`${loggerPrefix} missing anon key`, { request_id: requestId, email: safeEmail, anon_env: anon.name });
+    console.error(`${loggerPrefix} missing anon key`, { request_id: requestId, email: safeEmail });
     const err = new Error('misconfigured_supabase_auth');
     err.code = 'misconfigured_supabase_auth';
     err.detail = 'Missing SUPABASE_PUBLIC_ANON_KEY';
@@ -104,10 +101,7 @@ async function ensureUserAndSendRecovery({ email, redirectTo, request_id, logger
       console.error(`${loggerPrefix} recover non-2xx`, {
         request_id: requestId,
         email: safeEmail,
-        status: resp?.status || null,
-        data: resp?.data || null,
-        redirect_to: effectiveRedirect,
-        key: anon.name
+        status: resp?.status || null
       });
       const err = new Error('recover_failed');
       err.code = 'recover_failed';
@@ -119,9 +113,7 @@ async function ensureUserAndSendRecovery({ email, redirectTo, request_id, logger
     console.log(`${loggerPrefix} recovery sent`, {
       request_id: requestId,
       email: safeEmail,
-      status: resp?.status || null,
-      redirect_to: effectiveRedirect,
-      key: anon.name
+      status: resp?.status || null
     });
     return { userId, method, recovery_sent: true, request_id: requestId };
   } catch (e) {
@@ -130,10 +122,7 @@ async function ensureUserAndSendRecovery({ email, redirectTo, request_id, logger
     console.error(`${loggerPrefix} recover failed`, {
       request_id: requestId,
       email: safeEmail,
-      status,
-      data,
-      redirect_to: effectiveRedirect,
-      key: anon.name
+      status
     });
     const err = new Error('recover_failed');
     err.code = 'recover_failed';
