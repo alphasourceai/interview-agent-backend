@@ -330,7 +330,6 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         interview_score: transcriptOverall ?? null,
         overall_score,
         resume_analysis,
-        resume_debug,
         interview_analysis,
         latest_report_url,
         report_generated_at: rep?.created_at || null,
