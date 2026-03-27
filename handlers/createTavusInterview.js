@@ -76,17 +76,6 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
       participant_left_timeout: 60
     }
   };
-  console.log('[tavus-interview-prompt]', {
-    role_id: role?.id,
-    role_title: roleTitle,
-    company: companyName,
-    replica_id: payload.replica_id,
-    persona_id: payload.persona_id,
-    tavus_document_id: role?.tavus_document_id || null,
-    prompt: context,
-    custom_greeting: customGreeting
-  });
-
   let tavusDocumentId = role?.tavus_document_id || null;
   if (!tavusDocumentId && role?.kb_document_id) {
     try {

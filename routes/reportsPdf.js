@@ -383,28 +383,6 @@ async function handleGenerate(req, res) {
       summary: interview_summary
     };
 
-    // Optional targeted debug to inspect resume score sources
-    if (process.env.DEBUG_REPORTS === '1') {
-      const redact = (obj) => {
-        try {
-          return JSON.stringify(obj, (k, v) => {
-            if (typeof v === 'string') {
-              if (v.length > 400) return v.slice(0, 400) + '…';
-              if (v.includes('@')) return v.replace(/[^@]+@/g, '***@');
-            }
-            return v;
-          }, 2);
-        } catch {
-          return '[unserializable]';
-        }
-      };
-      console.log('[pdf.debug] candidate_id=', reportRow.candidate_id, 'report_id=', reportRow.id);
-      console.log('[pdf.debug] analysis.resume =', redact(reportRow?.analysis?.resume));
-      console.log('[pdf.debug] resumeRaw      =', redact(resumeRaw));
-      console.log('[pdf.debug] resume_breakdown (final) =', redact(resume_breakdown));
-      console.log('[pdf.debug] interview_breakdown (final) =', redact(interview_breakdown));
-    }
-
     let unansweredCandidateQuestions = Array.isArray(reportRow.unanswered_candidate_questions)
       ? reportRow.unanswered_candidate_questions.filter(q => typeof q === 'string' && q.trim())
       : [];

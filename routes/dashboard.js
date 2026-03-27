@@ -47,7 +47,6 @@ router.use((req, res, next) => {
 });
 
 router.get('/ping', (req, res) => {
-  console.log('[dashboard] ping hit');
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
@@ -277,23 +276,6 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         education:  Number.isFinite(Number(parsed.education_match_percent ?? parsed.educationMatchPercent)) ? Number(parsed.education_match_percent ?? parsed.educationMatchPercent) : null,
         summary: resume_summary
       };
-      const resume_debug = debug ? {
-          analysis_summary_type: typeof c.analysis_summary,
-          analysis_summary_is_null: c.analysis_summary == null,
-          analysis_summary_keys: (c.analysis_summary && typeof c.analysis_summary === 'object' && !Array.isArray(c.analysis_summary)) ? Object.keys(c.analysis_summary) : [],
-          parsed_keys: Object.keys(parsed || {}),
-          resume_score_raw: rs ?? null,
-          summary_len_raw: resume_summary.length
-        } : {};
-      if (resume_score === null || !resume_summary) {
-        console.log('[dashboard/rows] resume debug', {
-          candidate_id: c.id,
-          analysis_summary_type: typeof c.analysis_summary,
-          analysis_summary_len: String(c.analysis_summary || '').length,
-          parsed_keys: Object.keys(parsed || {})
-        });
-      }
-
       const perception = getPerceptionShape(iv);
       const interviewSummary = typeof iv?.interview_summary === 'string' ? iv.interview_summary : '';
       const interview_analysis = {
@@ -319,13 +301,6 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
                 ? Math.max(0, Math.min(100, Math.round(repOverallScore)))
                 : null;
       const canonicalHasAnalysis = hasCanonicalAnalysis(iv);
-      console.log('[dashboard/rows] row', {
-        interview_id: iv?.id || null,
-        has_analysis: canonicalHasAnalysis,
-        transcript_overall: transcriptOverall,
-        perception_keys_present: perception.presentKeys,
-        interview_summary_len: interviewSummary.trim().length
-      });
 
       return {
         // row identity is the candidate (FE now uses latest_interview_id for actions)
@@ -438,13 +413,6 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
         const perception = getPerceptionShape(r);
         const interviewSummary = typeof r?.interview_summary === 'string' ? r.interview_summary : '';
         const canonicalHasAnalysis = hasCanonicalAnalysis(r);
-        console.log('[dashboard/interviews] row', {
-          interview_id: r?.id || null,
-          has_analysis: canonicalHasAnalysis,
-          transcript_overall: transcriptOverall,
-          perception_keys_present: perception.presentKeys,
-          interview_summary_len: interviewSummary.trim().length
-        });
         return {
         id: r.id,
         created_at: r.created_at,
