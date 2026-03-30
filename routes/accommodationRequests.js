@@ -5,6 +5,7 @@ const multer = require('multer');
 const sg = require('@sendgrid/mail');
 const analyzeResume = require('../analyzeResume');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
+const { requireAuth } = require('../src/middleware/auth');
 const { redactEmail } = require('../src/lib/recoveryHelper');
 const { checkDuplicateCandidate, normalizeEmail, normalizePhone } = require('../src/lib/duplicateCandidate');
 
@@ -76,6 +77,11 @@ function logSupabaseError(message, request_id, error) {
   });
 }
 
+function requireAdmin(req, res, next) {
+  if (req.isGlobalAdmin === true || req.isAdmin === true) return next();
+  return res.status(403).json({ error: 'not_admin' });
+}
+
 async function findOrCreateCandidate({ role, name, email, phone }) {
   let existing = null;
   try {
@@ -118,7 +124,7 @@ async function findOrCreateCandidate({ role, name, email, phone }) {
  * GET /admin/accommodation-requests
  * Admin list endpoint for accommodation requests.
  */
-router.get('/', async (req, res) => {
+router.get('/', requireAuth, requireAdmin, async (req, res) => {
   const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
   try {
     const status = String(req.query.status || '').trim();
