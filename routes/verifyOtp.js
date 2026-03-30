@@ -48,6 +48,20 @@ async function verifyOtpRateLimit(req, res, next) {
 router.post("/", verifyOtpRateLimit, async (req, res) => {
   try {
     const request_id = req.request_id || null;
+    const verificationFailed = (reason, details = {}) => {
+      console.warn('[verify-otp] verification_failed', {
+        request_id,
+        reason,
+        ...details
+      });
+      const payload = {
+        error: 'verification_failed',
+        code: 'VERIFICATION_FAILED',
+        detail: 'Verification failed. Please check your code and try again.'
+      };
+      if (request_id) payload.request_id = request_id;
+      return res.status(400).json(payload);
+    };
     const email = String(req.body?.email || "").trim().toLowerCase();
     const code  = String(req.body?.code  || "").trim();
     const candidateIdIn = req.body?.candidate_id ? String(req.body.candidate_id).trim() : "";
@@ -68,12 +82,8 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
       if (!cErr && cand) {
         const candidateEmail = String(cand.email || "").trim().toLowerCase();
         if (candidateEmail !== email) {
-          return res.status(403).json({
-            error: 'forbidden',
-            code: 'CANDIDATE_EMAIL_MISMATCH',
-            detail: 'candidate_id does not match supplied email',
-            hint: null,
-            request_id
+          return verificationFailed('candidate_email_mismatch', {
+            candidate_id: candidateIdIn || null
           });
         }
       }
@@ -95,15 +105,17 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
         .limit(1)
         .single());
     }
-    if (cErr || !cand) return res.status(404).json({ error: "Candidate not found." });
+    if (cErr || !cand) {
+      return verificationFailed('candidate_not_found', {
+        candidate_id: candidateIdIn || null,
+        role_id: roleIdIn || null
+      });
+    }
 
     if (roleIdIn && String(cand.role_id || "") !== roleIdIn) {
-      return res.status(403).json({
-        error: 'forbidden',
-        code: 'CANDIDATE_ROLE_MISMATCH',
-        detail: 'candidate_id/email does not match supplied role_id',
-        hint: null,
-        request_id
+      return verificationFailed('candidate_role_mismatch', {
+        candidate_id: cand.id || null,
+        role_id: roleIdIn || null
       });
     }
 
@@ -182,15 +194,33 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
-    if (tErr || !token) return res.status(400).json({ error: "OTP not found." });
+    if (tErr || !token) {
+      return verificationFailed('otp_not_found', {
+        candidate_id: cand.id || null,
+        role_id: roleId
+      });
+    }
 
     // 3) Validate
     if (token.expires_at && new Date(token.expires_at) <= new Date()) {
-      return res.status(400).json({ error: "OTP has expired. Please try again." });
+      return verificationFailed('otp_expired', {
+        candidate_id: cand.id || null,
+        role_id: roleId
+      });
     }
     const isUsed = String(token.used).toLowerCase() === "true"; // supports text/boolean
-    if (isUsed) return res.status(400).json({ error: "OTP already used. Please request a new one." });
-    if (String(token.code) !== code) return res.status(400).json({ error: "Invalid code." });
+    if (isUsed) {
+      return verificationFailed('otp_already_used', {
+        candidate_id: cand.id || null,
+        role_id: roleId
+      });
+    }
+    if (String(token.code) !== code) {
+      return verificationFailed('otp_invalid_code', {
+        candidate_id: cand.id || null,
+        role_id: roleId
+      });
+    }
 
     // 4) Mark OTP used (handle text/boolean schemas). Prefer update by id; confirm with read-back.
     const updatesToTry = [
