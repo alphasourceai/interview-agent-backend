@@ -145,7 +145,7 @@ async function findOrCreateCandidate({ role, name, email, phone }) {
  * Admin list endpoint for accommodation requests.
  */
 router.get('/', requireAuth, requireAdmin, async (req, res) => {
-  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+  const request_id = req.request_id || null;
   try {
     const status = String(req.query.status || '').trim();
     const clientId = String(req.query.client_id || '').trim();
@@ -199,7 +199,7 @@ router.get('/', requireAuth, requireAdmin, async (req, res) => {
  * Candidate-facing accommodation request form.
  */
 router.post('/request', accommodationRequestRateLimit, upload.any(), async (req, res) => {
-  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+  const request_id = req.request_id || null;
   try {
     const candidate_name = safeText(req.body?.candidate_name || req.body?.name);
     const candidate_email = normalizeEmail(req.body?.candidate_email || req.body?.email);

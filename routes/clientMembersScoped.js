@@ -107,7 +107,7 @@ async function applyTesterAck(clientId, userId, ipAddress) {
 
 router.get('/', requireAuth, withClientScope, async (req, res) => {
   try {
-    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+    const request_id = req.request_id || null;
     const clientId = req.query.client_id || req.client?.id || req.clientScope?.defaultClientId || null;
     if (!clientId) return res.status(400).json({ error: 'client_id_required', request_id });
 
@@ -131,14 +131,14 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
     const items = (data || []).map((m) => ({ ...m, id: m.user_id || m.email }));
     res.json({ items, request_id });
   } catch (e) {
-    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+    const request_id = req.request_id || null;
     console.error('[client-members] unexpected', e?.message || e);
     res.status(500).json({ error: 'server_error', request_id });
   }
 });
 
 router.get('/me', requireAuth, withClientScope, async (req, res) => {
-  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+  const request_id = req.request_id || null;
   try {
     const clientId = req.client?.id || req.clientScope?.defaultClientId || req.query.client_id || null;
     const userId = req.user?.id || null;
@@ -182,7 +182,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
     const { client_id, email, name } = req.body || {};
     const role = (req.body?.role || 'member').toLowerCase();
     const clientId = client_id || req.client?.id || req.clientScope?.defaultClientId || null;
-    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+    const request_id = req.request_id || null;
 
     if (!clientId || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required', request_id });
 
@@ -231,7 +231,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
     res.json({ item: { ...m, id: m.user_id || m.email }, request_id });
   } catch (e) {
     if (e?.code === 'misconfigured_supabase_auth') {
-      return res.status(500).json({ error: 'misconfigured_supabase_auth', detail: e.detail || 'Missing SUPABASE_PUBLIC_ANON_KEY', request_id: req.request_id || request_id });
+      return res.status(500).json({ error: 'misconfigured_supabase_auth', detail: e.detail || 'Missing SUPABASE_PUBLIC_ANON_KEY', request_id: req.request_id || null });
     }
     if (e?.code === 'email_in_use') {
       console.warn('[client-members/scoped-add] email_in_use', { email: redactEmail(req.body?.email), request_id: req.request_id || null });
@@ -244,7 +244,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
 
 router.delete('/:id', requireAuth, withClientScope, async (req, res) => {
   try {
-    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+    const request_id = req.request_id || null;
     const key = req.params.id;
     const client_id = req.query.client_id || req.client?.id || req.clientScope?.defaultClientId || null;
     if (!client_id) return res.status(400).json({ error: 'client_id_required', request_id });
@@ -278,7 +278,7 @@ router.delete('/:id', requireAuth, withClientScope, async (req, res) => {
     if (error) return res.status(500).json({ error: 'remove_member_failed', detail: error.message, request_id });
     res.json({ ok: true, request_id });
   } catch (e) {
-    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+    const request_id = req.request_id || null;
     console.error('[client-members/delete] unexpected', e?.message || e);
     res.status(500).json({ error: 'server_error', request_id });
   }
@@ -286,7 +286,7 @@ router.delete('/:id', requireAuth, withClientScope, async (req, res) => {
 
 router.get('/tester-ack', requireAuth, withClientScope, async (req, res) => {
   try {
-    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+    const request_id = req.request_id || null;
     const clientId = req.client?.id || req.clientScope?.defaultClientId || req.query.client_id || req.body?.client_id || null;
     const userId = req.user?.id || null;
 
@@ -315,7 +315,7 @@ router.get('/tester-ack', requireAuth, withClientScope, async (req, res) => {
       request_id
     });
   } catch (e) {
-    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+    const request_id = req.request_id || null;
     console.error('[tester-ack] unexpected', e?.message || e);
     return res.status(500).json({ error: 'server_error', request_id });
   }
@@ -324,7 +324,7 @@ router.get('/tester-ack', requireAuth, withClientScope, async (req, res) => {
 // Tester NDA acknowledgement
 router.post('/tester-ack', requireAuth, withClientScope, async (req, res) => {
   try {
-    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+    const request_id = req.request_id || null;
     const clientId = req.client?.id || req.clientScope?.defaultClientId || req.query.client_id || req.body?.client_id || null;
     const userId = req.user?.id || null;
     const accepted = parseAccepted(req.body?.accepted);
@@ -340,7 +340,7 @@ router.post('/tester-ack', requireAuth, withClientScope, async (req, res) => {
     }
     return res.json({ ok: true });
   } catch (e) {
-    const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+    const request_id = req.request_id || null;
     if (e?.message) {
       console.error('[tester-ack] update failed', e.message);
       return res.status(500).json({ error: 'tester_ack_failed', detail: e.message, request_id });

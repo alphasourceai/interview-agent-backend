@@ -12,7 +12,7 @@ const upload = multer({ storage });
 const handleResumeUpload = [
   upload.single('resume'),
   async (req, res) => {
-    const request_id = req.request_id || `resume-upload-${Date.now()}`;
+    const request_id = req.request_id || null;
     try {
       const { name, email, role_id } = req.body;
       const resumeFile = req.file;

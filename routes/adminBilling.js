@@ -51,7 +51,7 @@ async function requireAdmin(req, res, next) {
 router.use(requireAuth, requireAdmin);
 
 router.get('/customers', async (_req, res) => {
-  const request_id = crypto.randomUUID?.() || String(Date.now());
+  const request_id = _req.request_id || null;
   try {
     const { data, error } = await supabaseAdmin
       .from('billing_customers')
@@ -69,7 +69,7 @@ router.get('/customers', async (_req, res) => {
 });
 
 router.post('/customers', async (req, res) => {
-  const request_id = crypto.randomUUID?.() || String(Date.now());
+  const request_id = req.request_id || null;
   try {
     const name = (req.body?.company_name || req.body?.name || '').trim();
     const primary_contact_name = (req.body?.primary_contact_name || '').trim();
@@ -100,7 +100,7 @@ router.post('/customers', async (req, res) => {
 });
 
 router.get('/invoices', async (_req, res) => {
-  const request_id = crypto.randomUUID?.() || String(Date.now());
+  const request_id = _req.request_id || null;
   try {
     const { data, error } = await supabaseAdmin
       .from('billing_invoices')
@@ -145,7 +145,7 @@ router.get('/invoices', async (_req, res) => {
 });
 
 router.post('/invoices/send', async (req, res) => {
-  const request_id = crypto.randomUUID?.() || String(Date.now());
+  const request_id = req.request_id || null;
   try {
     const billing_customer_id = req.body?.billing_customer_id || null;
     const invoice_title = (req.body?.invoice_title || req.body?.title || '').trim();

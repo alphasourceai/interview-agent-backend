@@ -168,7 +168,7 @@ function ensureApprovedStatus(status) {
 }
 
 router.post('/session', async (req, res) => {
-  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+  const request_id = req.request_id || null;
   try {
     const token = String(req.body?.token || '').trim();
     if (!token) {
@@ -278,7 +278,7 @@ router.post('/session', async (req, res) => {
 });
 
 router.post('/resume', upload.any(), async (req, res) => {
-  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+  const request_id = req.request_id || null;
   try {
     const token = String(req.body?.token || '').trim();
     if (!token) {
@@ -438,7 +438,7 @@ router.post('/resume', upload.any(), async (req, res) => {
 });
 
 router.post('/answers', async (req, res) => {
-  const request_id = req.request_id || crypto.randomUUID?.() || String(Date.now());
+  const request_id = req.request_id || null;
   try {
     const token = String(req.body?.token || '').trim();
     const answers = Array.isArray(req.body?.answers) ? req.body.answers : null;
