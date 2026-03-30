@@ -502,7 +502,7 @@ router.post('/:id/send-text-link', requireAuth, requireAdmin, async (req, res) =
       });
     }
 
-    const frontendBase = (process.env.PUBLIC_SITE_BASE || process.env.CANONICAL_SITE_BASE || 'https://www.alphasourceai.com').replace(/\/+$/, '');
+    const frontendBase = (process.env.CLIENT_AUTH_FRONTEND_BASE || process.env.FRONTEND_BASE || process.env.FRONTEND_URL || 'https://clients.alphasourceai.com').replace(/\/+$/, '');
     const interviewLink = `${frontendBase}/text-interview/${token}`;
     const candidateName = String(reqRow.candidate_name || '').trim();
 
