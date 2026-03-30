@@ -102,7 +102,8 @@ router.get('/resume-signed-url', requireAuth, withClientScope, async (req, res) 
     if (!raw) return res.status(404).json({ error: 'resume not available' });
 
     let parsed = parseBucketPath(raw);
-    if (!parsed && !/^https?:\/\//i.test(raw)) {
+    const isBucketlessPath = !parsed && !/^https?:\/\//i.test(raw);
+    if (isBucketlessPath) {
       parsed = {
         bucket: process.env.SUPABASE_RESUMES_BUCKET || 'resumes',
         path: raw.replace(/^\/+/, ''),
@@ -114,10 +115,36 @@ router.get('/resume-signed-url', requireAuth, withClientScope, async (req, res) 
     }
 
     const EXPIRES = Number(process.env.SIGNED_URL_TTL_SECONDS || 300);
-    const { data: signed, error: signErr } = await supabaseAdmin
+    let { data: signed, error: signErr } = await supabaseAdmin
       .storage
       .from(parsed.bucket)
       .createSignedUrl(parsed.path, EXPIRES);
+
+    if (isBucketlessPath && signErr) {
+      const firstErrMessage = String(signErr?.message || '').toLowerCase();
+      const firstErrCode = String(signErr?.code || '').toLowerCase();
+      const firstErrStatus = String(signErr?.status || signErr?.statusCode || '').toLowerCase();
+      const retryableNotFound =
+        firstErrStatus === '404' ||
+        firstErrCode.includes('not_found') ||
+        firstErrCode.includes('no_such_key') ||
+        firstErrMessage.includes('object not found') ||
+        firstErrMessage.includes('path not found') ||
+        firstErrMessage.includes('no such object') ||
+        firstErrMessage.includes('not found');
+      const accommodationBucket = process.env.SUPABASE_ACCOMMODATION_RESUMES_BUCKET || 'accommodation-resumes';
+      if (retryableNotFound && accommodationBucket && accommodationBucket !== parsed.bucket) {
+        const retry = await supabaseAdmin
+          .storage
+          .from(accommodationBucket)
+          .createSignedUrl(parsed.path, EXPIRES);
+        if (!retry.error && retry.data) {
+          signed = retry.data;
+          signErr = null;
+          parsed = { ...parsed, bucket: accommodationBucket };
+        }
+      }
+    }
 
     if (signErr) return res.status(400).json({ error: signErr.message });
     return res.json({ ok: true, url: signed?.signedUrl, mode: 'signed', bucket: parsed.bucket });
