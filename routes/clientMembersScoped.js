@@ -142,13 +142,6 @@ router.get('/me', requireAuth, withClientScope, async (req, res) => {
   try {
     const clientId = req.client?.id || req.clientScope?.defaultClientId || req.query.client_id || null;
     const userId = req.user?.id || null;
-    console.log('[client-members] me hit', {
-      method: req.method,
-      path: req.originalUrl || req.path,
-      request_id,
-      client_id: clientId,
-      user_id: userId
-    });
     if (!clientId) return res.status(400).json({ error: 'client_id_required', request_id });
     if (!userId) return res.status(401).json({ error: 'unauthorized', request_id });
 
@@ -203,15 +196,12 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
       return res.status(400).json({ error: 'invalid_role', request_id });
     }
 
-    console.log('[client-members/scoped-add] start', { request_id, client_id: clientId, role, email: redactEmail(email), by_role: userRole, redirectTo: `${FRONTEND_BASE}/pwreset` });
-
     const { userId, method, inviteActionLink, recovery_sent } = await ensureUserAndSendRecovery({
       email,
       redirectTo: `${FRONTEND_BASE}/pwreset`,
       request_id,
       loggerPrefix: '[client-members/scoped-add]'
     });
-    console.log('[client-members/scoped-add] invite-result', { request_id, email: redactEmail(email), method, userIdPresent: !!userId, hasInviteActionLink: !!inviteActionLink, redirectTo: `${FRONTEND_BASE}/pwreset`, recovery_sent: !!recovery_sent });
     if (!userId) {
       console.error('[client-members/scoped-add] add_member_no_user_id', { request_id, email: redactEmail(email), method });
       return res.status(400).json({
@@ -238,7 +228,6 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
     }
 
     const m = data;
-    console.log('[client-members/scoped-add] success', { request_id, client_id: clientId, role, email: redactEmail(email), method });
     res.json({ item: { ...m, id: m.user_id || m.email }, request_id });
   } catch (e) {
     if (e?.code === 'misconfigured_supabase_auth') {
@@ -301,14 +290,6 @@ router.get('/tester-ack', requireAuth, withClientScope, async (req, res) => {
     const clientId = req.client?.id || req.clientScope?.defaultClientId || req.query.client_id || req.body?.client_id || null;
     const userId = req.user?.id || null;
 
-    console.log('[client-members] tester-ack hit', {
-      method: req.method,
-      path: req.originalUrl || req.path,
-      request_id,
-      client_id: clientId,
-      user_id: userId
-    });
-
     if (!clientId) return res.status(400).json({ error: 'client_id_required', request_id });
     if (!userId) return res.status(401).json({ error: 'unauthorized', request_id });
 
@@ -348,14 +329,6 @@ router.post('/tester-ack', requireAuth, withClientScope, async (req, res) => {
     const userId = req.user?.id || null;
     const accepted = parseAccepted(req.body?.accepted);
     const ipAddress = getClientIp(req);
-
-    console.log('[client-members] tester-ack hit', {
-      method: req.method,
-      path: req.originalUrl || req.path,
-      request_id,
-      client_id: clientId,
-      user_id: userId
-    });
 
     if (!clientId) return res.status(400).json({ error: 'client_id_required', request_id });
     if (!userId) return res.status(401).json({ error: 'unauthorized', request_id });

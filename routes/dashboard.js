@@ -16,32 +16,11 @@ function getRequestId(req) {
 }
 
 router.use((req, res, next) => {
-  const start = Date.now();
-  const request_id = getRequestId(req);
-
   // Avoid cached dashboard payloads while we debug wiring.
   res.set('Cache-Control', 'no-store, max-age=0');
   res.set('Pragma', 'no-cache');
   res.set('Expires', '0');
   res.set('Surrogate-Control', 'no-store');
-
-  console.log('[dashboard] hit', {
-    request_id,
-    method: req.method,
-    path: req.originalUrl,
-    client_id: req.query?.client_id || null,
-    scope_client_id: req.client?.id || req.clientScope?.defaultClientId || null
-  });
-
-  res.on('finish', () => {
-    console.log('[dashboard] done', {
-      request_id,
-      method: req.method,
-      path: req.originalUrl,
-      status: res.statusCode,
-      ms: Date.now() - start
-    });
-  });
 
   next();
 });
@@ -121,13 +100,6 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
   try {
     const request_id = getRequestId(req);
     const debug = String(req.query.debug || '') === '1';
-    console.log('[dashboard/rows] hit', {
-      method: req.method,
-      path: req.originalUrl,
-      request_id,
-      client_id: req.query.client_id || null
-    });
-
     const clientId =
       req.client?.id ||
       req.clientScope?.defaultClientId ||

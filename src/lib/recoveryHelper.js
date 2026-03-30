@@ -37,12 +37,6 @@ async function ensureUserAndSendRecovery({ email, redirectTo, request_id, logger
   const anon = resolveAnonKey();
   const hasAnonKey = !!anon.value;
 
-  console.log(`${loggerPrefix} start`, {
-    request_id: requestId,
-    email: safeEmail,
-    hasAnonKey
-  });
-
   if (!hasAnonKey) {
     console.error(`${loggerPrefix} missing anon key`, { request_id: requestId, email: safeEmail });
     const err = new Error('misconfigured_supabase_auth');
@@ -74,7 +68,6 @@ async function ensureUserAndSendRecovery({ email, redirectTo, request_id, logger
       const created = await supabaseAdmin.auth.admin.createUser({ email, email_confirm: true });
       userId = created?.data?.user?.id || null;
       method = 'createUser';
-      console.log(`${loggerPrefix} createUser`, { request_id: requestId, email: safeEmail, userIdPresent: !!userId });
     } catch (e) {
       console.error(`${loggerPrefix} createUser failed`, { request_id: requestId, email: safeEmail, error: e?.message || e, code: e?.code });
       const err = new Error('create_user_failed');
@@ -110,11 +103,6 @@ async function ensureUserAndSendRecovery({ email, redirectTo, request_id, logger
       err.responseData = resp?.data || null;
       throw err;
     }
-    console.log(`${loggerPrefix} recovery sent`, {
-      request_id: requestId,
-      email: safeEmail,
-      status: resp?.status || null
-    });
     return { userId, method, recovery_sent: true, request_id: requestId };
   } catch (e) {
     const status = e?.response?.status || e?.status || null;

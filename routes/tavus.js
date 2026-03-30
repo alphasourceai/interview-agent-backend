@@ -182,13 +182,6 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
       });
     }
 
-    console.log('[tavus/end-conversation] status_updated', {
-      request_id,
-      conversation_id,
-      interview_id: updatedInterview?.id || null,
-      status: updatedInterview?.status || 'ending_requested'
-    });
-
     if (updatedInterview?.id) {
       const interviewId = updatedInterview.id;
       setTimeout(async () => {
@@ -246,10 +239,6 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
             return;
           }
 
-          console.log('[tavus/end-conversation] early_end_reconcile_finalized', {
-            request_id,
-            interview_id: interviewId
-          });
         } catch (e) {
           console.error('[tavus/end-conversation] early_end_reconcile_unexpected', {
             request_id,

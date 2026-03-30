@@ -329,12 +329,6 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
       });
     }
 
-    console.log('accommodation_request_created', {
-      request_id: reqRow.id,
-      role_id: role.id,
-      candidate_email: redactEmail(candidate_email),
-    });
-
     let resume_url = null;
     let resume_received_at = null;
     let resumeBuffer = null;
@@ -420,7 +414,6 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
           .from('candidates')
           .update({ analysis_summary: analysis })
           .eq('id', candidate_id);
-        console.log('resume_scored', { request_id: reqRow.id, candidate_id, role_id: role.id });
       } catch (e) {
         console.warn('[accommodation] resume scoring failed', { request_id: reqRow.id, error: e?.message || e });
       }
@@ -451,12 +444,6 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
     } catch (e) {
       console.error('[accommodation] notify email failed', { request_id: reqRow.id, error: e?.message || e });
     }
-
-    console.log('accommodation_notify_sent', {
-      request_id: reqRow.id,
-      role_id: role.id,
-      sent: notifySent,
-    });
 
     return res.status(200).json({ ok: true, request_id: reqRow.id });
   } catch (err) {

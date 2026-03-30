@@ -231,12 +231,6 @@ router.post('/', createTavusRateLimit, async (req, res) => {
     const webhookUrl = `${base}/webhook/tavus`;
 
     // Tavus
-    console.log('[create-tavus-interview] launch_role_state', {
-      role_id: role?.id || roleId || null,
-      kb_document_id: role?.kb_document_id || null,
-      tavus_document_id: role?.tavus_document_id || null,
-      candidate_id
-    });
     const result = await createTavusInterviewHandler(candidate, role, webhookUrl, {
       maxInterviewMinutes
     });
