@@ -79,6 +79,16 @@ function normName(v = '') {
 router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
   try {
     const request_id = req.request_id || null;
+    const submissionFailed = (reason, details = {}) => {
+      console.warn('[candidate-submit] submission_failed', { request_id, reason, ...details });
+      const payload = {
+        error: 'submission_failed',
+        code: 'SUBMISSION_FAILED',
+        detail: 'We could not process this request. Please review your information and try again.'
+      };
+      if (request_id) payload.request_id = request_id;
+      return res.status(400).json(payload);
+    };
     // --- normalize inputs ---
     const role_token   = (req.body.role_token || '').trim();
     const role_id_in   = (req.body.role_id || '').trim();
@@ -116,7 +126,12 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
         .eq('slug_or_token', role_token)
         .single());
     }
-    if (rErr || !role) return res.status(404).json({ error: 'Role not found.' });
+    if (rErr || !role) {
+      return submissionFailed('role_not_found', {
+        role_id: role_id_in || null,
+        role_token: role_token || null
+      });
+    }
     const roleId = role.id;
 
     if (BILLING_ENFORCED && role.client_id) {
@@ -193,9 +208,9 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       if (phone && !existingByEmail.phone) {
         await supabase.from('candidates').update({ phone }).eq('id', existingByEmail.id);
       }
-      return res.status(409).json({
-        error:
-          "You’ve already interviewed for this role with this information. If you believe this is an error, contact support at info@alphasourceai.com",
+      return submissionFailed('duplicate_email', {
+        role_id: roleId,
+        candidate_id: existingByEmail.id || null
       });
     }
 
@@ -217,9 +232,9 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
         if (!existingByNamePhone.phone && phone) {
           await supabase.from('candidates').update({ phone }).eq('id', existingByNamePhone.id);
         }
-        return res.status(409).json({
-          error:
-            "You’ve already interviewed for this role with this information. If you believe this is an error, contact support at info@alphasourceai.com",
+        return submissionFailed('duplicate_name_phone', {
+          role_id: roleId,
+          candidate_id: existingByNamePhone.id || null
         });
       }
     }
@@ -304,7 +319,21 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
       used: false,
     });
-    if (otpErr) return res.status(500).json({ error: `Could not create OTP: ${otpErr.message}` });
+    if (otpErr) {
+      console.error('otp create failed', {
+        request_id,
+        candidate_id,
+        role_id: roleId,
+        error: otpErr.message,
+        code: otpErr.code || null
+      });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'OTP_CREATE_FAILED',
+        detail: 'Unable to continue verification at this time.',
+        ...(request_id ? { request_id } : {})
+      });
+    }
 
     // --- email OTP (non-fatal) ---
     let emailSent = false;
@@ -327,8 +356,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
 
     // success
     return res.status(200).json({
-      message: emailSent ? 'Candidate created. OTP emailed.' : 'Candidate created. OTP email failed.',
-      email_sent: emailSent,
+      message: 'If your information is accepted, a verification code will be sent shortly.',
       candidate_id,
       role_id: roleId,
       resume_url: resume_url || null,
