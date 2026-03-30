@@ -45,6 +45,20 @@ async function createTavusRateLimit(req, res, next) {
 router.post('/', createTavusRateLimit, async (req, res) => {
   try {
     const request_id = req.request_id || null;
+    const launchFailed = (reason, details = {}) => {
+      console.warn('[create-tavus-interview] launch_failed', {
+        request_id,
+        reason,
+        ...details
+      });
+      const payload = {
+        error: 'launch_failed',
+        code: 'LAUNCH_FAILED',
+        detail: 'We could not start this interview. Please restart from the interview link and try again.'
+      };
+      if (request_id) payload.request_id = request_id;
+      return res.status(400).json(payload);
+    };
     const computedBase = `${req.protocol}://${req.get('host')}`;
     const base = (process.env.PUBLIC_BACKEND_URL || computedBase).replace(/\/+$/, '');
 
@@ -63,7 +77,13 @@ router.post('/', createTavusRateLimit, async (req, res) => {
       .select('*')
       .eq('id', candidate_id)
       .single();
-    if (cErr || !candidate) return res.status(404).json({ error: cErr?.message || 'Candidate not found' });
+    if (cErr || !candidate) {
+      return launchFailed('candidate_not_found', {
+        candidate_id,
+        error: cErr?.message || null,
+        code: cErr?.code || null
+      });
+    }
 
     const candidateRoleId = String(candidate?.role_id || '').trim();
     const candidateClientId = String(candidate?.client_id || '').trim();
@@ -81,21 +101,14 @@ router.post('/', createTavusRateLimit, async (req, res) => {
         return res.status(500).json({ error: rtErr.message });
       }
       if (!roleByToken) {
-        return res.status(404).json({
-          error: 'not_found',
-          code: 'ROLE_NOT_FOUND',
-          detail: 'Role not found',
-          hint: null,
-          request_id
+        return launchFailed('role_token_not_found', {
+          role_token: roleTokenFromBody
         });
       }
       if (String(roleByToken.id || '') !== candidateRoleId) {
-        return res.status(403).json({
-          error: 'forbidden',
-          code: 'CANDIDATE_ROLE_MISMATCH',
-          detail: 'candidate_id is not authorized for the supplied role context',
-          hint: null,
-          request_id
+        return launchFailed('candidate_role_mismatch', {
+          candidate_id,
+          role_id: roleByToken.id || null
         });
       }
       role = roleByToken;
@@ -103,12 +116,9 @@ router.post('/', createTavusRateLimit, async (req, res) => {
     }
 
     if (roleId && roleId !== candidateRoleId) {
-      return res.status(403).json({
-        error: 'forbidden',
-        code: 'CANDIDATE_ROLE_MISMATCH',
-        detail: 'candidate_id is not authorized for the supplied role context',
-        hint: null,
-        request_id
+      return launchFailed('candidate_role_mismatch', {
+        candidate_id,
+        role_id: roleId
       });
     }
 
@@ -118,40 +128,48 @@ router.post('/', createTavusRateLimit, async (req, res) => {
 
     if (!role) {
       if (!roleId) {
-        return res.status(400).json({ error: 'role_id or valid role token required (candidate has no role_id)' });
+        return launchFailed('missing_role_binding_context', {
+          candidate_id,
+          candidate_role_id: candidateRoleId || null
+        });
       }
       const { data: roleById, error: rErr } = await supabase
         .from('roles')
         .select('*')
         .eq('id', roleId)
         .single();
-      if (rErr || !roleById) return res.status(404).json({ error: rErr?.message || 'Role not found' });
+      if (rErr || !roleById) {
+        return launchFailed('role_id_not_found', {
+          candidate_id,
+          role_id: roleId,
+          error: rErr?.message || null,
+          code: rErr?.code || null
+        });
+      }
       role = roleById;
     }
 
     if (String(role?.id || '') !== candidateRoleId) {
-      return res.status(403).json({
-        error: 'forbidden',
-        code: 'CANDIDATE_ROLE_MISMATCH',
-        detail: 'candidate_id is not authorized for the supplied role context',
-        hint: null,
-        request_id
+      return launchFailed('candidate_role_mismatch', {
+        candidate_id,
+        role_id: role?.id || null
       });
     }
 
     if (candidateClientId && String(role?.client_id || '').trim() && String(role.client_id || '').trim() !== candidateClientId) {
-      return res.status(403).json({
-        error: 'forbidden',
-        code: 'CANDIDATE_CLIENT_MISMATCH',
-        detail: 'candidate_id is not authorized for the supplied role context',
-        hint: null,
-        request_id
+      return launchFailed('candidate_client_mismatch', {
+        candidate_id,
+        candidate_client_id: candidateClientId || null,
+        role_client_id: role?.client_id || null
       });
     }
 
     const clientId = role.client_id || candidate.client_id || null;
     if (!clientId) {
-      return res.status(400).json({ error: 'client_id could not be determined from role or candidate' });
+      return launchFailed('missing_role_binding_context', {
+        candidate_id,
+        role_id: role?.id || roleId || null
+      });
     }
     let maxInterviewMinutes = null;
     try {
