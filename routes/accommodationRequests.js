@@ -79,6 +79,15 @@ function sendError(res, status, { error, code, detail, hint, request_id }) {
   return res.status(status).json({ error, code, detail, hint, request_id });
 }
 
+function sendPublicRequestFailed(res, request_id) {
+  return res.status(400).json({
+    error: 'request_failed',
+    code: 'REQUEST_FAILED',
+    detail: 'We could not process this request. Please review your information and try again.',
+    request_id,
+  });
+}
+
 function logSupabaseError(message, request_id, error) {
   console.error(message, {
     request_id,
@@ -266,13 +275,7 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
       }
     }
     if (!role) {
-      return sendError(res, 404, {
-        error: 'role_not_found',
-        code: 'role_not_found',
-        detail: 'Role not found for supplied request link.',
-        hint: 'Use the role link provided for this request.',
-        request_id,
-      });
+      return sendPublicRequestFailed(res, request_id);
     }
 
     const dup = await checkDuplicateCandidate({
@@ -290,13 +293,7 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
         candidate_id: dup.candidateId || null,
         reason: dup.reason || null,
       });
-      return sendError(res, 409, {
-        error: 'Already interviewed for this role.',
-        code: 'duplicate_candidate',
-        detail: dup.reason || null,
-        hint: null,
-        request_id,
-      });
+      return sendPublicRequestFailed(res, request_id);
     }
 
     const { id: candidate_id, resume_url: existingResumeUrl } = await findOrCreateCandidate({
