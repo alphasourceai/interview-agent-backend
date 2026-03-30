@@ -1,6 +1,7 @@
 // routes/accommodationRequests.js
 const express = require('express');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const sg = require('@sendgrid/mail');
 const analyzeResume = require('../analyzeResume');
@@ -29,6 +30,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 const isUuid = (value) => UUID_RE.test(String(value || '').trim());
 const ACCOMMODATION_REQUEST_RATE_WINDOW_MS = 60 * 60 * 1000;
 const ACCOMMODATION_REQUEST_RATE_MAX = 10;
+const TEXT_INTERVIEW_TOKEN_SECRET = String(process.env.TEXT_INTERVIEW_JWT_SECRET || process.env.SUPABASE_JWT_SECRET || '').trim();
 function safeText(v) {
   return String(v || '').trim();
 }
@@ -140,6 +142,98 @@ async function findOrCreateCandidate({ role, name, email, phone }) {
   return { id: candidateId, resume_url: null, created: true };
 }
 
+function parseBucketPath(v) {
+  if (!v || typeof v !== 'string') return null;
+  const s = v.trim();
+  if (!s) return null;
+  if (!/^https?:\/\//i.test(s)) {
+    const i = s.indexOf('/');
+    return i > 0 ? { bucket: s.slice(0, i), path: s.slice(i + 1) } : null;
+  }
+  try {
+    const u = new URL(s);
+    const parts = u.pathname.split('/').filter(Boolean);
+    const idx = parts.findIndex((p) => p === 'public' || p === 'sign');
+    if (idx >= 0 && parts[idx + 1]) {
+      const bucket = parts[idx + 1];
+      const path = parts.slice(idx + 2).join('/');
+      if (bucket && path) return { bucket, path };
+    }
+  } catch (_) {}
+  return null;
+}
+
+async function signResumeUrl(raw, { forceAccommodationBucket = false } = {}) {
+  const value = String(raw || '').trim();
+  if (!value) return null;
+  if (/^https?:\/\//i.test(value)) return value;
+
+  let bucket = null;
+  let path = null;
+
+  if (forceAccommodationBucket) {
+    bucket = getAccommodationResumeBucket();
+    path = value.replace(/^\/+/, '');
+  } else {
+    const parsed = parseBucketPath(value);
+    if (parsed) {
+      bucket = parsed.bucket;
+      path = parsed.path;
+    } else {
+      bucket = process.env.SUPABASE_RESUMES_BUCKET || 'resumes';
+      path = value.replace(/^\/+/, '');
+    }
+  }
+
+  const expires = Number(process.env.SIGNED_URL_TTL_SECONDS || 600);
+  const { data: signed, error } = await supabaseAdmin.storage.from(bucket).createSignedUrl(path, expires);
+  if (error || !signed?.signedUrl) throw error || new Error('signed_url_missing');
+  return signed.signedUrl;
+}
+
+async function enrichRequestForAdmin(row, { roleTitle = '', candidateResumeUrl = null, request_id = null } = {}) {
+  let signedResumeUrl = null;
+  try {
+    if (row?.resume_url) {
+      signedResumeUrl = await signResumeUrl(row.resume_url, { forceAccommodationBucket: true });
+    } else if (candidateResumeUrl) {
+      signedResumeUrl = await signResumeUrl(candidateResumeUrl, { forceAccommodationBucket: false });
+    }
+  } catch (error) {
+    console.error('[accommodation] resume signed url failed', {
+      request_id,
+      accommodation_request_id: row?.id || null,
+      error: error?.message || error,
+      detail: error?.detail || null,
+      hint: error?.hint || null,
+    });
+  }
+
+  return {
+    ...row,
+    role: { title: roleTitle || '' },
+    resume_url: signedResumeUrl || null,
+  };
+}
+
+function buildTextInterviewToken(reqRow) {
+  if (!TEXT_INTERVIEW_TOKEN_SECRET) {
+    const err = new Error('TEXT_INTERVIEW_JWT_SECRET or SUPABASE_JWT_SECRET not configured');
+    err.code = 'token_secret_missing';
+    err.detail = 'TEXT_INTERVIEW_JWT_SECRET or SUPABASE_JWT_SECRET not configured';
+    throw err;
+  }
+  return jwt.sign(
+    {
+      mode: 'text',
+      request_id: reqRow.id,
+      role_id: reqRow.role_id,
+    },
+    TEXT_INTERVIEW_TOKEN_SECRET,
+    { expiresIn: '14d' }
+  );
+}
+
 /**
  * GET /admin/accommodation-requests
  * Admin list endpoint for accommodation requests.
@@ -149,15 +243,16 @@ router.get('/', requireAuth, requireAdmin, async (req, res) => {
   try {
     const status = String(req.query.status || '').trim();
     const clientId = String(req.query.client_id || '').trim();
+    let clientRoles = null;
     let q = supabaseAdmin
       .from('accommodation_requests')
-      .select('id, created_at, role_id, candidate_id, candidate_name, candidate_email, candidate_phone, request_text, status, resume_url, resume_received_at, admin_notes')
+      .select('id, created_at, role_id, candidate_id, candidate_name, candidate_email, candidate_phone, request_text, status, resume_url, resume_received_at, admin_notes, approved_at, sent_at')
       .order('created_at', { ascending: false });
     if (status) {
       q = q.eq('status', status);
     }
     if (clientId) {
-      const { data: roles, error: rErr } = await supabaseAdmin.from('roles').select('id').eq('client_id', clientId);
+      const { data: roles, error: rErr } = await supabaseAdmin.from('roles').select('id, title').eq('client_id', clientId);
       if (rErr) {
         return sendError(res, 500, {
           error: 'Failed to fetch roles for client.',
@@ -170,6 +265,7 @@ router.get('/', requireAuth, requireAdmin, async (req, res) => {
       if (!roles || roles.length === 0) {
         return res.json({ ok: true, items: [] });
       }
+      clientRoles = roles;
       q = q.in('role_id', roles.map(r => r.id));
     }
     const { data, error } = await q;
@@ -182,13 +278,282 @@ router.get('/', requireAuth, requireAdmin, async (req, res) => {
         request_id,
       });
     }
-    return res.json({ ok: true, items: data || [] });
+    const rows = data || [];
+    if (!rows.length) return res.json({ ok: true, items: [] });
+
+    const roleById = new Map((clientRoles || []).map((r) => [r.id, r]));
+    const missingRoleIds = [...new Set(rows.map((row) => row.role_id).filter(Boolean))]
+      .filter((roleId) => !roleById.has(roleId));
+    if (missingRoleIds.length) {
+      const { data: roleRows, error: roleErr } = await supabaseAdmin
+        .from('roles')
+        .select('id, title')
+        .in('id', missingRoleIds);
+      if (roleErr) {
+        return sendError(res, 500, {
+          error: 'Failed to fetch role titles.',
+          code: 'roles_lookup_failed',
+          detail: roleErr.message || null,
+          hint: roleErr.hint || null,
+          request_id,
+        });
+      }
+      for (const role of roleRows || []) roleById.set(role.id, role);
+    }
+
+    const candidateIds = [...new Set(rows
+      .filter((row) => !row.resume_url && row.candidate_id)
+      .map((row) => row.candidate_id))];
+    const candidateById = new Map();
+    if (candidateIds.length) {
+      const { data: candidates, error: cErr } = await supabaseAdmin
+        .from('candidates')
+        .select('id, resume_url')
+        .in('id', candidateIds);
+      if (cErr) {
+        logSupabaseError('[accommodation] candidate fallback lookup failed', request_id, cErr);
+      } else {
+        for (const candidate of candidates || []) candidateById.set(candidate.id, candidate);
+      }
+    }
+
+    const items = await Promise.all(rows.map((row) => enrichRequestForAdmin(row, {
+      roleTitle: roleById.get(row.role_id)?.title || '',
+      candidateResumeUrl: candidateById.get(row.candidate_id)?.resume_url || null,
+      request_id,
+    })));
+
+    return res.json({ ok: true, items });
   } catch (error) {
     return sendError(res, 500, {
       error: 'Server error.',
       code: 'accommodation_requests_fetch_failed',
       detail: error?.message || null,
       hint: null,
+      request_id,
+    });
+  }
+});
+
+router.patch('/:id', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null;
+  const id = String(req.params?.id || '').trim();
+  const payload = req.body || {};
+  try {
+    const { data: existing, error: fetchErr } = await supabaseAdmin
+      .from('accommodation_requests')
+      .select('id, created_at, role_id, candidate_id, candidate_name, candidate_email, candidate_phone, request_text, status, resume_url, resume_received_at, admin_notes, approved_at, sent_at')
+      .eq('id', id)
+      .maybeSingle();
+    if (fetchErr) {
+      return sendError(res, 500, {
+        error: 'Failed to load accommodation request.',
+        code: 'accommodation_request_fetch_failed',
+        detail: fetchErr.message || null,
+        hint: fetchErr.hint || null,
+        request_id,
+      });
+    }
+    if (!existing) {
+      return sendError(res, 404, {
+        error: 'accommodation_request_not_found',
+        code: 'accommodation_request_not_found',
+        detail: null,
+        hint: null,
+        request_id,
+      });
+    }
+
+    const updates = {};
+    if (Object.prototype.hasOwnProperty.call(payload, 'status')) {
+      const normalizedStatus = String(payload.status || '').trim().toLowerCase();
+      if (!['pending', 'approved', 'sent', 'denied'].includes(normalizedStatus)) {
+        return sendError(res, 400, {
+          error: 'invalid_status',
+          code: 'invalid_status',
+          detail: 'Status must be one of: pending, approved, sent, denied.',
+          hint: null,
+          request_id,
+        });
+      }
+      updates.status = normalizedStatus;
+      if (normalizedStatus === 'approved' && !existing.approved_at) {
+        updates.approved_at = new Date().toISOString();
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(payload, 'admin_notes')) {
+      updates.admin_notes = String(payload.admin_notes ?? '').trim().slice(0, 5000);
+    }
+
+    let row = existing;
+    if (Object.keys(updates).length) {
+      const { data: updated, error: updateErr } = await supabaseAdmin
+        .from('accommodation_requests')
+        .update(updates)
+        .eq('id', id)
+        .select('id, created_at, role_id, candidate_id, candidate_name, candidate_email, candidate_phone, request_text, status, resume_url, resume_received_at, admin_notes, approved_at, sent_at')
+        .maybeSingle();
+      if (updateErr || !updated) {
+        return sendError(res, 500, {
+          error: 'Failed to update accommodation request.',
+          code: 'accommodation_request_update_failed',
+          detail: updateErr?.message || null,
+          hint: updateErr?.hint || null,
+          request_id,
+        });
+      }
+      row = updated;
+    }
+
+    const [roleResp, candidateResp] = await Promise.all([
+      supabaseAdmin.from('roles').select('id, title').eq('id', row.role_id).maybeSingle(),
+      row.candidate_id
+        ? supabaseAdmin.from('candidates').select('id, resume_url').eq('id', row.candidate_id).maybeSingle()
+        : Promise.resolve({ data: null, error: null }),
+    ]);
+    if (roleResp.error) {
+      return sendError(res, 500, {
+        error: 'Failed to fetch role title.',
+        code: 'roles_lookup_failed',
+        detail: roleResp.error.message || null,
+        hint: roleResp.error.hint || null,
+        request_id,
+      });
+    }
+    if (candidateResp.error) {
+      logSupabaseError('[accommodation] candidate fallback lookup failed', request_id, candidateResp.error);
+    }
+
+    const item = await enrichRequestForAdmin(row, {
+      roleTitle: roleResp.data?.title || '',
+      candidateResumeUrl: candidateResp.data?.resume_url || null,
+      request_id,
+    });
+    return res.json({ ok: true, item });
+  } catch (error) {
+    return sendError(res, 500, {
+      error: 'Server error.',
+      code: 'accommodation_request_update_failed',
+      detail: error?.message || null,
+      hint: error?.hint || null,
+      request_id,
+    });
+  }
+});
+
+router.post('/:id/send-text-link', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null;
+  const id = String(req.params?.id || '').trim();
+  try {
+    const { data: reqRow, error: fetchErr } = await supabaseAdmin
+      .from('accommodation_requests')
+      .select('id, role_id, candidate_name, candidate_email, status')
+      .eq('id', id)
+      .maybeSingle();
+    if (fetchErr) {
+      return sendError(res, 500, {
+        error: 'Failed to load accommodation request.',
+        code: 'accommodation_request_fetch_failed',
+        detail: fetchErr.message || null,
+        hint: fetchErr.hint || null,
+        request_id,
+      });
+    }
+    if (!reqRow) {
+      return sendError(res, 404, {
+        error: 'accommodation_request_not_found',
+        code: 'accommodation_request_not_found',
+        detail: null,
+        hint: null,
+        request_id,
+      });
+    }
+
+    const currentStatus = String(reqRow.status || '').trim().toLowerCase();
+    if (!['approved', 'sent'].includes(currentStatus)) {
+      return sendError(res, 400, {
+        error: 'invalid_status',
+        code: 'invalid_status',
+        detail: 'Text interview links can only be sent for approved or sent requests.',
+        hint: null,
+        request_id,
+      });
+    }
+    if (!SENDGRID_KEY || !FROM_EMAIL) {
+      return sendError(res, 500, {
+        error: 'sendgrid_not_configured',
+        code: 'sendgrid_not_configured',
+        detail: 'SENDGRID_API_KEY or SENDGRID_FROM not configured.',
+        hint: null,
+        request_id,
+      });
+    }
+
+    let token = '';
+    try {
+      token = buildTextInterviewToken(reqRow);
+    } catch (e) {
+      return sendError(res, 500, {
+        error: e?.code || 'token_secret_missing',
+        code: e?.code || 'token_secret_missing',
+        detail: e?.detail || e?.message || null,
+        hint: e?.hint || null,
+        request_id,
+      });
+    }
+
+    const frontendBase = (process.env.PUBLIC_SITE_BASE || process.env.CANONICAL_SITE_BASE || 'https://www.alphasourceai.com').replace(/\/+$/, '');
+    const interviewLink = `${frontendBase}/text-interview/${token}`;
+    const candidateName = String(reqRow.candidate_name || '').trim();
+
+    try {
+      await sg.send({
+        to: reqRow.candidate_email,
+        from: { email: FROM_EMAIL, name: APP_NAME },
+        subject: `${APP_NAME} text interview link`,
+        text: [
+          candidateName ? `Hi ${candidateName},` : 'Hi,',
+          '',
+          'Your interview link is ready. Use the link below to start your text interview:',
+          interviewLink,
+          '',
+          'If you did not request this, please ignore this email.',
+        ].join('\n'),
+      });
+    } catch (e) {
+      return sendError(res, 500, {
+        error: 'send_text_link_failed',
+        code: 'send_text_link_failed',
+        detail: e?.message || null,
+        hint: null,
+        request_id,
+      });
+    }
+
+    const nextUpdate = { sent_at: new Date().toISOString() };
+    if (currentStatus === 'approved') nextUpdate.status = 'sent';
+    const { error: updateErr } = await supabaseAdmin
+      .from('accommodation_requests')
+      .update(nextUpdate)
+      .eq('id', reqRow.id);
+    if (updateErr) {
+      logSupabaseError('[accommodation] send-text-link update failed', request_id, updateErr);
+      return sendError(res, 500, {
+        error: 'accommodation_request_update_failed',
+        code: 'accommodation_request_update_failed',
+        detail: updateErr.message || null,
+        hint: updateErr.hint || null,
+        request_id,
+      });
+    }
+
+    return res.json({ ok: true });
+  } catch (error) {
+    return sendError(res, 500, {
+      error: 'Server error.',
+      code: 'send_text_link_failed',
+      detail: error?.message || null,
+      hint: error?.hint || null,
       request_id,
     });
   }

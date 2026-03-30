@@ -170,6 +170,7 @@ app.use('/api/candidate/submit', require('./routes/candidateSubmit'))
 app.use('/api/candidate/verify-otp', require('./routes/verifyOtp'))
 app.use('/create-tavus-interview', require('./routes/createTavusInterview'))
 app.use('/api/accommodations', require('./routes/accommodationRequests'))
+app.use('/api/text-interview', require('./routes/textInterview'))
 
 // ---------- Simple test endpoint ----------
 app.get('/auth/ping', requireAuth, withClientScope, (req, res) => {
