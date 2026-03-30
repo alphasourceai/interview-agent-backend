@@ -74,7 +74,7 @@ router.post('/', createTavusRateLimit, async (req, res) => {
       const { data: roleByToken, error: rtErr } = await supabase
         .from('roles')
         .select('*')
-        .or(`slug_or_token.eq.${roleTokenFromBody},token.eq.${roleTokenFromBody}`)
+        .eq('slug_or_token', roleTokenFromBody)
         .limit(1)
         .maybeSingle();
       if (rtErr) {
