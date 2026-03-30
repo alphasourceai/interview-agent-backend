@@ -2,28 +2,38 @@
 const express = require("express");
 const { supabase, supabaseAdmin } = require("../src/lib/supabaseClient");
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
+const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
 
 const router = express.Router();
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
 const BILLING_ENFORCED = BILLING_MODE === 'enforce';
 const VERIFY_OTP_RATE_WINDOW_MS = 60 * 60 * 1000;
 const VERIFY_OTP_RATE_MAX = 20;
-const verifyOtpRateBuckets = new Map();
 
-function verifyOtpRateLimit(req, res, next) {
-  const now = Date.now();
-  const ip = String((req.headers['x-forwarded-for'] || req.ip || 'unknown')).split(',')[0].trim() || 'unknown';
-  const current = verifyOtpRateBuckets.get(ip);
-  const bucket = (!current || current.resetAt <= now)
-    ? { count: 0, resetAt: now + VERIFY_OTP_RATE_WINDOW_MS }
-    : current;
-  bucket.count += 1;
-  verifyOtpRateBuckets.set(ip, bucket);
-  if (bucket.count > VERIFY_OTP_RATE_MAX) {
-    return res.status(429).json({
-      error: 'rate_limited',
-      code: 'RATE_LIMIT_EXCEEDED',
-      detail: 'Too many requests. Please try again later.'
+async function verifyOtpRateLimit(req, res, next) {
+  try {
+    const result = await checkAndIncrementRateLimit({
+      routeName: 'verify_otp',
+      subjectKey: getRequestSubjectKey(req),
+      windowMs: VERIFY_OTP_RATE_WINDOW_MS,
+      maxCount: VERIFY_OTP_RATE_MAX
+    });
+    if (!result.allowed) {
+      return res.status(429).json({
+        error: 'rate_limited',
+        code: 'RATE_LIMIT_EXCEEDED',
+        detail: 'Too many requests. Please try again later.'
+      });
+    }
+  } catch (error) {
+    console.error('[rate-limit] verify otp check failed', {
+      request_id: req.request_id || null,
+      error: error?.message || error
+    });
+    return res.status(503).json({
+      error: 'rate_limit_unavailable',
+      code: 'RATE_LIMIT_UNAVAILABLE',
+      detail: 'Request protection is temporarily unavailable. Please try again shortly.'
     });
   }
   return next();

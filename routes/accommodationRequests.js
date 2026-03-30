@@ -6,6 +6,7 @@ const sg = require('@sendgrid/mail');
 const analyzeResume = require('../analyzeResume');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { requireAuth } = require('../src/middleware/auth');
+const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
 const { redactEmail } = require('../src/lib/recoveryHelper');
 const { checkDuplicateCandidate, normalizeEmail, normalizePhone } = require('../src/lib/duplicateCandidate');
 
@@ -28,25 +29,35 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 const isUuid = (value) => UUID_RE.test(String(value || '').trim());
 const ACCOMMODATION_REQUEST_RATE_WINDOW_MS = 60 * 60 * 1000;
 const ACCOMMODATION_REQUEST_RATE_MAX = 10;
-const accommodationRequestRateBuckets = new Map();
 function safeText(v) {
   return String(v || '').trim();
 }
 
-function accommodationRequestRateLimit(req, res, next) {
-  const now = Date.now();
-  const ip = String((req.headers['x-forwarded-for'] || req.ip || 'unknown')).split(',')[0].trim() || 'unknown';
-  const current = accommodationRequestRateBuckets.get(ip);
-  const bucket = (!current || current.resetAt <= now)
-    ? { count: 0, resetAt: now + ACCOMMODATION_REQUEST_RATE_WINDOW_MS }
-    : current;
-  bucket.count += 1;
-  accommodationRequestRateBuckets.set(ip, bucket);
-  if (bucket.count > ACCOMMODATION_REQUEST_RATE_MAX) {
-    return res.status(429).json({
-      error: 'rate_limited',
-      code: 'RATE_LIMIT_EXCEEDED',
-      detail: 'Too many requests. Please try again later.',
+async function accommodationRequestRateLimit(req, res, next) {
+  try {
+    const result = await checkAndIncrementRateLimit({
+      routeName: 'accommodation_request',
+      subjectKey: getRequestSubjectKey(req),
+      windowMs: ACCOMMODATION_REQUEST_RATE_WINDOW_MS,
+      maxCount: ACCOMMODATION_REQUEST_RATE_MAX
+    });
+    if (!result.allowed) {
+      return res.status(429).json({
+        error: 'rate_limited',
+        code: 'RATE_LIMIT_EXCEEDED',
+        detail: 'Too many requests. Please try again later.',
+        request_id: req.request_id || null
+      });
+    }
+  } catch (error) {
+    console.error('[rate-limit] accommodation request check failed', {
+      request_id: req.request_id || null,
+      error: error?.message || error
+    });
+    return res.status(503).json({
+      error: 'rate_limit_unavailable',
+      code: 'RATE_LIMIT_UNAVAILABLE',
+      detail: 'Request protection is temporarily unavailable. Please try again shortly.',
       request_id: req.request_id || null
     });
   }

@@ -5,6 +5,7 @@ const multer = require('multer');
 const sg = require('@sendgrid/mail');
 const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
+const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
 const analyzeResume = require('../analyzeResume'); // resume analyzer
 
 // uploads: keep in memory; 10MB limit
@@ -22,22 +23,31 @@ const BILLING_ENFORCED = BILLING_MODE === 'enforce';
 if (SENDGRID_KEY) sg.setApiKey(SENDGRID_KEY);
 const SUBMIT_RATE_WINDOW_MS = 60 * 60 * 1000;
 const SUBMIT_RATE_MAX = 10;
-const submitRateBuckets = new Map();
 
-function candidateSubmitRateLimit(req, res, next) {
-  const now = Date.now();
-  const ip = String((req.headers['x-forwarded-for'] || req.ip || 'unknown')).split(',')[0].trim() || 'unknown';
-  const current = submitRateBuckets.get(ip);
-  const bucket = (!current || current.resetAt <= now)
-    ? { count: 0, resetAt: now + SUBMIT_RATE_WINDOW_MS }
-    : current;
-  bucket.count += 1;
-  submitRateBuckets.set(ip, bucket);
-  if (bucket.count > SUBMIT_RATE_MAX) {
-    return res.status(429).json({
-      error: 'rate_limited',
-      code: 'RATE_LIMIT_EXCEEDED',
-      detail: 'Too many requests. Please try again later.'
+async function candidateSubmitRateLimit(req, res, next) {
+  try {
+    const result = await checkAndIncrementRateLimit({
+      routeName: 'candidate_submit',
+      subjectKey: getRequestSubjectKey(req),
+      windowMs: SUBMIT_RATE_WINDOW_MS,
+      maxCount: SUBMIT_RATE_MAX
+    });
+    if (!result.allowed) {
+      return res.status(429).json({
+        error: 'rate_limited',
+        code: 'RATE_LIMIT_EXCEEDED',
+        detail: 'Too many requests. Please try again later.'
+      });
+    }
+  } catch (error) {
+    console.error('[rate-limit] candidate submit check failed', {
+      request_id: req.request_id || null,
+      error: error?.message || error
+    });
+    return res.status(503).json({
+      error: 'rate_limit_unavailable',
+      code: 'RATE_LIMIT_UNAVAILABLE',
+      detail: 'Request protection is temporarily unavailable. Please try again shortly.'
     });
   }
   return next();

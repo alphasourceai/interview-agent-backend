@@ -2,27 +2,39 @@
 
 const express = require('express');
 const { supabase } = require('../src/lib/supabaseClient');
+const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
 
 const router = express.Router();
 const PUBLIC_STATUS_RATE_WINDOW_MS = 5 * 60 * 1000;
 const PUBLIC_STATUS_RATE_MAX = 120;
-const publicStatusRateBuckets = new Map();
 
-function publicStatusRateLimit(req, res, next) {
-  const now = Date.now();
-  const ip = String((req.headers['x-forwarded-for'] || req.ip || 'unknown')).split(',')[0].trim() || 'unknown';
-  const current = publicStatusRateBuckets.get(ip);
-  const bucket = (!current || current.resetAt <= now)
-    ? { count: 0, resetAt: now + PUBLIC_STATUS_RATE_WINDOW_MS }
-    : current;
-  bucket.count += 1;
-  publicStatusRateBuckets.set(ip, bucket);
-  if (bucket.count > PUBLIC_STATUS_RATE_MAX) {
+async function publicStatusRateLimit(req, res, next) {
+  try {
+    const result = await checkAndIncrementRateLimit({
+      routeName: 'public_interview_status',
+      subjectKey: getRequestSubjectKey(req),
+      windowMs: PUBLIC_STATUS_RATE_WINDOW_MS,
+      maxCount: PUBLIC_STATUS_RATE_MAX
+    });
+    if (!result.allowed) {
+      const request_id = req.request_id || req.headers['x-request-id'] || req.headers['x-correlation-id'] || null;
+      return res.status(429).json({
+        error: 'rate_limited',
+        code: 'RATE_LIMIT_EXCEEDED',
+        detail: 'Too many requests. Please try again later.',
+        request_id
+      });
+    }
+  } catch (error) {
+    console.error('[rate-limit] public interview status check failed', {
+      request_id: req.request_id || req.headers['x-request-id'] || req.headers['x-correlation-id'] || null,
+      error: error?.message || error
+    });
     const request_id = req.request_id || req.headers['x-request-id'] || req.headers['x-correlation-id'] || null;
-    return res.status(429).json({
-      error: 'rate_limited',
-      code: 'RATE_LIMIT_EXCEEDED',
-      detail: 'Too many requests. Please try again later.',
+    return res.status(503).json({
+      error: 'rate_limit_unavailable',
+      code: 'RATE_LIMIT_UNAVAILABLE',
+      detail: 'Request protection is temporarily unavailable. Please try again shortly.',
       request_id
     });
   }
