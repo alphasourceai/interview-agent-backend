@@ -54,6 +54,131 @@ const toScoreOrNull = (value) => {
   return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : null;
 };
 
+const normalizeInlineText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+
+function buildTextInterviewTranscript(answers, rubricQuestions = []) {
+  const lines = ['INTERVIEW MODE: TEXT'];
+  const items = Array.isArray(answers) ? answers : [];
+  for (let i = 0; i < items.length; i += 1) {
+    const item = items[i] || {};
+    const question = normalizeInlineText(item.question || rubricQuestions[i] || '') || '[question missing]';
+    const answer = normalizeInlineText(item.answer || '');
+    lines.push('');
+    lines.push(`QUESTION ${i + 1}: ${question}`);
+    lines.push(`ANSWER ${i + 1}: ${answer || '[no answer provided]'}`);
+  }
+  return lines.join('\n');
+}
+
+function getUnansweredCandidateQuestions({ rubricQuestions, answers }) {
+  if (!Array.isArray(rubricQuestions) || rubricQuestions.length === 0) return [];
+  const items = Array.isArray(answers) ? answers : [];
+  const answeredByQuestion = new Set();
+  for (const item of items) {
+    const question = normalizeInlineText(item?.question || '').toLowerCase();
+    const answer = normalizeInlineText(item?.answer || '');
+    if (question && answer) answeredByQuestion.add(question);
+  }
+
+  const unanswered = [];
+  for (let i = 0; i < rubricQuestions.length; i += 1) {
+    const question = normalizeInlineText(rubricQuestions[i] || '');
+    if (!question) continue;
+    const indexedAnswer = normalizeInlineText(items[i]?.answer || '');
+    if (indexedAnswer) continue;
+    if (answeredByQuestion.has(question.toLowerCase())) continue;
+    unanswered.push(question);
+  }
+  return unanswered;
+}
+
+function assessAiAidedRiskFromAnswers(answers) {
+  const answerTexts = (Array.isArray(answers) ? answers : [])
+    .map((item) => normalizeInlineText(item?.answer || ''))
+    .filter(Boolean);
+  if (!answerTexts.length) {
+    return {
+      ai_aided_risk: 'low',
+      ai_aided_risk_reason: 'Insufficient answer text to assess.',
+    };
+  }
+
+  const normalizeForCompare = (text) => String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const openings = answerTexts
+    .map((text) => normalizeForCompare(text).split(' ').slice(0, 4).join(' '))
+    .filter(Boolean);
+  const openingCounts = new Map();
+  for (const opening of openings) openingCounts.set(opening, (openingCounts.get(opening) || 0) + 1);
+  const maxOpeningRepeat = Math.max(0, ...Array.from(openingCounts.values()));
+
+  const normalizedAnswers = answerTexts.map(normalizeForCompare).filter(Boolean);
+  const hasDuplicateAnswers = new Set(normalizedAnswers).size < normalizedAnswers.length;
+
+  const genericPattern = /\b(firstly|secondly|thirdly|in conclusion|to summarize|in summary|it is important to note|furthermore|moreover|overall)\b/gi;
+  let genericHits = 0;
+  for (const text of answerTexts) {
+    const matches = text.match(genericPattern);
+    if (matches) genericHits += matches.length;
+  }
+
+  const specificityPattern = /\b(\d+(?:\.\d+)?%?|sql|python|java|javascript|typescript|node|react|aws|gcp|azure|kpi|okr|api|etl|docker|kubernetes|salesforce|tableau|excel|postgres|mysql|redis)\b/gi;
+  let lowSpecificVerboseCount = 0;
+  for (const text of answerTexts) {
+    const words = text.split(/\s+/).filter(Boolean);
+    if (words.length < 55) continue;
+    const specificityHits = (text.match(specificityPattern) || []).length;
+    if (specificityHits < 2) lowSpecificVerboseCount += 1;
+  }
+
+  let points = 0;
+  const signals = [];
+  if (hasDuplicateAnswers) {
+    points += 3;
+    signals.push('multiple answers were near-duplicates');
+  }
+  if (maxOpeningRepeat >= 3) {
+    points += 2;
+    signals.push('several answers begin with the same opening phrase');
+  } else if (maxOpeningRepeat >= 2 && openings.length >= 3) {
+    points += 1;
+    signals.push('answers repeatedly start with similar phrasing');
+  }
+  if (genericHits >= 4) {
+    points += 2;
+    signals.push('answers repeatedly use generic transition language');
+  } else if (genericHits >= 2) {
+    points += 1;
+    signals.push('answers include repeated generic transition language');
+  }
+  if (lowSpecificVerboseCount >= 2) {
+    points += 2;
+    signals.push('long responses include limited role-specific detail');
+  } else if (lowSpecificVerboseCount === 1) {
+    points += 1;
+    signals.push('one long response includes limited role-specific detail');
+  }
+
+  const ai_aided_risk = points >= 5 ? 'high' : (points >= 3 ? 'medium' : 'low');
+  let ai_aided_risk_reason = 'Low observable signs of formulaic or externally generated phrasing.';
+  if (signals.length > 0 && ai_aided_risk === 'high') {
+    ai_aided_risk_reason = `Higher-risk pattern detected: ${signals.slice(0, 2).join('; ')}.`;
+  } else if (signals.length > 0 && ai_aided_risk === 'medium') {
+    ai_aided_risk_reason = `Some formulaic-pattern signals detected: ${signals.slice(0, 2).join('; ')}.`;
+  } else if (signals.length > 0) {
+    ai_aided_risk_reason = `Limited indicators of formulaic phrasing: ${signals[0]}.`;
+  }
+
+  return {
+    ai_aided_risk,
+    ai_aided_risk_reason: ai_aided_risk_reason.slice(0, 300),
+  };
+}
+
 async function scoreTextInterview({ role, answers }) {
   if (!openai) {
     const err = new Error('OpenAI not configured');
@@ -505,6 +630,7 @@ router.post('/answers', async (req, res) => {
         request_id,
       });
     }
+    const rubricQuestions = parseQuestions(role.rubric);
 
     const firstSubmit = !reqRow.text_completed_at;
 
@@ -568,11 +694,27 @@ router.post('/answers', async (req, res) => {
       const overallScore = resumeScore == null
         ? interviewScore
         : clampScore((resumeScore + interviewScore) / 2);
+      const aiRisk = assessAiAidedRiskFromAnswers(answers);
+      const transcript = buildTextInterviewTranscript(answers, rubricQuestions);
+      const unansweredCandidateQuestions = getUnansweredCandidateQuestions({ rubricQuestions, answers });
+      const transcriptScores = {
+        overall: interviewScore,
+        confidence: null,
+        ai_aided_risk: aiRisk.ai_aided_risk,
+        ai_aided_risk_reason: aiRisk.ai_aided_risk_reason,
+      };
+      const perceptionScores = {
+        mode: 'text',
+        unavailable: true,
+        reason: 'Perception analysis is not available for text interviews.',
+      };
 
       const interview_breakdown = {
         clarity: null,
         confidence: null,
         body_language: null,
+        ai_aided_risk: transcriptScores.ai_aided_risk,
+        ai_aided_risk_reason: transcriptScores.ai_aided_risk_reason,
         summary: summaryNote,
       };
 
@@ -584,7 +726,13 @@ router.post('/answers', async (req, res) => {
           clarity: null,
           confidence: null,
           body_language: null,
+          overall: interviewScore,
+          ai_aided_risk: transcriptScores.ai_aided_risk,
+          ai_aided_risk_reason: transcriptScores.ai_aided_risk_reason,
         },
+        transcript_scores: transcriptScores,
+        perception_scores: perceptionScores,
+        unanswered_candidate_questions: unansweredCandidateQuestions,
         answers,
       };
 
@@ -593,6 +741,11 @@ router.post('/answers', async (req, res) => {
         role_id: role.id,
         client_id: role.client_id || null,
         rubric: role.rubric || null,
+        transcript,
+        transcript_scores: transcriptScores,
+        interview_summary: summaryNote,
+        perception_scores: perceptionScores,
+        unanswered_candidate_questions: unansweredCandidateQuestions,
         analysis: interviewAnalysis,
         status: 'completed',
       });
@@ -615,6 +768,8 @@ router.post('/answers', async (req, res) => {
           mode: 'text',
           summary: summaryNote,
           interview_score: interviewScore,
+          ai_aided_risk: transcriptScores.ai_aided_risk,
+          ai_aided_risk_reason: transcriptScores.ai_aided_risk_reason,
         };
         await supabaseAdmin
           .from('reports')
@@ -635,7 +790,13 @@ router.post('/answers', async (req, res) => {
           interview_score: interviewScore,
           overall_score: overallScore,
           interview_breakdown,
-          analysis: { summary: summaryNote, mode: 'text', interview_score: interviewScore },
+          analysis: {
+            summary: summaryNote,
+            mode: 'text',
+            interview_score: interviewScore,
+            ai_aided_risk: transcriptScores.ai_aided_risk,
+            ai_aided_risk_reason: transcriptScores.ai_aided_risk_reason,
+          },
         });
       }
 
