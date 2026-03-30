@@ -93,9 +93,23 @@ function getUnansweredCandidateQuestions({ rubricQuestions, answers }) {
 }
 
 function assessAiAidedRiskFromAnswers(answers) {
-  const answerTexts = (Array.isArray(answers) ? answers : [])
-    .map((item) => normalizeInlineText(item?.answer || ''))
-    .filter(Boolean);
+  const asNonNegativeInt = (value) => {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return Math.floor(n);
+  };
+
+  const answerItems = (Array.isArray(answers) ? answers : [])
+    .map((item) => ({
+      text: normalizeInlineText(item?.answer || ''),
+      used_paste: item?.used_paste === true,
+      paste_count: asNonNegativeInt(item?.paste_count),
+      largest_paste_length: asNonNegativeInt(item?.largest_paste_length),
+      typed_char_count: asNonNegativeInt(item?.typed_char_count),
+      pasted_char_count: asNonNegativeInt(item?.pasted_char_count),
+    }))
+    .filter((item) => item.text);
+  const answerTexts = answerItems.map((item) => item.text);
   if (!answerTexts.length) {
     return {
       ai_aided_risk: 'low',
@@ -135,6 +149,18 @@ function assessAiAidedRiskFromAnswers(answers) {
     if (specificityHits < 2) lowSpecificVerboseCount += 1;
   }
 
+  const answersWithPaste = answerItems.filter((item) =>
+    item.used_paste || item.paste_count > 0 || item.pasted_char_count > 0 || item.largest_paste_length > 0
+  );
+  const largePasteAnswers = answerItems.filter((item) => item.largest_paste_length >= 120);
+  const pasteDominantAnswers = answerItems.filter((item) =>
+    item.pasted_char_count >= 120 &&
+    item.pasted_char_count > (item.typed_char_count * 1.2)
+  );
+  const veryLargePasteAnswers = answerItems.filter((item) => item.largest_paste_length >= 240);
+  const totalTypedChars = answerItems.reduce((sum, item) => sum + item.typed_char_count, 0);
+  const totalPastedChars = answerItems.reduce((sum, item) => sum + item.pasted_char_count, 0);
+
   let points = 0;
   const signals = [];
   if (hasDuplicateAnswers) {
@@ -161,6 +187,36 @@ function assessAiAidedRiskFromAnswers(answers) {
   } else if (lowSpecificVerboseCount === 1) {
     points += 1;
     signals.push('one long response includes limited role-specific detail');
+  }
+  if (answersWithPaste.length >= 3) {
+    points += 1;
+    signals.push('paste was used across multiple answers');
+  }
+  if (largePasteAnswers.length >= 2) {
+    points += 2;
+    signals.push('multiple answers include large paste events');
+  } else if (largePasteAnswers.length === 1) {
+    points += 1;
+    signals.push('one answer includes a large paste event');
+  }
+  if (pasteDominantAnswers.length >= 2) {
+    points += 2;
+    signals.push('multiple answers are primarily paste-driven');
+  } else if (pasteDominantAnswers.length === 1) {
+    points += 1;
+    signals.push('one answer appears primarily paste-driven');
+  }
+  if (veryLargePasteAnswers.length >= 1) {
+    points += 1;
+    signals.push('at least one answer contains a very large pasted block');
+  }
+  if (
+    answerItems.length >= 2 &&
+    totalPastedChars >= 320 &&
+    totalPastedChars > (totalTypedChars * 1.3)
+  ) {
+    points += 1;
+    signals.push('overall response volume is skewed toward pasted text');
   }
 
   const ai_aided_risk = points >= 5 ? 'high' : (points >= 3 ? 'medium' : 'low');
