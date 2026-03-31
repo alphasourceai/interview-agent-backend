@@ -374,6 +374,11 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
         const safeVideoUrl = r.video_url && !isDailyRoomUrl(r.video_url) ? r.video_url : null;
         const hasTranscript = !!r.transcript_url || !!r.transcript;
         const transcriptOverall = getTranscriptOverall(r);
+        const resumeScore = isFinite(r.resume_score) ? Number(r.resume_score) : null;
+        const overallScore =
+          Number.isFinite(resumeScore) && Number.isFinite(transcriptOverall)
+            ? Math.max(0, Math.min(100, Math.round((resumeScore + transcriptOverall) / 2)))
+            : null;
         const perception = getPerceptionShape(r);
         const interviewSummary = typeof r?.interview_summary === 'string' ? r.interview_summary : '';
         const canonicalHasAnalysis = hasCanonicalAnalysis(r);
@@ -393,9 +398,9 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
         has_video: !!safeVideoUrl,
         has_transcript: hasTranscript,
         has_analysis: canonicalHasAnalysis,
-        resume_score: isFinite(r.resume_score) ? Number(r.resume_score) : null,
+        resume_score: resumeScore,
         interview_score: transcriptOverall ?? null,
-        overall_score: isFinite(r.overall_score) ? Number(r.overall_score) : null,
+        overall_score: overallScore,
         resume_analysis: r.resume_analysis || { experience: null, skills: null, education: null, summary: '' },
         interview_analysis: {
           clarity: perception.clarity,
@@ -452,18 +457,22 @@ router.get('/candidates', requireAuth, withClientScope, async (req, res) => {
       try {
         const a = r.analysis_summary || {};
         resumeScore    = a.resume_score ?? a.resume ?? a.resume_match_percent ?? null;
-        interviewScore = a.interview_score ?? a.interview ?? null;
-        overallScore   = a.overall_score ?? a.overall ?? a.overall_resume_match_percent ?? null;
       } catch {}
+      const resumeScoreNumber = isFinite(resumeScore) ? Number(resumeScore) : null;
+      const interviewScoreNumber = Number.isFinite(interviewScore) ? Number(interviewScore) : null;
+      overallScore =
+        Number.isFinite(resumeScoreNumber) && Number.isFinite(interviewScoreNumber)
+          ? Math.max(0, Math.min(100, Math.round((resumeScoreNumber + interviewScoreNumber) / 2)))
+          : null;
 
       return {
         id: r.id,
         name: [r.first_name, r.last_name].filter(Boolean).join(' ') || '—',
         email: r.email || '—',
         role: rolesById[r.role_id] || '—',
-        resume_score: isFinite(resumeScore) ? Number(resumeScore) : null,
-        interview_score: isFinite(interviewScore) ? Number(interviewScore) : null,
-        overall_score: isFinite(overallScore) ? Number(overallScore) : null,
+        resume_score: resumeScoreNumber,
+        interview_score: interviewScoreNumber,
+        overall_score: overallScore,
         created_at: r.created_at,
         resume_url: r.resume_url || null,
         interview_video_url: r.interview_video_url || null,
