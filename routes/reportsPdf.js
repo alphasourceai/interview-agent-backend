@@ -397,7 +397,6 @@ async function handleGenerate(req, res) {
         candidateSummary.resumeMatchPercent
       );
     const interviewFromTranscript = coerceNumber(transcriptScores.overall);
-    const overallFromReport = coerceNumber(reportRow.overall_score);
     const overallFromCurrent =
       (resumeFromCandidate !== null && interviewFromTranscript !== null)
         ? Math.round((resumeFromCandidate + interviewFromTranscript) / 2)
@@ -405,11 +404,7 @@ async function handleGenerate(req, res) {
 
     if (resumeFromCandidate !== null) reportRow.resume_score = resumeFromCandidate;
     if (interviewFromTranscript !== null) reportRow.interview_score = interviewFromTranscript;
-    if (overallFromReport !== null) {
-      reportRow.overall_score = overallFromReport;
-    } else if (overallFromCurrent !== null) {
-      reportRow.overall_score = overallFromCurrent;
-    }
+    reportRow.overall_score = overallFromCurrent;
 
     const resumeSummaryFromCandidate =
       (typeof candidateSummary.summary === 'string' && candidateSummary.summary.trim()) ||
@@ -469,9 +464,9 @@ async function handleGenerate(req, res) {
       company_name: typeof client?.name === 'string' ? client.name.trim() : '',
       role_name: typeof role?.title === 'string' ? role.title.trim() : '',
       status,
-      resume_score: coerceNumber(reportRow.resume_score) ?? 0,
-      interview_score: coerceNumber(reportRow.interview_score) ?? 0,
-      overall_score: coerceNumber(reportRow.overall_score) ?? 0,
+      resume_score: coerceNumber(reportRow.resume_score) ?? null,
+      interview_score: coerceNumber(reportRow.interview_score) ?? null,
+      overall_score: coerceNumber(reportRow.overall_score) ?? null,
       resume_breakdown,
       resume_summary: resume_breakdown.summary || resume_summary,
       interview_breakdown,

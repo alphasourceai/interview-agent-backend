@@ -234,7 +234,6 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const rs = parsed.resume_score ?? parsed.resume ?? parsed.resume_match_percent ?? parsed.resumeMatchPercent ?? null;
       const resume_score = Number.isFinite(Number(rs)) ? Number(rs) : null;
       const interview_score = isFinite(rep?.interview_score) ? Number(rep.interview_score) : null;
-      const repOverallScore = isFinite(rep?.overall_score) ? Number(rep.overall_score) : null;
 
       const resume_summary =
         (typeof parsed.summary === 'string' && parsed.summary) ||
@@ -265,13 +264,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const overall_score =
         Number.isFinite(resume_score) && Number.isFinite(transcriptOverall)
           ? Math.max(0, Math.min(100, Math.round((resume_score + transcriptOverall) / 2)))
-          : Number.isFinite(transcriptOverall)
-            ? Math.max(0, Math.min(100, Math.round(transcriptOverall)))
-            : Number.isFinite(resume_score)
-              ? Math.max(0, Math.min(100, Math.round(resume_score)))
-              : Number.isFinite(repOverallScore)
-                ? Math.max(0, Math.min(100, Math.round(repOverallScore)))
-                : null;
+          : null;
       const canonicalHasAnalysis = hasCanonicalAnalysis(iv);
 
       return {

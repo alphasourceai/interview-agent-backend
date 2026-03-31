@@ -747,9 +747,9 @@ router.post('/answers', async (req, res) => {
       }
 
       const interviewScore = clampScore(scoring.interview_score);
-      const overallScore = resumeScore == null
-        ? interviewScore
-        : clampScore((resumeScore + interviewScore) / 2);
+      const overallScore = (resumeScore != null && interviewScore != null)
+        ? clampScore((resumeScore + interviewScore) / 2)
+        : null;
       const aiRisk = assessAiAidedRiskFromAnswers(answers);
       const transcript = buildTextInterviewTranscript(answers, rubricQuestions);
       const unansweredCandidateQuestions = getUnansweredCandidateQuestions({ rubricQuestions, answers });
