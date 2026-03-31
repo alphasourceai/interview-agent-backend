@@ -79,6 +79,10 @@
       background: #b58cff;
     }
 
+    .bar.unavailable {
+      background: #e2e2e8;
+    }
+
     .section {
       margin-top: 28px;
     }
@@ -134,29 +138,35 @@
     <div class="gauge-row">
       <div class="card">
         <div class="label">Resume Score</div>
-        <div class="score-text">{{resume_score}}%</div>
-        <div class="bar"><span style="width: {{resume_score}}%;"></span></div>
+        <div class="score-text">{{scoreText resume_score}}</div>
+        <div class="bar {{#unless (hasScore resume_score)}}unavailable{{/unless}}">
+          {{#if (hasScore resume_score)}}<span style="width: {{scoreBarWidth resume_score}}%;"></span>{{/if}}
+        </div>
       </div>
 
       <div class="card">
         <div class="label">Interview Score</div>
-        <div class="score-text">{{interview_score}}%</div>
-        <div class="bar"><span style="width: {{interview_score}}%;"></span></div>
+        <div class="score-text">{{scoreText interview_score}}</div>
+        <div class="bar {{#unless (hasScore interview_score)}}unavailable{{/unless}}">
+          {{#if (hasScore interview_score)}}<span style="width: {{scoreBarWidth interview_score}}%;"></span>{{/if}}
+        </div>
       </div>
 
       <div class="card">
         <div class="label">Overall Score</div>
-        <div class="score-text">{{overall_score}}%</div>
-        <div class="bar"><span style="width: {{overall_score}}%;"></span></div>
+        <div class="score-text">{{scoreText overall_score}}</div>
+        <div class="bar {{#unless (hasScore overall_score)}}unavailable{{/unless}}">
+          {{#if (hasScore overall_score)}}<span style="width: {{scoreBarWidth overall_score}}%;"></span>{{/if}}
+        </div>
       </div>
     </div>
 
     <div class="section">
       <h3>Resume Analysis</h3>
       <ul class="kv">
-        <li><strong>Experience:</strong> {{resume_breakdown.experience}}%</li>
-        <li><strong>Skills:</strong> {{resume_breakdown.skills}}%</li>
-        <li><strong>Education:</strong> {{resume_breakdown.education}}%</li>
+        <li><strong>Experience:</strong> {{scoreText resume_breakdown.experience}}</li>
+        <li><strong>Skills:</strong> {{scoreText resume_breakdown.skills}}</li>
+        <li><strong>Education:</strong> {{scoreText resume_breakdown.education}}</li>
       </ul>
 
       <div class="summary-box">
@@ -171,10 +181,10 @@
     <div class="section">
       <h3>Interview Analysis</h3>
       <ul class="kv">
-        <li><strong>Confidence:</strong> {{interview_breakdown.confidence}}%</li>
-        <li><strong>Clarity:</strong> {{interview_breakdown.clarity}}%</li>
-<li><strong>Engagement:</strong> {{interview_breakdown.engagement}}%</li>
-        <li><strong>Evidence strength:</strong> {{interview_breakdown.evidence_strength}}%</li>
+        <li><strong>Confidence:</strong> {{scoreText interview_breakdown.confidence}}</li>
+        <li><strong>Clarity:</strong> {{scoreText interview_breakdown.clarity}}</li>
+        <li><strong>Engagement:</strong> {{scoreText interview_breakdown.engagement}}</li>
+        <li><strong>Evidence strength:</strong> {{scoreText interview_breakdown.evidence_strength}}</li>
         <li><strong>AI-aided interview risk:</strong> {{interview_breakdown.ai_aided_risk}}</li>
         {{#if interview_breakdown.ai_aided_risk_reason}}
           <li><strong>Risk note:</strong> {{interview_breakdown.ai_aided_risk_reason}}</li>

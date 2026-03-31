@@ -281,7 +281,10 @@ Return strict JSON:
     parsed = {};
   }
 
-  const interview_score = clampScore(parsed.interview_score ?? parsed.score ?? parsed.total_score);
+  const parsedInterviewScore = parsed.interview_score ?? parsed.score ?? parsed.total_score;
+  const interview_score = Number.isFinite(Number(parsedInterviewScore))
+    ? clampScore(parsedInterviewScore)
+    : null;
   const summary = String(parsed.summary || '').trim();
   return { interview_score, summary };
 }
@@ -746,7 +749,9 @@ router.post('/answers', async (req, res) => {
         if (!resumeBreakdown && candResume) resumeBreakdown = candResume;
       }
 
-      const interviewScore = clampScore(scoring.interview_score);
+      const interviewScore = Number.isFinite(Number(scoring.interview_score))
+        ? clampScore(scoring.interview_score)
+        : null;
       const overallScore = (resumeScore != null && interviewScore != null)
         ? clampScore((resumeScore + interviewScore) / 2)
         : null;

@@ -12,6 +12,17 @@ let cachedLogoSrc = null;
 let triedLogoLoad = false;
 
 Handlebars.registerHelper('fallback', (v, d) => (v == null || v === '' ? d : v));
+Handlebars.registerHelper('hasScore', (v) => coerceNumber(v) !== null);
+Handlebars.registerHelper('scoreText', (v) => {
+  const n = coerceNumber(v);
+  if (n === null) return '—';
+  return `${Math.max(0, Math.min(100, Math.round(n)))}%`;
+});
+Handlebars.registerHelper('scoreBarWidth', (v) => {
+  const n = coerceNumber(v);
+  if (n === null) return '';
+  return String(Math.max(0, Math.min(100, Math.round(n))));
+});
 
 function coerceNumber(val) {
   if (val === null || val === undefined) return null;
@@ -166,9 +177,9 @@ function buildCandidateReportHtml(payload) {
     role_name: nonEmptyString(p.role_name),
     status: nonEmptyString(p.status),
 
-    resume_score: coerceNumber(p.resume_score) ?? coerceNumber(p.resumeScore) ?? '',
-    interview_score: coerceNumber(p.interview_score) ?? coerceNumber(p.interviewScore) ?? '',
-    overall_score: coerceNumber(p.overall_score) ?? coerceNumber(p.overallScore) ?? '',
+    resume_score: coerceNumber(p.resume_score) ?? coerceNumber(p.resumeScore) ?? null,
+    interview_score: coerceNumber(p.interview_score) ?? coerceNumber(p.interviewScore) ?? null,
+    overall_score: coerceNumber(p.overall_score) ?? coerceNumber(p.overallScore) ?? null,
 
     resume_breakdown: resumeBreakdown,
     interview_breakdown: interviewBreakdown,

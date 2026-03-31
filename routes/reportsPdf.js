@@ -372,12 +372,14 @@ async function handleGenerate(req, res) {
     const aiAidedRiskFromTranscript = typeof transcriptScores.ai_aided_risk === 'string' ? transcriptScores.ai_aided_risk.trim().toLowerCase() : '';
     const aiAidedRiskReasonFromTranscript = typeof transcriptScores.ai_aided_risk_reason === 'string' ? transcriptScores.ai_aided_risk_reason.trim() : '';
 
+    const clarityFromReport = coerceNumber(rb.clarity);
+    const confidenceFromReport = coerceNumber(rb.confidence);
+    const clarityFromIvScores = coerceNumber(ivScores.clarity);
+    const confidenceFromIvScores = coerceNumber(ivScores.confidence);
     const interview_breakdown = {
-      clarity: Number.isFinite(Number(rb.clarity)) ? Number(rb.clarity)
-              : (Number.isFinite(Number(ivScores.clarity)) ? Number(ivScores.clarity) : 0),
-      confidence: Number.isFinite(Number(rb.confidence)) ? Number(rb.confidence)
-                 : (Number.isFinite(Number(ivScores.confidence)) ? Number(ivScores.confidence) : 0),
-      evidence_strength: evidenceStrengthFromTranscript !== null ? evidenceStrengthFromTranscript : 0,
+      clarity: clarityFromReport !== null ? clarityFromReport : clarityFromIvScores,
+      confidence: confidenceFromReport !== null ? confidenceFromReport : confidenceFromIvScores,
+      evidence_strength: evidenceStrengthFromTranscript !== null ? evidenceStrengthFromTranscript : null,
       ai_aided_risk: aiAidedRiskFromTranscript,
       ai_aided_risk_reason: aiAidedRiskReasonFromTranscript,
       summary: interview_summary
