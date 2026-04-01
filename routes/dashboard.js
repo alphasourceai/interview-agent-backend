@@ -57,9 +57,16 @@ function toFiniteOrNull(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+function toScoreOrNull(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string' && value.trim() === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
 function getTranscriptOverall(interviewRow) {
   const scores = parseJsonObject(interviewRow?.transcript_scores);
-  return scores ? toFiniteOrNull(scores.overall) : null;
+  return scores ? toScoreOrNull(scores.overall) : null;
 }
 
 function getPerceptionShape(interviewRow) {
@@ -232,8 +239,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
 
       const parsed = parseJsonObject(c?.analysis_summary) || {};
       const rs = parsed.resume_score ?? parsed.resume ?? parsed.resume_match_percent ?? parsed.resumeMatchPercent ?? null;
-      const resume_score = Number.isFinite(Number(rs)) ? Number(rs) : null;
-      const interview_score = isFinite(rep?.interview_score) ? Number(rep.interview_score) : null;
+      const resume_score = toScoreOrNull(rs);
 
       const resume_summary =
         (typeof parsed.summary === 'string' && parsed.summary) ||
@@ -261,9 +267,10 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const safeVideoUrl = iv?.video_url && !isDailyRoomUrl(iv.video_url) ? iv.video_url : null;
       const hasTranscript = !!iv?.transcript;
       const transcriptOverall = getTranscriptOverall(iv);
+      const interviewScore = Number.isFinite(transcriptOverall) ? transcriptOverall : null;
       const overall_score =
-        Number.isFinite(resume_score) && Number.isFinite(transcriptOverall)
-          ? Math.max(0, Math.min(100, Math.round((resume_score + transcriptOverall) / 2)))
+        Number.isFinite(resume_score) && Number.isFinite(interviewScore)
+          ? Math.max(0, Math.min(100, Math.round((resume_score + interviewScore) / 2)))
           : null;
       const canonicalHasAnalysis = hasCanonicalAnalysis(iv);
 
@@ -292,7 +299,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
 
         // report-driven bits
         resume_score,
-        interview_score: transcriptOverall ?? null,
+        interview_score: interviewScore,
         overall_score,
         resume_analysis,
         interview_analysis,
@@ -374,10 +381,11 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
         const safeVideoUrl = r.video_url && !isDailyRoomUrl(r.video_url) ? r.video_url : null;
         const hasTranscript = !!r.transcript_url || !!r.transcript;
         const transcriptOverall = getTranscriptOverall(r);
-        const resumeScore = isFinite(r.resume_score) ? Number(r.resume_score) : null;
+        const interviewScore = Number.isFinite(transcriptOverall) ? transcriptOverall : null;
+        const resumeScore = toScoreOrNull(r.resume_score);
         const overallScore =
-          Number.isFinite(resumeScore) && Number.isFinite(transcriptOverall)
-            ? Math.max(0, Math.min(100, Math.round((resumeScore + transcriptOverall) / 2)))
+          Number.isFinite(resumeScore) && Number.isFinite(interviewScore)
+            ? Math.max(0, Math.min(100, Math.round((resumeScore + interviewScore) / 2)))
             : null;
         const perception = getPerceptionShape(r);
         const interviewSummary = typeof r?.interview_summary === 'string' ? r.interview_summary : '';
@@ -399,7 +407,7 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
         has_transcript: hasTranscript,
         has_analysis: canonicalHasAnalysis,
         resume_score: resumeScore,
-        interview_score: transcriptOverall ?? null,
+        interview_score: interviewScore,
         overall_score: overallScore,
         resume_analysis: r.resume_analysis || { experience: null, skills: null, education: null, summary: '' },
         interview_analysis: {
