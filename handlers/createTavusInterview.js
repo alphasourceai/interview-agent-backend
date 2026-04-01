@@ -51,14 +51,16 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   const companyNameRaw = (options.companyName || role.company_name || '').trim();
   const companyName = /^the hiring organization$/i.test(companyNameRaw) ? '' : companyNameRaw;
   const roleTitle = (role?.title || 'this position').trim();
+  const spokenRoleTitle = normalizeSpokenTextAbbreviations(roleTitle);
   const candidateName = (candidate?.name || '').trim() || 'there';
   const candidateFirstName = deriveSpokenFirstName(candidate?.name) || 'there';
 
   const rubricQuestions = extractInterviewQuestions(role);
+  const spokenRubricQuestions = rubricQuestions.map((q) => normalizeSpokenTextAbbreviations(q));
   const fallbackQuestion = 'To start, can you tell me a bit about your background and how it relates to this role?';
-  const firstQuestion = rubricQuestions[0] || fallbackQuestion;
-  const customGreeting = buildCustomGreeting(candidateFirstName, roleTitle, companyName, firstQuestion);
-  const defaultContext = buildConversationalContext(candidateName, roleTitle, companyName, rubricQuestions);
+  const firstQuestion = spokenRubricQuestions[0] || fallbackQuestion;
+  const customGreeting = buildCustomGreeting(candidateFirstName, spokenRoleTitle, companyName, firstQuestion);
+  const defaultContext = buildConversationalContext(candidateName, spokenRoleTitle, companyName, spokenRubricQuestions);
   const promptOverride = typeof role?.tavus_prompt === 'string' && role.tavus_prompt.trim() ? role.tavus_prompt.trim() : '';
   const context = promptOverride || defaultContext;
 
@@ -215,6 +217,8 @@ function buildConversationalContext(candidateName, roleTitle, companyName, rubri
     '- Ask questions one at a time from the rubric.',
     '- Expand common business/job-title abbreviations when speaking naturally.',
     '- Use these spoken expansions: Sr/SR = Senior, Jr/JR = Junior, VP = Vice President, SVP = Senior Vice President, EVP = Executive Vice President, Dir = Director, Mgr = Manager, Ops = Operations, HR = Human Resources, IT = Information Technology.',
+    '- After asking a question, if the candidate does not begin responding after about 5 to 7 seconds, check in once naturally and address the candidate by first name (for example, "Hi there, are you still with me?").',
+    '- If there is still no response after that one check-in, briefly restate the question once or move on naturally. Do not remain in indefinite silence.',
     '- If an answer is very short, vague, non-specific, or does not answer the question, briefly acknowledge it and ask exactly one short follow-up (for example, "Could you tell me a little more about that?").',
     '- After one follow-up attempt, if the candidate still does not elaborate, move on to the next rubric question.',
     '- END OF INTERVIEW PROTOCOL: After the final rubric question is answered, ask exactly once: "Do you have any questions for me before we wrap up?"',
@@ -242,6 +246,23 @@ function deriveSpokenFirstName(value) {
   if (!raw) return '';
   const token = raw.split(/\s+/).find(Boolean) || '';
   return token.replace(/^[,.;:!?()[\]{}"']+|[,.;:!?()[\]{}"']+$/g, '').trim();
+}
+
+function normalizeSpokenTextAbbreviations(value) {
+  let out = typeof value === 'string' ? value.trim() : '';
+  if (!out) return out;
+  out = out
+    .replace(/\bE\.?V\.?P\.?\b/g, 'Executive Vice President')
+    .replace(/\bS\.?V\.?P\.?\b/g, 'Senior Vice President')
+    .replace(/\bV\.?P\.?\b/g, 'Vice President')
+    .replace(/\bS\.?R\.?\b/gi, 'Senior')
+    .replace(/\bJ\.?R\.?\b/gi, 'Junior')
+    .replace(/\bDir\.?\b/gi, 'Director')
+    .replace(/\bMgr\.?\b/gi, 'Manager')
+    .replace(/\bOps\b/g, 'Operations')
+    .replace(/\bHR\b/g, 'Human Resources')
+    .replace(/\bIT\b/g, 'Information Technology');
+  return out.replace(/\s{2,}/g, ' ').trim();
 }
 
 module.exports = { createTavusInterviewHandler };
