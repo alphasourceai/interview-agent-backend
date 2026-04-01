@@ -188,7 +188,7 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
         try {
           const { data: fresh, error: freshError } = await supabaseAdmin
             .from('interviews')
-            .select('id,status,created_at,transcript,analysis,interview_summary')
+            .select('id,candidate_id,role_id,status,created_at,transcript,analysis,interview_summary')
             .eq('id', interviewId)
             .maybeSingle();
 
@@ -237,6 +237,36 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
               detail: finalizeError.message
             });
             return;
+          }
+
+          if (fresh.candidate_id) {
+            const { error: reportCleanupError } = await supabaseAdmin
+              .from('reports')
+              .update({
+                interview_score: null,
+                overall_score: null,
+                interview_breakdown: {
+                  clarity: null,
+                  confidence: null,
+                  body_language: null,
+                  evidence_strength: null,
+                  total_score: null,
+                  summary: EARLY_END_SUMMARY
+                }
+              })
+              .eq('candidate_id', fresh.candidate_id)
+              .eq('role_id', fresh.role_id);
+
+            if (reportCleanupError) {
+              console.error('[tavus/end-conversation] early_end_reconcile_report_cleanup_failed', {
+                request_id,
+                interview_id: interviewId,
+                candidate_id: fresh.candidate_id,
+                role_id: fresh.role_id,
+                code: reportCleanupError.code,
+                detail: reportCleanupError.message
+              });
+            }
           }
 
         } catch (e) {
