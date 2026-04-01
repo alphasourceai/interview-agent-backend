@@ -1,6 +1,7 @@
 // routes/candidateSubmit.js
 const express = require('express');
 const router = express.Router();
+const Sentry = require('@sentry/node');
 const multer = require('multer');
 const sg = require('@sendgrid/mail');
 const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
@@ -77,8 +78,14 @@ function normName(v = '') {
  * Required: email + (name OR first/last) + (role_id OR role_token)
  */
 router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
+  const request_id = req.request_id || null;
+  let sentryCandidateId = null;
+  let sentryRoleId = null;
+  let sentryClientId = null;
+  Sentry.setTag('route_name', 'candidate_submit');
+  Sentry.setTag('surface', 'backend');
+  if (request_id) Sentry.setTag('request_id', String(request_id));
   try {
-    const request_id = req.request_id || null;
     const submissionFailed = (reason, details = {}) => {
       console.warn('[candidate-submit] submission_failed', { request_id, reason, ...details });
       const payload = {
@@ -133,6 +140,16 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       });
     }
     const roleId = role.id;
+    sentryRoleId = roleId || null;
+    sentryClientId = role.client_id || null;
+    if (sentryRoleId) Sentry.setTag('role_id', String(sentryRoleId));
+    if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
+    Sentry.addBreadcrumb({
+      category: 'candidate_submit',
+      message: 'role loaded',
+      level: 'info',
+      data: { role_id: roleId, client_id: role.client_id || null }
+    });
 
     if (BILLING_ENFORCED && role.client_id) {
       const { data: client, error: clientErr } = await supabase
@@ -150,6 +167,12 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
           request_id
         });
       }
+      Sentry.addBreadcrumb({
+        category: 'candidate_submit',
+        message: 'client loaded',
+        level: 'info',
+        data: { client_id: role.client_id || null }
+      });
 
       const accessOverrideMode = String(client.access_override_mode || 'inherit').toLowerCase();
       if (accessOverrideMode === 'force_inactive' || (accessOverrideMode !== 'force_active' && client.billing_status !== 'active')) {
@@ -176,6 +199,12 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       roleTitle: role?.title || ''
     });
     if (availability.remaining_interviews != null && availability.remaining_interviews <= 0) {
+      Sentry.addBreadcrumb({
+        category: 'candidate_submit',
+        message: 'interview limit reached',
+        level: 'info',
+        data: { role_id: roleId, client_id: role.client_id || null }
+      });
       return res.status(403).json({
         error: 'forbidden',
         code: 'interview_limit_reached',
@@ -258,6 +287,14 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
         .single();
       if (cErr) return res.status(500).json({ error: cErr.message });
       candidate_id = inserted.id;
+      sentryCandidateId = candidate_id || null;
+      if (sentryCandidateId) Sentry.setTag('candidate_id', String(sentryCandidateId));
+      Sentry.addBreadcrumb({
+        category: 'candidate_submit',
+        message: 'candidate created',
+        level: 'info',
+        data: { candidate_id, role_id: roleId }
+      });
 
       // self-reference (candidate_id column)
       await supabase.from('candidates').update({ candidate_id }).eq('id', candidate_id);
@@ -352,6 +389,12 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       const status = e?.response?.status || e?.code || null;
       const message = e?.message || 'send_failed';
       console.error('sendEmailOtp failed', { request_id, status, message });
+      Sentry.addBreadcrumb({
+        category: 'candidate_submit',
+        message: 'otp send failed',
+        level: 'warning',
+        data: { request_id, status, message, candidate_id, role_id: roleId }
+      });
     }
 
     // success
@@ -363,6 +406,22 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
     });
   } catch (err) {
     console.error('Error in /candidate/submit:', err);
+    Sentry.captureException(err, {
+      tags: {
+        route_name: 'candidate_submit',
+        surface: 'backend',
+        request_id: request_id || undefined,
+        candidate_id: sentryCandidateId || undefined,
+        role_id: sentryRoleId || undefined,
+        client_id: sentryClientId || undefined
+      },
+      extra: {
+        request_id,
+        candidate_id: sentryCandidateId,
+        role_id: sentryRoleId,
+        client_id: sentryClientId
+      }
+    });
     return res.status(500).json({ error: 'Server error.' });
   }
 });

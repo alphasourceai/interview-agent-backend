@@ -2,6 +2,7 @@
 'use strict';
 
 const express = require('express');
+const Sentry = require('@sentry/node');
 const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
 const { createTavusInterviewHandler } = require('../handlers/createTavusInterview');
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
@@ -43,8 +44,14 @@ async function createTavusRateLimit(req, res, next) {
 }
 
 router.post('/', createTavusRateLimit, async (req, res) => {
+  const request_id = req.request_id || null;
+  let sentryCandidateId = null;
+  let sentryRoleId = null;
+  let sentryClientId = null;
+  Sentry.setTag('route_name', 'create_tavus_interview');
+  Sentry.setTag('surface', 'backend');
+  if (request_id) Sentry.setTag('request_id', String(request_id));
   try {
-    const request_id = req.request_id || null;
     const launchFailed = (reason, details = {}) => {
       console.warn('[create-tavus-interview] launch_failed', {
         request_id,
@@ -68,6 +75,8 @@ router.post('/', createTavusRateLimit, async (req, res) => {
       roleToken,
       role_token
     } = req.body || {};
+    sentryCandidateId = candidate_id || null;
+    if (sentryCandidateId) Sentry.setTag('candidate_id', String(sentryCandidateId));
     const roleTokenFromBody = roleToken || role_token || null;
     if (!candidate_id) return res.status(400).json({ error: 'candidate_id required' });
 
@@ -84,6 +93,12 @@ router.post('/', createTavusRateLimit, async (req, res) => {
         code: cErr?.code || null
       });
     }
+    Sentry.addBreadcrumb({
+      category: 'create_tavus_interview',
+      message: 'candidate loaded',
+      level: 'info',
+      data: { candidate_id }
+    });
 
     const candidateRoleId = String(candidate?.role_id || '').trim();
     const candidateClientId = String(candidate?.client_id || '').trim();
@@ -114,6 +129,8 @@ router.post('/', createTavusRateLimit, async (req, res) => {
       role = roleByToken;
       roleId = String(roleByToken.id || '').trim();
     }
+    sentryRoleId = roleId || candidateRoleId || null;
+    if (sentryRoleId) Sentry.setTag('role_id', String(sentryRoleId));
 
     if (roleId && roleId !== candidateRoleId) {
       return launchFailed('candidate_role_mismatch', {
@@ -148,6 +165,14 @@ router.post('/', createTavusRateLimit, async (req, res) => {
       }
       role = roleById;
     }
+    sentryRoleId = String(role?.id || roleId || '').trim() || null;
+    if (sentryRoleId) Sentry.setTag('role_id', String(sentryRoleId));
+    Sentry.addBreadcrumb({
+      category: 'create_tavus_interview',
+      message: 'role loaded',
+      level: 'info',
+      data: { role_id: sentryRoleId }
+    });
 
     if (String(role?.id || '') !== candidateRoleId) {
       return launchFailed('candidate_role_mismatch', {
@@ -165,6 +190,8 @@ router.post('/', createTavusRateLimit, async (req, res) => {
     }
 
     const clientId = role.client_id || candidate.client_id || null;
+    sentryClientId = clientId || null;
+    if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
     if (!clientId) {
       return launchFailed('missing_role_binding_context', {
         candidate_id,
@@ -199,6 +226,12 @@ router.post('/', createTavusRateLimit, async (req, res) => {
           request_id
         });
       }
+      Sentry.addBreadcrumb({
+        category: 'create_tavus_interview',
+        message: 'client loaded',
+        level: 'info',
+        data: { client_id: clientId }
+      });
       const accessOverrideMode = String(client.access_override_mode || 'inherit').toLowerCase();
       if (accessOverrideMode === 'force_inactive' || (accessOverrideMode !== 'force_active' && client.billing_status !== 'active')) {
         return res.status(403).json({
@@ -236,6 +269,12 @@ router.post('/', createTavusRateLimit, async (req, res) => {
         roleTitle: role?.title || ''
       });
       if (availability.remaining_interviews != null && availability.remaining_interviews <= 0) {
+        Sentry.addBreadcrumb({
+          category: 'create_tavus_interview',
+          message: 'interview limit reached',
+          level: 'info',
+          data: { role_id: roleId, client_id: clientId }
+        });
         return res.status(403).json({
           error: 'forbidden',
           code: 'interview_limit_reached',
@@ -249,8 +288,20 @@ router.post('/', createTavusRateLimit, async (req, res) => {
     const webhookUrl = `${base}/webhook/tavus`;
 
     // Tavus
+    Sentry.addBreadcrumb({
+      category: 'create_tavus_interview',
+      message: 'tavus launch started',
+      level: 'info',
+      data: { candidate_id, role_id: roleId, client_id: clientId }
+    });
     const result = await createTavusInterviewHandler(candidate, role, webhookUrl, {
       maxInterviewMinutes
+    });
+    Sentry.addBreadcrumb({
+      category: 'create_tavus_interview',
+      message: 'tavus launch succeeded',
+      level: 'info',
+      data: { conversation_id: result?.conversation_id || null }
     });
 
     // Immediately reflect on candidate
@@ -317,6 +368,24 @@ router.post('/', createTavusRateLimit, async (req, res) => {
     }
   } catch (e) {
     const status = e.status || 500;
+    if (status >= 500) {
+      Sentry.captureException(e, {
+        tags: {
+          route_name: 'create_tavus_interview',
+          surface: 'backend',
+          request_id: request_id || undefined,
+          candidate_id: sentryCandidateId || undefined,
+          role_id: sentryRoleId || undefined,
+          client_id: sentryClientId || undefined
+        },
+        extra: {
+          request_id,
+          candidate_id: sentryCandidateId,
+          role_id: sentryRoleId,
+          client_id: sentryClientId
+        }
+      });
+    }
     return res.status(status).json({ error: e.message });
   }
 });

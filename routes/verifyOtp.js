@@ -1,5 +1,6 @@
 // routes/verifyOtp.js
 const express = require("express");
+const Sentry = require('@sentry/node');
 const { supabase, supabaseAdmin } = require("../src/lib/supabaseClient");
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
@@ -46,8 +47,14 @@ async function verifyOtpRateLimit(req, res, next) {
  * - candidate_id/role_id remove ambiguity if the same email is used across roles
  */
 router.post("/", verifyOtpRateLimit, async (req, res) => {
+  const request_id = req.request_id || null;
+  let sentryCandidateId = null;
+  let sentryRoleId = null;
+  let sentryClientId = null;
+  Sentry.setTag('route_name', 'verify_otp');
+  Sentry.setTag('surface', 'backend');
+  if (request_id) Sentry.setTag('request_id', String(request_id));
   try {
-    const request_id = req.request_id || null;
     const verificationFailed = (reason, details = {}) => {
       console.warn('[verify-otp] verification_failed', {
         request_id,
@@ -111,6 +118,14 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
         role_id: roleIdIn || null
       });
     }
+    sentryCandidateId = cand.id || null;
+    if (sentryCandidateId) Sentry.setTag('candidate_id', String(sentryCandidateId));
+    Sentry.addBreadcrumb({
+      category: 'verify_otp',
+      message: 'candidate loaded',
+      level: 'info',
+      data: { candidate_id: cand.id || null }
+    });
 
     if (roleIdIn && String(cand.role_id || "") !== roleIdIn) {
       return verificationFailed('candidate_role_mismatch', {
@@ -120,6 +135,8 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
     }
 
     const roleId = String(cand.role_id || "");
+    sentryRoleId = roleId || null;
+    if (sentryRoleId) Sentry.setTag('role_id', String(sentryRoleId));
 
     const { data: role, error: roleErr } = await supabase
       .from('roles')
@@ -132,9 +149,17 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
         code: 'ROLE_LOOKUP_FAILED',
         detail: roleErr?.message || 'Failed to load role record',
         hint: roleErr?.hint || null,
-        request_id
-      });
+          request_id
+        });
     }
+    sentryClientId = role.client_id || null;
+    if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
+    Sentry.addBreadcrumb({
+      category: 'verify_otp',
+      message: 'role loaded',
+      level: 'info',
+      data: { role_id: roleId, client_id: role.client_id || null }
+    });
 
     if (BILLING_ENFORCED && role.client_id) {
       const { data: client, error: clientErr } = await supabase
@@ -151,6 +176,12 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
           request_id
         });
       }
+      Sentry.addBreadcrumb({
+        category: 'verify_otp',
+        message: 'client loaded',
+        level: 'info',
+        data: { client_id: role.client_id || null }
+      });
       const accessOverrideMode = String(client.access_override_mode || 'inherit').toLowerCase();
       if (accessOverrideMode === 'force_inactive' || (accessOverrideMode !== 'force_active' && client.billing_status !== 'active')) {
         return res.status(403).json({
@@ -176,6 +207,12 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
       roleTitle: ''
     });
     if (availability.remaining_interviews != null && availability.remaining_interviews <= 0) {
+      Sentry.addBreadcrumb({
+        category: 'verify_otp',
+        message: 'interview limit reached',
+        level: 'info',
+        data: { role_id: roleId, client_id: role.client_id || null }
+      });
       return res.status(403).json({
         error: 'forbidden',
         code: 'interview_limit_reached',
@@ -200,6 +237,12 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
         role_id: roleId
       });
     }
+    Sentry.addBreadcrumb({
+      category: 'verify_otp',
+      message: 'otp token loaded',
+      level: 'info',
+      data: { otp_token_id: token.id || null, candidate_id: cand.id || null, role_id: roleId }
+    });
 
     // 3) Validate
     if (token.expires_at && new Date(token.expires_at) <= new Date()) {
@@ -283,6 +326,12 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
       .update({ status: "Verified", verified: true, otp_verified_at: new Date().toISOString() })
       .eq("id", cand.id);
     if (uCandErr) return res.status(500).json({ error: "Could not update verification status." });
+    Sentry.addBreadcrumb({
+      category: 'verify_otp',
+      message: 'otp verified',
+      level: 'info',
+      data: { candidate_id: cand.id || null, role_id: roleId }
+    });
 
     return res.status(200).json({
       message: "Verified",
@@ -293,10 +342,26 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
     });
   } catch (e) {
     console.error("verify-otp error", {
-      request_id: req.request_id || null,
+      request_id,
       message: e?.message || "Server error",
       code: e?.code || null,
       status: e?.response?.status || null
+    });
+    Sentry.captureException(e, {
+      tags: {
+        route_name: 'verify_otp',
+        surface: 'backend',
+        request_id: request_id || undefined,
+        candidate_id: sentryCandidateId || undefined,
+        role_id: sentryRoleId || undefined,
+        client_id: sentryClientId || undefined
+      },
+      extra: {
+        request_id,
+        candidate_id: sentryCandidateId,
+        role_id: sentryRoleId,
+        client_id: sentryClientId
+      }
     });
     return res.status(500).json({ error: e?.message || "Server error" });
   }
