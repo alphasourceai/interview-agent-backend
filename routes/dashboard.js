@@ -2,6 +2,7 @@
 // Express router mounted at /dashboard
 
 const express = require('express');
+const Sentry = require('@sentry/node');
 const { supabase } = require('../src/lib/supabaseClient');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 
@@ -104,14 +105,27 @@ function hasCanonicalAnalysis(interviewRow) {
  * - FE uses latest_interview_id for Transcript/PDF actions
  */
 router.get('/rows', requireAuth, withClientScope, async (req, res) => {
+  const request_id = getRequestId(req);
+  let sentryClientId = null;
+  Sentry.setTag('route_name', 'dashboard_rows');
+  Sentry.setTag('surface', 'backend');
+  if (request_id) Sentry.setTag('request_id', String(request_id));
   try {
-    const request_id = getRequestId(req);
     const debug = String(req.query.debug || '') === '1';
     const clientId =
       req.client?.id ||
       req.clientScope?.defaultClientId ||
       req.query.client_id ||
       null;
+
+    sentryClientId = clientId ? String(clientId) : null;
+    if (sentryClientId) Sentry.setTag('client_id', sentryClientId);
+    Sentry.addBreadcrumb({
+      category: 'dashboard',
+      message: 'dashboard rows query started',
+      level: 'info',
+      data: { client_id: sentryClientId }
+    });
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
 
@@ -124,6 +138,16 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       .limit(1000);
 
     if (cErr) {
+      Sentry.addBreadcrumb({
+        category: 'dashboard',
+        message: 'dashboard rows query failed',
+        level: 'warning',
+        data: {
+          stage: 'candidates',
+          client_id: sentryClientId,
+          error: cErr?.message || null
+        }
+      });
       console.error('[dashboard/rows] candidates error', cErr);
       return res.status(500).json({ error: 'query failed (candidates)' });
     }
@@ -173,6 +197,15 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         .order('created_at', { ascending: false });
 
       if (iErr) {
+        Sentry.addBreadcrumb({
+          category: 'dashboard',
+          message: 'interview fetch failed',
+          level: 'warning',
+          data: {
+            client_id: sentryClientId,
+            error: iErr?.message || null
+          }
+        });
         console.error('[dashboard/rows] interviews error', iErr);
       } else {
         for (const iv of ivs || []) {
@@ -210,6 +243,15 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         .order('created_at', { ascending: false });
 
       if (repErr) {
+        Sentry.addBreadcrumb({
+          category: 'dashboard',
+          message: 'report fetch failed',
+          level: 'warning',
+          data: {
+            client_id: sentryClientId,
+            error: repErr?.message || null
+          }
+        });
         console.error('[dashboard/rows] reports error', {
           request_id,
           client_id: clientId,
@@ -310,6 +352,18 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
 
     return res.json({ items });
   } catch (e) {
+    Sentry.captureException(e, {
+      tags: {
+        route_name: 'dashboard_rows',
+        surface: 'backend',
+        request_id: request_id || undefined,
+        client_id: sentryClientId || undefined
+      },
+      extra: {
+        request_id,
+        client_id: sentryClientId
+      }
+    });
     console.error('[dashboard/rows] unexpected', e);
     return res.status(500).json({ error: 'Server error' });
   }
@@ -319,12 +373,26 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
  * (Keep these existing endpoints in case other pages still use them)
  */
 router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
+  const request_id = getRequestId(req);
+  let sentryClientId = null;
+  Sentry.setTag('route_name', 'dashboard_interviews');
+  Sentry.setTag('surface', 'backend');
+  if (request_id) Sentry.setTag('request_id', String(request_id));
   try {
     const clientId =
       req.client?.id ||
       req.clientScope?.defaultClientId ||
       req.query.client_id ||
       null;
+
+    sentryClientId = clientId ? String(clientId) : null;
+    if (sentryClientId) Sentry.setTag('client_id', sentryClientId);
+    Sentry.addBreadcrumb({
+      category: 'dashboard',
+      message: 'dashboard interviews query started',
+      level: 'info',
+      data: { client_id: sentryClientId }
+    });
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
 
@@ -336,6 +404,15 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
       .limit(500);
 
     if (iErr) {
+      Sentry.addBreadcrumb({
+        category: 'dashboard',
+        message: 'dashboard interviews query failed',
+        level: 'warning',
+        data: {
+          client_id: sentryClientId,
+          error: iErr?.message || null
+        }
+      });
       console.error('[dashboard/interviews] supabase error', iErr);
       return res.status(500).json({ error: 'query failed' });
     }
@@ -423,18 +500,44 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
 
     return res.json({ items });
   } catch (e) {
+    Sentry.captureException(e, {
+      tags: {
+        route_name: 'dashboard_interviews',
+        surface: 'backend',
+        request_id: request_id || undefined,
+        client_id: sentryClientId || undefined
+      },
+      extra: {
+        request_id,
+        client_id: sentryClientId
+      }
+    });
     console.error('[dashboard/interviews] unexpected', e);
     return res.status(500).json({ error: 'Server error' });
   }
 });
 
 router.get('/candidates', requireAuth, withClientScope, async (req, res) => {
+  const request_id = getRequestId(req);
+  let sentryClientId = null;
+  Sentry.setTag('route_name', 'dashboard_candidates');
+  Sentry.setTag('surface', 'backend');
+  if (request_id) Sentry.setTag('request_id', String(request_id));
   try {
     const clientId =
       req.client?.id ||
       req.clientScope?.defaultClientId ||
       req.query.client_id ||
       null;
+
+    sentryClientId = clientId ? String(clientId) : null;
+    if (sentryClientId) Sentry.setTag('client_id', sentryClientId);
+    Sentry.addBreadcrumb({
+      category: 'dashboard',
+      message: 'dashboard candidates query started',
+      level: 'info',
+      data: { client_id: sentryClientId }
+    });
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
 
@@ -445,6 +548,15 @@ router.get('/candidates', requireAuth, withClientScope, async (req, res) => {
       .order('created_at', { ascending: false });
 
     if (error) {
+      Sentry.addBreadcrumb({
+        category: 'dashboard',
+        message: 'dashboard candidates query failed',
+        level: 'warning',
+        data: {
+          client_id: sentryClientId,
+          error: error?.message || null
+        }
+      });
       console.error('[dashboard/candidates] supabase error', error);
       return res.status(500).json({ error: 'query failed' });
     }
@@ -490,6 +602,18 @@ router.get('/candidates', requireAuth, withClientScope, async (req, res) => {
 
     res.json({ items });
   } catch (e) {
+    Sentry.captureException(e, {
+      tags: {
+        route_name: 'dashboard_candidates',
+        surface: 'backend',
+        request_id: request_id || undefined,
+        client_id: sentryClientId || undefined
+      },
+      extra: {
+        request_id,
+        client_id: sentryClientId
+      }
+    });
     console.error('[dashboard/candidates] unexpected', e);
     res.status(500).json({ error: 'Server error' });
   }

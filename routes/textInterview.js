@@ -1,5 +1,6 @@
 // routes/textInterview.js
 const express = require('express');
+const Sentry = require('@sentry/node');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
@@ -353,6 +354,12 @@ function ensureApprovedStatus(status) {
 
 router.post('/session', async (req, res) => {
   const request_id = req.request_id || null;
+  let sentryCandidateId = null;
+  let sentryRoleId = null;
+  let sentryClientId = null;
+  Sentry.setTag('route_name', 'text_interview_session');
+  Sentry.setTag('surface', 'backend');
+  if (request_id) Sentry.setTag('request_id', String(request_id));
   try {
     const token = String(req.body?.token || '').trim();
     if (!token) {
@@ -367,6 +374,10 @@ router.post('/session', async (req, res) => {
     const decoded = verifyToken(token);
 
     const reqRow = await loadRequest(decoded.request_id);
+    sentryCandidateId = reqRow.candidate_id || null;
+    sentryRoleId = reqRow.role_id || null;
+    if (sentryCandidateId) Sentry.setTag('candidate_id', String(sentryCandidateId));
+    if (sentryRoleId) Sentry.setTag('role_id', String(sentryRoleId));
     ensureApprovedStatus(reqRow.status);
 
     const dup = await checkDuplicateCandidate({
@@ -418,6 +429,8 @@ router.post('/session', async (req, res) => {
         request_id,
       });
     }
+    sentryClientId = role.client_id || null;
+    if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
 
     let resumeRequired = !(reqRow.resume_url || reqRow.resume_received_at);
     if (resumeRequired && reqRow.candidate_id) {
@@ -436,6 +449,17 @@ router.post('/session', async (req, res) => {
     }
 
     const questions = parseQuestions(role.rubric);
+    Sentry.addBreadcrumb({
+      category: 'text_interview',
+      message: 'session loaded',
+      level: 'info',
+      data: {
+        request_id: reqRow.id,
+        candidate_id: sentryCandidateId,
+        role_id: sentryRoleId,
+        client_id: sentryClientId
+      }
+    });
 
     return res.json({
       request_id: reqRow.id,
@@ -451,6 +475,24 @@ router.post('/session', async (req, res) => {
     let status = 400;
     if (e?.code === 'request_not_approved') status = 403;
     if (e?.code === 'token_secret_missing') status = 500;
+    if (status >= 500) {
+      Sentry.captureException(e, {
+        tags: {
+          route_name: 'text_interview_session',
+          surface: 'backend',
+          request_id: request_id || undefined,
+          candidate_id: sentryCandidateId || undefined,
+          role_id: sentryRoleId || undefined,
+          client_id: sentryClientId || undefined
+        },
+        extra: {
+          request_id,
+          candidate_id: sentryCandidateId,
+          role_id: sentryRoleId,
+          client_id: sentryClientId
+        }
+      });
+    }
     return sendError(res, status, {
       error: e?.message || 'Invalid request',
       code: e?.code || 'invalid_request',
@@ -463,6 +505,12 @@ router.post('/session', async (req, res) => {
 
 router.post('/resume', upload.any(), async (req, res) => {
   const request_id = req.request_id || null;
+  let sentryCandidateId = null;
+  let sentryRoleId = null;
+  let sentryClientId = null;
+  Sentry.setTag('route_name', 'text_interview_resume');
+  Sentry.setTag('surface', 'backend');
+  if (request_id) Sentry.setTag('request_id', String(request_id));
   try {
     const token = String(req.body?.token || '').trim();
     if (!token) {
@@ -476,6 +524,10 @@ router.post('/resume', upload.any(), async (req, res) => {
     }
     const decoded = verifyToken(token);
     const reqRow = await loadRequest(decoded.request_id);
+    sentryCandidateId = reqRow.candidate_id || null;
+    sentryRoleId = reqRow.role_id || null;
+    if (sentryCandidateId) Sentry.setTag('candidate_id', String(sentryCandidateId));
+    if (sentryRoleId) Sentry.setTag('role_id', String(sentryRoleId));
     ensureApprovedStatus(reqRow.status);
 
     const file = (req.files || []).find(f =>
@@ -577,6 +629,8 @@ router.post('/resume', upload.any(), async (req, res) => {
           request_id,
         });
       }
+      sentryClientId = role.client_id || null;
+      if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
       const roleForResume = {
         ...role,
         description: role.description || role.job_description_text || ''
@@ -587,16 +641,57 @@ router.post('/resume', upload.any(), async (req, res) => {
           .from('candidates')
           .update({ analysis_summary: analysis })
           .eq('id', reqRow.candidate_id);
+        Sentry.addBreadcrumb({
+          category: 'text_interview',
+          message: 'resume scored',
+          level: 'info',
+          data: {
+            request_id: reqRow.id,
+            candidate_id: sentryCandidateId,
+            role_id: sentryRoleId,
+            client_id: sentryClientId
+          }
+        });
         console.log('resume_scored', { request_id, candidate_id: reqRow.candidate_id, role_id: reqRow.role_id });
       } catch (e) {
         console.warn('[text-interview] resume scoring failed', { request_id, error: e?.message || e });
       }
     }
 
+    Sentry.addBreadcrumb({
+      category: 'text_interview',
+      message: 'resume submitted',
+      level: 'info',
+      data: {
+        request_id: reqRow.id,
+        candidate_id: sentryCandidateId,
+        role_id: sentryRoleId,
+        client_id: sentryClientId
+      }
+    });
+
     return res.json({ ok: true });
   } catch (e) {
     if (e?.code) {
       const status = e.code === 'request_not_approved' ? 403 : (e.code === 'openai_missing' ? 500 : 400);
+      if (status >= 500) {
+        Sentry.captureException(e, {
+          tags: {
+            route_name: 'text_interview_resume',
+            surface: 'backend',
+            request_id: request_id || undefined,
+            candidate_id: sentryCandidateId || undefined,
+            role_id: sentryRoleId || undefined,
+            client_id: sentryClientId || undefined
+          },
+          extra: {
+            request_id,
+            candidate_id: sentryCandidateId,
+            role_id: sentryRoleId,
+            client_id: sentryClientId
+          }
+        });
+      }
       return sendError(res, status, {
         error: e?.message || 'Invalid request',
         code: e?.code || 'invalid_request',
@@ -611,6 +706,22 @@ router.post('/resume', upload.any(), async (req, res) => {
       detail: e?.detail || null,
       hint: e?.hint || null,
     });
+    Sentry.captureException(e, {
+      tags: {
+        route_name: 'text_interview_resume',
+        surface: 'backend',
+        request_id: request_id || undefined,
+        candidate_id: sentryCandidateId || undefined,
+        role_id: sentryRoleId || undefined,
+        client_id: sentryClientId || undefined
+      },
+      extra: {
+        request_id,
+        candidate_id: sentryCandidateId,
+        role_id: sentryRoleId,
+        client_id: sentryClientId
+      }
+    });
     return sendError(res, 500, {
       error: 'resume_upload_failed',
       code: 'resume_upload_failed',
@@ -623,6 +734,12 @@ router.post('/resume', upload.any(), async (req, res) => {
 
 router.post('/answers', async (req, res) => {
   const request_id = req.request_id || null;
+  let sentryCandidateId = null;
+  let sentryRoleId = null;
+  let sentryClientId = null;
+  Sentry.setTag('route_name', 'text_interview_answers');
+  Sentry.setTag('surface', 'backend');
+  if (request_id) Sentry.setTag('request_id', String(request_id));
   try {
     const token = String(req.body?.token || '').trim();
     const answers = Array.isArray(req.body?.answers) ? req.body.answers : null;
@@ -646,6 +763,10 @@ router.post('/answers', async (req, res) => {
     }
     const decoded = verifyToken(token);
     const reqRow = await loadRequest(decoded.request_id);
+    sentryCandidateId = reqRow.candidate_id || null;
+    sentryRoleId = reqRow.role_id || null;
+    if (sentryCandidateId) Sentry.setTag('candidate_id', String(sentryCandidateId));
+    if (sentryRoleId) Sentry.setTag('role_id', String(sentryRoleId));
     ensureApprovedStatus(reqRow.status);
 
     let resumePresent = !!(reqRow.resume_url || reqRow.resume_received_at);
@@ -689,6 +810,8 @@ router.post('/answers', async (req, res) => {
         request_id,
       });
     }
+    sentryClientId = role.client_id || null;
+    if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
     const rubricQuestions = parseQuestions(role.rubric);
 
     const firstSubmit = !reqRow.text_completed_at;
@@ -697,6 +820,17 @@ router.post('/answers', async (req, res) => {
       .from('accommodation_requests')
       .update({ text_answers: answers })
       .eq('id', reqRow.id);
+    Sentry.addBreadcrumb({
+      category: 'text_interview',
+      message: 'answers submitted',
+      level: 'info',
+      data: {
+        request_id: reqRow.id,
+        candidate_id: sentryCandidateId,
+        role_id: sentryRoleId,
+        client_id: sentryClientId
+      }
+    });
 
     if (firstSubmit && reqRow.candidate_id) {
       const availability = await getRoleInterviewAvailability({
@@ -878,6 +1012,17 @@ router.post('/answers', async (req, res) => {
         interview_score: interviewScore,
         overall_score: overallScore,
       });
+      Sentry.addBreadcrumb({
+        category: 'text_interview',
+        message: 'answers scored',
+        level: 'info',
+        data: {
+          request_id: reqRow.id,
+          candidate_id: sentryCandidateId,
+          role_id: sentryRoleId,
+          client_id: sentryClientId
+        }
+      });
     }
 
     return res.json({ ok: true });
@@ -897,6 +1042,22 @@ router.post('/answers', async (req, res) => {
       error: e?.message || e,
       detail: e?.detail || null,
       hint: e?.hint || null,
+    });
+    Sentry.captureException(e, {
+      tags: {
+        route_name: 'text_interview_answers',
+        surface: 'backend',
+        request_id: request_id || undefined,
+        candidate_id: sentryCandidateId || undefined,
+        role_id: sentryRoleId || undefined,
+        client_id: sentryClientId || undefined
+      },
+      extra: {
+        request_id,
+        candidate_id: sentryCandidateId,
+        role_id: sentryRoleId,
+        client_id: sentryClientId
+      }
     });
     return sendError(res, 500, {
       error: 'submission_failed',
