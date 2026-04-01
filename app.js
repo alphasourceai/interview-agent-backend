@@ -258,10 +258,17 @@ app.get('/clients/billing/summary', requireAuth, withClientScope, async (req, re
   }
 })
 
+const CLIENT_DASHBOARD_TABS = new Set(['roles', 'candidates', 'members', 'billing', 'feedback'])
+function sanitizeClientDashboardTab(value, fallback) {
+  const raw = String(value || '').trim().toLowerCase()
+  return CLIENT_DASHBOARD_TABS.has(raw) ? raw : fallback
+}
+
 app.post('/clients/billing/portal-session', requireAuth, withClientScope, async (req, res) => {
   try {
     const ids = Array.isArray(req.client_memberships) ? req.client_memberships : []
     const clientId = String(req.body?.client_id || '').trim()
+    const tab = sanitizeClientDashboardTab(req.body?.tab, 'billing')
     if (!clientId) return res.status(400).json({ error: 'client_id_required' })
     if (!ids.includes(clientId)) return res.status(403).json({ error: 'forbidden' })
 
@@ -279,9 +286,13 @@ app.post('/clients/billing/portal-session', requireAuth, withClientScope, async 
     const Stripe = require('stripe')
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
     const accountReturnUrl = 'https://www.alphasourceai.com/account'
+    const returnParams = new URLSearchParams({
+      client_id: clientId,
+      tab
+    })
     const session = await stripe.billingPortal.sessions.create({
       customer: stripeCustomerId,
-      return_url: accountReturnUrl
+      return_url: `${accountReturnUrl}?${returnParams.toString()}`
     })
     return res.json({ ok: true, url: session?.url || null })
   } catch (e) {
@@ -294,6 +305,7 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
     const ids = Array.isArray(req.client_memberships) ? req.client_memberships : []
     const clientId = String(req.body?.client_id || '').trim()
     const roleId = String(req.body?.role_id || '').trim()
+    const tab = sanitizeClientDashboardTab(req.body?.tab, 'billing')
     const parsedQuantity = Number(req.body?.quantity)
     const quantity = Number.isInteger(parsedQuantity) ? parsedQuantity : NaN
 
@@ -403,6 +415,20 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
       quantity: String(quantity)
     }
     const canonicalSiteBase = 'https://www.alphasourceai.com'
+    const successParams = new URLSearchParams({
+      tab,
+      intent: 'role_capacity',
+      purchase: 'success',
+      client_id: clientId,
+      role_id: roleId
+    })
+    const cancelParams = new URLSearchParams({
+      tab,
+      intent: 'role_capacity',
+      purchase: 'cancel',
+      client_id: clientId,
+      role_id: roleId
+    })
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       customer: stripeCustomerId || undefined,
@@ -417,8 +443,8 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
         quantity
       }],
       allow_promotion_codes: true,
-      success_url: `${canonicalSiteBase}/account?tab=billing&intent=role_capacity&purchase=success&client_id=${encodeURIComponent(clientId)}&role_id=${encodeURIComponent(roleId)}`,
-      cancel_url: `${canonicalSiteBase}/account?tab=billing&intent=role_capacity&purchase=cancel&client_id=${encodeURIComponent(clientId)}&role_id=${encodeURIComponent(roleId)}`,
+      success_url: `${canonicalSiteBase}/account?${successParams.toString()}`,
+      cancel_url: `${canonicalSiteBase}/account?${cancelParams.toString()}`,
       metadata: sessionMetadata
     })
 
@@ -446,6 +472,7 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
   try {
     const ids = Array.isArray(req.client_memberships) ? req.client_memberships : []
     const clientId = String(req.body?.client_id || '').trim()
+    const tab = sanitizeClientDashboardTab(req.body?.tab, 'roles')
     const roleTitle = String(req.body?.role_title || '').trim()
     const interviewType = String(req.body?.interview_type || '').trim().toUpperCase()
     const jdFile = req.file || null
@@ -603,13 +630,23 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
     })
 
     const canonicalSiteBase = 'https://www.alphasourceai.com'
+    const successParams = new URLSearchParams({
+      role_checkout: 'success',
+      client_id: String(client.id),
+      tab
+    })
+    const cancelParams = new URLSearchParams({
+      role_checkout: 'cancel',
+      client_id: String(client.id),
+      tab
+    })
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       customer: stripeCustomerId,
       line_items: [{ price: rolePrice.id, quantity: 1 }],
       allow_promotion_codes: true,
-      success_url: `${canonicalSiteBase}/account?role_checkout=success&client_id=${client.id}`,
-      cancel_url: `${canonicalSiteBase}/account?role_checkout=cancel&client_id=${client.id}`,
+      success_url: `${canonicalSiteBase}/account?${successParams.toString()}`,
+      cancel_url: `${canonicalSiteBase}/account?${cancelParams.toString()}`,
       metadata: sessionMetadata
     })
 
