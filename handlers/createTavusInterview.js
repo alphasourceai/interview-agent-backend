@@ -52,11 +52,12 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   const companyName = /^the hiring organization$/i.test(companyNameRaw) ? '' : companyNameRaw;
   const roleTitle = (role?.title || 'this position').trim();
   const candidateName = (candidate?.name || '').trim() || 'there';
+  const candidateFirstName = deriveSpokenFirstName(candidate?.name) || 'there';
 
   const rubricQuestions = extractInterviewQuestions(role);
   const fallbackQuestion = 'To start, can you tell me a bit about your background and how it relates to this role?';
   const firstQuestion = rubricQuestions[0] || fallbackQuestion;
-  const customGreeting = buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestion);
+  const customGreeting = buildCustomGreeting(candidateFirstName, roleTitle, companyName, firstQuestion);
   const defaultContext = buildConversationalContext(candidateName, roleTitle, companyName, rubricQuestions);
   const promptOverride = typeof role?.tavus_prompt === 'string' && role.tavus_prompt.trim() ? role.tavus_prompt.trim() : '';
   const context = promptOverride || defaultContext;
@@ -183,7 +184,13 @@ function extractInterviewQuestions(role) {
 
 function buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestion) {
   const companyClause = companyName ? ` at ${companyName}` : '';
-  const greeting = `Hi ${candidateName}, thank you for taking the time to speak with me today. I'll be conducting your interview for the ${roleTitle} position${companyClause}. I'll ask questions one at a time, and you can answer naturally. Let's get started.`;
+  const greeting = [
+    `Hi ${candidateName}.`,
+    'Thank you for taking the time to speak with me today.',
+    `I\'ll be conducting your interview for the ${roleTitle} position${companyClause}.`,
+    'I\'ll ask questions one at a time, and you can answer naturally.',
+    'Let\'s get started.'
+  ].join(' ');
   return `${greeting} ${firstQuestion}`;
 }
 
@@ -200,8 +207,14 @@ function buildConversationalContext(candidateName, roleTitle, companyName, rubri
     '- You are a structured interviewer.',
     '- YOU must speak first when the call connects: deliver the greeting and ask the first rubric question immediately. Do not wait in silence.',
     '- Do not introduce yourself with any personal name.',
+    '- Speak in short, natural sentences.',
+    '- Use a calm, conversational pace.',
+    '- Pause briefly between greeting sentences and before the first question.',
+    '- Avoid rushed or compressed delivery, especially in the opening.',
+    '- Sound like a human interviewer, not a disclaimer or scripted speed-read.',
     '- Ask questions one at a time from the rubric.',
-    '- Maintain a warm, professional, slightly slower pace with natural pauses; avoid sounding mechanical or rapid-fire.',
+    '- Expand common business/job-title abbreviations when speaking naturally.',
+    '- Use these spoken expansions: Sr/SR = Senior, Jr/JR = Junior, VP = Vice President, SVP = Senior Vice President, EVP = Executive Vice President, Dir = Director, Mgr = Manager, Ops = Operations, HR = Human Resources, IT = Information Technology.',
     '- If an answer is very short, vague, non-specific, or does not answer the question, briefly acknowledge it and ask exactly one short follow-up (for example, "Could you tell me a little more about that?").',
     '- After one follow-up attempt, if the candidate still does not elaborate, move on to the next rubric question.',
     '- END OF INTERVIEW PROTOCOL: After the final rubric question is answered, ask exactly once: "Do you have any questions for me before we wrap up?"',
@@ -222,6 +235,13 @@ function buildConversationalContext(candidateName, roleTitle, companyName, rubri
     rubricQuestions.forEach((q, idx) => lines.push(`${idx + 1}. ${q}`));
   }
   return lines.join('\n').trim();
+}
+
+function deriveSpokenFirstName(value) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return '';
+  const token = raw.split(/\s+/).find(Boolean) || '';
+  return token.replace(/^[,.;:!?()[\]{}"']+|[,.;:!?()[\]{}"']+$/g, '').trim();
 }
 
 module.exports = { createTavusInterviewHandler };
