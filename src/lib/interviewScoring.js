@@ -16,9 +16,6 @@ function isSubstantiveTranscript(transcriptText) {
 
   const words = text.split(/\s+/).filter(Boolean);
   const wordCount = words.length;
-  if (wordCount < 40) {
-    return { ok: false, reason: 'low_word_count', wordCount };
-  }
 
   const lines = text
     .split(/\r?\n/)
@@ -27,15 +24,34 @@ function isSubstantiveTranscript(transcriptText) {
 
   let speakerTurns = 0;
   let answerTurns = 0;
+  let candidateResponseWords = 0;
+  let meaningfulCandidateTurns = 0;
+  const fillerOnlyRe = /^(?:yes|no|ok(?:ay)?|sure|thanks?|thank you|hello|hi|good\s+(?:morning|afternoon|evening)|sounds good|got it|not sure|i\s+(?:do\s+not|don't)\s+know|maybe|pass|skip|n\/?a|none)(?:[\s.!?]|$)+$/i;
   for (const line of lines) {
     if (/^(CANDIDATE|USER)\s*:/i.test(line)) {
       answerTurns += 1;
       speakerTurns += 1;
+      const candidateText = line.replace(/^(CANDIDATE|USER)\s*:/i, '').trim();
+      const candidateWords = candidateText ? candidateText.split(/\s+/).filter(Boolean).length : 0;
+      if (candidateWords > 0) {
+        candidateResponseWords += candidateWords;
+        if (candidateWords >= 4 && !fillerOnlyRe.test(candidateText)) {
+          meaningfulCandidateTurns += 1;
+        }
+      }
       continue;
     }
     if (/^(INTERVIEWER|ASSISTANT|AGENT)\s*:/i.test(line)) {
       speakerTurns += 1;
     }
+  }
+
+  if (answerTurns === 0 || candidateResponseWords === 0) {
+    return { ok: false, reason: 'no_candidate_response', wordCount };
+  }
+
+  if (meaningfulCandidateTurns < 1) {
+    return { ok: false, reason: 'insufficient_candidate_content', wordCount };
   }
 
   if (speakerTurns < 2 && answerTurns < 2) {
