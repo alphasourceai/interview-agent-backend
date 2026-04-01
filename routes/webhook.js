@@ -2,6 +2,7 @@
 'use strict';
 
 const express = require('express');
+const Sentry = require('@sentry/node');
 const router = express.Router();
 const { createClient } = require('@supabase/supabase-js');
 const { analyzeInterviewTranscriptById } = require('../scripts/backfillInterviews.js');
@@ -816,9 +817,19 @@ router.get('/_ping', (_req, res) => res.json({ ok: true }));
 
 // Primary webhook entry
 router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
+  let requestId = null;
+  let eventType = null;
+  let interviewId = null;
+  let conversationId = null;
+  let sentryCandidateId = null;
+  let sentryRoleId = null;
+  let sentryClientId = null;
   try {
     const body = req.body || {};
-    const requestId = getRequestId(req, body);
+    requestId = getRequestId(req, body);
+    Sentry.setTag('route_name', 'tavus_webhook');
+    Sentry.setTag('surface', 'backend');
+    if (requestId) Sentry.setTag('request_id', String(requestId));
     const eventReceivedAt = new Date();
     const eventReceivedAtIso = eventReceivedAt.toISOString();
 
@@ -833,7 +844,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
       fromAny(body, 'status')
     );
 
-    const eventType = String(eventTypeRaw || '').toLowerCase();
+    eventType = String(eventTypeRaw || '').toLowerCase();
     const isTranscriptionReady = eventType === 'application.transcription_ready';
     const isRecordingReady = eventType === 'application.recording_ready';
     const isPerceptionAnalysis =
@@ -844,18 +855,29 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
     const isShutdown = eventType === 'system.shutdown';
     const isKnownEvent = isReplicaJoined || isShutdown || isTranscriptionReady || isRecordingReady || isPerceptionAnalysis || isToolCall;
 
-    const interviewId = pickFirst(
+    interviewId = pickFirst(
       fromAny(body, 'interview_id'),
       fromAny(body, 'interviewId'),
       fromAny(body, 'metadata.interview_id')
     );
 
-    const conversationId = pickFirst(
+    conversationId = pickFirst(
       fromAny(body, 'conversation_id'),
       fromAny(body, 'properties.conversation_id'),
       fromAny(body, 'properties.conversationId'),
       fromAny(body, 'metadata.conversation_id')
     );
+    Sentry.addBreadcrumb({
+      category: 'webhook',
+      message: 'tavus webhook event received',
+      level: 'info',
+      data: {
+        request_id: requestId || null,
+        event_type: eventType || null,
+        interview_id: interviewId || null,
+        conversation_id: conversationId || null
+      }
+    });
 
     const recordingUrls = collectValues(
       body,
@@ -904,6 +926,24 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
       console.error(`[webhook] interview not found conversation_id=${conversationId || 'null'}`);
       return res.status(200).json({ ok: true });
     }
+    if (interview?.id) Sentry.setTag('interview_id', String(interview.id));
+    sentryCandidateId = interview?.candidate_id || null;
+    sentryRoleId = interview?.role_id || null;
+    sentryClientId = interview?.client_id || null;
+    if (sentryCandidateId) Sentry.setTag('candidate_id', String(sentryCandidateId));
+    if (sentryRoleId) Sentry.setTag('role_id', String(sentryRoleId));
+    if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
+    Sentry.addBreadcrumb({
+      category: 'webhook',
+      message: 'tavus webhook processing started',
+      level: 'info',
+      data: {
+        request_id: requestId || null,
+        event_type: eventType || null,
+        interview_id: interview?.id || null,
+        conversation_id: conversationId || null
+      }
+    });
     const interviewCreatedAt = interview?.created_at || null;
     const elapsedFromInterviewCreatedSec = elapsedSecondsSince(interviewCreatedAt, eventReceivedAt);
     if (isTranscriptionReady || isPerceptionAnalysis) {
@@ -1526,6 +1566,27 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
 
     return res.status(200).json({ ok: true });
   } catch (e) {
+    Sentry.captureException(e, {
+      tags: {
+        route_name: 'tavus_webhook',
+        surface: 'backend',
+        request_id: requestId || undefined,
+        interview_id: interviewId || undefined,
+        conversation_id: conversationId || undefined,
+        candidate_id: sentryCandidateId || undefined,
+        role_id: sentryRoleId || undefined,
+        client_id: sentryClientId || undefined
+      },
+      extra: {
+        request_id: requestId || null,
+        event_type: eventType || null,
+        interview_id: interviewId || null,
+        conversation_id: conversationId || null,
+        candidate_id: sentryCandidateId,
+        role_id: sentryRoleId,
+        client_id: sentryClientId
+      }
+    });
     console.error('[webhook] error:', e.message || e);
     // Be lenient to avoid provider retries storms
     return res.status(200).json({ ok: true });
