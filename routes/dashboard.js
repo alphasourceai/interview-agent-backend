@@ -297,10 +297,19 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       };
       const perception = getPerceptionShape(iv);
       const interviewSummary = typeof iv?.interview_summary === 'string' ? iv.interview_summary : '';
+      const transcriptOverall = getTranscriptOverall(iv);
+      const interviewSummaryLower = interviewSummary.toLowerCase();
+      const insufficientInterview =
+        transcriptOverall === null &&
+        (
+          interviewSummaryLower.includes('before any substantive responses were recorded') ||
+          interviewSummaryLower.includes('before substantive responses were captured') ||
+          interviewSummaryLower.includes('insufficient data')
+        );
       const interview_analysis = {
-        clarity: perception.clarity,
-        confidence: perception.confidence,
-        engagement: perception.engagement,
+        clarity: insufficientInterview ? null : perception.clarity,
+        confidence: insufficientInterview ? null : perception.confidence,
+        engagement: insufficientInterview ? null : perception.engagement,
         summary: interviewSummary
       };
 
@@ -308,7 +317,6 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const latest_report_url = rep?.latest_report_url || rep?.report_url || null;
       const safeVideoUrl = iv?.video_url && !isDailyRoomUrl(iv.video_url) ? iv.video_url : null;
       const hasTranscript = !!iv?.transcript;
-      const transcriptOverall = getTranscriptOverall(iv);
       const interviewScore = Number.isFinite(transcriptOverall) ? transcriptOverall : null;
       const overall_score =
         Number.isFinite(resume_score) && Number.isFinite(interviewScore)
