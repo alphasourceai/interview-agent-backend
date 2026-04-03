@@ -3,8 +3,9 @@
 const axios = require('axios');
 const crypto = require('crypto');
 const { supabaseAdmin } = require('./supabaseClient');
+const { publicSiteOrFrontendBase } = require('../../config/urlConfig');
 
-const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || 'https://www.alphasourceai.com').replace(/\/+$/, '');
+const FRONTEND_BASE = publicSiteOrFrontendBase;
 
 const redactEmail = (email) => {
   try {

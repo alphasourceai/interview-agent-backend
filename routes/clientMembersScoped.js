@@ -5,8 +5,9 @@ const { requireAuth, withClientScope } = require('../src/middleware/auth');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { ensureUserAndSendRecovery, redactEmail } = require('../src/lib/recoveryHelper');
 const crypto = require('crypto');
+const { publicSiteOrFrontendBase } = require('../config/urlConfig');
 
-const FRONTEND_BASE = ((process.env.FRONTEND_BASE || process.env.FRONTEND_URL || 'https://www.alphasourceai.com')).replace(/\/+$/, '');
+const FRONTEND_BASE = publicSiteOrFrontendBase;
 
 const router = express.Router();
 

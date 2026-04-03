@@ -1,8 +1,9 @@
 'use strict';
 
 const { sendRoleInterviewLimitReachedEmail } = require('../../utils/mailer');
+const { publicSiteBase } = require('../../config/urlConfig');
 
-const FRONTEND_BASE = 'https://www.alphasourceai.com';
+const FRONTEND_BASE = publicSiteBase;
 const EARLY_ENDED_SENTINEL_SUMMARY = 'Interview ended before substantive responses were captured.';
 const INSUFFICIENT_TRANSCRIPT_EARLY_END_SUMMARY_PREFIX = 'Interview ended before any substantive responses were recorded.';
 

@@ -7,6 +7,7 @@ const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
 const { createTavusInterviewHandler } = require('../handlers/createTavusInterview');
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
+const { resolvePublicBackendBase } = require('../config/urlConfig');
 
 const router = express.Router();
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
@@ -67,7 +68,7 @@ router.post('/', createTavusRateLimit, async (req, res) => {
       return res.status(400).json(payload);
     };
     const computedBase = `${req.protocol}://${req.get('host')}`;
-    const base = (process.env.PUBLIC_BACKEND_URL || computedBase).replace(/\/+$/, '');
+    const base = resolvePublicBackendBase(computedBase);
 
     const {
       candidate_id,

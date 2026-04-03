@@ -56,9 +56,14 @@ const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
 const { sendSubscriptionCheckoutEmail } = require('./utils/mailer')
-
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
-const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || FRONTEND_URL || '').replace(/\/+$/, '')
+const {
+  frontendUrl: FRONTEND_URL,
+  interviewAppBase: INTERVIEW_APP_BASE,
+  publicSiteBase: PUBLIC_SITE_BASE,
+  clientAppBase: CLIENT_APP_BASE,
+  adminAppBase: ADMIN_APP_BASE,
+  resolvePublicBackendBase
+} = require('./config/urlConfig')
 const ROLE_CHECKOUT_JD_BUCKET = (process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || process.env.SUPABASE_JD_BUCKET || 'job-descriptions').trim()
 const roleCheckoutUpload = multer({
   storage: multer.memoryStorage(),
@@ -285,7 +290,7 @@ app.post('/clients/billing/portal-session', requireAuth, withClientScope, async 
 
     const Stripe = require('stripe')
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
-    const accountReturnUrl = 'https://www.alphasourceai.com/account'
+    const accountReturnUrl = `${PUBLIC_SITE_BASE}/account`
     const returnParams = new URLSearchParams({
       client_id: clientId,
       tab
@@ -414,7 +419,7 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
       role_id: roleId,
       quantity: String(quantity)
     }
-    const canonicalSiteBase = 'https://www.alphasourceai.com'
+    const canonicalSiteBase = PUBLIC_SITE_BASE
     const successParams = new URLSearchParams({
       tab,
       intent: 'role_capacity',
@@ -629,7 +634,7 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
       metadata: sessionMetadata
     })
 
-    const canonicalSiteBase = 'https://www.alphasourceai.com'
+    const canonicalSiteBase = PUBLIC_SITE_BASE
     const successParams = new URLSearchParams({
       role_checkout: 'success',
       client_id: String(client.id),
@@ -853,7 +858,7 @@ app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
       .insert({ client_id, email, role, token, invited_by: req.user.id })
     if (error) return res.status(500).json({ error: 'Failed to create invite', detail: error.message })
 
-    const acceptUrlBase = (process.env.FRONTEND_URL || FRONTEND_URL).replace(/\/+$/, '')
+    const acceptUrlBase = FRONTEND_URL
     const accept_url = `${acceptUrlBase}/accept-invite?token=${encodeURIComponent(token)}`
     res.json({ ok: true, accept_url })
   } catch (e) {
@@ -1340,7 +1345,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   // Optionally seed an admin member
   let seeded_member = null
   if (adminEmail) {
-    const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
+    const redirectTo = `${PUBLIC_SITE_BASE}/account?auth_callback=1`
     const { userId, actionLink, method } = await ensureUserIdAndInvite(adminEmail, redirectTo, { suppressInvite: true })
 
     if (!userId) {
@@ -1785,11 +1790,11 @@ adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAd
       }
     }
 
-    const canonicalSiteBase = 'https://www.alphasourceai.com'
+    const canonicalSiteBase = PUBLIC_SITE_BASE
     const returnBase =
       returnTarget === 'client'
         ? `${canonicalSiteBase}/account`
-        : `${canonicalSiteBase}/admin-dashboard`
+        : `${ADMIN_APP_BASE}/admin-dashboard`
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
@@ -1972,11 +1977,11 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
       lineItems.push({ price: priceId, quantity: 1 })
     }
 
-    const canonicalSiteBase = 'https://www.alphasourceai.com'
+    const canonicalSiteBase = PUBLIC_SITE_BASE
     const forwardedProto = String(req.headers?.['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim()
     const forwardedHost = String(req.headers?.['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim()
     const computedBackendBase = forwardedHost ? `${forwardedProto || 'https'}://${forwardedHost}` : ''
-    const publicBackendBase = String(process.env.PUBLIC_BACKEND_URL || computedBackendBase || '').replace(/\/+$/, '')
+    const publicBackendBase = resolvePublicBackendBase(computedBackendBase || '')
     const checkoutSuccessUrl = publicBackendBase
       ? `${publicBackendBase}/checkout/subscription-success?session_id={CHECKOUT_SESSION_ID}&client_id=${encodeURIComponent(client.id)}`
       : `${canonicalSiteBase}/account?checkout=success&client_id=${client.id}`
@@ -3269,7 +3274,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   const role = (req.body?.role || 'member').toLowerCase()
   if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
 
-  const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
+  const redirectTo = `${PUBLIC_SITE_BASE}/account?auth_callback=1`
   const { userId, actionLink, method } = await ensureUserIdAndInvite(email, redirectTo)
 
   if (!userId) {
@@ -3339,8 +3344,8 @@ app.post('/internal/contracts/process-renewals', async (req, res) => {
 })
 
 app.get('/checkout/subscription-success', async (req, res) => {
-  const canonicalSiteBase = 'https://www.alphasourceai.com'
-  const clientAuthBase = String(process.env.CLIENT_AUTH_FRONTEND_BASE || 'https://clients.alphasourceai.com').replace(/\/+$/, '')
+  const canonicalSiteBase = PUBLIC_SITE_BASE
+  const clientAuthBase = CLIENT_APP_BASE
   const makeAccountSuccessUrl = (clientId) => `${canonicalSiteBase}/account?checkout=success${clientId ? `&client_id=${encodeURIComponent(clientId)}` : ''}`
   const fallbackClientId = String(req.query?.client_id || '').trim()
   const sessionId = String(req.query?.session_id || '').trim()
@@ -3500,7 +3505,7 @@ app.get(['/interview-host', '/interview-host/:token'], (req, res) => {
     const qsIndex = req.url.indexOf('?');
     const qs = qsIndex >= 0 ? req.url.slice(qsIndex) : '';
 
-    const targetUrl = `${FRONTEND_BASE}${targetPath}${qs}`;
+    const targetUrl = `${INTERVIEW_APP_BASE}${targetPath}${qs}`;
     return res.redirect(302, targetUrl);
   } catch (e) {
     return res.status(500).type('text/plain').send('redirect_failed');

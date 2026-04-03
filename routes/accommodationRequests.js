@@ -10,6 +10,7 @@ const { requireAuth } = require('../src/middleware/auth');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
 const { redactEmail } = require('../src/lib/recoveryHelper');
 const { checkDuplicateCandidate, normalizeEmail, normalizePhone } = require('../src/lib/duplicateCandidate');
+const { clientAppBaseWithFrontendFallback } = require('../config/urlConfig');
 
 const router = express.Router();
 
@@ -502,7 +503,7 @@ router.post('/:id/send-text-link', requireAuth, requireAdmin, async (req, res) =
       });
     }
 
-    const frontendBase = (process.env.CLIENT_AUTH_FRONTEND_BASE || process.env.FRONTEND_BASE || process.env.FRONTEND_URL || 'https://clients.alphasourceai.com').replace(/\/+$/, '');
+    const frontendBase = clientAppBaseWithFrontendFallback;
     const interviewLink = `${frontendBase}/text-interview/${token}`;
     const candidateName = String(reqRow.candidate_name || '').trim();
 
