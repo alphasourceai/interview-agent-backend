@@ -131,6 +131,46 @@ function isInterviewPrettyLinkHost(hostHeader) {
   return !!host && host === interviewPrettyLinkHost;
 }
 
+function serializeQuery(query) {
+  if (!query) return '';
+  if (query instanceof URLSearchParams) {
+    return query.toString();
+  }
+  if (typeof query === 'string') {
+    return query.replace(/^\?+/, '');
+  }
+  try {
+    return new URLSearchParams(query).toString();
+  } catch (_) {
+    return '';
+  }
+}
+
+function appendQuery(baseUrl, query) {
+  const serialized = serializeQuery(query);
+  return serialized ? `${baseUrl}?${serialized}` : baseUrl;
+}
+
+function buildPublicAccountUrl(query) {
+  return appendQuery(`${publicSiteBase}/account`, query);
+}
+
+function buildAdminDashboardUrl(query) {
+  return appendQuery(`${adminAppBase}/admin-dashboard`, query);
+}
+
+function buildClientPwResetUrl(query) {
+  return appendQuery(`${clientAppBase}/pwreset`, query);
+}
+
+function buildPublicPwResetUrl(query) {
+  return appendQuery(`${publicSiteOrFrontendBase}/pwreset`, query);
+}
+
+function buildAcceptInviteUrl(token) {
+  return appendQuery(`${frontendUrl}/accept-invite`, { token: String(token || '') });
+}
+
 module.exports = {
   canonical,
   trimTrailingSlash,
@@ -140,6 +180,11 @@ module.exports = {
   firstBase,
   resolvePublicBackendBase,
   isInterviewPrettyLinkHost,
+  buildPublicAccountUrl,
+  buildAdminDashboardUrl,
+  buildClientPwResetUrl,
+  buildPublicPwResetUrl,
+  buildAcceptInviteUrl,
   corsDefaultOrigins,
   frontendUrl,
   frontendBase,

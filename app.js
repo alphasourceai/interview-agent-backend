@@ -59,12 +59,13 @@ const { sendSubscriptionCheckoutEmail } = require('./utils/mailer')
 const {
   frontendUrl: FRONTEND_URL,
   interviewAppBase: INTERVIEW_APP_BASE,
-  publicSiteBase: PUBLIC_SITE_BASE,
-  clientAppBase: CLIENT_APP_BASE,
-  adminAppBase: ADMIN_APP_BASE,
   corsDefaultOrigins,
   isInterviewPrettyLinkHost,
-  resolvePublicBackendBase
+  resolvePublicBackendBase,
+  buildPublicAccountUrl,
+  buildAdminDashboardUrl,
+  buildClientPwResetUrl,
+  buildAcceptInviteUrl
 } = require('./config/urlConfig')
 const ROLE_CHECKOUT_JD_BUCKET = (process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || process.env.SUPABASE_JD_BUCKET || 'job-descriptions').trim()
 const roleCheckoutUpload = multer({
@@ -282,14 +283,13 @@ app.post('/clients/billing/portal-session', requireAuth, withClientScope, async 
 
     const Stripe = require('stripe')
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
-    const accountReturnUrl = `${PUBLIC_SITE_BASE}/account`
     const returnParams = new URLSearchParams({
       client_id: clientId,
       tab
     })
     const session = await stripe.billingPortal.sessions.create({
       customer: stripeCustomerId,
-      return_url: `${accountReturnUrl}?${returnParams.toString()}`
+      return_url: buildPublicAccountUrl(returnParams)
     })
     return res.json({ ok: true, url: session?.url || null })
   } catch (e) {
@@ -411,7 +411,6 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
       role_id: roleId,
       quantity: String(quantity)
     }
-    const canonicalSiteBase = PUBLIC_SITE_BASE
     const successParams = new URLSearchParams({
       tab,
       intent: 'role_capacity',
@@ -440,8 +439,8 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
         quantity
       }],
       allow_promotion_codes: true,
-      success_url: `${canonicalSiteBase}/account?${successParams.toString()}`,
-      cancel_url: `${canonicalSiteBase}/account?${cancelParams.toString()}`,
+      success_url: buildPublicAccountUrl(successParams),
+      cancel_url: buildPublicAccountUrl(cancelParams),
       metadata: sessionMetadata
     })
 
@@ -626,7 +625,6 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
       metadata: sessionMetadata
     })
 
-    const canonicalSiteBase = PUBLIC_SITE_BASE
     const successParams = new URLSearchParams({
       role_checkout: 'success',
       client_id: String(client.id),
@@ -642,8 +640,8 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
       customer: stripeCustomerId,
       line_items: [{ price: rolePrice.id, quantity: 1 }],
       allow_promotion_codes: true,
-      success_url: `${canonicalSiteBase}/account?${successParams.toString()}`,
-      cancel_url: `${canonicalSiteBase}/account?${cancelParams.toString()}`,
+      success_url: buildPublicAccountUrl(successParams),
+      cancel_url: buildPublicAccountUrl(cancelParams),
       metadata: sessionMetadata
     })
 
@@ -850,8 +848,7 @@ app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
       .insert({ client_id, email, role, token, invited_by: req.user.id })
     if (error) return res.status(500).json({ error: 'Failed to create invite', detail: error.message })
 
-    const acceptUrlBase = FRONTEND_URL
-    const accept_url = `${acceptUrlBase}/accept-invite?token=${encodeURIComponent(token)}`
+    const accept_url = buildAcceptInviteUrl(token)
     res.json({ ok: true, accept_url })
   } catch (e) {
     res.status(500).json({ error: 'Server error' })
@@ -1337,7 +1334,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   // Optionally seed an admin member
   let seeded_member = null
   if (adminEmail) {
-    const redirectTo = `${PUBLIC_SITE_BASE}/account?auth_callback=1`
+    const redirectTo = buildPublicAccountUrl({ auth_callback: '1' })
     const { userId, actionLink, method } = await ensureUserIdAndInvite(adminEmail, redirectTo, { suppressInvite: true })
 
     if (!userId) {
@@ -1782,11 +1779,10 @@ adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAd
       }
     }
 
-    const canonicalSiteBase = PUBLIC_SITE_BASE
     const returnBase =
       returnTarget === 'client'
-        ? `${canonicalSiteBase}/account`
-        : `${ADMIN_APP_BASE}/admin-dashboard`
+        ? buildPublicAccountUrl()
+        : buildAdminDashboardUrl()
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
@@ -1969,14 +1965,13 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
       lineItems.push({ price: priceId, quantity: 1 })
     }
 
-    const canonicalSiteBase = PUBLIC_SITE_BASE
     const forwardedProto = String(req.headers?.['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim()
     const forwardedHost = String(req.headers?.['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim()
     const computedBackendBase = forwardedHost ? `${forwardedProto || 'https'}://${forwardedHost}` : ''
     const publicBackendBase = resolvePublicBackendBase(computedBackendBase || '')
     const checkoutSuccessUrl = publicBackendBase
       ? `${publicBackendBase}/checkout/subscription-success?session_id={CHECKOUT_SESSION_ID}&client_id=${encodeURIComponent(client.id)}`
-      : `${canonicalSiteBase}/account?checkout=success&client_id=${client.id}`
+      : buildPublicAccountUrl({ checkout: 'success', client_id: client.id })
     const checkoutMetadata = {
       source: 'admin_subscription_checkout',
       client_id: client.id,
@@ -1989,7 +1984,7 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
       customer: resolvedStripeCustomerId,
       line_items: lineItems,
       success_url: checkoutSuccessUrl,
-      cancel_url: `${canonicalSiteBase}/account?checkout=cancel&client_id=${client.id}`,
+      cancel_url: buildPublicAccountUrl({ checkout: 'cancel', client_id: client.id }),
       allow_promotion_codes: true,
       metadata: checkoutMetadata,
       subscription_data: {
@@ -3266,7 +3261,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   const role = (req.body?.role || 'member').toLowerCase()
   if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
 
-  const redirectTo = `${PUBLIC_SITE_BASE}/account?auth_callback=1`
+  const redirectTo = buildPublicAccountUrl({ auth_callback: '1' })
   const { userId, actionLink, method } = await ensureUserIdAndInvite(email, redirectTo)
 
   if (!userId) {
@@ -3336,9 +3331,11 @@ app.post('/internal/contracts/process-renewals', async (req, res) => {
 })
 
 app.get('/checkout/subscription-success', async (req, res) => {
-  const canonicalSiteBase = PUBLIC_SITE_BASE
-  const clientAuthBase = CLIENT_APP_BASE
-  const makeAccountSuccessUrl = (clientId) => `${canonicalSiteBase}/account?checkout=success${clientId ? `&client_id=${encodeURIComponent(clientId)}` : ''}`
+  const makeAccountSuccessUrl = (clientId) => {
+    const params = new URLSearchParams({ checkout: 'success' })
+    if (clientId) params.set('client_id', clientId)
+    return buildPublicAccountUrl(params)
+  }
   const fallbackClientId = String(req.query?.client_id || '').trim()
   const sessionId = String(req.query?.session_id || '').trim()
   const fallbackUrl = makeAccountSuccessUrl(fallbackClientId)
@@ -3377,7 +3374,11 @@ app.get('/checkout/subscription-success', async (req, res) => {
     const clientEmail = String(client.email || '').trim()
     if (!clientEmail) return res.redirect(302, successUrl)
 
-    const recoveryRedirectUrl = `${clientAuthBase}/pwreset?origin=client&checkout=success&client_id=${client.id}`
+    const recoveryRedirectUrl = buildClientPwResetUrl({
+      origin: 'client',
+      checkout: 'success',
+      client_id: client.id
+    })
     const generateRecoveryActionLink = async () => {
       const link = await supabaseAdmin.auth.admin.generateLink({
         type: 'recovery',
