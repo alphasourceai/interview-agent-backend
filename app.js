@@ -62,6 +62,8 @@ const {
   publicSiteBase: PUBLIC_SITE_BASE,
   clientAppBase: CLIENT_APP_BASE,
   adminAppBase: ADMIN_APP_BASE,
+  corsDefaultOrigins,
+  isInterviewPrettyLinkHost,
   resolvePublicBackendBase
 } = require('./config/urlConfig')
 const ROLE_CHECKOUT_JD_BUCKET = (process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || process.env.SUPABASE_JD_BUCKET || 'job-descriptions').trim()
@@ -81,17 +83,7 @@ if (SENTRY_ENABLED) {
 }
 
 // ---------- CORS ----------
-const DEFAULT_ORIGINS = [
-  'http://localhost:5173',
-  'https://interview-agent-frontend.onrender.com',
-  'https://ia-frontend-prod.onrender.com',
-  'https://www.alphasourceai.com',
-  'https://alphasourceai.com',
-  'https://www-alphasourceai-com.filesusr.com',
-  'https://editor.wix.com',
-  'https://ia-frontend-qa.onrender.com',
-  'https://ia-frontend-staging.onrender.com',
-]
+const DEFAULT_ORIGINS = corsDefaultOrigins
 const envOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -3515,7 +3507,7 @@ app.get(['/interview-host', '/interview-host/:token'], (req, res) => {
 app.get('/:token', (req, res, next) => {
   const host = (req.headers.host || '').toLowerCase();
   // Only act on the interviews subdomain; otherwise defer
-  if (!/^interviews\.alphasourceai\.com(?::\d+)?$/.test(host)) return next();
+  if (!isInterviewPrettyLinkHost(host)) return next();
 
   const token = req.params.token;
   // Conservative match: UUID v4 tokens only, prevents clashes with other paths

@@ -4,6 +4,33 @@ function trimTrailingSlash(value) {
   return String(value || '').trim().replace(/\/+$/, '');
 }
 
+function toOrigin(value) {
+  const raw = trimTrailingSlash(value);
+  if (!raw) return '';
+  try {
+    return trimTrailingSlash(new URL(raw).origin);
+  } catch (_) {
+    return raw;
+  }
+}
+
+function toHost(value) {
+  const raw = trimTrailingSlash(value);
+  if (!raw) return '';
+  try {
+    return String(new URL(raw).hostname || '').toLowerCase();
+  } catch (_) {
+    return '';
+  }
+}
+
+function splitCsv(value) {
+  return String(value || '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
 function firstBase(...values) {
   for (const value of values) {
     const normalized = trimTrailingSlash(value);
@@ -71,15 +98,49 @@ const interviewAppBase = firstBase(
   frontendBase
 );
 
+const corsDefaultOrigins = Array.from(new Set([
+  'http://localhost:5173',
+  'https://interview-agent-frontend.onrender.com',
+  'https://ia-frontend-prod.onrender.com',
+  'https://www.alphasourceai.com',
+  'https://alphasourceai.com',
+  'https://www-alphasourceai-com.filesusr.com',
+  'https://editor.wix.com',
+  'https://ia-frontend-qa.onrender.com',
+  'https://ia-frontend-staging.onrender.com',
+  ...splitCsv(process.env.CORS_DEFAULT_ORIGINS),
+  frontendUrl,
+  frontendBase,
+  publicSiteBase,
+  clientAppBase,
+  adminAppBase,
+  interviewAppBase
+].map(toOrigin).filter(Boolean)));
+
+const interviewPrettyLinkHost = toHost(firstBase(
+  canonical.INTERVIEW_APP_BASE,
+  'https://interviews.alphasourceai.com'
+));
+
 function resolvePublicBackendBase(fallbackBase) {
   return firstBase(canonical.PUBLIC_BACKEND_URL, fallbackBase);
+}
+
+function isInterviewPrettyLinkHost(hostHeader) {
+  const host = String(hostHeader || '').toLowerCase().split(':')[0];
+  return !!host && host === interviewPrettyLinkHost;
 }
 
 module.exports = {
   canonical,
   trimTrailingSlash,
+  toOrigin,
+  toHost,
+  splitCsv,
   firstBase,
   resolvePublicBackendBase,
+  isInterviewPrettyLinkHost,
+  corsDefaultOrigins,
   frontendUrl,
   frontendBase,
   publicSiteBase,
