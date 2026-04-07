@@ -101,8 +101,15 @@ router.get('/resume-signed-url', requireAuth, withClientScope, async (req, res) 
     const raw = String(candidate.resume_url || '').trim();
     if (!raw) return res.status(404).json({ error: 'resume not available' });
 
-    let parsed = parseBucketPath(raw);
-    const isBucketlessPath = !parsed && !/^https?:\/\//i.test(raw);
+    const isHttpUrl = /^https?:\/\//i.test(raw);
+    const accommodationBucket = process.env.SUPABASE_ACCOMMODATION_RESUMES_BUCKET || 'accommodation-resumes';
+    const rawNoLeadingSlash = raw.replace(/^\/+/, '');
+    const looksLikeAccommodationPath = !isHttpUrl && /^accommodations\//i.test(rawNoLeadingSlash);
+
+    let parsed = looksLikeAccommodationPath
+      ? { bucket: accommodationBucket, path: rawNoLeadingSlash }
+      : parseBucketPath(raw);
+    const isBucketlessPath = !parsed && !isHttpUrl;
     if (isBucketlessPath) {
       parsed = {
         bucket: process.env.SUPABASE_RESUMES_BUCKET || 'resumes',
@@ -110,7 +117,7 @@ router.get('/resume-signed-url', requireAuth, withClientScope, async (req, res) 
       };
     }
     if (!parsed) {
-      if (/^https?:\/\//i.test(raw)) return res.json({ ok: true, url: raw, mode: 'legacy_url' });
+      if (isHttpUrl) return res.json({ ok: true, url: raw, mode: 'legacy_url' });
       return res.status(400).json({ error: 'Unrecognized storage path/URL' });
     }
 
@@ -176,7 +183,6 @@ router.get('/resume-signed-url', requireAuth, withClientScope, async (req, res) 
     }
 
     if (isBucketlessPath && signErr) {
-      const accommodationBucket = process.env.SUPABASE_ACCOMMODATION_RESUMES_BUCKET || 'accommodation-resumes';
       if (isNotFoundSignError(signErr) && accommodationBucket && accommodationBucket !== parsed.bucket) {
         const retry = await supabaseAdmin
           .storage
