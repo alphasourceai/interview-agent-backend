@@ -125,11 +125,12 @@ app.use(express.json({ limit: '10mb' }))
 // ---------- CSP: allow Wix to embed (frame-ancestors) ----------
 app.use((req, res, next) => {
   try {
-    // Keep CSP minimal to avoid breaking existing resources; just control who may embed us
-    // Add your production Wix domain(s) here as needed
+    const cspFrameAncestors = String(
+      process.env.CSP_FRAME_ANCESTORS || `'self' ${FRONTEND_URL} https://*.wixsite.com https://*.filesusr.com`
+    ).trim();
     res.setHeader(
       'Content-Security-Policy',
-      'frame-ancestors https://www.alphasourceai.com https://alphasourceai.com https://*.wixsite.com https://*.filesusr.com;'
+      `frame-ancestors ${cspFrameAncestors};`
     );
     // Ensure we don't send legacy X-Frame-Options that could conflict with CSP
     res.removeHeader && res.removeHeader('X-Frame-Options');

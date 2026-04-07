@@ -61,29 +61,31 @@ const frontendBase = firstBase(
 const publicSiteBase = firstBase(
   canonical.PUBLIC_SITE_BASE,
   process.env.ACCOUNT_REDIRECT_BASE,
-  'https://www.alphasourceai.com'
+  process.env.PUBLIC_SITE_BASE_FALLBACK
 );
 
 const publicSiteOrFrontendBase = firstBase(
   canonical.PUBLIC_SITE_BASE,
   process.env.ACCOUNT_REDIRECT_BASE,
+  process.env.PUBLIC_SITE_BASE_FALLBACK,
   process.env.FRONTEND_BASE,
   process.env.FRONTEND_URL,
-  'https://www.alphasourceai.com'
+  frontendUrl
 );
 
 const clientAppBase = firstBase(
   canonical.CLIENT_APP_BASE,
   process.env.CLIENT_AUTH_FRONTEND_BASE,
-  'https://clients.alphasourceai.com'
+  process.env.CLIENT_APP_BASE_FALLBACK
 );
 
 const clientAppBaseWithFrontendFallback = firstBase(
   canonical.CLIENT_APP_BASE,
   process.env.CLIENT_AUTH_FRONTEND_BASE,
+  process.env.CLIENT_APP_BASE_FALLBACK,
   process.env.FRONTEND_BASE,
   process.env.FRONTEND_URL,
-  'https://clients.alphasourceai.com'
+  frontendUrl
 );
 
 const adminAppBase = firstBase(
@@ -117,10 +119,13 @@ const corsDefaultOrigins = Array.from(new Set([
   interviewAppBase
 ].map(toOrigin).filter(Boolean)));
 
-const interviewPrettyLinkHost = toHost(firstBase(
-  canonical.INTERVIEW_APP_BASE,
-  'https://interviews.alphasourceai.com'
-));
+const interviewPrettyLinkHost = String(
+  process.env.INTERVIEW_PRETTY_LINK_HOST ||
+  toHost(firstBase(
+    process.env.INTERVIEW_PRETTY_LINK_BASE,
+    canonical.INTERVIEW_APP_BASE
+  ))
+).trim().toLowerCase();
 
 function resolvePublicBackendBase(fallbackBase) {
   return firstBase(canonical.PUBLIC_BACKEND_URL, fallbackBase);

@@ -20,7 +20,10 @@ async function createTavusInterview(req, res) {
     const forwardedProto = String(req.headers?.['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
     const forwardedHost = String(req.headers?.['x-forwarded-host'] || req.get?.('host') || req.headers?.host || '').split(',')[0].trim();
     const computedBase = forwardedHost ? `${forwardedProto || 'https'}://${forwardedHost}` : '';
-    const callbackBase = resolvePublicBackendBase(computedBase || 'https://interview-agent-backend-z6un.onrender.com');
+    const callbackBase = resolvePublicBackendBase(computedBase);
+    if (!callbackBase) {
+      throw new Error('missing_callback_base_url');
+    }
 
     const response = await fetch('https://api.tavus.io/conversations', {
       method: 'POST',

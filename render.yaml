@@ -20,9 +20,13 @@ services:
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
       - key: FRONTEND_URL
-        value: https://ia-frontend-prod.onrender.com
+        sync: false
       - key: CORS_ORIGINS
-        value: https://ia-frontend-prod.onrender.com
+        sync: false
+      - key: PUBLIC_SITE_BASE_FALLBACK
+        sync: false
+      - key: CLIENT_APP_BASE_FALLBACK
+        sync: false
       - key: PUPPETEER_SKIP_DOWNLOAD
         value: "true"
 
@@ -46,6 +50,10 @@ services:
         value: https://ia-frontend-qa.onrender.com
       - key: CORS_ORIGINS
         value: https://ia-frontend-qa.onrender.com
+      - key: PUBLIC_SITE_BASE_FALLBACK
+        value: https://ia-frontend-qa.onrender.com
+      - key: CLIENT_APP_BASE_FALLBACK
+        value: https://ia-frontend-qa.onrender.com
 
   - type: web
     name: ia-backend-staging
@@ -66,4 +74,8 @@ services:
       - key: FRONTEND_URL
         value: https://ia-frontend-staging.onrender.com
       - key: CORS_ORIGINS
+        value: https://ia-frontend-staging.onrender.com
+      - key: PUBLIC_SITE_BASE_FALLBACK
+        value: https://ia-frontend-staging.onrender.com
+      - key: CLIENT_APP_BASE_FALLBACK
         value: https://ia-frontend-staging.onrender.com
