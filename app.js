@@ -3400,6 +3400,24 @@ app.get('/checkout/subscription-success', async (req, res) => {
 
     const clientEmail = String(client.email || '').trim()
     if (!clientEmail) return res.redirect(302, successUrl)
+    const clientEmailLower = clientEmail.toLowerCase()
+
+    let existingAuthUser = null
+    try {
+      const { data: authUsersData, error: authUsersError } = await supabaseAdmin.auth.admin.listUsers({ email: clientEmail })
+      if (authUsersError) {
+        console.error('subscription_checkout_list_users_failed:', authUsersError?.message || authUsersError)
+      } else {
+        existingAuthUser = (authUsersData?.users || []).find((user) => {
+          return String(user?.email || '').trim().toLowerCase() === clientEmailLower
+        }) || null
+      }
+    } catch (listUsersErr) {
+      console.error('subscription_checkout_list_users_exception:', listUsersErr?.message || listUsersErr)
+    }
+
+    const hasSignedIn = !!String(existingAuthUser?.last_sign_in_at || '').trim()
+    if (existingAuthUser && hasSignedIn) return res.redirect(302, successUrl)
 
     const recoveryRedirectUrl = buildClientPwResetUrl({
       origin: 'client',
