@@ -132,7 +132,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
     // 1) Candidates for this client
     const { data: cands, error: cErr } = await supabase
       .from('candidates')
-      .select('id, first_name, last_name, name, email, role_id, created_at, client_id, analysis_summary')
+      .select('id, first_name, last_name, name, email, role_id, created_at, client_id, analysis_summary, resume_url')
       .eq('client_id', clientId)
       .order('created_at', { ascending: false })
       .limit(1000);
@@ -330,7 +330,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         created_at: c.created_at,
         client_id: c.client_id,
 
-        candidate: { id: c.id, name: fullName, email: c.email || '' },
+        candidate: { id: c.id, name: fullName, email: c.email || '', resume_url: c.resume_url || null },
         role, // { id, title, client_id } | null
 
         // latest interview bits for the expanded area + transcript button
