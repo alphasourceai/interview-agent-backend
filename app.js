@@ -63,6 +63,7 @@ const {
   isInterviewPrettyLinkHost,
   resolvePublicBackendBase,
   buildPublicAccountUrl,
+  buildClientDashboardReturnUrl,
   buildAdminDashboardUrl,
   buildClientPwResetUrl,
   buildAcceptInviteUrl
@@ -290,7 +291,7 @@ app.post('/clients/billing/portal-session', requireAuth, withClientScope, async 
     })
     const session = await stripe.billingPortal.sessions.create({
       customer: stripeCustomerId,
-      return_url: buildPublicAccountUrl(returnParams)
+      return_url: buildClientDashboardReturnUrl(returnParams)
     })
     return res.json({ ok: true, url: session?.url || null })
   } catch (e) {
@@ -440,8 +441,8 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
         quantity
       }],
       allow_promotion_codes: true,
-      success_url: buildPublicAccountUrl(successParams),
-      cancel_url: buildPublicAccountUrl(cancelParams),
+      success_url: buildClientDashboardReturnUrl(successParams),
+      cancel_url: buildClientDashboardReturnUrl(cancelParams),
       metadata: sessionMetadata
     })
 
@@ -646,8 +647,8 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
       customer: stripeCustomerId,
       line_items: [{ price: rolePrice.id, quantity: 1 }],
       allow_promotion_codes: true,
-      success_url: buildPublicAccountUrl(successParams),
-      cancel_url: buildPublicAccountUrl(cancelParams),
+      success_url: buildClientDashboardReturnUrl(successParams),
+      cancel_url: buildClientDashboardReturnUrl(cancelParams),
       metadata: sessionMetadata
     })
 
@@ -1786,10 +1787,6 @@ adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAd
       }
     }
 
-    const returnBase =
-      returnTarget === 'client'
-        ? buildPublicAccountUrl()
-        : buildAdminDashboardUrl()
     const successParams = new URLSearchParams({
       checkout: 'success',
       client_id: String(client.id)
@@ -1802,13 +1799,21 @@ adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAd
       successParams.set('tab', returnTab)
       cancelParams.set('tab', returnTab)
     }
+    const successUrl =
+      returnTarget === 'client'
+        ? buildClientDashboardReturnUrl(successParams)
+        : buildAdminDashboardUrl(successParams)
+    const cancelUrl =
+      returnTarget === 'client'
+        ? buildClientDashboardReturnUrl(cancelParams)
+        : buildAdminDashboardUrl(cancelParams)
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       customer: stripeCustomerId,
       line_items: [{ price: resolvedPriceId, quantity: 1 }],
-      success_url: `${returnBase}?${successParams.toString()}`,
-      cancel_url: `${returnBase}?${cancelParams.toString()}`,
+      success_url: successUrl,
+      cancel_url: cancelUrl,
       allow_promotion_codes: true,
       metadata: {
         client_id: client.id,
@@ -1991,7 +1996,7 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
     const publicBackendBase = resolvePublicBackendBase(computedBackendBase || '')
     const checkoutSuccessUrl = publicBackendBase
       ? `${publicBackendBase}/checkout/subscription-success?session_id={CHECKOUT_SESSION_ID}&client_id=${encodeURIComponent(client.id)}${returnTab ? `&tab=${encodeURIComponent(returnTab)}` : ''}`
-      : buildPublicAccountUrl(returnTab ? { checkout: 'success', client_id: client.id, tab: returnTab } : { checkout: 'success', client_id: client.id })
+      : buildClientDashboardReturnUrl(returnTab ? { checkout: 'success', client_id: client.id, tab: returnTab } : { checkout: 'success', client_id: client.id })
     const checkoutMetadata = {
       source: 'admin_subscription_checkout',
       client_id: client.id,
@@ -2004,7 +2009,7 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
       customer: resolvedStripeCustomerId,
       line_items: lineItems,
       success_url: checkoutSuccessUrl,
-      cancel_url: buildPublicAccountUrl(returnTab ? { checkout: 'cancel', client_id: client.id, tab: returnTab } : { checkout: 'cancel', client_id: client.id }),
+      cancel_url: buildClientDashboardReturnUrl(returnTab ? { checkout: 'cancel', client_id: client.id, tab: returnTab } : { checkout: 'cancel', client_id: client.id }),
       allow_promotion_codes: true,
       metadata: checkoutMetadata,
       subscription_data: {
@@ -3355,7 +3360,7 @@ app.get('/checkout/subscription-success', async (req, res) => {
     const params = new URLSearchParams({ checkout: 'success' })
     if (clientId) params.set('client_id', clientId)
     if (tab) params.set('tab', tab)
-    return buildPublicAccountUrl(params)
+    return buildClientDashboardReturnUrl(params)
   }
   const fallbackClientId = String(req.query?.client_id || '').trim()
   const fallbackTab = String(req.query?.tab || '').trim().toLowerCase()

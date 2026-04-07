@@ -160,6 +160,37 @@ function buildPublicAccountUrl(query) {
   return appendQuery(`${publicSiteBase}/account`, query);
 }
 
+function buildClientDashboardReturnUrl(query) {
+  const publicReturnOrigin = toOrigin(firstBase(
+    publicSiteBase,
+    publicSiteOrFrontendBase,
+    frontendBase,
+    frontendUrl
+  ));
+  const clientReturnOrigin = toOrigin(firstBase(
+    clientAppBaseWithFrontendFallback,
+    clientAppBase
+  ));
+  const useDashboardRoute =
+    !!publicReturnOrigin &&
+    !!clientReturnOrigin &&
+    publicReturnOrigin === clientReturnOrigin;
+
+  if (useDashboardRoute) {
+    const dashboardBase = firstBase(
+      clientAppBaseWithFrontendFallback,
+      clientAppBase,
+      publicSiteOrFrontendBase,
+      publicSiteBase,
+      frontendBase,
+      frontendUrl
+    );
+    return appendQuery(`${dashboardBase}/dashboard`, query);
+  }
+
+  return buildPublicAccountUrl(query);
+}
+
 function buildAdminDashboardUrl(query) {
   return appendQuery(`${adminAppBase}/admin-dashboard`, query);
 }
@@ -186,6 +217,7 @@ module.exports = {
   resolvePublicBackendBase,
   isInterviewPrettyLinkHost,
   buildPublicAccountUrl,
+  buildClientDashboardReturnUrl,
   buildAdminDashboardUrl,
   buildClientPwResetUrl,
   buildPublicPwResetUrl,
