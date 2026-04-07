@@ -469,6 +469,7 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
   try {
     const ids = Array.isArray(req.client_memberships) ? req.client_memberships : []
     const clientId = String(req.body?.client_id || '').trim()
+    const roleId = String(req.body?.role_id || '').trim()
     const tab = sanitizeClientDashboardTab(req.body?.tab, 'roles')
     const roleTitle = String(req.body?.role_title || '').trim()
     const interviewType = String(req.body?.interview_type || '').trim().toUpperCase()
@@ -636,6 +637,10 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
       client_id: String(client.id),
       tab
     })
+    if (roleId) {
+      successParams.set('role_id', roleId)
+      cancelParams.set('role_id', roleId)
+    }
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
       customer: stripeCustomerId,
@@ -1668,6 +1673,7 @@ adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAd
   const clientId = req.params?.id
   const billingCycle = String(req.body?.billing_cycle || '')
   const returnTarget = String(req.body?.return_target || '').trim().toLowerCase()
+  const returnTab = String(req.body?.tab || '').trim().toLowerCase()
   if (!clientId) {
     return res.status(400).json({
       error: 'invalid_request',
@@ -1784,13 +1790,25 @@ adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAd
       returnTarget === 'client'
         ? buildPublicAccountUrl()
         : buildAdminDashboardUrl()
+    const successParams = new URLSearchParams({
+      checkout: 'success',
+      client_id: String(client.id)
+    })
+    const cancelParams = new URLSearchParams({
+      checkout: 'cancel',
+      client_id: String(client.id)
+    })
+    if (returnTab) {
+      successParams.set('tab', returnTab)
+      cancelParams.set('tab', returnTab)
+    }
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       customer: stripeCustomerId,
       line_items: [{ price: resolvedPriceId, quantity: 1 }],
-      success_url: `${returnBase}?checkout=success&client_id=${client.id}`,
-      cancel_url: `${returnBase}?checkout=cancel&client_id=${client.id}`,
+      success_url: `${returnBase}?${successParams.toString()}`,
+      cancel_url: `${returnBase}?${cancelParams.toString()}`,
       allow_promotion_codes: true,
       metadata: {
         client_id: client.id,
@@ -1815,6 +1833,7 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
   const clientId = req.params?.id
   const planTier = String(req.body?.plan_tier || '').trim().toLowerCase()
   const billingInterval = String(req.body?.billing_interval || '').trim().toLowerCase()
+  const returnTab = String(req.body?.tab || '').trim().toLowerCase()
 
   if (!['basic', 'pro', 'enterprise'].includes(planTier)) {
     return res.status(400).json({ error: 'invalid_plan_tier' })
@@ -1971,8 +1990,8 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
     const computedBackendBase = forwardedHost ? `${forwardedProto || 'https'}://${forwardedHost}` : ''
     const publicBackendBase = resolvePublicBackendBase(computedBackendBase || '')
     const checkoutSuccessUrl = publicBackendBase
-      ? `${publicBackendBase}/checkout/subscription-success?session_id={CHECKOUT_SESSION_ID}&client_id=${encodeURIComponent(client.id)}`
-      : buildPublicAccountUrl({ checkout: 'success', client_id: client.id })
+      ? `${publicBackendBase}/checkout/subscription-success?session_id={CHECKOUT_SESSION_ID}&client_id=${encodeURIComponent(client.id)}${returnTab ? `&tab=${encodeURIComponent(returnTab)}` : ''}`
+      : buildPublicAccountUrl(returnTab ? { checkout: 'success', client_id: client.id, tab: returnTab } : { checkout: 'success', client_id: client.id })
     const checkoutMetadata = {
       source: 'admin_subscription_checkout',
       client_id: client.id,
@@ -1985,7 +2004,7 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
       customer: resolvedStripeCustomerId,
       line_items: lineItems,
       success_url: checkoutSuccessUrl,
-      cancel_url: buildPublicAccountUrl({ checkout: 'cancel', client_id: client.id }),
+      cancel_url: buildPublicAccountUrl(returnTab ? { checkout: 'cancel', client_id: client.id, tab: returnTab } : { checkout: 'cancel', client_id: client.id }),
       allow_promotion_codes: true,
       metadata: checkoutMetadata,
       subscription_data: {
@@ -3332,14 +3351,16 @@ app.post('/internal/contracts/process-renewals', async (req, res) => {
 })
 
 app.get('/checkout/subscription-success', async (req, res) => {
-  const makeAccountSuccessUrl = (clientId) => {
+  const makeAccountSuccessUrl = (clientId, tab) => {
     const params = new URLSearchParams({ checkout: 'success' })
     if (clientId) params.set('client_id', clientId)
+    if (tab) params.set('tab', tab)
     return buildPublicAccountUrl(params)
   }
   const fallbackClientId = String(req.query?.client_id || '').trim()
+  const fallbackTab = String(req.query?.tab || '').trim().toLowerCase()
   const sessionId = String(req.query?.session_id || '').trim()
-  const fallbackUrl = makeAccountSuccessUrl(fallbackClientId)
+  const fallbackUrl = makeAccountSuccessUrl(fallbackClientId, fallbackTab)
   if (!sessionId) return res.redirect(302, fallbackUrl)
 
   try {
@@ -3350,7 +3371,7 @@ app.get('/checkout/subscription-success', async (req, res) => {
     const metadataSource = String(metadata?.source || '').trim().toLowerCase()
     const metadataClientId = String(metadata?.client_id || '').trim()
     const clientId = metadataClientId || fallbackClientId
-    const successUrl = makeAccountSuccessUrl(clientId)
+    const successUrl = makeAccountSuccessUrl(clientId, fallbackTab)
 
     if (metadataSource !== 'admin_subscription_checkout') return res.redirect(302, successUrl)
     if (String(session?.status || '').toLowerCase() !== 'complete') return res.redirect(302, successUrl)
