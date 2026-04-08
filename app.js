@@ -2281,10 +2281,13 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
     .single()
   if (error) return res.status(500).json({ error: 'create_role_failed', detail: error.message })
 
-  try {
-    await generateRubricAndKBForRole(role.id)
-  } catch (e) {
-    console.error('enrich_role_failed:', e?.message || e)
+  const hasInitialJobDescriptionUrl = typeof role?.job_description_url === 'string' && role.job_description_url.trim().length > 0
+  if (hasInitialJobDescriptionUrl) {
+    try {
+      await generateRubricAndKBForRole(role.id)
+    } catch (e) {
+      console.error('enrich_role_failed:', e?.message || e)
+    }
   }
 
   const { data: updated } = await supabaseAdmin
