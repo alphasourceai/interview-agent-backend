@@ -641,6 +641,7 @@ router.post('/', async (req, res) => {
         const invoicePeriodEnd = toIsoFromUnixSeconds(eventObject?.lines?.data?.[0]?.period?.end);
         const activationUpdates = {
           plan_tier: metadataPlanTier,
+          subscription_status: 'active',
           billing_status: 'active',
           billing_interval: metadataBillingInterval,
           auto_renew: true,
@@ -659,7 +660,7 @@ router.post('/', async (req, res) => {
         if (activationErr) throw new Error(activationErr.message || 'Client activation update failed');
       }
 
-      if (customerId) {
+      if (customerId && !isAdminSubscriptionInvoice) {
         const { data: client, error: clientErr } = await supabaseAdmin
           .from('clients')
           .select('id')
