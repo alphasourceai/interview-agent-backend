@@ -3478,13 +3478,6 @@ app.get('/checkout/subscription-success', async (req, res) => {
       matching_user_found: !!existingAuthUser,
       has_last_sign_in_at: hasSignedIn
     })
-    if (existingAuthUser && hasSignedIn) {
-      console.log('subscription_checkout_success_redirect:', {
-        branch: 'existing_user_signed_in',
-        target: 'success_url'
-      })
-      return res.redirect(302, successUrl)
-    }
 
     const recoveryRedirectUrl = buildClientPwResetUrl({
       origin: 'client',
