@@ -66,6 +66,7 @@ const {
   buildClientDashboardReturnUrl,
   buildAdminDashboardUrl,
   buildClientPwResetUrl,
+  buildPublicPwResetUrl,
   buildAcceptInviteUrl
 } = require('./config/urlConfig')
 const ROLE_CHECKOUT_JD_BUCKET = (process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || process.env.SUPABASE_JD_BUCKET || 'job-descriptions').trim()
@@ -3366,7 +3367,13 @@ app.get('/checkout/subscription-success', async (req, res) => {
   const fallbackTab = String(req.query?.tab || '').trim().toLowerCase()
   const sessionId = String(req.query?.session_id || '').trim()
   const fallbackUrl = makeAccountSuccessUrl(fallbackClientId, fallbackTab)
-  if (!sessionId) return res.redirect(302, fallbackUrl)
+  if (!sessionId) {
+    console.log('subscription_checkout_success_redirect:', {
+      branch: 'missing_session_id',
+      target: 'fallback_url'
+    })
+    return res.redirect(302, fallbackUrl)
+  }
 
   try {
     const Stripe = require('stripe')
@@ -3377,14 +3384,47 @@ app.get('/checkout/subscription-success', async (req, res) => {
     const metadataClientId = String(metadata?.client_id || '').trim()
     const clientId = metadataClientId || fallbackClientId
     const successUrl = makeAccountSuccessUrl(clientId, fallbackTab)
-
-    if (metadataSource !== 'admin_subscription_checkout') return res.redirect(302, successUrl)
-    if (String(session?.status || '').toLowerCase() !== 'complete') return res.redirect(302, successUrl)
     const paymentStatus = String(session?.payment_status || '').toLowerCase()
-    if (paymentStatus && !['paid', 'no_payment_required'].includes(paymentStatus)) return res.redirect(302, successUrl)
     const subscriptionObj = session?.subscription && typeof session.subscription === 'object' ? session.subscription : null
     const subscriptionStatus = String(subscriptionObj?.status || '').toLowerCase()
-    if (subscriptionStatus && !['active', 'trialing'].includes(subscriptionStatus)) return res.redirect(302, successUrl)
+
+    console.log('subscription_checkout_success_entry:', {
+      client_id: clientId || null,
+      fallback_tab: fallbackTab || null,
+      metadata_source: metadataSource || null,
+      session_status: String(session?.status || '').toLowerCase() || null,
+      session_payment_status: paymentStatus || null,
+      subscription_status: subscriptionStatus || null
+    })
+
+    if (metadataSource !== 'admin_subscription_checkout') {
+      console.log('subscription_checkout_success_redirect:', {
+        branch: 'metadata_source_mismatch',
+        target: 'success_url'
+      })
+      return res.redirect(302, successUrl)
+    }
+    if (String(session?.status || '').toLowerCase() !== 'complete') {
+      console.log('subscription_checkout_success_redirect:', {
+        branch: 'session_incomplete',
+        target: 'success_url'
+      })
+      return res.redirect(302, successUrl)
+    }
+    if (paymentStatus && !['paid', 'no_payment_required'].includes(paymentStatus)) {
+      console.log('subscription_checkout_success_redirect:', {
+        branch: 'payment_not_paid',
+        target: 'success_url'
+      })
+      return res.redirect(302, successUrl)
+    }
+    if (subscriptionStatus && !['active', 'trialing'].includes(subscriptionStatus)) {
+      console.log('subscription_checkout_success_redirect:', {
+        branch: 'subscription_not_active',
+        target: 'success_url'
+      })
+      return res.redirect(302, successUrl)
+    }
 
     let client = null
     if (clientId) {
@@ -3396,10 +3436,27 @@ app.get('/checkout/subscription-success', async (req, res) => {
       if (clientErr) throw new Error(clientErr.message || 'client_lookup_failed')
       client = clientRow || null
     }
-    if (!client?.id) return res.redirect(302, successUrl)
+    console.log('subscription_checkout_success_client_lookup:', {
+      client_id: clientId || null,
+      found: !!client?.id,
+      has_email: !!String(client?.email || '').trim()
+    })
+    if (!client?.id) {
+      console.log('subscription_checkout_success_redirect:', {
+        branch: 'client_not_found',
+        target: 'success_url'
+      })
+      return res.redirect(302, successUrl)
+    }
 
     const clientEmail = String(client.email || '').trim()
-    if (!clientEmail) return res.redirect(302, successUrl)
+    if (!clientEmail) {
+      console.log('subscription_checkout_success_redirect:', {
+        branch: 'client_email_missing',
+        target: 'success_url'
+      })
+      return res.redirect(302, successUrl)
+    }
     const clientEmailLower = clientEmail.toLowerCase()
 
     let existingAuthUser = null
@@ -3417,7 +3474,17 @@ app.get('/checkout/subscription-success', async (req, res) => {
     }
 
     const hasSignedIn = !!String(existingAuthUser?.last_sign_in_at || '').trim()
-    if (existingAuthUser && hasSignedIn) return res.redirect(302, successUrl)
+    console.log('subscription_checkout_success_auth_user_lookup:', {
+      matching_user_found: !!existingAuthUser,
+      has_last_sign_in_at: hasSignedIn
+    })
+    if (existingAuthUser && hasSignedIn) {
+      console.log('subscription_checkout_success_redirect:', {
+        branch: 'existing_user_signed_in',
+        target: 'success_url'
+      })
+      return res.redirect(302, successUrl)
+    }
 
     const recoveryRedirectUrl = buildClientPwResetUrl({
       origin: 'client',
@@ -3434,13 +3501,19 @@ app.get('/checkout/subscription-success', async (req, res) => {
     }
 
     let recoveryActionLink = null
+    let createUserAttempted = false
+    let retryProducedActionLink = false
     try {
       recoveryActionLink = await generateRecoveryActionLink()
     } catch (recoveryErr) {
       console.error('subscription_checkout_generate_recovery_link_failed:', recoveryErr?.message || recoveryErr)
     }
+    console.log('subscription_checkout_success_recovery_first_result:', {
+      has_action_link: !!recoveryActionLink
+    })
 
     if (!recoveryActionLink) {
+      createUserAttempted = true
       try {
         await supabaseAdmin.auth.admin.createUser({
           email: clientEmail,
@@ -3454,15 +3527,49 @@ app.get('/checkout/subscription-success', async (req, res) => {
       }
       try {
         recoveryActionLink = await generateRecoveryActionLink()
+        retryProducedActionLink = !!recoveryActionLink
       } catch (recoveryRetryErr) {
         console.error('subscription_checkout_generate_recovery_link_retry_failed:', recoveryRetryErr?.message || recoveryRetryErr)
       }
     }
 
-    if (recoveryActionLink) return res.redirect(302, recoveryActionLink)
-    return res.redirect(302, successUrl)
+    console.log('subscription_checkout_success_create_user_attempt:', {
+      attempted: createUserAttempted
+    })
+    if (createUserAttempted) {
+      console.log('subscription_checkout_success_recovery_retry_result:', {
+        has_action_link: retryProducedActionLink
+      })
+    }
+
+    if (recoveryActionLink) {
+      console.log('subscription_checkout_success_redirect:', {
+        branch: 'recovery_action_link',
+        target: 'recovery_action_link'
+      })
+      return res.redirect(302, recoveryActionLink)
+    }
+    const pendingOnboardingUrl = buildPublicPwResetUrl({
+      origin: 'client',
+      checkout: 'success',
+      client_id: client.id,
+      onboarding: 'pending'
+    })
+    console.log('subscription_checkout_success_onboarding_pending_fallback:', {
+      client_id: client.id,
+      target: 'pending_onboarding_pwreset'
+    })
+    console.log('subscription_checkout_success_redirect:', {
+      branch: 'onboarding_pending_no_recovery_link',
+      target: 'pending_onboarding_pwreset'
+    })
+    return res.redirect(302, pendingOnboardingUrl)
   } catch (e) {
     console.error('subscription_checkout_success_handoff_failed:', e?.message || e)
+    console.log('subscription_checkout_success_redirect:', {
+      branch: 'handler_exception',
+      target: 'fallback_url'
+    })
     return res.redirect(302, fallbackUrl)
   }
 })
