@@ -101,8 +101,15 @@ router.get('/resume-signed-url', requireAuth, withClientScope, async (req, res) 
     const raw = String(candidate.resume_url || '').trim();
     if (!raw) return res.status(404).json({ error: 'resume not available' });
 
-    let parsed = parseBucketPath(raw);
-    const isBucketlessPath = !parsed && !/^https?:\/\//i.test(raw);
+    const isHttpUrl = /^https?:\/\//i.test(raw);
+    const accommodationBucket = process.env.SUPABASE_ACCOMMODATION_RESUMES_BUCKET || 'accommodation-resumes';
+    const rawNoLeadingSlash = raw.replace(/^\/+/, '');
+    const looksLikeAccommodationPath = !isHttpUrl && /^accommodations\//i.test(rawNoLeadingSlash);
+
+    let parsed = looksLikeAccommodationPath
+      ? { bucket: accommodationBucket, path: rawNoLeadingSlash }
+      : parseBucketPath(raw);
+    const isBucketlessPath = !parsed && !isHttpUrl;
     if (isBucketlessPath) {
       parsed = {
         bucket: process.env.SUPABASE_RESUMES_BUCKET || 'resumes',
@@ -110,30 +117,73 @@ router.get('/resume-signed-url', requireAuth, withClientScope, async (req, res) 
       };
     }
     if (!parsed) {
-      if (/^https?:\/\//i.test(raw)) return res.json({ ok: true, url: raw, mode: 'legacy_url' });
+      if (isHttpUrl) return res.json({ ok: true, url: raw, mode: 'legacy_url' });
       return res.status(400).json({ error: 'Unrecognized storage path/URL' });
     }
 
     const EXPIRES = Number(process.env.SIGNED_URL_TTL_SECONDS || 300);
-    let { data: signed, error: signErr } = await supabaseAdmin
-      .storage
-      .from(parsed.bucket)
-      .createSignedUrl(parsed.path, EXPIRES);
+    const isNotFoundSignError = (err) => {
+      const msg = String(err?.message || '').toLowerCase();
+      const code = String(err?.code || '').toLowerCase();
+      const status = String(err?.status || err?.statusCode || '').toLowerCase();
+      return (
+        status === '404' ||
+        code.includes('not_found') ||
+        code.includes('no_such_key') ||
+        msg.includes('object not found') ||
+        msg.includes('path not found') ||
+        msg.includes('no such object') ||
+        msg.includes('not found')
+      );
+    };
+
+    const defaultResumeBucket = process.env.SUPABASE_RESUMES_BUCKET || 'resumes';
+    const defaultBucketPrefix = `${defaultResumeBucket}/`;
+    const attempts = [];
+    const attemptKeys = new Set();
+    const queueAttempt = (bucket, path) => {
+      const b = String(bucket || '').trim();
+      const p = String(path || '').trim();
+      if (!b || !p) return;
+      const key = `${b}::${p}`;
+      if (attemptKeys.has(key)) return;
+      attemptKeys.add(key);
+      attempts.push({ bucket: b, path: p });
+    };
+
+    const initialPath = String(parsed.path || '');
+    const strippedPath = initialPath.replace(/^\/+/, '');
+    const deBucketedInitial = initialPath.startsWith(defaultBucketPrefix)
+      ? initialPath.slice(defaultBucketPrefix.length).replace(/^\/+/, '')
+      : '';
+    const deBucketedStripped = strippedPath.startsWith(defaultBucketPrefix)
+      ? strippedPath.slice(defaultBucketPrefix.length).replace(/^\/+/, '')
+      : '';
+
+    queueAttempt(parsed.bucket, initialPath);
+    queueAttempt(parsed.bucket, strippedPath);
+    queueAttempt(defaultResumeBucket, deBucketedInitial);
+    queueAttempt(defaultResumeBucket, deBucketedStripped);
+
+    let signed = null;
+    let signErr = null;
+    for (const attempt of attempts) {
+      const retry = await supabaseAdmin
+        .storage
+        .from(attempt.bucket)
+        .createSignedUrl(attempt.path, EXPIRES);
+      if (!retry.error && retry.data) {
+        signed = retry.data;
+        signErr = null;
+        parsed = { ...parsed, bucket: attempt.bucket, path: attempt.path };
+        break;
+      }
+      signErr = retry.error;
+      if (!isNotFoundSignError(signErr)) break;
+    }
 
     if (isBucketlessPath && signErr) {
-      const firstErrMessage = String(signErr?.message || '').toLowerCase();
-      const firstErrCode = String(signErr?.code || '').toLowerCase();
-      const firstErrStatus = String(signErr?.status || signErr?.statusCode || '').toLowerCase();
-      const retryableNotFound =
-        firstErrStatus === '404' ||
-        firstErrCode.includes('not_found') ||
-        firstErrCode.includes('no_such_key') ||
-        firstErrMessage.includes('object not found') ||
-        firstErrMessage.includes('path not found') ||
-        firstErrMessage.includes('no such object') ||
-        firstErrMessage.includes('not found');
-      const accommodationBucket = process.env.SUPABASE_ACCOMMODATION_RESUMES_BUCKET || 'accommodation-resumes';
-      if (retryableNotFound && accommodationBucket && accommodationBucket !== parsed.bucket) {
+      if (isNotFoundSignError(signErr) && accommodationBucket && accommodationBucket !== parsed.bucket) {
         const retry = await supabaseAdmin
           .storage
           .from(accommodationBucket)
