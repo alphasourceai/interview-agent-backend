@@ -246,7 +246,7 @@ async function sendMemberRecoveryEmail(to, recoveryUrl, recipientName) {
           a { text-decoration: none; }
           @media (max-width: 640px) {
             .container { width: 100% !important; padding: 16px !important; }
-            .card { padding: 20px !important; border-radius: 16px !important; }
+            .card { padding: 18px !important; border-radius: 14px !important; }
             .cta { display: block !important; width: 100% !important; text-align: center !important; box-sizing: border-box !important; }
           }
         </style>
@@ -257,11 +257,11 @@ async function sendMemberRecoveryEmail(to, recoveryUrl, recipientName) {
         </div>
         <table role="presentation" width="100%" style="background:#0F1E5D;color:#C9D3FF;">
           <tr>
-            <td align="center" style="padding: 28px 16px;">
+            <td align="center" style="padding: 24px 16px;">
               <table role="presentation" width="100%" class="container" style="max-width: 640px;">
                 <tr>
                   <td>
-                    <table role="presentation" width="100%" class="card" style="background:#10256A;color:#C9D3FF;border:1px solid rgba(201,211,255,0.20);border-radius:18px;box-shadow:0 14px 34px rgba(7,14,48,0.45);padding:28px;">
+                    <table role="presentation" width="100%" class="card" style="background:#0F1E5D;color:#C9D3FF;border:0;border-radius:0;box-shadow:none;padding:24px;">
                       <tr>
                         <td align="left" style="padding-bottom:16px;">
                           <img src="https://rytlclkkcvvnkoncfaid.supabase.co/storage/v1/object/public/email-assets/Color%20logo%20-%20no%20background.png" alt="AlphaSource" width="208" style="display:block;border:0;outline:none;text-decoration:none;height:auto;max-width:100%;" />
@@ -290,13 +290,8 @@ async function sendMemberRecoveryEmail(to, recoveryUrl, recipientName) {
                         </td>
                       </tr>
                       <tr>
-                        <td style="color:#C9D3FF;font-size:14px;line-height:1.55;padding-bottom:10px;">
-                          If the button doesn’t work, use this link:
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="color:#FFFFFF;font-size:13px;line-height:1.55;word-break:break-all;padding-bottom:16px;">
-                          <a href="${safeRecoveryUrl}" target="_blank" rel="noopener noreferrer" style="color:#FFFFFF;">${safeRecoveryUrl}</a>
+                        <td style="color:#C9D3FF;font-size:14px;line-height:1.55;padding-bottom:16px;">
+                          If the button doesn’t work, <a href="${safeRecoveryUrl}" target="_blank" rel="noopener noreferrer" style="color:#FFFFFF;">click here</a> to set your password.
                         </td>
                       </tr>
                       <tr>
