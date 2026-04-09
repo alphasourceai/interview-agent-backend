@@ -69,6 +69,7 @@ const {
   buildPublicPwResetUrl,
   buildAcceptInviteUrl
 } = require('./config/urlConfig')
+const { ensureUserAndSendRecovery } = require('./src/lib/recoveryHelper')
 const ROLE_CHECKOUT_JD_BUCKET = (process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || process.env.SUPABASE_JD_BUCKET || 'job-descriptions').trim()
 const roleCheckoutUpload = multer({
   storage: multer.memoryStorage(),
@@ -3290,7 +3291,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   const role = (req.body?.role || 'member').toLowerCase()
   if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
 
-  const redirectTo = buildPublicAccountUrl({ auth_callback: '1' })
+  const redirectTo = buildPublicPwResetUrl()
   const { userId, actionLink, method } = await ensureUserIdAndInvite(email, redirectTo)
 
   if (!userId) {
@@ -3317,6 +3318,35 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
 
   const m = data
   res.json({ item: { ...m, id: m.user_id || m.email } })
+})
+
+adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  const email = String(req.body?.email || '').trim()
+  if (!email) return res.status(400).json({ error: 'email_required', request_id })
+
+  try {
+    await ensureUserAndSendRecovery({
+      email,
+      redirectTo: buildPublicPwResetUrl(),
+      request_id,
+      loggerPrefix: '[admin/send-password-reset]'
+    })
+    return res.json({ ok: true, request_id })
+  } catch (e) {
+    if (e?.code === 'misconfigured_supabase_auth') {
+      return res.status(500).json({
+        error: 'misconfigured_supabase_auth',
+        detail: e.detail || 'Missing SUPABASE_PUBLIC_ANON_KEY',
+        request_id
+      })
+    }
+    return res.status(500).json({
+      error: 'send_password_reset_failed',
+      detail: e?.detail || e?.message || 'send_password_reset_failed',
+      request_id
+    })
+  }
 })
 
 // Remove a client member
