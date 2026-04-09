@@ -69,7 +69,6 @@ const {
   buildPublicPwResetUrl,
   buildAcceptInviteUrl
 } = require('./config/urlConfig')
-const { ensureUserAndSendRecovery } = require('./src/lib/recoveryHelper')
 const ROLE_CHECKOUT_JD_BUCKET = (process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || process.env.SUPABASE_JD_BUCKET || 'job-descriptions').trim()
 const roleCheckoutUpload = multer({
   storage: multer.memoryStorage(),
@@ -969,6 +968,112 @@ async function ensureUserIdAndInvite(email, redirectTo, opts = {}) {
         console.error('second invite after createUser failed:', e?.message || e)
       }
     }
+  }
+
+  return { userId, actionLink, method }
+}
+
+async function ensureUserIdAndRecoveryLink(email, redirectTo, opts = {}) {
+  const requireActionLink = opts?.requireActionLink === true
+  const normalizedEmail = String(email || '').trim()
+  const emailLower = normalizedEmail.toLowerCase()
+
+  let userId = null
+  let actionLink = null
+  let method = null
+  let lastErr = null
+
+  const findUserId = async () => {
+    try {
+      const { data, error } = await supabaseAdmin.auth.admin.listUsers({ email: normalizedEmail })
+      if (error) {
+        console.error('listUsers(recovery) failed:', error?.message || error)
+        return null
+      }
+      const existing = (data?.users || []).find((u) => String(u?.email || '').trim().toLowerCase() === emailLower)
+      return existing?.id || null
+    } catch (e) {
+      console.error('listUsers(recovery) exception:', e?.message || e)
+      return null
+    }
+  }
+
+  const generateRecoveryLink = async () => {
+    const link = await supabaseAdmin.auth.admin.generateLink({
+      type: 'recovery',
+      email: normalizedEmail,
+      options: { redirectTo }
+    })
+    return {
+      userId: link?.data?.user?.id || null,
+      actionLink: link?.data?.action_link || link?.data?.properties?.action_link || null
+    }
+  }
+
+  try {
+    const generated = await generateRecoveryLink()
+    userId = generated.userId || userId
+    actionLink = generated.actionLink || actionLink
+    method = 'recovery'
+  } catch (e) {
+    lastErr = e
+    console.error('generateLink(recovery) failed:', e?.message || e)
+  }
+
+  if (!userId) {
+    userId = await findUserId()
+    if (userId && !method) method = 'existingUser'
+  }
+
+  if (!actionLink) {
+    if (!userId) {
+      try {
+        const created = await supabaseAdmin.auth.admin.createUser({
+          email: normalizedEmail,
+          email_confirm: true
+        })
+        userId = created?.data?.user?.id || userId
+        method = method || 'createUser'
+      } catch (e) {
+        const msg = String(e?.message || '').toLowerCase()
+        if (!msg.includes('already') && !msg.includes('exists')) {
+          const err = new Error('create_user_failed')
+          err.code = 'create_user_failed'
+          err.detail = e?.message || 'create_user_failed'
+          err.status = e?.status || e?.response?.status || null
+          throw err
+        }
+      }
+      if (!userId) {
+        userId = await findUserId()
+      }
+    }
+
+    try {
+      const retry = await generateRecoveryLink()
+      userId = retry.userId || userId
+      actionLink = retry.actionLink || actionLink
+      method = userId ? 'recovery_retry' : method
+    } catch (e) {
+      lastErr = e
+      console.error('generateLink(recovery) retry failed:', e?.message || e)
+    }
+  }
+
+  if (!userId) {
+    const err = new Error('add_member_no_user_id')
+    err.code = 'add_member_no_user_id'
+    err.detail = 'Could not create or locate user for this email.'
+    err.status = lastErr?.status || lastErr?.response?.status || null
+    throw err
+  }
+
+  if (requireActionLink && !actionLink) {
+    const err = new Error('generate_recovery_link_failed')
+    err.code = 'generate_recovery_link_failed'
+    err.detail = lastErr?.message || 'Failed to generate recovery link'
+    err.status = lastErr?.status || lastErr?.response?.status || null
+    throw err
   }
 
   return { userId, actionLink, method }
@@ -3295,11 +3400,8 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   let userId = null
   let method = null
   try {
-    const ensured = await ensureUserAndSendRecovery({
-      email,
-      redirectTo: buildPublicPwResetUrl(),
-      request_id,
-      loggerPrefix: '[admin/client-members]'
+    const ensured = await ensureUserIdAndRecoveryLink(email, buildPublicPwResetUrl(), {
+      requireActionLink: true
     })
     userId = ensured?.userId || null
     method = ensured?.method || null
@@ -3311,7 +3413,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
       status: e?.status || null
     })
     return res.status(500).json({
-      error: e?.code || 'add_member_failed',
+      error: 'add_member_failed',
       detail: e?.detail || e?.message || 'add_member_failed',
       request_id,
       code: e?.code || 'add_member_failed',
@@ -3351,21 +3453,11 @@ adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, 
   if (!email) return res.status(400).json({ error: 'email_required', request_id })
 
   try {
-    await ensureUserAndSendRecovery({
-      email,
-      redirectTo: buildPublicPwResetUrl(),
-      request_id,
-      loggerPrefix: '[admin/send-password-reset]'
+    await ensureUserIdAndRecoveryLink(email, buildPublicPwResetUrl(), {
+      requireActionLink: true
     })
     return res.json({ ok: true, request_id })
   } catch (e) {
-    if (e?.code === 'misconfigured_supabase_auth') {
-      return res.status(500).json({
-        error: 'misconfigured_supabase_auth',
-        detail: e.detail || 'Missing SUPABASE_PUBLIC_ANON_KEY',
-        request_id
-      })
-    }
     return res.status(500).json({
       error: 'send_password_reset_failed',
       detail: e?.detail || e?.message || 'send_password_reset_failed',
