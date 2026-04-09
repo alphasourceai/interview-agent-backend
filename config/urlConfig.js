@@ -180,19 +180,27 @@ function buildClientDashboardReturnUrl(query) {
     const dashboardBase = firstBase(
       clientAppBaseWithFrontendFallback,
       clientAppBase,
-      publicSiteOrFrontendBase,
-      publicSiteBase,
       frontendBase,
-      frontendUrl
+      frontendUrl,
+      publicSiteBase,
+      publicSiteOrFrontendBase
     );
     return appendQuery(`${dashboardBase}/dashboard`, query);
   }
 
-  return buildPublicAccountUrl(query);
+  const dashboardBase = firstBase(
+    clientAppBaseWithFrontendFallback,
+    clientAppBase,
+    frontendBase,
+    frontendUrl,
+    publicSiteBase,
+    publicSiteOrFrontendBase
+  );
+  return appendQuery(`${dashboardBase}/dashboard`, query);
 }
 
 function buildAdminDashboardUrl(query) {
-  return appendQuery(`${adminAppBase}/admin-dashboard`, query);
+  return appendQuery(`${adminAppBase}/admin`, query);
 }
 
 function buildClientPwResetUrl(query) {
