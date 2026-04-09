@@ -230,13 +230,89 @@ async function sendMemberRecoveryEmail(to, recoveryUrl, recipientName) {
   const msg = {
     to,
     from: FROM,
-    subject: 'Set your Interview Agent password',
+    subject: 'Set or reset your alphaScreen password',
     html: `
-      <p>${greeting}</p>
-      <p>Use the secure link below to set your password and access your account:</p>
-      <p><a href="${safeRecoveryUrl}" target="_blank" rel="noopener noreferrer">Set password</a></p>
-      <p>If the button doesn't work, copy and paste this URL into your browser:</p>
-      <p>${safeRecoveryUrl}</p>
+      <!doctype html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <meta name="color-scheme" content="light dark" />
+        <meta name="supported-color-schemes" content="light dark" />
+        <title>Set or reset your alphaScreen password</title>
+        <style>
+          body { margin: 0; padding: 0; background: #0F1E5D; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+          table { border-collapse: collapse; }
+          a { text-decoration: none; }
+          @media (max-width: 640px) {
+            .container { width: 100% !important; padding: 16px !important; }
+            .card { padding: 20px !important; border-radius: 16px !important; }
+            .cta { display: block !important; width: 100% !important; text-align: center !important; box-sizing: border-box !important; }
+          }
+        </style>
+      </head>
+      <body>
+        <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
+          Use this secure link to set or reset your account password.
+        </div>
+        <table role="presentation" width="100%" style="background:#0F1E5D;color:#C9D3FF;">
+          <tr>
+            <td align="center" style="padding: 28px 16px;">
+              <table role="presentation" width="100%" class="container" style="max-width: 640px;">
+                <tr>
+                  <td>
+                    <table role="presentation" width="100%" class="card" style="background:#10256A;color:#C9D3FF;border:1px solid rgba(201,211,255,0.20);border-radius:18px;box-shadow:0 14px 34px rgba(7,14,48,0.45);padding:28px;">
+                      <tr>
+                        <td align="left" style="padding-bottom:16px;">
+                          <img src="https://rytlclkkcvvnkoncfaid.supabase.co/storage/v1/object/public/email-assets/Color%20logo%20-%20no%20background.png" alt="AlphaSource" width="208" style="display:block;border:0;outline:none;text-decoration:none;height:auto;max-width:100%;" />
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="color:#E6EBFF;font-size:24px;line-height:1.25;font-weight:700;padding-bottom:10px;">
+                          Set or reset your password
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="color:#C9D3FF;font-size:15px;line-height:1.6;padding-bottom:12px;">
+                          ${greeting}
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="color:#C9D3FF;font-size:15px;line-height:1.6;padding-bottom:20px;">
+                          Use the secure link below to finish account setup and access your dashboard.
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding-bottom:18px;">
+                          <a class="cta" href="${safeRecoveryUrl}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#A78BFA;color:#0A1547;border:1px solid #CFCBFF;border-radius:10px;padding:11px 18px;font-size:14px;font-weight:700;line-height:1;">
+                            Set password
+                          </a>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="color:#C9D3FF;font-size:14px;line-height:1.55;padding-bottom:10px;">
+                          If the button doesn’t work, use this link:
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="color:#FFFFFF;font-size:13px;line-height:1.55;word-break:break-all;padding-bottom:16px;">
+                          <a href="${safeRecoveryUrl}" target="_blank" rel="noopener noreferrer" style="color:#FFFFFF;">${safeRecoveryUrl}</a>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="border-top:1px solid rgba(255,255,255,0.10);padding-top:14px;color:#6B77C9;font-size:13px;line-height:1.55;">
+                          Need help? Email <a href="mailto:info@alphasourceai.com" style="color:#A78BFA;">info@alphasourceai.com</a>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+      </html>
     `
   }
   const [resp] = await sg.send(msg)
