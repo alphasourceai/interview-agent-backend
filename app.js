@@ -1448,7 +1448,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   // Optionally seed an admin member
   let seeded_member = null
   if (adminEmail) {
-    const redirectTo = buildPublicAccountUrl({ auth_callback: '1' })
+    const redirectTo = buildClientDashboardReturnUrl({ auth_callback: '1' })
     const { userId, actionLink, method } = await ensureUserIdAndInvite(adminEmail, redirectTo, { suppressInvite: true })
 
     if (!userId) {
