@@ -4,6 +4,7 @@ const express = require('express');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { ensureUserAndSendRecovery, redactEmail } = require('../src/lib/recoveryHelper');
+const { sendMemberRecoveryEmail } = require('../utils/mailer');
 const crypto = require('crypto');
 const { buildPublicPwResetUrl } = require('../config/urlConfig');
 
@@ -195,7 +196,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
       return res.status(400).json({ error: 'invalid_role', request_id });
     }
 
-    const { userId, method, inviteActionLink, recovery_sent } = await ensureUserAndSendRecovery({
+    const { userId, method, actionLink, recovery_sent } = await ensureUserAndSendRecovery({
       email,
       redirectTo: buildPublicPwResetUrl(),
       request_id,
@@ -209,6 +210,14 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
         hint: 'Try again or send the magic link manually.',
         request_id
       });
+    }
+
+    const emailResult = await sendMemberRecoveryEmail(email, actionLink, name);
+    if (emailResult?.statusCode !== 202) {
+      const err = new Error(emailResult?.skipped ? 'email_skipped' : 'email_send_failed');
+      err.code = 'send_member_recovery_email_failed';
+      err.detail = emailResult?.skipped ? 'email_skipped' : 'email_send_failed';
+      throw err;
     }
 
     const payload = { client_id: clientId, email, name, role, user_id: userId };
@@ -236,7 +245,16 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
       console.warn('[client-members/scoped-add] email_in_use', { email: redactEmail(req.body?.email), request_id: req.request_id || null });
       return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id: req.request_id || null });
     }
-    if (e?.code === 'recover_failed' || e?.code === 'create_user_failed') {
+    if (e?.code === 'add_member_no_user_id') {
+      return res.status(400).json({
+        error: 'add_member_failed',
+        detail: e?.detail || 'Could not create or locate user for this email.',
+        hint: 'Try again or send the magic link manually.',
+        request_id: req.request_id || null,
+        code: e.code
+      });
+    }
+    if (e?.code === 'recover_failed' || e?.code === 'create_user_failed' || e?.code === 'send_member_recovery_email_failed') {
       return res.status(500).json({
         error: e.code,
         detail: e?.detail || e?.message || e.code,

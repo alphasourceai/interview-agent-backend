@@ -221,4 +221,26 @@ async function sendRoleInterviewLimitReachedEmail(to, billingUrl, recipientName,
   return { statusCode: resp?.statusCode || 0 }
 }
 
-module.exports = { sendInvite, sendSubscriptionCheckoutEmail, sendRoleInterviewLimitReachedEmail }
+async function sendMemberRecoveryEmail(to, recoveryUrl, recipientName) {
+  if (!API_KEY) return { skipped: true }
+  const safeRecoveryUrl = String(recoveryUrl || '').trim()
+  const firstNameRaw = String(recipientName || '').trim().split(/\s+/).filter(Boolean)[0] || ''
+  const safeFirstName = firstNameRaw.replace(/[^A-Za-z0-9'.-]/g, '').slice(0, 40)
+  const greeting = /[A-Za-z0-9]/.test(safeFirstName) ? `Hi ${safeFirstName},` : 'Hi there,'
+  const msg = {
+    to,
+    from: FROM,
+    subject: 'Set your Interview Agent password',
+    html: `
+      <p>${greeting}</p>
+      <p>Use the secure link below to set your password and access your account:</p>
+      <p><a href="${safeRecoveryUrl}" target="_blank" rel="noopener noreferrer">Set password</a></p>
+      <p>If the button doesn't work, copy and paste this URL into your browser:</p>
+      <p>${safeRecoveryUrl}</p>
+    `
+  }
+  const [resp] = await sg.send(msg)
+  return { statusCode: resp?.statusCode || 0 }
+}
+
+module.exports = { sendInvite, sendSubscriptionCheckoutEmail, sendRoleInterviewLimitReachedEmail, sendMemberRecoveryEmail }

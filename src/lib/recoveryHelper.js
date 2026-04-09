@@ -1,6 +1,5 @@
 'use strict';
 
-const axios = require('axios');
 const crypto = require('crypto');
 const { supabaseAdmin } = require('./supabaseClient');
 const { buildPublicPwResetUrl } = require('../../config/urlConfig');
@@ -17,108 +16,110 @@ const redactEmail = (email) => {
   }
 };
 
-function resolveAnonKey() {
-  const candidates = [
-    { name: 'SUPABASE_PUBLIC_ANON_KEY', value: process.env.SUPABASE_PUBLIC_ANON_KEY },
-    { name: 'SUPABASE_ANON_KEY', value: process.env.SUPABASE_ANON_KEY },
-    { name: 'SUPABASE_ANON_PUBLIC_KEY', value: process.env.SUPABASE_ANON_PUBLIC_KEY },
-  ];
-  for (const c of candidates) {
-    if (c.value) return c;
-  }
-  return { name: 'SUPABASE_PUBLIC_ANON_KEY', value: null };
-}
-
 async function ensureUserAndSendRecovery({ email, redirectTo, request_id, loggerPrefix = '[recover-helper]' }) {
   const requestId = request_id || crypto.randomUUID?.() || String(Date.now());
   const effectiveRedirect = redirectTo || buildPublicPwResetUrl();
+  const normalizedEmail = String(email || '').trim();
+  const emailLower = normalizedEmail.toLowerCase();
   const safeEmail = redactEmail(email);
-  const anon = resolveAnonKey();
-  const hasAnonKey = !!anon.value;
-
-  if (!hasAnonKey) {
-    console.error(`${loggerPrefix} missing anon key`, { request_id: requestId, email: safeEmail });
-    const err = new Error('misconfigured_supabase_auth');
-    err.code = 'misconfigured_supabase_auth';
-    err.detail = 'Missing SUPABASE_PUBLIC_ANON_KEY';
-    err.request_id = requestId;
-    throw err;
-  }
 
   let userId = null;
-  let method = 'existingUser';
+  let actionLink = null;
+  let method = null;
+  let lastErr = null;
+
+  const findUserId = async () => {
+    try {
+      const { data, error } = await supabaseAdmin.auth.admin.listUsers({ email: normalizedEmail });
+      if (error) {
+        console.error(`${loggerPrefix} listUsers failed`, { request_id: requestId, email: safeEmail, error: error.message, code: error.code });
+      }
+      const existing = (data?.users || []).find((u) => String(u?.email || '').trim().toLowerCase() === emailLower);
+      return existing?.id || null;
+    } catch (e) {
+      console.error(`${loggerPrefix} listUsers exception`, { request_id: requestId, email: safeEmail, error: e?.message || e });
+      return null;
+    }
+  };
+
+  const generateRecoveryLink = async () => {
+    const link = await supabaseAdmin.auth.admin.generateLink({
+      type: 'recovery',
+      email: normalizedEmail,
+      options: { redirectTo: effectiveRedirect }
+    });
+    return {
+      userId: link?.data?.user?.id || null,
+      actionLink: link?.data?.action_link || link?.data?.properties?.action_link || null
+    };
+  };
 
   try {
-    const { data, error } = await supabaseAdmin.auth.admin.listUsers({ email });
-    if (error) {
-      console.error(`${loggerPrefix} listUsers failed`, { request_id: requestId, email: safeEmail, error: error.message, code: error.code });
-    }
-    const existing = (data?.users || []).find((u) => (u.email || '').toLowerCase() === String(email || '').toLowerCase());
-    if (existing) {
-      userId = existing.id;
-      method = 'existingUser';
-    }
+    const generated = await generateRecoveryLink();
+    userId = generated.userId || userId;
+    actionLink = generated.actionLink || actionLink;
+    method = 'recovery';
   } catch (e) {
-    console.error(`${loggerPrefix} listUsers exception`, { request_id: requestId, email: safeEmail, error: e?.message || e });
+    lastErr = e;
+    console.error(`${loggerPrefix} generateLink(recovery) failed`, { request_id: requestId, email: safeEmail, error: e?.message || e });
+  }
+
+  if (!userId) {
+    userId = await findUserId();
+    if (userId && !method) method = 'existingUser';
   }
 
   if (!userId) {
     try {
-      const created = await supabaseAdmin.auth.admin.createUser({ email, email_confirm: true });
+      const created = await supabaseAdmin.auth.admin.createUser({ email: normalizedEmail, email_confirm: true });
       userId = created?.data?.user?.id || null;
       method = 'createUser';
     } catch (e) {
-      console.error(`${loggerPrefix} createUser failed`, { request_id: requestId, email: safeEmail, error: e?.message || e, code: e?.code });
-      const err = new Error('create_user_failed');
-      err.code = 'create_user_failed';
-      err.detail = e?.message || e;
-      err.request_id = requestId;
-      throw err;
+      const msg = String(e?.message || '').toLowerCase();
+      if (!msg.includes('already') && !msg.includes('exists')) {
+        console.error(`${loggerPrefix} createUser failed`, { request_id: requestId, email: safeEmail, error: e?.message || e, code: e?.code });
+        const err = new Error('create_user_failed');
+        err.code = 'create_user_failed';
+        err.detail = e?.message || e;
+        err.request_id = requestId;
+        err.status = e?.status || e?.response?.status || null;
+        throw err;
+      }
+      userId = await findUserId();
     }
   }
 
-  const recoverUrl = `${process.env.SUPABASE_URL}/auth/v1/recover`;
-  const anonKey = anon.value;
-  const headers = {
-    apikey: anonKey,
-    Authorization: `Bearer ${anonKey}`,
-    'Content-Type': 'application/json'
-  };
-  const payload = { email, redirect_to: effectiveRedirect };
-
-  try {
-    const resp = await axios.post(recoverUrl, payload, { headers });
-    const ok = resp?.status >= 200 && resp?.status < 300;
-    if (!ok) {
-      console.error(`${loggerPrefix} recover non-2xx`, {
-        request_id: requestId,
-        email: safeEmail,
-        status: resp?.status || null
-      });
-      const err = new Error('recover_failed');
-      err.code = 'recover_failed';
-      err.status = resp?.status || null;
-      err.request_id = requestId;
-      err.responseData = resp?.data || null;
-      throw err;
+  if (!actionLink) {
+    try {
+      const retry = await generateRecoveryLink();
+      userId = retry.userId || userId;
+      actionLink = retry.actionLink || actionLink;
+      method = userId ? 'recovery_retry' : method;
+    } catch (e) {
+      lastErr = e;
+      console.error(`${loggerPrefix} generateLink(recovery) retry failed`, { request_id: requestId, email: safeEmail, error: e?.message || e });
     }
-    return { userId, method, recovery_sent: true, request_id: requestId };
-  } catch (e) {
-    const status = e?.response?.status || e?.status || null;
-    const data = e?.response?.data || e?.responseData || null;
-    console.error(`${loggerPrefix} recover failed`, {
-      request_id: requestId,
-      email: safeEmail,
-      status
-    });
-    const err = new Error('recover_failed');
-    err.code = 'recover_failed';
-    err.status = status;
-    err.responseData = data;
+  }
+
+  if (!userId) {
+    const err = new Error('add_member_no_user_id');
+    err.code = 'add_member_no_user_id';
+    err.detail = 'Could not create or locate user for this email.';
     err.request_id = requestId;
-    err.detail = data?.error_description || data?.message || e?.message || 'Recovery email failed';
+    err.status = lastErr?.status || lastErr?.response?.status || null;
     throw err;
   }
+
+  if (!actionLink) {
+    const err = new Error('recover_failed');
+    err.code = 'recover_failed';
+    err.status = lastErr?.status || lastErr?.response?.status || null;
+    err.request_id = requestId;
+    err.detail = lastErr?.message || 'Recovery link generation failed';
+    throw err;
+  }
+
+  return { userId, method, actionLink, recovery_sent: true, request_id: requestId };
 }
 
 module.exports = { ensureUserAndSendRecovery, redactEmail };

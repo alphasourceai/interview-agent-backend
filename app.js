@@ -55,7 +55,7 @@ const axios = require('axios')
 const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
-const { sendSubscriptionCheckoutEmail } = require('./utils/mailer')
+const { sendSubscriptionCheckoutEmail, sendMemberRecoveryEmail } = require('./utils/mailer')
 const {
   frontendUrl: FRONTEND_URL,
   interviewAppBase: INTERVIEW_APP_BASE,
@@ -3398,12 +3398,14 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
 
   let userId = null
+  let actionLink = null
   let method = null
   try {
     const ensured = await ensureUserIdAndRecoveryLink(email, buildPublicPwResetUrl(), {
       requireActionLink: true
     })
     userId = ensured?.userId || null
+    actionLink = ensured?.actionLink || null
     method = ensured?.method || null
   } catch (e) {
     console.error('[admin/client-members] ensure_recovery_failed', {
@@ -3412,6 +3414,15 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
       code: e?.code,
       status: e?.status || null
     })
+    if (e?.code === 'add_member_no_user_id') {
+      return res.status(400).json({
+        error: 'add_member_failed',
+        detail: e?.detail || 'Could not create or locate user for this email.',
+        hint: 'Try again or send the magic link manually.',
+        request_id,
+        code: e.code
+      })
+    }
     return res.status(500).json({
       error: 'add_member_failed',
       detail: e?.detail || e?.message || 'add_member_failed',
@@ -3427,6 +3438,23 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
       error: 'add_member_failed',
       detail: 'Could not create or locate user for this email.',
       hint: 'Try again or send the magic link manually.'
+    })
+  }
+
+  try {
+    const emailResult = await sendMemberRecoveryEmail(email, actionLink, name)
+    if (emailResult?.statusCode !== 202) {
+      const err = new Error(emailResult?.skipped ? 'email_skipped' : 'email_send_failed')
+      err.code = 'send_member_recovery_email_failed'
+      err.detail = emailResult?.skipped ? 'email_skipped' : 'email_send_failed'
+      throw err
+    }
+  } catch (e) {
+    return res.status(500).json({
+      error: 'add_member_failed',
+      detail: e?.detail || e?.message || 'add_member_failed',
+      request_id,
+      code: e?.code || 'add_member_failed'
     })
   }
 
@@ -3453,9 +3481,17 @@ adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, 
   if (!email) return res.status(400).json({ error: 'email_required', request_id })
 
   try {
-    await ensureUserIdAndRecoveryLink(email, buildPublicPwResetUrl(), {
+    const ensured = await ensureUserIdAndRecoveryLink(email, buildPublicPwResetUrl(), {
       requireActionLink: true
     })
+    const actionLink = ensured?.actionLink || null
+    const emailResult = await sendMemberRecoveryEmail(email, actionLink, null)
+    if (emailResult?.statusCode !== 202) {
+      const err = new Error(emailResult?.skipped ? 'email_skipped' : 'email_send_failed')
+      err.code = 'send_member_recovery_email_failed'
+      err.detail = emailResult?.skipped ? 'email_skipped' : 'email_send_failed'
+      throw err
+    }
     return res.json({ ok: true, request_id })
   } catch (e) {
     return res.status(500).json({
