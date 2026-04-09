@@ -3289,10 +3289,35 @@ adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) =
 adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) => {
   const { client_id, email, name } = req.body || {}
   const role = (req.body?.role || 'member').toLowerCase()
+  const request_id = req.request_id || null
   if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
 
-  const redirectTo = buildPublicPwResetUrl()
-  const { userId, actionLink, method } = await ensureUserIdAndInvite(email, redirectTo)
+  let userId = null
+  let method = null
+  try {
+    const ensured = await ensureUserAndSendRecovery({
+      email,
+      redirectTo: buildPublicPwResetUrl(),
+      request_id,
+      loggerPrefix: '[admin/client-members]'
+    })
+    userId = ensured?.userId || null
+    method = ensured?.method || null
+  } catch (e) {
+    console.error('[admin/client-members] ensure_recovery_failed', {
+      request_id,
+      error: e?.message || e,
+      code: e?.code,
+      status: e?.status || null
+    })
+    return res.status(500).json({
+      error: e?.code || 'add_member_failed',
+      detail: e?.detail || e?.message || 'add_member_failed',
+      request_id,
+      code: e?.code || 'add_member_failed',
+      helper_status: e?.status || null
+    })
+  }
 
   if (!userId) {
     console.error('add_member_no_user_id', { email, method })
@@ -3344,7 +3369,10 @@ adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, 
     return res.status(500).json({
       error: 'send_password_reset_failed',
       detail: e?.detail || e?.message || 'send_password_reset_failed',
-      request_id
+      request_id,
+      code: e?.code || 'send_password_reset_failed',
+      helper_error_code: e?.code || null,
+      helper_status: e?.status || null
     })
   }
 })

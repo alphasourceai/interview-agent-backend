@@ -236,6 +236,15 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
       console.warn('[client-members/scoped-add] email_in_use', { email: redactEmail(req.body?.email), request_id: req.request_id || null });
       return res.status(409).json({ error: 'email_in_use', detail: 'Email address already exists', request_id: req.request_id || null });
     }
+    if (e?.code === 'recover_failed' || e?.code === 'create_user_failed') {
+      return res.status(500).json({
+        error: e.code,
+        detail: e?.detail || e?.message || e.code,
+        request_id: req.request_id || null,
+        code: e.code,
+        helper_status: e?.status || null
+      });
+    }
     console.error('[client-members/add] unexpected', { request_id: req.request_id || null, error: e?.message || e });
     res.status(500).json({ error: 'server_error', request_id: req.request_id || null, code: 'server_error' });
   }
