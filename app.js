@@ -56,6 +56,7 @@ const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
 const { sendSubscriptionCheckoutEmail } = require('./utils/mailer')
+const { ensureUserAndSendRecovery } = require('./src/lib/recoveryHelper')
 const {
   buildClientDashboardUrl,
   buildAdminDashboardUrl,
@@ -3316,6 +3317,27 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
 
   const m = data
   res.json({ item: { ...m, id: m.user_id || m.email } })
+})
+
+adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  const email = String(req.body?.email || '').trim()
+  if (!email) return res.status(400).json({ error: 'email_required', request_id })
+  try {
+    await ensureUserAndSendRecovery({
+      email,
+      redirectTo: buildClientPwResetUrl(),
+      request_id,
+      loggerPrefix: '[admin/send-password-reset]'
+    })
+    return res.json({ ok: true })
+  } catch (e) {
+    return res.status(500).json({
+      error: 'send_password_reset_failed',
+      detail: e?.detail || e?.message || 'send_password_reset_failed',
+      request_id
+    })
+  }
 })
 
 // Remove a client member
