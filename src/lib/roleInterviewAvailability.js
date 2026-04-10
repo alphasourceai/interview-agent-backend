@@ -2,7 +2,7 @@
 
 const { sendRoleInterviewLimitReachedEmail } = require('../../utils/mailer');
 
-const FRONTEND_BASE = 'https://www.alphasourceai.com';
+const FRONTEND_BASE = String(process.env.FRONTEND_BASE || process.env.FRONTEND_URL || 'https://www.alphasourceai.com').replace(/\/+$/, '');
 const EARLY_ENDED_SENTINEL_SUMMARY = 'Interview ended before substantive responses were captured.';
 const INSUFFICIENT_TRANSCRIPT_EARLY_END_SUMMARY_PREFIX = 'Interview ended before any substantive responses were recorded.';
 
@@ -144,7 +144,7 @@ function buildRoleBillingUrl(clientId, roleId) {
     client_id: String(clientId || ''),
     role_id: String(roleId || '')
   });
-  return `${FRONTEND_BASE}/account?${params.toString()}`;
+  return `${FRONTEND_BASE}/dashboard?${params.toString()}`;
 }
 
 async function syncRoleInterviewLimitNotification({
