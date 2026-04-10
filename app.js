@@ -56,6 +56,11 @@ const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
 const { sendSubscriptionCheckoutEmail } = require('./utils/mailer')
+const {
+  buildClientDashboardUrl,
+  buildAdminDashboardUrl,
+  buildClientPwResetUrl,
+} = require('./config/urlConfig')
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
 const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || FRONTEND_URL || '').replace(/\/+$/, '')
@@ -285,14 +290,13 @@ app.post('/clients/billing/portal-session', requireAuth, withClientScope, async 
 
     const Stripe = require('stripe')
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
-    const accountReturnUrl = 'https://www.alphasourceai.com/account'
     const returnParams = new URLSearchParams({
       client_id: clientId,
       tab
     })
     const session = await stripe.billingPortal.sessions.create({
       customer: stripeCustomerId,
-      return_url: `${accountReturnUrl}?${returnParams.toString()}`
+      return_url: buildClientDashboardUrl(returnParams)
     })
     return res.json({ ok: true, url: session?.url || null })
   } catch (e) {
@@ -414,7 +418,6 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
       role_id: roleId,
       quantity: String(quantity)
     }
-    const canonicalSiteBase = 'https://www.alphasourceai.com'
     const successParams = new URLSearchParams({
       tab,
       intent: 'role_capacity',
@@ -443,8 +446,8 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
         quantity
       }],
       allow_promotion_codes: true,
-      success_url: `${canonicalSiteBase}/account?${successParams.toString()}`,
-      cancel_url: `${canonicalSiteBase}/account?${cancelParams.toString()}`,
+      success_url: buildClientDashboardUrl(successParams),
+      cancel_url: buildClientDashboardUrl(cancelParams),
       metadata: sessionMetadata
     })
 
@@ -629,7 +632,6 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
       metadata: sessionMetadata
     })
 
-    const canonicalSiteBase = 'https://www.alphasourceai.com'
     const successParams = new URLSearchParams({
       role_checkout: 'success',
       client_id: String(client.id),
@@ -645,8 +647,8 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
       customer: stripeCustomerId,
       line_items: [{ price: rolePrice.id, quantity: 1 }],
       allow_promotion_codes: true,
-      success_url: `${canonicalSiteBase}/account?${successParams.toString()}`,
-      cancel_url: `${canonicalSiteBase}/account?${cancelParams.toString()}`,
+      success_url: buildClientDashboardUrl(successParams),
+      cancel_url: buildClientDashboardUrl(cancelParams),
       metadata: sessionMetadata
     })
 
@@ -1340,7 +1342,7 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   // Optionally seed an admin member
   let seeded_member = null
   if (adminEmail) {
-    const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
+    const redirectTo = buildClientDashboardUrl(new URLSearchParams({ auth_callback: '1' }))
     const { userId, actionLink, method } = await ensureUserIdAndInvite(adminEmail, redirectTo, { suppressInvite: true })
 
     if (!userId) {
@@ -1785,18 +1787,29 @@ adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAd
       }
     }
 
-    const canonicalSiteBase = 'https://www.alphasourceai.com'
-    const returnBase =
+    const successParams = new URLSearchParams({
+      checkout: 'success',
+      client_id: String(client.id)
+    })
+    const cancelParams = new URLSearchParams({
+      checkout: 'cancel',
+      client_id: String(client.id)
+    })
+    const returnSuccessUrl =
       returnTarget === 'client'
-        ? `${canonicalSiteBase}/account`
-        : `${canonicalSiteBase}/admin-dashboard`
+        ? buildClientDashboardUrl(successParams)
+        : buildAdminDashboardUrl(successParams)
+    const returnCancelUrl =
+      returnTarget === 'client'
+        ? buildClientDashboardUrl(cancelParams)
+        : buildAdminDashboardUrl(cancelParams)
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       customer: stripeCustomerId,
       line_items: [{ price: resolvedPriceId, quantity: 1 }],
-      success_url: `${returnBase}?checkout=success&client_id=${client.id}`,
-      cancel_url: `${returnBase}?checkout=cancel&client_id=${client.id}`,
+      success_url: returnSuccessUrl,
+      cancel_url: returnCancelUrl,
       allow_promotion_codes: true,
       metadata: {
         client_id: client.id,
@@ -1972,14 +1985,21 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
       lineItems.push({ price: priceId, quantity: 1 })
     }
 
-    const canonicalSiteBase = 'https://www.alphasourceai.com'
     const forwardedProto = String(req.headers?.['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim()
     const forwardedHost = String(req.headers?.['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim()
     const computedBackendBase = forwardedHost ? `${forwardedProto || 'https'}://${forwardedHost}` : ''
     const publicBackendBase = String(process.env.PUBLIC_BACKEND_URL || computedBackendBase || '').replace(/\/+$/, '')
+    const successParams = new URLSearchParams({
+      checkout: 'success',
+      client_id: String(client.id)
+    })
+    const cancelParams = new URLSearchParams({
+      checkout: 'cancel',
+      client_id: String(client.id)
+    })
     const checkoutSuccessUrl = publicBackendBase
       ? `${publicBackendBase}/checkout/subscription-success?session_id={CHECKOUT_SESSION_ID}&client_id=${encodeURIComponent(client.id)}`
-      : `${canonicalSiteBase}/account?checkout=success&client_id=${client.id}`
+      : buildClientDashboardUrl(successParams)
     const checkoutMetadata = {
       source: 'admin_subscription_checkout',
       client_id: client.id,
@@ -1992,7 +2012,7 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
       customer: resolvedStripeCustomerId,
       line_items: lineItems,
       success_url: checkoutSuccessUrl,
-      cancel_url: `${canonicalSiteBase}/account?checkout=cancel&client_id=${client.id}`,
+      cancel_url: buildClientDashboardUrl(cancelParams),
       allow_promotion_codes: true,
       metadata: checkoutMetadata,
       subscription_data: {
@@ -3269,7 +3289,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   const role = (req.body?.role || 'member').toLowerCase()
   if (!client_id || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required' })
 
-  const redirectTo = 'https://www.alphasourceai.com/account?auth_callback=1'
+  const redirectTo = buildClientDashboardUrl(new URLSearchParams({ auth_callback: '1' }))
   const { userId, actionLink, method } = await ensureUserIdAndInvite(email, redirectTo)
 
   if (!userId) {
@@ -3339,12 +3359,14 @@ app.post('/internal/contracts/process-renewals', async (req, res) => {
 })
 
 app.get('/checkout/subscription-success', async (req, res) => {
-  const canonicalSiteBase = 'https://www.alphasourceai.com'
-  const clientAuthBase = String(process.env.CLIENT_AUTH_FRONTEND_BASE || 'https://clients.alphasourceai.com').replace(/\/+$/, '')
-  const makeAccountSuccessUrl = (clientId) => `${canonicalSiteBase}/account?checkout=success${clientId ? `&client_id=${encodeURIComponent(clientId)}` : ''}`
+  const makeDashboardSuccessUrl = (clientId) => {
+    const params = new URLSearchParams({ checkout: 'success' })
+    if (clientId) params.set('client_id', String(clientId))
+    return buildClientDashboardUrl(params)
+  }
   const fallbackClientId = String(req.query?.client_id || '').trim()
   const sessionId = String(req.query?.session_id || '').trim()
-  const fallbackUrl = makeAccountSuccessUrl(fallbackClientId)
+  const fallbackUrl = makeDashboardSuccessUrl(fallbackClientId)
   if (!sessionId) return res.redirect(302, fallbackUrl)
 
   try {
@@ -3355,7 +3377,7 @@ app.get('/checkout/subscription-success', async (req, res) => {
     const metadataSource = String(metadata?.source || '').trim().toLowerCase()
     const metadataClientId = String(metadata?.client_id || '').trim()
     const clientId = metadataClientId || fallbackClientId
-    const successUrl = makeAccountSuccessUrl(clientId)
+    const successUrl = makeDashboardSuccessUrl(clientId)
 
     if (metadataSource !== 'admin_subscription_checkout') return res.redirect(302, successUrl)
     if (String(session?.status || '').toLowerCase() !== 'complete') return res.redirect(302, successUrl)
@@ -3380,7 +3402,11 @@ app.get('/checkout/subscription-success', async (req, res) => {
     const clientEmail = String(client.email || '').trim()
     if (!clientEmail) return res.redirect(302, successUrl)
 
-    const recoveryRedirectUrl = `${clientAuthBase}/pwreset?origin=client&checkout=success&client_id=${client.id}`
+    const recoveryRedirectUrl = buildClientPwResetUrl(new URLSearchParams({
+      origin: 'client',
+      checkout: 'success',
+      client_id: String(client.id)
+    }))
     const generateRecoveryActionLink = async () => {
       const link = await supabaseAdmin.auth.admin.generateLink({
         type: 'recovery',

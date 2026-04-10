@@ -5,8 +5,7 @@ const { requireAuth, withClientScope } = require('../src/middleware/auth');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { ensureUserAndSendRecovery, redactEmail } = require('../src/lib/recoveryHelper');
 const crypto = require('crypto');
-
-const FRONTEND_BASE = ((process.env.FRONTEND_BASE || process.env.FRONTEND_URL || 'https://www.alphasourceai.com')).replace(/\/+$/, '');
+const { buildClientPwResetUrl } = require('../config/urlConfig');
 
 const router = express.Router();
 
@@ -198,7 +197,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
 
     const { userId, method, inviteActionLink, recovery_sent } = await ensureUserAndSendRecovery({
       email,
-      redirectTo: `${FRONTEND_BASE}/pwreset`,
+      redirectTo: buildClientPwResetUrl(),
       request_id,
       loggerPrefix: '[client-members/scoped-add]'
     });

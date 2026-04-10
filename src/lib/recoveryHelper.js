@@ -3,8 +3,7 @@
 const axios = require('axios');
 const crypto = require('crypto');
 const { supabaseAdmin } = require('./supabaseClient');
-
-const FRONTEND_BASE = (process.env.FRONTEND_BASE || process.env.FRONTEND_URL || 'https://www.alphasourceai.com').replace(/\/+$/, '');
+const { buildClientPwResetUrl } = require('../../config/urlConfig');
 
 const redactEmail = (email) => {
   try {
@@ -32,7 +31,7 @@ function resolveAnonKey() {
 
 async function ensureUserAndSendRecovery({ email, redirectTo, request_id, loggerPrefix = '[recover-helper]' }) {
   const requestId = request_id || crypto.randomUUID?.() || String(Date.now());
-  const effectiveRedirect = redirectTo || `${FRONTEND_BASE}/pwreset`;
+  const effectiveRedirect = redirectTo || buildClientPwResetUrl();
   const safeEmail = redactEmail(email);
   const anon = resolveAnonKey();
   const hasAnonKey = !!anon.value;
