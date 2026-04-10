@@ -29,6 +29,23 @@ async function sendInvite(to, acceptUrl, inviterEmail) {
   return { statusCode: resp?.statusCode || 0 }
 }
 
+async function sendPasswordResetEmail(to, resetUrl) {
+  if (!API_KEY) return { skipped: true }
+  const msg = {
+    to,
+    from: FROM,
+    subject: 'Reset your alphaScreen password',
+    html: `
+      <p>We received a request to reset your alphaScreen password.</p>
+      <p><a href="${resetUrl}" target="_blank" rel="noopener">Reset password</a></p>
+      <hr />
+      <p>If you did not request this, you can safely ignore this email.</p>
+    `,
+  }
+  const [resp] = await sg.send(msg)
+  return { statusCode: resp?.statusCode || 0 }
+}
+
 async function sendSubscriptionCheckoutEmail(to, checkoutUrl, recipientName) {
   if (!API_KEY) return { skipped: true }
   const safeCheckoutUrl = String(checkoutUrl || '').trim()
@@ -221,4 +238,4 @@ async function sendRoleInterviewLimitReachedEmail(to, billingUrl, recipientName,
   return { statusCode: resp?.statusCode || 0 }
 }
 
-module.exports = { sendInvite, sendSubscriptionCheckoutEmail, sendRoleInterviewLimitReachedEmail }
+module.exports = { sendInvite, sendPasswordResetEmail, sendSubscriptionCheckoutEmail, sendRoleInterviewLimitReachedEmail }

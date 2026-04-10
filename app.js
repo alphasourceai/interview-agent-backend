@@ -55,8 +55,7 @@ const axios = require('axios')
 const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
-const { sendSubscriptionCheckoutEmail } = require('./utils/mailer')
-const { ensureUserAndSendRecovery } = require('./src/lib/recoveryHelper')
+const { sendInvite, sendPasswordResetEmail, sendSubscriptionCheckoutEmail } = require('./utils/mailer')
 const {
   buildClientDashboardUrl,
   buildAdminDashboardUrl,
@@ -3324,12 +3323,36 @@ adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, 
   const email = String(req.body?.email || '').trim()
   if (!email) return res.status(400).json({ error: 'email_required', request_id })
   try {
-    await ensureUserAndSendRecovery({
-      email,
-      redirectTo: buildClientPwResetUrl(),
-      request_id,
-      loggerPrefix: '[admin/send-password-reset]'
-    })
+    const recoveryRedirectUrl = buildClientPwResetUrl()
+    const generateRecoveryActionLink = async () => {
+      const link = await supabaseAdmin.auth.admin.generateLink({
+        type: 'recovery',
+        email,
+        options: { redirectTo: recoveryRedirectUrl }
+      })
+      return link?.data?.action_link || link?.data?.properties?.action_link || null
+    }
+
+    let recoveryActionLink = null
+    try {
+      recoveryActionLink = await generateRecoveryActionLink()
+    } catch (_) {}
+
+    if (!recoveryActionLink) {
+      try {
+        await supabaseAdmin.auth.admin.createUser({
+          email,
+          email_confirm: true
+        })
+      } catch (_) {}
+      recoveryActionLink = await generateRecoveryActionLink()
+    }
+
+    if (!recoveryActionLink) {
+      throw new Error('recovery_link_not_generated')
+    }
+
+    await sendPasswordResetEmail(email, recoveryActionLink)
     return res.json({ ok: true })
   } catch (e) {
     return res.status(500).json({
