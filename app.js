@@ -3401,7 +3401,7 @@ adminRouter.post('/client-members', requireAuth, requireAdmin, async (req, res) 
   let actionLink = null
   let method = null
   try {
-    const ensured = await ensureUserIdAndRecoveryLink(email, buildPublicPwResetUrl(), {
+    const ensured = await ensureUserIdAndRecoveryLink(email, buildClientPwResetUrl(), {
       requireActionLink: true
     })
     userId = ensured?.userId || null
@@ -3481,7 +3481,7 @@ adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, 
   if (!email) return res.status(400).json({ error: 'email_required', request_id })
 
   try {
-    const ensured = await ensureUserIdAndRecoveryLink(email, buildPublicPwResetUrl(), {
+    const ensured = await ensureUserIdAndRecoveryLink(email, buildClientPwResetUrl(), {
       requireActionLink: true
     })
     const actionLink = ensured?.actionLink || null

@@ -6,7 +6,7 @@ const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { ensureUserAndSendRecovery, redactEmail } = require('../src/lib/recoveryHelper');
 const { sendMemberRecoveryEmail } = require('../utils/mailer');
 const crypto = require('crypto');
-const { buildPublicPwResetUrl } = require('../config/urlConfig');
+const { buildClientPwResetUrl } = require('../config/urlConfig');
 
 const router = express.Router();
 
@@ -198,7 +198,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
 
     const { userId, method, actionLink, recovery_sent } = await ensureUserAndSendRecovery({
       email,
-      redirectTo: buildPublicPwResetUrl(),
+      redirectTo: buildClientPwResetUrl(),
       request_id,
       loggerPrefix: '[client-members/scoped-add]'
     });
