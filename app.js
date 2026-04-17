@@ -265,6 +265,12 @@ function sanitizeClientDashboardTab(value, fallback) {
   return CLIENT_DASHBOARD_TABS.has(raw) ? raw : fallback
 }
 
+function wantsEmbeddedCheckout(value) {
+  if (value === true) return true
+  const raw = String(value || '').trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'embedded'
+}
+
 app.post('/clients/billing/portal-session', requireAuth, withClientScope, async (req, res) => {
   try {
     const ids = Array.isArray(req.client_memberships) ? req.client_memberships : []
@@ -306,6 +312,7 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
     const clientId = String(req.body?.client_id || '').trim()
     const roleId = String(req.body?.role_id || '').trim()
     const tab = sanitizeClientDashboardTab(req.body?.tab, 'billing')
+    const embeddedCheckoutRequested = wantsEmbeddedCheckout(req.body?.embedded)
     const parsedQuantity = Number(req.body?.quantity)
     const quantity = Number.isInteger(parsedQuantity) ? parsedQuantity : NaN
 
@@ -428,7 +435,7 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
       client_id: clientId,
       role_id: roleId
     })
-    const session = await stripe.checkout.sessions.create({
+    const checkoutBasePayload = {
       mode: 'payment',
       customer: stripeCustomerId || undefined,
       line_items: [{
@@ -442,15 +449,56 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
         quantity
       }],
       allow_promotion_codes: true,
-      success_url: buildClientDashboardReturnUrl(successParams),
-      cancel_url: buildClientDashboardReturnUrl(cancelParams),
       metadata: sessionMetadata
-    })
+    }
+
+    let checkoutClientSecret = null
+    let primaryCheckoutSession = null
+    let hostedFallbackSession = null
+
+    if (embeddedCheckoutRequested) {
+      try {
+        primaryCheckoutSession = await stripe.checkout.sessions.create({
+          ...checkoutBasePayload,
+          ui_mode: 'embedded',
+          return_url: buildClientDashboardReturnUrl(successParams)
+        })
+        const resolvedClientSecret = String(primaryCheckoutSession?.client_secret || '').trim()
+        if (resolvedClientSecret) {
+          checkoutClientSecret = resolvedClientSecret
+        } else {
+          primaryCheckoutSession = null
+        }
+      } catch (embeddedErr) {
+        console.error('create_additional_interviews_embedded_checkout_session_failed:', embeddedErr?.message || embeddedErr)
+      }
+    }
+
+    if (!primaryCheckoutSession) {
+      primaryCheckoutSession = await stripe.checkout.sessions.create({
+        ...checkoutBasePayload,
+        success_url: buildClientDashboardReturnUrl(successParams),
+        cancel_url: buildClientDashboardReturnUrl(cancelParams)
+      })
+    } else {
+      try {
+        hostedFallbackSession = await stripe.checkout.sessions.create({
+          ...checkoutBasePayload,
+          success_url: buildClientDashboardReturnUrl(successParams),
+          cancel_url: buildClientDashboardReturnUrl(cancelParams)
+        })
+      } catch (hostedFallbackErr) {
+        console.error('create_additional_interviews_hosted_fallback_checkout_session_failed:', hostedFallbackErr?.message || hostedFallbackErr)
+      }
+    }
+
+    const checkoutUrl = String(hostedFallbackSession?.url || primaryCheckoutSession?.url || '').trim() || null
+    const checkoutSessionId = String(primaryCheckoutSession?.id || hostedFallbackSession?.id || '').trim() || null
 
     const { error: updatePurchaseErr } = await supabaseAdmin
       .from('role_interview_purchases')
       .update({
-        stripe_checkout_session_id: session?.id || null
+        stripe_checkout_session_id: checkoutSessionId
       })
       .eq('id', pendingPurchase.id)
     if (updatePurchaseErr) {
@@ -459,8 +507,10 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
 
     return res.json({
       ok: true,
-      url: session?.url || null,
-      role_interview_purchase_id: pendingPurchase.id
+      url: checkoutUrl,
+      role_interview_purchase_id: pendingPurchase.id,
+      checkout_client_secret: checkoutClientSecret,
+      embedded_checkout: !!checkoutClientSecret
     })
   } catch (e) {
     return res.status(500).json({ error: 'create_additional_interviews_checkout_session_failed', detail: e?.message || 'create_additional_interviews_checkout_session_failed' })
@@ -473,6 +523,7 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
     const clientId = String(req.body?.client_id || '').trim()
     const roleId = String(req.body?.role_id || '').trim()
     const tab = sanitizeClientDashboardTab(req.body?.tab, 'roles')
+    const embeddedCheckoutRequested = wantsEmbeddedCheckout(req.body?.embedded)
     const roleTitle = String(req.body?.role_title || '').trim()
     const interviewType = String(req.body?.interview_type || '').trim().toUpperCase()
     const jdFile = req.file || null
@@ -643,20 +694,61 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
       successParams.set('role_id', roleId)
       cancelParams.set('role_id', roleId)
     }
-    const session = await stripe.checkout.sessions.create({
+    const checkoutBasePayload = {
       mode: 'payment',
       customer: stripeCustomerId,
       line_items: [{ price: rolePrice.id, quantity: 1 }],
       allow_promotion_codes: true,
-      success_url: buildClientDashboardReturnUrl(successParams),
-      cancel_url: buildClientDashboardReturnUrl(cancelParams),
       metadata: sessionMetadata
-    })
+    }
+
+    let checkoutClientSecret = null
+    let primaryCheckoutSession = null
+    let hostedFallbackSession = null
+
+    if (embeddedCheckoutRequested) {
+      try {
+        primaryCheckoutSession = await stripe.checkout.sessions.create({
+          ...checkoutBasePayload,
+          ui_mode: 'embedded',
+          return_url: buildClientDashboardReturnUrl(successParams)
+        })
+        const resolvedClientSecret = String(primaryCheckoutSession?.client_secret || '').trim()
+        if (resolvedClientSecret) {
+          checkoutClientSecret = resolvedClientSecret
+        } else {
+          primaryCheckoutSession = null
+        }
+      } catch (embeddedErr) {
+        console.error('create_role_embedded_checkout_session_failed:', embeddedErr?.message || embeddedErr)
+      }
+    }
+
+    if (!primaryCheckoutSession) {
+      primaryCheckoutSession = await stripe.checkout.sessions.create({
+        ...checkoutBasePayload,
+        success_url: buildClientDashboardReturnUrl(successParams),
+        cancel_url: buildClientDashboardReturnUrl(cancelParams)
+      })
+    } else {
+      try {
+        hostedFallbackSession = await stripe.checkout.sessions.create({
+          ...checkoutBasePayload,
+          success_url: buildClientDashboardReturnUrl(successParams),
+          cancel_url: buildClientDashboardReturnUrl(cancelParams)
+        })
+      } catch (hostedFallbackErr) {
+        console.error('create_role_hosted_fallback_checkout_session_failed:', hostedFallbackErr?.message || hostedFallbackErr)
+      }
+    }
+
+    const checkoutUrl = String(hostedFallbackSession?.url || primaryCheckoutSession?.url || '').trim() || null
+    const checkoutSessionId = String(primaryCheckoutSession?.id || hostedFallbackSession?.id || '').trim() || null
 
     const { error: pendingRolePurchaseUpdateErr } = await supabaseAdmin
       .from('pending_role_purchases')
       .update({
-        stripe_checkout_session_id: session?.id || null,
+        stripe_checkout_session_id: checkoutSessionId,
         stripe_customer_id: stripeCustomerId || null
       })
       .eq('id', pendingRolePurchase.id)
@@ -664,7 +756,13 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
       return res.status(500).json({ error: 'update_pending_role_purchase_failed', detail: pendingRolePurchaseUpdateErr.message })
     }
 
-    return res.json({ ok: true, url: session?.url || null, session_id: session?.id || null })
+    return res.json({
+      ok: true,
+      url: checkoutUrl,
+      session_id: checkoutSessionId,
+      checkout_client_secret: checkoutClientSecret,
+      embedded_checkout: !!checkoutClientSecret
+    })
   } catch (e) {
     return res.status(500).json({ error: 'create_role_checkout_session_failed', detail: e?.message || 'create_role_checkout_session_failed' })
   }
