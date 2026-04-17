@@ -215,6 +215,11 @@ function buildAcceptInviteUrl(token) {
   return appendQuery(`${frontendUrl}/accept-invite`, { token: String(token || '') });
 }
 
+function buildTextInterviewUrl(token) {
+  const safeToken = String(token || '');
+  return `${interviewAppBase}/text-interview/${safeToken}`;
+}
+
 module.exports = {
   canonical,
   trimTrailingSlash,
@@ -230,6 +235,7 @@ module.exports = {
   buildClientPwResetUrl,
   buildPublicPwResetUrl,
   buildAcceptInviteUrl,
+  buildTextInterviewUrl,
   corsDefaultOrigins,
   frontendUrl,
   frontendBase,

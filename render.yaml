@@ -51,9 +51,11 @@ services:
       - key: CORS_ORIGINS
         value: https://ia-frontend-qa.onrender.com
       - key: PUBLIC_SITE_BASE_FALLBACK
-        value: https://ia-frontend-qa.onrender.com
+        value: https://alphasourceai-com.onrender.com
+      - key: CLIENT_APP_BASE
+        value: https://alphasourceai-com.onrender.com
       - key: CLIENT_APP_BASE_FALLBACK
-        value: https://ia-frontend-qa.onrender.com
+        value: https://alphasourceai-com.onrender.com
 
   - type: web
     name: ia-backend-staging
