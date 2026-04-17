@@ -3577,19 +3577,91 @@ adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, 
   const request_id = req.request_id || null
   const email = String(req.body?.email || '').trim()
   if (!email) return res.status(400).json({ error: 'email_required', request_id })
+  const diagPrefix = '[admin/send-password-reset][diag]'
+  const redirectTo = buildClientPwResetUrl({ origin: 'admin' })
 
   try {
-    const ensured = await ensureUserIdAndRecoveryLink(email, buildClientPwResetUrl({ origin: 'admin' }), {
-      requireActionLink: true
+    console.log(`${diagPrefix} start`, {
+      request_id,
+      email,
+      redirectTo
     })
-    const actionLink = ensured?.actionLink || null
-    const emailResult = await sendMemberRecoveryEmail(email, actionLink, null)
-    if (emailResult?.statusCode !== 202) {
-      const err = new Error(emailResult?.skipped ? 'email_skipped' : 'email_send_failed')
-      err.code = 'send_member_recovery_email_failed'
-      err.detail = emailResult?.skipped ? 'email_skipped' : 'email_send_failed'
-      throw err
+
+    let ensured = null
+    try {
+      ensured = await ensureUserIdAndRecoveryLink(email, redirectTo, {
+        requireActionLink: true
+      })
+    } catch (e) {
+      console.error(`${diagPrefix} helper_failed`, {
+        request_id,
+        email,
+        redirectTo,
+        error: e?.message || e,
+        code: e?.code || null,
+        status: e?.status || null
+      })
+      throw e
     }
+
+    const actionLink = ensured?.actionLink || null
+    let actionLinkHost = null
+    let actionLinkPath = null
+    let actionLinkContainsPwreset = false
+    let actionLinkContainsRedirectTo = false
+    if (actionLink) {
+      actionLinkContainsPwreset =
+        String(actionLink).includes('/pwreset') ||
+        String(actionLink).toLowerCase().includes('%2fpwreset')
+      actionLinkContainsRedirectTo =
+        String(actionLink).includes('redirect_to=') ||
+        String(actionLink).toLowerCase().includes('redirect_to%3d')
+      try {
+        const parsed = new URL(actionLink)
+        actionLinkHost = parsed.host || null
+        actionLinkPath = parsed.pathname || null
+      } catch (_) {}
+    }
+
+    console.log(`${diagPrefix} link_generated`, {
+      request_id,
+      email,
+      redirectTo,
+      actionLink,
+      actionLink_host: actionLinkHost,
+      actionLink_path: actionLinkPath,
+      actionLink_contains_pwreset: actionLinkContainsPwreset,
+      actionLink_contains_redirect_to: actionLinkContainsRedirectTo
+    })
+
+    try {
+      const emailResult = await sendMemberRecoveryEmail(email, actionLink, null)
+      if (emailResult?.statusCode !== 202) {
+        const err = new Error(emailResult?.skipped ? 'email_skipped' : 'email_send_failed')
+        err.code = 'send_member_recovery_email_failed'
+        err.detail = emailResult?.skipped ? 'email_skipped' : 'email_send_failed'
+        throw err
+      }
+    } catch (e) {
+      console.error(`${diagPrefix} mail_send_failed`, {
+        request_id,
+        email,
+        redirectTo,
+        actionLink,
+        error: e?.message || e,
+        code: e?.code || null,
+        status: e?.status || null
+      })
+      throw e
+    }
+
+    console.log(`${diagPrefix} success`, {
+      request_id,
+      email,
+      redirectTo,
+      actionLink_host: actionLinkHost,
+      actionLink_path: actionLinkPath
+    })
     return res.json({ ok: true, request_id })
   } catch (e) {
     return res.status(500).json({
