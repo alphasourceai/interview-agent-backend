@@ -1874,6 +1874,64 @@ adminRouter.get('/audit/billing-reconciliation', requireAuth, requireAdmin, asyn
   return res.json({ items })
 })
 
+adminRouter.get('/audit/agreements', requireAuth, requireAdmin, async (_req, res) => {
+  const { data, error } = await supabaseAdmin
+    .from('membership_agreements')
+    .select('id,client_id,client_legal_name,status,created_by_user_id,created_by_email,admin_email,sent_at,opened_at,signed_at,signer_ip,created_at')
+    .order('created_at', { ascending: false })
+    .limit(200)
+  if (error) return res.status(500).json({ error: 'list_agreement_audit_failed', detail: error.message })
+
+  const toTs = (value) => {
+    const raw = String(value || '').trim()
+    if (!raw) return 0
+    const ts = new Date(raw).getTime()
+    return Number.isFinite(ts) ? ts : 0
+  }
+
+  const items = []
+  for (const row of data || []) {
+    const base = {
+      agreement_id: row?.id || null,
+      client_id: row?.client_id || null,
+      client_name: row?.client_legal_name || null,
+      sent_by_user_id: row?.created_by_user_id || null,
+      sent_by_email: row?.created_by_email || null,
+      sent_to_email: row?.admin_email || null,
+      signer_ip: row?.signer_ip || null,
+      status: row?.status || null
+    }
+
+    if (row?.sent_at) {
+      items.push({
+        ...base,
+        id: `${row.id}-sent`,
+        event_type: 'agreement_sent',
+        event_at: row.sent_at
+      })
+    }
+    if (row?.opened_at) {
+      items.push({
+        ...base,
+        id: `${row.id}-opened`,
+        event_type: 'agreement_opened',
+        event_at: row.opened_at
+      })
+    }
+    if (row?.signed_at) {
+      items.push({
+        ...base,
+        id: `${row.id}-signed`,
+        event_type: 'agreement_signed',
+        event_at: row.signed_at
+      })
+    }
+  }
+
+  items.sort((a, b) => toTs(b.event_at) - toTs(a.event_at))
+  return res.json({ items })
+})
+
 adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAdmin, async (req, res) => {
   const request_id = req.request_id || null
   const clientId = req.params?.id
