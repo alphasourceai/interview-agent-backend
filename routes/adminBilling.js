@@ -2,10 +2,25 @@
 
 const express = require('express');
 const crypto = require('crypto');
-const stripe = require('../lib/stripeClient');
+let stripe = null;
+try {
+  stripe = require('../lib/stripeClient');
+} catch (e) {
+  console.error('[billing] stripe_client_load_failed', e?.message || e);
+}
 const { supabaseAnon, supabaseAdmin } = require('../src/lib/supabaseClient');
+const { htmlToPdf } = require('../utils/pdfRenderer');
+const { buildMembershipAgreementHtml, normalizeMembershipAgreementInput } = require('../utils/renderMembershipAgreement');
+const { sendMembershipAgreementEmail, sendMembershipAgreementInternalNotification } = require('../utils/mailer');
+const { buildMembershipAgreementSignUrl } = require('../config/urlConfig');
 
 const router = express.Router();
+const AGREEMENTS_BUCKET = process.env.SUPABASE_AGREEMENTS_BUCKET || 'agreements';
+const MEMBERSHIP_INTERNAL_NOTIFY_EMAIL = 'memberships@alphasourceai.com';
+const SIGNING_LINK_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const AGREEMENT_CLIENT_MODE_ATTACH = 'attach_existing_client';
+const AGREEMENT_CLIENT_MODE_ADD = 'add_new_client';
 
 const bearer = (req) => {
   const h = req.headers['authorization'] || req.headers['Authorization'];
@@ -49,6 +64,469 @@ async function requireAdmin(req, res, next) {
 }
 
 router.use(requireAuth, requireAdmin);
+
+function normalizeAgreementClientMode(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === AGREEMENT_CLIENT_MODE_ADD) return AGREEMENT_CLIENT_MODE_ADD;
+  return AGREEMENT_CLIENT_MODE_ATTACH;
+}
+
+function normalizeAgreementPayload(raw) {
+  const body = raw || {};
+  const normalized = normalizeMembershipAgreementInput(body);
+  const normalizedClientId = UUID_RE.test(normalized.client_id || '') ? normalized.client_id : null;
+  const attachedClientIdRaw = String(
+    body.attached_client_id ||
+    body.attachedClientId ||
+    normalizedClientId ||
+    ''
+  ).trim();
+  const attachedClientId = UUID_RE.test(attachedClientIdRaw) ? attachedClientIdRaw : normalizedClientId;
+
+  return {
+    ...normalized,
+    client_id: attachedClientId,
+    attached_client_id: attachedClientId,
+    client_mode: normalizeAgreementClientMode(body.client_mode || body.clientMode),
+    candidate_assistance_contact: String(body.candidate_assistance_contact || body.candidateAssistanceContact || '').trim()
+  };
+}
+
+function validateAgreementPayload(payload) {
+  const missing = [];
+  if (!payload.client_legal_name) missing.push('client_legal_name');
+  if (!payload.primary_admin_name) missing.push('primary_admin_name');
+  if (!payload.admin_email) missing.push('admin_email');
+  if (!payload.initial_term_start) missing.push('initial_term_start');
+  if (!payload.initial_renewal_date) missing.push('initial_renewal_date');
+
+  if (missing.length) {
+    return {
+      ok: false,
+      code: 'missing_fields',
+      detail: `Missing required fields: ${missing.join(', ')}`
+    };
+  }
+
+  const emailLooksValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payload.admin_email);
+  if (!emailLooksValid) {
+    return {
+      ok: false,
+      code: 'invalid_email',
+      detail: 'Admin email must be a valid email address.'
+    };
+  }
+
+  if (payload.client_mode === AGREEMENT_CLIENT_MODE_ATTACH && !payload.attached_client_id) {
+    return {
+      ok: false,
+      code: 'client_id_required',
+      detail: 'Select an existing client to attach this agreement.'
+    };
+  }
+
+  if (payload.client_mode === AGREEMENT_CLIENT_MODE_ADD && !payload.candidate_assistance_contact) {
+    return {
+      ok: false,
+      code: 'candidate_assistance_contact_required',
+      detail: 'Candidate Assistance Contact is required when adding a new client.'
+    };
+  }
+
+  return { ok: true };
+}
+
+async function createClientFromAgreementPayload(payload) {
+  const { data, error } = await supabaseAdmin
+    .from('clients')
+    .insert({
+      name: payload.client_legal_name,
+      email: payload.admin_email,
+      client_admin_name: payload.primary_admin_name || null,
+      candidate_assistance_contact: payload.candidate_assistance_contact,
+      plan_tier: null,
+      billing_interval: null
+    })
+    .select('id,name,email,candidate_assistance_contact')
+    .single();
+
+  if (error) {
+    const err = new Error(error.message || 'create_client_failed');
+    err.code = error.code || 'create_client_failed';
+    err.hint = error.hint || null;
+    throw err;
+  }
+
+  return data;
+}
+
+async function resolveAgreementClientContext(payload) {
+  if (payload.client_mode === AGREEMENT_CLIENT_MODE_ADD) {
+    const createdClient = await createClientFromAgreementPayload(payload);
+    return {
+      client_id: createdClient?.id || null,
+      created_client: createdClient || null
+    };
+  }
+
+  const clientId = String(payload.attached_client_id || payload.client_id || '').trim();
+  if (!clientId) {
+    const err = new Error('Select an existing client to attach this agreement.');
+    err.code = 'client_id_required';
+    err.status = 400;
+    throw err;
+  }
+
+  const { data: existingClient, error: existingClientErr } = await supabaseAdmin
+    .from('clients')
+    .select('id,name,email')
+    .eq('id', clientId)
+    .maybeSingle();
+
+  if (existingClientErr) {
+    const err = new Error(existingClientErr.message || 'client_lookup_failed');
+    err.code = existingClientErr.code || 'client_lookup_failed';
+    err.hint = existingClientErr.hint || null;
+    throw err;
+  }
+
+  if (!existingClient) {
+    const err = new Error('Selected client was not found.');
+    err.code = 'client_not_found';
+    err.status = 404;
+    throw err;
+  }
+
+  return { client_id: existingClient.id, created_client: null };
+}
+
+async function findOpenAgreementForClient(clientId) {
+  if (!clientId) return null;
+  const { data, error } = await supabaseAdmin
+    .from('membership_agreements')
+    .select('id,status,created_at,sent_at')
+    .eq('client_id', clientId)
+    .in('status', ['draft', 'sent'])
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    const err = new Error(error.message || 'agreement_lookup_failed');
+    err.code = error.code || 'agreement_lookup_failed';
+    err.hint = error.hint || null;
+    throw err;
+  }
+
+  return data || null;
+}
+
+function extractErrorMessage(text, fallback) {
+  const raw = String(text || '').trim();
+  if (!raw) return fallback;
+  try {
+    const parsed = JSON.parse(raw);
+    const detail = parsed?.detail || parsed?.message || parsed?.error;
+    if (typeof detail === 'string' && detail.trim()) return detail.trim();
+  } catch (_) {}
+  return raw;
+}
+
+function slugify(value) {
+  const slug = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64);
+  return slug || 'client';
+}
+
+function formatDateForEmail(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  const [year, month, day] = raw.split('-');
+  const parsed = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+  if (Number.isNaN(parsed.getTime())) return raw;
+  return parsed.toLocaleDateString('en-US', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    timeZone: 'UTC'
+  });
+}
+
+router.post('/agreements/preview-html', async (req, res) => {
+  const request_id = req.request_id || null;
+  try {
+    const payload = normalizeAgreementPayload(req.body || {});
+    const validation = validateAgreementPayload(payload);
+    if (!validation.ok) {
+      return res.status(400).json({
+        error: validation.code,
+        code: validation.code,
+        detail: validation.detail,
+        request_id
+      });
+    }
+
+    const { html } = buildMembershipAgreementHtml(payload);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(200).send(html);
+  } catch (e) {
+    console.error('[billing/agreements/preview-html] unexpected', { request_id, error: e?.message || e });
+    return res.status(500).json({ error: 'server_error', code: 'server_error', detail: e?.message || 'Server error', request_id });
+  }
+});
+
+async function renderAgreementPreviewPdf(req, res) {
+  const request_id = req.request_id || null;
+  try {
+    const payload = normalizeAgreementPayload(req.body || {});
+    const validation = validateAgreementPayload(payload);
+    if (!validation.ok) {
+      return res.status(400).json({
+        error: validation.code,
+        code: validation.code,
+        detail: validation.detail,
+        request_id
+      });
+    }
+
+    const { html } = buildMembershipAgreementHtml(payload);
+    const pdf = await htmlToPdf(html, {
+      format: 'Letter',
+      margin: { top: '0.75in', right: '0.75in', bottom: '0.75in', left: '0.75in' }
+    });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', 'inline; filename="membership-agreement-preview.pdf"');
+    return res.send(pdf);
+  } catch (e) {
+    console.error('[billing/agreements/preview-pdf] unexpected', { request_id, error: e?.message || e });
+    return res.status(500).json({ error: 'pdf_render_failed', code: 'pdf_render_failed', detail: e?.message || 'PDF render failed', request_id });
+  }
+}
+
+router.post('/agreements/preview-pdf', renderAgreementPreviewPdf);
+router.post('/agreements/preview', renderAgreementPreviewPdf);
+
+router.post('/agreements/send', async (req, res) => {
+  const request_id = req.request_id || null;
+  try {
+    const payload = normalizeAgreementPayload(req.body || {});
+    const validation = validateAgreementPayload(payload);
+    if (!validation.ok) {
+      return res.status(400).json({
+        error: validation.code,
+        code: validation.code,
+        detail: validation.detail,
+        request_id
+      });
+    }
+
+    const clientContext = await resolveAgreementClientContext(payload);
+    const resolvedClientId = clientContext?.client_id || null;
+    if (!resolvedClientId) {
+      return res.status(400).json({
+        error: 'client_id_required',
+        code: 'client_id_required',
+        detail: 'A client must be selected or created before sending an agreement.',
+        request_id
+      });
+    }
+
+    const openAgreement = await findOpenAgreementForClient(resolvedClientId);
+    if (openAgreement) {
+      return res.status(409).json({
+        error: 'agreement_already_open',
+        code: 'agreement_already_open',
+        detail: `This client already has an open ${openAgreement.status} agreement (${openAgreement.id}).`,
+        open_agreement_id: openAgreement.id,
+        open_agreement_status: openAgreement.status,
+        request_id
+      });
+    }
+
+    const payloadWithClient = {
+      ...payload,
+      client_id: resolvedClientId,
+      attached_client_id: resolvedClientId
+    };
+
+    const { html, normalized } = buildMembershipAgreementHtml(payloadWithClient);
+    const pdf = await htmlToPdf(html, {
+      format: 'Letter',
+      margin: { top: '0.75in', right: '0.75in', bottom: '0.75in', left: '0.75in' }
+    });
+
+    const agreementId = crypto.randomUUID();
+    const clientSlug = slugify(normalized.client_legal_name);
+    const draftPdfPath = `membership-agreements/${agreementId}/${clientSlug}-draft.pdf`;
+
+    const upload = await supabaseAdmin
+      .storage
+      .from(AGREEMENTS_BUCKET)
+      .upload(draftPdfPath, pdf, {
+        contentType: 'application/pdf',
+        upsert: true
+      });
+
+    if (upload.error) {
+      console.error('[billing/agreements/send] draft_upload_failed', {
+        request_id,
+        error: upload.error.message,
+        code: upload.error.code
+      });
+      return res.status(500).json({
+        error: 'draft_upload_failed',
+        code: upload.error.code || 'draft_upload_failed',
+        detail: upload.error.message,
+        request_id
+      });
+    }
+
+    const signerToken = crypto.randomBytes(32).toString('hex');
+    const signerTokenHash = crypto.createHash('sha256').update(signerToken).digest('hex');
+    const signerTokenExpiresAt = new Date(Date.now() + SIGNING_LINK_TTL_MS).toISOString();
+    const signingUrl = buildMembershipAgreementSignUrl(signerToken);
+
+    const templateSnapshot = {
+      template_name: 'membership-agreement',
+      template_version: 'membership_agreement_v2_phase1',
+      source_document: 'alphaScreen Membership Agreementv2.docx',
+      generated_at: new Date().toISOString(),
+      client_association: {
+        mode: payload.client_mode,
+        client_id: resolvedClientId,
+        created_client_id: clientContext?.created_client?.id || null,
+        candidate_assistance_contact:
+          payload.client_mode === AGREEMENT_CLIENT_MODE_ADD
+            ? payload.candidate_assistance_contact
+            : null
+      },
+      values: normalized,
+      rendered_html: html
+    };
+
+    const { data: inserted, error: insertErr } = await supabaseAdmin
+      .from('membership_agreements')
+      .insert({
+        id: agreementId,
+        client_id: resolvedClientId,
+        status: 'draft',
+        client_legal_name: normalized.client_legal_name,
+        dba_trade_name: normalized.dba_trade_name || null,
+        primary_admin_name: normalized.primary_admin_name,
+        admin_email: normalized.admin_email,
+        membership_tier: normalized.membership_tier,
+        initial_term_start: normalized.initial_term_start,
+        initial_renewal_date: normalized.initial_renewal_date,
+        billing_option: normalized.billing_option,
+        auto_renew: normalized.auto_renew,
+        notice_deadline_days: normalized.notice_deadline_days,
+        template_version: 'membership_agreement_v2_phase1',
+        template_snapshot: templateSnapshot,
+        draft_pdf_path: draftPdfPath,
+        signer_token_hash: signerTokenHash,
+        signer_token_expires_at: signerTokenExpiresAt,
+        created_by_user_id: req.user?.id || null,
+        created_by_email: req.user?.email || null
+      })
+      .select('id,status,admin_email,signer_token_expires_at,draft_pdf_path')
+      .single();
+
+    if (insertErr) {
+      console.error('[billing/agreements/send] persist_failed', {
+        request_id,
+        error: insertErr.message,
+        code: insertErr.code,
+        hint: insertErr.hint
+      });
+      return res.status(500).json({
+        error: 'persist_failed',
+        code: insertErr.code || 'persist_failed',
+        detail: insertErr.message,
+        hint: insertErr.hint,
+        request_id
+      });
+    }
+
+    try {
+      await sendMembershipAgreementEmail(normalized.admin_email, signingUrl, {
+        client_legal_name: normalized.client_legal_name,
+        primary_admin_name: normalized.primary_admin_name,
+        membership_tier: normalized.membership_tier,
+        expires_on: formatDateForEmail(signerTokenExpiresAt)
+      });
+
+      await sendMembershipAgreementInternalNotification(MEMBERSHIP_INTERNAL_NOTIFY_EMAIL, {
+        agreement_id: agreementId,
+        client_legal_name: normalized.client_legal_name,
+        primary_admin_name: normalized.primary_admin_name,
+        admin_email: normalized.admin_email,
+        membership_tier: normalized.membership_tier,
+        billing_option: normalized.billing_option
+      });
+    } catch (emailErr) {
+      console.error('[billing/agreements/send] email_failed', { request_id, error: emailErr?.message || emailErr });
+      return res.status(500).json({
+        error: 'email_send_failed',
+        code: 'email_send_failed',
+        detail: extractErrorMessage(emailErr?.message || '', 'Agreement email could not be delivered.'),
+        request_id
+      });
+    }
+
+    const { data: updated, error: updateErr } = await supabaseAdmin
+      .from('membership_agreements')
+      .update({ status: 'sent', sent_at: new Date().toISOString() })
+      .eq('id', agreementId)
+      .select('id,status,admin_email,signer_token_expires_at,draft_pdf_path,sent_at')
+      .single();
+
+    if (updateErr) {
+      console.error('[billing/agreements/send] sent_status_update_failed', {
+        request_id,
+        error: updateErr.message,
+        code: updateErr.code,
+        hint: updateErr.hint
+      });
+      return res.status(500).json({
+        error: 'status_update_failed',
+        code: updateErr.code || 'status_update_failed',
+        detail: updateErr.message,
+        hint: updateErr.hint,
+        request_id
+      });
+    }
+
+    return res.json({
+      ok: true,
+      agreement: updated || inserted,
+      client: clientContext?.created_client || null,
+      request_id
+    });
+  } catch (e) {
+    if (Number(e?.status) === 404 || String(e?.code || '') === 'client_not_found') {
+      return res.status(404).json({
+        error: 'client_not_found',
+        code: 'client_not_found',
+        detail: e?.message || 'Selected client was not found.',
+        request_id
+      });
+    }
+    console.error('[billing/agreements/send] unexpected', { request_id, error: e?.message || e });
+    return res.status(500).json({
+      error: 'server_error',
+      code: e?.code || 'server_error',
+      detail: e?.message || 'Server error',
+      hint: e?.hint || null,
+      request_id
+    });
+  }
+});
 
 router.get('/customers', async (_req, res) => {
   const request_id = _req.request_id || null;
@@ -147,6 +625,15 @@ router.get('/invoices', async (_req, res) => {
 router.post('/invoices/send', async (req, res) => {
   const request_id = req.request_id || null;
   try {
+    if (!stripe || !stripe.customers || !stripe.invoices || !stripe.invoiceItems) {
+      return res.status(500).json({
+        error: 'stripe_unavailable',
+        code: 'stripe_unavailable',
+        detail: 'Stripe client is unavailable.',
+        request_id
+      });
+    }
+
     const billing_customer_id = req.body?.billing_customer_id || null;
     const invoice_title = (req.body?.invoice_title || req.body?.title || '').trim();
     const invoice_description = (req.body?.invoice_description || '').trim() || null;

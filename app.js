@@ -3693,7 +3693,9 @@ adminRouter.delete('/client-members/:id', requireAuth, requireAdmin, async (req,
 // Mount admin sub-routers (Billing + Accommodation Requests)
 try {
   adminRouter.use('/billing', requireAuth, requireAdmin, require('./routes/adminBilling'))
-} catch (_) {}
+} catch (e) {
+  console.error('[mount] Failed to load routes/adminBilling:', e?.message || e)
+}
 try {
   adminRouter.use('/accommodation-requests', requireAuth, requireAdmin, require('./routes/accommodationRequests'))
 } catch (_) {}
@@ -3940,6 +3942,11 @@ app.use('/admin', adminRouter)
 app.use('/kb', require('./routes/kb'))
 app.use('/', require('./routes/tavus'))
 app.use('/', require('./routes/publicInterviewStatus'))
+try {
+  app.use('/membership-agreements', require('./routes/membershipAgreementsPublic'))
+} catch (e) {
+  console.error('[mount] Failed to load routes/membershipAgreementsPublic:', e?.message || e)
+}
 
 // ---------- JD upload route (authenticated + scoped) ----------
 try {
