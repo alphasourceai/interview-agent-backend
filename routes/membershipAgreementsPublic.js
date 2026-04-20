@@ -481,7 +481,7 @@ router.post('/sign', async (req, res) => {
     const responseDownloadUrl = await createAgreementSignedUrl(executedPdfPath, SIGNED_URL_TTL_SECONDS);
 
     try {
-      await sendMembershipAgreementSignedCopyEmail(updatedAgreement.admin_email, {
+      const signedCopyEmailResult = await sendMembershipAgreementSignedCopyEmail(updatedAgreement.admin_email, {
         client_legal_name: updatedAgreement.client_legal_name,
         primary_admin_name: updatedAgreement.primary_admin_name,
         signer_typed_name: typedName,
@@ -490,11 +490,32 @@ router.post('/sign', async (req, res) => {
         pdf_base64: executedPdf.toString('base64'),
         file_name: `${clientSlug}-membership-agreement-signed.pdf`
       });
+      if (!signedCopyEmailResult || signedCopyEmailResult.skipped) {
+        console.warn('[membership-agreements/sign] signed_copy_email_skipped', {
+          request_id,
+          agreement_id: updatedAgreement.id || agreement.id,
+          result: signedCopyEmailResult || null
+        });
+      } else {
+        console.info('[membership-agreements/sign] signed_copy_email_sent', {
+          request_id,
+          agreement_id: updatedAgreement.id || agreement.id,
+          status_code: signedCopyEmailResult.statusCode || null
+        });
+      }
     } catch (emailErr) {
+      const sendgridResponseBody = emailErr?.response?.body || null;
+      const sendgridResponseErrors = Array.isArray(sendgridResponseBody?.errors)
+        ? sendgridResponseBody.errors
+        : null;
       console.error('[membership-agreements/sign] signed_copy_email_failed', {
         request_id,
-        agreement_id: agreement.id,
-        error: emailErr?.message || emailErr
+        agreement_id: updatedAgreement.id || agreement.id,
+        message: emailErr?.message || String(emailErr || ''),
+        code: emailErr?.code || null,
+        status: emailErr?.response?.statusCode || emailErr?.statusCode || null,
+        response_body: sendgridResponseBody,
+        response_errors: sendgridResponseErrors
       });
     }
 
