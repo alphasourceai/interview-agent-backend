@@ -477,6 +477,62 @@ router.post('/sign', async (req, res) => {
       });
     }
 
+    const { data: previousSignedRows, error: previousSignedErr } = await supabaseAdmin
+      .from('membership_agreements')
+      .select('id,template_snapshot')
+      .eq('client_id', updatedAgreement.client_id)
+      .eq('status', 'signed')
+      .neq('id', updatedAgreement.id);
+
+    if (previousSignedErr) {
+      console.error('[membership-agreements/sign] previous_signed_lookup_failed', {
+        request_id,
+        agreement_id: updatedAgreement.id || agreement.id,
+        client_id: updatedAgreement.client_id || null,
+        error: previousSignedErr.message,
+        code: previousSignedErr.code,
+        hint: previousSignedErr.hint
+      });
+    } else if (Array.isArray(previousSignedRows) && previousSignedRows.length > 0) {
+      await Promise.all(previousSignedRows.map(async (row) => {
+        const previousSnapshot = row?.template_snapshot && typeof row.template_snapshot === 'object'
+          ? row.template_snapshot
+          : {};
+        const previousExecution = previousSnapshot.execution && typeof previousSnapshot.execution === 'object'
+          ? previousSnapshot.execution
+          : {};
+        const nextSnapshot = {
+          ...previousSnapshot,
+          execution: {
+            ...previousExecution,
+            replacement_status: 'superseded',
+            superseded_at: signedAt,
+            superseded_by_agreement_id: updatedAgreement.id
+          }
+        };
+
+        const { error: supersedeErr } = await supabaseAdmin
+          .from('membership_agreements')
+          .update({
+            template_snapshot: nextSnapshot,
+            updated_at: signedAt
+          })
+          .eq('id', row.id);
+
+        if (supersedeErr) {
+          console.error('[membership-agreements/sign] supersede_previous_signed_failed', {
+            request_id,
+            agreement_id: updatedAgreement.id || agreement.id,
+            superseded_agreement_id: row.id,
+            client_id: updatedAgreement.client_id || null,
+            error: supersedeErr.message,
+            code: supersedeErr.code,
+            hint: supersedeErr.hint
+          });
+        }
+      }));
+    }
+
     const emailDownloadUrl = await createAgreementSignedUrl(executedPdfPath, EMAIL_SIGNED_URL_TTL_SECONDS);
     const responseDownloadUrl = await createAgreementSignedUrl(executedPdfPath, SIGNED_URL_TTL_SECONDS);
     const executedPdfBuffer = Buffer.isBuffer(executedPdf)

@@ -88,7 +88,8 @@ function normalizeAgreementPayload(raw) {
     client_id: attachedClientId,
     attached_client_id: attachedClientId,
     client_mode: normalizeAgreementClientMode(body.client_mode || body.clientMode),
-    candidate_assistance_contact: String(body.candidate_assistance_contact || body.candidateAssistanceContact || '').trim()
+    candidate_assistance_contact: String(body.candidate_assistance_contact || body.candidateAssistanceContact || '').trim(),
+    confirm_replace_existing: body.confirm_replace_existing === true || body.confirmReplaceExisting === true
   };
 }
 
@@ -221,6 +222,28 @@ async function findOpenAgreementForClient(clientId) {
   return data || null;
 }
 
+async function findCurrentSignedAgreementForClient(clientId) {
+  if (!clientId) return null;
+  const { data, error } = await supabaseAdmin
+    .from('membership_agreements')
+    .select('id,client_id,status,client_legal_name,membership_tier,initial_term_start,initial_renewal_date,signed_at,created_at')
+    .eq('client_id', clientId)
+    .eq('status', 'signed')
+    .order('signed_at', { ascending: false, nullsFirst: false })
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    const err = new Error(error.message || 'agreement_lookup_failed');
+    err.code = error.code || 'agreement_lookup_failed';
+    err.hint = error.hint || null;
+    throw err;
+  }
+
+  return data || null;
+}
+
 function extractErrorMessage(text, fallback) {
   const raw = String(text || '').trim();
   if (!raw) return fallback;
@@ -294,6 +317,27 @@ async function renderAgreementPreviewPdf(req, res) {
       });
     }
 
+    if (payload.client_mode === AGREEMENT_CLIENT_MODE_ATTACH && payload.client_id && !payload.confirm_replace_existing) {
+      const currentAgreement = await findCurrentSignedAgreementForClient(payload.client_id);
+      if (currentAgreement) {
+        return res.status(409).json({
+          error: 'agreement_replacement_confirmation_required',
+          code: 'agreement_replacement_confirmation_required',
+          detail: 'This client already has an active signed agreement. Confirm replacement to continue.',
+          existing_agreement: {
+            id: currentAgreement.id,
+            client_id: currentAgreement.client_id,
+            client_legal_name: currentAgreement.client_legal_name || null,
+            membership_tier: currentAgreement.membership_tier || null,
+            initial_term_start: currentAgreement.initial_term_start || null,
+            initial_renewal_date: currentAgreement.initial_renewal_date || null,
+            signed_at: currentAgreement.signed_at || null
+          },
+          request_id
+        });
+      }
+    }
+
     const { html } = buildMembershipAgreementHtml(payload);
     const pdf = await htmlToPdf(html, {
       format: 'Letter',
@@ -335,6 +379,27 @@ router.post('/agreements/send', async (req, res) => {
         detail: 'A client must be selected or created before sending an agreement.',
         request_id
       });
+    }
+
+    if (payload.client_mode === AGREEMENT_CLIENT_MODE_ATTACH && !payload.confirm_replace_existing) {
+      const currentAgreement = await findCurrentSignedAgreementForClient(resolvedClientId);
+      if (currentAgreement) {
+        return res.status(409).json({
+          error: 'agreement_replacement_confirmation_required',
+          code: 'agreement_replacement_confirmation_required',
+          detail: 'This client already has an active signed agreement. Confirm replacement to continue.',
+          existing_agreement: {
+            id: currentAgreement.id,
+            client_id: currentAgreement.client_id,
+            client_legal_name: currentAgreement.client_legal_name || null,
+            membership_tier: currentAgreement.membership_tier || null,
+            initial_term_start: currentAgreement.initial_term_start || null,
+            initial_renewal_date: currentAgreement.initial_renewal_date || null,
+            signed_at: currentAgreement.signed_at || null
+          },
+          request_id
+        });
+      }
     }
 
     const openAgreement = await findOpenAgreementForClient(resolvedClientId);
