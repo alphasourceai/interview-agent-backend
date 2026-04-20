@@ -99,10 +99,40 @@ router.get('/resume-signed-url', requireAuth, withClientScope, async (req, res) 
     if (!scopedIds.includes(candidate.client_id)) return res.status(403).json({ error: 'Forbidden' });
 
     const raw = String(candidate.resume_url || '').trim();
-    if (!raw) return res.status(404).json({ error: 'resume not available' });
-
     const isHttpUrl = /^https?:\/\//i.test(raw);
     const accommodationBucket = process.env.SUPABASE_ACCOMMODATION_RESUMES_BUCKET || 'accommodation-resumes';
+    const EXPIRES = Number(process.env.SIGNED_URL_TTL_SECONDS || 300);
+    const tryAccommodationRequestFallback = async () => {
+      const { data: requestRow, error: requestErr } = await supabaseAdmin
+        .from('accommodation_requests')
+        .select('resume_url, resume_received_at, created_at')
+        .eq('candidate_id', candidate.id)
+        .not('resume_url', 'is', null)
+        .neq('resume_url', '')
+        .order('resume_received_at', { ascending: false, nullsFirst: false })
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (requestErr || !requestRow?.resume_url) return null;
+
+      const fallbackPath = String(requestRow.resume_url).trim().replace(/^\/+/, '');
+      if (!fallbackPath) return null;
+
+      const retry = await supabaseAdmin
+        .storage
+        .from(accommodationBucket)
+        .createSignedUrl(fallbackPath, EXPIRES);
+      if (retry.error || !retry.data?.signedUrl) return null;
+      return { signed: retry.data, bucket: accommodationBucket };
+    };
+    if (!raw) {
+      const fallback = await tryAccommodationRequestFallback();
+      if (fallback) {
+        return res.json({ ok: true, url: fallback.signed.signedUrl, mode: 'signed', bucket: fallback.bucket });
+      }
+      return res.status(404).json({ error: 'resume not available' });
+    }
+
     const rawNoLeadingSlash = raw.replace(/^\/+/, '');
     const looksLikeAccommodationPath = !isHttpUrl && /^accommodations\//i.test(rawNoLeadingSlash);
 
@@ -118,10 +148,13 @@ router.get('/resume-signed-url', requireAuth, withClientScope, async (req, res) 
     }
     if (!parsed) {
       if (isHttpUrl) return res.json({ ok: true, url: raw, mode: 'legacy_url' });
+      const fallback = await tryAccommodationRequestFallback();
+      if (fallback) {
+        return res.json({ ok: true, url: fallback.signed.signedUrl, mode: 'signed', bucket: fallback.bucket });
+      }
       return res.status(400).json({ error: 'Unrecognized storage path/URL' });
     }
 
-    const EXPIRES = Number(process.env.SIGNED_URL_TTL_SECONDS || 300);
     const isNotFoundSignError = (err) => {
       const msg = String(err?.message || '').toLowerCase();
       const code = String(err?.code || '').toLowerCase();
@@ -159,11 +192,28 @@ router.get('/resume-signed-url', requireAuth, withClientScope, async (req, res) 
     const deBucketedStripped = strippedPath.startsWith(defaultBucketPrefix)
       ? strippedPath.slice(defaultBucketPrefix.length).replace(/^\/+/, '')
       : '';
+    const accommodationBucketPrefix = `${accommodationBucket}/`;
+    const deAccommodationBucketedInitial = initialPath.startsWith(accommodationBucketPrefix)
+      ? initialPath.slice(accommodationBucketPrefix.length).replace(/^\/+/, '')
+      : '';
+    const deAccommodationBucketedStripped = strippedPath.startsWith(accommodationBucketPrefix)
+      ? strippedPath.slice(accommodationBucketPrefix.length).replace(/^\/+/, '')
+      : '';
+    const shouldTryAccommodationFallback =
+      !isHttpUrl && /(?:^|\/)accommodations\//i.test(rawNoLeadingSlash);
 
     queueAttempt(parsed.bucket, initialPath);
     queueAttempt(parsed.bucket, strippedPath);
     queueAttempt(defaultResumeBucket, deBucketedInitial);
     queueAttempt(defaultResumeBucket, deBucketedStripped);
+    if (shouldTryAccommodationFallback) {
+      queueAttempt(accommodationBucket, initialPath);
+      queueAttempt(accommodationBucket, strippedPath);
+      queueAttempt(accommodationBucket, deBucketedInitial);
+      queueAttempt(accommodationBucket, deBucketedStripped);
+      queueAttempt(accommodationBucket, deAccommodationBucketedInitial);
+      queueAttempt(accommodationBucket, deAccommodationBucketedStripped);
+    }
 
     let signed = null;
     let signErr = null;
@@ -182,7 +232,7 @@ router.get('/resume-signed-url', requireAuth, withClientScope, async (req, res) 
       if (!isNotFoundSignError(signErr)) break;
     }
 
-    if (isBucketlessPath && signErr) {
+    if (shouldTryAccommodationFallback && signErr) {
       if (isNotFoundSignError(signErr) && accommodationBucket && accommodationBucket !== parsed.bucket) {
         const retry = await supabaseAdmin
           .storage
@@ -196,7 +246,13 @@ router.get('/resume-signed-url', requireAuth, withClientScope, async (req, res) 
       }
     }
 
-    if (signErr) return res.status(400).json({ error: signErr.message });
+    if (signErr) {
+      const fallback = await tryAccommodationRequestFallback();
+      if (fallback) {
+        return res.json({ ok: true, url: fallback.signed.signedUrl, mode: 'signed', bucket: fallback.bucket });
+      }
+      return res.status(400).json({ error: signErr.message });
+    }
     return res.json({ ok: true, url: signed?.signedUrl, mode: 'signed', bucket: parsed.bucket });
   } catch (e) {
     return res.status(500).json({ error: e.message });

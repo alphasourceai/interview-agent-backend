@@ -220,6 +220,16 @@ function buildTextInterviewUrl(token) {
   return `${interviewAppBase}/text-interview/${safeToken}`;
 }
 
+function buildMembershipAgreementSignUrl(token) {
+  const safeToken = encodeURIComponent(String(token || '').trim());
+  const base = firstBase(
+    publicSiteOrFrontendBase,
+    frontendBase,
+    frontendUrl
+  );
+  return `${base}/membership-agreement/sign/${safeToken}`;
+}
+
 module.exports = {
   canonical,
   trimTrailingSlash,
@@ -236,6 +246,7 @@ module.exports = {
   buildPublicPwResetUrl,
   buildAcceptInviteUrl,
   buildTextInterviewUrl,
+  buildMembershipAgreementSignUrl,
   corsDefaultOrigins,
   frontendUrl,
   frontendBase,

@@ -10,7 +10,7 @@ const { requireAuth } = require('../src/middleware/auth');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
 const { redactEmail } = require('../src/lib/recoveryHelper');
 const { checkDuplicateCandidate, normalizeEmail, normalizePhone } = require('../src/lib/duplicateCandidate');
-const { clientAppBaseWithFrontendFallback } = require('../config/urlConfig');
+const { buildTextInterviewUrl } = require('../config/urlConfig');
 
 const router = express.Router();
 
@@ -503,8 +503,7 @@ router.post('/:id/send-text-link', requireAuth, requireAdmin, async (req, res) =
       });
     }
 
-    const frontendBase = clientAppBaseWithFrontendFallback;
-    const interviewLink = `${frontendBase}/text-interview/${token}`;
+    const interviewLink = buildTextInterviewUrl(token);
     const candidateName = String(reqRow.candidate_name || '').trim();
 
     try {
@@ -693,6 +692,7 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
     }
 
     let resume_url = null;
+    let candidate_resume_url = null;
     let resume_received_at = null;
     let resumeBuffer = null;
     let resumeMime = null;
@@ -722,6 +722,7 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
           });
         }
         resume_url = path;
+        candidate_resume_url = `${bucket}/${path}`;
         resume_received_at = new Date().toISOString();
       } catch (e) {
         console.error('[accommodation] resume upload failed', {
@@ -755,10 +756,10 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
           request_id: reqRow.id,
         });
       }
-      if (!existingResumeUrl && candidate_id) {
+      if (!existingResumeUrl && candidate_id && candidate_resume_url) {
         const { error: candUpdateErr } = await supabaseAdmin
           .from('candidates')
-          .update({ resume_url })
+          .update({ resume_url: candidate_resume_url })
           .eq('id', candidate_id);
         if (candUpdateErr) {
           logSupabaseError('[accommodation] candidate resume update failed', reqRow.id, candUpdateErr);

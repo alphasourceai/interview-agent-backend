@@ -11,6 +11,15 @@ if (!API_KEY) {
 
 const FROM = process.env.SENDGRID_FROM || 'no-reply@yourdomain.com'
 
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
 async function sendInvite(to, acceptUrl, inviterEmail) {
   if (!API_KEY) return { skipped: true }
   const msg = {
@@ -314,4 +323,220 @@ async function sendMemberRecoveryEmail(to, recoveryUrl, recipientName) {
   return { statusCode: resp?.statusCode || 0 }
 }
 
-module.exports = { sendInvite, sendSubscriptionCheckoutEmail, sendRoleInterviewLimitReachedEmail, sendMemberRecoveryEmail }
+async function sendMembershipAgreementEmail(to, signingUrl, details = {}) {
+  if (!API_KEY) return { skipped: true }
+  const safeSigningUrl = String(signingUrl || '').trim()
+  const safeClientLegalName = escapeHtml(details.clientLegalName || details.client_legal_name || 'Your organization')
+  const safePrimaryAdmin = escapeHtml(details.primaryAdmin || details.primary_admin_name || '')
+  const safeMembershipTier = escapeHtml(details.membershipTier || details.membership_tier || '')
+  const safeExpiresOn = escapeHtml(details.expiresOn || details.expires_on || '')
+  const greeting = safePrimaryAdmin ? `Hi ${safePrimaryAdmin},` : 'Hi there,'
+
+  const msg = {
+    to,
+    from: FROM,
+    subject: 'Review and sign your alphaScreen Membership Agreement',
+    html: `
+      <!doctype html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>Sign your alphaScreen Membership Agreement</title>
+        <style>
+          body { margin: 0; padding: 0; background: #0F1E5D; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+          table { border-collapse: collapse; }
+          a { text-decoration: none; }
+        </style>
+      </head>
+      <body>
+        <table role="presentation" width="100%" style="background:#0F1E5D;color:#C9D3FF;">
+          <tr>
+            <td align="center" style="padding: 24px 16px;">
+              <table role="presentation" width="100%" style="max-width: 640px;">
+                <tr>
+                  <td style="background:#0F1E5D;color:#C9D3FF;padding:24px;">
+                    <p style="margin:0 0 10px;color:#E6EBFF;font-size:24px;line-height:1.25;font-weight:700;">
+                      alphaScreen Membership Agreement
+                    </p>
+                    <p style="margin:0 0 12px;color:#C9D3FF;font-size:15px;line-height:1.6;">
+                      ${greeting}
+                    </p>
+                    <p style="margin:0 0 10px;color:#C9D3FF;font-size:15px;line-height:1.6;">
+                      Your membership agreement for <strong>${safeClientLegalName}</strong> is ready for signature.
+                    </p>
+                    ${safeMembershipTier ? `<p style="margin:0 0 10px;color:#C9D3FF;font-size:14px;line-height:1.55;">Membership tier: <strong>${safeMembershipTier}</strong></p>` : ''}
+                    ${safeExpiresOn ? `<p style="margin:0 0 14px;color:#C9D3FF;font-size:14px;line-height:1.55;">Signing link expires on: <strong>${safeExpiresOn}</strong></p>` : ''}
+                    <p style="margin:0 0 18px;">
+                      <a href="${safeSigningUrl}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#A78BFA;color:#0A1547;border:1px solid #CFCBFF;border-radius:10px;padding:11px 18px;font-size:14px;font-weight:700;line-height:1;">
+                        Review and sign agreement
+                      </a>
+                    </p>
+                    <p style="margin:0 0 16px;color:#C9D3FF;font-size:14px;line-height:1.55;">
+                      If the button doesn’t work, <a href="${safeSigningUrl}" target="_blank" rel="noopener noreferrer" style="color:#FFFFFF;">click here</a> to open the agreement.
+                    </p>
+                    <p style="margin:0;border-top:1px solid rgba(255,255,255,0.10);padding-top:14px;color:#6B77C9;font-size:13px;line-height:1.55;">
+                      Need help? Email <a href="mailto:memberships@alphasourceai.com" style="color:#A78BFA;">memberships@alphasourceai.com</a>
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+      </html>
+    `
+  }
+  const [resp] = await sg.send(msg)
+  return { statusCode: resp?.statusCode || 0 }
+}
+
+async function sendMembershipAgreementInternalNotification(to, details = {}) {
+  if (!API_KEY) return { skipped: true }
+
+  const safeAgreementId = escapeHtml(details.agreementId || details.agreement_id || '')
+  const safeClientLegalName = escapeHtml(details.clientLegalName || details.client_legal_name || '')
+  const safePrimaryAdmin = escapeHtml(details.primaryAdmin || details.primary_admin_name || '')
+  const safeAdminEmail = escapeHtml(details.adminEmail || details.admin_email || '')
+  const safeMembershipTier = escapeHtml(details.membershipTier || details.membership_tier || '')
+  const safeBillingOption = escapeHtml(details.billingOption || details.billing_option || '')
+
+  const msg = {
+    to,
+    from: FROM,
+    subject: 'Membership agreement sent - manual checkout follow-up required',
+    html: `
+      <p>A membership agreement has been sent and requires manual checkout follow-up.</p>
+      <ul>
+        ${safeAgreementId ? `<li><strong>Agreement ID:</strong> ${safeAgreementId}</li>` : ''}
+        ${safeClientLegalName ? `<li><strong>Client:</strong> ${safeClientLegalName}</li>` : ''}
+        ${safePrimaryAdmin ? `<li><strong>Primary Admin:</strong> ${safePrimaryAdmin}</li>` : ''}
+        ${safeAdminEmail ? `<li><strong>Admin Email:</strong> ${safeAdminEmail}</li>` : ''}
+        ${safeMembershipTier ? `<li><strong>Membership Tier:</strong> ${safeMembershipTier}</li>` : ''}
+        ${safeBillingOption ? `<li><strong>Billing Option:</strong> ${safeBillingOption}</li>` : ''}
+      </ul>
+      <p>After signature is complete, manually send checkout per current phase-1 process.</p>
+    `
+  }
+  const [resp] = await sg.send(msg)
+  return { statusCode: resp?.statusCode || 0 }
+}
+
+async function sendMembershipAgreementSignedCopyEmail(to, details = {}) {
+  if (!API_KEY) return { skipped: true }
+  const safeExecutedPdfUrl = String(details.executedPdfUrl || details.executed_pdf_url || '').trim()
+  const safeClientLegalName = escapeHtml(details.clientLegalName || details.client_legal_name || 'Your organization')
+  const safePrimaryAdmin = escapeHtml(details.primaryAdmin || details.primary_admin_name || '')
+  const safeSignerTypedName = escapeHtml(details.signerTypedName || details.signer_typed_name || '')
+  const safeSignedAt = escapeHtml(details.signedAt || details.signed_at || '')
+  const pdfBase64 = String(details.pdfBase64 || details.pdf_base64 || '').trim()
+  const fileName = String(details.fileName || details.file_name || 'membership-agreement-signed.pdf').trim() || 'membership-agreement-signed.pdf'
+  const greeting = safePrimaryAdmin ? `Hi ${safePrimaryAdmin},` : 'Hi there,'
+
+  const msg = {
+    to,
+    from: FROM,
+    subject: 'Your signed alphaScreen Membership Agreement',
+    html: `
+      <!doctype html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>Your signed alphaScreen Membership Agreement</title>
+        <style>
+          body { margin: 0; padding: 0; background: #0F1E5D; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+          table { border-collapse: collapse; }
+          a { text-decoration: none; }
+        </style>
+      </head>
+      <body>
+        <table role="presentation" width="100%" style="background:#0F1E5D;color:#C9D3FF;">
+          <tr>
+            <td align="center" style="padding: 24px 16px;">
+              <table role="presentation" width="100%" style="max-width: 640px;">
+                <tr>
+                  <td style="background:#0F1E5D;color:#C9D3FF;padding:24px;">
+                    <p style="margin:0 0 10px;color:#E6EBFF;font-size:24px;line-height:1.25;font-weight:700;">
+                      Signed Membership Agreement
+                    </p>
+                    <p style="margin:0 0 12px;color:#C9D3FF;font-size:15px;line-height:1.6;">
+                      ${greeting}
+                    </p>
+                    <p style="margin:0 0 10px;color:#C9D3FF;font-size:15px;line-height:1.6;">
+                      Your signed agreement for <strong>${safeClientLegalName}</strong> is attached.
+                    </p>
+                    ${safeSignerTypedName ? `<p style="margin:0 0 10px;color:#C9D3FF;font-size:14px;line-height:1.55;">Signed by: <strong>${safeSignerTypedName}</strong></p>` : ''}
+                    ${safeSignedAt ? `<p style="margin:0 0 14px;color:#C9D3FF;font-size:14px;line-height:1.55;">Signed at: <strong>${safeSignedAt}</strong></p>` : ''}
+                    ${safeExecutedPdfUrl ? `<p style="margin:0 0 16px;color:#C9D3FF;font-size:14px;line-height:1.55;">Secure copy link: <a href="${safeExecutedPdfUrl}" target="_blank" rel="noopener noreferrer" style="color:#FFFFFF;">Open signed agreement</a></p>` : ''}
+                    <p style="margin:0;border-top:1px solid rgba(255,255,255,0.10);padding-top:14px;color:#6B77C9;font-size:13px;line-height:1.55;">
+                      Need help? Email <a href="mailto:memberships@alphasourceai.com" style="color:#A78BFA;">memberships@alphasourceai.com</a>
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+      </html>
+    `
+  }
+
+  if (pdfBase64) {
+    msg.attachments = [
+      {
+        content: pdfBase64,
+        type: 'application/pdf',
+        filename: fileName,
+        disposition: 'attachment'
+      }
+    ]
+  }
+
+  const [resp] = await sg.send(msg)
+  return { statusCode: resp?.statusCode || 0 }
+}
+
+async function sendMembershipAgreementCompletedInternalNotification(to, details = {}) {
+  if (!API_KEY) return { skipped: true }
+
+  const safeAgreementId = escapeHtml(details.agreementId || details.agreement_id || '')
+  const safeClientLegalName = escapeHtml(details.clientLegalName || details.client_legal_name || '')
+  const safePrimaryAdmin = escapeHtml(details.primaryAdmin || details.primary_admin_name || '')
+  const safeAdminEmail = escapeHtml(details.adminEmail || details.admin_email || '')
+  const safeSignerTypedName = escapeHtml(details.signerTypedName || details.signer_typed_name || '')
+  const safeSignedAt = escapeHtml(details.signedAt || details.signed_at || '')
+
+  const msg = {
+    to,
+    from: FROM,
+    subject: 'Membership agreement signed - manual checkout follow-up required',
+    html: `
+      <p>A membership agreement has been signed and is ready for manual checkout follow-up.</p>
+      <ul>
+        ${safeAgreementId ? `<li><strong>Agreement ID:</strong> ${safeAgreementId}</li>` : ''}
+        ${safeClientLegalName ? `<li><strong>Client:</strong> ${safeClientLegalName}</li>` : ''}
+        ${safePrimaryAdmin ? `<li><strong>Primary Admin:</strong> ${safePrimaryAdmin}</li>` : ''}
+        ${safeAdminEmail ? `<li><strong>Admin Email:</strong> ${safeAdminEmail}</li>` : ''}
+        ${safeSignerTypedName ? `<li><strong>Signer:</strong> ${safeSignerTypedName}</li>` : ''}
+        ${safeSignedAt ? `<li><strong>Signed At:</strong> ${safeSignedAt}</li>` : ''}
+      </ul>
+      <p>Send checkout manually per current process.</p>
+    `
+  }
+  const [resp] = await sg.send(msg)
+  return { statusCode: resp?.statusCode || 0 }
+}
+
+module.exports = {
+  sendInvite,
+  sendSubscriptionCheckoutEmail,
+  sendRoleInterviewLimitReachedEmail,
+  sendMemberRecoveryEmail,
+  sendMembershipAgreementEmail,
+  sendMembershipAgreementInternalNotification,
+  sendMembershipAgreementSignedCopyEmail,
+  sendMembershipAgreementCompletedInternalNotification
+}

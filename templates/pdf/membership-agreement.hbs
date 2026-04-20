@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>alphaScreen Membership Agreement</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Raleway:wght@400;500;600;700;800;900&display=swap');
+
+    @page {
+      size: Letter;
+      margin: 0.75in;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: 'Raleway', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      color: #1f2430;
+      font-size: 12px;
+      line-height: 1.45;
+      background: #ffffff;
+    }
+
+    .page {
+      width: 100%;
+    }
+
+    .logo-wrap {
+      margin-bottom: 8px;
+    }
+
+    .logo-wrap img {
+      width: 238px;
+      max-width: 100%;
+      height: auto;
+      display: block;
+    }
+
+    .title {
+      margin: 6px 0 0;
+      text-align: center;
+      font-size: 28px;
+      font-weight: 800;
+      color: #08165B;
+      line-height: 1.15;
+    }
+
+    .subtitle {
+      margin: 6px 0 18px;
+      text-align: center;
+      font-size: 14px;
+      font-weight: 600;
+      color: #5D6375;
+    }
+
+    .details-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 12px;
+      table-layout: fixed;
+    }
+
+    .details-table td {
+      border: 1px solid #D5D8E0;
+      vertical-align: top;
+      padding: 8px 10px 9px;
+      height: 72px;
+    }
+
+    .cell-label {
+      font-size: 10px;
+      font-weight: 800;
+      color: #5D6375;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      margin-bottom: 8px;
+    }
+
+    .cell-value {
+      font-size: 14px;
+      font-weight: 700;
+      color: #08165B;
+      word-break: break-word;
+    }
+
+    .triplet {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 10px;
+      table-layout: fixed;
+    }
+
+    .triplet td {
+      border: 2px solid #A582FF;
+      vertical-align: top;
+      padding: 9px 10px;
+      height: 90px;
+    }
+
+    .triplet-label {
+      font-size: 10px;
+      font-weight: 800;
+      color: #5D6375;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      margin-bottom: 8px;
+    }
+
+    .triplet-value {
+      font-size: 18px;
+      font-weight: 800;
+      color: #A582FF;
+      line-height: 1.1;
+      margin-bottom: 6px;
+    }
+
+    .triplet-note {
+      font-size: 10px;
+      color: #5D6375;
+      line-height: 1.35;
+    }
+
+    .ack-title {
+      margin: 14px 0 8px;
+      font-size: 17px;
+      font-weight: 800;
+      color: #08165B;
+    }
+
+    .ack-list {
+      margin: 0;
+      padding: 0 0 0 12px;
+      list-style: none;
+    }
+
+    .ack-item {
+      margin: 0 0 7px;
+      font-size: 11px;
+      color: #1f2430;
+      line-height: 1.4;
+    }
+
+    .ack-item .box {
+      color: #A582FF;
+      font-weight: 800;
+      margin-right: 7px;
+    }
+
+    .generated-note {
+      margin-top: 10px;
+      font-size: 10px;
+      color: #5D6375;
+      text-align: right;
+    }
+
+    .page-break {
+      page-break-before: always;
+      break-before: page;
+    }
+
+    .agreement-title {
+      margin: 0 0 8px;
+      font-size: 25px;
+      line-height: 1.15;
+      color: #08165B;
+      font-weight: 800;
+    }
+
+    .intro {
+      margin: 0 0 12px;
+      font-size: 12px;
+      line-height: 1.52;
+      color: #1f2430;
+    }
+
+    .section-title {
+      margin: 14px 0 6px;
+      font-size: 14px;
+      font-weight: 800;
+      color: #08165B;
+    }
+
+    .section-paragraph {
+      margin: 0 0 8px;
+      font-size: 11px;
+      line-height: 1.56;
+      color: #1f2430;
+    }
+
+    .accept-title {
+      margin: 18px 0 8px;
+      font-size: 16px;
+      color: #08165B;
+      font-weight: 800;
+    }
+
+    .accept-check {
+      margin: 0 0 14px;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .signature-table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+      margin-top: 8px;
+    }
+
+    .signature-table td {
+      border: 1px solid #D5D8E0;
+      padding: 10px 12px;
+      vertical-align: top;
+    }
+
+    .signature-header {
+      background: #F4F5F8;
+      color: #08165B;
+      font-weight: 800;
+      font-size: 13px;
+    }
+
+    .signature-line {
+      margin: 0 0 12px;
+      font-size: 12px;
+      color: #1f2430;
+    }
+
+    .signature-image-wrap {
+      display: inline-block;
+      min-width: 220px;
+      min-height: 44px;
+      vertical-align: middle;
+      border-bottom: 1px solid #B5BACC;
+      padding-bottom: 2px;
+    }
+
+    .signature-image {
+      display: block;
+      height: 42px;
+      width: auto;
+      max-width: 280px;
+      object-fit: contain;
+    }
+
+    .signature-executed-note {
+      margin: 2px 0 0;
+      font-size: 10px;
+      color: #5D6375;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <section class="page">
+    <div class="logo-wrap">
+      {{#if logo_src}}
+      <img src="{{logo_src}}" alt="alphaSource logo" />
+      {{/if}}
+    </div>
+
+    <h1 class="title">alphaScreen Membership Package</h1>
+    <p class="subtitle">Membership Details and Terms</p>
+
+    <table class="details-table">
+      <tr>
+        <td>
+          <div class="cell-label">Client Legal Name</div>
+          <div class="cell-value">{{client_legal_name}}</div>
+        </td>
+        <td>
+          <div class="cell-label">DBA / Trade Name</div>
+          <div class="cell-value">{{dba_trade_name}}</div>
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <div class="cell-label">Primary Admin</div>
+          <div class="cell-value">{{primary_admin_name}}</div>
+        </td>
+        <td>
+          <div class="cell-label">Admin Email</div>
+          <div class="cell-value">{{admin_email}}</div>
+        </td>
+      </tr>
+    </table>
+
+    <table class="triplet">
+      <tr>
+        <td>
+          <div class="triplet-label">Membership Tier</div>
+          <div class="triplet-value">{{membership_tier}}</div>
+          <div class="triplet-note">Selected plan</div>
+        </td>
+        <td>
+          <div class="triplet-label">Initial Term Start</div>
+          <div class="triplet-value">{{initial_term_start_display}}</div>
+          <div class="triplet-note">Activation date</div>
+        </td>
+        <td>
+          <div class="triplet-label">Initial Renewal Date</div>
+          <div class="triplet-value">{{initial_renewal_date_display}}</div>
+          <div class="triplet-note">12-month auto-renewal</div>
+        </td>
+      </tr>
+    </table>
+
+    <table class="triplet">
+      <tr>
+        <td>
+          <div class="triplet-label">Billing Option</div>
+          <div class="triplet-value">{{billing_option}}</div>
+          <div class="triplet-note">12-month commitment</div>
+        </td>
+        <td>
+          <div class="triplet-label">Auto-Renew</div>
+          <div class="triplet-value">{{auto_renew}}</div>
+          <div class="triplet-note">Unless canceled {{notice_deadline_plain}} days before renewal</div>
+        </td>
+        <td>
+          <div class="triplet-label">Notice Deadline</div>
+          <div class="triplet-value">{{notice_deadline_days}}</div>
+          <div class="triplet-note">Email: memberships@alphasourceai.com</div>
+        </td>
+      </tr>
+    </table>
+
+    <h2 class="ack-title">Membership Acknowledgments</h2>
+    <ul class="ack-list">
+      <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges this is a 12-month Membership term.</li>
+      <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges monthly billing is an installment option for the 12-month term and is not a month-to-month term.</li>
+      <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges the Membership auto-renews for an additional 12-month term unless canceled with written notice at least {{notice_deadline_plain}} days before renewal and will continue as such until canceled.</li>
+      <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges no refunds or partial-term refunds will be issued except as expressly stated in this Agreement or required by law.</li>
+      <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges access may be restricted or suspended if the account becomes delinquent.</li>
+    </ul>
+
+    <p class="generated-note">Prepared {{generated_at_label}}</p>
+  </section>
+
+  <section class="page page-break">
+    <h1 class="agreement-title">alphaScreen Membership Agreement</h1>
+    <p class="intro">
+      This Agreement is entered into by and between alphaSource Network, LLC, a Wyoming limited liability company (“alphaSource”), and
+      {{client_legal_name}}, the client identified in the Membership Details page, order summary, checkout, invoice, or account registration (“Client”),
+      individually a “Party”, and together with alphaSource, the “Parties”.
+    </p>
+
+    <h2 class="section-title">1. Services</h2>
+    <p class="section-paragraph">alphaSource provides an AI-assisted hiring and interview workflow platform that may include role creation, candidate intake, resume processing, candidate verification, AI-led interview workflows, dashboards, reporting, accommodation-request workflows, and related analytics, summaries, and reports. Features may vary by plan, configuration, availability, and third-party service dependencies.</p>
+
+    <h2 class="section-title">2. Membership Term</h2>
+    <p class="section-paragraph">Each Membership term begins on {{initial_term_start_long}} and continues for an initial term of twelve (12) months. Unless either party provides written notice of non-renewal at least {{notice_deadline_plain}} days before the end of the then-current term, the Membership will automatically renew for successive twelve (12) month renewal terms.</p>
+    <p class="section-paragraph">Client may cancel the Membership at any time by providing notice to alphaSource in accordance with Section 15 below. Cancellation will stop future renewal of the Membership but will not terminate or reduce Client’s payment obligations for the remainder of the then-current term. Client’s selected {{billing_option}} payment schedule will remain in effect through the end of the then-current term, and no additional cancellation fee will be charged.</p>
+    <p class="section-paragraph">All fees for the then-current term are non-refundable. No refunds or partial-term credits will be issued for early cancellation, non-use, reduced usage, or early termination, except as otherwise required by law or expressly provided in this Agreement.</p>
+
+    <h2 class="section-title">3. Fees, Billing, and Payment</h2>
+    <p class="section-paragraph">Client may elect annual billing for the full 12-month term or monthly billing as installment payments for the same 12-month term. Monthly billing is not a month-to-month term. Certain plans may include usage thresholds, interview allocations, role-based limits, or additional feature limitations. Additional usage or capacity may require additional fees.</p>
+    <p class="section-paragraph">Client authorizes alphaSource and its payment processors to charge the payment method on file for all applicable fees, renewals, additional usage purchases, taxes, and related charges. If any payment is late, declined, reversed, or unpaid, alphaSource may restrict, suspend, or disable some or all access to the Services until the account is brought current.</p>
+
+    <h2 class="section-title">4. Client Access and Permitted Use</h2>
+    <p class="section-paragraph">Client may use the Services only for its internal business purposes in connection with recruiting, interviewing, candidate evaluation, and related workforce decision-support activities. Client is responsible for all activity occurring under its account, including activity by its administrators, managers, employees, contractors, and representatives.</p>
+
+    <h2 class="section-title">5. Client Data, Candidate Data, and Privacy</h2>
+    <p class="section-paragraph">alphaSource may process information provided by Client or candidates, including candidate and user identity information, contact information, resumes, interview content, assessment data, accommodation-request information, reports, and related account data. alphaSource will keep Client and candidate information private and confidential and will not sell such information to third parties.</p>
+    <p class="section-paragraph">Client represents and warrants that it has all rights, permissions, notices, and legal authority necessary to submit, upload, use, and direct alphaSource to process Client data and candidate data in connection with the Services.</p>
+
+    <h2 class="section-title">6. Confidentiality</h2>
+    <p class="section-paragraph">Each Party will use the other Party’s non-public business, technical, commercial, candidate, pricing, account, and platform information only as necessary to perform or exercise rights under this Agreement and will protect such information using reasonable care.</p>
+
+    <h2 class="section-title">7. AI Outputs, Reports, and Limitations</h2>
+    <p class="section-paragraph">The Services may generate or assist with interview prompts, transcripts, summaries, scores, analyses, reports, AI-aided risk indicators, and other outputs using automated systems, machine learning models, third-party AI providers, and related tooling. Client acknowledges that AI-assisted outputs may be incomplete, inaccurate, probabilistic, inconsistent, or context-dependent.</p>
+
+    <h2 class="section-title">8. Client Responsibility for Hiring and Legal Compliance</h2>
+    <p class="section-paragraph">Client is solely responsible for all recruiting, screening, accommodation, interview, hiring, rejection, promotion, compensation, employment, and related business or employment decisions. alphaSource does not make employment decisions and is not the employer of any candidate. Client is solely responsible for compliance with all laws and regulations applicable to its recruiting and employment practices.</p>
+
+    <h2 class="section-title">9. Service Availability and Third-Party Dependencies</h2>
+    <p class="section-paragraph">The Services may depend on third-party infrastructure and providers, including hosting providers, storage providers, AI/model providers, communications providers, payment processors, video/interview providers, and related integrations. alphaSource does not guarantee uninterrupted availability, continuous uptime, error-free operation, immediate processing, successful message delivery, successful webhook delivery, or availability of any third-party integration at all times.</p>
+
+    <h2 class="section-title">10. Intellectual Property</h2>
+    <p class="section-paragraph">alphaSource and its licensors retain all right, title, and interest in and to the Services, software, platform, workflows, interface designs, documentation, know-how, and all related intellectual property. As between the Parties, Client retains ownership of Client data and candidate data submitted by or on behalf of Client, subject to alphaSource’s right to process such data as necessary to provide and support the Services.</p>
+
+    <h2 class="section-title">11. Suspension and Termination</h2>
+    <p class="section-paragraph">alphaSource may suspend or restrict access immediately if Client fails to pay amounts due, breaches this Agreement, uses the Services in a way that presents legal, security, operational, or reputational risk, or if alphaSource reasonably believes suspension is necessary to prevent harm or protect the Services, candidates, Client, or third parties.</p>
+    <p class="section-paragraph">Upon termination or expiration, Client’s access rights end, accrued payment obligations survive, and alphaSource may disable account access and related workflows. Client will have thirty (30) days from the effective date of termination to export or download its Client Data and Candidate Data from the Services.</p>
+
+    <h2 class="section-title">12. Warranty Disclaimer</h2>
+    <p class="section-paragraph">To the maximum extent permitted by law, the Services are provided “as is” and “as available.” alphaSource disclaims all warranties, whether express, implied, statutory, or otherwise, including any implied warranties of merchantability, fitness for a particular purpose, title, non-infringement, accuracy, availability, or that the Services or outputs will be error-free, complete, secure, or legally sufficient for Client’s intended use.</p>
+
+    <h2 class="section-title">13. Limitation of Liability</h2>
+    <p class="section-paragraph">To the maximum extent permitted by law, neither Party will be liable to the other for any indirect, incidental, special, consequential, exemplary, or punitive damages, or for any loss of profits, revenue, goodwill, data, business opportunity, or business interruption, even if advised of the possibility of such damages.</p>
+    <p class="section-paragraph">To the maximum extent permitted by law, alphaSource’s total aggregate liability arising out of or related to this Agreement or the Services will not exceed the total amount of fees paid or payable by Client to alphaSource under this Agreement during the twelve (12) months immediately preceding the event giving rise to the claim.</p>
+
+    <h2 class="section-title">14. Indemnification</h2>
+    <p class="section-paragraph">Client will defend, indemnify, and hold harmless alphaSource and its officers, directors, employees, affiliates, contractors, and agents from and against any third-party claims, demands, actions, damages, liabilities, losses, costs, and expenses (including reasonable attorneys’ fees) arising from or related to Client data, Client’s use of the Services, Client’s recruiting and employment decisions, or Client’s unlawful or non-compliant use of the Services or any outputs.</p>
+
+    <h2 class="section-title">15. General</h2>
+    <p class="section-paragraph">This Agreement, together with any applicable Membership Details form, order summary, checkout terms, invoice, or written addendum executed by the Parties, constitutes the entire agreement between the Parties regarding the Services and supersedes prior or contemporaneous understandings on that subject.</p>
+    <p class="section-paragraph">This Agreement is governed by the laws of the State of Wyoming, without regard to conflict-of-laws rules. Any dispute arising from or related to this Agreement will be brought exclusively in the state or federal courts located in Sheridan County, Wyoming, and each Party consents to that venue and jurisdiction.</p>
+    <p class="section-paragraph">All notices under this Agreement, including notices of cancellation, non-renewal, and other formal communications, must be sent to memberships@alphasourceai.com. Notices to alphaSource may also be sent by mail to alphaSource Network, LLC, 30 N. Gould St, Ste R, Sheridan, WY 82801.</p>
+
+    <h2 class="accept-title">Acceptance and Signatures</h2>
+    <p class="section-paragraph">Acceptance. This Agreement may be executed electronically. Client’s electronic signature constitutes Client’s acceptance of this Agreement and all terms incorporated herein. This Agreement becomes effective upon Client’s electronic acceptance and alphaSource’s activation of Client’s account and provision of access to the Services.</p>
+    <p class="accept-check"><span class="box">{{acceptance_checkbox_symbol}}</span>The undersigned acknowledge that they have read and agree to this alphaScreen Membership Agreement and the Membership Details page incorporated into it.</p>
+
+    <table class="signature-table">
+      <tr>
+        <td class="signature-header">Client</td>
+      </tr>
+      <tr>
+        <td>
+          <p class="signature-line">Name: {{signer_name_line}}</p>
+          <p class="signature-line">Title: _______________________________</p>
+          <p class="signature-line">Signature:
+            {{#if signature_image_src}}
+            <span class="signature-image-wrap">
+              <img class="signature-image" src="{{signature_image_src}}" alt="Client signature" />
+            </span>
+            {{else}}
+            __________________________
+            {{/if}}
+          </p>
+          <p class="signature-line">Date: {{signer_date_line}}</p>
+          {{#if execution_completed_label}}
+          <p class="signature-executed-note">{{execution_completed_label}}</p>
+          {{/if}}
+        </td>
+      </tr>
+    </table>
+  </section>
+</body>
+</html>
