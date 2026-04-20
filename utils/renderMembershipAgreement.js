@@ -204,6 +204,7 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
     enterprise_per_role_fee: formatUsd(normalized.per_role_fee),
     enterprise_additional_interview_fee: formatUsd(normalized.additional_interview_fee),
     enterprise_included_interviews_per_role: normalized.included_interviews_per_role || '—',
+    enterprise_fee_period_label: normalized.billing_option === 'annual' ? 'per year' : 'per month',
     initial_term_start_display: formatDateShort(normalized.initial_term_start),
     initial_renewal_date_display: formatDateShort(normalized.initial_renewal_date),
     billing_option: normalized.billing_option === 'annual' ? 'Annual' : 'Monthly',
