@@ -42,6 +42,22 @@ function normalizeNoticeDays(value) {
   return parsed;
 }
 
+function normalizeMoneyInput(value) {
+  const raw = normalizeText(value).replace(/[$,\s]/g, '');
+  if (!raw) return '';
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return '';
+  return `${Math.round(parsed * 100) / 100}`;
+}
+
+function normalizeWholeNumberInput(value) {
+  const raw = normalizeText(value);
+  if (!raw) return '';
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return '';
+  return `${parsed}`;
+}
+
 function normalizeDateInput(value) {
   const raw = normalizeText(value);
   if (!raw) return '';
@@ -79,6 +95,19 @@ function titleCase(value) {
   const normalized = normalizeText(value).toLowerCase();
   if (!normalized) return '—';
   return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+}
+
+function formatUsd(value) {
+  const raw = normalizeText(value);
+  if (!raw) return '—';
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return '—';
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  }).format(parsed);
 }
 
 function normalizeExecutionInput(input = {}) {
@@ -138,6 +167,10 @@ function normalizeMembershipAgreementInput(input = {}) {
     primary_admin_name: normalizeText(input.primary_admin_name || input.primaryAdmin),
     admin_email: normalizeText(input.admin_email || input.adminEmail).toLowerCase(),
     membership_tier: normalizeTier(input.membership_tier || input.membershipTier),
+    platform_fee: normalizeMoneyInput(input.platform_fee || input.platformFee || input.membership_fee || input.membershipFee),
+    per_role_fee: normalizeMoneyInput(input.per_role_fee || input.perRoleFee),
+    additional_interview_fee: normalizeMoneyInput(input.additional_interview_fee || input.additionalInterviewFee),
+    included_interviews_per_role: normalizeWholeNumberInput(input.included_interviews_per_role || input.includedInterviewsPerRole),
     initial_term_start: normalizeDateInput(input.initial_term_start || input.initialTermStart),
     initial_renewal_date: normalizeDateInput(input.initial_renewal_date || input.initialRenewalDate),
     billing_option: normalizeBillingOption(input.billing_option || input.billingOption),
@@ -166,6 +199,11 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
     primary_admin_name: normalized.primary_admin_name || '______________________________',
     admin_email: normalized.admin_email || '______________________________',
     membership_tier: titleCase(normalized.membership_tier),
+    is_enterprise: normalized.membership_tier === 'enterprise',
+    enterprise_platform_fee: formatUsd(normalized.platform_fee),
+    enterprise_per_role_fee: formatUsd(normalized.per_role_fee),
+    enterprise_additional_interview_fee: formatUsd(normalized.additional_interview_fee),
+    enterprise_included_interviews_per_role: normalized.included_interviews_per_role || '—',
     initial_term_start_display: formatDateShort(normalized.initial_term_start),
     initial_renewal_date_display: formatDateShort(normalized.initial_renewal_date),
     billing_option: normalized.billing_option === 'annual' ? 'Annual' : 'Monthly',

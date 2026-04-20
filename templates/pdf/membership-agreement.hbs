@@ -333,6 +333,31 @@
       </tr>
     </table>
 
+    {{#if is_enterprise}}
+    <table class="details-table">
+      <tr>
+        <td>
+          <div class="cell-label">Enterprise Membership Fee</div>
+          <div class="cell-value">{{enterprise_platform_fee}}</div>
+        </td>
+        <td>
+          <div class="cell-label">Enterprise Per-Role Fee</div>
+          <div class="cell-value">{{enterprise_per_role_fee}}</div>
+        </td>
+      </tr>
+      <tr>
+        <td>
+          <div class="cell-label">Included Interviews (Per Role)</div>
+          <div class="cell-value">{{enterprise_included_interviews_per_role}}</div>
+        </td>
+        <td>
+          <div class="cell-label">Additional Interview Fee</div>
+          <div class="cell-value">{{enterprise_additional_interview_fee}}</div>
+        </td>
+      </tr>
+    </table>
+    {{/if}}
+
     <h2 class="ack-title">Membership Acknowledgments</h2>
     <ul class="ack-list">
       <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges this is a 12-month Membership term.</li>
