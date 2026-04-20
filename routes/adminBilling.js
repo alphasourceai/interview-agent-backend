@@ -226,12 +226,10 @@ async function findCurrentSignedAgreementForClient(clientId) {
   if (!clientId) return null;
   const { data, error } = await supabaseAdmin
     .from('membership_agreements')
-    .select('id,client_id,status,client_legal_name,membership_tier,initial_term_start,initial_renewal_date,signed_at,created_at')
+    .select('id,client_id,status,client_legal_name,membership_tier,initial_term_start,initial_renewal_date,signed_at,created_at,is_current')
     .eq('client_id', clientId)
     .eq('status', 'signed')
-    .order('signed_at', { ascending: false, nullsFirst: false })
-    .order('created_at', { ascending: false })
-    .limit(1)
+    .eq('is_current', true)
     .maybeSingle();
 
   if (error) {

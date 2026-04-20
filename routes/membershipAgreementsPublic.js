@@ -430,26 +430,20 @@ router.post('/sign', async (req, res) => {
       }
     };
 
-    const { data: updatedAgreement, error: updateErr } = await supabaseAdmin
-      .from('membership_agreements')
-      .update({
-        status: 'signed',
-        opened_at: agreement.opened_at || signedAt,
-        signed_at: signedAt,
-        signer_typed_name: typedName,
-        signer_accepted: true,
-        signature_image_path: signaturePath,
-        signature_sha256: signatureSha256,
-        signer_ip: ipAddress,
-        signer_user_agent: userAgent,
-        executed_pdf_path: executedPdfPath,
-        template_snapshot: nextTemplateSnapshot,
-        updated_at: signedAt
-      })
-      .eq('id', agreement.id)
-      .eq('status', 'sent')
-      .select('id,client_id,status,signed_at,signer_typed_name,client_legal_name,primary_admin_name,admin_email,executed_pdf_path')
-      .maybeSingle();
+    const { data: signingRows, error: updateErr } = await supabaseAdmin
+      .rpc('complete_membership_agreement_signing', {
+        p_agreement_id: agreement.id,
+        p_signed_at: signedAt,
+        p_opened_at: agreement.opened_at || signedAt,
+        p_signer_typed_name: typedName,
+        p_signature_image_path: signaturePath,
+        p_signature_sha256: signatureSha256,
+        p_signer_ip: ipAddress,
+        p_signer_user_agent: userAgent,
+        p_executed_pdf_path: executedPdfPath,
+        p_template_snapshot: nextTemplateSnapshot
+      });
+    const updatedAgreement = Array.isArray(signingRows) ? (signingRows[0] || null) : (signingRows || null);
 
     if (updateErr) {
       console.error('[membership-agreements/sign] status_update_failed', {
@@ -475,62 +469,6 @@ router.post('/sign', async (req, res) => {
         detail: 'This agreement was already signed or is no longer signable.',
         request_id
       });
-    }
-
-    const { data: previousSignedRows, error: previousSignedErr } = await supabaseAdmin
-      .from('membership_agreements')
-      .select('id,template_snapshot')
-      .eq('client_id', updatedAgreement.client_id)
-      .eq('status', 'signed')
-      .neq('id', updatedAgreement.id);
-
-    if (previousSignedErr) {
-      console.error('[membership-agreements/sign] previous_signed_lookup_failed', {
-        request_id,
-        agreement_id: updatedAgreement.id || agreement.id,
-        client_id: updatedAgreement.client_id || null,
-        error: previousSignedErr.message,
-        code: previousSignedErr.code,
-        hint: previousSignedErr.hint
-      });
-    } else if (Array.isArray(previousSignedRows) && previousSignedRows.length > 0) {
-      await Promise.all(previousSignedRows.map(async (row) => {
-        const previousSnapshot = row?.template_snapshot && typeof row.template_snapshot === 'object'
-          ? row.template_snapshot
-          : {};
-        const previousExecution = previousSnapshot.execution && typeof previousSnapshot.execution === 'object'
-          ? previousSnapshot.execution
-          : {};
-        const nextSnapshot = {
-          ...previousSnapshot,
-          execution: {
-            ...previousExecution,
-            replacement_status: 'superseded',
-            superseded_at: signedAt,
-            superseded_by_agreement_id: updatedAgreement.id
-          }
-        };
-
-        const { error: supersedeErr } = await supabaseAdmin
-          .from('membership_agreements')
-          .update({
-            template_snapshot: nextSnapshot,
-            updated_at: signedAt
-          })
-          .eq('id', row.id);
-
-        if (supersedeErr) {
-          console.error('[membership-agreements/sign] supersede_previous_signed_failed', {
-            request_id,
-            agreement_id: updatedAgreement.id || agreement.id,
-            superseded_agreement_id: row.id,
-            client_id: updatedAgreement.client_id || null,
-            error: supersedeErr.message,
-            code: supersedeErr.code,
-            hint: supersedeErr.hint
-          });
-        }
-      }));
     }
 
     const emailDownloadUrl = await createAgreementSignedUrl(executedPdfPath, EMAIL_SIGNED_URL_TTL_SECONDS);
@@ -642,12 +580,10 @@ router.get('/latest-signed', requireAuth, withClientScope, async (req, res) => {
 
     const { data: latest, error: latestErr } = await supabaseAdmin
       .from('membership_agreements')
-      .select('id,client_id,status,signed_at,signer_typed_name,client_legal_name,executed_pdf_path,created_at')
+      .select('id,client_id,status,signed_at,signer_typed_name,client_legal_name,executed_pdf_path,created_at,is_current')
       .eq('client_id', clientId)
       .eq('status', 'signed')
-      .order('signed_at', { ascending: false, nullsFirst: false })
-      .order('created_at', { ascending: false })
-      .limit(1)
+      .eq('is_current', true)
       .maybeSingle();
 
     if (latestErr) {
@@ -720,12 +656,10 @@ router.get('/latest-signed-url', requireAuth, withClientScope, async (req, res) 
 
     const { data: latest, error: latestErr } = await supabaseAdmin
       .from('membership_agreements')
-      .select('id,executed_pdf_path,created_at,signed_at')
+      .select('id,executed_pdf_path,created_at,signed_at,is_current')
       .eq('client_id', clientId)
       .eq('status', 'signed')
-      .order('signed_at', { ascending: false, nullsFirst: false })
-      .order('created_at', { ascending: false })
-      .limit(1)
+      .eq('is_current', true)
       .maybeSingle();
 
     if (latestErr) {
