@@ -212,16 +212,17 @@
     }
 
     .signature-table td {
-      border: 1px solid #D5D8E0;
-      padding: 10px 12px;
+      border: 0;
+      padding: 4px 0;
       vertical-align: top;
     }
 
     .signature-header {
-      background: #F4F5F8;
       color: #08165B;
       font-weight: 800;
-      font-size: 13px;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
     }
 
     .signature-line {
@@ -231,12 +232,11 @@
     }
 
     .signature-image-wrap {
-      display: inline-block;
+      display: inline-flex;
       min-width: 220px;
       min-height: 44px;
       vertical-align: middle;
-      border-bottom: 1px solid #B5BACC;
-      padding-bottom: 2px;
+      align-items: flex-end;
     }
 
     .signature-image {
@@ -413,7 +413,6 @@
       <tr>
         <td>
           <p class="signature-line">Name: {{signer_name_line}}</p>
-          <p class="signature-line">Title: _______________________________</p>
           <p class="signature-line">Signature:
             {{#if signature_image_src}}
             <span class="signature-image-wrap">

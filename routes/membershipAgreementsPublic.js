@@ -615,4 +615,75 @@ router.get('/latest-signed', requireAuth, withClientScope, async (req, res) => {
   }
 });
 
+router.get('/latest-signed-url', requireAuth, withClientScope, async (req, res) => {
+  const request_id = req.request_id || null;
+  try {
+    const clientId = String(req.query?.client_id || req.client?.id || req.clientScope?.defaultClientId || '').trim();
+    if (!clientId || clientId === 'all') {
+      return res.json({ ok: true, executed_pdf_url: null, request_id });
+    }
+
+    const scopedIds = Array.isArray(req.client_memberships)
+      ? req.client_memberships
+      : (Array.isArray(req.clientIds) ? req.clientIds : []);
+    const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
+    if (!isGlobalAdmin && !scopedIds.includes(clientId)) {
+      return res.status(403).json({
+        error: 'forbidden',
+        code: 'forbidden',
+        detail: 'Client scope mismatch.',
+        request_id
+      });
+    }
+
+    const { data: latest, error: latestErr } = await supabaseAdmin
+      .from('membership_agreements')
+      .select('id,executed_pdf_path,created_at,signed_at')
+      .eq('client_id', clientId)
+      .eq('status', 'signed')
+      .order('signed_at', { ascending: false, nullsFirst: false })
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (latestErr) {
+      console.error('[membership-agreements/latest-signed-url] query_failed', {
+        request_id,
+        client_id: clientId,
+        error: latestErr.message,
+        code: latestErr.code,
+        hint: latestErr.hint
+      });
+      return res.status(500).json({
+        error: 'latest_signed_query_failed',
+        code: latestErr.code || 'latest_signed_query_failed',
+        detail: latestErr.message,
+        hint: latestErr.hint,
+        request_id
+      });
+    }
+
+    if (!latest) {
+      return res.json({ ok: true, executed_pdf_url: null, request_id });
+    }
+
+    const executedPdfUrl = await createAgreementSignedUrl(latest.executed_pdf_path, SIGNED_URL_TTL_SECONDS);
+
+    return res.json({
+      ok: true,
+      agreement_id: latest.id,
+      executed_pdf_url: executedPdfUrl,
+      request_id
+    });
+  } catch (e) {
+    console.error('[membership-agreements/latest-signed-url] unexpected', { request_id, error: e?.message || e });
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'server_error',
+      detail: e?.message || 'Server error',
+      request_id
+    });
+  }
+});
+
 module.exports = router;
