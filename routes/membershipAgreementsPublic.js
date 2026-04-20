@@ -479,6 +479,11 @@ router.post('/sign', async (req, res) => {
 
     const emailDownloadUrl = await createAgreementSignedUrl(executedPdfPath, EMAIL_SIGNED_URL_TTL_SECONDS);
     const responseDownloadUrl = await createAgreementSignedUrl(executedPdfPath, SIGNED_URL_TTL_SECONDS);
+    const executedPdfBuffer = Buffer.isBuffer(executedPdf)
+      ? executedPdf
+      : ArrayBuffer.isView(executedPdf)
+        ? Buffer.from(executedPdf.buffer, executedPdf.byteOffset, executedPdf.byteLength)
+        : Buffer.from(executedPdf);
 
     try {
       const signedCopyEmailResult = await sendMembershipAgreementSignedCopyEmail(updatedAgreement.admin_email, {
@@ -487,7 +492,7 @@ router.post('/sign', async (req, res) => {
         signer_typed_name: typedName,
         signed_at: signedAt,
         executed_pdf_url: emailDownloadUrl,
-        pdf_base64: executedPdf.toString('base64'),
+        pdf_base64: executedPdfBuffer.toString('base64'),
         file_name: `${clientSlug}-membership-agreement-signed.pdf`
       });
       if (!signedCopyEmailResult || signedCopyEmailResult.skipped) {
