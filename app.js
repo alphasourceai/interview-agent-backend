@@ -1473,7 +1473,7 @@ async function processContractRenewals(context = {}) {
 adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
   const { data, error } = await supabaseAdmin
     .from('clients')
-    .select('id,name,email,created_at,plan_tier,billing_status,manual_active_override,access_override_mode,candidate_assistance_contact,stripe_customer_id,stripe_subscription_id,subscription_status,current_term_end,cancel_at_term_end,billing_interval,contract_start_at,contract_end_at,auto_renew')
+    .select('id,name,email,client_admin_name,created_at,plan_tier,billing_status,manual_active_override,access_override_mode,candidate_assistance_contact,stripe_customer_id,stripe_subscription_id,subscription_status,current_term_end,cancel_at_term_end,billing_interval,contract_start_at,contract_end_at,auto_renew')
     .order('created_at', { ascending: false })
   if (error) return res.status(500).json({ error: 'list_clients_failed', detail: error.message })
   const items = data || []
