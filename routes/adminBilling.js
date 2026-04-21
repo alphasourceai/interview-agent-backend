@@ -697,14 +697,15 @@ router.post('/invoices/send', async (req, res) => {
       });
     }
 
-    const billing_customer_id = req.body?.billing_customer_id || null;
+    let billing_customer_id = String(req.body?.billing_customer_id || '').trim() || null;
+    const client_id = String(req.body?.client_id || '').trim() || null;
     const invoice_title = (req.body?.invoice_title || req.body?.title || '').trim();
     const invoice_description = (req.body?.invoice_description || '').trim() || null;
     const days_until_due = Number.isFinite(parseInt(req.body?.days_until_due, 10)) ? parseInt(req.body?.days_until_due, 10) : 7;
     const line_items = Array.isArray(req.body?.line_items) ? req.body.line_items : [];
 
-    if (!billing_customer_id || !invoice_title) {
-      return res.status(400).json({ error: 'missing_fields', code: 'missing_fields', detail: 'billing_customer_id and invoice_title are required', request_id });
+    if (!invoice_title || (!billing_customer_id && !client_id)) {
+      return res.status(400).json({ error: 'missing_fields', code: 'missing_fields', detail: 'client_id (or billing_customer_id) and invoice_title are required', request_id });
     }
 
     const normalizedItems = (line_items || []).map((li) => {
@@ -740,17 +741,82 @@ router.post('/invoices/send', async (req, res) => {
 
     console.log('[billing/send] normalized_items', { request_id, items: normalizedItems });
 
-    const { data: billingCustomer, error: fetchErr } = await supabaseAdmin
-      .from('billing_customers')
-      .select('id,name,primary_contact_name,primary_contact_email,stripe_customer_id')
-      .eq('id', billing_customer_id)
-      .maybeSingle();
+    let billingCustomer = null;
+    if (billing_customer_id) {
+      const { data: fetchedCustomer, error: fetchErr } = await supabaseAdmin
+        .from('billing_customers')
+        .select('id,name,primary_contact_name,primary_contact_email,stripe_customer_id')
+        .eq('id', billing_customer_id)
+        .maybeSingle();
+      if (fetchErr) {
+        console.error('[billing/send] customer_lookup_failed', { request_id, error: fetchErr.message, code: fetchErr.code, hint: fetchErr.hint });
+        return res.status(500).json({ error: 'customer_lookup_failed', code: fetchErr.code || 'customer_lookup_failed', detail: fetchErr.message, hint: fetchErr.hint, request_id });
+      }
+      billingCustomer = fetchedCustomer || null;
+    } else {
+      const { data: clientRow, error: clientErr } = await supabaseAdmin
+        .from('clients')
+        .select('id,name,email,client_admin_name')
+        .eq('id', client_id)
+        .maybeSingle();
+      if (clientErr) {
+        console.error('[billing/send] client_lookup_failed', { request_id, error: clientErr.message, code: clientErr.code, hint: clientErr.hint });
+        return res.status(500).json({ error: 'client_lookup_failed', code: clientErr.code || 'client_lookup_failed', detail: clientErr.message, hint: clientErr.hint, request_id });
+      }
+      if (!clientRow) {
+        return res.status(404).json({ error: 'client_not_found', code: 'client_not_found', detail: 'Client not found', request_id });
+      }
 
-    if (fetchErr) {
-      console.error('[billing/send] customer_lookup_failed', { request_id, error: fetchErr.message, code: fetchErr.code, hint: fetchErr.hint });
-      return res.status(500).json({ error: 'customer_lookup_failed', code: fetchErr.code || 'customer_lookup_failed', detail: fetchErr.message, hint: fetchErr.hint, request_id });
+      const customerName = String(clientRow.name || '').trim();
+      const customerEmail = String(clientRow.email || '').trim();
+      const customerContact = String(clientRow.client_admin_name || clientRow.name || '').trim();
+      const emailLooksValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail);
+      if (!customerName || !customerContact || !emailLooksValid) {
+        return res.status(400).json({
+          error: 'client_billing_data_missing',
+          code: 'client_billing_data_missing',
+          detail: 'Selected client is missing required billing contact data.',
+          request_id
+        });
+      }
+
+      const { data: existingCustomer, error: existingErr } = await supabaseAdmin
+        .from('billing_customers')
+        .select('id,name,primary_contact_name,primary_contact_email,stripe_customer_id')
+        .eq('client_id', clientRow.id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (existingErr) {
+        console.error('[billing/send] customer_lookup_failed', { request_id, error: existingErr.message, code: existingErr.code, hint: existingErr.hint });
+        return res.status(500).json({ error: 'customer_lookup_failed', code: existingErr.code || 'customer_lookup_failed', detail: existingErr.message, hint: existingErr.hint, request_id });
+      }
+
+      if (existingCustomer) {
+        billingCustomer = existingCustomer;
+      } else {
+        const { data: createdCustomer, error: createErr } = await supabaseAdmin
+          .from('billing_customers')
+          .insert({
+            client_id: clientRow.id,
+            name: customerName,
+            primary_contact_name: customerContact,
+            primary_contact_email: customerEmail,
+            notes: null
+          })
+          .select('id,name,primary_contact_name,primary_contact_email,stripe_customer_id')
+          .single();
+        if (createErr) {
+          console.error('[billing/send] customer_create_failed', { request_id, error: createErr.message, code: createErr.code, hint: createErr.hint });
+          return res.status(500).json({ error: 'customer_create_failed', code: createErr.code || 'customer_create_failed', detail: createErr.message, hint: createErr.hint, request_id });
+        }
+        billingCustomer = createdCustomer || null;
+      }
+
+      billing_customer_id = billingCustomer?.id || null;
     }
-    if (!billingCustomer) {
+
+    if (!billingCustomer || !billing_customer_id) {
       return res.status(404).json({ error: 'customer_not_found', code: 'customer_not_found', detail: 'Billing customer not found', request_id });
     }
 
