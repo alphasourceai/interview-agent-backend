@@ -401,22 +401,67 @@ async function sendMembershipAgreementInternalNotification(to, details = {}) {
   const safeAdminEmail = escapeHtml(details.adminEmail || details.admin_email || '')
   const safeMembershipTier = escapeHtml(details.membershipTier || details.membership_tier || '')
   const safeBillingOption = escapeHtml(details.billingOption || details.billing_option || '')
+  const detailItems = [
+    safeAgreementId ? `<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;"><strong>Agreement ID:</strong> ${safeAgreementId}</li>` : '',
+    safeClientLegalName ? `<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;"><strong>Client:</strong> ${safeClientLegalName}</li>` : '',
+    safePrimaryAdmin ? `<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;"><strong>Primary Admin:</strong> ${safePrimaryAdmin}</li>` : '',
+    safeAdminEmail ? `<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;"><strong>Admin Email:</strong> ${safeAdminEmail}</li>` : '',
+    safeMembershipTier ? `<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;"><strong>Membership Tier:</strong> ${safeMembershipTier}</li>` : '',
+    safeBillingOption ? `<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;"><strong>Billing Option:</strong> ${safeBillingOption}</li>` : ''
+  ].filter(Boolean).join('')
 
   const msg = {
     to,
     from: FROM,
     subject: 'Membership agreement sent - manual checkout follow-up required',
     html: `
-      <p>A membership agreement has been sent and requires manual checkout follow-up.</p>
-      <ul>
-        ${safeAgreementId ? `<li><strong>Agreement ID:</strong> ${safeAgreementId}</li>` : ''}
-        ${safeClientLegalName ? `<li><strong>Client:</strong> ${safeClientLegalName}</li>` : ''}
-        ${safePrimaryAdmin ? `<li><strong>Primary Admin:</strong> ${safePrimaryAdmin}</li>` : ''}
-        ${safeAdminEmail ? `<li><strong>Admin Email:</strong> ${safeAdminEmail}</li>` : ''}
-        ${safeMembershipTier ? `<li><strong>Membership Tier:</strong> ${safeMembershipTier}</li>` : ''}
-        ${safeBillingOption ? `<li><strong>Billing Option:</strong> ${safeBillingOption}</li>` : ''}
-      </ul>
-      <p>After signature is complete, manually send checkout per current phase-1 process.</p>
+      <!doctype html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <meta name="color-scheme" content="light dark" />
+        <meta name="supported-color-schemes" content="light dark" />
+        <title>Membership agreement sent</title>
+        <style>
+          body { margin: 0; padding: 0; background: #0F1E5D; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+          table { border-collapse: collapse; }
+          a { text-decoration: none; }
+        </style>
+      </head>
+      <body>
+        <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
+          Membership agreement sent - manual checkout follow-up required.
+        </div>
+        <table role="presentation" width="100%" style="background:#0F1E5D;color:#C9D3FF;">
+          <tr>
+            <td align="center" style="padding: 24px 16px;">
+              <table role="presentation" width="100%" style="max-width: 640px;">
+                <tr>
+                  <td style="background:#0F1E5D;color:#C9D3FF;padding:24px;">
+                    <p style="margin:0 0 10px;color:#E6EBFF;font-size:24px;line-height:1.25;font-weight:700;">
+                      Membership agreement sent
+                    </p>
+                    <p style="margin:0 0 12px;color:#C9D3FF;font-size:15px;line-height:1.6;">
+                      A membership agreement has been sent and requires manual checkout follow-up.
+                    </p>
+                    <ul style="margin:0 0 14px;padding:0;">
+                      ${detailItems || '<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;">No agreement details provided.</li>'}
+                    </ul>
+                    <p style="margin:0 0 14px;color:#C9D3FF;font-size:14px;line-height:1.55;">
+                      After signature is complete, manually send checkout per current phase-1 process.
+                    </p>
+                    <p style="margin:0;border-top:1px solid rgba(255,255,255,0.10);padding-top:14px;color:#6B77C9;font-size:13px;line-height:1.55;">
+                      Internal notification for the memberships workflow.
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+      </html>
     `
   }
   const [resp] = await sg.send(msg)
@@ -508,22 +553,67 @@ async function sendMembershipAgreementCompletedInternalNotification(to, details 
   const safeAdminEmail = escapeHtml(details.adminEmail || details.admin_email || '')
   const safeSignerTypedName = escapeHtml(details.signerTypedName || details.signer_typed_name || '')
   const safeSignedAt = escapeHtml(details.signedAt || details.signed_at || '')
+  const detailItems = [
+    safeAgreementId ? `<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;"><strong>Agreement ID:</strong> ${safeAgreementId}</li>` : '',
+    safeClientLegalName ? `<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;"><strong>Client:</strong> ${safeClientLegalName}</li>` : '',
+    safePrimaryAdmin ? `<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;"><strong>Primary Admin:</strong> ${safePrimaryAdmin}</li>` : '',
+    safeAdminEmail ? `<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;"><strong>Admin Email:</strong> ${safeAdminEmail}</li>` : '',
+    safeSignerTypedName ? `<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;"><strong>Signer:</strong> ${safeSignerTypedName}</li>` : '',
+    safeSignedAt ? `<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;"><strong>Signed At:</strong> ${safeSignedAt}</li>` : ''
+  ].filter(Boolean).join('')
 
   const msg = {
     to,
     from: FROM,
     subject: 'Membership agreement signed - manual checkout follow-up required',
     html: `
-      <p>A membership agreement has been signed and is ready for manual checkout follow-up.</p>
-      <ul>
-        ${safeAgreementId ? `<li><strong>Agreement ID:</strong> ${safeAgreementId}</li>` : ''}
-        ${safeClientLegalName ? `<li><strong>Client:</strong> ${safeClientLegalName}</li>` : ''}
-        ${safePrimaryAdmin ? `<li><strong>Primary Admin:</strong> ${safePrimaryAdmin}</li>` : ''}
-        ${safeAdminEmail ? `<li><strong>Admin Email:</strong> ${safeAdminEmail}</li>` : ''}
-        ${safeSignerTypedName ? `<li><strong>Signer:</strong> ${safeSignerTypedName}</li>` : ''}
-        ${safeSignedAt ? `<li><strong>Signed At:</strong> ${safeSignedAt}</li>` : ''}
-      </ul>
-      <p>Send checkout manually per current process.</p>
+      <!doctype html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <meta name="color-scheme" content="light dark" />
+        <meta name="supported-color-schemes" content="light dark" />
+        <title>Membership agreement signed</title>
+        <style>
+          body { margin: 0; padding: 0; background: #0F1E5D; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+          table { border-collapse: collapse; }
+          a { text-decoration: none; }
+        </style>
+      </head>
+      <body>
+        <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
+          Membership agreement signed - manual checkout follow-up required.
+        </div>
+        <table role="presentation" width="100%" style="background:#0F1E5D;color:#C9D3FF;">
+          <tr>
+            <td align="center" style="padding: 24px 16px;">
+              <table role="presentation" width="100%" style="max-width: 640px;">
+                <tr>
+                  <td style="background:#0F1E5D;color:#C9D3FF;padding:24px;">
+                    <p style="margin:0 0 10px;color:#E6EBFF;font-size:24px;line-height:1.25;font-weight:700;">
+                      Membership agreement signed
+                    </p>
+                    <p style="margin:0 0 12px;color:#C9D3FF;font-size:15px;line-height:1.6;">
+                      A membership agreement has been signed and is ready for manual checkout follow-up.
+                    </p>
+                    <ul style="margin:0 0 14px;padding:0;">
+                      ${detailItems || '<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;">No agreement details provided.</li>'}
+                    </ul>
+                    <p style="margin:0 0 14px;color:#C9D3FF;font-size:14px;line-height:1.55;">
+                      Send checkout manually per current process.
+                    </p>
+                    <p style="margin:0;border-top:1px solid rgba(255,255,255,0.10);padding-top:14px;color:#6B77C9;font-size:13px;line-height:1.55;">
+                      Internal notification for the memberships workflow.
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+      </html>
     `
   }
   const [resp] = await sg.send(msg)

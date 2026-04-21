@@ -27,6 +27,81 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 
 const router = express.Router();
 
+function escapeHtml(value = '') {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildRubricChangeEmailHtml({ roleId, roleTitle, clientId, userEmail, requestId, notes, questions }) {
+  const safeRoleId = escapeHtml(roleId || '');
+  const safeRoleTitle = escapeHtml(roleTitle || '');
+  const safeClientId = escapeHtml(clientId || '');
+  const safeUserEmail = escapeHtml(userEmail || '');
+  const safeRequestId = escapeHtml(requestId || '');
+  const safeNotes = escapeHtml(notes || '').replace(/\n/g, '<br />');
+  const safeQuestions = Array.isArray(questions) ? questions : [];
+  const questionItems = safeQuestions.length
+    ? safeQuestions.map((q, i) => `<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;">${i + 1}. ${escapeHtml(q)}</li>`).join('')
+    : '<li style="margin:0 0 6px 18px;color:#E6EBFF;font-size:13px;line-height:1.5;">(none provided)</li>';
+
+  return `
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width,initial-scale=1" />
+      <meta name="color-scheme" content="light dark" />
+      <meta name="supported-color-schemes" content="light dark" />
+      <title>Rubric change request</title>
+      <style>
+        body { margin: 0; padding: 0; background: #0F1E5D; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+        table { border-collapse: collapse; }
+      </style>
+    </head>
+    <body>
+      <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
+        A rubric change request was submitted for role ${safeRoleTitle || safeRoleId}.
+      </div>
+      <table role="presentation" width="100%" style="background:#0F1E5D;color:#C9D3FF;">
+        <tr>
+          <td align="center" style="padding:24px 16px;">
+            <table role="presentation" width="100%" style="max-width:640px;">
+              <tr>
+                <td style="background:#0F1E5D;color:#C9D3FF;padding:24px;">
+                  <p style="margin:0 0 10px;color:#E6EBFF;font-size:24px;line-height:1.25;font-weight:700;">
+                    Rubric change request received
+                  </p>
+                  <table role="presentation" width="100%" style="margin:0 0 14px;">
+                    <tr><td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;width:140px;vertical-align:top;">Role ID</td><td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.4;vertical-align:top;">${safeRoleId}</td></tr>
+                    <tr><td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;width:140px;vertical-align:top;">Role Title</td><td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.4;vertical-align:top;">${safeRoleTitle}</td></tr>
+                    <tr><td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;width:140px;vertical-align:top;">Client ID</td><td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.4;vertical-align:top;">${safeClientId}</td></tr>
+                    <tr><td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;width:140px;vertical-align:top;">User Email</td><td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.4;vertical-align:top;">${safeUserEmail}</td></tr>
+                    <tr><td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;width:140px;vertical-align:top;">Request ID</td><td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.4;vertical-align:top;">${safeRequestId}</td></tr>
+                  </table>
+                  <p style="margin:0 0 6px;color:#9FB0FF;font-size:12px;line-height:1.4;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Notes</p>
+                  <p style="margin:0 0 14px;color:#E6EBFF;font-size:13px;line-height:1.6;">${safeNotes || '(none provided)'}</p>
+                  <p style="margin:0 0 6px;color:#9FB0FF;font-size:12px;line-height:1.4;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Questions</p>
+                  <ul style="margin:0 0 14px;padding:0;">
+                    ${questionItems}
+                  </ul>
+                  <p style="margin:0;border-top:1px solid rgba(255,255,255,0.10);padding-top:14px;color:#6B77C9;font-size:13px;line-height:1.55;">
+                    Notification from alphaScreen rubric workflow.
+                  </p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+  `;
+}
+
 function getScopedMembershipRole(req, clientId) {
   const targetClientId = String(clientId || '').trim();
   if (!targetClientId) return '';
@@ -518,7 +593,16 @@ ${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}
           to: RUBRIC_CHANGE_TO,
           from: RUBRIC_CHANGE_FROM,
           subject,
-          text
+          text,
+          html: buildRubricChangeEmailHtml({
+            roleId,
+            roleTitle: roleData?.title || '',
+            clientId,
+            userEmail,
+            requestId,
+            notes,
+            questions
+          })
         });
       }
     } catch (e) {

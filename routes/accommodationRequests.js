@@ -36,6 +36,163 @@ function safeText(v) {
   return String(v || '').trim();
 }
 
+function escapeHtml(value = '') {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function buildBrandedEmailShell({ preheader, title, contentHtml }) {
+  const safePreheader = escapeHtml(preheader || '');
+  const safeTitle = escapeHtml(title || '');
+  return `
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width,initial-scale=1" />
+      <meta name="color-scheme" content="light dark" />
+      <meta name="supported-color-schemes" content="light dark" />
+      <title>${safeTitle}</title>
+      <style>
+        body { margin: 0; padding: 0; background: #0F1E5D; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+        table { border-collapse: collapse; }
+        a { text-decoration: none; }
+        @media (max-width: 640px) {
+          .container { width: 100% !important; padding: 16px !important; }
+          .card { padding: 18px !important; border-radius: 14px !important; }
+          .cta { display: block !important; width: 100% !important; text-align: center !important; box-sizing: border-box !important; }
+        }
+      </style>
+    </head>
+    <body>
+      <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
+        ${safePreheader}
+      </div>
+      <table role="presentation" width="100%" style="background:#0F1E5D;color:#C9D3FF;">
+        <tr>
+          <td align="center" style="padding: 24px 16px;">
+            <table role="presentation" width="100%" class="container" style="max-width: 640px;">
+              <tr>
+                <td>
+                  <table role="presentation" width="100%" class="card" style="background:#0F1E5D;color:#C9D3FF;border:0;border-radius:0;box-shadow:none;padding:24px;">
+                    <tr>
+                      <td align="left" style="padding-bottom:16px;">
+                        <img src="https://rytlclkkcvvnkoncfaid.supabase.co/storage/v1/object/public/email-assets/Color%20logo%20-%20no%20background.png" alt="AlphaSource" width="208" style="display:block;border:0;outline:none;text-decoration:none;height:auto;max-width:100%;" />
+                      </td>
+                    </tr>
+                    <tr>
+                      <td style="color:#E6EBFF;font-size:24px;line-height:1.25;font-weight:700;padding-bottom:10px;">
+                        ${safeTitle}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        ${contentHtml || ''}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td style="border-top:1px solid rgba(255,255,255,0.10);padding-top:14px;color:#6B77C9;font-size:13px;line-height:1.55;">
+                        Need help? Email <a href="mailto:info@alphasourceai.com" style="color:#A78BFA;">info@alphasourceai.com</a>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+  `;
+}
+
+function buildTextInterviewLinkEmailHtml({ candidateName, interviewLink }) {
+  const safeCandidateName = escapeHtml(candidateName || '');
+  const safeInterviewLink = escapeHtml(interviewLink || '');
+  const greeting = safeCandidateName ? `Hi ${safeCandidateName},` : 'Hi,';
+  return buildBrandedEmailShell({
+    preheader: 'Your interview link is ready.',
+    title: `${APP_NAME} text interview link`,
+    contentHtml: `
+      <p style="margin:0 0 12px;color:#C9D3FF;font-size:15px;line-height:1.6;">
+        ${greeting}
+      </p>
+      <p style="margin:0 0 18px;color:#C9D3FF;font-size:15px;line-height:1.6;">
+        Your interview link is ready. Use the button below to start your text interview.
+      </p>
+      <p style="margin:0 0 18px;">
+        <a class="cta" href="${safeInterviewLink}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#A78BFA;color:#0A1547;border:1px solid #CFCBFF;border-radius:10px;padding:11px 18px;font-size:14px;font-weight:700;line-height:1;">
+          Start text interview
+        </a>
+      </p>
+      <p style="margin:0 0 16px;color:#C9D3FF;font-size:14px;line-height:1.55;">
+        If the button doesn’t work, <a href="${safeInterviewLink}" target="_blank" rel="noopener noreferrer" style="color:#FFFFFF;">click here</a> to open your interview link.
+      </p>
+      <p style="margin:0 0 16px;color:#C9D3FF;font-size:14px;line-height:1.55;">
+        If you did not request this, please ignore this email.
+      </p>
+    `
+  });
+}
+
+function buildAccommodationNotifyEmailHtml({
+  requestId,
+  roleTitle,
+  roleId,
+  candidateName,
+  candidateEmail,
+  candidatePhone,
+  requestText,
+  resumeUrl,
+  createdAt
+}) {
+  const safeRequestText = escapeHtml(requestText || '').replace(/\n/g, '<br />');
+  const detailRows = [
+    ['Request ID', escapeHtml(requestId || '')],
+    ['Role', escapeHtml(roleTitle || '')],
+    ['Role ID', escapeHtml(roleId || '')],
+    ['Candidate', escapeHtml(candidateName || '')],
+    ['Email', escapeHtml(candidateEmail || '')],
+    candidatePhone ? ['Phone', escapeHtml(candidatePhone)] : null,
+    ['Created', escapeHtml(createdAt || '')]
+  ].filter(Boolean);
+
+  return buildBrandedEmailShell({
+    preheader: `New accommodation request (${requestId || ''})`,
+    title: 'New accommodation request',
+    contentHtml: `
+      <p style="margin:0 0 14px;color:#C9D3FF;font-size:15px;line-height:1.6;">
+        A new accommodation request has been submitted and may require follow-up.
+      </p>
+      <table role="presentation" width="100%" style="margin:0 0 14px;">
+        ${detailRows.map(([label, value]) => `
+          <tr>
+            <td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;vertical-align:top;width:140px;">${label}</td>
+            <td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.4;vertical-align:top;">${value}</td>
+          </tr>
+        `).join('')}
+        <tr>
+          <td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;vertical-align:top;width:140px;">Request</td>
+          <td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.5;vertical-align:top;">${safeRequestText || '(none provided)'}</td>
+        </tr>
+        ${resumeUrl ? `
+          <tr>
+            <td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;vertical-align:top;width:140px;">Resume</td>
+            <td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.4;vertical-align:top;">
+              <a href="${escapeHtml(resumeUrl)}" target="_blank" rel="noopener noreferrer" style="color:#FFFFFF;">Open resume</a>
+            </td>
+          </tr>
+        ` : ''}
+      </table>
+    `
+  });
+}
+
 async function accommodationRequestRateLimit(req, res, next) {
   try {
     const result = await checkAndIncrementRateLimit({
@@ -505,20 +662,22 @@ router.post('/:id/send-text-link', requireAuth, requireAdmin, async (req, res) =
 
     const interviewLink = buildTextInterviewUrl(token);
     const candidateName = String(reqRow.candidate_name || '').trim();
+    const textBody = [
+      candidateName ? `Hi ${candidateName},` : 'Hi,',
+      '',
+      'Your interview link is ready. Use the link below to start your text interview:',
+      interviewLink,
+      '',
+      'If you did not request this, please ignore this email.',
+    ].join('\n');
 
     try {
       await sg.send({
         to: reqRow.candidate_email,
         from: { email: FROM_EMAIL, name: APP_NAME },
         subject: `${APP_NAME} text interview link`,
-        text: [
-          candidateName ? `Hi ${candidateName},` : 'Hi,',
-          '',
-          'Your interview link is ready. Use the link below to start your text interview:',
-          interviewLink,
-          '',
-          'If you did not request this, please ignore this email.',
-        ].join('\n'),
+        text: textBody,
+        html: buildTextInterviewLinkEmailHtml({ candidateName, interviewLink })
       });
     } catch (e) {
       return sendError(res, 500, {
@@ -803,6 +962,17 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
         from: { email: FROM_EMAIL, name: APP_NAME },
         subject: `Accommodation request: ${candidate_name} (${role.title || 'Role'})`,
         text: textBody,
+        html: buildAccommodationNotifyEmailHtml({
+          requestId: reqRow.id,
+          roleTitle: role.title || role.id,
+          roleId: role.id,
+          candidateName: candidate_name,
+          candidateEmail: candidate_email,
+          candidatePhone: candidate_phone,
+          requestText: request_text,
+          resumeUrl: resume_url,
+          createdAt: reqRow.created_at
+        })
       });
       notifySent = resp?.statusCode === 202;
     } catch (e) {
