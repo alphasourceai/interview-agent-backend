@@ -64,8 +64,7 @@ function buildBrandedEmailShell({
   preheader = '',
   contentHtml = '',
   helpEmail = DEFAULT_HELP_EMAIL,
-  footerNote = '',
-  noCard = false
+  footerNote = ''
 } = {}) {
   const safeTitle = escapeHtml(title || '')
   const safePreheader = escapeHtml(preheader || '')
@@ -88,9 +87,6 @@ function buildBrandedEmailShell({
       </tr>
     `
     : ''
-  const cardStyle = noCard
-    ? 'background:#F8F9FD;color:#33416D;border:0;border-radius:0;box-shadow:none;padding:24px;'
-    : 'background:#FFFFFF;color:#33416D;border:1px solid #E6EAF7;border-radius:18px;box-shadow:0 16px 38px rgba(10,21,71,0.08);padding:24px;'
   return `
     <!doctype html>
     <html lang="en">
@@ -101,12 +97,12 @@ function buildBrandedEmailShell({
       <meta name="supported-color-schemes" content="light" />
       <title>${safeTitle}</title>
       <style>
-        body { margin: 0; padding: 0; background: #F8F9FD; color: #33416D; font-family: Raleway, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        body { margin: 0; padding: 0; background: #F8F9FD; color: #0A1547; font-family: Raleway, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
         table { border-collapse: collapse; }
         a { color: #4E40A5; text-decoration: none; }
-        p { margin: 0 0 12px; color: #33416D; font-size: 15px; line-height: 1.65; }
+        p { margin: 0 0 12px; color: #0A1547; font-size: 15px; line-height: 1.65; }
         ul { margin: 0 0 12px; padding: 0; }
-        li { color: #33416D; font-size: 14px; line-height: 1.55; }
+        li { color: #46527C; font-size: 14px; line-height: 1.55; }
         .cta {
           display: inline-block;
           background: #A380F6;
@@ -120,7 +116,7 @@ function buildBrandedEmailShell({
         }
         @media (max-width: 640px) {
           .container { width: 100% !important; padding: 16px !important; }
-          .card { padding: 18px !important; border-radius: 16px !important; }
+          .card { padding: 18px !important; }
           .cta { display: block !important; width: 100% !important; text-align: center !important; box-sizing: border-box !important; }
         }
       </style>
@@ -135,7 +131,7 @@ function buildBrandedEmailShell({
             <table role="presentation" width="100%" class="container" style="max-width: 640px;">
               <tr>
                 <td>
-                  <table role="presentation" width="100%" class="card" style="${cardStyle}">
+                  <table role="presentation" width="100%" class="card" style="background:#F8F9FD;color:#0A1547;border:0;border-radius:0;box-shadow:none;padding:24px;">
                     <tr>
                       <td align="left" style="padding-bottom:16px;">
                         <img src="${safeLogoUrl}" alt="AlphaSource" width="208" style="display:block;border:0;outline:none;text-decoration:none;height:auto;max-width:100%;" />
@@ -147,7 +143,7 @@ function buildBrandedEmailShell({
                       </td>
                     </tr>
                     <tr>
-                      <td style="color:#33416D;">
+                      <td style="color:#0A1547;">
                         ${normalizedContentHtml}
                       </td>
                     </tr>
@@ -321,7 +317,6 @@ async function sendMembershipAgreementEmail(to, signingUrl, details = {}) {
       title: 'alphaScreen Membership Agreement',
       preheader: `Your membership agreement for ${clientLegalNameText} is ready for signature.`,
       helpEmail: 'memberships@alphasourceai.com',
-      noCard: true,
       contentHtml: `
         <p style="margin:0 0 12px;font-size:15px;line-height:1.6;">
           ${escapeHtml(greeting)}
