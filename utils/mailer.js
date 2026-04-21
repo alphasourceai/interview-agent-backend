@@ -64,7 +64,8 @@ function buildBrandedEmailShell({
   preheader = '',
   contentHtml = '',
   helpEmail = DEFAULT_HELP_EMAIL,
-  footerNote = ''
+  footerNote = '',
+  noCard = false
 } = {}) {
   const safeTitle = escapeHtml(title || '')
   const safePreheader = escapeHtml(preheader || '')
@@ -87,6 +88,9 @@ function buildBrandedEmailShell({
       </tr>
     `
     : ''
+  const cardStyle = noCard
+    ? 'background:#F8F9FD;color:#33416D;border:0;border-radius:0;box-shadow:none;padding:24px;'
+    : 'background:#FFFFFF;color:#33416D;border:1px solid #E6EAF7;border-radius:18px;box-shadow:0 16px 38px rgba(10,21,71,0.08);padding:24px;'
   return `
     <!doctype html>
     <html lang="en">
@@ -131,7 +135,7 @@ function buildBrandedEmailShell({
             <table role="presentation" width="100%" class="container" style="max-width: 640px;">
               <tr>
                 <td>
-                  <table role="presentation" width="100%" class="card" style="background:#FFFFFF;color:#33416D;border:1px solid #E6EAF7;border-radius:18px;box-shadow:0 16px 38px rgba(10,21,71,0.08);padding:24px;">
+                  <table role="presentation" width="100%" class="card" style="${cardStyle}">
                     <tr>
                       <td align="left" style="padding-bottom:16px;">
                         <img src="${safeLogoUrl}" alt="AlphaSource" width="208" style="display:block;border:0;outline:none;text-decoration:none;height:auto;max-width:100%;" />
@@ -317,6 +321,7 @@ async function sendMembershipAgreementEmail(to, signingUrl, details = {}) {
       title: 'alphaScreen Membership Agreement',
       preheader: `Your membership agreement for ${clientLegalNameText} is ready for signature.`,
       helpEmail: 'memberships@alphasourceai.com',
+      noCard: true,
       contentHtml: `
         <p style="margin:0 0 12px;font-size:15px;line-height:1.6;">
           ${escapeHtml(greeting)}
