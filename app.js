@@ -265,6 +265,20 @@ function sanitizeClientDashboardTab(value, fallback) {
   return CLIENT_DASHBOARD_TABS.has(raw) ? raw : fallback
 }
 
+function getClientMembershipRole(req, clientId) {
+  const targetClientId = String(clientId || '').trim()
+  if (!targetClientId) return ''
+  const memberships = Array.isArray(req?.memberships) ? req.memberships : []
+  const membership = memberships.find((item) => String(item?.client_id || '').trim() === targetClientId)
+  return String(membership?.role || '').trim().toLowerCase()
+}
+
+function hasClientWriteAccess(req, clientId) {
+  if (req?.isGlobalAdmin === true || req?.isAdmin === true) return true
+  const role = getClientMembershipRole(req, clientId)
+  return role === 'manager' || role === 'admin'
+}
+
 function wantsEmbeddedCheckout(value) {
   if (value === true) return true
   const raw = String(value || '').trim().toLowerCase()
@@ -278,6 +292,7 @@ app.post('/clients/billing/portal-session', requireAuth, withClientScope, async 
     const tab = sanitizeClientDashboardTab(req.body?.tab, 'billing')
     if (!clientId) return res.status(400).json({ error: 'client_id_required' })
     if (!ids.includes(clientId)) return res.status(403).json({ error: 'forbidden' })
+    if (!hasClientWriteAccess(req, clientId)) return res.status(403).json({ error: 'forbidden' })
 
     const { data: client, error: clientErr } = await supabaseAdmin
       .from('clients')
@@ -318,6 +333,7 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
 
     if (!clientId) return res.status(400).json({ error: 'client_id_required' })
     if (!ids.includes(clientId)) return res.status(403).json({ error: 'forbidden' })
+    if (!hasClientWriteAccess(req, clientId)) return res.status(403).json({ error: 'forbidden' })
     if (!roleId) return res.status(400).json({ error: 'role_id_required' })
     if (!Number.isInteger(quantity) || quantity <= 0) {
       return res.status(400).json({ error: 'invalid_quantity' })
@@ -530,6 +546,7 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
 
     if (!clientId) return res.status(400).json({ error: 'client_id_required' })
     if (!ids.includes(clientId)) return res.status(403).json({ error: 'forbidden' })
+    if (!hasClientWriteAccess(req, clientId)) return res.status(403).json({ error: 'forbidden' })
     if (!roleTitle) return res.status(400).json({ error: 'role_title_required' })
     if (!['BASIC', 'DETAILED', 'TECHNICAL'].includes(interviewType)) {
       return res.status(400).json({ error: 'invalid_interview_type' })
@@ -947,6 +964,7 @@ app.post('/clients/invite', requireAuth, withClientScope, async (req, res) => {
     const { email, role = 'member', client_id } = req.body || {}
     if (!email || !client_id) return res.status(400).json({ error: 'email and client_id are required' })
     if (!(req.clientIds || []).includes(client_id)) return res.status(403).json({ error: 'Forbidden' })
+    if (!hasClientWriteAccess(req, client_id)) return res.status(403).json({ error: 'Forbidden' })
 
     const token = crypto.randomBytes(16).toString('hex')
     const { error } = await supabaseAdmin

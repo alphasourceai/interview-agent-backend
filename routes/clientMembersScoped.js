@@ -189,7 +189,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
     const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
     const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
     const userRole = (membership?.role || '').toLowerCase();
-    if (!isGlobalAdmin && (!membership || !['manager', 'admin', 'tester'].includes(userRole))) {
+    if (!isGlobalAdmin && (!membership || !['manager', 'admin'].includes(userRole))) {
       return res.status(403).json({ error: 'forbidden', request_id });
     }
     if (!['member', 'manager'].includes(role)) {
@@ -268,6 +268,77 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
   }
 });
 
+router.post('/send-password-reset', requireAuth, withClientScope, async (req, res) => {
+  try {
+    const request_id = req.request_id || null;
+    const clientId = req.body?.client_id || req.client?.id || req.clientScope?.defaultClientId || null;
+    const email = String(req.body?.email || '').trim();
+    if (!clientId || !email) return res.status(400).json({ error: 'client_id_and_email_required', request_id });
+
+    const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
+    const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
+    const userRole = (membership?.role || '').toLowerCase();
+    if (!isGlobalAdmin && (!membership || !['manager', 'admin'].includes(userRole))) {
+      return res.status(403).json({ error: 'forbidden', request_id });
+    }
+
+    const { data: existingMember, error: lookupErr } = await supabaseAdmin
+      .from('client_members')
+      .select('email,name')
+      .eq('client_id', clientId)
+      .eq('email', email)
+      .maybeSingle();
+    if (lookupErr) {
+      return res.status(500).json({ error: 'member_lookup_failed', detail: lookupErr.message, request_id });
+    }
+    if (!existingMember) {
+      return res.status(404).json({ error: 'member_not_found', request_id });
+    }
+
+    const memberName = String(existingMember.name || req.body?.name || email).trim() || email;
+    const { userId, method, actionLink } = await ensureUserAndSendRecovery({
+      email,
+      redirectTo: buildClientPwResetUrl(),
+      request_id,
+      loggerPrefix: '[client-members/send-password-reset]'
+    });
+    if (!userId) {
+      console.error('[client-members/send-password-reset] add_member_no_user_id', { request_id, email: redactEmail(email), method });
+      return res.status(400).json({
+        error: 'send_password_reset_failed',
+        detail: 'Could not create or locate user for this email.',
+        request_id
+      });
+    }
+
+    const emailResult = await sendMemberRecoveryEmail(email, actionLink, memberName);
+    if (emailResult?.statusCode !== 202) {
+      const err = new Error(emailResult?.skipped ? 'email_skipped' : 'email_send_failed');
+      err.code = 'send_member_recovery_email_failed';
+      err.detail = emailResult?.skipped ? 'email_skipped' : 'email_send_failed';
+      throw err;
+    }
+
+    return res.json({ ok: true, request_id });
+  } catch (e) {
+    if (e?.code === 'recover_failed' || e?.code === 'create_user_failed' || e?.code === 'send_member_recovery_email_failed') {
+      return res.status(500).json({
+        error: 'send_password_reset_failed',
+        detail: e?.detail || e?.message || 'send_password_reset_failed',
+        request_id: req.request_id || null,
+        code: e?.code || 'send_password_reset_failed',
+        helper_status: e?.status || null
+      });
+    }
+    return res.status(500).json({
+      error: 'send_password_reset_failed',
+      detail: e?.message || 'send_password_reset_failed',
+      request_id: req.request_id || null,
+      code: e?.code || 'send_password_reset_failed'
+    });
+  }
+});
+
 router.delete('/:id', requireAuth, withClientScope, async (req, res) => {
   try {
     const request_id = req.request_id || null;
@@ -278,7 +349,7 @@ router.delete('/:id', requireAuth, withClientScope, async (req, res) => {
     const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === client_id);
     const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
     const userRole = (membership?.role || '').toLowerCase();
-    if (!isGlobalAdmin && (!membership || !['manager', 'admin', 'tester'].includes(userRole))) {
+    if (!isGlobalAdmin && (!membership || !['manager', 'admin'].includes(userRole))) {
       return res.status(403).json({ error: 'forbidden', request_id });
     }
 

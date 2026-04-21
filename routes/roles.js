@@ -27,6 +27,20 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
 
 const router = express.Router();
 
+function getScopedMembershipRole(req, clientId) {
+  const targetClientId = String(clientId || '').trim();
+  if (!targetClientId) return '';
+  const memberships = Array.isArray(req?.clientScope?.memberships) ? req.clientScope.memberships : [];
+  const membership = memberships.find((item) => String(item?.client_id || '').trim() === targetClientId);
+  return String(membership?.role || '').trim().toLowerCase();
+}
+
+function hasScopedWriteAccess(req, clientId) {
+  if (req?.isGlobalAdmin === true || req?.isAdmin === true) return true;
+  const role = getScopedMembershipRole(req, clientId);
+  return role === 'manager' || role === 'admin';
+}
+
 
 /**
  * GET /roles?client_id=...
@@ -121,6 +135,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
       null;
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
+    if (!hasScopedWriteAccess(req, clientId)) return res.status(403).json({ error: 'forbidden' });
     const interviewTypeRaw = String(req.body.interview_type || '').trim().toUpperCase();
     const interviewType = ['BASIC', 'DETAILED', 'TECHNICAL'].includes(interviewTypeRaw)
       ? interviewTypeRaw
@@ -519,19 +534,65 @@ ${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}
 
 /**
  * DELETE /admin/roles?id=...&client_id=...
- * Also supports JSON body. Requires auth (global admin dashboard behavior).
+ * Also supports JSON body.
  */
-router.delete('/admin/roles', requireAuth, async (req, res) => {
-  return res.status(403).json({ error: 'legacy_route_disabled' });
+router.delete('/admin/roles', requireAuth, withClientScope, async (req, res) => {
+  try {
+    const roleId = String(req.query?.id || req.body?.id || '').trim();
+    const clientId = String(req.query?.client_id || req.body?.client_id || '').trim();
+    if (!roleId || !clientId) return res.status(400).json({ error: 'id_and_client_id_required' });
+    if (!hasScopedWriteAccess(req, clientId)) return res.status(403).json({ error: 'forbidden' });
+
+    const { data, error } = await db
+      .from('roles')
+      .delete()
+      .eq('id', roleId)
+      .eq('client_id', clientId)
+      .select('id')
+      .maybeSingle();
+
+    if (error) {
+      console.error('[DELETE /roles/admin/roles] supabase error', error);
+      return res.status(500).json({ error: 'delete_role_failed', detail: error.message });
+    }
+    if (!data) return res.status(404).json({ error: 'not_found' });
+    return res.json({ ok: true, id: data.id });
+  } catch (e) {
+    console.error('[DELETE /roles/admin/roles] unexpected', e);
+    return res.status(500).json({ error: 'server_error' });
+  }
 });
 
 /**
  * POST /admin/roles/delete
  * Body: { id, client_id }
- * Mirrors FE fall-back call pattern.
+ * Mirrors FE fallback call pattern.
  */
-router.post('/admin/roles/delete', requireAuth, async (req, res) => {
-  return res.status(403).json({ error: 'legacy_route_disabled' });
+router.post('/admin/roles/delete', requireAuth, withClientScope, async (req, res) => {
+  try {
+    const roleId = String(req.body?.id || '').trim();
+    const clientId = String(req.body?.client_id || '').trim();
+    if (!roleId || !clientId) return res.status(400).json({ error: 'id_and_client_id_required' });
+    if (!hasScopedWriteAccess(req, clientId)) return res.status(403).json({ error: 'forbidden' });
+
+    const { data, error } = await db
+      .from('roles')
+      .delete()
+      .eq('id', roleId)
+      .eq('client_id', clientId)
+      .select('id')
+      .maybeSingle();
+
+    if (error) {
+      console.error('[POST /roles/admin/roles/delete] supabase error', error);
+      return res.status(500).json({ error: 'delete_role_failed', detail: error.message });
+    }
+    if (!data) return res.status(404).json({ error: 'not_found' });
+    return res.json({ ok: true, id: data.id });
+  } catch (e) {
+    console.error('[POST /roles/admin/roles/delete] unexpected', e);
+    return res.status(500).json({ error: 'server_error' });
+  }
 });
 
 module.exports = router;
