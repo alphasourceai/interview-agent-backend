@@ -21,6 +21,7 @@ const SIGNING_LINK_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const AGREEMENT_CLIENT_MODE_ATTACH = 'attach_existing_client';
 const AGREEMENT_CLIENT_MODE_ADD = 'add_new_client';
+const BILLING_INVOICE_SELECT = 'id,billing_customer_id,title,invoice_title,invoice_description,amount_total_cents,currency,status,hosted_invoice_url,stripe_invoice_id,created_at,customer_name,customer_email';
 
 const bearer = (req) => {
   const h = req.headers['authorization'] || req.headers['Authorization'];
@@ -251,6 +252,71 @@ function extractErrorMessage(text, fallback) {
     if (typeof detail === 'string' && detail.trim()) return detail.trim();
   } catch (_) {}
   return raw;
+}
+
+function buildBillingInvoiceSyncPayload(stripeInvoice) {
+  const statusRaw = String(stripeInvoice?.status || '').trim().toLowerCase();
+  const hostedInvoiceUrlRaw = String(stripeInvoice?.hosted_invoice_url || '').trim();
+  const totalRaw = Number(stripeInvoice?.total);
+  const amountDueRaw = Number(stripeInvoice?.amount_due);
+  const amountTotalCents = Number.isFinite(totalRaw)
+    ? Math.round(totalRaw)
+    : Number.isFinite(amountDueRaw)
+      ? Math.round(amountDueRaw)
+      : null;
+  const currencyRaw = String(stripeInvoice?.currency || '').trim().toLowerCase();
+
+  const payload = {};
+  if (statusRaw) payload.status = statusRaw;
+  if (hostedInvoiceUrlRaw) payload.hosted_invoice_url = hostedInvoiceUrlRaw;
+  if (amountTotalCents !== null) payload.amount_total_cents = amountTotalCents;
+  if (currencyRaw) payload.currency = currencyRaw;
+  return payload;
+}
+
+async function syncBillingInvoicesByStripeIds(stripeInvoiceIds, { request_id, logPrefix }) {
+  if (!stripe || !stripe.invoices || !Array.isArray(stripeInvoiceIds) || !stripeInvoiceIds.length) {
+    return { attempted: 0, synced: 0, failed: 0 };
+  }
+
+  let synced = 0;
+  let failed = 0;
+
+  for (const invoiceId of stripeInvoiceIds) {
+    const stripeInvoiceId = String(invoiceId || '').trim();
+    if (!stripeInvoiceId) continue;
+    try {
+      const stripeInvoice = await stripe.invoices.retrieve(stripeInvoiceId);
+      const payload = buildBillingInvoiceSyncPayload(stripeInvoice);
+      if (!Object.keys(payload).length) continue;
+      const { data: updatedRows, error: updateErr } = await supabaseAdmin
+        .from('billing_invoices')
+        .update(payload)
+        .eq('stripe_invoice_id', stripeInvoiceId)
+        .select('id');
+      if (updateErr) {
+        failed += 1;
+        console.error(`${logPrefix} sync_update_failed`, {
+          request_id,
+          stripe_invoice_id: stripeInvoiceId,
+          error: updateErr.message,
+          code: updateErr.code,
+          hint: updateErr.hint
+        });
+        continue;
+      }
+      if (Array.isArray(updatedRows) && updatedRows.length > 0) synced += 1;
+    } catch (syncErr) {
+      failed += 1;
+      console.error(`${logPrefix} sync_retrieve_failed`, {
+        request_id,
+        stripe_invoice_id: stripeInvoiceId,
+        error: syncErr?.message || syncErr
+      });
+    }
+  }
+
+  return { attempted: stripeInvoiceIds.length, synced, failed };
 }
 
 function slugify(value) {
@@ -645,7 +711,7 @@ router.get('/invoices', async (_req, res) => {
   try {
     const { data, error } = await supabaseAdmin
       .from('billing_invoices')
-      .select('id,billing_customer_id,title,invoice_title,invoice_description,amount_total_cents,currency,status,hosted_invoice_url,stripe_invoice_id,created_at,customer_name,customer_email')
+      .select(BILLING_INVOICE_SELECT)
       .order('created_at', { ascending: false })
       .limit(200);
     if (error) {
@@ -653,7 +719,31 @@ router.get('/invoices', async (_req, res) => {
       return res.status(500).json({ error: 'list_invoices_failed', code: error.code || 'list_invoices_failed', detail: error.message, hint: error.hint, request_id });
     }
 
-    const needsEnrichment = (data || []).filter((inv) => !inv.customer_name || !inv.customer_email);
+    let invoices = data || [];
+
+    const stripeInvoiceIds = Array.from(
+      new Set(invoices.map((inv) => String(inv?.stripe_invoice_id || '').trim()).filter(Boolean))
+    );
+    if (stripeInvoiceIds.length) {
+      await syncBillingInvoicesByStripeIds(stripeInvoiceIds, { request_id, logPrefix: '[billing/invoices:list]' });
+      const { data: refreshed, error: refreshErr } = await supabaseAdmin
+        .from('billing_invoices')
+        .select(BILLING_INVOICE_SELECT)
+        .order('created_at', { ascending: false })
+        .limit(200);
+      if (refreshErr) {
+        console.error('[billing/invoices:list] refresh_failed', {
+          request_id,
+          error: refreshErr.message,
+          code: refreshErr.code,
+          hint: refreshErr.hint
+        });
+      } else if (Array.isArray(refreshed)) {
+        invoices = refreshed;
+      }
+    }
+
+    const needsEnrichment = (invoices || []).filter((inv) => !inv.customer_name || !inv.customer_email);
     if (needsEnrichment.length) {
       const ids = Array.from(new Set(needsEnrichment.map((inv) => inv.billing_customer_id).filter(Boolean)));
       if (ids.length) {
@@ -663,7 +753,7 @@ router.get('/invoices', async (_req, res) => {
           .in('id', ids);
         if (!custErr && Array.isArray(custData)) {
           const map = Object.fromEntries((custData || []).map((c) => [c.id, c]));
-          data.forEach((inv) => {
+          invoices.forEach((inv) => {
             if (!inv.customer_name || !inv.customer_email) {
               const c = map[inv.billing_customer_id];
               if (c) {
@@ -678,9 +768,51 @@ router.get('/invoices', async (_req, res) => {
       }
     }
 
-    return res.json({ items: data || [], request_id });
+    return res.json({ items: invoices || [], request_id });
   } catch (e) {
     console.error('[billing/invoices:list] unexpected', { request_id, error: e?.message || e });
+    return res.status(500).json({ error: 'server_error', code: 'server_error', detail: e?.message || 'Server error', request_id });
+  }
+});
+
+router.post('/invoices/sync', async (req, res) => {
+  const request_id = req.request_id || null;
+  try {
+    if (!stripe || !stripe.invoices) {
+      return res.status(500).json({
+        error: 'stripe_unavailable',
+        code: 'stripe_unavailable',
+        detail: 'Stripe client is unavailable.',
+        request_id
+      });
+    }
+
+    const requestedLimit = Number.parseInt(String(req.body?.limit || '500'), 10);
+    const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(requestedLimit, 2000)) : 500;
+    const { data: rows, error } = await supabaseAdmin
+      .from('billing_invoices')
+      .select('id,stripe_invoice_id')
+      .not('stripe_invoice_id', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    if (error) {
+      console.error('[billing/invoices:sync] list_failed', { request_id, error: error.message, code: error.code, hint: error.hint });
+      return res.status(500).json({
+        error: 'sync_list_failed',
+        code: error.code || 'sync_list_failed',
+        detail: error.message,
+        hint: error.hint,
+        request_id
+      });
+    }
+
+    const stripeInvoiceIds = Array.from(
+      new Set((rows || []).map((row) => String(row?.stripe_invoice_id || '').trim()).filter(Boolean))
+    );
+    const syncResult = await syncBillingInvoicesByStripeIds(stripeInvoiceIds, { request_id, logPrefix: '[billing/invoices:sync]' });
+    return res.json({ ok: true, ...syncResult, request_id });
+  } catch (e) {
+    console.error('[billing/invoices:sync] unexpected', { request_id, error: e?.message || e });
     return res.status(500).json({ error: 'server_error', code: 'server_error', detail: e?.message || 'Server error', request_id });
   }
 });

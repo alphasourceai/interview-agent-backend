@@ -34,6 +34,41 @@ function pickId(value) {
   return null;
 }
 
+function buildBillingInvoiceSyncPayload(stripeInvoice) {
+  const statusRaw = String(stripeInvoice?.status || '').trim().toLowerCase();
+  const hostedInvoiceUrlRaw = String(stripeInvoice?.hosted_invoice_url || '').trim();
+  const totalRaw = Number(stripeInvoice?.total);
+  const amountDueRaw = Number(stripeInvoice?.amount_due);
+  const amountTotalCents = Number.isFinite(totalRaw)
+    ? Math.round(totalRaw)
+    : Number.isFinite(amountDueRaw)
+      ? Math.round(amountDueRaw)
+      : null;
+  const currencyRaw = String(stripeInvoice?.currency || '').trim().toLowerCase();
+
+  const payload = {};
+  if (statusRaw) payload.status = statusRaw;
+  if (hostedInvoiceUrlRaw) payload.hosted_invoice_url = hostedInvoiceUrlRaw;
+  if (amountTotalCents !== null) payload.amount_total_cents = amountTotalCents;
+  if (currencyRaw) payload.currency = currencyRaw;
+  return payload;
+}
+
+async function syncBillingInvoiceFromStripeEvent(stripeInvoice, request_id) {
+  const stripeInvoiceId = pickId(stripeInvoice?.id);
+  if (!stripeInvoiceId) return;
+  const payload = buildBillingInvoiceSyncPayload(stripeInvoice);
+  if (!Object.keys(payload).length) return;
+
+  const { error } = await supabaseAdmin
+    .from('billing_invoices')
+    .update(payload)
+    .eq('stripe_invoice_id', stripeInvoiceId);
+  if (error) {
+    throw new Error(`Billing invoice sync failed (${stripeInvoiceId}): ${error.message || 'update_failed'}`);
+  }
+}
+
 const LIVE_SUB_STATUSES = new Set(['active', 'trialing']);
 const PLAN_SETTINGS_DEFAULTS = {
   basic: {
@@ -263,6 +298,10 @@ router.post('/', async (req, res) => {
   };
 
   try {
+    if (String(event.type || '').startsWith('invoice.')) {
+      await syncBillingInvoiceFromStripeEvent(eventObject, request_id);
+    }
+
     if (
       event.type === 'customer.subscription.created' ||
       event.type === 'customer.subscription.updated' ||
