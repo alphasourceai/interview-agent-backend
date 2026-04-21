@@ -11,6 +11,7 @@ const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib
 const { redactEmail } = require('../src/lib/recoveryHelper');
 const { checkDuplicateCandidate, normalizeEmail, normalizePhone } = require('../src/lib/duplicateCandidate');
 const { buildTextInterviewUrl } = require('../config/urlConfig');
+const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
 
 const router = express.Router();
 
@@ -34,81 +35,6 @@ const ACCOMMODATION_REQUEST_RATE_MAX = 10;
 const TEXT_INTERVIEW_TOKEN_SECRET = String(process.env.TEXT_INTERVIEW_JWT_SECRET || process.env.SUPABASE_JWT_SECRET || '').trim();
 function safeText(v) {
   return String(v || '').trim();
-}
-
-function escapeHtml(value = '') {
-  return String(value || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-function buildBrandedEmailShell({ preheader, title, contentHtml }) {
-  const safePreheader = escapeHtml(preheader || '');
-  const safeTitle = escapeHtml(title || '');
-  return `
-    <!doctype html>
-    <html lang="en">
-    <head>
-      <meta charset="utf-8" />
-      <meta name="viewport" content="width=device-width,initial-scale=1" />
-      <meta name="color-scheme" content="light dark" />
-      <meta name="supported-color-schemes" content="light dark" />
-      <title>${safeTitle}</title>
-      <style>
-        body { margin: 0; padding: 0; background: #0F1E5D; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
-        table { border-collapse: collapse; }
-        a { text-decoration: none; }
-        @media (max-width: 640px) {
-          .container { width: 100% !important; padding: 16px !important; }
-          .card { padding: 18px !important; border-radius: 14px !important; }
-          .cta { display: block !important; width: 100% !important; text-align: center !important; box-sizing: border-box !important; }
-        }
-      </style>
-    </head>
-    <body>
-      <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
-        ${safePreheader}
-      </div>
-      <table role="presentation" width="100%" style="background:#0F1E5D;color:#C9D3FF;">
-        <tr>
-          <td align="center" style="padding: 24px 16px;">
-            <table role="presentation" width="100%" class="container" style="max-width: 640px;">
-              <tr>
-                <td>
-                  <table role="presentation" width="100%" class="card" style="background:#0F1E5D;color:#C9D3FF;border:0;border-radius:0;box-shadow:none;padding:24px;">
-                    <tr>
-                      <td align="left" style="padding-bottom:16px;">
-                        <img src="https://rytlclkkcvvnkoncfaid.supabase.co/storage/v1/object/public/email-assets/Color%20logo%20-%20no%20background.png" alt="AlphaSource" width="208" style="display:block;border:0;outline:none;text-decoration:none;height:auto;max-width:100%;" />
-                      </td>
-                    </tr>
-                    <tr>
-                      <td style="color:#E6EBFF;font-size:24px;line-height:1.25;font-weight:700;padding-bottom:10px;">
-                        ${safeTitle}
-                      </td>
-                    </tr>
-                    <tr>
-                      <td>
-                        ${contentHtml || ''}
-                      </td>
-                    </tr>
-                    <tr>
-                      <td style="border-top:1px solid rgba(255,255,255,0.10);padding-top:14px;color:#6B77C9;font-size:13px;line-height:1.55;">
-                        Need help? Email <a href="mailto:info@alphasourceai.com" style="color:#A78BFA;">info@alphasourceai.com</a>
-                      </td>
-                    </tr>
-                  </table>
-                </td>
-              </tr>
-            </table>
-          </td>
-        </tr>
-      </table>
-    </body>
-    </html>
-  `;
 }
 
 function buildTextInterviewLinkEmailHtml({ candidateName, interviewLink }) {

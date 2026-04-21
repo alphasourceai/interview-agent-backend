@@ -6,6 +6,7 @@ const path = require('path');
 const crypto = require('crypto');
 const sg = require('@sendgrid/mail');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
+const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
 
 const SENDGRID_KEY = process.env.SENDGRID_API_KEY || '';
 const SEND_FROM = process.env.SENDGRID_FROM || 'no-reply@alphasourceai.com';
@@ -32,15 +33,6 @@ const BUCKET = process.env.SUPABASE_FEEDBACK_BUCKET || 'feedback-attachments';
 const FEEDBACK_SUBMIT_RATE_WINDOW_MS = 60 * 60 * 1000;
 const FEEDBACK_SUBMIT_RATE_MAX = 10;
 const feedbackSubmitRateBuckets = new Map();
-
-function escapeHtml(value = '') {
-  return String(value || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
 
 function feedbackSubmitRateLimit(req, res, next) {
   const now = Date.now();
@@ -240,74 +232,42 @@ router.post('/submit', feedbackSubmitRateLimit, upload.array('screenshots', 5), 
         from: SEND_FROM,
         subject: `New Tester Feedback – ${browser} (${device})`,
         text: lines.join('\n'),
-        html: `
-          <!doctype html>
-          <html lang="en">
-          <head>
-            <meta charset="utf-8" />
-            <meta name="viewport" content="width=device-width,initial-scale=1" />
-            <meta name="color-scheme" content="light dark" />
-            <meta name="supported-color-schemes" content="light dark" />
-            <title>New Tester Feedback</title>
-            <style>
-              body { margin: 0; padding: 0; background: #0F1E5D; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
-              table { border-collapse: collapse; }
-              a { text-decoration: none; }
-            </style>
-          </head>
-          <body>
-            <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
-              New tester feedback from ${escapeHtml(browser)} (${escapeHtml(device)}).
-            </div>
-            <table role="presentation" width="100%" style="background:#0F1E5D;color:#C9D3FF;">
-              <tr>
-                <td align="center" style="padding:24px 16px;">
-                  <table role="presentation" width="100%" style="max-width:640px;">
-                    <tr>
-                      <td style="background:#0F1E5D;color:#C9D3FF;padding:24px;">
-                        <p style="margin:0 0 10px;color:#E6EBFF;font-size:24px;line-height:1.25;font-weight:700;">
-                          New tester feedback
-                        </p>
-                        <table role="presentation" width="100%" style="margin:0 0 14px;">
-                          <tr><td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;width:120px;vertical-align:top;">Name</td><td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.4;vertical-align:top;">${escapeHtml(name)}</td></tr>
-                          <tr><td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;width:120px;vertical-align:top;">Email</td><td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.4;vertical-align:top;">${escapeHtml(email)}</td></tr>
-                          <tr><td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;width:120px;vertical-align:top;">Browser</td><td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.4;vertical-align:top;">${escapeHtml(browser)}</td></tr>
-                          <tr><td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;width:120px;vertical-align:top;">Device</td><td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.4;vertical-align:top;">${escapeHtml(device)}</td></tr>
-                        </table>
-                        <p style="margin:0 0 6px;color:#9FB0FF;font-size:12px;line-height:1.4;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Issues</p>
-                        <ul style="margin:0 0 12px;padding:0;">
-                          ${issuesHtml}
-                        </ul>
-                        ${newIssueText ? `
-                          <p style="margin:0 0 6px;color:#9FB0FF;font-size:12px;line-height:1.4;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Other Issue</p>
-                          <p style="margin:0 0 12px;color:#E6EBFF;font-size:13px;line-height:1.6;">${escapeHtml(newIssueText).replace(/\n/g, '<br />')}</p>
-                        ` : ''}
-                        <p style="margin:0 0 6px;color:#9FB0FF;font-size:12px;line-height:1.4;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Suggestions</p>
-                        <ul style="margin:0 0 12px;padding:0;">
-                          ${suggestionsHtml}
-                        </ul>
-                        ${newSuggestionText ? `
-                          <p style="margin:0 0 6px;color:#9FB0FF;font-size:12px;line-height:1.4;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Other Suggestion</p>
-                          <p style="margin:0 0 12px;color:#E6EBFF;font-size:13px;line-height:1.6;">${escapeHtml(newSuggestionText).replace(/\n/g, '<br />')}</p>
-                        ` : ''}
-                        ${screenshotsHtml ? `
-                          <p style="margin:0 0 6px;color:#9FB0FF;font-size:12px;line-height:1.4;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Screenshots</p>
-                          <ul style="margin:0 0 12px;padding:0;">
-                            ${screenshotsHtml}
-                          </ul>
-                        ` : ''}
-                        <p style="margin:0;border-top:1px solid rgba(255,255,255,0.10);padding-top:14px;color:#6B77C9;font-size:13px;line-height:1.55;">
-                          Notification from alphaScreen feedback intake.
-                        </p>
-                      </td>
-                    </tr>
-                  </table>
-                </td>
-              </tr>
+        html: buildBrandedEmailShell({
+          title: 'New tester feedback',
+          preheader: `New tester feedback from ${escapeHtml(browser)} (${escapeHtml(device)}).`,
+          helpEmail: '',
+          footerNote: 'Notification from alphaScreen feedback intake.',
+          contentHtml: `
+            <table role="presentation" width="100%" style="margin:0 0 14px;">
+              <tr><td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;width:120px;vertical-align:top;">Name</td><td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.4;vertical-align:top;">${escapeHtml(name)}</td></tr>
+              <tr><td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;width:120px;vertical-align:top;">Email</td><td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.4;vertical-align:top;">${escapeHtml(email)}</td></tr>
+              <tr><td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;width:120px;vertical-align:top;">Browser</td><td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.4;vertical-align:top;">${escapeHtml(browser)}</td></tr>
+              <tr><td style="padding:5px 0;color:#9FB0FF;font-size:13px;line-height:1.4;width:120px;vertical-align:top;">Device</td><td style="padding:5px 0;color:#E6EBFF;font-size:13px;line-height:1.4;vertical-align:top;">${escapeHtml(device)}</td></tr>
             </table>
-          </body>
-          </html>
-        `
+            <p style="margin:0 0 6px;color:#9FB0FF;font-size:12px;line-height:1.4;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Issues</p>
+            <ul style="margin:0 0 12px;padding:0;">
+              ${issuesHtml}
+            </ul>
+            ${newIssueText ? `
+              <p style="margin:0 0 6px;color:#9FB0FF;font-size:12px;line-height:1.4;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Other Issue</p>
+              <p style="margin:0 0 12px;color:#E6EBFF;font-size:13px;line-height:1.6;">${escapeHtml(newIssueText).replace(/\n/g, '<br />')}</p>
+            ` : ''}
+            <p style="margin:0 0 6px;color:#9FB0FF;font-size:12px;line-height:1.4;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Suggestions</p>
+            <ul style="margin:0 0 12px;padding:0;">
+              ${suggestionsHtml}
+            </ul>
+            ${newSuggestionText ? `
+              <p style="margin:0 0 6px;color:#9FB0FF;font-size:12px;line-height:1.4;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Other Suggestion</p>
+              <p style="margin:0 0 12px;color:#E6EBFF;font-size:13px;line-height:1.6;">${escapeHtml(newSuggestionText).replace(/\n/g, '<br />')}</p>
+            ` : ''}
+            ${screenshotsHtml ? `
+              <p style="margin:0 0 6px;color:#9FB0FF;font-size:12px;line-height:1.4;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Screenshots</p>
+              <ul style="margin:0 0 12px;padding:0;">
+                ${screenshotsHtml}
+              </ul>
+            ` : ''}
+          `
+        })
       };
       sg.send(msg).catch((err) => {
         console.error('[feedback/email] send error:', err?.message || err);

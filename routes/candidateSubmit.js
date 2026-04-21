@@ -7,6 +7,7 @@ const sg = require('@sendgrid/mail');
 const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
+const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
 const analyzeResume = require('../analyzeResume'); // resume analyzer
 
 // uploads: keep in memory; 10MB limit
@@ -72,89 +73,26 @@ function normName(v = '') {
   return String(v || '').trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
-function escapeHtml(value = '') {
-  return String(value || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
 function buildOtpEmailHtml(appName, otpCode) {
   const safeAppName = escapeHtml(appName || 'Interview Agent');
   const safeOtpCode = escapeHtml(otpCode || '');
-  return `
-    <!doctype html>
-    <html lang="en">
-    <head>
-      <meta charset="utf-8" />
-      <meta name="viewport" content="width=device-width,initial-scale=1" />
-      <meta name="color-scheme" content="light dark" />
-      <meta name="supported-color-schemes" content="light dark" />
-      <title>Your ${safeAppName} verification code</title>
-      <style>
-        body { margin: 0; padding: 0; background: #0F1E5D; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
-        table { border-collapse: collapse; }
-        @media (max-width: 640px) {
-          .container { width: 100% !important; padding: 16px !important; }
-          .card { padding: 18px !important; border-radius: 14px !important; }
-        }
-      </style>
-    </head>
-    <body>
-      <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
-        Your verification code is ${safeOtpCode}. It expires in 10 minutes.
-      </div>
-      <table role="presentation" width="100%" style="background:#0F1E5D;color:#C9D3FF;">
-        <tr>
-          <td align="center" style="padding: 24px 16px;">
-            <table role="presentation" width="100%" class="container" style="max-width: 640px;">
-              <tr>
-                <td>
-                  <table role="presentation" width="100%" class="card" style="background:#0F1E5D;color:#C9D3FF;border:0;border-radius:0;box-shadow:none;padding:24px;">
-                    <tr>
-                      <td align="left" style="padding-bottom:16px;">
-                        <img src="https://rytlclkkcvvnkoncfaid.supabase.co/storage/v1/object/public/email-assets/Color%20logo%20-%20no%20background.png" alt="AlphaSource" width="208" style="display:block;border:0;outline:none;text-decoration:none;height:auto;max-width:100%;" />
-                      </td>
-                    </tr>
-                    <tr>
-                      <td style="color:#E6EBFF;font-size:24px;line-height:1.25;font-weight:700;padding-bottom:10px;">
-                        Your verification code
-                      </td>
-                    </tr>
-                    <tr>
-                      <td style="color:#C9D3FF;font-size:15px;line-height:1.6;padding-bottom:14px;">
-                        Use this one-time code to continue your ${safeAppName} verification.
-                      </td>
-                    </tr>
-                    <tr>
-                      <td style="padding-bottom:16px;">
-                        <span style="display:inline-block;background:#A78BFA;color:#0A1547;border:1px solid #CFCBFF;border-radius:10px;padding:10px 16px;font-size:22px;font-weight:800;letter-spacing:0.22em;">
-                          ${safeOtpCode}
-                        </span>
-                      </td>
-                    </tr>
-                    <tr>
-                      <td style="color:#C9D3FF;font-size:14px;line-height:1.55;padding-bottom:16px;">
-                        This code expires in 10 minutes.
-                      </td>
-                    </tr>
-                    <tr>
-                      <td style="border-top:1px solid rgba(255,255,255,0.10);padding-top:14px;color:#6B77C9;font-size:13px;line-height:1.55;">
-                        Need help? Email <a href="mailto:info@alphasourceai.com" style="color:#A78BFA;">info@alphasourceai.com</a>
-                      </td>
-                    </tr>
-                  </table>
-                </td>
-              </tr>
-            </table>
-          </td>
-        </tr>
-      </table>
-    </body>
-    </html>
-  `;
+  return buildBrandedEmailShell({
+    title: 'Your verification code',
+    preheader: `Your verification code is ${safeOtpCode}. It expires in 10 minutes.`,
+    contentHtml: `
+      <p style="margin:0 0 14px;color:#C9D3FF;font-size:15px;line-height:1.6;">
+        Use this one-time code to continue your ${safeAppName} verification.
+      </p>
+      <p style="margin:0 0 16px;">
+        <span style="display:inline-block;background:#A78BFA;color:#0A1547;border:1px solid #CFCBFF;border-radius:10px;padding:10px 16px;font-size:22px;font-weight:800;letter-spacing:0.22em;">
+          ${safeOtpCode}
+        </span>
+      </p>
+      <p style="margin:0 0 16px;color:#C9D3FF;font-size:14px;line-height:1.55;">
+        This code expires in 10 minutes.
+      </p>
+    `
+  });
 }
 
 /**
