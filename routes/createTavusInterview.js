@@ -199,6 +199,7 @@ router.post('/', createTavusRateLimit, async (req, res) => {
         role_id: role?.id || roleId || null
       });
     }
+    let candidateAssistanceContact = '';
     let maxInterviewMinutes = null;
     try {
       const { data: planSettings } = await supabaseAdmin
@@ -243,6 +244,16 @@ router.post('/', createTavusRateLimit, async (req, res) => {
           request_id
         });
       }
+      candidateAssistanceContact = String(client.candidate_assistance_contact || '').trim();
+    } else {
+      try {
+        const { data: client } = await supabase
+          .from('clients')
+          .select('candidate_assistance_contact')
+          .eq('id', clientId)
+          .maybeSingle();
+        candidateAssistanceContact = String(client?.candidate_assistance_contact || '').trim();
+      } catch {}
     }
 
     // Check for existing interview row
@@ -345,7 +356,8 @@ router.post('/', createTavusRateLimit, async (req, res) => {
         conversation_url: result.conversation_url || null,
         conversation_id: result.conversation_id || null,
         interview_id: iData.id,
-        max_interview_minutes: maxInterviewMinutes
+        max_interview_minutes: maxInterviewMinutes,
+        candidate_assistance_contact: candidateAssistanceContact || null
       });
     } else {
       const { error: uErr } = await supabase
@@ -364,7 +376,8 @@ router.post('/', createTavusRateLimit, async (req, res) => {
         conversation_url: result.conversation_url || null,
         conversation_id: result.conversation_id || existing.tavus_application_id || null,
         interview_id: existing.id,
-        max_interview_minutes: maxInterviewMinutes
+        max_interview_minutes: maxInterviewMinutes,
+        candidate_assistance_contact: candidateAssistanceContact || null
       });
     }
   } catch (e) {
