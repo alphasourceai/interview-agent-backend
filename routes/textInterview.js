@@ -431,6 +431,17 @@ router.post('/session', async (req, res) => {
     }
     sentryClientId = role.client_id || null;
     if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
+    let candidateAssistanceContact = '';
+    if (role.client_id) {
+      try {
+        const { data: client } = await supabaseAdmin
+          .from('clients')
+          .select('candidate_assistance_contact')
+          .eq('id', role.client_id)
+          .maybeSingle();
+        candidateAssistanceContact = String(client?.candidate_assistance_contact || '').trim();
+      } catch {}
+    }
 
     let resumeRequired = !(reqRow.resume_url || reqRow.resume_received_at);
     if (resumeRequired && reqRow.candidate_id) {
@@ -467,6 +478,7 @@ router.post('/session', async (req, res) => {
       candidate_email: reqRow.candidate_email,
       role_id: role.id,
       role_title: role.title || '',
+      candidate_assistance_contact: candidateAssistanceContact || null,
       questions,
       resume_required: resumeRequired,
       completed: !!reqRow.text_completed_at,
