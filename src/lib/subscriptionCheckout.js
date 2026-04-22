@@ -50,6 +50,12 @@ function asWholeNumberOrNull(value, { allowZero = true } = {}) {
   return n
 }
 
+function wantsEmbeddedCheckout(value) {
+  if (value === true) return true
+  const raw = String(value || '').trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'embedded'
+}
+
 async function resolveStripeCustomerId({
   stripe,
   client,
@@ -108,6 +114,7 @@ async function createSubscriptionCheckoutSession({
   billingInterval,
   returnTab = '',
   cancelUrl = '',
+  embedded = false,
   metadataSource = 'admin_subscription_checkout',
   metadata = {},
   enterpriseFees = null,
@@ -118,6 +125,7 @@ async function createSubscriptionCheckoutSession({
   const normalizedBillingInterval = normalizeBillingInterval(billingInterval)
   const normalizedMetadataSource = String(metadataSource || '').trim().toLowerCase()
   const normalizedReturnTab = String(returnTab || '').trim().toLowerCase()
+  const embeddedCheckoutRequested = wantsEmbeddedCheckout(embedded)
 
   if (!normalizedClientId) throw makeError(400, 'client_id_required', 'Client id is required.')
   if (!normalizedPlanTier) throw makeError(400, 'invalid_plan_tier', 'Invalid plan tier.')
@@ -256,21 +264,61 @@ async function createSubscriptionCheckoutSession({
     ...normalizeMetadataObject(metadata)
   }
 
-  const session = await stripe.checkout.sessions.create({
+  const checkoutBasePayload = {
     mode: 'subscription',
     customer: resolvedStripeCustomerId,
     line_items: lineItems,
-    success_url: checkoutSuccessUrl,
-    cancel_url: normalizedCancelUrl || buildClientDashboardReturnUrl(cancelParams),
     allow_promotion_codes: true,
     metadata: checkoutMetadata,
     subscription_data: {
       metadata: checkoutMetadata
     }
-  })
+  }
+
+  let checkoutClientSecret = null
+  let primaryCheckoutSession = null
+  let hostedFallbackSession = null
+
+  if (embeddedCheckoutRequested) {
+    try {
+      primaryCheckoutSession = await stripe.checkout.sessions.create({
+        ...checkoutBasePayload,
+        ui_mode: 'embedded',
+        return_url: checkoutSuccessUrl
+      })
+      const resolvedClientSecret = String(primaryCheckoutSession?.client_secret || '').trim()
+      if (resolvedClientSecret) {
+        checkoutClientSecret = resolvedClientSecret
+      } else {
+        primaryCheckoutSession = null
+      }
+    } catch (embeddedErr) {
+      console.error('create_subscription_embedded_checkout_session_failed:', embeddedErr?.message || embeddedErr)
+    }
+  }
+
+  if (!primaryCheckoutSession) {
+    primaryCheckoutSession = await stripe.checkout.sessions.create({
+      ...checkoutBasePayload,
+      success_url: checkoutSuccessUrl,
+      cancel_url: normalizedCancelUrl || buildClientDashboardReturnUrl(cancelParams)
+    })
+  } else {
+    try {
+      hostedFallbackSession = await stripe.checkout.sessions.create({
+        ...checkoutBasePayload,
+        success_url: checkoutSuccessUrl,
+        cancel_url: normalizedCancelUrl || buildClientDashboardReturnUrl(cancelParams)
+      })
+    } catch (hostedFallbackErr) {
+      console.error('create_subscription_hosted_fallback_checkout_session_failed:', hostedFallbackErr?.message || hostedFallbackErr)
+    }
+  }
 
   return {
-    session,
+    session: primaryCheckoutSession,
+    fallbackSession: hostedFallbackSession,
+    checkoutClientSecret,
     client,
     clientEmail,
     checkoutMetadata

@@ -59,6 +59,13 @@ function normalizeAccepted(value) {
   return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
 }
 
+function wantsEmbeddedCheckout(value, fallback = false) {
+  if (value === undefined || value === null || String(value).trim() === '') return fallback;
+  if (value === true) return true;
+  const normalized = String(value).trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'embedded';
+}
+
 function getClientIp(req) {
   const cf = req.headers['cf-connecting-ip'];
   if (typeof cf === 'string' && cf.trim()) return cf.trim();
@@ -160,6 +167,57 @@ function validateSignableAgreement(row) {
   return { ok: true };
 }
 
+function resolveAgreementPublicSessionState(row) {
+  if (!row) {
+    return {
+      ok: false,
+      status: 404,
+      code: 'token_invalid',
+      detail: 'This signing link is invalid.'
+    };
+  }
+
+  const status = String(row.status || '').trim().toLowerCase();
+  const checkoutStatus = String(row.checkout_status || '').trim().toLowerCase();
+
+  if (status === 'sent') {
+    if (isExpired(row.signer_token_expires_at)) {
+      return {
+        ok: false,
+        status: 410,
+        code: 'token_expired',
+        detail: 'This signing link has expired.'
+      };
+    }
+    return {
+      ok: true,
+      state: 'signable'
+    };
+  }
+
+  if (status === 'signed' && row.is_current === true) {
+    if (checkoutStatus === 'paid') {
+      return {
+        ok: true,
+        state: 'activation_complete'
+      };
+    }
+    if (!checkoutStatus || checkoutStatus === 'pending_payment') {
+      return {
+        ok: true,
+        state: 'activation_pending'
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    status: 409,
+    code: 'agreement_not_available',
+    detail: 'This agreement is no longer available.'
+  };
+}
+
 function buildAgreementInputFromRow(row) {
   const snapshotValues =
     row?.template_snapshot &&
@@ -231,18 +289,18 @@ router.post('/session', async (req, res) => {
 
     const tokenHash = hashToken(token);
     const agreement = await loadAgreementByTokenHash(tokenHash);
-    const validation = validateSignableAgreement(agreement);
-    if (!validation.ok) {
-      return res.status(validation.status).json({
-        error: validation.code,
-        code: validation.code,
-        detail: validation.detail,
+    const sessionState = resolveAgreementPublicSessionState(agreement);
+    if (!sessionState.ok) {
+      return res.status(sessionState.status).json({
+        error: sessionState.code,
+        code: sessionState.code,
+        detail: sessionState.detail,
         request_id
       });
     }
 
     let openedAt = agreement.opened_at || null;
-    if (!openedAt) {
+    if (sessionState.state === 'signable' && !openedAt) {
       openedAt = new Date().toISOString();
       const { error: openedErr } = await supabaseAdmin
         .from('membership_agreements')
@@ -258,12 +316,23 @@ router.post('/session', async (req, res) => {
       }
     }
 
-    const draftPdfUrl = await createAgreementSignedUrl(agreement.draft_pdf_path, SIGNED_URL_TTL_SECONDS);
+    const draftPdfUrl =
+      sessionState.state === 'signable'
+        ? await createAgreementSignedUrl(agreement.draft_pdf_path, SIGNED_URL_TTL_SECONDS)
+        : null;
+    const executedPdfUrl =
+      sessionState.state !== 'signable'
+        ? await createAgreementSignedUrl(agreement.executed_pdf_path, SIGNED_URL_TTL_SECONDS)
+        : null;
 
     return res.json({
       ok: true,
       session: {
         agreement_id: agreement.id,
+        state: sessionState.state,
+        status: agreement.status,
+        is_current: agreement.is_current === true,
+        checkout_status: agreement.checkout_status || null,
         client_legal_name: agreement.client_legal_name,
         dba_trade_name: agreement.dba_trade_name,
         primary_admin_name: agreement.primary_admin_name,
@@ -276,8 +345,10 @@ router.post('/session', async (req, res) => {
         initial_renewal_date: agreement.initial_renewal_date,
         expires_at: agreement.signer_token_expires_at,
         sent_at: agreement.sent_at,
+        signed_at: agreement.signed_at,
         opened_at: openedAt,
-        draft_pdf_url: draftPdfUrl
+        draft_pdf_url: draftPdfUrl,
+        executed_pdf_url: executedPdfUrl
       },
       request_id
     });
@@ -563,6 +634,7 @@ router.post('/checkout-session', async (req, res) => {
   const request_id = req.request_id || null;
   try {
     const token = readToken(req);
+    const embeddedCheckoutRequested = wantsEmbeddedCheckout(req.body?.embedded, true);
     if (!token) {
       return res.status(400).json({
         error: 'token_required',
@@ -656,7 +728,7 @@ router.post('/checkout-session', async (req, res) => {
       });
     }
 
-    const { session } = await createSubscriptionCheckoutSession({
+    const { session, fallbackSession, checkoutClientSecret } = await createSubscriptionCheckoutSession({
       clientId,
       planTier,
       billingInterval,
@@ -665,6 +737,7 @@ router.post('/checkout-session', async (req, res) => {
         agreement_id: agreement.id
       },
       enterpriseFees,
+      embedded: embeddedCheckoutRequested,
       cancelUrl: buildMembershipAgreementSignUrl(token),
       requestContext: {
         forwardedProto: req.headers?.['x-forwarded-proto'],
@@ -674,9 +747,10 @@ router.post('/checkout-session', async (req, res) => {
       }
     });
 
-    const checkoutSessionId = String(session?.id || '').trim();
-    const checkoutUrl = String(session?.url || '').trim();
-    if (!checkoutSessionId || !checkoutUrl) {
+    const checkoutSessionId = String(session?.id || fallbackSession?.id || '').trim();
+    const checkoutUrl = String(fallbackSession?.url || session?.url || '').trim();
+    const resolvedCheckoutClientSecret = String(checkoutClientSecret || '').trim();
+    if (!checkoutSessionId || (!checkoutUrl && !resolvedCheckoutClientSecret)) {
       return res.status(500).json({
         error: 'checkout_session_missing',
         code: 'checkout_session_missing',
@@ -717,8 +791,10 @@ router.post('/checkout-session', async (req, res) => {
 
     return res.json({
       ok: true,
-      url: checkoutUrl,
+      url: checkoutUrl || null,
       session_id: checkoutSessionId,
+      checkout_client_secret: resolvedCheckoutClientSecret || null,
+      embedded_checkout: !!resolvedCheckoutClientSecret,
       request_id
     });
   } catch (e) {
