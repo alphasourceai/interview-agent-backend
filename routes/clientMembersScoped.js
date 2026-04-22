@@ -353,9 +353,27 @@ router.delete('/:id', requireAuth, withClientScope, async (req, res) => {
       return res.status(403).json({ error: 'forbidden', request_id });
     }
 
-    // Block self-delete
-    const targetUserId = key.includes('@') ? null : key;
-    if (targetUserId && targetUserId === req.user?.id) {
+    let targetLookup = supabaseAdmin
+      .from('client_members')
+      .select('user_id,email')
+      .eq('client_id', client_id);
+    if (key.includes('@')) targetLookup = targetLookup.eq('email', key);
+    else targetLookup = targetLookup.eq('user_id', key);
+
+    const { data: targetMember, error: targetLookupError } = await targetLookup.maybeSingle();
+    if (targetLookupError) {
+      return res.status(500).json({ error: 'remove_member_failed', detail: targetLookupError.message, request_id });
+    }
+
+    // Block self-delete by either user id or email match.
+    const currentUserId = String(req.user?.id || '').trim();
+    const currentUserEmail = String(req.user?.email || '').trim().toLowerCase();
+    const targetUserId = String(targetMember?.user_id || '').trim();
+    const targetEmail = String(targetMember?.email || '').trim().toLowerCase();
+    if (
+      (currentUserId && targetUserId && targetUserId === currentUserId) ||
+      (currentUserEmail && targetEmail && targetEmail === currentUserEmail)
+    ) {
       console.error('[client/members/delete] self delete blocked', { request_id, user_id: req.user?.id, target_user_id: targetUserId });
       return res.status(403).json({
         error: 'not_allowed',
