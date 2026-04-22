@@ -3737,7 +3737,7 @@ app.get('/checkout/subscription-success', async (req, res) => {
     if (clientId) {
       const { data: clientRow, error: clientErr } = await supabaseAdmin
         .from('clients')
-        .select('id,email')
+        .select('id,name,email,client_admin_name')
         .eq('id', clientId)
         .maybeSingle()
       if (clientErr) throw new Error(clientErr.message || 'client_lookup_failed')
@@ -3765,20 +3765,76 @@ app.get('/checkout/subscription-success', async (req, res) => {
       return res.redirect(302, successUrl)
     }
     const clientEmailLower = clientEmail.toLowerCase()
+    const membershipName = String(client.client_admin_name || client.name || clientEmail).trim() || clientEmail
 
-    let existingAuthUser = null
-    try {
-      const { data: authUsersData, error: authUsersError } = await supabaseAdmin.auth.admin.listUsers({ email: clientEmail })
-      if (authUsersError) {
-        console.error('subscription_checkout_list_users_failed:', authUsersError?.message || authUsersError)
-      } else {
-        existingAuthUser = (authUsersData?.users || []).find((user) => {
+    const upsertClientManagerMembership = async (targetUserId) => {
+      const normalizedUserId = String(targetUserId || '').trim() || null
+      const { data: existingRows, error: existingErr } = await supabaseAdmin
+        .from('client_members')
+        .select('client_id,user_id,email,name,role')
+        .eq('client_id', client.id)
+      if (existingErr) throw new Error(existingErr.message || 'membership_lookup_failed')
+
+      const existingMembership = (existingRows || []).find((row) => {
+        return String(row?.email || '').trim().toLowerCase() === clientEmailLower
+      }) || null
+
+      if (!existingMembership) {
+        const insertPayload = {
+          client_id: client.id,
+          email: clientEmail,
+          name: membershipName,
+          role: 'manager'
+        }
+        if (normalizedUserId) insertPayload.user_id = normalizedUserId
+
+        const { error: insertErr } = await supabaseAdmin
+          .from('client_members')
+          .insert(insertPayload)
+        if (insertErr) throw new Error(insertErr.message || 'membership_insert_failed')
+        return
+      }
+
+      const updatePayload = {}
+      const existingRole = String(existingMembership.role || '').trim().toLowerCase()
+      const existingName = String(existingMembership.name || '').trim()
+      const existingUserId = String(existingMembership.user_id || '').trim()
+
+      if (existingRole !== 'manager') updatePayload.role = 'manager'
+      if (!existingName) updatePayload.name = membershipName
+      if (normalizedUserId && existingUserId !== normalizedUserId) updatePayload.user_id = normalizedUserId
+
+      if (!Object.keys(updatePayload).length) return
+
+      const membershipEmail = String(existingMembership.email || '').trim() || clientEmail
+      const { error: updateErr } = await supabaseAdmin
+        .from('client_members')
+        .update(updatePayload)
+        .eq('client_id', client.id)
+        .eq('email', membershipEmail)
+      if (updateErr) throw new Error(updateErr.message || 'membership_update_failed')
+    }
+
+    const findAuthUserByClientEmail = async () => {
+      try {
+        const { data: authUsersData, error: authUsersError } = await supabaseAdmin.auth.admin.listUsers({ email: clientEmail })
+        if (authUsersError) {
+          console.error('subscription_checkout_list_users_failed:', authUsersError?.message || authUsersError)
+          return null
+        }
+        return (authUsersData?.users || []).find((user) => {
           return String(user?.email || '').trim().toLowerCase() === clientEmailLower
         }) || null
+      } catch (listUsersErr) {
+        console.error('subscription_checkout_list_users_exception:', listUsersErr?.message || listUsersErr)
+        return null
       }
-    } catch (listUsersErr) {
-      console.error('subscription_checkout_list_users_exception:', listUsersErr?.message || listUsersErr)
     }
+
+    let existingAuthUser = await findAuthUserByClientEmail()
+    let authUserId = String(existingAuthUser?.id || '').trim() || null
+
+    await upsertClientManagerMembership(authUserId)
 
     const hasSignedIn = !!String(existingAuthUser?.last_sign_in_at || '').trim()
     console.log('subscription_checkout_success_auth_user_lookup:', {
@@ -3822,10 +3878,12 @@ app.get('/checkout/subscription-success', async (req, res) => {
     if (!recoveryActionLink) {
       createUserAttempted = true
       try {
-        await supabaseAdmin.auth.admin.createUser({
+        const createdUser = await supabaseAdmin.auth.admin.createUser({
           email: clientEmail,
           email_confirm: true
         })
+        const createdUserId = String(createdUser?.data?.user?.id || '').trim()
+        if (createdUserId) authUserId = createdUserId
       } catch (createErr) {
         const msg = String(createErr?.message || '').toLowerCase()
         if (!msg.includes('already') && !msg.includes('exists')) {
@@ -3839,6 +3897,16 @@ app.get('/checkout/subscription-success', async (req, res) => {
         console.error('subscription_checkout_generate_recovery_link_retry_failed:', recoveryRetryErr?.message || recoveryRetryErr)
       }
     }
+
+    if (!authUserId) {
+      const refreshedAuthUser = await findAuthUserByClientEmail()
+      if (refreshedAuthUser) {
+        existingAuthUser = refreshedAuthUser
+        authUserId = String(refreshedAuthUser.id || '').trim() || null
+      }
+    }
+
+    await upsertClientManagerMembership(authUserId)
 
     console.log('subscription_checkout_success_create_user_attempt:', {
       attempted: createUserAttempted
