@@ -362,21 +362,21 @@ async function sendMembershipAgreementInternalNotification(to, details = {}) {
   const msg = {
     to,
     from: FROM,
-    subject: 'Membership agreement sent - manual checkout follow-up required',
+    subject: 'Membership agreement sent - client checkout follows signature',
     html: buildBrandedEmailShell({
       title: 'Membership agreement sent',
-      preheader: 'Membership agreement sent - manual checkout follow-up required.',
+      preheader: 'Membership agreement sent - client continues to checkout after signature.',
       helpEmail: '',
       footerNote: 'Internal notification for the memberships workflow.',
       contentHtml: `
         <p style="margin:0 0 12px;font-size:15px;line-height:1.6;">
-          A membership agreement has been sent and requires manual checkout follow-up.
+          A membership agreement has been sent.
         </p>
         <ul style="margin:0 0 14px;padding:0;">
           ${detailItems || '<li style="margin:0 0 6px 18px;font-size:13px;line-height:1.5;">No agreement details provided.</li>'}
         </ul>
         <p style="margin:0 0 14px;font-size:14px;line-height:1.55;">
-          After signature is complete, manually send checkout per current phase-1 process.
+          After signing, the client can continue directly to checkout from the signature flow.
         </p>
       `
     })
@@ -455,21 +455,21 @@ async function sendMembershipAgreementCompletedInternalNotification(to, details 
   const msg = {
     to,
     from: FROM,
-    subject: 'Membership agreement signed - manual checkout follow-up required',
+    subject: 'Membership agreement signed - client checkout ready',
     html: buildBrandedEmailShell({
       title: 'Membership agreement signed',
-      preheader: 'Membership agreement signed - manual checkout follow-up required.',
+      preheader: 'Membership agreement signed - client can continue to checkout from the signature success page.',
       helpEmail: '',
       footerNote: 'Internal notification for the memberships workflow.',
       contentHtml: `
         <p style="margin:0 0 12px;font-size:15px;line-height:1.6;">
-          A membership agreement has been signed and is ready for manual checkout follow-up.
+          A membership agreement has been signed.
         </p>
         <ul style="margin:0 0 14px;padding:0;">
           ${detailItems || '<li style="margin:0 0 6px 18px;font-size:13px;line-height:1.5;">No agreement details provided.</li>'}
         </ul>
         <p style="margin:0 0 14px;font-size:14px;line-height:1.55;">
-          Send checkout manually per current process.
+          The client can continue directly to checkout from the signature success page, and payment onboarding continues through the client checkout flow.
         </p>
       `
     })
