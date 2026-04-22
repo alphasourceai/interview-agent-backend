@@ -3654,10 +3654,12 @@ app.get('/checkout/subscription-success', async (req, res) => {
     if (tab) params.set('tab', tab)
     return buildClientDashboardReturnUrl(params)
   }
+  const request_id = req.request_id || null
   const fallbackClientId = String(req.query?.client_id || '').trim()
   const fallbackTab = String(req.query?.tab || '').trim().toLowerCase()
   const sessionId = String(req.query?.session_id || '').trim()
   const fallbackUrl = makeAccountSuccessUrl(fallbackClientId, fallbackTab)
+  let parsedMetadataSource = ''
   if (!sessionId) {
     console.log('subscription_checkout_success_redirect:', {
       branch: 'missing_session_id',
@@ -3672,6 +3674,7 @@ app.get('/checkout/subscription-success', async (req, res) => {
     const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['subscription'] })
     const metadata = session?.metadata && typeof session.metadata === 'object' ? session.metadata : {}
     const metadataSource = String(metadata?.source || '').trim().toLowerCase()
+    parsedMetadataSource = metadataSource
     const metadataClientId = String(metadata?.client_id || '').trim()
     const metadataAgreementId = String(metadata?.agreement_id || '').trim()
     const clientId = metadataClientId || fallbackClientId
@@ -3767,8 +3770,10 @@ app.get('/checkout/subscription-success', async (req, res) => {
     const clientEmailLower = clientEmail.toLowerCase()
     const membershipName = String(client.client_admin_name || client.name || clientEmail).trim() || clientEmail
 
-    const upsertClientManagerMembership = async (targetUserId) => {
+    const upsertClientManagerMembership = async (targetUserId, opts = {}) => {
+      const requireUserId = opts?.requireUserId === true
       const normalizedUserId = String(targetUserId || '').trim() || null
+      if (requireUserId && !normalizedUserId) throw new Error('membership_user_id_required')
       const { data: existingRows, error: existingErr } = await supabaseAdmin
         .from('client_members')
         .select('client_id,user_id,email,name,role')
@@ -3831,10 +3836,46 @@ app.get('/checkout/subscription-success', async (req, res) => {
       }
     }
 
+    const findAuthUserById = async (userId) => {
+      const normalizedUserId = String(userId || '').trim()
+      if (!normalizedUserId) return null
+      try {
+        const { data, error } = await supabaseAdmin.auth.admin.getUserById(normalizedUserId)
+        if (error) {
+          console.error('subscription_checkout_get_user_by_id_failed:', error?.message || error)
+          return null
+        }
+        return data?.user || null
+      } catch (getUserErr) {
+        console.error('subscription_checkout_get_user_by_id_exception:', getUserErr?.message || getUserErr)
+        return null
+      }
+    }
+
+    const recoveryRedirectUrl = buildClientPwResetUrl({
+      origin: 'client',
+      checkout: 'success',
+      client_id: client.id
+    })
+
     let existingAuthUser = await findAuthUserByClientEmail()
     let authUserId = String(existingAuthUser?.id || '').trim() || null
 
-    await upsertClientManagerMembership(authUserId)
+    if (metadataSource === 'agreement_checkout' && !authUserId) {
+      const ensured = await ensureUserIdAndRecoveryLink(clientEmail, recoveryRedirectUrl, {
+        requireActionLink: false
+      })
+      authUserId = String(ensured?.userId || '').trim() || null
+      existingAuthUser = await findAuthUserById(authUserId)
+    }
+
+    if (!existingAuthUser && authUserId) {
+      existingAuthUser = await findAuthUserById(authUserId)
+    }
+
+    await upsertClientManagerMembership(authUserId, {
+      requireUserId: metadataSource === 'agreement_checkout'
+    })
 
     const hasSignedIn = !!String(existingAuthUser?.last_sign_in_at || '').trim()
     console.log('subscription_checkout_success_auth_user_lookup:', {
@@ -3849,11 +3890,6 @@ app.get('/checkout/subscription-success', async (req, res) => {
       return res.redirect(302, successUrl)
     }
 
-    const recoveryRedirectUrl = buildClientPwResetUrl({
-      origin: 'client',
-      checkout: 'success',
-      client_id: client.id
-    })
     const generateRecoveryActionLink = async () => {
       const link = await supabaseAdmin.auth.admin.generateLink({
         type: 'recovery',
@@ -3906,7 +3942,17 @@ app.get('/checkout/subscription-success', async (req, res) => {
       }
     }
 
-    await upsertClientManagerMembership(authUserId)
+    if (!authUserId && metadataSource === 'agreement_checkout') {
+      throw new Error('agreement_checkout_auth_user_missing_after_bootstrap')
+    }
+
+    if (!existingAuthUser && authUserId) {
+      existingAuthUser = await findAuthUserById(authUserId)
+    }
+
+    await upsertClientManagerMembership(authUserId, {
+      requireUserId: metadataSource === 'agreement_checkout'
+    })
 
     console.log('subscription_checkout_success_create_user_attempt:', {
       attempted: createUserAttempted
@@ -3924,6 +3970,16 @@ app.get('/checkout/subscription-success', async (req, res) => {
       })
       return res.redirect(302, recoveryActionLink)
     }
+
+    if (metadataSource === 'agreement_checkout') {
+      return res.status(500).json({
+        error: 'agreement_checkout_bootstrap_failed',
+        code: 'agreement_checkout_bootstrap_failed',
+        detail: 'Unable to complete onboarding bootstrap.',
+        request_id
+      })
+    }
+
     const pendingOnboardingUrl = buildPublicPwResetUrl({
       origin: 'client',
       checkout: 'success',
@@ -3941,6 +3997,14 @@ app.get('/checkout/subscription-success', async (req, res) => {
     return res.redirect(302, pendingOnboardingUrl)
   } catch (e) {
     console.error('subscription_checkout_success_handoff_failed:', e?.message || e)
+    if (parsedMetadataSource === 'agreement_checkout') {
+      return res.status(500).json({
+        error: 'agreement_checkout_bootstrap_failed',
+        code: 'agreement_checkout_bootstrap_failed',
+        detail: e?.message || 'Unable to complete onboarding bootstrap.',
+        request_id
+      })
+    }
     console.log('subscription_checkout_success_redirect:', {
       branch: 'handler_exception',
       target: 'fallback_url'
