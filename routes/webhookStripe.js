@@ -70,6 +70,7 @@ async function syncBillingInvoiceFromStripeEvent(stripeInvoice, request_id) {
 }
 
 const LIVE_SUB_STATUSES = new Set(['active', 'trialing']);
+const MANAGED_SUBSCRIPTION_CHECKOUT_SOURCES = new Set(['admin_subscription_checkout', 'agreement_checkout']);
 const PLAN_SETTINGS_DEFAULTS = {
   basic: {
     per_role_fee: 399,
@@ -143,7 +144,7 @@ function buildClientPlanSettingsPayloadFromSubscription(subscription, clientId, 
 
   const metadataSources = getSubscriptionMetadataSources(subscription);
   const metadataSource = String(getSubscriptionMetadataValue(metadataSources, 'source', options.fallbackSource || '') || '').trim().toLowerCase();
-  if (metadataSource !== 'admin_subscription_checkout') return null;
+  if (!MANAGED_SUBSCRIPTION_CHECKOUT_SOURCES.has(metadataSource)) return null;
 
   const planTier = String(getSubscriptionMetadataValue(metadataSources, 'plan_tier', options.fallbackPlanTier || '') || '').trim().toLowerCase();
   if (!['basic', 'pro', 'enterprise'].includes(planTier)) return null;
@@ -241,10 +242,29 @@ function buildClientSubscriptionUpdatesFromStripe(subscription, options = {}) {
     contract_start_at: contractStartAt,
     contract_end_at: contractEndAt
   };
-  if (metadataSource === 'admin_subscription_checkout' && ['basic', 'pro', 'enterprise'].includes(metadataPlanTier)) {
+  if (MANAGED_SUBSCRIPTION_CHECKOUT_SOURCES.has(metadataSource) && ['basic', 'pro', 'enterprise'].includes(metadataPlanTier)) {
     updates.plan_tier = metadataPlanTier;
   }
   return updates;
+}
+
+async function markAgreementCheckoutPaid(agreementId, options = {}) {
+  const normalizedAgreementId = String(agreementId || '').trim();
+  if (!normalizedAgreementId) return;
+  const paidAt = String(options.paidAt || '').trim() || new Date().toISOString();
+  const checkoutSessionId = String(options.checkoutSessionId || '').trim() || null;
+
+  const payload = {
+    checkout_status: 'paid',
+    checkout_paid_at: paidAt
+  };
+  if (checkoutSessionId) payload.checkout_session_id = checkoutSessionId;
+
+  const { error } = await supabaseAdmin
+    .from('membership_agreements')
+    .update(payload)
+    .eq('id', normalizedAgreementId);
+  if (error) throw new Error(error.message || 'Agreement checkout status update failed');
 }
 
 router.post('/', async (req, res) => {
@@ -338,6 +358,7 @@ router.post('/', async (req, res) => {
       const purchaseType = String(metadata?.purchase_type || '').trim().toLowerCase();
       const metadataSource = String(metadata?.source || '').trim().toLowerCase();
       const metadataClientId = String(metadata?.client_id || '').trim();
+      const metadataAgreementId = String(metadata?.agreement_id || '').trim();
       const metadataPlanTier = String(metadata?.plan_tier || '').trim().toLowerCase();
       const metadataBillingInterval = String(metadata?.billing_interval || '').trim().toLowerCase();
       const customerId = pickId(eventObject?.customer);
@@ -598,7 +619,7 @@ router.post('/', async (req, res) => {
               .eq('id', targetClientId);
             if (updateErr) throw new Error(updateErr.message || 'Client update failed');
 
-            if (metadataSource === 'admin_subscription_checkout') {
+            if (MANAGED_SUBSCRIPTION_CHECKOUT_SOURCES.has(metadataSource)) {
               const planTierForSettings = String(updates?.plan_tier || metadataPlanTier || '').trim().toLowerCase();
               const billingIntervalForSettings = String(updates?.billing_interval || metadataBillingInterval || '').trim().toLowerCase();
               let planSettingsPayload = null;
@@ -650,6 +671,17 @@ router.post('/', async (req, res) => {
             }
           }
         }
+
+        if (
+          metadataSource === 'agreement_checkout' &&
+          metadataAgreementId &&
+          ['paid', 'no_payment_required'].includes(String(eventObject?.payment_status || '').trim().toLowerCase())
+        ) {
+          await markAgreementCheckoutPaid(metadataAgreementId, {
+            checkoutSessionId: pickId(eventObject?.id) || null,
+            paidAt: new Date().toISOString()
+          });
+        }
       }
     } else if (event.type === 'invoice.payment_succeeded' || event.type === 'invoice.payment_failed') {
       const customerId = pickId(eventObject?.customer);
@@ -657,16 +689,17 @@ router.post('/', async (req, res) => {
       const metadata = eventObject?.metadata && typeof eventObject.metadata === 'object' ? eventObject.metadata : {};
       const metadataSource = String(metadata?.source || '').trim().toLowerCase();
       const metadataClientId = String(metadata?.client_id || '').trim();
+      const metadataAgreementId = String(metadata?.agreement_id || '').trim();
       const metadataPlanTier = String(metadata?.plan_tier || '').trim().toLowerCase();
       const metadataBillingInterval = String(metadata?.billing_interval || '').trim().toLowerCase();
-      const isAdminSubscriptionInvoice =
+      const isManagedSubscriptionInvoice =
         event.type === 'invoice.payment_succeeded' &&
-        metadataSource === 'admin_subscription_checkout' &&
+        MANAGED_SUBSCRIPTION_CHECKOUT_SOURCES.has(metadataSource) &&
         !!metadataClientId &&
         ['basic', 'pro', 'enterprise'].includes(metadataPlanTier) &&
         ['monthly', 'annual'].includes(metadataBillingInterval);
 
-      if (isAdminSubscriptionInvoice) {
+      if (isManagedSubscriptionInvoice) {
         const { data: activationClient, error: activationClientErr } = await supabaseAdmin
           .from('clients')
           .select('id')
@@ -699,7 +732,17 @@ router.post('/', async (req, res) => {
         if (activationErr) throw new Error(activationErr.message || 'Client activation update failed');
       }
 
-      if (customerId && !isAdminSubscriptionInvoice) {
+      if (
+        event.type === 'invoice.payment_succeeded' &&
+        metadataSource === 'agreement_checkout' &&
+        metadataAgreementId
+      ) {
+        await markAgreementCheckoutPaid(metadataAgreementId, {
+          paidAt: new Date().toISOString()
+        });
+      }
+
+      if (customerId && !isManagedSubscriptionInvoice) {
         const { data: client, error: clientErr } = await supabaseAdmin
           .from('clients')
           .select('id')

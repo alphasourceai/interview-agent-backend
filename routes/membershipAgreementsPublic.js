@@ -3,6 +3,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
+const { buildMembershipAgreementSignUrl } = require('../config/urlConfig');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 const { htmlToPdf } = require('../utils/pdfRenderer');
 const {
@@ -13,6 +14,7 @@ const {
   sendMembershipAgreementSignedCopyEmail,
   sendMembershipAgreementCompletedInternalNotification
 } = require('../utils/mailer');
+const { createSubscriptionCheckoutSession } = require('../src/lib/subscriptionCheckout');
 
 const router = express.Router();
 
@@ -200,7 +202,7 @@ async function createAgreementSignedUrl(path, expiresInSeconds) {
 async function loadAgreementByTokenHash(tokenHash) {
   const { data, error } = await supabaseAdmin
     .from('membership_agreements')
-    .select('id,client_id,status,client_legal_name,dba_trade_name,primary_admin_name,admin_email,membership_tier,initial_term_start,initial_renewal_date,billing_option,auto_renew,notice_deadline_days,template_snapshot,draft_pdf_path,executed_pdf_path,signer_token_expires_at,opened_at,sent_at,signed_at,signer_typed_name')
+    .select('id,client_id,status,is_current,checkout_status,client_legal_name,dba_trade_name,primary_admin_name,admin_email,membership_tier,initial_term_start,initial_renewal_date,billing_option,auto_renew,notice_deadline_days,template_snapshot,draft_pdf_path,executed_pdf_path,signer_token_expires_at,opened_at,sent_at,signed_at,signer_typed_name')
     .eq('signer_token_hash', tokenHash)
     .maybeSingle();
 
@@ -552,6 +554,178 @@ router.post('/sign', async (req, res) => {
       error: 'server_error',
       code: e?.code || 'server_error',
       detail: extractErrorMessage(e?.message || '', 'Server error.'),
+      request_id
+    });
+  }
+});
+
+router.post('/checkout-session', async (req, res) => {
+  const request_id = req.request_id || null;
+  try {
+    const token = readToken(req);
+    if (!token) {
+      return res.status(400).json({
+        error: 'token_required',
+        code: 'token_required',
+        detail: 'Signing token is required.',
+        request_id
+      });
+    }
+
+    const tokenHash = hashToken(token);
+    const agreement = await loadAgreementByTokenHash(tokenHash);
+    if (!agreement) {
+      return res.status(404).json({
+        error: 'token_invalid',
+        code: 'token_invalid',
+        detail: 'This signing link is invalid.',
+        request_id
+      });
+    }
+
+    if (String(agreement.status || '').trim().toLowerCase() !== 'signed' || agreement.is_current !== true) {
+      return res.status(409).json({
+        error: 'agreement_not_checkout_eligible',
+        code: 'agreement_not_checkout_eligible',
+        detail: 'This agreement is not eligible for checkout.',
+        request_id
+      });
+    }
+    if (String(agreement.checkout_status || '').trim().toLowerCase() === 'paid') {
+      return res.status(409).json({
+        error: 'agreement_checkout_already_paid',
+        code: 'agreement_checkout_already_paid',
+        detail: 'Checkout is already completed for this agreement.',
+        request_id
+      });
+    }
+
+    const clientId = String(agreement.client_id || '').trim();
+    if (!clientId) {
+      return res.status(400).json({
+        error: 'missing_client_id',
+        code: 'missing_client_id',
+        detail: 'Agreement is not linked to a client.',
+        request_id
+      });
+    }
+
+    const agreementInput = buildAgreementInputFromRow(agreement);
+    const planTier = String(agreementInput.membership_tier || '').trim().toLowerCase();
+    const billingInterval = String(agreementInput.billing_option || '').trim().toLowerCase();
+    if (!['basic', 'pro', 'enterprise'].includes(planTier)) {
+      return res.status(409).json({
+        error: 'invalid_agreement_plan',
+        code: 'invalid_agreement_plan',
+        detail: 'Agreement plan tier is invalid for checkout.',
+        request_id
+      });
+    }
+    if (!['monthly', 'annual'].includes(billingInterval)) {
+      return res.status(409).json({
+        error: 'invalid_agreement_billing_interval',
+        code: 'invalid_agreement_billing_interval',
+        detail: 'Agreement billing interval is invalid for checkout.',
+        request_id
+      });
+    }
+
+    const enterpriseFees = planTier === 'enterprise'
+      ? {
+          platform_fee: agreementInput.platform_fee,
+          per_role_fee: agreementInput.per_role_fee,
+          included_interviews_per_role: agreementInput.included_interviews_per_role,
+          additional_interview_fee: agreementInput.additional_interview_fee
+        }
+      : null;
+
+    if (
+      planTier === 'enterprise' &&
+      (
+        !String(enterpriseFees?.platform_fee || '').trim() ||
+        !String(enterpriseFees?.per_role_fee || '').trim() ||
+        !String(enterpriseFees?.included_interviews_per_role || '').trim() ||
+        !String(enterpriseFees?.additional_interview_fee || '').trim()
+      )
+    ) {
+      return res.status(409).json({
+        error: 'invalid_enterprise_checkout_fields',
+        code: 'invalid_enterprise_checkout_fields',
+        detail: 'Enterprise checkout values are missing from this agreement.',
+        request_id
+      });
+    }
+
+    const { session } = await createSubscriptionCheckoutSession({
+      clientId,
+      planTier,
+      billingInterval,
+      metadataSource: 'agreement_checkout',
+      metadata: {
+        agreement_id: agreement.id
+      },
+      enterpriseFees,
+      cancelUrl: buildMembershipAgreementSignUrl(token),
+      requestContext: {
+        forwardedProto: req.headers?.['x-forwarded-proto'],
+        forwardedHost: req.headers?.['x-forwarded-host'],
+        protocol: req.protocol,
+        host: req.get('host')
+      }
+    });
+
+    const checkoutSessionId = String(session?.id || '').trim();
+    const checkoutUrl = String(session?.url || '').trim();
+    if (!checkoutSessionId || !checkoutUrl) {
+      return res.status(500).json({
+        error: 'checkout_session_missing',
+        code: 'checkout_session_missing',
+        detail: 'Checkout session was created without a valid URL.',
+        request_id
+      });
+    }
+
+    const nowIso = new Date().toISOString();
+    const { error: checkoutStateErr } = await supabaseAdmin
+      .from('membership_agreements')
+      .update({
+        checkout_status: 'pending_payment',
+        checkout_session_id: checkoutSessionId,
+        checkout_created_at: nowIso,
+        updated_at: nowIso
+      })
+      .eq('id', agreement.id)
+      .eq('status', 'signed')
+      .eq('is_current', true);
+
+    if (checkoutStateErr) {
+      console.error('[membership-agreements/checkout-session] checkout_state_update_failed', {
+        request_id,
+        agreement_id: agreement.id,
+        error: checkoutStateErr.message,
+        code: checkoutStateErr.code,
+        hint: checkoutStateErr.hint
+      });
+      return res.status(500).json({
+        error: 'checkout_state_update_failed',
+        code: checkoutStateErr.code || 'checkout_state_update_failed',
+        detail: checkoutStateErr.message,
+        hint: checkoutStateErr.hint,
+        request_id
+      });
+    }
+
+    return res.json({
+      ok: true,
+      url: checkoutUrl,
+      session_id: checkoutSessionId,
+      request_id
+    });
+  } catch (e) {
+    return res.status(Number(e?.status) || 500).json({
+      error: e?.code || 'create_subscription_checkout_failed',
+      code: e?.code || 'create_subscription_checkout_failed',
+      detail: extractErrorMessage(e?.message || '', 'Could not create checkout session.'),
       request_id
     });
   }

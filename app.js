@@ -55,6 +55,7 @@ const axios = require('axios')
 const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
+const { createSubscriptionCheckoutSession } = require('./src/lib/subscriptionCheckout')
 const { sendSubscriptionCheckoutEmail, sendMemberRecoveryEmail } = require('./utils/mailer')
 const {
   frontendUrl: FRONTEND_URL,
@@ -2121,180 +2122,28 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
   const billingInterval = String(req.body?.billing_interval || '').trim().toLowerCase()
   const returnTab = String(req.body?.tab || '').trim().toLowerCase()
 
-  if (!['basic', 'pro', 'enterprise'].includes(planTier)) {
-    return res.status(400).json({ error: 'invalid_plan_tier' })
-  }
-  if (!['monthly', 'annual'].includes(billingInterval)) {
-    return res.status(400).json({ error: 'invalid_billing_interval' })
-  }
-
-  const { data: client, error: clientError } = await supabaseAdmin
-    .from('clients')
-    .select('id,name,email,client_admin_name,stripe_customer_id')
-    .eq('id', clientId)
-    .maybeSingle()
-  if (clientError) return res.status(500).json({ error: 'client_lookup_failed', detail: clientError.message })
-  if (!client) return res.status(404).json({ error: 'client_not_found' })
-
-  const clientEmail = String(client.email || '').trim()
-  if (!clientEmail) return res.status(400).json({ error: 'missing_client_email' })
-
-  const { data: billingCustomerRows, error: billingCustomerError } = await supabaseAdmin
-    .from('billing_customers')
-    .select('id,stripe_customer_id')
-    .eq('client_id', client.id)
-    .order('created_at', { ascending: false })
-  if (billingCustomerError) return res.status(500).json({ error: 'customer_lookup_failed', detail: billingCustomerError.message })
-  const billingCustomerList = Array.isArray(billingCustomerRows) ? billingCustomerRows : []
-  const billingCustomer = billingCustomerList[0] || null
-
   try {
-    const Stripe = require('stripe')
-    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
-
-    const candidateStripeCustomerIds = []
-    for (const row of billingCustomerList) {
-      const id = String(row?.stripe_customer_id || '').trim()
-      if (!id) continue
-      if (!candidateStripeCustomerIds.includes(id)) candidateStripeCustomerIds.push(id)
-    }
-    const fallbackCustomerId = String(client?.stripe_customer_id || '').trim()
-    if (fallbackCustomerId && !candidateStripeCustomerIds.includes(fallbackCustomerId)) {
-      candidateStripeCustomerIds.push(fallbackCustomerId)
-    }
-
-    let resolvedStripeCustomerId = null
-    for (const candidateId of candidateStripeCustomerIds) {
-      try {
-        await stripe.customers.retrieve(candidateId)
-        resolvedStripeCustomerId = candidateId
-        break
-      } catch (e) {
-        const message = String(e?.message || '').toLowerCase()
-        const code = String(e?.code || '').toLowerCase()
-        if (code === 'resource_missing' || message.includes('no such customer')) continue
-        throw e
-      }
-    }
-
-    if (!resolvedStripeCustomerId) {
-      const createdCustomer = await stripe.customers.create({
-        name: client.name || undefined,
-        email: clientEmail,
-        metadata: { client_id: client.id }
-      })
-      resolvedStripeCustomerId = createdCustomer?.id || null
-    } else {
-      try {
-        await stripe.customers.update(resolvedStripeCustomerId, {
-          name: client.name || undefined,
-          email: clientEmail,
-          metadata: { client_id: client.id }
-        })
-      } catch (_) {}
-    }
-    if (!resolvedStripeCustomerId) return res.status(400).json({ error: 'missing_billing_customer' })
-
-    if (String(client?.stripe_customer_id || '').trim() !== resolvedStripeCustomerId) {
-      try {
-        await supabaseAdmin
-          .from('clients')
-          .update({ stripe_customer_id: resolvedStripeCustomerId })
-          .eq('id', client.id)
-      } catch (_) {}
-    }
-    if (billingCustomer?.id && String(billingCustomer?.stripe_customer_id || '').trim() !== resolvedStripeCustomerId) {
-      try {
-        await supabaseAdmin
-          .from('billing_customers')
-          .update({ stripe_customer_id: resolvedStripeCustomerId })
-          .eq('id', billingCustomer.id)
-      } catch (_) {}
-    }
-
-    const lineItems = []
-    let enterpriseCheckoutMetadata = null
-    if (planTier === 'enterprise') {
-      const platformFee = Number(req.body?.platform_fee)
-      const perRoleFee = Number(req.body?.per_role_fee)
-      const includedInterviewsPerRole = Number(req.body?.included_interviews_per_role)
-      const additionalInterviewFee = Number(req.body?.additional_interview_fee)
-      if (!Number.isFinite(platformFee) || platformFee <= 0) {
-        return res.status(400).json({ error: 'invalid_enterprise_fees' })
-      }
-      if (
-        !Number.isFinite(perRoleFee) || perRoleFee < 0 ||
-        !Number.isFinite(includedInterviewsPerRole) || !Number.isInteger(includedInterviewsPerRole) || includedInterviewsPerRole < 0 ||
-        !Number.isFinite(additionalInterviewFee) || additionalInterviewFee < 0
-      ) {
-        return res.status(400).json({ error: 'invalid_enterprise_fees' })
-      }
-      const platformCents = Math.round(platformFee * 100)
-      if (!Number.isFinite(platformCents) || platformCents <= 0) {
-        return res.status(400).json({ error: 'invalid_enterprise_fees' })
-      }
-      enterpriseCheckoutMetadata = {
-        platform_fee: String(Math.round(platformFee * 100) / 100),
-        per_role_fee: String(Math.round(perRoleFee * 100) / 100),
-        included_interviews_per_role: String(includedInterviewsPerRole),
-        additional_interview_fee: String(Math.round(additionalInterviewFee * 100) / 100)
-      }
-      const enterprisePrice = await stripe.prices.create({
-        currency: 'usd',
-        unit_amount: platformCents,
-        recurring: { interval: billingInterval === 'annual' ? 'year' : 'month' },
-        product_data: { name: 'Enterprise membership' },
-        metadata: {
-          source: 'admin_subscription_checkout',
-          client_id: client.id,
-          plan_tier: 'enterprise',
-          billing_interval: billingInterval,
-          ...enterpriseCheckoutMetadata
+    const enterpriseFees = planTier === 'enterprise'
+      ? {
+          platform_fee: req.body?.platform_fee,
+          per_role_fee: req.body?.per_role_fee,
+          included_interviews_per_role: req.body?.included_interviews_per_role,
+          additional_interview_fee: req.body?.additional_interview_fee
         }
-      })
-      lineItems.push({
-        price: enterprisePrice.id,
-        quantity: 1
-      })
-    } else {
-      let priceId = ''
-      if (planTier === 'basic') {
-        priceId = billingInterval === 'annual'
-          ? String(process.env.STRIPE_PRICE_BASIC_ANNUAL || '')
-          : String(process.env.STRIPE_PRICE_BASIC_MONTHLY || '')
-      } else if (planTier === 'pro') {
-        priceId = billingInterval === 'annual'
-          ? String(process.env.STRIPE_PRICE_PRO_ANNUAL || '')
-          : String(process.env.STRIPE_PRICE_PRO_MONTHLY || '')
-      }
-      if (!priceId) return res.status(500).json({ error: 'stripe_price_not_configured' })
-      lineItems.push({ price: priceId, quantity: 1 })
-    }
+      : null
 
-    const forwardedProto = String(req.headers?.['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim()
-    const forwardedHost = String(req.headers?.['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim()
-    const computedBackendBase = forwardedHost ? `${forwardedProto || 'https'}://${forwardedHost}` : ''
-    const publicBackendBase = resolvePublicBackendBase(computedBackendBase || '')
-    const checkoutSuccessUrl = publicBackendBase
-      ? `${publicBackendBase}/checkout/subscription-success?session_id={CHECKOUT_SESSION_ID}&client_id=${encodeURIComponent(client.id)}${returnTab ? `&tab=${encodeURIComponent(returnTab)}` : ''}`
-      : buildClientDashboardReturnUrl(returnTab ? { checkout: 'success', client_id: client.id, tab: returnTab } : { checkout: 'success', client_id: client.id })
-    const checkoutMetadata = {
-      source: 'admin_subscription_checkout',
-      client_id: client.id,
-      plan_tier: planTier,
-      billing_interval: billingInterval,
-      ...(enterpriseCheckoutMetadata || {})
-    }
-    const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
-      customer: resolvedStripeCustomerId,
-      line_items: lineItems,
-      success_url: checkoutSuccessUrl,
-      cancel_url: buildClientDashboardReturnUrl(returnTab ? { checkout: 'cancel', client_id: client.id, tab: returnTab } : { checkout: 'cancel', client_id: client.id }),
-      allow_promotion_codes: true,
-      metadata: checkoutMetadata,
-      subscription_data: {
-        metadata: checkoutMetadata
+    const { session, client, clientEmail } = await createSubscriptionCheckoutSession({
+      clientId,
+      planTier,
+      billingInterval,
+      returnTab,
+      metadataSource: 'admin_subscription_checkout',
+      enterpriseFees,
+      requestContext: {
+        forwardedProto: req.headers?.['x-forwarded-proto'],
+        forwardedHost: req.headers?.['x-forwarded-host'],
+        protocol: req.protocol,
+        host: req.get('host')
       }
     })
 
@@ -2321,7 +2170,12 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
       email_error
     })
   } catch (e) {
-    return res.status(500).json({ error: 'create_subscription_checkout_failed', detail: e?.message || 'create_subscription_checkout_failed' })
+    const status = Number(e?.status) || 500
+    const code = String(e?.code || '').trim()
+    if (status >= 500 && !code) {
+      return res.status(500).json({ error: 'create_subscription_checkout_failed', detail: e?.message || 'create_subscription_checkout_failed' })
+    }
+    return res.status(status).json({ error: code || 'create_subscription_checkout_failed', detail: e?.message || 'create_subscription_checkout_failed' })
   }
 })
 
@@ -3819,6 +3673,7 @@ app.get('/checkout/subscription-success', async (req, res) => {
     const metadata = session?.metadata && typeof session.metadata === 'object' ? session.metadata : {}
     const metadataSource = String(metadata?.source || '').trim().toLowerCase()
     const metadataClientId = String(metadata?.client_id || '').trim()
+    const metadataAgreementId = String(metadata?.agreement_id || '').trim()
     const clientId = metadataClientId || fallbackClientId
     const successUrl = makeAccountSuccessUrl(clientId, fallbackTab)
     const paymentStatus = String(session?.payment_status || '').toLowerCase()
@@ -3834,7 +3689,7 @@ app.get('/checkout/subscription-success', async (req, res) => {
       subscription_status: subscriptionStatus || null
     })
 
-    if (metadataSource !== 'admin_subscription_checkout') {
+    if (!['admin_subscription_checkout', 'agreement_checkout'].includes(metadataSource)) {
       console.log('subscription_checkout_success_redirect:', {
         branch: 'metadata_source_mismatch',
         target: 'success_url'
@@ -3861,6 +3716,21 @@ app.get('/checkout/subscription-success', async (req, res) => {
         target: 'success_url'
       })
       return res.redirect(302, successUrl)
+    }
+
+    if (metadataSource === 'agreement_checkout' && metadataAgreementId) {
+      try {
+        await supabaseAdmin
+          .from('membership_agreements')
+          .update({
+            checkout_status: 'paid',
+            checkout_session_id: sessionId,
+            checkout_paid_at: new Date().toISOString()
+          })
+          .eq('id', metadataAgreementId)
+      } catch (agreementCheckoutUpdateErr) {
+        console.error('subscription_checkout_success_agreement_checkout_state_update_failed:', agreementCheckoutUpdateErr?.message || agreementCheckoutUpdateErr)
+      }
     }
 
     let client = null
