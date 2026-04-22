@@ -202,7 +202,31 @@ function buildClientPlanSettingsPayloadFromSubscription(subscription, clientId, 
 
 async function upsertClientPlanSettingsFromSubscription(subscription, clientId, options = {}) {
   const payload = buildClientPlanSettingsPayloadFromSubscription(subscription, clientId, options);
-  if (!payload) return false;
+  if (!payload) {
+    const metadataSources = getSubscriptionMetadataSources(subscription);
+    const metadataSource = String(getSubscriptionMetadataValue(metadataSources, 'source', options.fallbackSource || '') || '').trim().toLowerCase();
+    const planTier = String(getSubscriptionMetadataValue(metadataSources, 'plan_tier', options.fallbackPlanTier || '') || '').trim().toLowerCase();
+    if (MANAGED_SUBSCRIPTION_CHECKOUT_SOURCES.has(metadataSource) && planTier === 'enterprise') {
+      const platformFee = parseMoneyValue(getSubscriptionMetadataValue(metadataSources, 'platform_fee', options.fallbackPlatformFee), { allowZero: false });
+      const perRoleFee = parseMoneyValue(getSubscriptionMetadataValue(metadataSources, 'per_role_fee', options.fallbackPerRoleFee));
+      const includedInterviewsPerRole = parseWholeNumber(getSubscriptionMetadataValue(metadataSources, 'included_interviews_per_role', options.fallbackIncludedInterviewsPerRole));
+      const additionalInterviewFee = parseMoneyValue(getSubscriptionMetadataValue(metadataSources, 'additional_interview_fee', options.fallbackAdditionalInterviewFee));
+      const missingFields = [];
+      if (platformFee === null) missingFields.push('platform_fee');
+      if (perRoleFee === null) missingFields.push('per_role_fee');
+      if (includedInterviewsPerRole === null) missingFields.push('included_interviews_per_role');
+      if (additionalInterviewFee === null) missingFields.push('additional_interview_fee');
+
+      const err = new Error(`Enterprise plan settings metadata missing: ${missingFields.join(', ') || 'unknown'}`);
+      err.code = 'enterprise_plan_settings_metadata_missing';
+      err.missing_fields = missingFields;
+      err.client_id = clientId;
+      err.subscription_id = pickId(subscription?.id) || null;
+      err.source = metadataSource;
+      throw err;
+    }
+    return false;
+  }
   const { error } = await supabaseAdmin
     .from('client_plan_settings')
     .upsert(payload, { onConflict: 'client_id' });
@@ -621,52 +645,22 @@ router.post('/', async (req, res) => {
 
             if (MANAGED_SUBSCRIPTION_CHECKOUT_SOURCES.has(metadataSource)) {
               const planTierForSettings = String(updates?.plan_tier || metadataPlanTier || '').trim().toLowerCase();
-              const billingIntervalForSettings = String(updates?.billing_interval || metadataBillingInterval || '').trim().toLowerCase();
-              let planSettingsPayload = null;
-
-              if (['basic', 'pro'].includes(planTierForSettings) && ['monthly', 'annual'].includes(billingIntervalForSettings)) {
-                const defaults = PLAN_SETTINGS_DEFAULTS[planTierForSettings];
-                planSettingsPayload = {
-                  client_id: targetClientId,
-                  plan_tier: planTierForSettings,
-                  billing_interval: billingIntervalForSettings,
-                  platform_fee: null,
-                  per_role_fee: defaults.per_role_fee,
-                  included_interviews_per_role: defaults.included_interviews_per_role,
-                  additional_interview_fee: defaults.additional_interview_fee,
-                  max_interview_minutes: defaults.max_interview_minutes
-                };
-              } else if (planTierForSettings === 'enterprise' && ['monthly', 'annual'].includes(billingIntervalForSettings)) {
-                const subscriptionMetadata = subscription?.metadata && typeof subscription?.metadata === 'object' ? subscription.metadata : {};
-                const platformFee = parseMoneyValue(subscriptionMetadata?.platform_fee ?? metadata?.platform_fee, { allowZero: false });
-                const perRoleFee = parseMoneyValue(subscriptionMetadata?.per_role_fee ?? metadata?.per_role_fee);
-                const includedInterviewsPerRole = parseWholeNumber(subscriptionMetadata?.included_interviews_per_role ?? metadata?.included_interviews_per_role);
-                const additionalInterviewFee = parseMoneyValue(subscriptionMetadata?.additional_interview_fee ?? metadata?.additional_interview_fee);
-
-                if (
-                  platformFee !== null &&
-                  perRoleFee !== null &&
-                  includedInterviewsPerRole !== null &&
-                  additionalInterviewFee !== null
-                ) {
-                  planSettingsPayload = {
-                    client_id: targetClientId,
-                    plan_tier: 'enterprise',
-                    billing_interval: billingIntervalForSettings,
-                    platform_fee: platformFee,
-                    per_role_fee: perRoleFee,
-                    included_interviews_per_role: includedInterviewsPerRole,
-                    additional_interview_fee: additionalInterviewFee,
-                    max_interview_minutes: 15
-                  };
-                }
-              }
-
-              if (planSettingsPayload) {
-                const { error: planSettingsErr } = await supabaseAdmin
-                  .from('client_plan_settings')
-                  .upsert(planSettingsPayload, { onConflict: 'client_id' });
-                if (planSettingsErr) throw new Error(planSettingsErr.message || 'Client plan settings upsert failed');
+              const planSettingsUpserted = await upsertClientPlanSettingsFromSubscription(subscription, targetClientId, {
+                fallbackSource: metadataSource,
+                fallbackPlanTier: updates?.plan_tier || metadataPlanTier || null,
+                fallbackBillingInterval: updates?.billing_interval || metadataBillingInterval || null,
+                fallbackPlatformFee: metadata?.platform_fee,
+                fallbackPerRoleFee: metadata?.per_role_fee,
+                fallbackIncludedInterviewsPerRole: metadata?.included_interviews_per_role,
+                fallbackAdditionalInterviewFee: metadata?.additional_interview_fee
+              });
+              if (!planSettingsUpserted && planTierForSettings === 'enterprise') {
+                const err = new Error('Enterprise plan settings upsert skipped');
+                err.code = 'enterprise_plan_settings_upsert_skipped';
+                err.client_id = targetClientId;
+                err.subscription_id = subscriptionId;
+                err.source = metadataSource;
+                throw err;
               }
             }
           }

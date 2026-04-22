@@ -1501,7 +1501,7 @@ adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
 
   const { data: planSettingsRows, error: planSettingsError } = await supabaseAdmin
     .from('client_plan_settings')
-    .select('client_id,plan_tier,per_role_fee,included_interviews_per_role,additional_interview_fee,updated_at')
+    .select('client_id,plan_tier,billing_interval,platform_fee,per_role_fee,included_interviews_per_role,additional_interview_fee,updated_at')
     .in('client_id', clientIds)
     .order('updated_at', { ascending: false })
   if (planSettingsError) return res.status(500).json({ error: 'list_clients_failed', detail: planSettingsError.message })
@@ -1518,6 +1518,8 @@ adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
     return {
       ...item,
       plan_settings_plan_tier: settings?.plan_tier || null,
+      plan_settings_billing_interval: settings?.billing_interval || null,
+      plan_settings_platform_fee: settings?.platform_fee ?? null,
       plan_settings_per_role_fee: settings?.per_role_fee ?? null,
       plan_settings_included_interviews_per_role: settings?.included_interviews_per_role ?? null,
       plan_settings_additional_interview_fee: settings?.additional_interview_fee ?? null
