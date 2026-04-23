@@ -10,7 +10,8 @@ if (!API_KEY) {
 }
 
 const FROM = process.env.SENDGRID_FROM || 'no-reply@yourdomain.com'
-const BRAND_LOGO_URL = process.env.BRANDED_EMAIL_LOGO_URL || 'https://rytlclkkcvvnkoncfaid.supabase.co/storage/v1/object/public/email-assets/Color%20logo%20-%20no%20background.png'
+const PUBLIC_SITE_BASE = String(process.env.PUBLIC_SITE_BASE || process.env.PUBLIC_SITE_BASE_FALLBACK || 'https://www.alphasourceai.com').trim().replace(/\/+$/, '')
+const BRAND_LOGO_URL = process.env.BRANDED_EMAIL_LOGO_URL || `${PUBLIC_SITE_BASE}/logo-dark-text-clear.png`
 const DEFAULT_HELP_EMAIL = process.env.BRANDED_EMAIL_HELP_EMAIL || 'info@alphasourceai.com'
 
 function escapeHtml(value) {
