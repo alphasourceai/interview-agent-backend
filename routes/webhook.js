@@ -40,6 +40,14 @@ function fromAny(obj, ...paths) {
   return undefined;
 }
 
+function fromAnyPathList(obj, paths) {
+  for (const p of paths) {
+    const value = fromAny(obj, p);
+    if (value !== undefined && value !== null && !(typeof value === 'string' && !value.trim())) return value;
+  }
+  return undefined;
+}
+
 function collectValues(obj, ...paths) {
   const out = [];
   for (const p of paths) {
@@ -94,8 +102,10 @@ function looksLikeJson(value) {
 }
 
 function clampScore(value) {
+  if (typeof value === 'string' && !value.trim()) return null;
   const n = Number(value);
   if (!Number.isFinite(n)) return null;
+  if (n > 0 && n <= 1) return Math.round(n * 100);
   return Math.max(0, Math.min(100, Math.round(n)));
 }
 
@@ -111,54 +121,77 @@ function elapsedSecondsSince(isoLike, endAt) {
 function extractPerceptionScores(payload) {
   if (!payload || typeof payload !== 'object') return {};
 
-  const clarityRaw = pickFirst(
-    fromAny(payload, 'clarity'),
-    fromAny(payload, 'scores.clarity'),
-    fromAny(payload, 'analysis.clarity'),
-    fromAny(payload, 'analysis.scores.clarity')
-  );
-  const confidenceRaw = pickFirst(
-    fromAny(payload, 'confidence'),
-    fromAny(payload, 'scores.confidence'),
-    fromAny(payload, 'analysis.confidence'),
-    fromAny(payload, 'analysis.scores.confidence')
-  );
-  const engagementRaw = pickFirst(
-    fromAny(payload, 'engagement'),
-    fromAny(payload, 'engagement_score'),
-    fromAny(payload, 'body_language'),
-    fromAny(payload, 'bodyLanguage'),
-    fromAny(payload, 'body_language_score'),
-    fromAny(payload, 'bodyLanguageScore'),
-    fromAny(payload, 'nonverbal'),
-    fromAny(payload, 'non_verbal'),
-    fromAny(payload, 'nonVerbal'),
-    fromAny(payload, 'nonverbal_score'),
-    fromAny(payload, 'nonVerbalScore'),
-    fromAny(payload, 'scores.engagement'),
-    fromAny(payload, 'scores.body_language'),
-    fromAny(payload, 'scores.bodyLanguage'),
-    fromAny(payload, 'scores.bodyLanguageScore'),
-    fromAny(payload, 'scores.nonverbal'),
-    fromAny(payload, 'scores.nonVerbal'),
-    fromAny(payload, 'analysis.engagement'),
-    fromAny(payload, 'analysis.body_language'),
-    fromAny(payload, 'analysis.bodyLanguage'),
-    fromAny(payload, 'analysis.bodyLanguageScore'),
-    fromAny(payload, 'analysis.nonverbal'),
-    fromAny(payload, 'analysis.nonVerbal'),
-    fromAny(payload, 'analysis.scores.engagement'),
-    fromAny(payload, 'analysis.scores.body_language'),
-    fromAny(payload, 'analysis.scores.bodyLanguage'),
-    fromAny(payload, 'analysis.scores.bodyLanguageScore'),
-    fromAny(payload, 'analysis.scores.nonverbal'),
-    fromAny(payload, 'analysis.scores.nonVerbal')
-  );
+  const clarityRaw = fromAnyPathList(payload, [
+    'clarity',
+    'scores.clarity',
+    'analysis.clarity',
+    'analysis.scores.clarity',
+    'perception_analysis.clarity',
+    'perception_analysis.scores.clarity'
+  ]);
+  const confidenceRaw = fromAnyPathList(payload, [
+    'confidence',
+    'scores.confidence',
+    'analysis.confidence',
+    'analysis.scores.confidence',
+    'perception_analysis.confidence',
+    'perception_analysis.scores.confidence'
+  ]);
+  const engagementRaw = fromAnyPathList(payload, [
+    'engagement',
+    'engagement_score',
+    'scores.engagement',
+    'analysis.engagement',
+    'analysis.scores.engagement',
+    'perception_analysis.engagement',
+    'perception_analysis.engagement_score',
+    'perception_analysis.scores.engagement'
+  ]);
+  const bodyLanguageRaw = fromAnyPathList(payload, [
+    'body_language',
+    'bodyLanguage',
+    'body_language_score',
+    'bodyLanguageScore',
+    'nonverbal',
+    'non_verbal',
+    'nonVerbal',
+    'nonverbal_score',
+    'nonVerbalScore',
+    'scores.body_language',
+    'scores.bodyLanguage',
+    'scores.bodyLanguageScore',
+    'scores.nonverbal',
+    'scores.nonVerbal',
+    'analysis.body_language',
+    'analysis.bodyLanguage',
+    'analysis.bodyLanguageScore',
+    'analysis.nonverbal',
+    'analysis.nonVerbal',
+    'analysis.scores.body_language',
+    'analysis.scores.bodyLanguage',
+    'analysis.scores.bodyLanguageScore',
+    'analysis.scores.nonverbal',
+    'analysis.scores.nonVerbal',
+    'perception_analysis.body_language',
+    'perception_analysis.bodyLanguage',
+    'perception_analysis.body_language_score',
+    'perception_analysis.bodyLanguageScore',
+    'perception_analysis.nonverbal',
+    'perception_analysis.non_verbal',
+    'perception_analysis.nonVerbal',
+    'perception_analysis.nonverbal_score',
+    'perception_analysis.nonVerbalScore',
+    'perception_analysis.scores.body_language',
+    'perception_analysis.scores.bodyLanguage',
+    'perception_analysis.scores.bodyLanguageScore',
+    'perception_analysis.scores.nonverbal',
+    'perception_analysis.scores.nonVerbal'
+  ]);
 
   const out = {};
   const clarity = clampScore(clarityRaw);
   const confidence = clampScore(confidenceRaw);
-  const engagement = clampScore(engagementRaw);
+  const engagement = clampScore(engagementRaw !== undefined ? engagementRaw : bodyLanguageRaw);
   if (clarity !== null) out.clarity = clarity;
   if (confidence !== null) out.confidence = confidence;
   if (engagement !== null) out.engagement = engagement;
@@ -619,7 +652,7 @@ async function applyInterviewUpdates(interviewId, updates, recordingMeta) {
   if (urlErr && !isMissingColumnError(urlErr)) throw urlErr;
 }
 
-async function updatePerceptionAnalysis(interview, analysisText, requestId) {
+async function updatePerceptionAnalysis(interview, analysisText, requestId, extraScoreSources = []) {
   let rawText;
   if (analysisText && typeof analysisText === 'object') {
     try {
@@ -631,8 +664,7 @@ async function updatePerceptionAnalysis(interview, analysisText, requestId) {
     rawText = String(analysisText || '');
   }
   rawText = String(rawText || '').trim();
-  if (!rawText) return { stored: false, perception_scores: {} };
-  const sanitizedText = sanitizePerceptionText(rawText);
+  const sanitizedText = rawText ? sanitizePerceptionText(rawText) : '';
   const conversationId = interview?.tavus_application_id || interview?.conversation_id || null;
 
   let perceptionScores = {};
@@ -669,7 +701,15 @@ async function updatePerceptionAnalysis(interview, analysisText, requestId) {
     perceptionScores = extractPerceptionScoresFromText(rawText);
   }
 
-  const updates = { perception_analysis_text: sanitizedText };
+  if (!Object.keys(perceptionScores).length) {
+    for (const source of extraScoreSources || []) {
+      perceptionScores = extractPerceptionScores(source);
+      if (Object.keys(perceptionScores).length) break;
+    }
+  }
+
+  const updates = {};
+  if (sanitizedText) updates.perception_analysis_text = sanitizedText;
   if (Object.keys(perceptionScores).length) {
     const existingScores =
       interview.perception_scores && typeof interview.perception_scores === 'object'
@@ -677,6 +717,7 @@ async function updatePerceptionAnalysis(interview, analysisText, requestId) {
         : {};
     updates.perception_scores = { ...existingScores, ...perceptionScores };
   }
+  if (!Object.keys(updates).length) return { stored: false, perception_scores: {} };
 
   const { error } = await supabaseAdmin
     .from('interviews')
@@ -858,14 +899,29 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
     interviewId = pickFirst(
       fromAny(body, 'interview_id'),
       fromAny(body, 'interviewId'),
-      fromAny(body, 'metadata.interview_id')
+      fromAny(body, 'metadata.interview_id'),
+      fromAny(body, 'properties.interview_id'),
+      fromAny(body, 'properties.interviewId'),
+      fromAny(body, 'payload.interview_id'),
+      fromAny(body, 'payload.interviewId'),
+      fromAny(body, 'payload.metadata.interview_id')
     );
 
     conversationId = pickFirst(
       fromAny(body, 'conversation_id'),
       fromAny(body, 'properties.conversation_id'),
       fromAny(body, 'properties.conversationId'),
-      fromAny(body, 'metadata.conversation_id')
+      fromAny(body, 'metadata.conversation_id'),
+      fromAny(body, 'payload.conversation_id'),
+      fromAny(body, 'payload.properties.conversation_id'),
+      fromAny(body, 'conversation.id'),
+      fromAny(body, 'payload.conversation.id'),
+      fromAny(body, 'application_id'),
+      fromAny(body, 'properties.application_id'),
+      fromAny(body, 'payload.application_id'),
+      fromAny(body, 'payload.properties.application_id'),
+      fromAny(body, 'application.id'),
+      fromAny(body, 'payload.application.id')
     );
     Sentry.addBreadcrumb({
       category: 'webhook',
@@ -923,7 +979,14 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
 
     const interview = await getInterviewByIds(interviewId, conversationId);
     if (!interview) {
-      console.error(`[webhook] interview not found conversation_id=${conversationId || 'null'}`);
+      console.warn('[webhook] interview not found', {
+        request_id: requestId || null,
+        event_type: eventType || null,
+        interview_id: interviewId || null,
+        conversation_id: conversationId || null,
+        top_keys: Object.keys(body || {}),
+        payload_keys: Object.keys(body?.payload || {})
+      });
       return res.status(200).json({ ok: true });
     }
     if (interview?.id) Sentry.setTag('interview_id', String(interview.id));
@@ -1241,6 +1304,16 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
         fromAny(body, 'perception_analysis'),
         fromAny(body, 'payload.perception_analysis')
       );
+      const perceptionScoreSources = [
+        body,
+        body?.properties,
+        body?.payload,
+        body?.payload?.properties,
+        body?.analysis,
+        body?.perception_analysis,
+        body?.payload?.analysis,
+        body?.payload?.perception_analysis
+      ];
       if (analysisText && typeof analysisText === 'object') {
         try {
           analysisText = JSON.stringify(analysisText);
@@ -1248,10 +1321,10 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
           analysisText = String(analysisText);
         }
       }
-      if (analysisText) {
-        const perceptionResult = await updatePerceptionAnalysis(interview, analysisText, requestId);
-        const extractedKeys = Object.keys(perceptionResult?.perception_scores || {});
-        perceptionKeysCount = extractedKeys.length;
+      const perceptionResult = await updatePerceptionAnalysis(interview, analysisText, requestId, perceptionScoreSources);
+      const extractedKeys = Object.keys(perceptionResult?.perception_scores || {});
+      perceptionKeysCount = extractedKeys.length;
+      if (extractedKeys.length) {
         console.log('[webhook] perception_analysis processed', {
           request_id: requestId || null,
           event_type: eventType || null,
@@ -1264,11 +1337,11 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
           stored: perceptionResult?.stored ?? null
         });
       } else {
-        perceptionKeysCount = 0;
-        console.log('[webhook] perception_analysis missing analysis', {
+        console.warn('[webhook] perception_analysis no scores extracted', {
           request_id: requestId || null,
           event_type: eventType || null,
           interview_id: interview.id,
+          extracted_interview_id: interviewId || null,
           conversation_id: conversationId || null,
           interview_created_at: interviewCreatedAt,
           elapsed_seconds_from_interview_created: elapsedFromInterviewCreatedSec,
