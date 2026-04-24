@@ -53,6 +53,26 @@ function parseJsonObject(value) {
   return null;
 }
 
+function normalizeUnansweredQuestions(primary, fallback) {
+  const normalizeOne = (value) => {
+    if (Array.isArray(value)) {
+      return value.map(q => String(q || '').trim()).filter(Boolean);
+    }
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (!trimmed) return [];
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return normalizeOne(parsed);
+      } catch {}
+      return [trimmed];
+    }
+    return [];
+  };
+  const primaryQuestions = normalizeOne(primary);
+  return primaryQuestions.length ? primaryQuestions : normalizeOne(fallback);
+}
+
 function toFiniteOrNull(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
@@ -190,7 +210,8 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
           'perception_scores',
           'transcript_scores',
           'interview_summary',
-          'unanswered_candidate_questions'
+          'unanswered_candidate_questions',
+          'unanswered_candidate_questions_text'
         ].join(', '))
         .eq('client_id', clientId)
         .in('candidate_id', candIds)
@@ -341,7 +362,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         transcript_scores: parseJsonObject(iv?.transcript_scores) || null,
         perception_scores: parseJsonObject(iv?.perception_scores) || null,
         interview_summary: interviewSummary || '',
-        unanswered_candidate_questions: Array.isArray(iv?.unanswered_candidate_questions) ? iv.unanswered_candidate_questions : [],
+        unanswered_candidate_questions: normalizeUnansweredQuestions(iv?.unanswered_candidate_questions, iv?.unanswered_candidate_questions_text),
         transcript: typeof iv?.transcript === 'string' ? iv.transcript : '',
         has_video: !!safeVideoUrl,
         has_transcript: hasTranscript,
