@@ -124,7 +124,7 @@ ${role.manual_questions || 'None'}
   let rubricObj = null
   try {
     const resp = await openai.chat.completions.create({
-      model: 'gpt-4',
+      model: process.env.OPENAI_RUBRIC_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini',
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.2
     })
