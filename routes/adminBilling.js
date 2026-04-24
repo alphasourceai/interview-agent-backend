@@ -138,6 +138,140 @@ function validateAgreementPayload(payload) {
   return { ok: true };
 }
 
+async function resolveAgreementAdminUserId(email) {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+
+  const findUserId = async () => {
+    const { data, error } = await supabaseAdmin.auth.admin.listUsers({ email: normalizedEmail });
+    if (error) {
+      const err = new Error(error.message || 'auth_user_lookup_failed');
+      err.code = error.code || 'auth_user_lookup_failed';
+      throw err;
+    }
+    const existing = (data?.users || []).find((user) => String(user?.email || '').trim().toLowerCase() === normalizedEmail);
+    return existing?.id || null;
+  };
+
+  let userId = await findUserId();
+  if (userId) return userId;
+
+  try {
+    const { data, error } = await supabaseAdmin.auth.admin.createUser({
+      email: normalizedEmail,
+      email_confirm: true
+    });
+    if (error) {
+      const msg = String(error.message || '').toLowerCase();
+      if (msg.includes('already') || msg.includes('exists')) {
+        userId = await findUserId();
+      } else {
+        const err = new Error(error.message || 'auth_user_create_failed');
+        err.code = error.code || 'auth_user_create_failed';
+        throw err;
+      }
+    } else {
+      userId = data?.user?.id || null;
+    }
+  } catch (e) {
+    const msg = String(e?.message || '').toLowerCase();
+    if (!msg.includes('already') && !msg.includes('exists')) {
+      const err = new Error(e?.message || 'auth_user_create_failed');
+      err.code = e?.code || 'auth_user_create_failed';
+      throw err;
+    }
+    userId = await findUserId();
+  }
+
+  if (!userId) {
+    const err = new Error('Could not create or locate admin user for this client.');
+    err.code = 'auth_user_missing';
+    throw err;
+  }
+
+  return userId;
+}
+
+async function ensureAgreementClientManagerMembership(clientId, payload) {
+  const normalizedClientId = String(clientId || '').trim();
+  const email = String(payload?.admin_email || '').trim().toLowerCase();
+  const name = String(payload?.primary_admin_name || '').trim();
+  if (!normalizedClientId || !email) return null;
+
+  const userId = await resolveAgreementAdminUserId(email);
+  let memberSelect = 'id,client_id,user_id,email,name,role,created_at';
+  let { data: existingRows, error: lookupErr } = await supabaseAdmin
+    .from('client_members')
+    .select('id,client_id,user_id,email,name,role,created_at')
+    .eq('client_id', normalizedClientId);
+
+  if (lookupErr && (lookupErr.code === '42703' || lookupErr.code === 'PGRST204')) {
+    memberSelect = 'client_id,user_id,email,name,role,created_at';
+    ({ data: existingRows, error: lookupErr } = await supabaseAdmin
+      .from('client_members')
+      .select(memberSelect)
+      .eq('client_id', normalizedClientId));
+  }
+
+  if (lookupErr) {
+    const err = new Error(lookupErr.message || 'membership_lookup_failed');
+    err.code = lookupErr.code || 'membership_lookup_failed';
+    throw err;
+  }
+
+  const existingMembership = (existingRows || []).find((row) => {
+    const rowEmail = String(row?.email || '').trim().toLowerCase();
+    const rowUserId = String(row?.user_id || '').trim();
+    return (rowEmail && rowEmail === email) || (rowUserId && rowUserId === userId);
+  }) || null;
+
+  if (!existingMembership) {
+    const { data, error } = await supabaseAdmin
+      .from('client_members')
+      .insert({ client_id: normalizedClientId, email, name: name || email, role: 'manager', user_id: userId })
+      .select(memberSelect)
+      .single();
+    if (error) {
+      const err = new Error(error.message || 'membership_insert_failed');
+      err.code = error.code || 'membership_insert_failed';
+      err.hint = error.hint || null;
+      throw err;
+    }
+    return data;
+  }
+
+  const updatePayload = {};
+  if (String(existingMembership.role || '').trim().toLowerCase() !== 'manager') updatePayload.role = 'manager';
+  if (String(existingMembership.email || '').trim().toLowerCase() !== email) updatePayload.email = email;
+  if (!String(existingMembership.name || '').trim() && name) updatePayload.name = name;
+  if (!String(existingMembership.user_id || '').trim()) updatePayload.user_id = userId;
+  if (!Object.keys(updatePayload).length) return existingMembership;
+
+  let updateQuery = supabaseAdmin
+    .from('client_members')
+    .update(updatePayload)
+    .eq('client_id', normalizedClientId);
+
+  const existingId = String(existingMembership.id || '').trim();
+  const existingEmail = String(existingMembership.email || '').trim();
+  const existingUserId = String(existingMembership.user_id || '').trim();
+  if (existingId) {
+    updateQuery = updateQuery.eq('id', existingId);
+  } else {
+    updateQuery = existingEmail ? updateQuery.eq('email', existingEmail) : updateQuery.eq('user_id', existingUserId);
+  }
+
+  const { data, error } = await updateQuery
+    .select(memberSelect)
+    .single();
+  if (error) {
+    const err = new Error(error.message || 'membership_update_failed');
+    err.code = error.code || 'membership_update_failed';
+    err.hint = error.hint || null;
+    throw err;
+  }
+  return data;
+}
+
 async function createClientFromAgreementPayload(payload) {
   const { data, error } = await supabaseAdmin
     .from('clients')
@@ -158,6 +292,8 @@ async function createClientFromAgreementPayload(payload) {
     err.hint = error.hint || null;
     throw err;
   }
+
+  await ensureAgreementClientManagerMembership(data.id, payload);
 
   return data;
 }
