@@ -236,9 +236,11 @@ function buildTextInterviewUrl(token) {
 function buildMembershipAgreementSignUrl(token) {
   const safeToken = encodeURIComponent(String(token || '').trim());
   const base = firstBase(
-    publicSiteOrFrontendBase,
+    clientAppBase,
+    clientAppBaseWithFrontendFallback,
     frontendBase,
-    frontendUrl
+    frontendUrl,
+    publicSiteOrFrontendBase
   );
   return `${base}/membership-agreement/sign/${safeToken}`;
 }
