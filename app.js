@@ -3874,6 +3874,7 @@ app.get('/checkout/subscription-success', async (req, res) => {
     parsedMetadataSource = metadataSource
     const metadataClientId = String(metadata?.client_id || '').trim()
     const metadataAgreementId = String(metadata?.agreement_id || '').trim()
+    const metadataPlanTier = String(metadata?.plan_tier || '').trim().toLowerCase()
     const clientId = metadataClientId || fallbackClientId
     const successUrl = makeAccountSuccessUrl(clientId, fallbackTab)
     const paymentStatus = String(session?.payment_status || '').toLowerCase()
@@ -3916,6 +3917,74 @@ app.get('/checkout/subscription-success', async (req, res) => {
         target: 'success_url'
       })
       return res.redirect(302, successUrl)
+    }
+
+    if (clientId && subscriptionObj && ['active', 'trialing'].includes(subscriptionStatus)) {
+      try {
+        const pickStripeId = (value) => {
+          if (!value) return null
+          if (typeof value === 'string') return value
+          if (typeof value === 'object' && typeof value.id === 'string') return value.id
+          return null
+        }
+        const toIsoFromUnixSeconds = (value) => {
+          const n = Number(value)
+          if (!Number.isFinite(n) || n <= 0) return null
+          return new Date(n * 1000).toISOString()
+        }
+        const normalizeStripeInterval = (value) => {
+          const raw = String(value || '').trim().toLowerCase()
+          if (raw === 'month') return 'monthly'
+          if (raw === 'year') return 'annual'
+          if (raw === 'monthly' || raw === 'annual') return raw
+          return null
+        }
+        const intervalRaw =
+          subscriptionObj?.items?.data?.[0]?.price?.recurring?.interval ||
+          subscriptionObj?.plan?.interval ||
+          ''
+        const cancelAtTermEnd = subscriptionObj?.cancel_at_period_end === true
+        const currentTermEnd = toIsoFromUnixSeconds(
+          subscriptionObj?.current_period_end ??
+          subscriptionObj?.items?.data?.[0]?.current_period_end ??
+          null
+        )
+        const clientBillingUpdates = {
+          stripe_customer_id: pickStripeId(subscriptionObj?.customer) || pickStripeId(session?.customer) || null,
+          stripe_subscription_id: pickStripeId(subscriptionObj?.id) || null,
+          subscription_status: subscriptionStatus,
+          current_term_end: currentTermEnd,
+          cancel_at_term_end: cancelAtTermEnd,
+          billing_interval: normalizeStripeInterval(intervalRaw),
+          billing_status: 'active',
+          auto_renew: !cancelAtTermEnd,
+          cancel_effective_at: null
+        }
+        if (['basic', 'pro', 'enterprise'].includes(metadataPlanTier)) {
+          clientBillingUpdates.plan_tier = metadataPlanTier
+        }
+        const { error: clientBillingUpdateErr } = await supabaseAdmin
+          .from('clients')
+          .update(clientBillingUpdates)
+          .eq('id', clientId)
+        if (clientBillingUpdateErr) {
+          console.error('subscription_checkout_success_client_billing_update_failed:', {
+            request_id,
+            client_id: clientId,
+            session_id: sessionId,
+            error: clientBillingUpdateErr.message,
+            code: clientBillingUpdateErr.code || null,
+            hint: clientBillingUpdateErr.hint || null
+          })
+        }
+      } catch (clientBillingUpdateErr) {
+        console.error('subscription_checkout_success_client_billing_update_failed:', {
+          request_id,
+          client_id: clientId,
+          session_id: sessionId,
+          error: clientBillingUpdateErr?.message || clientBillingUpdateErr
+        })
+      }
     }
 
     if (metadataSource === 'agreement_checkout' && metadataAgreementId) {
