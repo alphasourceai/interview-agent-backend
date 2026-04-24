@@ -55,6 +55,7 @@ const axios = require('axios')
 const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
+const { getRoleInterviewAvailability } = require('./src/lib/roleInterviewAvailability')
 const { createSubscriptionCheckoutSession } = require('./src/lib/subscriptionCheckout')
 const { sendSubscriptionCheckoutEmail, sendMemberRecoveryEmail } = require('./utils/mailer')
 const {
@@ -2390,7 +2391,37 @@ adminRouter.get('/roles', requireAuth, requireAdmin, async (req, res) => {
   if (client_id) q = q.eq('client_id', client_id)
   const { data, error } = await q
   if (error) return res.status(500).json({ error: 'list_roles_failed', detail: error.message })
-  res.json({ items: data || [] })
+  const availabilityFallback = {
+    included_interviews_per_role: null,
+    purchased_interviews: null,
+    used_interviews: null,
+    remaining_interviews: null
+  }
+  const items = await Promise.all((data || []).map(async (role) => {
+    try {
+      if (!role?.id || !role?.client_id) return { ...role, ...availabilityFallback }
+      const availability = await getRoleInterviewAvailability({
+        db: supabaseAdmin,
+        roleId: role.id,
+        clientId: role.client_id
+      })
+      return {
+        ...role,
+        included_interviews_per_role: availability?.included_interviews_per_role ?? null,
+        purchased_interviews: availability?.purchased_interviews ?? null,
+        used_interviews: availability?.used_interviews ?? null,
+        remaining_interviews: availability?.remaining_interviews ?? null
+      }
+    } catch (e) {
+      console.warn('[admin/roles] availability lookup failed', {
+        role_id: role?.id || null,
+        client_id: role?.client_id || null,
+        error: e?.message || e
+      })
+      return { ...role, ...availabilityFallback }
+    }
+  }))
+  res.json({ items })
 })
 
 // Create role (keeps existing rubric+KB generation)
