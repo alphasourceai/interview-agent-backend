@@ -210,8 +210,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
           'perception_scores',
           'transcript_scores',
           'interview_summary',
-          'unanswered_candidate_questions',
-          'unanswered_candidate_questions_text'
+          'unanswered_candidate_questions'
         ].join(', '))
         .eq('client_id', clientId)
         .in('candidate_id', candIds)
@@ -229,6 +228,26 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         });
         console.error('[dashboard/rows] interviews error', iErr);
       } else {
+        const ivsById = Object.fromEntries((ivs || []).map(iv => [iv.id, iv]));
+        const ivIds = Object.keys(ivsById);
+        if (ivIds.length) {
+          const { data: questionTextRows, error: questionTextErr } = await supabase
+            .from('interviews')
+            .select('id, unanswered_candidate_questions_text')
+            .in('id', ivIds);
+          if (questionTextErr) {
+            console.warn('[dashboard/rows] unanswered_candidate_questions_text fallback skipped', {
+              code: questionTextErr.code,
+              message: questionTextErr.message
+            });
+          } else {
+            for (const row of questionTextRows || []) {
+              if (row?.id && ivsById[row.id]) {
+                ivsById[row.id].unanswered_candidate_questions_text = row.unanswered_candidate_questions_text;
+              }
+            }
+          }
+        }
         for (const iv of ivs || []) {
           const k = iv.candidate_id;
           if (!latestInterviewByCand[k]) latestInterviewByCand[k] = iv;
