@@ -2,7 +2,7 @@
 
 const crypto = require('crypto');
 const { supabaseAdmin } = require('./supabaseClient');
-const { buildPublicPwResetUrl } = require('../../config/urlConfig');
+const { buildClientPwResetUrl } = require('../../config/urlConfig');
 
 const redactEmail = (email) => {
   try {
@@ -18,7 +18,7 @@ const redactEmail = (email) => {
 
 async function ensureUserAndSendRecovery({ email, redirectTo, request_id, loggerPrefix = '[recover-helper]' }) {
   const requestId = request_id || crypto.randomUUID?.() || String(Date.now());
-  const effectiveRedirect = redirectTo || buildPublicPwResetUrl();
+  const effectiveRedirect = redirectTo || buildClientPwResetUrl();
   const normalizedEmail = String(email || '').trim();
   const emailLower = normalizedEmail.toLowerCase();
   const safeEmail = redactEmail(email);

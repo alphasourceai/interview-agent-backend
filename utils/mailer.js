@@ -192,6 +192,91 @@ async function sendInvite(to, acceptUrl, inviterEmail) {
   return { statusCode: resp?.statusCode || 0 }
 }
 
+async function sendPasswordResetEmail(to, resetUrl) {
+  if (!API_KEY) return { skipped: true }
+  const safeResetUrl = resetUrl
+  const msg = {
+    to,
+    from: FROM,
+    subject: 'Reset your alphaScreen password',
+    html: `
+      <!doctype html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <meta name="color-scheme" content="light dark" />
+        <meta name="supported-color-schemes" content="light dark" />
+        <title>Reset your alphaScreen password</title>
+        <style>
+          body { margin: 0; padding: 0; background: #0F1E5D; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+          table { border-collapse: collapse; }
+          a { text-decoration: none; }
+          @media (max-width: 640px) {
+            .container { width: 100% !important; padding: 16px !important; }
+            .card { padding: 18px !important; border-radius: 14px !important; }
+            .cta { display: block !important; width: 100% !important; text-align: center !important; box-sizing: border-box !important; }
+          }
+        </style>
+      </head>
+      <body>
+        <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
+          Reset your alphaScreen password securely.
+        </div>
+        <table role="presentation" width="100%" style="background:#0F1E5D;color:#C9D3FF;">
+          <tr>
+            <td align="center" style="padding: 24px 16px;">
+              <table role="presentation" width="100%" class="container" style="max-width: 640px;">
+                <tr>
+                  <td>
+                    <table role="presentation" width="100%" class="card" style="background:#0F1E5D;color:#C9D3FF;border:0;border-radius:0;box-shadow:none;padding:24px;">
+                      <tr>
+                        <td align="left" style="padding-bottom:16px;">
+                          <img src="http://cdn.mcauto-images-production.sendgrid.net/fe2f293446641ea1/9d2d6663-bd5f-4b91-8bf2-5704f37cbc78/3163x752.png" alt="AlphaSource" width="208" style="display:block;border:0;outline:none;text-decoration:none;height:auto;max-width:100%;" />
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="color:#E6EBFF;font-size:24px;line-height:1.25;font-weight:700;padding-bottom:10px;">
+                          Reset your alphaScreen password
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="color:#C9D3FF;font-size:15px;line-height:1.6;padding-bottom:20px;">
+                          Use the button below to set a new password for your account.
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding-bottom:18px;">
+                          <a class="cta" href="${safeResetUrl}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#A78BFA;color:#0A1547;border:1px solid #CFCBFF;border-radius:10px;padding:11px 18px;font-size:14px;font-weight:700;line-height:1;">
+                            Reset password
+                          </a>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="color:#C9D3FF;font-size:14px;line-height:1.55;padding-bottom:16px;">
+                          If the button doesn’t work, <a href="${safeResetUrl}" target="_blank" rel="noopener noreferrer" style="color:#FFFFFF;">click here</a> to reset your password.
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="border-top:1px solid rgba(255,255,255,0.10);padding-top:14px;color:#6B77C9;font-size:13px;line-height:1.55;">
+                          If you did not request this, you can safely ignore this email.
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+      </html>
+    `,
+  }
+  const [resp] = await sg.send(msg)
+  return { statusCode: resp?.statusCode || 0 }
+}
+
 async function sendSubscriptionCheckoutEmail(to, checkoutUrl, recipientName) {
   if (!API_KEY) return { skipped: true }
   const safeCheckoutUrl = escapeHtml(String(checkoutUrl || '').trim())
@@ -483,6 +568,7 @@ module.exports = {
   escapeHtml,
   buildBrandedEmailShell,
   sendInvite,
+  sendPasswordResetEmail,
   sendSubscriptionCheckoutEmail,
   sendRoleInterviewLimitReachedEmail,
   sendMemberRecoveryEmail,

@@ -169,7 +169,6 @@ router.get('/resume-signed-url', requireAuth, withClientScope, async (req, res) 
         msg.includes('not found')
       );
     };
-
     const defaultResumeBucket = process.env.SUPABASE_RESUMES_BUCKET || 'resumes';
     const defaultBucketPrefix = `${defaultResumeBucket}/`;
     const attempts = [];
@@ -232,7 +231,7 @@ router.get('/resume-signed-url', requireAuth, withClientScope, async (req, res) 
       if (!isNotFoundSignError(signErr)) break;
     }
 
-    if (shouldTryAccommodationFallback && signErr) {
+    if ((shouldTryAccommodationFallback || isBucketlessPath) && signErr) {
       if (isNotFoundSignError(signErr) && accommodationBucket && accommodationBucket !== parsed.bucket) {
         const retry = await supabaseAdmin
           .storage

@@ -1,7 +1,7 @@
 'use strict';
 
 const { sendRoleInterviewLimitReachedEmail } = require('../../utils/mailer');
-const { buildPublicAccountUrl } = require('../../config/urlConfig');
+const { buildClientDashboardReturnUrl } = require('../../config/urlConfig');
 const EARLY_ENDED_SENTINEL_SUMMARY = 'Interview ended before substantive responses were captured.';
 const INSUFFICIENT_TRANSCRIPT_EARLY_END_SUMMARY_PREFIX = 'Interview ended before any substantive responses were recorded.';
 
@@ -143,7 +143,7 @@ function buildRoleBillingUrl(clientId, roleId) {
     client_id: String(clientId || ''),
     role_id: String(roleId || '')
   });
-  return buildPublicAccountUrl(params);
+  return buildClientDashboardReturnUrl(params);
 }
 
 async function syncRoleInterviewLimitNotification({
