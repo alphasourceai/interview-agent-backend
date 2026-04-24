@@ -183,6 +183,20 @@ async function createSubscriptionCheckoutSession({
     } catch (_) {}
   }
 
+  if (['admin_subscription_checkout', 'agreement_checkout'].includes(normalizedMetadataSource)) {
+    const existingSubscriptions = await stripe.subscriptions.list({
+      customer: resolvedStripeCustomerId,
+      status: 'all',
+      limit: 100
+    })
+    const blockingSubscription = (existingSubscriptions?.data || []).find((subscription) => {
+      return ['active', 'trialing', 'past_due', 'incomplete'].includes(String(subscription?.status || '').trim().toLowerCase())
+    })
+    if (blockingSubscription) {
+      throw makeError(409, 'client_subscription_already_exists', 'Client already has an active or pending Stripe subscription.')
+    }
+  }
+
   const lineItems = []
   let enterpriseCheckoutMetadata = null
   if (normalizedPlanTier === 'enterprise') {
