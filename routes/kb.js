@@ -3,52 +3,20 @@
 
 const express = require('express');
 const axios = require('axios');
-const { supabaseAnon, supabaseAdmin } = require('../src/lib/supabaseClient');
+const { supabaseAdmin } = require('../src/lib/supabaseClient');
+const { requireAuth, withClientScope } = require('../src/middleware/auth');
 
 const router = express.Router();
 
-// ---- Local auth helpers (mirror app.js semantics) ----
-function bearer(req) {
-  const h = req.headers['authorization'] || req.headers['Authorization'];
-  if (!h) return null;
-  const m = String(h).match(/^Bearer\s+(.+)$/i);
-  return m ? m[1] : null;
-}
-
-async function requireAuth(req, res, next) {
-  try {
-    const token = bearer(req);
-    if (!token) return res.status(401).json({ error: 'Unauthorized' });
-    const { data, error } = await supabaseAnon.auth.getUser(token);
-    if (error || !data?.user) return res.status(401).json({ error: 'Unauthorized' });
-    req.user = { id: data.user.id, email: data.user.email };
-    next();
-  } catch (e) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-}
-
-async function withClientScope(req, res, next) {
-  try {
-    if (!req.user) return res.status(401).json({ error: 'Unauthorized' });
-    const { data, error } = await supabaseAdmin
-      .from('client_members')
-      .select('client_id, role')
-      .eq('user_id', req.user.id);
-    if (error) return res.status(500).json({ error: 'Failed to load memberships' });
-    req.clientScope = { memberships: data || [] };
-    next();
-  } catch (e) {
-    return res.status(500).json({ error: 'Server error' });
-  }
-}
-
 // Collect scoped client IDs
 function getScopedClientIds(req) {
-  const fromScope = Array.isArray(req?.clientScope?.memberships)
-    ? req.clientScope.memberships.map(m => m.client_id).filter(Boolean)
-    : [];
-  return Array.from(new Set(fromScope));
+  if (Array.isArray(req?.client_memberships)) {
+    return Array.from(new Set(req.client_memberships.filter(Boolean)));
+  }
+  if (Array.isArray(req?.memberships)) {
+    return Array.from(new Set(req.memberships.map(m => m?.client_id).filter(Boolean)));
+  }
+  return [];
 }
 
 /**

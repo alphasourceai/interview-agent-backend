@@ -907,7 +907,9 @@ CREATE TABLE public.roles (
     job_description_url text,
     manual_questions text,
     kb_document_id text,
-    job_description_text text
+    job_description_text text,
+    tavus_prompt text,
+    rubric_questions jsonb
 );
 
 
@@ -1673,4 +1675,3 @@ ALTER TABLE storage.s3_multipart_uploads_parts ENABLE ROW LEVEL SECURITY;
 --
 
 \unrestrict fRKjHyYhUiUat8XnMma6gpbjvsnsZl0KPsC4SnORof1VsPtMJPPfdMGEfzFtEKO
-

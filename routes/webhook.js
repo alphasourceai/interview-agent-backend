@@ -2,11 +2,25 @@
 'use strict';
 
 const express = require('express');
+const Sentry = require('@sentry/node');
 const router = express.Router();
-const { supabase } = require('../src/lib/supabaseClient');
+const { createClient } = require('@supabase/supabase-js');
+const { analyzeInterviewTranscriptById } = require('../scripts/backfillInterviews.js');
+const { INSUFFICIENT_SUMMARY, isSubstantiveTranscript, scoreInterview } = require('../src/lib/interviewScoring');
+const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabaseAdmin = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+  : null;
 
 const TRANSCRIPTS_BUCKET = process.env.SUPABASE_TRANSCRIPTS_BUCKET || 'transcripts';
-const ANALYSIS_BUCKET    = process.env.SUPABASE_ANALYSIS_BUCKET    || 'analysis';
+
+const DAILY_ROOM_RE = /(^https?:\/\/)?([a-z0-9-]+\.)?(tavus\.daily\.co|c\.daily\.co)(\/|\?|$)/i;
+const ANALYSIS_TRIGGER_TTL_MS = 2 * 60 * 1000;
+const analysisTriggerGuard = new Map();
+const roleJdCache = new Map();
 
 // --- utilities ---
 function pickFirst(...vals) {
@@ -26,34 +40,749 @@ function fromAny(obj, ...paths) {
   return undefined;
 }
 
-async function getInterviewByAnyId(anyId) {
-  if (!anyId) return null;
-  // Try by id
-  let { data } = await supabase.from('interviews').select('*').eq('id', anyId).maybeSingle();
-  if (data) return data;
-  // Try by conversation_id
-  ({ data } = await supabase.from('interviews').select('*').eq('conversation_id', anyId).maybeSingle());
-  if (data) return data;
+function fromAnyPathList(obj, paths) {
+  for (const p of paths) {
+    const value = fromAny(obj, p);
+    if (value !== undefined && value !== null && !(typeof value === 'string' && !value.trim())) return value;
+  }
+  return undefined;
+}
+
+function collectValues(obj, ...paths) {
+  const out = [];
+  for (const p of paths) {
+    const v = fromAny(obj, p);
+    if (v === undefined || v === null) continue;
+    if (Array.isArray(v)) {
+      for (const item of v) {
+        if (item !== undefined && item !== null) out.push(item);
+      }
+    } else {
+      out.push(v);
+    }
+  }
+  return out;
+}
+
+function isDailyRoomUrl(url) {
+  return !!url && DAILY_ROOM_RE.test(String(url));
+}
+
+function isDownloadableRecordingUrl(url) {
+  if (!url) return false;
+  if (!/^https?:\/\//i.test(String(url))) return false;
+  if (isDailyRoomUrl(url)) return false;
+  return true;
+}
+
+function isMissingColumnError(error) {
+  const msg = String(error?.message || '');
+  return /column .* does not exist/i.test(msg);
+}
+
+function pruneMetadata(meta) {
+  const out = {};
+  for (const [key, value] of Object.entries(meta || {})) {
+    if (value === undefined || value === null) continue;
+    if (typeof value === 'string' && !value.trim()) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+function hasColumn(row, key) {
+  return Object.prototype.hasOwnProperty.call(row || {}, key);
+}
+
+function looksLikeJson(value) {
+  if (value == null) return false;
+  const trimmed = String(value).trim();
+  if (!trimmed) return false;
+  return (trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'));
+}
+
+function clampScore(value) {
+  if (typeof value === 'string' && !value.trim()) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  if (n > 0 && n <= 1) return Math.round(n * 100);
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+function elapsedSecondsSince(isoLike, endAt) {
+  if (!isoLike) return null;
+  const started = new Date(isoLike);
+  if (Number.isNaN(started.getTime())) return null;
+  const ended = endAt instanceof Date ? endAt : new Date(endAt || Date.now());
+  if (Number.isNaN(ended.getTime())) return null;
+  return Math.max(0, Math.round((ended.getTime() - started.getTime()) / 1000));
+}
+
+function extractPerceptionScores(payload) {
+  if (!payload || typeof payload !== 'object') return {};
+
+  const clarityRaw = fromAnyPathList(payload, [
+    'clarity',
+    'scores.clarity',
+    'analysis.clarity',
+    'analysis.scores.clarity',
+    'perception_analysis.clarity',
+    'perception_analysis.scores.clarity'
+  ]);
+  const confidenceRaw = fromAnyPathList(payload, [
+    'confidence',
+    'scores.confidence',
+    'analysis.confidence',
+    'analysis.scores.confidence',
+    'perception_analysis.confidence',
+    'perception_analysis.scores.confidence'
+  ]);
+  const engagementRaw = fromAnyPathList(payload, [
+    'engagement',
+    'engagement_score',
+    'scores.engagement',
+    'analysis.engagement',
+    'analysis.scores.engagement',
+    'perception_analysis.engagement',
+    'perception_analysis.engagement_score',
+    'perception_analysis.scores.engagement'
+  ]);
+  const bodyLanguageRaw = fromAnyPathList(payload, [
+    'body_language',
+    'bodyLanguage',
+    'body_language_score',
+    'bodyLanguageScore',
+    'nonverbal',
+    'non_verbal',
+    'nonVerbal',
+    'nonverbal_score',
+    'nonVerbalScore',
+    'scores.body_language',
+    'scores.bodyLanguage',
+    'scores.bodyLanguageScore',
+    'scores.nonverbal',
+    'scores.nonVerbal',
+    'analysis.body_language',
+    'analysis.bodyLanguage',
+    'analysis.bodyLanguageScore',
+    'analysis.nonverbal',
+    'analysis.nonVerbal',
+    'analysis.scores.body_language',
+    'analysis.scores.bodyLanguage',
+    'analysis.scores.bodyLanguageScore',
+    'analysis.scores.nonverbal',
+    'analysis.scores.nonVerbal',
+    'perception_analysis.body_language',
+    'perception_analysis.bodyLanguage',
+    'perception_analysis.body_language_score',
+    'perception_analysis.bodyLanguageScore',
+    'perception_analysis.nonverbal',
+    'perception_analysis.non_verbal',
+    'perception_analysis.nonVerbal',
+    'perception_analysis.nonverbal_score',
+    'perception_analysis.nonVerbalScore',
+    'perception_analysis.scores.body_language',
+    'perception_analysis.scores.bodyLanguage',
+    'perception_analysis.scores.bodyLanguageScore',
+    'perception_analysis.scores.nonverbal',
+    'perception_analysis.scores.nonVerbal'
+  ]);
+
+  const out = {};
+  const clarity = clampScore(clarityRaw);
+  const confidence = clampScore(confidenceRaw);
+  const engagement = clampScore(engagementRaw !== undefined ? engagementRaw : bodyLanguageRaw);
+  if (clarity !== null) out.clarity = clarity;
+  if (confidence !== null) out.confidence = confidence;
+  if (engagement !== null) out.engagement = engagement;
+  return out;
+}
+
+function extractPerceptionScoresFromText(text) {
+  if (!text || typeof text !== 'string') return {};
+  const markdownNormalized = String(text)
+    .replace(/^\s*[-*+]\s+/gm, '')
+    .replace(/\*/g, '')
+    .replace(/`/g, '');
+  const readNum = (re) => {
+    const direct = re.exec(text);
+    if (direct) return clampScore(direct[1]);
+    const normalized = re.exec(markdownNormalized);
+    if (!normalized) return null;
+    return clampScore(normalized[1]);
+  };
+  const clarity = readNum(/CLARITY\s*[:=]\s*(\d{1,3})/i);
+  const confidence = readNum(/CONFIDENCE\s*[:=]\s*(\d{1,3})/i);
+  let engagement = readNum(/ENGAGEMENT\s*[:=]\s*(\d{1,3})/i);
+  if (engagement === null) engagement = readNum(/BODY[_\s-]*LANGUAGE\s*[:=]\s*(\d{1,3})/i);
+  if (engagement === null) engagement = readNum(/NONVERBAL\s*[:=]\s*(\d{1,3})/i);
+
+  const out = {};
+  if (clarity !== null) out.clarity = clarity;
+  if (confidence !== null) out.confidence = confidence;
+  if (engagement !== null) out.engagement = engagement;
+  return out;
+}
+
+function extractJsonFromText(text) {
+  if (!text || typeof text !== 'string') return null;
+  const fenced = text.match(/```json\s*([\s\S]*?)```/i);
+  const candidate = fenced?.[1] || null;
+  if (candidate) {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      return null;
+    }
+  }
+  const first = text.indexOf('{');
+  const last = text.lastIndexOf('}');
+  if (first >= 0 && last > first) {
+    const snippet = text.slice(first, last + 1);
+    try {
+      return JSON.parse(snippet);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function sanitizePerceptionText(text) {
+  if (!text) return '';
+  let out = String(text);
+  const patterns = [
+    /\b(\d{1,2}\s*-\s*year\s*-\s*old|\d{1,2}\s*year\s*old|\d{2}s|teen(ager|age)?|young|younger|middle[-\s]?aged|elderly|senior|old|older)\b/gi,
+    /\b(male|female|man|woman|boy|girl|nonbinary|non-binary|transgender|cisgender|trans|cis)\b/gi,
+    /\b(white|black|african\s*american|asian|latino|latina|latinx|hispanic|indigenous|native\s*american|middle\s*eastern|arab|pacific\s*islander)\b/gi,
+    /\b(christian|muslim|jewish|hindu|buddhist|sikh|atheist|agnostic|catholic|protestant|mormon)\b/gi,
+    /\b(disabled|disability|wheelchair|blind|deaf|autistic|adhd|amputee|bipolar|schizophrenia|ptsd|paralyzed)\b/gi,
+    /\b(pregnant|pregnancy)\b/gi,
+    /\b(in|around)\s+(his|her|their)\s+\d{2}s\b/gi,
+    /\b(appears|appeared|seems|seemed|looks|looked)\s+(?:to\s+be\s+)?(young|older|middle[-\s]?aged|elderly|\d{2}s)\b/gi
+  ];
+  for (const re of patterns) {
+    out = out.replace(re, '[REDACTED]');
+  }
+  out = out.replace(/\[REDACTED\](\s+\[REDACTED\])+/g, '[REDACTED]');
+  out = out.replace(/\s{2,}/g, ' ').trim();
+  return out;
+}
+
+function hasAnalysisResult(interview) {
+  if (!interview) return false;
+  if (interview.analysis) {
+    if (typeof interview.analysis === 'object') {
+      if (Array.isArray(interview.analysis)) return interview.analysis.length > 0;
+      return Object.keys(interview.analysis).length > 0;
+    }
+    return true;
+  }
+  if (interview.analysis_url) return true;
+  if (interview.interview_analysis) return true;
+  if (interview.report_url) return true;
+  if (interview.overall_score !== undefined && interview.overall_score !== null) return true;
+  return false;
+}
+
+function hasTranscriptAnalysis(interview) {
+  if (!interview || !interview.analysis || typeof interview.analysis !== 'object' || Array.isArray(interview.analysis)) {
+    return false;
+  }
+  const summary = typeof interview.analysis.summary === 'string' ? interview.analysis.summary.trim() : '';
+  const transcriptScores = interview.analysis.transcript_scores && typeof interview.analysis.transcript_scores === 'object'
+    ? Object.keys(interview.analysis.transcript_scores).length > 0
+    : false;
+  const legacyScores = interview.analysis.scores && typeof interview.analysis.scores === 'object'
+    ? Object.keys(interview.analysis.scores).length > 0
+    : false;
+  return !!summary && (transcriptScores || legacyScores);
+}
+
+function isTranscriptAnalysisComplete(analysis) {
+  if (!analysis) return false;
+  let obj = analysis;
+  if (typeof obj === 'string') {
+    try {
+      obj = JSON.parse(obj);
+    } catch {
+      return false;
+    }
+  }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+  const overallNew = obj.transcript_scores && typeof obj.transcript_scores === 'object'
+    ? obj.transcript_scores.overall
+    : undefined;
+  const overallLegacy = obj.scores && typeof obj.scores === 'object'
+    ? obj.scores.overall
+    : undefined;
+  return Number.isFinite(overallNew) || Number.isFinite(overallLegacy);
+}
+
+function isTranscriptAnalysisCompleteForRow(row) {
+  if (!row) return false;
+  if (row.transcript_scores && typeof row.transcript_scores === 'object') {
+    if (Number.isFinite(row.transcript_scores.overall)) return true;
+  }
+  return isTranscriptAnalysisComplete(row.analysis);
+}
+
+function extractAnswerScoresFromAnalysis(analysis) {
+  let obj = analysis;
+  if (typeof obj === 'string') {
+    try {
+      obj = JSON.parse(obj);
+    } catch {
+      return {};
+    }
+  }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return {};
+  const src = obj.transcript_scores && typeof obj.transcript_scores === 'object'
+    ? obj.transcript_scores
+    : obj.scores && typeof obj.scores === 'object'
+      ? obj.scores
+      : null;
+  if (!src) return {};
+  const out = {};
+  if (Number.isFinite(src.overall)) out.overall = src.overall;
+  if (Number.isFinite(src.role_fit ?? src.roleFit)) out.role_fit = Number.isFinite(src.role_fit) ? src.role_fit : src.roleFit;
+  if (Number.isFinite(src.technical_strength ?? src.technicalStrength)) {
+    out.technical_strength = Number.isFinite(src.technical_strength) ? src.technical_strength : src.technicalStrength;
+  }
+  if (Number.isFinite(src.communication_quality ?? src.communicationQuality)) {
+    out.communication_quality = Number.isFinite(src.communication_quality) ? src.communication_quality : src.communicationQuality;
+  }
+  return out;
+}
+
+function getRequestId(req, body) {
+  return pickFirst(
+    req?.headers?.['x-request-id'],
+    req?.headers?.['x-requestid'],
+    req?.headers?.['x-correlation-id'],
+    fromAny(body, 'request_id'),
+    fromAny(body, 'requestId'),
+    fromAny(body, 'metadata.request_id'),
+    fromAny(body, 'metadata.requestId'),
+    fromAny(body, 'properties.request_id'),
+    fromAny(body, 'payload.request_id')
+  );
+}
+
+function shouldTriggerAnalysis(interviewId, requestId) {
+  if (!interviewId) return false;
+  const now = Date.now();
+  const last = analysisTriggerGuard.get(interviewId);
+  if (last && now - last < ANALYSIS_TRIGGER_TTL_MS) {
+    console.log('[analysis-trigger] dedupe', {
+      request_id: requestId || null,
+      interview_id: interviewId
+    });
+    return false;
+  }
+  analysisTriggerGuard.set(interviewId, now);
+  if (analysisTriggerGuard.size > 1000) {
+    for (const [id, ts] of analysisTriggerGuard.entries()) {
+      if (now - ts > ANALYSIS_TRIGGER_TTL_MS) analysisTriggerGuard.delete(id);
+    }
+  }
+  return true;
+}
+
+async function getRoleJdText(roleId, requestId, interviewId, conversationId) {
+  if (!roleId) return '';
+  const cacheKey = String(roleId);
+  if (roleJdCache.has(cacheKey)) return roleJdCache.get(cacheKey);
+
+  const { data, error } = await supabaseAdmin
+    .from('roles')
+    .select('id, job_description_text, job_description_url')
+    .eq('id', roleId)
+    .maybeSingle();
+
+  if (error) {
+    console.error('[webhook] role jd lookup failed', {
+      request_id: requestId || null,
+      interview_id: interviewId || null,
+      conversation_id: conversationId || null,
+      role_id: roleId || null,
+      error: error.message || error,
+      details: error.details || null,
+      hint: error.hint || null
+    });
+    roleJdCache.set(cacheKey, '');
+    return '';
+  }
+
+  const jdText = typeof data?.job_description_text === 'string' && data.job_description_text.trim()
+    ? data.job_description_text.trim()
+    : (typeof data?.job_description_url === 'string' ? data.job_description_url.trim() : '');
+  roleJdCache.set(cacheKey, jdText || '');
+  return jdText || '';
+}
+
+async function applyTranscriptScoringForInterview({ interview, fresh, transcriptText, requestId, conversationId }) {
+  const transcript = typeof transcriptText === 'string' ? transcriptText.trim() : '';
+  const substantiveCheck = isSubstantiveTranscript(transcript);
+  const transcriptWordCount = transcript ? transcript.split(/\s+/).filter(Boolean).length : 0;
+  const candidateResponseTurns = (transcript.match(/^(CANDIDATE|USER)\s*:/gim) || []).length;
+  const disconnectedLevel = !substantiveCheck.ok && (
+    substantiveCheck.reason === 'empty_transcript' ||
+    transcriptWordCount <= 10 ||
+    (candidateResponseTurns === 0 && transcriptWordCount <= 30)
+  );
+  const disconnectedSummary = 'Interview ended before substantive responses were captured.';
+  const disconnectedRiskReason = 'No substantive interview response was available to assess.';
+  const existingTopScores =
+    fresh?.transcript_scores && typeof fresh.transcript_scores === 'object'
+      ? fresh.transcript_scores
+      : {};
+  const existingSummary = typeof fresh?.interview_summary === 'string' ? fresh.interview_summary.trim() : '';
+  const existingOverall = existingTopScores.overall;
+  const existingConfidence = existingTopScores.confidence;
+  const hasInsufficientSummary = existingSummary === INSUFFICIENT_SUMMARY ||
+    existingSummary.includes('Interview ended before any substantive responses were recorded.');
+
+  if (substantiveCheck.ok && Number.isFinite(existingOverall) && Number.isFinite(existingConfidence) && existingSummary) {
+    return { updated: false, substantive: true, reason: 'already_scored' };
+  }
+  if (
+    disconnectedLevel &&
+    existingSummary === disconnectedSummary &&
+    existingTopScores.overall == null &&
+    existingTopScores.role_fit == null &&
+    existingTopScores.technical_strength == null &&
+    existingTopScores.communication_quality == null &&
+    Number(existingTopScores.confidence) === 0 &&
+    String(existingTopScores.ai_aided_risk || '').toLowerCase() === 'low' &&
+    String(existingTopScores.ai_aided_risk_reason || '').trim() === disconnectedRiskReason
+  ) {
+    return { updated: false, substantive: false, reason: 'already_disconnected' };
+  }
+  if (!substantiveCheck.ok && Number(existingConfidence) === 0 && hasInsufficientSummary) {
+    return { updated: false, substantive: false, reason: 'already_insufficient' };
+  }
+
+  const roleId = fresh?.role_id || interview?.role_id || null;
+  const jdText = await getRoleJdText(roleId, requestId, interview?.id, conversationId);
+  const perceptionScores =
+    fresh?.perception_scores && typeof fresh.perception_scores === 'object'
+      ? fresh.perception_scores
+      : (
+        interview?.perception_scores && typeof interview.perception_scores === 'object'
+          ? interview.perception_scores
+          : {}
+      );
+
+  const scored = disconnectedLevel
+    ? {
+      summary: disconnectedSummary,
+      transcript_scores: {
+        overall: null,
+        role_fit: null,
+        technical_strength: null,
+        communication_quality: null,
+        confidence: 0,
+        ai_aided_risk: 'low',
+        ai_aided_risk_reason: disconnectedRiskReason
+      }
+    }
+    : await scoreInterview({
+      transcriptText: transcript,
+      jdText,
+      perceptionScores,
+      mode: 'webhook',
+      request_id: requestId || null
+    });
+
+  if (!substantiveCheck.ok && !disconnectedLevel) {
+    console.log('[webhook] transcript summary skipped insufficient', {
+      request_id: requestId || null,
+      interview_id: interview?.id || null,
+      reason: substantiveCheck.reason
+    });
+  }
+
+  const updateFields = {
+    transcript_scores: {
+      ...existingTopScores,
+      ...(scored?.transcript_scores || {})
+    }
+  };
+  if (substantiveCheck.ok) {
+    if (!existingSummary || existingSummary === INSUFFICIENT_SUMMARY) {
+      updateFields.interview_summary = scored.summary;
+    }
+  } else if (disconnectedLevel) {
+    updateFields.interview_summary = scored.summary;
+  } else if (!hasInsufficientSummary) {
+    updateFields.interview_summary = scored.summary;
+  }
+
+  const { error: scoreErr } = await supabaseAdmin
+    .from('interviews')
+    .update(updateFields)
+    .eq('id', interview.id);
+  if (scoreErr) {
+    console.error('[webhook] transcript_scores update failed', {
+      request_id: requestId || null,
+      interview_id: interview.id,
+      conversation_id: conversationId || null,
+      error: scoreErr.message || scoreErr,
+      details: scoreErr.details || null,
+      hint: scoreErr.hint || null
+    });
+    return { updated: false, substantive: substantiveCheck.ok, reason: 'update_failed' };
+  }
+
+  const roleIdForAvailability = fresh?.role_id || interview?.role_id || null;
+  const clientIdForAvailability = fresh?.client_id || interview?.client_id || null;
+  if (roleIdForAvailability && clientIdForAvailability) {
+    try {
+      const availability = await getRoleInterviewAvailability({
+        db: supabaseAdmin,
+        roleId: roleIdForAvailability,
+        clientId: clientIdForAvailability
+      });
+      await syncRoleInterviewLimitNotification({
+        db: supabaseAdmin,
+        roleId: roleIdForAvailability,
+        clientId: clientIdForAvailability,
+        remainingInterviews: availability.remaining_interviews,
+        roleTitle: ''
+      });
+    } catch (syncErr) {
+      console.error('[webhook] role limit sync failed', {
+        request_id: requestId || null,
+        interview_id: interview?.id || null,
+        conversation_id: conversationId || null,
+        role_id: roleIdForAvailability,
+        client_id: clientIdForAvailability,
+        error: syncErr?.message || syncErr
+      });
+    }
+  }
+
+  return { updated: true, substantive: substantiveCheck.ok, reason: substantiveCheck.reason };
+}
+
+function extractCandidateQuestions(transcriptText) {
+  if (!transcriptText || typeof transcriptText !== 'string') return [];
+  const markerRe = /\[\[UNANSWERED_QUESTION:\s*([^\]]+?)\s*\]\]/g;
+  const markerSet = new Set();
+  let match;
+  while ((match = markerRe.exec(transcriptText)) !== null) {
+    const text = String(match[1] || '').trim();
+    if (text) markerSet.add(text);
+  }
+  if (markerSet.size) return Array.from(markerSet);
+
+  const lines = transcriptText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const out = new Set();
+  const interrogativeRe = /^(who|what|when|where|why|how|can|could|would|do|does|is|are|should)\b/i;
+  const refusalRe = /note it for the hiring manager|i don't have that information|i do not have that information|i can't answer|i cannot answer|i will pass it to the hiring manager|i'll pass it to the hiring manager|i will note it for the hiring manager|i'll note it for the hiring manager/i;
+  let lastCandidate = '';
+  for (const line of lines) {
+    const upper = line.toUpperCase();
+    const isInterviewer = upper.startsWith('INTERVIEWER:');
+    const isCandidate = upper.startsWith('CANDIDATE:');
+    let cleaned = line;
+    if (isInterviewer) cleaned = line.slice('INTERVIEWER:'.length).trim();
+    if (isCandidate) cleaned = line.slice('CANDIDATE:'.length).trim();
+
+    if (isCandidate) {
+      if (cleaned) lastCandidate = cleaned;
+      if (cleaned && (cleaned.includes('?') || interrogativeRe.test(cleaned))) {
+        out.add(cleaned);
+      }
+      continue;
+    }
+
+    if (isInterviewer && refusalRe.test(cleaned) && lastCandidate) {
+      out.add(lastCandidate);
+    }
+  }
+  return Array.from(out).slice(0, 10);
+}
+
+function isEmptyQuestionList(value) {
+  if (value == null) return true;
+  if (Array.isArray(value)) return value.length === 0;
+  if (typeof value === 'string') return !value.trim();
+  return false;
+}
+
+async function applyInterviewUpdates(interviewId, updates, recordingMeta) {
+  const baseUpdates = updates && Object.keys(updates).length ? updates : null;
+  const cleanedMeta = pruneMetadata(recordingMeta);
+  const hasMeta = Object.keys(cleanedMeta).length > 0;
+
+  if (!hasMeta) {
+    if (!baseUpdates) return;
+    const { error } = await supabaseAdmin.from('interviews').update(baseUpdates).eq('id', interviewId);
+    if (error) throw error;
+    return;
+  }
+
+  const combined = { ...(baseUpdates || {}), ...cleanedMeta };
+  let { error } = await supabaseAdmin.from('interviews').update(combined).eq('id', interviewId);
+  if (!error) return;
+
+  if (!isMissingColumnError(error)) throw error;
+
+  if (baseUpdates) {
+    const { error: baseErr } = await supabaseAdmin.from('interviews').update(baseUpdates).eq('id', interviewId);
+    if (baseErr) throw baseErr;
+  }
+
+  ({ error } = await supabaseAdmin
+    .from('interviews')
+    .update({ recording_metadata: cleanedMeta })
+    .eq('id', interviewId));
+  if (!error) return;
+  if (!isMissingColumnError(error)) throw error;
+
+  const pathName = `interviews/${interviewId}-recording-metadata.json`;
+  const stored = await putJsonToStorage(TRANSCRIPTS_BUCKET, pathName, cleanedMeta);
+
+  const { error: urlErr } = await supabaseAdmin
+    .from('interviews')
+    .update({ recording_metadata_url: stored })
+    .eq('id', interviewId);
+  if (urlErr && !isMissingColumnError(urlErr)) throw urlErr;
+}
+
+async function updatePerceptionAnalysis(interview, analysisText, requestId, extraScoreSources = []) {
+  let rawText;
+  if (analysisText && typeof analysisText === 'object') {
+    try {
+      rawText = JSON.stringify(analysisText);
+    } catch {
+      rawText = String(analysisText);
+    }
+  } else {
+    rawText = String(analysisText || '');
+  }
+  rawText = String(rawText || '').trim();
+  const sanitizedText = rawText ? sanitizePerceptionText(rawText) : '';
+  const conversationId = interview?.tavus_application_id || interview?.conversation_id || null;
+
+  let perceptionScores = {};
+  let parsedDirect = null;
+  if (analysisText && typeof analysisText === 'object') {
+    parsedDirect = analysisText;
+  } else if (looksLikeJson(rawText)) {
+    try {
+      parsedDirect = JSON.parse(rawText);
+    } catch (err) {
+      console.error('[webhook] perception_analysis JSON parse failed', {
+        request_id: requestId || null,
+        interview_id: interview.id,
+        conversation_id: conversationId,
+        error: err?.message || err,
+        details: err?.details || null,
+        hint: err?.hint || null
+      });
+    }
+  }
+
+  if (parsedDirect) {
+    perceptionScores = extractPerceptionScores(parsedDirect);
+  }
+
+  if (!Object.keys(perceptionScores).length) {
+    const blockJson = extractJsonFromText(rawText);
+    if (blockJson) {
+      perceptionScores = extractPerceptionScores(blockJson);
+    }
+  }
+
+  if (!Object.keys(perceptionScores).length) {
+    perceptionScores = extractPerceptionScoresFromText(rawText);
+  }
+
+  if (!Object.keys(perceptionScores).length) {
+    for (const source of extraScoreSources || []) {
+      perceptionScores = extractPerceptionScores(source);
+      if (Object.keys(perceptionScores).length) break;
+    }
+  }
+
+  const updates = {};
+  if (sanitizedText) updates.perception_analysis_text = sanitizedText;
+  if (Object.keys(perceptionScores).length) {
+    const existingScores =
+      interview.perception_scores && typeof interview.perception_scores === 'object'
+        ? interview.perception_scores
+        : {};
+    updates.perception_scores = { ...existingScores, ...perceptionScores };
+  }
+  if (!Object.keys(updates).length) return { stored: false, perception_scores: {} };
+
+  const { error } = await supabaseAdmin
+    .from('interviews')
+    .update(updates)
+    .eq('id', interview.id);
+  if (error) {
+    console.error('[webhook] perception_analysis update failed', {
+      request_id: requestId || null,
+      interview_id: interview.id,
+      conversation_id: conversationId,
+      error: error.message || error,
+      details: error.details || null,
+      hint: error.hint || null
+    });
+    return { stored: false, perception_scores: perceptionScores };
+  }
+
+  return { stored: true, perception_scores: perceptionScores };
+}
+
+async function getInterviewByIds(interviewId, conversationId) {
+  if (conversationId) {
+    let { data } = await supabaseAdmin
+      .from('interviews')
+      .select('*')
+      .eq('tavus_application_id', conversationId)
+      .maybeSingle();
+    if (data) return data;
+
+    ({ data } = await supabaseAdmin
+      .from('interviews')
+      .select('*')
+      .eq('conversation_id', conversationId)
+      .maybeSingle());
+    if (data) return data;
+  }
+
+  if (interviewId) {
+    const { data } = await supabaseAdmin
+      .from('interviews')
+      .select('*')
+      .eq('id', interviewId)
+      .maybeSingle();
+    return data || null;
+  }
+
   return null;
 }
 
 async function ensureBucket(name) {
-  const { data: list } = await supabase.storage.listBuckets();
+  const { data: list } = await supabaseAdmin.storage.listBuckets();
   if (!list?.find(b => b.name === name)) {
     try {
-      await supabase.storage.createBucket(name, { public: false });
+      await supabaseAdmin.storage.createBucket(name, { public: false });
     } catch {}
   }
 }
 
-async function putJsonToStorage(bucket, path, jsonOrUrl) {
+async function putJsonToStorage(bucket, pathName, jsonOrUrl) {
   await ensureBucket(bucket);
 
   let buf;
   let contentType = 'application/json';
 
   if (typeof jsonOrUrl === 'string' && /^https?:\/\//i.test(jsonOrUrl)) {
-    // fetch from remote URL
     const r = await fetch(jsonOrUrl);
     if (!r.ok) throw new Error(`fetch ${jsonOrUrl} failed: ${r.status}`);
     const ct = r.headers.get('content-type') || '';
@@ -66,90 +795,874 @@ async function putJsonToStorage(bucket, path, jsonOrUrl) {
     buf = Buffer.from(JSON.stringify(jsonOrUrl ?? {}), 'utf8');
   }
 
-  const { error } = await supabase
+  const { error } = await supabaseAdmin
     .storage
     .from(bucket)
-    .upload(path, buf, { upsert: true, contentType });
+    .upload(pathName, buf, { upsert: true, contentType });
   if (error) throw new Error(error.message);
 
-  return `${bucket}/${path}`;
+  return `${bucket}/${pathName}`;
+}
+
+function extractSanitizedContent(item) {
+  if (!item) return null;
+
+  const role = typeof item.role === 'string' ? item.role.trim().toLowerCase() : '';
+  if (!role || role === 'system') return null;
+
+  let content = item.content ?? item.text ?? item.message ?? item.value;
+  if (content == null) return null;
+  if (typeof content !== 'string') {
+    try {
+      content = JSON.stringify(content);
+    } catch {
+      content = String(content);
+    }
+  }
+
+  let text = String(content).trim();
+  if (!text) return null;
+
+  // Strip the "unanswered" marker artifacts so they don't appear in stored transcripts or get read aloud in reports.
+  // NOTE: We still capture unanswered questions via `extractCandidateQuestions(...)` using refusal heuristics.
+  text = text
+    .replace(/\[\[UNANSWERED_QUESTION:[^\]]*\]\]/g, '')
+    .replace(/\[\s*\]/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
+  if (!text) return null;
+
+  if (role === 'user') {
+    return `CANDIDATE: ${text}`;
+  }
+
+  if (role === 'assistant' || role === 'interviewer' || role === 'agent') {
+    return `INTERVIEWER: ${text}`;
+  }
+
+  return null;
+}
+
+function sanitizeTranscriptArray(arr) {
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const item of arr) {
+    const line = extractSanitizedContent(item);
+    if (line) out.push(line);
+  }
+  return out;
 }
 
 router.get('/_ping', (_req, res) => res.json({ ok: true }));
 
 // Primary webhook entry
 router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
+  let requestId = null;
+  let eventType = null;
+  let interviewId = null;
+  let conversationId = null;
+  let sentryCandidateId = null;
+  let sentryRoleId = null;
+  let sentryClientId = null;
   try {
     const body = req.body || {};
+    requestId = getRequestId(req, body);
+    Sentry.setTag('route_name', 'tavus_webhook');
+    Sentry.setTag('surface', 'backend');
+    if (requestId) Sentry.setTag('request_id', String(requestId));
+    const eventReceivedAt = new Date();
+    const eventReceivedAtIso = eventReceivedAt.toISOString();
 
-    // Find an interview identifier from the payload
-    const anyId = pickFirst(
+    const eventTypeRaw = pickFirst(
+      fromAny(body, 'event_type'),
+      fromAny(body, 'eventType'),
+      fromAny(body, 'type'),
+      fromAny(body, 'payload.event_type'),
+      fromAny(body, 'payload.eventType'),
+      fromAny(body, 'payload.type'),
+      fromAny(body, 'event'),
+      fromAny(body, 'status')
+    );
+
+    eventType = String(eventTypeRaw || '').toLowerCase();
+    const isTranscriptionReady = eventType === 'application.transcription_ready';
+    const isRecordingReady = eventType === 'application.recording_ready';
+    const isPerceptionAnalysis =
+      eventType === 'conversation.perception_analysis' ||
+      eventType === 'application.perception_analysis';
+    const isToolCall = eventType === 'conversation.tool_call';
+    const isReplicaJoined = eventType === 'system.replica_joined';
+    const isShutdown = eventType === 'system.shutdown';
+    const isKnownEvent = isReplicaJoined || isShutdown || isTranscriptionReady || isRecordingReady || isPerceptionAnalysis || isToolCall;
+
+    interviewId = pickFirst(
       fromAny(body, 'interview_id'),
       fromAny(body, 'interviewId'),
-      fromAny(body, 'conversation_id'),
-      fromAny(body, 'conversationId'),
       fromAny(body, 'metadata.interview_id'),
-      fromAny(body, 'metadata.conversation_id')
+      fromAny(body, 'properties.interview_id'),
+      fromAny(body, 'properties.interviewId'),
+      fromAny(body, 'payload.interview_id'),
+      fromAny(body, 'payload.interviewId'),
+      fromAny(body, 'payload.metadata.interview_id')
     );
-    if (!anyId) return res.status(400).json({ error: 'No interview identifier in payload' });
 
-    const interview = await getInterviewByAnyId(anyId);
-    if (!interview) return res.status(404).json({ error: 'Interview not found' });
-
-    // Determine event type loosely
-    const event =
-      pickFirst(fromAny(body, 'event'), fromAny(body, 'type'), fromAny(body, 'status')) || '';
-
-    // Possible blobs/links
-    const transcriptObj = pickFirst(fromAny(body, 'transcript'), fromAny(body, 'payload.transcript'));
-    const transcriptUrl = pickFirst(fromAny(body, 'transcript_url'), fromAny(body, 'payload.transcript_url'));
-    const analysisObj   = pickFirst(fromAny(body, 'analysis'), fromAny(body, 'payload.analysis'));
-    const analysisUrl   = pickFirst(fromAny(body, 'analysis_url'), fromAny(body, 'payload.analysis_url'));
-    const videoUrl      = pickFirst(
-      fromAny(body, 'video_url'),
-      fromAny(body, 'payload.video_url'),
-      fromAny(body, 'output.video_url')
+    conversationId = pickFirst(
+      fromAny(body, 'conversation_id'),
+      fromAny(body, 'properties.conversation_id'),
+      fromAny(body, 'properties.conversationId'),
+      fromAny(body, 'metadata.conversation_id'),
+      fromAny(body, 'payload.conversation_id'),
+      fromAny(body, 'payload.properties.conversation_id'),
+      fromAny(body, 'conversation.id'),
+      fromAny(body, 'payload.conversation.id'),
+      fromAny(body, 'application_id'),
+      fromAny(body, 'properties.application_id'),
+      fromAny(body, 'payload.application_id'),
+      fromAny(body, 'payload.properties.application_id'),
+      fromAny(body, 'application.id'),
+      fromAny(body, 'payload.application.id')
     );
+    Sentry.addBreadcrumb({
+      category: 'webhook',
+      message: 'tavus webhook event received',
+      level: 'info',
+      data: {
+        request_id: requestId || null,
+        event_type: eventType || null,
+        interview_id: interviewId || null,
+        conversation_id: conversationId || null
+      }
+    });
+
+    const recordingUrls = collectValues(
+      body,
+      'properties.recording_url',
+      'recording_url',
+      'payload.recording_url'
+    );
+    const videoUrls = collectValues(
+      body,
+      'properties.video_url',
+      'video_url',
+      'payload.video_url',
+      'output.video_url'
+    );
+
+    console.log('[webhook] received', {
+      request_id: requestId || null,
+      received_at: eventReceivedAtIso,
+      event_type_raw: eventTypeRaw ?? null,
+      event_type: eventType || null,
+      interview_id: interviewId || null,
+      conversation_id: conversationId || null,
+      recording_url: recordingUrls,
+      video_url: videoUrls
+    });
+
+    if (!isKnownEvent) {
+      return res.status(200).json({ ok: true });
+    }
+
+    if (!interviewId && !conversationId) {
+      return res.status(200).json({ ok: true });
+    }
+
+    if (!supabaseAdmin) {
+      console.error('[webhook] fatal missing supabase admin credentials', {
+        request_id: requestId || null,
+        interview_id: interviewId || null,
+        conversation_id: conversationId || null
+      });
+      return res.status(200).json({ ok: true });
+    }
+
+    const interview = await getInterviewByIds(interviewId, conversationId);
+    if (!interview) {
+      console.warn('[webhook] interview not found', {
+        request_id: requestId || null,
+        event_type: eventType || null,
+        interview_id: interviewId || null,
+        conversation_id: conversationId || null,
+        top_keys: Object.keys(body || {}),
+        payload_keys: Object.keys(body?.payload || {})
+      });
+      return res.status(200).json({ ok: true });
+    }
+    if (interview?.id) Sentry.setTag('interview_id', String(interview.id));
+    sentryCandidateId = interview?.candidate_id || null;
+    sentryRoleId = interview?.role_id || null;
+    sentryClientId = interview?.client_id || null;
+    if (sentryCandidateId) Sentry.setTag('candidate_id', String(sentryCandidateId));
+    if (sentryRoleId) Sentry.setTag('role_id', String(sentryRoleId));
+    if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
+    Sentry.addBreadcrumb({
+      category: 'webhook',
+      message: 'tavus webhook processing started',
+      level: 'info',
+      data: {
+        request_id: requestId || null,
+        event_type: eventType || null,
+        interview_id: interview?.id || null,
+        conversation_id: conversationId || null
+      }
+    });
+    const interviewCreatedAt = interview?.created_at || null;
+    const elapsedFromInterviewCreatedSec = elapsedSecondsSince(interviewCreatedAt, eventReceivedAt);
+    if (isTranscriptionReady || isPerceptionAnalysis) {
+      console.log('[webhook] event_timing', {
+        request_id: requestId || null,
+        event_type: eventType || null,
+        interview_id: interview.id || null,
+        conversation_id: conversationId || null,
+        interview_created_at: interviewCreatedAt,
+        received_at: eventReceivedAtIso,
+        elapsed_seconds_from_interview_created: elapsedFromInterviewCreatedSec
+      });
+    }
+
+    const statusBefore = interview.status || null;
+    let statusAfter = null;
+    let analysisCompleteSummary = null;
+    let perceptionKeysCount = null;
+    let unansweredQuestionsCount = null;
+    const toolNameRaw = pickFirst(
+      fromAny(body, 'tool_name'),
+      fromAny(body, 'tool.name'),
+      fromAny(body, 'name'),
+      fromAny(body, 'payload.tool_name'),
+      fromAny(body, 'payload.tool.name'),
+      fromAny(body, 'properties.tool_name'),
+      fromAny(body, 'properties.tool.name')
+    );
+    const toolArgs = pickFirst(
+      fromAny(body, 'tool_arguments'),
+      fromAny(body, 'tool.arguments'),
+      fromAny(body, 'arguments'),
+      fromAny(body, 'payload.tool_arguments'),
+      fromAny(body, 'payload.tool.arguments'),
+      fromAny(body, 'properties.tool_arguments'),
+      fromAny(body, 'properties.tool.arguments')
+    );
+    const toolName = String(toolNameRaw || '').trim().toLowerCase();
 
     const updates = {};
+    let transcriptNonEmpty = false;
+    let analysisMissing = false;
+    let shouldTriggerAnalysisRun = false;
+    let transcriptText = '';
 
-    // If video URL present, persist it
-    if (videoUrl && !interview.video_url) {
-      updates.video_url = videoUrl;
+    if (isToolCall && toolName === 'end_interview' && conversationId && interview?.id) {
+      try {
+        const apiKey = String(process.env.TAVUS_API_KEY || '').trim();
+        if (!apiKey) {
+          console.error('[webhook] tool_call missing tavus api key', {
+            request_id: requestId || null,
+            conversation_id: conversationId || null,
+            interview_id: interview.id,
+            tool_name: toolName
+          });
+        } else {
+          const endResp = await fetch(
+            `https://tavusapi.com/v2/conversations/${encodeURIComponent(conversationId)}/end`,
+            {
+              method: 'POST',
+              headers: {
+                'x-api-key': apiKey,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({})
+            }
+          );
+
+          if (!endResp.ok) {
+            const detail = await endResp.text().catch(() => '');
+            console.error('[webhook] tool_call tavus end failed', {
+              request_id: requestId || null,
+              conversation_id: conversationId || null,
+              interview_id: interview.id,
+              tool_name: toolName,
+              status: endResp.status,
+              detail: detail || null
+            });
+          } else {
+            const { error: toolUpdateError } = await supabaseAdmin
+              .from('interviews')
+              .update({
+                status: 'ending_requested',
+                updated_at: new Date().toISOString()
+              })
+              .eq('id', interview.id);
+
+            if (toolUpdateError) {
+              console.error('[webhook] tool_call status update failed', {
+                request_id: requestId || null,
+                conversation_id: conversationId || null,
+                interview_id: interview.id,
+                tool_name: toolName,
+                error: toolUpdateError.message || toolUpdateError,
+                details: toolUpdateError.details || null,
+                hint: toolUpdateError.hint || null
+              });
+            } else {
+              statusAfter = 'ending_requested';
+              console.log('[webhook] tool_call end_interview processed', {
+                request_id: requestId || null,
+                conversation_id: conversationId || null,
+                interview_id: interview.id,
+                tool_name: toolName,
+                tool_arguments: toolArgs ?? null
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[webhook] tool_call end_interview failed', {
+          request_id: requestId || null,
+          conversation_id: conversationId || null,
+          interview_id: interview.id,
+          tool_name: toolName,
+          error: err?.message || err
+        });
+      }
     }
 
-    // If transcript present (object or url), upload privately and store bucket/path
-    if (transcriptObj || transcriptUrl) {
-      const path = `${interview.id}.json`;
-      const stored = await putJsonToStorage(TRANSCRIPTS_BUCKET, path, transcriptObj || transcriptUrl);
-      updates.transcript_url = stored;
+    if (isShutdown) {
+      updates.status = 'Ended';
+      console.log('[webhook] interview ended', {
+        request_id: requestId || null,
+        interview_id: interview.id,
+        tavus_application_id: interview.tavus_application_id || conversationId || null
+      });
     }
 
-    // If analysis present (object or url), upload privately and store bucket/path
-    if (analysisObj || analysisUrl) {
-      const path = `${interview.id}.json`;
-      const stored = await putJsonToStorage(ANALYSIS_BUCKET, path, analysisObj || analysisUrl);
-      updates.analysis_url = stored;
+    if (isTranscriptionReady) {
+      const rawTranscript = pickFirst(
+        fromAny(body, 'properties.transcript'),
+        fromAny(body, 'transcript'),
+        fromAny(body, 'payload.transcript')
+      );
+
+      const transcriptUrlSignal = pickFirst(
+        fromAny(body, 'properties.transcript_url'),
+        fromAny(body, 'transcript_url'),
+        fromAny(body, 'payload.transcript_url')
+      );
+      const hasTranscriptSignal =
+        (rawTranscript !== undefined && rawTranscript !== null) ||
+        (transcriptUrlSignal !== undefined && transcriptUrlSignal !== null);
+      if (hasTranscriptSignal) {
+        const pathName = `interviews/${interview.id}.json`;
+        const stored = await putJsonToStorage(TRANSCRIPTS_BUCKET, pathName, body);
+        updates.transcript_url = stored;
+      }
+
+      const transcriptItems = Array.isArray(rawTranscript)
+        ? rawTranscript
+        : Array.isArray(rawTranscript?.messages)
+          ? rawTranscript.messages
+          : Array.isArray(fromAny(body, 'messages'))
+            ? fromAny(body, 'messages')
+            : Array.isArray(fromAny(body, 'transcript'))
+              ? fromAny(body, 'transcript')
+              : null;
+
+      const sanitizedLines = transcriptItems ? sanitizeTranscriptArray(transcriptItems) : [];
+      transcriptText = sanitizedLines.join('\n\n').trim();
+      if (transcriptText) {
+        updates.transcript = transcriptText;
+        updates.status = 'Transcribed';
+        transcriptNonEmpty = true;
+        analysisMissing = !isTranscriptAnalysisCompleteForRow(interview);
+        shouldTriggerAnalysisRun = analysisMissing;
+      } else {
+        updates.transcript = null;
+        updates.status = 'TranscriptionReceived';
+      }
     }
 
-    // Optional status update heuristics
-    if (updates.analysis_url) {
-      updates.status = 'Analyzed';
-    } else if (updates.transcript_url) {
-      updates.status = 'Transcribed';
-    } else if (updates.video_url) {
-      updates.status = 'VideoReady';
+    if (!transcriptText && interview?.transcript) {
+      const existingTranscript = String(interview.transcript || '').trim();
+      if (existingTranscript) {
+        transcriptText = existingTranscript;
+        if (!transcriptNonEmpty) {
+          transcriptNonEmpty = true;
+          analysisMissing = !isTranscriptAnalysisCompleteForRow(interview);
+          shouldTriggerAnalysisRun = analysisMissing;
+        }
+      }
     }
 
+    if (isRecordingReady) {
+      const recordingFieldSnapshot = {
+        properties_recording_url: fromAny(body, 'properties.recording_url'),
+        properties_video_url: fromAny(body, 'properties.video_url'),
+        recording_url: fromAny(body, 'recording_url'),
+        video_url: fromAny(body, 'video_url'),
+        payload_recording_url: fromAny(body, 'payload.recording_url'),
+        payload_video_url: fromAny(body, 'payload.video_url'),
+        output_video_url: fromAny(body, 'output.video_url'),
+        bucket_name: fromAny(body, 'bucket_name'),
+        s3_key: fromAny(body, 's3_key'),
+        duration: fromAny(body, 'duration'),
+        properties_bucket_name: fromAny(body, 'properties.bucket_name'),
+        properties_s3_key: fromAny(body, 'properties.s3_key'),
+        properties_duration: fromAny(body, 'properties.duration'),
+        payload_bucket_name: fromAny(body, 'payload.bucket_name'),
+        payload_s3_key: fromAny(body, 'payload.s3_key'),
+        payload_duration: fromAny(body, 'payload.duration'),
+        output_bucket_name: fromAny(body, 'output.bucket_name'),
+        output_s3_key: fromAny(body, 'output.s3_key'),
+        output_duration: fromAny(body, 'output.duration')
+      };
+      console.log('[webhook] recording_ready fields', {
+        request_id: requestId || null,
+        ...recordingFieldSnapshot
+      });
+
+      const recordingUrl = pickFirst(
+        fromAny(body, 'properties.recording_url'),
+        fromAny(body, 'properties.video_url'),
+        fromAny(body, 'recording_url'),
+        fromAny(body, 'video_url'),
+        fromAny(body, 'payload.recording_url'),
+        fromAny(body, 'payload.video_url'),
+        fromAny(body, 'output.video_url')
+      );
+
+      const recordingMeta = {
+        bucket_name: pickFirst(
+          fromAny(body, 'bucket_name'),
+          fromAny(body, 'properties.bucket_name'),
+          fromAny(body, 'payload.bucket_name'),
+          fromAny(body, 'output.bucket_name')
+        ),
+        s3_key: pickFirst(
+          fromAny(body, 's3_key'),
+          fromAny(body, 'properties.s3_key'),
+          fromAny(body, 'payload.s3_key'),
+          fromAny(body, 'output.s3_key')
+        ),
+        duration: pickFirst(
+          fromAny(body, 'duration'),
+          fromAny(body, 'properties.duration'),
+          fromAny(body, 'payload.duration'),
+          fromAny(body, 'output.duration')
+        )
+      };
+
+      const hasDownloadableUrl = isDownloadableRecordingUrl(recordingUrl);
+      if (recordingUrl && !hasDownloadableUrl && isDailyRoomUrl(recordingUrl)) {
+        const existingVideoUrl = interview.video_url || null;
+        if (!existingVideoUrl || isDailyRoomUrl(existingVideoUrl)) {
+          updates.video_url = null;
+        }
+      } else if (hasDownloadableUrl) {
+        updates.video_url = recordingUrl;
+      }
+
+      if (!hasDownloadableUrl && Object.keys(pruneMetadata(recordingMeta)).length) {
+        updates.recording_metadata = recordingMeta;
+      }
+    }
+
+    if (isPerceptionAnalysis) {
+      let perceptionRawPath = null;
+      try {
+        const perceptionPath = `interviews/${interview.id}-perception.json`;
+        perceptionRawPath = await putJsonToStorage(TRANSCRIPTS_BUCKET, perceptionPath, body);
+        const { error: rawErr } = await supabaseAdmin
+          .from('interviews')
+          .update({ perception_raw_path: perceptionRawPath })
+          .eq('id', interview.id);
+        if (rawErr) {
+          console.error('[webhook] perception_raw_path update failed', {
+            request_id: requestId || null,
+            interview_id: interview.id,
+            conversation_id: conversationId || null,
+            error: rawErr.message || rawErr,
+            details: rawErr.details || null,
+            hint: rawErr.hint || null
+          });
+        }
+      } catch (err) {
+        console.error('[webhook] perception_analysis storage failed', {
+          request_id: requestId || null,
+          interview_id: interview.id,
+          conversation_id: conversationId || null,
+          error: err?.message || err,
+          details: err?.details || null,
+          hint: err?.hint || null
+        });
+      }
+
+      let analysisText = pickFirst(
+        fromAny(body, 'properties.analysis'),
+        fromAny(body, 'analysis'),
+        fromAny(body, 'payload.analysis'),
+        fromAny(body, 'properties.perception_analysis'),
+        fromAny(body, 'perception_analysis'),
+        fromAny(body, 'payload.perception_analysis')
+      );
+      const perceptionScoreSources = [
+        body,
+        body?.properties,
+        body?.payload,
+        body?.payload?.properties,
+        body?.analysis,
+        body?.perception_analysis,
+        body?.payload?.analysis,
+        body?.payload?.perception_analysis
+      ];
+      if (analysisText && typeof analysisText === 'object') {
+        try {
+          analysisText = JSON.stringify(analysisText);
+        } catch {
+          analysisText = String(analysisText);
+        }
+      }
+      const perceptionResult = await updatePerceptionAnalysis(interview, analysisText, requestId, perceptionScoreSources);
+      const extractedKeys = Object.keys(perceptionResult?.perception_scores || {});
+      perceptionKeysCount = extractedKeys.length;
+      if (extractedKeys.length) {
+        console.log('[webhook] perception_analysis processed', {
+          request_id: requestId || null,
+          event_type: eventType || null,
+          interview_id: interview.id,
+          conversation_id: conversationId || null,
+          interview_created_at: interviewCreatedAt,
+          elapsed_seconds_from_interview_created: elapsedFromInterviewCreatedSec,
+          extracted_keys: extractedKeys,
+          extracted_count: extractedKeys.length,
+          stored: perceptionResult?.stored ?? null
+        });
+      } else {
+        console.warn('[webhook] perception_analysis no scores extracted', {
+          request_id: requestId || null,
+          event_type: eventType || null,
+          interview_id: interview.id,
+          extracted_interview_id: interviewId || null,
+          conversation_id: conversationId || null,
+          interview_created_at: interviewCreatedAt,
+          elapsed_seconds_from_interview_created: elapsedFromInterviewCreatedSec,
+          top_keys: Object.keys(body || {}),
+          payload_keys: Object.keys(body?.payload || {})
+        });
+      }
+    }
+
+    let updatesApplied = false;
     if (Object.keys(updates).length) {
-      await supabase.from('interviews').update(updates).eq('id', interview.id);
+      const { recording_metadata: recordingMeta, ...baseUpdates } = updates;
+      try {
+        await applyInterviewUpdates(interview.id, baseUpdates, recordingMeta);
+        updatesApplied = true;
+      } catch (err) {
+        console.error('[webhook] interview update failed', {
+          request_id: requestId || null,
+          interview_id: interview.id,
+          conversation_id: conversationId || null,
+          error: err?.message || err,
+          details: err?.details || null,
+          hint: err?.hint || null
+        });
+      }
     }
 
-    res.json({ ok: true, interview_id: interview.id, event });
+    let freshAfterTranscript = null;
+    let transcriptForQuestions = transcriptText;
+    if (isTranscriptionReady) {
+      const { data: fresh, error: freshErr } = await supabaseAdmin
+        .from('interviews')
+        .select('id, role_id, status, analysis, transcript_scores, transcript, interview_summary, perception_scores, unanswered_candidate_questions')
+        .eq('id', interview.id)
+        .maybeSingle();
+      if (freshErr) {
+        console.error('[webhook] post-transcription reselect failed', {
+          request_id: requestId || null,
+          interview_id: interview.id,
+          conversation_id: conversationId || null,
+          error: freshErr.message || freshErr,
+          details: freshErr.details || null,
+          hint: freshErr.hint || null
+        });
+      } else {
+        freshAfterTranscript = fresh;
+        const freshTranscript = typeof fresh?.transcript === 'string' ? fresh.transcript.trim() : '';
+        if (!transcriptForQuestions && freshTranscript) {
+          transcriptForQuestions = freshTranscript;
+          transcriptNonEmpty = true;
+        }
+
+        const analysisComplete = isTranscriptAnalysisCompleteForRow(fresh);
+        analysisCompleteSummary = analysisComplete;
+        if (transcriptNonEmpty) {
+          analysisMissing = !analysisComplete;
+          shouldTriggerAnalysisRun = analysisMissing;
+        }
+        if (transcriptNonEmpty) {
+          const scoringResult = await applyTranscriptScoringForInterview({
+            interview,
+            fresh,
+            transcriptText: freshTranscript || transcriptForQuestions || '',
+            requestId,
+            conversationId
+          });
+
+          const statusFrom = fresh.status || null;
+          let statusTo = null;
+          const allowed = [
+            'ReadyForAnalysis',
+            'Ready For Analysis',
+            'Transcribed',
+            'TranscriptionReceived',
+            'TranscriptionReady',
+            'TranscriptReady',
+            'Video Ready'
+          ];
+          if (allowed.includes(statusFrom)) {
+            statusTo = analysisComplete ? 'Analyzed' : 'ReadyForAnalysis';
+          }
+
+          if (statusTo) {
+            const { error: statusErr } = await supabaseAdmin
+              .from('interviews')
+              .update({ status: statusTo })
+              .eq('id', interview.id);
+            if (statusErr) {
+              console.error('[webhook] analysis status update failed', {
+                request_id: requestId || null,
+                interview_id: interview.id,
+                conversation_id: conversationId || null,
+                error: statusErr.message || statusErr,
+                details: statusErr.details || null,
+                hint: statusErr.hint || null
+              });
+            } else if (statusTo !== statusFrom) {
+              statusAfter = statusTo;
+            }
+          }
+
+        console.log('[webhook] post-transcription status normalization', {
+            request_id: requestId || null,
+            event_type: eventType || null,
+            interview_id: interview.id,
+            conversation_id: conversationId || null,
+            interview_created_at: interviewCreatedAt,
+            elapsed_seconds_from_interview_created: elapsedFromInterviewCreatedSec,
+            status_from: statusFrom,
+            status_to: statusTo,
+            scoring_updated: scoringResult?.updated || false
+          });
+        }
+      }
+    }
+
+    if (transcriptNonEmpty && !analysisMissing) {
+      console.log('[webhook] skip transcript analysis (already analyzed)', {
+        request_id: requestId || null,
+        interview_id: interview.id
+      });
+    }
+
+    const currentQuestions = freshAfterTranscript
+      ? freshAfterTranscript.unanswered_candidate_questions
+      : interview.unanswered_candidate_questions;
+    const needsQuestionCapture =
+      transcriptNonEmpty &&
+      transcriptForQuestions &&
+      isEmptyQuestionList(currentQuestions);
+
+    if (needsQuestionCapture) {
+      const questions = extractCandidateQuestions(transcriptForQuestions);
+      unansweredQuestionsCount = questions.length;
+      if (questions.length) {
+        setImmediate(async () => {
+          try {
+            const { error } = await supabaseAdmin
+              .from('interviews')
+              .update({ unanswered_candidate_questions: questions })
+              .eq('id', interview.id);
+            if (error) {
+              console.error('[webhook] unanswered_candidate_questions update failed', {
+                request_id: requestId || null,
+                interview_id: interview.id,
+                conversation_id: conversationId || null,
+                error: error.message || error,
+                details: error.details || null,
+                hint: error.hint || null
+              });
+            } else {
+              console.log('[webhook] unanswered_candidate_questions updated', {
+                request_id: requestId || null,
+                interview_id: interview.id,
+                count: questions.length
+              });
+            }
+          } catch (err) {
+            console.error('[webhook] unanswered_candidate_questions update failed', {
+              request_id: requestId || null,
+              interview_id: interview.id,
+              conversation_id: conversationId || null,
+              error: err?.message || err,
+              details: err?.details || null,
+              hint: err?.hint || null
+            });
+          }
+        });
+      }
+    }
+
+    if (
+      shouldTriggerAnalysisRun &&
+      transcriptNonEmpty &&
+      shouldTriggerAnalysis(interview.id, requestId)
+    ) {
+      console.log('[webhook] trigger transcript analysis', {
+        request_id: requestId || null,
+        interview_id: interview.id,
+        transcriptNonEmpty,
+        analysisMissing
+      });
+      setImmediate(async () => {
+        try {
+          const result = await analyzeInterviewTranscriptById(interview.id, {
+            request_id: requestId || null,
+            dry_run: false
+          });
+          let analysisComplete = false;
+          let statusFrom = null;
+          let statusTo = null;
+          let statusError = null;
+
+          if (result?.ok) {
+            const { data: fresh, error: freshErr } = await supabaseAdmin
+              .from('interviews')
+              .select('id, role_id, status, analysis, transcript_scores, transcript, interview_summary, perception_scores')
+              .eq('id', interview.id)
+              .maybeSingle();
+            if (!freshErr && fresh) {
+          analysisComplete = isTranscriptAnalysisCompleteForRow(fresh);
+          statusFrom = fresh.status || null;
+          await applyTranscriptScoringForInterview({
+            interview,
+            fresh,
+            transcriptText: typeof fresh.transcript === 'string' ? fresh.transcript : '',
+            requestId,
+            conversationId
+          });
+
+              const allowed = [
+                'ReadyForAnalysis',
+                'Ready For Analysis',
+                'Transcribed',
+                'TranscriptionReceived',
+                'TranscriptionReady',
+                'TranscriptReady',
+                'Video Ready'
+              ];
+              if (allowed.includes(statusFrom)) {
+                if (analysisComplete) {
+                  statusTo = 'Analyzed';
+                } else if (typeof fresh.transcript === 'string' && fresh.transcript.trim()) {
+                  statusTo = 'ReadyForAnalysis';
+                }
+              }
+              if (statusTo) {
+                const { error: statusErr } = await supabaseAdmin
+                  .from('interviews')
+                  .update({ status: statusTo })
+                  .eq('id', interview.id);
+                if (statusErr) {
+                  statusError = statusErr.message || statusErr;
+                  console.error('[webhook] analysis status update failed', {
+                    request_id: requestId || null,
+                    interview_id: interview.id,
+                    conversation_id: conversationId || null,
+                    error: statusErr.message || statusErr,
+                    details: statusErr.details || null,
+                    hint: statusErr.hint || null
+                  });
+                }
+              }
+            } else if (freshErr) {
+              statusError = freshErr.message || freshErr;
+            }
+          }
+
+          console.log('[webhook] transcript analysis finished', {
+            request_id: requestId || null,
+            interview_id: interview.id,
+            ok: result?.ok ?? null,
+            updated: result?.updated ?? null,
+            skipped: result?.skipped ?? null,
+            reason: result?.reason ?? null,
+            error: result?.error ?? statusError ?? null,
+            analysis_complete: analysisComplete,
+            status_from: statusFrom,
+            status_to: statusTo
+          });
+          if (result?.ok === false) {
+            console.error('[webhook] transcript analysis update failed', {
+              request_id: requestId || null,
+              interview_id: interview.id,
+              conversation_id: conversationId || null,
+              error: result?.error ?? null
+            });
+          }
+        } catch (err) {
+          console.error('[webhook] transcript analysis failed', {
+            request_id: requestId || null,
+            interview_id: interview.id,
+            conversation_id: conversationId || null,
+            error: err?.message || err
+          });
+        }
+      });
+    }
+
+    if (analysisCompleteSummary === null) {
+      analysisCompleteSummary = isTranscriptAnalysisCompleteForRow(interview);
+    }
+
+    console.log('[webhook] summary', {
+      request_id: requestId || null,
+      event_type: eventType || null,
+      interview_id: interview.id,
+      conversation_id: conversationId || null,
+      status_before: statusBefore,
+      status_after: statusAfter,
+      analysis_complete: analysisCompleteSummary,
+      perception_keys_count: perceptionKeysCount,
+      unanswered_questions_count: unansweredQuestionsCount
+    });
+
+    return res.status(200).json({ ok: true });
   } catch (e) {
-    console.error('[webhook] error:', e.message);
+    Sentry.captureException(e, {
+      tags: {
+        route_name: 'tavus_webhook',
+        surface: 'backend',
+        request_id: requestId || undefined,
+        interview_id: interviewId || undefined,
+        conversation_id: conversationId || undefined,
+        candidate_id: sentryCandidateId || undefined,
+        role_id: sentryRoleId || undefined,
+        client_id: sentryClientId || undefined
+      },
+      extra: {
+        request_id: requestId || null,
+        event_type: eventType || null,
+        interview_id: interviewId || null,
+        conversation_id: conversationId || null,
+        candidate_id: sentryCandidateId,
+        role_id: sentryRoleId,
+        client_id: sentryClientId
+      }
+    });
+    console.error('[webhook] error:', e.message || e);
     // Be lenient to avoid provider retries storms
-    res.status(200).json({ ok: true });
+    return res.status(200).json({ ok: true });
   }
 });
 

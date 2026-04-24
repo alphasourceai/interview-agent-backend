@@ -1,9 +1,13 @@
 // routes/candidateSubmit.js
 const express = require('express');
 const router = express.Router();
+const Sentry = require('@sentry/node');
 const multer = require('multer');
 const sg = require('@sendgrid/mail');
-const { supabase } = require('../src/lib/supabaseClient');
+const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
+const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
+const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
+const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
 const analyzeResume = require('../analyzeResume'); // resume analyzer
 
 // uploads: keep in memory; 10MB limit
@@ -16,7 +20,40 @@ const upload = multer({
 const FROM_EMAIL = process.env.SENDGRID_FROM;
 const SENDGRID_KEY = process.env.SENDGRID_API_KEY;
 const APP_NAME = process.env.APP_NAME || 'Interview Agent';
+const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
+const BILLING_ENFORCED = BILLING_MODE === 'enforce';
 if (SENDGRID_KEY) sg.setApiKey(SENDGRID_KEY);
+const SUBMIT_RATE_WINDOW_MS = 60 * 60 * 1000;
+const SUBMIT_RATE_MAX = 10;
+
+async function candidateSubmitRateLimit(req, res, next) {
+  try {
+    const result = await checkAndIncrementRateLimit({
+      routeName: 'candidate_submit',
+      subjectKey: getRequestSubjectKey(req),
+      windowMs: SUBMIT_RATE_WINDOW_MS,
+      maxCount: SUBMIT_RATE_MAX
+    });
+    if (!result.allowed) {
+      return res.status(429).json({
+        error: 'rate_limited',
+        code: 'RATE_LIMIT_EXCEEDED',
+        detail: 'Too many requests. Please try again later.'
+      });
+    }
+  } catch (error) {
+    console.error('[rate-limit] candidate submit check failed', {
+      request_id: req.request_id || null,
+      error: error?.message || error
+    });
+    return res.status(503).json({
+      error: 'rate_limit_unavailable',
+      code: 'RATE_LIMIT_UNAVAILABLE',
+      detail: 'Request protection is temporarily unavailable. Please try again shortly.'
+    });
+  }
+  return next();
+}
 
 // 6-digit OTP
 function six() {
@@ -36,13 +73,52 @@ function normName(v = '') {
   return String(v || '').trim().replace(/\s+/g, ' ').toLowerCase();
 }
 
+function buildOtpEmailHtml(appName, otpCode) {
+  const safeAppName = escapeHtml(appName || 'Interview Agent');
+  const safeOtpCode = escapeHtml(otpCode || '');
+  return buildBrandedEmailShell({
+    title: 'Your verification code',
+    preheader: `Your verification code is ${safeOtpCode}. It expires in 10 minutes.`,
+    contentHtml: `
+      <p style="margin:0 0 14px;color:#C9D3FF;font-size:15px;line-height:1.6;">
+        Use this one-time code to continue your ${safeAppName} verification.
+      </p>
+      <p style="margin:0 0 16px;">
+        <span style="display:inline-block;background:#A78BFA;color:#0A1547;border:1px solid #CFCBFF;border-radius:10px;padding:10px 16px;font-size:22px;font-weight:800;letter-spacing:0.22em;">
+          ${safeOtpCode}
+        </span>
+      </p>
+      <p style="margin:0 0 16px;color:#C9D3FF;font-size:14px;line-height:1.55;">
+        This code expires in 10 minutes.
+      </p>
+    `
+  });
+}
+
 /**
  * POST /api/candidate/submit
  * Accepts multipart form (resume) or JSON (resume_url).
  * Required: email + (name OR first/last) + (role_id OR role_token)
  */
-router.post('/', upload.any(), async (req, res) => {
+router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
+  const request_id = req.request_id || null;
+  let sentryCandidateId = null;
+  let sentryRoleId = null;
+  let sentryClientId = null;
+  Sentry.setTag('route_name', 'candidate_submit');
+  Sentry.setTag('surface', 'backend');
+  if (request_id) Sentry.setTag('request_id', String(request_id));
   try {
+    const submissionFailed = (reason, details = {}) => {
+      console.warn('[candidate-submit] submission_failed', { request_id, reason, ...details });
+      const payload = {
+        error: 'submission_failed',
+        code: 'SUBMISSION_FAILED',
+        detail: 'We could not process this request. Please review your information and try again.'
+      };
+      if (request_id) payload.request_id = request_id;
+      return res.status(400).json(payload);
+    };
     // --- normalize inputs ---
     const role_token   = (req.body.role_token || '').trim();
     const role_id_in   = (req.body.role_id || '').trim();
@@ -80,8 +156,86 @@ router.post('/', upload.any(), async (req, res) => {
         .eq('slug_or_token', role_token)
         .single());
     }
-    if (rErr || !role) return res.status(404).json({ error: 'Role not found.' });
+    if (rErr || !role) {
+      return submissionFailed('role_not_found', {
+        role_id: role_id_in || null,
+        role_token: role_token || null
+      });
+    }
     const roleId = role.id;
+    sentryRoleId = roleId || null;
+    sentryClientId = role.client_id || null;
+    if (sentryRoleId) Sentry.setTag('role_id', String(sentryRoleId));
+    if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
+    Sentry.addBreadcrumb({
+      category: 'candidate_submit',
+      message: 'role loaded',
+      level: 'info',
+      data: { role_id: roleId, client_id: role.client_id || null }
+    });
+
+    if (BILLING_ENFORCED && role.client_id) {
+      const { data: client, error: clientErr } = await supabase
+        .from('clients')
+        .select('id,billing_status,manual_active_override,access_override_mode,candidate_assistance_contact')
+        .eq('id', role.client_id)
+        .maybeSingle();
+
+      if (clientErr || !client) {
+        return res.status(500).json({
+          error: 'server_error',
+          code: 'CLIENT_LOOKUP_FAILED',
+          detail: clientErr?.message || 'Failed to load client record',
+          hint: clientErr?.hint || null,
+          request_id
+        });
+      }
+      Sentry.addBreadcrumb({
+        category: 'candidate_submit',
+        message: 'client loaded',
+        level: 'info',
+        data: { client_id: role.client_id || null }
+      });
+
+      const accessOverrideMode = String(client.access_override_mode || 'inherit').toLowerCase();
+      if (accessOverrideMode === 'force_inactive' || (accessOverrideMode !== 'force_active' && client.billing_status !== 'active')) {
+        return res.status(403).json({
+          error: 'forbidden',
+          code: 'CLIENT_INACTIVE',
+          detail: 'Interviewing service is currently inactive for this employer.',
+          hint: client.candidate_assistance_contact || 'Please contact the employer.',
+          request_id
+        });
+      }
+    }
+
+    const availability = await getRoleInterviewAvailability({
+      db: supabaseAdmin,
+      roleId,
+      clientId: role.client_id || null
+    });
+    await syncRoleInterviewLimitNotification({
+      db: supabaseAdmin,
+      roleId,
+      clientId: role.client_id || null,
+      remainingInterviews: availability.remaining_interviews,
+      roleTitle: role?.title || ''
+    });
+    if (availability.remaining_interviews != null && availability.remaining_interviews <= 0) {
+      Sentry.addBreadcrumb({
+        category: 'candidate_submit',
+        message: 'interview limit reached',
+        level: 'info',
+        data: { role_id: roleId, client_id: role.client_id || null }
+      });
+      return res.status(403).json({
+        error: 'forbidden',
+        code: 'interview_limit_reached',
+        detail: 'This role has no interviews remaining under the current plan.',
+        hint: null,
+        request_id
+      });
+    }
 
     // --- duplicate & enrichment policy ---
     // RULES:
@@ -106,9 +260,9 @@ router.post('/', upload.any(), async (req, res) => {
       if (phone && !existingByEmail.phone) {
         await supabase.from('candidates').update({ phone }).eq('id', existingByEmail.id);
       }
-      return res.status(409).json({
-        error:
-          "You’ve already interviewed for this role with this information. If you believe this is an error, contact support at info@alphasourceai.com",
+      return submissionFailed('duplicate_email', {
+        role_id: roleId,
+        candidate_id: existingByEmail.id || null
       });
     }
 
@@ -130,9 +284,9 @@ router.post('/', upload.any(), async (req, res) => {
         if (!existingByNamePhone.phone && phone) {
           await supabase.from('candidates').update({ phone }).eq('id', existingByNamePhone.id);
         }
-        return res.status(409).json({
-          error:
-            "You’ve already interviewed for this role with this information. If you believe this is an error, contact support at info@alphasourceai.com",
+        return submissionFailed('duplicate_name_phone', {
+          role_id: roleId,
+          candidate_id: existingByNamePhone.id || null
         });
       }
     }
@@ -156,6 +310,14 @@ router.post('/', upload.any(), async (req, res) => {
         .single();
       if (cErr) return res.status(500).json({ error: cErr.message });
       candidate_id = inserted.id;
+      sentryCandidateId = candidate_id || null;
+      if (sentryCandidateId) Sentry.setTag('candidate_id', String(sentryCandidateId));
+      Sentry.addBreadcrumb({
+        category: 'candidate_submit',
+        message: 'candidate created',
+        level: 'info',
+        data: { candidate_id, role_id: roleId }
+      });
 
       // self-reference (candidate_id column)
       await supabase.from('candidates').update({ candidate_id }).eq('id', candidate_id);
@@ -180,8 +342,7 @@ router.post('/', upload.any(), async (req, res) => {
           upsert: true,
         });
         if (!up.error) {
-          const { data: pub } = supabase.storage.from(bucket).getPublicUrl(path);
-          resume_url = pub?.publicUrl || resume_url;
+          resume_url = `${bucket}/${path}`;
         }
       }
     } catch (e) {
@@ -218,10 +379,24 @@ router.post('/', upload.any(), async (req, res) => {
       expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
       used: false,
     });
-    if (otpErr) return res.status(500).json({ error: `Could not create OTP: ${otpErr.message}` });
+    if (otpErr) {
+      console.error('otp create failed', {
+        request_id,
+        candidate_id,
+        role_id: roleId,
+        error: otpErr.message,
+        code: otpErr.code || null
+      });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'OTP_CREATE_FAILED',
+        detail: 'Unable to continue verification at this time.',
+        ...(request_id ? { request_id } : {})
+      });
+    }
 
     // --- email OTP (non-fatal) ---
-    let emailSent = false, emailError = null;
+    let emailSent = false;
     try {
       if (!SENDGRID_KEY || !FROM_EMAIL) throw new Error('SENDGRID_API_KEY or SENDGRID_FROM not configured');
       const [resp] = await sg.send({
@@ -229,27 +404,46 @@ router.post('/', upload.any(), async (req, res) => {
         from: { email: FROM_EMAIL, name: APP_NAME },
         subject: `Your ${APP_NAME} verification code`,
         text: `Your verification code is ${freshCode}. It expires in 10 minutes.`,
-        html: `<p>Your verification code is <strong style="font-size:18px">${freshCode}</strong>.</p>
-               <p>It expires in 10 minutes.</p>`,
+        html: buildOtpEmailHtml(APP_NAME, freshCode),
       });
       emailSent = resp?.statusCode === 202;
     } catch (e) {
-      emailError = e?.response?.data || e?.message || String(e);
-      console.error('sendEmailOtp failed:', emailError);
+      const status = e?.response?.status || e?.code || null;
+      const message = e?.message || 'send_failed';
+      console.error('sendEmailOtp failed', { request_id, status, message });
+      Sentry.addBreadcrumb({
+        category: 'candidate_submit',
+        message: 'otp send failed',
+        level: 'warning',
+        data: { request_id, status, message, candidate_id, role_id: roleId }
+      });
     }
 
     // success
     return res.status(200).json({
-      message: emailSent ? 'Candidate created. OTP emailed.' : 'Candidate created. OTP email failed.',
-      email_sent: emailSent,
-      email_error: emailError,
+      message: 'If your information is accepted, a verification code will be sent shortly.',
       candidate_id,
       role_id: roleId,
-      email,
       resume_url: resume_url || null,
     });
   } catch (err) {
     console.error('Error in /candidate/submit:', err);
+    Sentry.captureException(err, {
+      tags: {
+        route_name: 'candidate_submit',
+        surface: 'backend',
+        request_id: request_id || undefined,
+        candidate_id: sentryCandidateId || undefined,
+        role_id: sentryRoleId || undefined,
+        client_id: sentryClientId || undefined
+      },
+      extra: {
+        request_id,
+        candidate_id: sentryCandidateId,
+        role_id: sentryRoleId,
+        client_id: sentryClientId
+      }
+    });
     return res.status(500).json({ error: 'Server error.' });
   }
 });

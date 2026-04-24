@@ -1,13 +1,10 @@
 const multer = require('multer');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
-const pdfParse = require('pdf-parse');
 const { createClient } = require('@supabase/supabase-js');
-const OpenAI = require('openai');
-const fs = require('fs');
+const analyzeResume = require('../analyzeResume');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
@@ -15,13 +12,13 @@ const upload = multer({ storage });
 const handleResumeUpload = [
   upload.single('resume'),
   async (req, res) => {
+    const request_id = req.request_id || null;
     try {
       const { name, email, role_id } = req.body;
       const resumeFile = req.file;
       const fileExt = path.extname(resumeFile.originalname);
-      const timestamp = Date.now();
       const candidate_id = `cand-${uuidv4()}`;
-      const storagePath = `resumes/${candidate_id}${fileExt}`;
+      const storagePath = `${candidate_id}${fileExt}`;
 
       const { data: uploadData, error: uploadError } = await supabase.storage
         .from('resumes')
@@ -34,48 +31,37 @@ const handleResumeUpload = [
         return res.status(500).json({ error: 'Resume upload failed', details: uploadError });
       }
 
-      const publicURL = `https://${process.env.SUPABASE_URL.split('//')[1]}/storage/v1/object/public/${uploadData.path}`;
+      const resumeStoragePath = `resumes/${uploadData?.path || storagePath}`;
 
-      const pdfText = (await pdfParse(resumeFile.buffer)).text;
+      const role = await supabase.from('roles').select('id, title, description, client_id').eq('id', role_id).single();
+      let analysis;
+      try {
+        analysis = await analyzeResume(resumeFile.buffer, resumeFile.mimetype, role.data || {}, candidate_id);
+      } catch (analysisErr) {
+        return res.status(500).json({
+          error: 'resume_analysis_failed',
+          code: 'resume_analysis_failed',
+          detail: analysisErr?.message || String(analysisErr || ''),
+          hint: null,
+          request_id
+        });
+      }
 
-      const role = await supabase.from('roles').select('description').eq('id', role_id).single();
-      const roleDesc = role.data?.description || 'No role description available';
 
-      const analysisPrompt = `
-You are an expert recruiter. Evaluate the following resume against this role description.
-
-Role Description:
-${roleDesc}
-
-Resume:
-${pdfText}
-
-Use this scoring rubric (0–100 total):
-- Skills Match %
-- Experience Match %
-- Education Match %
-
-Respond in JSON with:
-{
-  "resume_score": [0–100],
-  "skills_match_percent": [0–100],
-  "experience_match_percent": [0–100],
-  "education_match_percent": [0–100],
-  "overall_resume_match_percent": [0–100],
-  "summary": "short explanation"
-}
-`;
-
-      const response = await openai.chat.completions.create({
-        model: 'gpt-4-turbo',
-        messages: [{ role: 'user', content: analysisPrompt }],
-        temperature: 0.3,
-      });
-
-      const raw = response.choices[0].message.content;
-const cleanJson = raw.replace(/```json|```/g, '').trim();
-const analysis = JSON.parse(cleanJson);
-
+      const analysisSummary = {
+        resume_score: Number(analysis.resume_score) || 0,
+        skills_match_percent: Number(analysis.skills_match_percent) || 0,
+        experience_match_percent: Number(analysis.experience_match_percent) || 0,
+        education_match_percent: Number(analysis.education_match_percent) || 0,
+        overall_resume_match_percent: Number(analysis.overall_resume_match_percent) || 0,
+        resume_summary: analysis.summary || '',
+        resume_analysis: {
+          experience_match_percent: Number(analysis.experience_match_percent) || 0,
+          skills_match_percent: Number(analysis.skills_match_percent) || 0,
+          education_match_percent: Number(analysis.education_match_percent) || 0,
+          summary: analysis.summary || ''
+        }
+      };
 
       const { data: candidate, error: dbError } = await supabase
         .from('candidates')
@@ -88,8 +74,8 @@ const analysis = JSON.parse(cleanJson);
           upload_ts: new Date().toISOString(),
           status: 'Resume Uploaded',
           interview_status: 'pending',
-          resume_url: publicURL,
-          analysis_summary: analysis.summary
+          resume_url: resumeStoragePath,
+          analysis_summary: analysisSummary
         }])
         .select()
         .single();
@@ -98,18 +84,16 @@ const analysis = JSON.parse(cleanJson);
         return res.status(500).json({ error: 'Failed to save candidate metadata', dbError });
       }
 
-      await supabase.from('reports').insert([
-        {
-          candidate_id: candidate.id,
-          analysis,
-          resume_score: analysis.resume_score,
-        },
-      ]);
-
-      return res.json({ message: 'Resume uploaded and analyzed', candidate, resume_url: publicURL, analysis });
+      return res.json({ message: 'Resume uploaded and analyzed', candidate, resume_url: resumeStoragePath, analysis });
     } catch (err) {
       console.error(err);
-      return res.status(500).json({ error: 'Internal server error', details: err.message });
+      return res.status(500).json({
+        error: 'internal_server_error',
+        code: 'internal_server_error',
+        detail: err?.message || String(err || ''),
+        hint: null,
+        request_id
+      });
     }
   }
 ];

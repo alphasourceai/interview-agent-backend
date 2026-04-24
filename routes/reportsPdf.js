@@ -98,7 +98,7 @@ async function handleGenerate(req, res) {
       return res.status(500).json({ error: 'Storage not configured (missing SUPABASE_URL/SUPABASE_SERVICE_KEY)' });
     }
 
-    const { candidate_id, report_id } = req.body || {};
+    const { candidate_id, report_id, interview_id } = req.body || {};
     if (!candidate_id && !report_id) {
       return res.status(400).json({ error: 'candidate_id or report_id is required' });
     }
@@ -108,7 +108,7 @@ async function handleGenerate(req, res) {
     if (report_id) {
       const { data, error } = await supabaseAdmin
         .from('reports')
-        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis')
+        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis, unanswered_candidate_questions')
         .eq('id', report_id)
         .maybeSingle();
       if (error) throw error;
@@ -116,7 +116,7 @@ async function handleGenerate(req, res) {
     } else {
       const { data, error } = await supabaseAdmin
         .from('reports')
-        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis')
+        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis, unanswered_candidate_questions')
         .eq('candidate_id', candidate_id)
         .order('created_at', { ascending: false })
         .limit(1);
@@ -131,17 +131,29 @@ async function handleGenerate(req, res) {
       Sentry.addBreadcrumb({ category: 'db', level: 'info', message: 'reports:loaded', data: { report_id: reportRow.id, candidate_id: reportRow.candidate_id } });
     }
 
-    // Load latest interview for this candidate (for fallbacks + status)
+    // Load interview row used for current dashboard values.
+    // Prefer explicit interview_id from FE; otherwise use latest by candidate.
     let latestInterview = null;
     {
-      const { data: ivs, error: ivErr } = await supabaseAdmin
-        .from('interviews')
-        .select('id, created_at, candidate_id, video_url, transcript_url, analysis_url, analysis')
-        .eq('candidate_id', reportRow.candidate_id)
-        .order('created_at', { ascending: false })
-        .limit(1);
-      if (ivErr) throw ivErr;
-      latestInterview = (ivs && ivs[0]) || null;
+      if (interview_id) {
+        const { data: ivById, error: ivByIdErr } = await supabaseAdmin
+          .from('interviews')
+          .select('id, created_at, candidate_id, video_url, transcript_url, analysis_url, analysis, transcript_scores, perception_scores, interview_summary, unanswered_candidate_questions')
+          .eq('id', interview_id)
+          .maybeSingle();
+        if (ivByIdErr) throw ivByIdErr;
+        latestInterview = ivById || null;
+      }
+      if (!latestInterview) {
+        const { data: ivs, error: ivErr } = await supabaseAdmin
+          .from('interviews')
+          .select('id, created_at, candidate_id, video_url, transcript_url, analysis_url, analysis, transcript_scores, perception_scores, interview_summary, unanswered_candidate_questions')
+          .eq('candidate_id', reportRow.candidate_id)
+          .order('created_at', { ascending: false })
+          .limit(1);
+        if (ivErr) throw ivErr;
+        latestInterview = (ivs && ivs[0]) || null;
+      }
     }
     if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
       Sentry.addBreadcrumb({ category: 'db', level: 'info', message: 'interviews:loaded', data: { latest_interview_id: latestInterview ? latestInterview.id : null } });
@@ -149,7 +161,7 @@ async function handleGenerate(req, res) {
 
     // 2) Load candidate + role
     const [{ data: cand, error: candErr }, { data: role, error: roleErr }] = await Promise.all([
-      supabaseAdmin.from('candidates').select('id,name,email,client_id').eq('id', reportRow.candidate_id).maybeSingle(),
+      supabaseAdmin.from('candidates').select('id,name,email,client_id,analysis_summary').eq('id', reportRow.candidate_id).maybeSingle(),
       supabaseAdmin.from('roles').select('id,title').eq('id', reportRow.role_id).maybeSingle(),
     ]);
     if (candErr) throw candErr;
@@ -157,6 +169,17 @@ async function handleGenerate(req, res) {
     if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
       Sentry.addBreadcrumb({ category: 'db', level: 'info', message: 'candidate:loaded', data: { candidate_id: cand ? cand.id : null } });
       Sentry.addBreadcrumb({ category: 'db', level: 'info', message: 'role:loaded', data: { role_id: role ? role.id : null } });
+    }
+
+    let client = null;
+    if (cand?.client_id) {
+      const { data: clientRow, error: clientErr } = await supabaseAdmin
+        .from('clients')
+        .select('id,name')
+        .eq('id', cand.client_id)
+        .maybeSingle();
+      if (clientErr) throw clientErr;
+      client = clientRow || null;
     }
 
     // Normalize to the template contract (flat keys expected by candidate-report.hbs)
@@ -196,6 +219,20 @@ async function handleGenerate(req, res) {
         const n = Number(m[0]);
         if (!Number.isFinite(n)) return null;
         return (n > 0 && n <= 1) ? Math.round(n * 100) : n;
+      }
+      return null;
+    }
+
+    function parseJsonObject(value) {
+      if (!value) return null;
+      if (typeof value === 'object' && !Array.isArray(value)) return value;
+      if (typeof value === 'string') {
+        try {
+          const parsed = JSON.parse(value);
+          return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+        } catch {
+          return null;
+        }
       }
       return null;
     }
@@ -330,72 +367,92 @@ async function handleGenerate(req, res) {
       education: educationScore,
       summary: resume_summary
     };
+    const transcriptScores = parseJsonObject(latestInterview?.transcript_scores) || {};
+    const evidenceStrengthFromTranscript = coerceNumber(transcriptScores.confidence);
+    const aiAidedRiskFromTranscript = typeof transcriptScores.ai_aided_risk === 'string' ? transcriptScores.ai_aided_risk.trim().toLowerCase() : '';
+    const aiAidedRiskReasonFromTranscript = typeof transcriptScores.ai_aided_risk_reason === 'string' ? transcriptScores.ai_aided_risk_reason.trim() : '';
 
+    const clarityFromReport = coerceNumber(rb.clarity);
+    const confidenceFromReport = coerceNumber(rb.confidence);
+    const clarityFromIvScores = coerceNumber(ivScores.clarity);
+    const confidenceFromIvScores = coerceNumber(ivScores.confidence);
     const interview_breakdown = {
-      clarity: Number.isFinite(Number(rb.clarity)) ? Number(rb.clarity)
-              : (Number.isFinite(Number(ivScores.clarity)) ? Number(ivScores.clarity) : 0),
-      confidence: Number.isFinite(Number(rb.confidence)) ? Number(rb.confidence)
-                 : (Number.isFinite(Number(ivScores.confidence)) ? Number(ivScores.confidence) : 0),
-      body_language: Number.isFinite(Number(rb.body_language)) ? Number(rb.body_language)
-                    : (Number.isFinite(Number(ivScores.body_language)) ? Number(ivScores.body_language) : 0),
+      clarity: clarityFromReport !== null ? clarityFromReport : clarityFromIvScores,
+      confidence: confidenceFromReport !== null ? confidenceFromReport : confidenceFromIvScores,
+      evidence_strength: evidenceStrengthFromTranscript !== null ? evidenceStrengthFromTranscript : null,
+      ai_aided_risk: aiAidedRiskFromTranscript,
+      ai_aided_risk_reason: aiAidedRiskReasonFromTranscript,
       summary: interview_summary
     };
 
-    // Optional targeted debug to inspect resume score sources
-    if (process.env.DEBUG_REPORTS === '1') {
-      const redact = (obj) => {
-        try {
-          return JSON.stringify(obj, (k, v) => {
-            if (typeof v === 'string') {
-              if (v.length > 400) return v.slice(0, 400) + '…';
-              if (v.includes('@')) return v.replace(/[^@]+@/g, '***@');
-            }
-            return v;
-          }, 2);
-        } catch {
-          return '[unserializable]';
-        }
-      };
-      console.log('[pdf.debug] candidate_id=', reportRow.candidate_id, 'report_id=', reportRow.id);
-      console.log('[pdf.debug] analysis.resume =', redact(reportRow?.analysis?.resume));
-      console.log('[pdf.debug] resumeRaw      =', redact(resumeRaw));
-      console.log('[pdf.debug] resume_breakdown (final) =', redact(resume_breakdown));
-      console.log('[pdf.debug] interview_breakdown (final) =', redact(interview_breakdown));
+    let unansweredCandidateQuestions = Array.isArray(reportRow.unanswered_candidate_questions)
+      ? reportRow.unanswered_candidate_questions.filter(q => typeof q === 'string' && q.trim())
+      : [];
+
+    // Use the same source-of-truth fields as /dashboard/rows.
+    const candidateSummary = parseJsonObject(cand?.analysis_summary) || {};
+    const resumeFromCandidate =
+      coerceNumber(
+        candidateSummary.resume_score ??
+        candidateSummary.resume ??
+        candidateSummary.resume_match_percent ??
+        candidateSummary.resumeMatchPercent
+      );
+    const interviewFromTranscript = coerceNumber(transcriptScores.overall);
+    const overallFromCurrent =
+      (resumeFromCandidate !== null && interviewFromTranscript !== null)
+        ? Math.round((resumeFromCandidate + interviewFromTranscript) / 2)
+        : null;
+
+    if (resumeFromCandidate !== null) reportRow.resume_score = resumeFromCandidate;
+    if (interviewFromTranscript !== null) reportRow.interview_score = interviewFromTranscript;
+    reportRow.overall_score = overallFromCurrent;
+
+    const resumeSummaryFromCandidate =
+      (typeof candidateSummary.summary === 'string' && candidateSummary.summary.trim()) ||
+      (typeof candidateSummary.resume_summary === 'string' && candidateSummary.resume_summary.trim()) ||
+      (typeof candidateSummary.resumeSummary === 'string' && candidateSummary.resumeSummary.trim()) ||
+      (typeof candidateSummary.resume_analysis?.summary === 'string' && candidateSummary.resume_analysis.summary.trim()) ||
+      '';
+    if (resumeSummaryFromCandidate) {
+      resume_breakdown.summary = resumeSummaryFromCandidate;
     }
 
-    // Try to reuse the exact normalized row the dashboard uses (to guarantee parity)
-    const clientId = cand?.client_id || req.body?.client_id || null;
-    if (clientId) {
-      const dashRow = await getDashboardRowNormalized(clientId, reportRow.candidate_id);
-      if (dashRow) {
-        const dashResume = dashRow.resume_analysis || dashRow.resume_breakdown || {};
-        const dashInterview = dashRow.interview_analysis || dashRow.interview_breakdown || {};
-        const dashResumeScores = dashResume?.scores ? dashResume.scores : dashResume;
-        const dashInterviewScores = dashInterview?.scores ? dashInterview.scores : dashInterview;
+    const experienceFromCandidate = coerceNumber(
+      candidateSummary.experience_match_percent ?? candidateSummary.experienceMatchPercent
+    );
+    const skillsFromCandidate = coerceNumber(
+      candidateSummary.skills_match_percent ?? candidateSummary.skillsMatchPercent
+    );
+    const educationFromCandidate = coerceNumber(
+      candidateSummary.education_match_percent ?? candidateSummary.educationMatchPercent
+    );
+    if (experienceFromCandidate !== null) resume_breakdown.experience = experienceFromCandidate;
+    if (skillsFromCandidate !== null) resume_breakdown.skills = skillsFromCandidate;
+    if (educationFromCandidate !== null) resume_breakdown.education = educationFromCandidate;
 
-        // Overwrite summaries if dashboard has them
-        if (typeof dashResume.summary === 'string' && dashResume.summary.trim()) {
-          resume_breakdown.summary = dashResume.summary.trim();
-        }
-        if (typeof dashInterview.summary === 'string' && dashInterview.summary.trim()) {
-          interview_breakdown.summary = dashInterview.summary.trim();
-        }
+    const perceptionScores = parseJsonObject(latestInterview?.perception_scores) || {};
+    const clarityFromInterview = coerceNumber(perceptionScores.clarity);
+    const confidenceFromInterview = coerceNumber(perceptionScores.confidence);
+    const engagementFromInterview = coerceNumber(perceptionScores.engagement);
+    if (clarityFromInterview !== null) interview_breakdown.clarity = clarityFromInterview;
+    if (confidenceFromInterview !== null) interview_breakdown.confidence = confidenceFromInterview;
+    if (engagementFromInterview !== null) {
+      interview_breakdown.engagement = engagementFromInterview;
+    }
 
-        // Overwrite category scores if dashboard has them
-        const exp = coerceNumber(dashResumeScores?.experience);
-        const skl = coerceNumber(dashResumeScores?.skills);
-        const edu = coerceNumber(dashResumeScores?.education);
-        if (exp !== null) resume_breakdown.experience = exp;
-        if (skl !== null) resume_breakdown.skills = skl;
-        if (edu !== null) resume_breakdown.education = edu;
+    const interviewSummaryFromInterview = typeof latestInterview?.interview_summary === 'string'
+      ? latestInterview.interview_summary.trim()
+      : '';
+    if (interviewSummaryFromInterview) {
+      interview_breakdown.summary = interviewSummaryFromInterview;
+    }
 
-        const cla = coerceNumber(dashInterviewScores?.clarity);
-        const con = coerceNumber(dashInterviewScores?.confidence);
-        const bl  = coerceNumber(dashInterviewScores?.body_language);
-        if (cla !== null) interview_breakdown.clarity = cla;
-        if (con !== null) interview_breakdown.confidence = con;
-        if (bl  !== null) interview_breakdown.body_language = bl;
-      }
+    if (Array.isArray(latestInterview?.unanswered_candidate_questions)) {
+      const cleaned = latestInterview.unanswered_candidate_questions
+        .map((q) => (q == null ? '' : String(q).trim()))
+        .filter(Boolean);
+      unansweredCandidateQuestions = cleaned;
     }
 
     const status = latestInterview?.video_url ? 'Interview Completed' : 'Pending';
@@ -406,16 +463,18 @@ async function handleGenerate(req, res) {
     const payload = {
       name,
       email,
+      company_name: typeof client?.name === 'string' ? client.name.trim() : '',
+      role_name: typeof role?.title === 'string' ? role.title.trim() : '',
       status,
-      resume_score: Number.isFinite(Number(reportRow.resume_score)) ? Number(reportRow.resume_score) : 0,
-      interview_score: Number.isFinite(Number(reportRow.interview_score)) ? Number(reportRow.interview_score)
-                        : (Number.isFinite(Number(rb.overall)) ? Number(rb.overall) : 0),
-      overall_score: Number.isFinite(Number(reportRow.overall_score)) ? Number(reportRow.overall_score) : 0,
+      resume_score: coerceNumber(reportRow.resume_score) ?? null,
+      interview_score: coerceNumber(reportRow.interview_score) ?? null,
+      overall_score: coerceNumber(reportRow.overall_score) ?? null,
       resume_breakdown,
-      resume_summary,
+      resume_summary: resume_breakdown.summary || resume_summary,
       interview_breakdown,
-      interview_summary,
-      created_at: reportRow.created_at
+      interview_summary: interview_breakdown.summary || interview_summary,
+      created_at: reportRow.created_at,
+      unanswered_candidate_questions: unansweredCandidateQuestions
     };
 
     // 4) Render and convert to PDF
@@ -442,10 +501,7 @@ async function handleGenerate(req, res) {
       Sentry.addBreadcrumb({ category: 'storage', level: 'info', message: 'storage:uploaded', data: { key } });
     }
 
-    // Derive a public-style URL (works if bucket is public; harmless otherwise)
-    const { data: pub } = supabaseAdmin.storage.from(REPORTS_BUCKET).getPublicUrl(key);
-
-    // Also create a short-lived signed URL for immediate download/open
+    // Create a short-lived signed URL for immediate download/open
     const expiresIn = Math.max(MIN_SIGNED_SECS, Math.min(MAX_SIGNED_SECS, Number(req.query.expires || DEFAULT_SIGNED_SECS)));
     const { data: signed, error: signErr } = await supabaseAdmin
       .storage
@@ -461,7 +517,7 @@ async function handleGenerate(req, res) {
       await supabaseAdmin
         .from('reports')
         .update({
-          report_url: pub?.publicUrl || null,
+          report_url: key,
           report_generated_at: new Date().toISOString()
         })
         .eq('id', reportRow.id);
@@ -475,7 +531,7 @@ async function handleGenerate(req, res) {
       ok: true,
       report_id: reportRow.id,
       key,
-      url: pub?.publicUrl || null,
+      report_url: key,
       signed_url: signed?.signedUrl || null,
       expires_in: expiresIn
     });
@@ -558,4 +614,5 @@ router.get('/:id/url', async (req, res) => {
   }
 });
 
+router._handleGenerate = handleGenerate;
 module.exports = router;

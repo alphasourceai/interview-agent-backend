@@ -8,7 +8,8 @@ const crypto = require('crypto');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { parseBufferToText } = require('../utils/jdParser');
 
-const JD_BUCKET = process.env.SUPABASE_JD_BUCKET || 'job-descriptions';
+// Canonical JD storage bucket; store job_description_url as "<bucket>/<path>".
+const JD_BUCKET = (process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || process.env.SUPABASE_JD_BUCKET || 'job-descriptions').trim();
 
 const router = express.Router();
 
@@ -38,7 +39,7 @@ function okContentType(filename) {
  * Side effects:
  *  - Uploads JD file to JD_BUCKET
  *  - Parses text (pdf/docx)
- *  - Updates role: job_description_url, description
+ *  - Updates role: job_description_url, job_description_text
  *  - (NEW) Conditionally enriches rubric/KB if role has neither rubric nor KB yet
  * Returns: { ok, role, parsed_text_preview }
  */
@@ -49,8 +50,8 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
     if (!client_id) return res.status(400).json({ error: 'Missing client_id' });
     if (!role_id) return res.status(400).json({ error: 'Missing role_id' });
 
-    // Scope check: withClientScope added by app.js sets req.clientIds
-    const scopedIds = Array.isArray(req.clientIds) ? req.clientIds : [];
+    // Scope check: withClientScope added by app.js sets req.client_memberships
+    const scopedIds = Array.isArray(req.client_memberships) ? req.client_memberships : [];
     if (!scopedIds.includes(client_id)) return res.status(403).json({ error: 'Forbidden' });
 
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
@@ -72,7 +73,7 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
 
     const job_description_url = `${JD_BUCKET}/${objectKey}`;
 
-    // 2) Parse JD text to populate roles.description (best-effort)
+    // 2) Parse JD text to populate roles.job_description_text (best-effort)
     let parsedText = '';
     try {
       parsedText = await parseBufferToText(buffer, contentType, originalname);
@@ -81,14 +82,18 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
     }
 
     const updates = { job_description_url };
-    if (parsedText) updates.description = parsedText.slice(0, 15000);
+    if (parsedText) {
+      const descriptionExcerpt = parsedText.replace(/\s+/g, ' ').trim().slice(0, 400);
+      updates.job_description_text = parsedText;
+      updates.description = descriptionExcerpt || null;
+    }
 
-    // 3) Update role with JD path (+ optional description)
+    // 3) Update role with JD path (+ optional parsed JD text)
     let { data: updated, error: updErr } = await supabaseAdmin
       .from('roles')
       .update(updates)
       .eq('id', role_id)
-      .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
+      .select('id,title,client_id,slug_or_token,interview_type,job_description_url,job_description_text,description,rubric,kb_document_id,tavus_document_id,created_at')
       .single();
 
     if (updErr) {
@@ -108,7 +113,7 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
         // Re-fetch the role so FE gets fresh rubric/kb fields in the response
         const refetch = await supabaseAdmin
           .from('roles')
-          .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
+          .select('id,title,client_id,slug_or_token,interview_type,job_description_url,job_description_text,description,rubric,kb_document_id,tavus_document_id,created_at')
           .eq('id', role_id)
           .single();
         if (!refetch.error && refetch.data) {
@@ -116,7 +121,7 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
         }
       } catch (e) {
         console.error('[upload-jd] post-upload enrichment failed:', e?.message || e);
-        // Do not fail the upload response—JD is saved and description set.
+        // Do not fail the upload response—JD is saved and parsed text set.
       }
     }
 

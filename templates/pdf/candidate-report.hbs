@@ -3,103 +3,220 @@
 <head>
   <meta charset="utf-8" />
   <title>Candidate Report</title>
+
   <style>
-    html { font-size: 80%; } /* shrink global font sizes by ~20% */
-    /* brand from your PDFMonkey CSS */
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background:#252a34; color:#fff; padding:24px; }
-    .container { max-width: 800px; margin: 0 auto; }
-    .header { text-align:left; margin-bottom:48px; }
-    .header img { max-height: 96px; margin: 0 auto 48px; display:block; }
-    .header h2 { font-size: 28px; margin:0; color:#00cfc8; margin-bottom: 12px; }
+    html { font-size: 80%; }
 
-    .gauge-row { display:flex; gap:16px; margin:48px 0 24px; font-size: 125%; } /* keep score boxes at original size */
-    .card { background:#fff; border:2px solid #00cfc8; border-radius:12px; padding:14px; flex:1; color:#252a34; }
-    .label { font-size: 14px; margin: 0 0 6px; color:#252a34; }
-    .score-text { font-size: 20px; font-weight: 700; color:#00cfc8; margin: 0 0 8px; }
+    body {
+      font-family: Raleway, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      background: #ffffff;
+      color: #252a34;
+      padding: 24px;
+    }
 
-    /* reliable progress bar (replaces canvas gauge for server PDFs) */
-    .bar { width:100%; height:10px; background:#252a34; border-radius:6px; overflow:hidden; border:1px solid #00cfc8; }
-    .bar > span { display:block; height:100%; background:#00cfc8; width:0; }
-    .bar[data-pct] > span { width: attr(data-pct percentage); } /* not supported everywhere */
-    /* Use inline style for width on spans so Puppeteer picks it up 100% */
+    .container {
+      max-width: 820px;
+      margin: 0 auto;
+    }
 
-    .info { margin: 18px 0 20px; font-size: 15px; }
-    .info p { margin: 4px 0; }
+    .header {
+      margin-bottom: 36px;
+    }
 
-    .breakdown-section { margin-top: 18px; }
-    .breakdown-section h2 { color:#00cfc8; font-size:18px; margin: 0 0 6px; }
+    .header img {
+      max-height: 72px;
+      margin-bottom: 24px;
+      display: block;
+    }
 
-    .summary { margin-top:12px; background: rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.16); border-radius:10px; padding:12px; }
-    .muted { opacity: 0.85; }
-    .kv li { line-height: 1.35; }
-    .kv li strong { white-space: nowrap; }
-    .kv li { word-break: break-word; }
+    .header h2 {
+      font-size: 26px;
+      margin: 0 0 12px;
+    }
+
+    .header p {
+      margin: 4px 0;
+      font-size: 14px;
+    }
+
+    .gauge-row {
+      display: flex;
+      gap: 16px;
+      margin: 32px 0;
+    }
+
+    .card {
+      flex: 1;
+      background: #ffffff;
+      border: 2px solid #b58cff;
+      border-radius: 12px;
+      padding: 14px;
+    }
+
+    .label {
+      font-size: 13px;
+      margin-bottom: 6px;
+    }
+
+    .score-text {
+      font-size: 22px;
+      font-weight: 700;
+      color: #b58cff;
+      margin-bottom: 8px;
+    }
+
+    .bar {
+      width: 100%;
+      height: 10px;
+      background: #252a34;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    .bar span {
+      display: block;
+      height: 100%;
+      background: #b58cff;
+    }
+
+    .bar.unavailable {
+      background: #e2e2e8;
+    }
+
+    .section {
+      margin-top: 28px;
+    }
+
+    .section h3 {
+      font-size: 18px;
+      margin-bottom: 8px;
+    }
+
+    .kv {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+
+    .kv li {
+      margin-bottom: 6px;
+      line-height: 1.4;
+      word-break: break-word;
+    }
+
+    .kv strong {
+      white-space: nowrap;
+    }
+
+    .summary-box {
+      margin-top: 10px;
+      padding: 12px;
+      border: 1px solid #e2e2e8;
+      border-radius: 10px;
+      background: #fafafa;
+    }
+
+    .muted {
+      opacity: 0.75;
+      font-size: 13px;
+    }
   </style>
 </head>
+
 <body>
   <div class="container">
+
     <div class="header">
-      <img src="https://i.imgur.com/Xb3LdBB.png" alt="AlphaSource Logo" />
+      {{#if logo_src}}<img src="{{logo_src}}" alt="AlphaSource Logo" />{{/if}}
       <h2>Candidate Report</h2>
       <p><strong>Name:</strong> {{name}}</p>
       <p><strong>Email:</strong> {{email}}</p>
+      <p><strong>Company:</strong> {{company_name}}</p>
+      <p><strong>Role:</strong> {{role_name}}</p>
     </div>
 
     <div class="gauge-row">
       <div class="card">
-        <p class="label">Resume Score</p>
-        <div class="score-text">{{resume_score}}%</div>
-        <div class="bar"><span style="width: {{resume_score}}%;"></span></div>
+        <div class="label">Resume Score</div>
+        <div class="score-text">{{scoreText resume_score}}</div>
+        <div class="bar {{#unless (hasScore resume_score)}}unavailable{{/unless}}">
+          {{#if (hasScore resume_score)}}<span style="width: {{scoreBarWidth resume_score}}%;"></span>{{/if}}
+        </div>
       </div>
+
       <div class="card">
-        <p class="label">Interview Score</p>
-        <div class="score-text">{{interview_score}}%</div>
-        <div class="bar"><span style="width: {{interview_score}}%;"></span></div>
+        <div class="label">Interview Score</div>
+        <div class="score-text">{{scoreText interview_score}}</div>
+        <div class="bar {{#unless (hasScore interview_score)}}unavailable{{/unless}}">
+          {{#if (hasScore interview_score)}}<span style="width: {{scoreBarWidth interview_score}}%;"></span>{{/if}}
+        </div>
       </div>
+
       <div class="card">
-        <p class="label">Overall Score</p>
-        <div class="score-text">{{overall_score}}%</div>
-        <div class="bar"><span style="width: {{overall_score}}%;"></span></div>
+        <div class="label">Overall Score</div>
+        <div class="score-text">{{scoreText overall_score}}</div>
+        <div class="bar {{#unless (hasScore overall_score)}}unavailable{{/unless}}">
+          {{#if (hasScore overall_score)}}<span style="width: {{scoreBarWidth overall_score}}%;"></span>{{/if}}
+        </div>
       </div>
     </div>
 
-
-
-    <div class="breakdown-section">
-      <h2>Resume Analysis</h2>
+    <div class="section">
+      <h3>Resume Analysis</h3>
       <ul class="kv">
-        <li><strong>Experience:</strong> {{resume_breakdown.experience}}%</li>
-        <li><strong>Skills:</strong> {{resume_breakdown.skills}}%</li>
-        <li><strong>Education:</strong> {{resume_breakdown.education}}%</li>
-        <li><strong>Summary:</strong>
-          {{#if resume_breakdown.summary}}
-            {{resume_breakdown.summary}}
-          {{else}}
-            Summary not available
-          {{/if}}
-        </li>
+        <li><strong>Experience:</strong> {{scoreText resume_breakdown.experience}}</li>
+        <li><strong>Skills:</strong> {{scoreText resume_breakdown.skills}}</li>
+        <li><strong>Education:</strong> {{scoreText resume_breakdown.education}}</li>
       </ul>
+
+      <div class="summary-box">
+        {{#if resume_summary}}
+          {{resume_summary}}
+        {{else}}
+          <span class="muted">Summary not available.</span>
+        {{/if}}
+      </div>
     </div>
 
-    <div class="breakdown-section">
-      <h2>Interview Analysis</h2>
+    <div class="section">
+      <h3>Interview Analysis</h3>
       <ul class="kv">
-        <li><strong>Confidence:</strong> {{interview_breakdown.confidence}}%</li>
-        <li><strong>Clarity:</strong> {{interview_breakdown.clarity}}%</li>
-        <li><strong>Body Language:</strong> {{interview_breakdown.body_language}}%</li>
-        <li><strong>Summary:</strong>
-          {{#if interview_breakdown.summary}}
-            {{interview_breakdown.summary}}
-          {{else}}
-            {{#if analysis}}
-              {{analysis}}
-            {{else}}
-              Summary not available
-            {{/if}}
-          {{/if}}
-        </li>
+        <li><strong>Confidence:</strong> {{scoreText interview_breakdown.confidence}}</li>
+        <li><strong>Clarity:</strong> {{scoreText interview_breakdown.clarity}}</li>
+        <li><strong>Engagement:</strong> {{scoreText interview_breakdown.engagement}}</li>
+        <li><strong>Evidence strength:</strong> {{scoreText interview_breakdown.evidence_strength}}</li>
+        <li><strong>AI-aided interview risk:</strong> {{interview_breakdown.ai_aided_risk}}</li>
+        {{#if interview_breakdown.ai_aided_risk_reason}}
+          <li><strong>Risk note:</strong> {{interview_breakdown.ai_aided_risk_reason}}</li>
+        {{/if}}
       </ul>
+
+      <div class="summary-box">
+        {{#if interview_summary}}
+          {{interview_summary}}
+        {{else}}
+          {{#if analysis.summary}}
+            {{analysis.summary}}
+          {{else}}
+            <span class="muted">Summary not available.</span>
+          {{/if}}
+        {{/if}}
+      </div>
     </div>
+
+    <div class="section">
+      <h3>Unanswered Candidate Questions</h3>
+      {{#if unanswered_candidate_questions.length}}
+        <ul class="kv">
+          {{#each unanswered_candidate_questions}}
+            <li>{{this}}</li>
+          {{/each}}
+        </ul>
+      {{else}}
+        <p class="muted">None reported.</p>
+      {{/if}}
+    </div>
+
   </div>
 </body>
 </html>

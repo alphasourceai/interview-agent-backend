@@ -4,6 +4,7 @@ const OpenAI = require('openai')
 const { randomUUID } = require('crypto')
 const path = require('path')
 const { parseBufferToText } = require('./utils/jdParser')
+const { ensureTavusDocumentForRole } = require('./lib/tavusDocuments')
 
 // Create internal clients with SR key (server-side only)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
@@ -84,6 +85,34 @@ Return ONLY valid JSON. Shape:
 Interview Type: ${role.interview_type || 'BASIC'}
 Role Title: ${role.title}
 
+Question requirements:
+- Every question must be open-ended and designed to elicit a substantive response.
+- Never generate yes/no questions or other closed-ended prompts.
+- Prefer formats like: "Tell me about...", "Walk me through...", "Describe a time when...", "How have you..."
+- Ground questions in the JD and Manual Questions.
+
+Interview-type guidance:
+- BASIC: short screening style; focus on core fit, relevant experience, motivation, and communication; lighter depth; use a smaller set of questions; target about 5-7 questions.
+- DETAILED: deeper behavioral and situational coverage; leadership, ownership, judgment, collaboration, problem-solving, and complexity; target about 7-10 questions.
+- TECHNICAL: skill-heavy and scenario-based; tools/processes/technical reasoning depth; require approach, tradeoffs, execution, and troubleshooting detail; target about 7-10 questions.
+
+Manual-question handling:
+- If Manual Questions are provided, incorporate them into the final rubric.
+- You may lightly clean wording for clarity, but preserve original intent.
+- Do not drop manual questions unless they are duplicative, closed-ended, or clearly low quality.
+- If adapted, convert them into stronger open-ended versions.
+
+Ordering:
+- Start with broad/core fit questions.
+- Then move into role-specific depth.
+- End with the most specialized, technical, or high-judgment questions.
+
+Avoid:
+- duplicate questions
+- overly generic filler questions
+- questions that can be answered with yes/no
+- questions unrelated to the JD or Manual Questions
+
 Job Description (may be empty):
 ${jdText || 'N/A'}
 
@@ -95,7 +124,7 @@ ${role.manual_questions || 'None'}
   let rubricObj = null
   try {
     const resp = await openai.chat.completions.create({
-      model: 'gpt-4',
+      model: process.env.OPENAI_RUBRIC_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini',
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.2
     })
@@ -114,11 +143,12 @@ ${role.manual_questions || 'None'}
     rubricObj = { questions: fallbackQ.map(t => ({ text: t, category: 'auto' })) }
   }
 
-  // 5) Write rubric to roles.rubric + description (first chunk of JD text)
-  const description = jdText ? jdText.slice(0, 2000) : null
+  // 5) Write rubric to roles.rubric + canonical parsed JD text
+  const descriptionExcerpt = jdText ? jdText.replace(/\s+/g, ' ').trim().slice(0, 400) : ''
   await supabase.from('roles').update({
     rubric: rubricObj,
-    ...(description ? { description } : {})
+    rubric_questions: Array.isArray(rubricObj?.questions) ? rubricObj.questions : [],
+    ...(jdText ? { job_description_text: jdText, description: descriptionExcerpt || null } : {})
   }).eq('id', roleId)
 
   // 6) Create + upload KB JSON (kbs/<uuid>.json), store <uuid> in roles.kb_document_id
@@ -148,7 +178,19 @@ ${role.manual_questions || 'None'}
     .eq('id', roleId)
   if (updErr) throw new Error(`kb_id_update_failed: ${updErr.message}`)
 
+  try {
+    await ensureTavusDocumentForRole(
+      { id: roleId, title: role.title, kb_document_id: kbId },
+      { supabase, rubric: rubricObj }
+    )
+  } catch (tavusErr) {
+    console.error(
+      `[generateRubric] tavus_document_creation_failed role=${roleId} kb_document_id=${kbId}:`,
+      tavusErr?.message || tavusErr
+    )
+  }
+
   return { role_id: roleId, kb_document_id: kbId }
 }
 
-module.exports = { generateRubricAndKBForRole }
+module.exports = { generateRubricAndKBForRole, makeKBFromRubric }

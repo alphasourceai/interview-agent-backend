@@ -1,19 +1,8 @@
 // src/middleware/auth.js
 const jwt = require('jsonwebtoken');
-const { createClient } = require('@supabase/supabase-js');
+const { supabaseAdmin } = require('../lib/supabaseClient');
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
-
-if (!SUPABASE_URL || !SERVICE_ROLE) {
-  // Don’t crash process here; some scripts import this file.
-  // Instead, throw lazily if we actually try to use the client.
-  console.warn('[auth] SUPABASE_URL / SERVICE_ROLE not set at require-time.');
-}
-
-const supabase = SUPABASE_URL && SERVICE_ROLE
-  ? createClient(SUPABASE_URL, SERVICE_ROLE, { auth: { persistSession: false } })
-  : null;
+const supabase = supabaseAdmin;
 
 /**
  * Extract a bearer token from:
@@ -36,12 +25,39 @@ function getToken(req) {
   return null;
 }
 
+async function lookupGlobalAdmin(userEmail, userId) {
+  if (!supabase) return false;
+  try {
+    if (userEmail) {
+      const { data, error } = await supabase
+        .from('admins')
+        .select('id')
+        .eq('email', userEmail)
+        .eq('is_active', true)
+        .maybeSingle();
+      if (!error && data) return true;
+    }
+    if (userId) {
+      const { data, error } = await supabase
+        .from('admins')
+        .select('id')
+        .eq('user_id', userId)
+        .eq('is_active', true)
+        .maybeSingle();
+      if (!error && data) return true;
+    }
+  } catch (err) {
+    console.error('[requireAuth] admin lookup error', err);
+  }
+  return false;
+}
+
 /**
  * Auth middleware
  * - Decodes the Supabase JWT (no verification here; Supabase will verify on DB calls via RLS)
  * - Attaches req.user and req.userToken
  */
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
   try {
     const token = getToken(req);
     if (!token) return res.status(401).json({ error: 'Missing bearer token' });
@@ -53,6 +69,8 @@ function requireAuth(req, res, next) {
 
     req.user = { id: sub, email: decoded.email || decoded.user_email || null };
     req.userToken = token;
+    req.isGlobalAdmin = await lookupGlobalAdmin(req.user.email, req.user.id);
+    req.isAdmin = req.isGlobalAdmin;
     return next();
   } catch (err) {
     console.error('[requireAuth] error', err);
@@ -79,6 +97,49 @@ async function withClientScope(req, res, next) {
 
     const explicit = req.query.client_id || req.body?.client_id || null;
 
+    if (req.isGlobalAdmin === true) {
+      if (explicit) {
+        req.client_memberships = [explicit];
+        req.clientIds = [explicit];
+        req.memberships = [{ client_id: explicit, role: 'admin', name: null }];
+        req.clientScope = { user: req.user, memberships: req.memberships, defaultClientId: explicit, default_client_id: explicit };
+        req.client = { id: explicit, name: null };
+        req.membership = { role: 'admin' };
+        return next();
+      }
+
+      const { data: clients, error: clientsErr } = await supabase
+        .from('clients')
+        .select('id, name')
+        .limit(5000);
+      if (clientsErr) {
+        console.error('[withClientScope] admin clients lookup error', clientsErr);
+        req.client_memberships = [];
+        req.clientIds = [];
+        req.memberships = [];
+        req.clientScope = { user: req.user, memberships: [] };
+        return next();
+      }
+
+      const memberships = (clients || []).map(c => ({
+        client_id: c.id,
+        role: 'admin',
+        name: c.name || null,
+      }));
+      const ids = memberships.map(m => m.client_id).filter(Boolean);
+      req.client_memberships = ids;
+      req.clientIds = ids;
+      req.memberships = memberships;
+      const defaultClientId = ids.length ? ids[0] : null;
+      req.clientScope = { user: req.user, memberships, defaultClientId, default_client_id: defaultClientId };
+      if (defaultClientId) {
+        const m = memberships.find(x => x.client_id === defaultClientId) || null;
+        req.client = { id: defaultClientId, name: m?.name || null };
+        req.membership = { role: 'admin' };
+      }
+      return next();
+    }
+
     // Try modern column first
     let rows = [];
     let { data, error } = await supabase
@@ -102,6 +163,8 @@ async function withClientScope(req, res, next) {
       console.error('[withClientScope] lookup error', error);
       // Don’t block every request due to a read failure; attach empty context
       req.client_memberships = [];
+      req.clientIds = [];
+      req.memberships = [];
       req.clientScope = { user: req.user, memberships: [] };
       return next();
     }
@@ -115,12 +178,19 @@ async function withClientScope(req, res, next) {
 
     const ids = memberships.map(m => m.client_id).filter(Boolean);
     req.client_memberships = ids;
+    req.clientIds = ids;
+    req.memberships = memberships;
 
     // Decide default
-    let defaultClientId = explicit || (ids.length ? ids[0] : null);
+    let defaultClientId = null;
+    if (explicit && ids.includes(explicit)) {
+      defaultClientId = explicit;
+    } else if (ids.length) {
+      defaultClientId = ids[0];
+    }
 
     // Attach helpers for routes that expect them
-    req.clientScope = { user: req.user, memberships, defaultClientId };
+    req.clientScope = { user: req.user, memberships, defaultClientId, default_client_id: defaultClientId };
     if (defaultClientId) {
       const m = memberships.find(x => x.client_id === defaultClientId) || memberships[0] || null;
       req.client = { id: defaultClientId, name: m?.name || null };
@@ -133,6 +203,8 @@ async function withClientScope(req, res, next) {
   } catch (err) {
     console.error('[withClientScope] error', err);
     req.client_memberships = [];
+    req.clientIds = [];
+    req.memberships = [];
     req.clientScope = { user: req.user, memberships: [] };
     return next();
   }

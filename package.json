@@ -40,6 +40,7 @@
     "openai": "^5.23.1",
     "pdf-parse": "^1.1.1",
     "puppeteer-core": "^24.1.1",
+    "stripe": "^16.6.0",
     "react-router-dom": "^7.7.1",
     "resend": "^4.8.0",
     "supabase": "^2.33.9",

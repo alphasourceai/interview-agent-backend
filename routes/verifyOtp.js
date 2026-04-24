@@ -1,8 +1,44 @@
 // routes/verifyOtp.js
 const express = require("express");
-const { supabase } = require("../src/lib/supabaseClient");
+const Sentry = require('@sentry/node');
+const { supabase, supabaseAdmin } = require("../src/lib/supabaseClient");
+const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
+const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
 
 const router = express.Router();
+const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
+const BILLING_ENFORCED = BILLING_MODE === 'enforce';
+const VERIFY_OTP_RATE_WINDOW_MS = 60 * 60 * 1000;
+const VERIFY_OTP_RATE_MAX = 20;
+
+async function verifyOtpRateLimit(req, res, next) {
+  try {
+    const result = await checkAndIncrementRateLimit({
+      routeName: 'verify_otp',
+      subjectKey: getRequestSubjectKey(req),
+      windowMs: VERIFY_OTP_RATE_WINDOW_MS,
+      maxCount: VERIFY_OTP_RATE_MAX
+    });
+    if (!result.allowed) {
+      return res.status(429).json({
+        error: 'rate_limited',
+        code: 'RATE_LIMIT_EXCEEDED',
+        detail: 'Too many requests. Please try again later.'
+      });
+    }
+  } catch (error) {
+    console.error('[rate-limit] verify otp check failed', {
+      request_id: req.request_id || null,
+      error: error?.message || error
+    });
+    return res.status(503).json({
+      error: 'rate_limit_unavailable',
+      code: 'RATE_LIMIT_UNAVAILABLE',
+      detail: 'Request protection is temporarily unavailable. Please try again shortly.'
+    });
+  }
+  return next();
+}
 
 /**
  * POST /api/candidate/verify-otp
@@ -10,8 +46,29 @@ const router = express.Router();
  * - email and 6-digit code are required
  * - candidate_id/role_id remove ambiguity if the same email is used across roles
  */
-router.post("/", async (req, res) => {
+router.post("/", verifyOtpRateLimit, async (req, res) => {
+  const request_id = req.request_id || null;
+  let sentryCandidateId = null;
+  let sentryRoleId = null;
+  let sentryClientId = null;
+  Sentry.setTag('route_name', 'verify_otp');
+  Sentry.setTag('surface', 'backend');
+  if (request_id) Sentry.setTag('request_id', String(request_id));
   try {
+    const verificationFailed = (reason, details = {}) => {
+      console.warn('[verify-otp] verification_failed', {
+        request_id,
+        reason,
+        ...details
+      });
+      const payload = {
+        error: 'verification_failed',
+        code: 'VERIFICATION_FAILED',
+        detail: 'Verification failed. Please check your code and try again.'
+      };
+      if (request_id) payload.request_id = request_id;
+      return res.status(400).json(payload);
+    };
     const email = String(req.body?.email || "").trim().toLowerCase();
     const code  = String(req.body?.code  || "").trim();
     const candidateIdIn = req.body?.candidate_id ? String(req.body.candidate_id).trim() : "";
@@ -26,8 +83,25 @@ router.post("/", async (req, res) => {
     if (candidateIdIn) {
       ({ data: cand, error: cErr } = await supabase
         .from("candidates")
-        .select("id, role_id")
+        .select("id, role_id, email")
         .eq("id", candidateIdIn)
+        .single());
+      if (!cErr && cand) {
+        const candidateEmail = String(cand.email || "").trim().toLowerCase();
+        if (candidateEmail !== email) {
+          return verificationFailed('candidate_email_mismatch', {
+            candidate_id: candidateIdIn || null
+          });
+        }
+      }
+    } else if (roleIdIn) {
+      ({ data: cand, error: cErr } = await supabase
+        .from("candidates")
+        .select("id, role_id")
+        .eq("email", email)
+        .eq("role_id", roleIdIn)
+        .order("created_at", { ascending: false })
+        .limit(1)
         .single());
     } else {
       ({ data: cand, error: cErr } = await supabase
@@ -38,9 +112,115 @@ router.post("/", async (req, res) => {
         .limit(1)
         .single());
     }
-    if (cErr || !cand) return res.status(404).json({ error: "Candidate not found." });
+    if (cErr || !cand) {
+      return verificationFailed('candidate_not_found', {
+        candidate_id: candidateIdIn || null,
+        role_id: roleIdIn || null
+      });
+    }
+    sentryCandidateId = cand.id || null;
+    if (sentryCandidateId) Sentry.setTag('candidate_id', String(sentryCandidateId));
+    Sentry.addBreadcrumb({
+      category: 'verify_otp',
+      message: 'candidate loaded',
+      level: 'info',
+      data: { candidate_id: cand.id || null }
+    });
 
-    const roleId = roleIdIn || cand.role_id;
+    if (roleIdIn && String(cand.role_id || "") !== roleIdIn) {
+      return verificationFailed('candidate_role_mismatch', {
+        candidate_id: cand.id || null,
+        role_id: roleIdIn || null
+      });
+    }
+
+    const roleId = String(cand.role_id || "");
+    sentryRoleId = roleId || null;
+    if (sentryRoleId) Sentry.setTag('role_id', String(sentryRoleId));
+
+    const { data: role, error: roleErr } = await supabase
+      .from('roles')
+      .select('id,client_id')
+      .eq('id', roleId)
+      .maybeSingle();
+    if (roleErr || !role) {
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'ROLE_LOOKUP_FAILED',
+        detail: roleErr?.message || 'Failed to load role record',
+        hint: roleErr?.hint || null,
+          request_id
+        });
+    }
+    sentryClientId = role.client_id || null;
+    if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
+    Sentry.addBreadcrumb({
+      category: 'verify_otp',
+      message: 'role loaded',
+      level: 'info',
+      data: { role_id: roleId, client_id: role.client_id || null }
+    });
+
+    if (BILLING_ENFORCED && role.client_id) {
+      const { data: client, error: clientErr } = await supabase
+        .from('clients')
+        .select('id,billing_status,manual_active_override,access_override_mode,candidate_assistance_contact')
+        .eq('id', role.client_id)
+        .maybeSingle();
+      if (clientErr || !client) {
+        return res.status(500).json({
+          error: 'server_error',
+          code: 'CLIENT_LOOKUP_FAILED',
+          detail: clientErr?.message || 'Failed to load client record',
+          hint: clientErr?.hint || null,
+          request_id
+        });
+      }
+      Sentry.addBreadcrumb({
+        category: 'verify_otp',
+        message: 'client loaded',
+        level: 'info',
+        data: { client_id: role.client_id || null }
+      });
+      const accessOverrideMode = String(client.access_override_mode || 'inherit').toLowerCase();
+      if (accessOverrideMode === 'force_inactive' || (accessOverrideMode !== 'force_active' && client.billing_status !== 'active')) {
+        return res.status(403).json({
+          error: 'forbidden',
+          code: 'CLIENT_INACTIVE',
+          detail: 'Interviewing service is currently inactive for this employer.',
+          hint: client.candidate_assistance_contact || 'Please contact the employer.',
+          request_id
+        });
+      }
+    }
+
+    const availability = await getRoleInterviewAvailability({
+      db: supabaseAdmin,
+      roleId,
+      clientId: role.client_id || null
+    });
+    await syncRoleInterviewLimitNotification({
+      db: supabaseAdmin,
+      roleId,
+      clientId: role.client_id || null,
+      remainingInterviews: availability.remaining_interviews,
+      roleTitle: ''
+    });
+    if (availability.remaining_interviews != null && availability.remaining_interviews <= 0) {
+      Sentry.addBreadcrumb({
+        category: 'verify_otp',
+        message: 'interview limit reached',
+        level: 'info',
+        data: { role_id: roleId, client_id: role.client_id || null }
+      });
+      return res.status(403).json({
+        error: 'forbidden',
+        code: 'interview_limit_reached',
+        detail: 'This role has no interviews remaining under the current plan.',
+        hint: null,
+        request_id
+      });
+    }
 
     // 2) Newest OTP for (candidate_email, role_id)
     const { data: token, error: tErr } = await supabase
@@ -51,15 +231,39 @@ router.post("/", async (req, res) => {
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
-    if (tErr || !token) return res.status(400).json({ error: "OTP not found." });
+    if (tErr || !token) {
+      return verificationFailed('otp_not_found', {
+        candidate_id: cand.id || null,
+        role_id: roleId
+      });
+    }
+    Sentry.addBreadcrumb({
+      category: 'verify_otp',
+      message: 'otp token loaded',
+      level: 'info',
+      data: { otp_token_id: token.id || null, candidate_id: cand.id || null, role_id: roleId }
+    });
 
     // 3) Validate
     if (token.expires_at && new Date(token.expires_at) <= new Date()) {
-      return res.status(400).json({ error: "OTP has expired. Please try again." });
+      return verificationFailed('otp_expired', {
+        candidate_id: cand.id || null,
+        role_id: roleId
+      });
     }
     const isUsed = String(token.used).toLowerCase() === "true"; // supports text/boolean
-    if (isUsed) return res.status(400).json({ error: "OTP already used. Please request a new one." });
-    if (String(token.code) !== code) return res.status(400).json({ error: "Invalid code." });
+    if (isUsed) {
+      return verificationFailed('otp_already_used', {
+        candidate_id: cand.id || null,
+        role_id: roleId
+      });
+    }
+    if (String(token.code) !== code) {
+      return verificationFailed('otp_invalid_code', {
+        candidate_id: cand.id || null,
+        role_id: roleId
+      });
+    }
 
     // 4) Mark OTP used (handle text/boolean schemas). Prefer update by id; confirm with read-back.
     const updatesToTry = [
@@ -122,6 +326,12 @@ router.post("/", async (req, res) => {
       .update({ status: "Verified", verified: true, otp_verified_at: new Date().toISOString() })
       .eq("id", cand.id);
     if (uCandErr) return res.status(500).json({ error: "Could not update verification status." });
+    Sentry.addBreadcrumb({
+      category: 'verify_otp',
+      message: 'otp verified',
+      level: 'info',
+      data: { candidate_id: cand.id || null, role_id: roleId }
+    });
 
     return res.status(200).json({
       message: "Verified",
@@ -131,7 +341,28 @@ router.post("/", async (req, res) => {
       email
     });
   } catch (e) {
-    console.error("verify-otp error:", e?.response?.data || e?.message || e);
+    console.error("verify-otp error", {
+      request_id,
+      message: e?.message || "Server error",
+      code: e?.code || null,
+      status: e?.response?.status || null
+    });
+    Sentry.captureException(e, {
+      tags: {
+        route_name: 'verify_otp',
+        surface: 'backend',
+        request_id: request_id || undefined,
+        candidate_id: sentryCandidateId || undefined,
+        role_id: sentryRoleId || undefined,
+        client_id: sentryClientId || undefined
+      },
+      extra: {
+        request_id,
+        candidate_id: sentryCandidateId,
+        role_id: sentryRoleId,
+        client_id: sentryClientId
+      }
+    });
     return res.status(500).json({ error: e?.message || "Server error" });
   }
 });
