@@ -122,6 +122,7 @@ app.use(cors({
 }))
 
 app.use('/webhook/stripe', express.raw({ type: 'application/json' }), require('./routes/webhookStripe'))
+app.use('/webhook/sendgrid', express.json({ limit: '2mb' }), require('./routes/webhookSendgrid'))
 app.use('/webhook', require('./routes/webhook'))
 
 app.use(express.json({ limit: '10mb' }))
@@ -1966,6 +1967,18 @@ adminRouter.get('/audit/contract-processing-runs', requireAuth, requireAdmin, as
     .order('created_at', { ascending: false })
     .limit(25)
   if (error) return res.status(500).json({ error: 'list_contract_processing_runs_failed', detail: error.message })
+  return res.json({ items: data || [] })
+})
+
+adminRouter.get('/audit/email-delivery-events', requireAuth, requireAdmin, async (_req, res) => {
+  const { data, error } = await supabaseAdmin
+    .from('email_delivery_events')
+    .select('id,event_at,event_type,email,email_category,category,sg_event_id,sg_message_id,reason,status,response,attempt,is_time_sensitive,alert_sent_at,alert_error,sg_template_id,subject,from_email,created_at')
+    .eq('is_problem', true)
+    .order('event_at', { ascending: false })
+    .order('created_at', { ascending: false })
+    .limit(200)
+  if (error) return res.status(500).json({ error: 'list_email_delivery_events_failed', detail: error.message })
   return res.json({ items: data || [] })
 })
 
