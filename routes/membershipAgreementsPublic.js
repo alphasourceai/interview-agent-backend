@@ -728,7 +728,13 @@ router.post('/checkout-session', async (req, res) => {
       });
     }
 
-    const { session, fallbackSession, checkoutClientSecret } = await createSubscriptionCheckoutSession({
+    const {
+      session,
+      fallbackSession,
+      checkoutClientSecret,
+      replacesStripeSubscriptionId,
+      replacementPolicy
+    } = await createSubscriptionCheckoutSession({
       clientId,
       planTier,
       billingInterval,
@@ -760,14 +766,20 @@ router.post('/checkout-session', async (req, res) => {
     }
 
     const nowIso = new Date().toISOString();
+    const checkoutUpdate = {
+      checkout_status: 'pending_payment',
+      checkout_session_id: checkoutSessionId,
+      checkout_created_at: nowIso,
+      updated_at: nowIso
+    };
+    if (replacesStripeSubscriptionId) {
+      checkoutUpdate.replaces_stripe_subscription_id = replacesStripeSubscriptionId;
+      checkoutUpdate.replacement_policy = replacementPolicy || 'immediate_cancel';
+      checkoutUpdate.replacement_error = null;
+    }
     const { error: checkoutStateErr } = await supabaseAdmin
       .from('membership_agreements')
-      .update({
-        checkout_status: 'pending_payment',
-        checkout_session_id: checkoutSessionId,
-        checkout_created_at: nowIso,
-        updated_at: nowIso
-      })
+      .update(checkoutUpdate)
       .eq('id', agreement.id)
       .eq('status', 'signed')
       .eq('is_current', true);

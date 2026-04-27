@@ -183,6 +183,8 @@ async function createSubscriptionCheckoutSession({
     } catch (_) {}
   }
 
+  let replacesStripeSubscriptionId = null
+  let replacementMetadata = null
   if (['admin_subscription_checkout', 'agreement_checkout'].includes(normalizedMetadataSource)) {
     const existingSubscriptions = await stripe.subscriptions.list({
       customer: resolvedStripeCustomerId,
@@ -193,7 +195,16 @@ async function createSubscriptionCheckoutSession({
       return ['active', 'trialing', 'past_due', 'incomplete'].includes(String(subscription?.status || '').trim().toLowerCase())
     })
     if (blockingSubscription) {
-      throw makeError(409, 'client_subscription_already_exists', 'Client already has an active or pending Stripe subscription.')
+      if (normalizedMetadataSource === 'admin_subscription_checkout') {
+        throw makeError(409, 'client_subscription_already_exists', 'Client already has an active or pending Stripe subscription.')
+      }
+      replacesStripeSubscriptionId = String(blockingSubscription?.id || '').trim() || null
+      if (replacesStripeSubscriptionId) {
+        replacementMetadata = {
+          replaces_stripe_subscription_id: replacesStripeSubscriptionId,
+          replacement_policy: 'immediate_cancel'
+        }
+      }
     }
   }
 
@@ -233,7 +244,8 @@ async function createSubscriptionCheckoutSession({
         plan_tier: 'enterprise',
         billing_interval: normalizedBillingInterval,
         ...enterpriseCheckoutMetadata,
-        ...normalizeMetadataObject(metadata)
+        ...normalizeMetadataObject(metadata),
+        ...normalizeMetadataObject(replacementMetadata || {})
       }
     })
     lineItems.push({ price: enterprisePrice.id, quantity: 1 })
@@ -275,7 +287,8 @@ async function createSubscriptionCheckoutSession({
     plan_tier: normalizedPlanTier,
     billing_interval: normalizedBillingInterval,
     ...normalizeMetadataObject(enterpriseCheckoutMetadata || {}),
-    ...normalizeMetadataObject(metadata)
+    ...normalizeMetadataObject(metadata),
+    ...normalizeMetadataObject(replacementMetadata || {})
   }
 
   const checkoutBasePayload = {
@@ -335,7 +348,9 @@ async function createSubscriptionCheckoutSession({
     checkoutClientSecret,
     client,
     clientEmail,
-    checkoutMetadata
+    checkoutMetadata,
+    replacesStripeSubscriptionId,
+    replacementPolicy: replacesStripeSubscriptionId ? 'immediate_cancel' : null
   }
 }
 
