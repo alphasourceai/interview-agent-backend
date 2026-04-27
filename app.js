@@ -3882,6 +3882,12 @@ app.get('/checkout/subscription-success', async (req, res) => {
     const Stripe = require('stripe')
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
     const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['subscription'] })
+    const pickStripeId = (value) => {
+      if (!value) return null
+      if (typeof value === 'string') return value
+      if (typeof value === 'object' && typeof value.id === 'string') return value.id
+      return null
+    }
     const metadata = session?.metadata && typeof session.metadata === 'object' ? session.metadata : {}
     const metadataSource = String(metadata?.source || '').trim().toLowerCase()
     parsedMetadataSource = metadataSource
@@ -3893,7 +3899,13 @@ app.get('/checkout/subscription-success', async (req, res) => {
     const successUrl = makeAccountSuccessUrl(clientId, fallbackTab)
     const paymentStatus = String(session?.payment_status || '').toLowerCase()
     const subscriptionObj = session?.subscription && typeof session.subscription === 'object' ? session.subscription : null
+    const subscriptionMetadata = subscriptionObj?.metadata && typeof subscriptionObj.metadata === 'object' ? subscriptionObj.metadata : {}
     const subscriptionStatus = String(subscriptionObj?.status || '').toLowerCase()
+    const replacesStripeSubscriptionId = String(
+      metadata?.replaces_stripe_subscription_id ||
+      subscriptionMetadata?.replaces_stripe_subscription_id ||
+      ''
+    ).trim()
 
     console.log('subscription_checkout_success_entry:', {
       client_id: clientId || null,
@@ -4064,6 +4076,54 @@ app.get('/checkout/subscription-success', async (req, res) => {
         target: 'success_url'
       })
       return res.redirect(302, successUrl)
+    }
+
+    if (metadataSource === 'agreement_checkout' && metadataAgreementId && replacesStripeSubscriptionId) {
+      const newSubscriptionId = pickStripeId(subscriptionObj?.id)
+      const currentCustomerId = pickStripeId(subscriptionObj?.customer) || pickStripeId(session?.customer)
+      try {
+        if (!newSubscriptionId) throw new Error('replacement_new_subscription_missing')
+        if (!['active', 'trialing'].includes(subscriptionStatus)) throw new Error('replacement_new_subscription_not_active')
+        if (replacesStripeSubscriptionId === newSubscriptionId) throw new Error('replacement_subscription_matches_new_subscription')
+        if (!currentCustomerId) throw new Error('replacement_customer_missing')
+
+        const oldSubscription = await stripe.subscriptions.retrieve(replacesStripeSubscriptionId)
+        const oldCustomerId = pickStripeId(oldSubscription?.customer)
+        if (!oldCustomerId) throw new Error('replacement_old_customer_missing')
+        if (oldCustomerId !== currentCustomerId) throw new Error('replacement_customer_mismatch')
+
+        if (String(oldSubscription?.status || '').trim().toLowerCase() !== 'canceled') {
+          await stripe.subscriptions.cancel(replacesStripeSubscriptionId, {
+            invoice_now: false,
+            prorate: false
+          })
+        }
+
+        const { error: replacementUpdateErr } = await supabaseAdmin
+          .from('membership_agreements')
+          .update({
+            replaced_stripe_subscription_canceled_at: new Date().toISOString(),
+            replacement_error: null
+          })
+          .eq('id', metadataAgreementId)
+        if (replacementUpdateErr) throw new Error(replacementUpdateErr.message || 'replacement_state_update_failed')
+      } catch (replacementErr) {
+        const replacementError = String(replacementErr?.message || replacementErr || 'replacement_cancel_failed').slice(0, 500)
+        console.error('subscription_checkout_success_replacement_cancel_failed:', {
+          request_id,
+          agreement_id: metadataAgreementId,
+          client_id: client.id,
+          old_subscription_id: replacesStripeSubscriptionId,
+          new_subscription_id: newSubscriptionId || null,
+          error: replacementError
+        })
+        try {
+          await supabaseAdmin
+            .from('membership_agreements')
+            .update({ replacement_error: replacementError })
+            .eq('id', metadataAgreementId)
+        } catch (_) {}
+      }
     }
 
     const clientEmail = String(client.email || '').trim()
