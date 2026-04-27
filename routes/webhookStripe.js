@@ -272,6 +272,19 @@ function buildClientSubscriptionUpdatesFromStripe(subscription, options = {}) {
   return updates;
 }
 
+function shouldIgnoreStaleSubscriptionUpdate(client, incomingSubscriptionId, eventType) {
+  const currentSubscriptionId = String(client?.stripe_subscription_id || '').trim();
+  const subscriptionId = String(incomingSubscriptionId || '').trim();
+  if (!currentSubscriptionId || !subscriptionId || currentSubscriptionId === subscriptionId) return false;
+  console.log('stripe_webhook_subscription_stale_ignored', {
+    client_id: client?.id || null,
+    incoming_subscription_id: subscriptionId,
+    current_subscription_id: currentSubscriptionId,
+    event_type: eventType || null
+  });
+  return true;
+}
+
 async function markAgreementCheckoutPaid(agreementId, options = {}) {
   const normalizedAgreementId = String(agreementId || '').trim();
   if (!normalizedAgreementId) return;
@@ -353,16 +366,17 @@ router.post('/', async (req, res) => {
     ) {
       const customerId = pickId(eventObject?.customer);
       if (customerId) {
+        const incomingSubscriptionId = pickId(eventObject?.id) || pickId(eventObject?.subscription) || null;
         const { data: client, error: clientErr } = await supabaseAdmin
           .from('clients')
-          .select('id')
+          .select('id,stripe_subscription_id')
           .eq('stripe_customer_id', customerId)
           .maybeSingle();
         if (clientErr) throw new Error(clientErr.message || 'Client lookup failed');
-        if (client?.id) {
+        if (client?.id && !shouldIgnoreStaleSubscriptionUpdate(client, incomingSubscriptionId, event.type)) {
           const updates = buildClientSubscriptionUpdatesFromStripe(eventObject, {
             fallbackCustomerId: customerId,
-            fallbackSubscriptionId: pickId(eventObject?.id) || pickId(eventObject?.subscription) || null
+            fallbackSubscriptionId: incomingSubscriptionId
           });
           const { error: updateErr } = await supabaseAdmin
             .from('clients')
@@ -739,12 +753,12 @@ router.post('/', async (req, res) => {
       if (customerId && !isManagedSubscriptionInvoice) {
         const { data: client, error: clientErr } = await supabaseAdmin
           .from('clients')
-          .select('id')
+          .select('id,stripe_subscription_id')
           .eq('stripe_customer_id', customerId)
           .maybeSingle();
         if (clientErr) throw new Error(clientErr.message || 'Client lookup failed');
         if (client?.id) {
-          if (subscriptionId) {
+          if (subscriptionId && !shouldIgnoreStaleSubscriptionUpdate(client, subscriptionId, event.type)) {
             const subscription = await stripe.subscriptions.retrieve(subscriptionId);
             const updates = buildClientSubscriptionUpdatesFromStripe(subscription, {
               fallbackCustomerId: customerId,
