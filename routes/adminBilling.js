@@ -22,6 +22,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 const AGREEMENT_CLIENT_MODE_ATTACH = 'attach_existing_client';
 const AGREEMENT_CLIENT_MODE_ADD = 'add_new_client';
 const BILLING_INVOICE_SELECT = 'id,billing_customer_id,title,invoice_title,invoice_description,amount_total_cents,currency,status,hosted_invoice_url,stripe_invoice_id,created_at,customer_name,customer_email';
+const AGREEMENT_PENDING_SELECT = 'id,client_id,status,checkout_status,client_legal_name,admin_email,sent_at,opened_at,signed_at,checkout_created_at,checkout_session_id,is_current,voided_at,voided_by_email,void_reason,created_at';
 
 const bearer = (req) => {
   const h = req.headers['authorization'] || req.headers['Authorization'];
@@ -479,6 +480,240 @@ function formatDateForEmail(value) {
     timeZone: 'UTC'
   });
 }
+
+router.get('/agreements/pending', async (req, res) => {
+  const request_id = req.request_id || null;
+  const clientId = String(req.query?.client_id || '').trim();
+  if (!UUID_RE.test(clientId)) {
+    return res.status(400).json({
+      error: 'client_id_required',
+      code: 'client_id_required',
+      detail: 'A valid client_id is required.',
+      request_id
+    });
+  }
+
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('membership_agreements')
+      .select(AGREEMENT_PENDING_SELECT)
+      .eq('client_id', clientId)
+      .in('status', ['sent', 'signed'])
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    if (error) {
+      console.error('[billing/agreements/pending] query_failed', {
+        request_id,
+        client_id: clientId,
+        error: error.message,
+        code: error.code,
+        hint: error.hint
+      });
+      return res.status(500).json({
+        error: 'pending_agreement_lookup_failed',
+        code: error.code || 'pending_agreement_lookup_failed',
+        detail: error.message,
+        hint: error.hint,
+        request_id
+      });
+    }
+
+    const agreement = (data || []).find((row) => {
+      const status = String(row?.status || '').trim().toLowerCase();
+      const checkoutStatus = String(row?.checkout_status || '').trim().toLowerCase();
+      if (status === 'sent') return true;
+      return status === 'signed' && row?.is_current === true && (!checkoutStatus || checkoutStatus === 'pending_payment');
+    }) || null;
+
+    return res.json({ ok: true, agreement, request_id });
+  } catch (e) {
+    console.error('[billing/agreements/pending] unexpected', { request_id, client_id: clientId, error: e?.message || e });
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'server_error',
+      detail: e?.message || 'Server error',
+      request_id
+    });
+  }
+});
+
+router.post('/agreements/:id/void', async (req, res) => {
+  const request_id = req.request_id || null;
+  const agreementId = String(req.params?.id || '').trim();
+  if (!UUID_RE.test(agreementId)) {
+    return res.status(400).json({
+      error: 'agreement_id_required',
+      code: 'agreement_id_required',
+      detail: 'A valid agreement id is required.',
+      request_id
+    });
+  }
+
+  try {
+    const { data: agreement, error: lookupErr } = await supabaseAdmin
+      .from('membership_agreements')
+      .select('id,client_id,status,checkout_status,is_current')
+      .eq('id', agreementId)
+      .maybeSingle();
+
+    if (lookupErr) {
+      console.error('[billing/agreements/void] lookup_failed', {
+        request_id,
+        agreement_id: agreementId,
+        error: lookupErr.message,
+        code: lookupErr.code,
+        hint: lookupErr.hint
+      });
+      return res.status(500).json({
+        error: 'agreement_lookup_failed',
+        code: lookupErr.code || 'agreement_lookup_failed',
+        detail: lookupErr.message,
+        hint: lookupErr.hint,
+        request_id
+      });
+    }
+
+    if (!agreement) {
+      return res.status(404).json({
+        error: 'agreement_not_found',
+        code: 'agreement_not_found',
+        detail: 'Agreement was not found.',
+        request_id
+      });
+    }
+
+    const status = String(agreement.status || '').trim().toLowerCase();
+    const checkoutStatus = String(agreement.checkout_status || '').trim().toLowerCase();
+    const canVoid =
+      status === 'sent' ||
+      status === 'draft' ||
+      (status === 'signed' && (!checkoutStatus || checkoutStatus === 'pending_payment'));
+
+    if (!canVoid) {
+      return res.status(409).json({
+        error: checkoutStatus === 'paid' ? 'agreement_checkout_already_paid' : 'agreement_not_voidable',
+        code: checkoutStatus === 'paid' ? 'agreement_checkout_already_paid' : 'agreement_not_voidable',
+        detail: checkoutStatus === 'paid'
+          ? 'Paid agreements cannot be voided through this action.'
+          : 'Only sent unsigned or signed unpaid agreements can be voided.',
+        request_id
+      });
+    }
+
+    const nowIso = new Date().toISOString();
+    const voidedByEmail = String(req.user?.email || req.user?.id || '').trim() || null;
+    const voidReason = String(req.body?.void_reason || req.body?.reason || '').trim() || null;
+    const { data: voided, error: voidErr } = await supabaseAdmin
+      .from('membership_agreements')
+      .update({
+        status: 'voided',
+        is_current: false,
+        voided_at: nowIso,
+        voided_by_email: voidedByEmail,
+        void_reason: voidReason,
+        updated_at: nowIso
+      })
+      .eq('id', agreement.id)
+      .select(AGREEMENT_PENDING_SELECT)
+      .single();
+
+    if (voidErr) {
+      console.error('[billing/agreements/void] update_failed', {
+        request_id,
+        agreement_id: agreement.id,
+        error: voidErr.message,
+        code: voidErr.code,
+        hint: voidErr.hint
+      });
+      return res.status(500).json({
+        error: 'agreement_void_failed',
+        code: voidErr.code || 'agreement_void_failed',
+        detail: voidErr.message,
+        hint: voidErr.hint,
+        request_id
+      });
+    }
+
+    let restoredAgreement = null;
+    if (status === 'signed' && agreement.is_current === true && agreement.client_id) {
+      const { data: prior, error: priorErr } = await supabaseAdmin
+        .from('membership_agreements')
+        .select('id')
+        .eq('client_id', agreement.client_id)
+        .eq('status', 'superseded')
+        .eq('superseded_by_agreement_id', agreement.id)
+        .order('signed_at', { ascending: false })
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (priorErr) {
+        console.error('[billing/agreements/void] prior_lookup_failed', {
+          request_id,
+          agreement_id: agreement.id,
+          client_id: agreement.client_id,
+          error: priorErr.message,
+          code: priorErr.code,
+          hint: priorErr.hint
+        });
+        return res.status(500).json({
+          error: 'agreement_prior_restore_lookup_failed',
+          code: priorErr.code || 'agreement_prior_restore_lookup_failed',
+          detail: priorErr.message,
+          hint: priorErr.hint,
+          agreement: voided,
+          request_id
+        });
+      }
+
+      if (prior?.id) {
+        const { data: restored, error: restoreErr } = await supabaseAdmin
+          .from('membership_agreements')
+          .update({
+            status: 'signed',
+            is_current: true,
+            superseded_at: null,
+            superseded_by_agreement_id: null,
+            updated_at: nowIso
+          })
+          .eq('id', prior.id)
+          .select('id,client_id,status,is_current')
+          .single();
+
+        if (restoreErr) {
+          console.error('[billing/agreements/void] prior_restore_failed', {
+            request_id,
+            agreement_id: agreement.id,
+            prior_agreement_id: prior.id,
+            error: restoreErr.message,
+            code: restoreErr.code,
+            hint: restoreErr.hint
+          });
+          return res.status(500).json({
+            error: 'agreement_prior_restore_failed',
+            code: restoreErr.code || 'agreement_prior_restore_failed',
+            detail: restoreErr.message,
+            hint: restoreErr.hint,
+            agreement: voided,
+            request_id
+          });
+        }
+        restoredAgreement = restored || null;
+      }
+    }
+
+    return res.json({ ok: true, agreement: voided, restored_agreement: restoredAgreement, request_id });
+  } catch (e) {
+    console.error('[billing/agreements/void] unexpected', { request_id, agreement_id: agreementId, error: e?.message || e });
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'server_error',
+      detail: e?.message || 'Server error',
+      request_id
+    });
+  }
+});
 
 router.post('/agreements/preview-html', async (req, res) => {
   const request_id = req.request_id || null;
