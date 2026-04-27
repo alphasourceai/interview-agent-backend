@@ -352,16 +352,6 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       await supabase.from('candidates').update({ resume_url }).eq('id', candidate_id);
     }
 
-    // --- analyze resume (non-fatal) ---
-    try {
-      if (fileBuf) {
-        const summary = await analyzeResume(fileBuf, fileType, role, candidate_id);
-        await supabase.from('candidates').update({ analysis_summary: summary }).eq('id', candidate_id);
-      }
-    } catch (e) {
-      console.warn('resume analysis failed:', e?.message || e);
-    }
-
     // --- OTP hardening: invalidate old + create fresh ---
     const nowIso = new Date().toISOString();
     await supabase
@@ -420,12 +410,60 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
     }
 
     // success
-    return res.status(200).json({
+    res.status(200).json({
       message: 'If your information is accepted, a verification code will be sent shortly.',
       candidate_id,
       role_id: roleId,
       resume_url: resume_url || null,
     });
+
+    if (fileBuf) {
+      setImmediate(async () => {
+        console.log('[candidate-submit] background_resume_analysis_start', {
+          request_id,
+          candidate_id,
+          role_id: roleId,
+          email
+        });
+        try {
+          const summary = await analyzeResume(fileBuf, fileType, role, candidate_id);
+          await supabase.from('candidates').update({ analysis_summary: summary }).eq('id', candidate_id);
+          console.log('[candidate-submit] background_resume_analysis_success', {
+            request_id,
+            candidate_id,
+            role_id: roleId,
+            email
+          });
+        } catch (e) {
+          console.warn('[candidate-submit] background_resume_analysis_failed', {
+            request_id,
+            candidate_id,
+            role_id: roleId,
+            email,
+            error: e?.message || e
+          });
+          Sentry.captureException(e, {
+            tags: {
+              route_name: 'candidate_submit',
+              surface: 'backend',
+              task: 'background_resume_analysis',
+              request_id: request_id || undefined,
+              candidate_id: candidate_id || undefined,
+              role_id: roleId || undefined,
+              client_id: role?.client_id || undefined
+            },
+            extra: {
+              request_id,
+              candidate_id,
+              role_id: roleId,
+              client_id: role?.client_id || null,
+              email
+            }
+          });
+        }
+      });
+    }
+    return;
   } catch (err) {
     console.error('Error in /candidate/submit:', err);
     Sentry.captureException(err, {
