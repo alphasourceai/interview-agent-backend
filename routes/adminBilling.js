@@ -484,28 +484,32 @@ function formatDateForEmail(value) {
 router.get('/agreements/pending', async (req, res) => {
   const request_id = req.request_id || null;
   const clientId = String(req.query?.client_id || '').trim();
-  if (!UUID_RE.test(clientId)) {
+  const scopedToClient = clientId && clientId.toLowerCase() !== 'all';
+  if (scopedToClient && !UUID_RE.test(clientId)) {
     return res.status(400).json({
       error: 'client_id_required',
       code: 'client_id_required',
-      detail: 'A valid client_id is required.',
+      detail: 'client_id must be a valid client id or all.',
       request_id
     });
   }
 
   try {
-    const { data, error } = await supabaseAdmin
+    let query = supabaseAdmin
       .from('membership_agreements')
       .select(AGREEMENT_PENDING_SELECT)
-      .eq('client_id', clientId)
-      .in('status', ['sent', 'signed'])
+      .in('status', ['draft', 'sent', 'signed'])
       .order('created_at', { ascending: false })
-      .limit(20);
+      .limit(scopedToClient ? 20 : 100);
+
+    if (scopedToClient) query = query.eq('client_id', clientId);
+
+    const { data, error } = await query;
 
     if (error) {
       console.error('[billing/agreements/pending] query_failed', {
         request_id,
-        client_id: clientId,
+        client_id: scopedToClient ? clientId : 'all',
         error: error.message,
         code: error.code,
         hint: error.hint
@@ -519,16 +523,18 @@ router.get('/agreements/pending', async (req, res) => {
       });
     }
 
-    const agreement = (data || []).find((row) => {
+    const items = (data || []).filter((row) => {
       const status = String(row?.status || '').trim().toLowerCase();
       const checkoutStatus = String(row?.checkout_status || '').trim().toLowerCase();
-      if (status === 'sent') return true;
-      return status === 'signed' && row?.is_current === true && (!checkoutStatus || checkoutStatus === 'pending_payment');
-    }) || null;
+      if (checkoutStatus === 'paid') return false;
+      if (status === 'draft' || status === 'sent') return true;
+      return status === 'signed' && (!checkoutStatus || checkoutStatus === 'pending_payment');
+    });
+    const agreement = items[0] || null;
 
-    return res.json({ ok: true, agreement, request_id });
+    return res.json({ ok: true, agreement, items, request_id });
   } catch (e) {
-    console.error('[billing/agreements/pending] unexpected', { request_id, client_id: clientId, error: e?.message || e });
+    console.error('[billing/agreements/pending] unexpected', { request_id, client_id: scopedToClient ? clientId : 'all', error: e?.message || e });
     return res.status(500).json({
       error: 'server_error',
       code: 'server_error',
