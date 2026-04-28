@@ -1,15 +1,24 @@
 // routes/verifyOtp.js
 const express = require("express");
 const Sentry = require('@sentry/node');
+const sg = require('@sendgrid/mail');
 const { supabase, supabaseAdmin } = require("../src/lib/supabaseClient");
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
+const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
 
 const router = express.Router();
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
 const BILLING_ENFORCED = BILLING_MODE === 'enforce';
+const FROM_EMAIL = process.env.SENDGRID_FROM;
+const SENDGRID_KEY = process.env.SENDGRID_API_KEY;
+const APP_NAME = process.env.APP_NAME || 'Interview Agent';
+if (SENDGRID_KEY) sg.setApiKey(SENDGRID_KEY);
 const VERIFY_OTP_RATE_WINDOW_MS = 60 * 60 * 1000;
 const VERIFY_OTP_RATE_MAX = 20;
+const RESEND_OTP_RATE_WINDOW_MS = 60 * 60 * 1000;
+const RESEND_OTP_RATE_MAX = 5;
+const RESEND_OTP_MESSAGE = 'If your information is accepted, a new verification code will be sent shortly.';
 
 async function verifyOtpRateLimit(req, res, next) {
   try {
@@ -39,6 +48,239 @@ async function verifyOtpRateLimit(req, res, next) {
   }
   return next();
 }
+
+async function resendOtpRateLimit(req, res, next) {
+  try {
+    const result = await checkAndIncrementRateLimit({
+      routeName: 'resend_otp',
+      subjectKey: getRequestSubjectKey(req),
+      windowMs: RESEND_OTP_RATE_WINDOW_MS,
+      maxCount: RESEND_OTP_RATE_MAX
+    });
+    if (!result.allowed) {
+      return res.status(429).json({
+        error: 'rate_limited',
+        code: 'RATE_LIMIT_EXCEEDED',
+        detail: 'Too many requests. Please try again later.'
+      });
+    }
+  } catch (error) {
+    console.error('[rate-limit] resend otp check failed', {
+      request_id: req.request_id || null,
+      error: error?.message || error
+    });
+    return res.status(503).json({
+      error: 'rate_limit_unavailable',
+      code: 'RATE_LIMIT_UNAVAILABLE',
+      detail: 'Request protection is temporarily unavailable. Please try again shortly.'
+    });
+  }
+  return next();
+}
+
+function six() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function buildOtpEmailHtml(appName, otpCode) {
+  const safeAppName = escapeHtml(appName || 'Interview Agent');
+  const safeOtpCode = escapeHtml(otpCode || '');
+  return buildBrandedEmailShell({
+    title: 'Your verification code',
+    preheader: `Your verification code is ${safeOtpCode}. It expires in 10 minutes.`,
+    contentHtml: `
+      <p style="margin:0 0 14px;color:#C9D3FF;font-size:15px;line-height:1.6;">
+        Use this one-time code to continue your ${safeAppName} verification.
+      </p>
+      <p style="margin:0 0 16px;">
+        <span style="display:inline-block;background:#A78BFA;color:#0A1547;border:1px solid #CFCBFF;border-radius:10px;padding:10px 16px;font-size:22px;font-weight:800;letter-spacing:0.22em;">
+          ${safeOtpCode}
+        </span>
+      </p>
+      <p style="margin:0 0 16px;color:#C9D3FF;font-size:14px;line-height:1.55;">
+        This code expires in 10 minutes.
+      </p>
+    `
+  });
+}
+
+/**
+ * POST /api/candidate/verify-otp/resend
+ * Body: { email, candidate_id? } or { email, role_id }
+ */
+router.post("/resend", resendOtpRateLimit, async (req, res) => {
+  const request_id = req.request_id || null;
+  Sentry.setTag('route_name', 'resend_otp');
+  Sentry.setTag('surface', 'backend');
+  if (request_id) Sentry.setTag('request_id', String(request_id));
+  const generic = () => res.status(200).json({ message: RESEND_OTP_MESSAGE });
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const candidateIdIn = req.body?.candidate_id ? String(req.body.candidate_id).trim() : "";
+    const roleIdIn = req.body?.role_id ? String(req.body.role_id).trim() : "";
+    if (!email) {
+      return res.status(400).json({
+        error: 'bad_request',
+        code: 'EMAIL_REQUIRED',
+        detail: 'email is required',
+        request_id
+      });
+    }
+
+    let cand = null, cErr = null;
+    if (candidateIdIn) {
+      ({ data: cand, error: cErr } = await supabase
+        .from("candidates")
+        .select("id, role_id, email")
+        .eq("id", candidateIdIn)
+        .maybeSingle());
+      if (!cErr && cand && String(cand.email || "").trim().toLowerCase() !== email) return generic();
+    } else {
+      if (!roleIdIn) return generic();
+      ({ data: cand, error: cErr } = await supabase
+        .from("candidates")
+        .select("id, role_id, email")
+        .eq("email", email)
+        .eq("role_id", roleIdIn)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle());
+    }
+    if (cErr || !cand) return generic();
+
+    const candidate_id = cand.id;
+    const roleId = String(cand.role_id || roleIdIn || "");
+    if (!roleId) return generic();
+    Sentry.setTag('candidate_id', String(candidate_id));
+    Sentry.setTag('role_id', String(roleId));
+
+    const nowIso = new Date().toISOString();
+    const { error: invalidateErr } = await supabase
+      .from("otp_tokens")
+      .update({ used: true, used_at: nowIso })
+      .eq("candidate_email", email)
+      .eq("role_id", roleId)
+      .eq("used", false);
+    if (invalidateErr) {
+      console.error('[resend-otp] invalidate failed', {
+        request_id,
+        candidate_id,
+        role_id: roleId,
+        error: invalidateErr.message,
+        code: invalidateErr.code || null
+      });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'OTP_INVALIDATE_FAILED',
+        detail: 'Unable to resend verification code at this time.',
+        request_id
+      });
+    }
+
+    const freshCode = six();
+    const { error: otpErr } = await supabase.from("otp_tokens").insert({
+      candidate_email: email,
+      role_id: roleId,
+      code: freshCode,
+      expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+      used: false,
+    });
+    if (otpErr) {
+      console.error('[resend-otp] otp create failed', {
+        request_id,
+        candidate_id,
+        role_id: roleId,
+        error: otpErr.message,
+        code: otpErr.code || null
+      });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'OTP_CREATE_FAILED',
+        detail: 'Unable to resend verification code at this time.',
+        request_id
+      });
+    }
+
+    res.status(200).json({ message: RESEND_OTP_MESSAGE });
+
+    setImmediate(async () => {
+      console.log('[resend-otp] background_email_start', {
+        request_id,
+        candidate_id,
+        role_id: roleId,
+        email
+      });
+      try {
+        if (!SENDGRID_KEY || !FROM_EMAIL) throw new Error('SENDGRID_API_KEY or SENDGRID_FROM not configured');
+        const [resp] = await sg.send({
+          to: email,
+          from: { email: FROM_EMAIL, name: APP_NAME },
+          subject: `Your ${APP_NAME} verification code`,
+          text: `Your verification code is ${freshCode}. It expires in 10 minutes.`,
+          html: buildOtpEmailHtml(APP_NAME, freshCode),
+        });
+        console.log('[resend-otp] background_email_success', {
+          request_id,
+          candidate_id,
+          role_id: roleId,
+          email,
+          status: resp?.statusCode || null
+        });
+      } catch (e) {
+        const status = e?.response?.status || e?.code || null;
+        const message = e?.message || 'send_failed';
+        console.warn('[resend-otp] background_email_failed', {
+          request_id,
+          candidate_id,
+          role_id: roleId,
+          email,
+          status,
+          message
+        });
+        Sentry.captureException(e, {
+          tags: {
+            route_name: 'resend_otp',
+            surface: 'backend',
+            task: 'background_resend_otp_email',
+            request_id: request_id || undefined,
+            candidate_id: candidate_id || undefined,
+            role_id: roleId || undefined
+          },
+          extra: {
+            request_id,
+            candidate_id,
+            role_id: roleId,
+            email,
+            status,
+            message
+          }
+        });
+      }
+    });
+    return;
+  } catch (e) {
+    console.error("resend-otp error", {
+      request_id,
+      message: e?.message || "Server error",
+      code: e?.code || null,
+      status: e?.response?.status || null
+    });
+    Sentry.captureException(e, {
+      tags: {
+        route_name: 'resend_otp',
+        surface: 'backend',
+        request_id: request_id || undefined
+      },
+      extra: { request_id }
+    });
+    return res.status(500).json({
+      error: "server_error",
+      code: "RESEND_OTP_FAILED",
+      detail: "Unable to resend verification code at this time.",
+      request_id
+    });
+  }
+});
 
 /**
  * POST /api/candidate/verify-otp

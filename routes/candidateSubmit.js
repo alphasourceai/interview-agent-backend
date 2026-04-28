@@ -385,36 +385,75 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       });
     }
 
-    // --- email OTP (non-fatal) ---
-    let emailSent = false;
-    try {
-      if (!SENDGRID_KEY || !FROM_EMAIL) throw new Error('SENDGRID_API_KEY or SENDGRID_FROM not configured');
-      const [resp] = await sg.send({
-        to: email,
-        from: { email: FROM_EMAIL, name: APP_NAME },
-        subject: `Your ${APP_NAME} verification code`,
-        text: `Your verification code is ${freshCode}. It expires in 10 minutes.`,
-        html: buildOtpEmailHtml(APP_NAME, freshCode),
-      });
-      emailSent = resp?.statusCode === 202;
-    } catch (e) {
-      const status = e?.response?.status || e?.code || null;
-      const message = e?.message || 'send_failed';
-      console.error('sendEmailOtp failed', { request_id, status, message });
-      Sentry.addBreadcrumb({
-        category: 'candidate_submit',
-        message: 'otp send failed',
-        level: 'warning',
-        data: { request_id, status, message, candidate_id, role_id: roleId }
-      });
-    }
-
     // success
     res.status(200).json({
       message: 'If your information is accepted, a verification code will be sent shortly.',
       candidate_id,
       role_id: roleId,
       resume_url: resume_url || null,
+    });
+
+    setImmediate(async () => {
+      console.log('[candidate-submit] background_otp_email_start', {
+        request_id,
+        candidate_id,
+        role_id: roleId,
+        email
+      });
+      try {
+        if (!SENDGRID_KEY || !FROM_EMAIL) throw new Error('SENDGRID_API_KEY or SENDGRID_FROM not configured');
+        const [resp] = await sg.send({
+          to: email,
+          from: { email: FROM_EMAIL, name: APP_NAME },
+          subject: `Your ${APP_NAME} verification code`,
+          text: `Your verification code is ${freshCode}. It expires in 10 minutes.`,
+          html: buildOtpEmailHtml(APP_NAME, freshCode),
+        });
+        console.log('[candidate-submit] background_otp_email_success', {
+          request_id,
+          candidate_id,
+          role_id: roleId,
+          email,
+          status: resp?.statusCode || null
+        });
+      } catch (e) {
+        const status = e?.response?.status || e?.code || null;
+        const message = e?.message || 'send_failed';
+        console.warn('[candidate-submit] background_otp_email_failed', {
+          request_id,
+          candidate_id,
+          role_id: roleId,
+          email,
+          status,
+          message
+        });
+        Sentry.addBreadcrumb({
+          category: 'candidate_submit',
+          message: 'otp send failed',
+          level: 'warning',
+          data: { request_id, status, message, candidate_id, role_id: roleId }
+        });
+        Sentry.captureException(e, {
+          tags: {
+            route_name: 'candidate_submit',
+            surface: 'backend',
+            task: 'background_otp_email',
+            request_id: request_id || undefined,
+            candidate_id: candidate_id || undefined,
+            role_id: roleId || undefined,
+            client_id: role?.client_id || undefined
+          },
+          extra: {
+            request_id,
+            candidate_id,
+            role_id: roleId,
+            client_id: role?.client_id || null,
+            email,
+            status,
+            message
+          }
+        });
+      }
     });
 
     if (fileBuf) {
