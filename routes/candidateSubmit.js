@@ -146,13 +146,13 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
     if (role_id_in) {
       ({ data: role, error: rErr } = await supabase
         .from('roles')
-        .select('id, title, description, kb_document_id, client_id')
+        .select('id, title, description, job_description_text, kb_document_id, client_id')
         .eq('id', role_id_in)
         .single());
     } else {
       ({ data: role, error: rErr } = await supabase
         .from('roles')
-        .select('id, title, description, kb_document_id, client_id')
+        .select('id, title, description, job_description_text, kb_document_id, client_id')
         .eq('slug_or_token', role_token)
         .single());
     }
@@ -426,7 +426,10 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
           email
         });
         try {
-          const summary = await analyzeResume(fileBuf, fileType, role, candidate_id);
+          const summary = await analyzeResume(fileBuf, fileType, {
+            ...role,
+            description: role.description || role.job_description_text || ''
+          }, candidate_id);
           await supabase.from('candidates').update({ analysis_summary: summary }).eq('id', candidate_id);
           console.log('[candidate-submit] background_resume_analysis_success', {
             request_id,
