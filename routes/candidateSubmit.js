@@ -239,7 +239,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
 
     // --- duplicate & enrichment policy ---
     // RULES:
-    // 1) Email match for this role -> BLOCK (409). Enrich phone if missing, then stop (no OTP, no resume upload, no analysis).
+    // 1) Email match for this role -> BLOCK if verified; recover OTP if unverified.
     // 2) If email does NOT match, but (name + phone) BOTH match for this role -> BLOCK (409). Enrich phone on the existing record if missing.
     // 3) Otherwise, ALLOW (create candidate, upload, send OTP).
 
@@ -248,7 +248,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
     {
       const { data, error } = await supabase
         .from('candidates')
-        .select('id, name, email, phone')
+        .select('id, name, email, phone, verified, status, resume_url')
         .eq('role_id', roleId)
         .eq('email', email)
         .limit(1)
@@ -259,6 +259,137 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       // Enrich phone if missing
       if (phone && !existingByEmail.phone) {
         await supabase.from('candidates').update({ phone }).eq('id', existingByEmail.id);
+      }
+      const alreadyVerified = existingByEmail.verified === true || String(existingByEmail.status || '').toLowerCase() === 'verified';
+      if (!alreadyVerified) {
+        const candidate_id = existingByEmail.id;
+        sentryCandidateId = candidate_id || null;
+        if (sentryCandidateId) Sentry.setTag('candidate_id', String(sentryCandidateId));
+        console.log('[candidate-submit] duplicate_unverified_recovery_start', {
+          request_id,
+          candidate_id,
+          role_id: roleId,
+          email
+        });
+
+        const nowIso = new Date().toISOString();
+        const { error: invalidateErr } = await supabase
+          .from('otp_tokens')
+          .update({ used: true, used_at: nowIso })
+          .eq('candidate_email', email)
+          .eq('role_id', roleId)
+          .eq('used', false);
+        if (invalidateErr) {
+          console.error('[candidate-submit] duplicate_unverified_recovery_invalidate_failed', {
+            request_id,
+            candidate_id,
+            role_id: roleId,
+            email,
+            error: invalidateErr.message,
+            code: invalidateErr.code || null
+          });
+          return res.status(500).json({
+            error: 'server_error',
+            code: 'OTP_INVALIDATE_FAILED',
+            detail: 'Unable to continue verification at this time.',
+            ...(request_id ? { request_id } : {})
+          });
+        }
+
+        const freshCode = six();
+        const { error: otpErr } = await supabase.from('otp_tokens').insert({
+          candidate_email: email,
+          role_id: roleId,
+          code: freshCode,
+          expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+          used: false,
+        });
+        if (otpErr) {
+          console.error('otp create failed', {
+            request_id,
+            candidate_id,
+            role_id: roleId,
+            error: otpErr.message,
+            code: otpErr.code || null
+          });
+          return res.status(500).json({
+            error: 'server_error',
+            code: 'OTP_CREATE_FAILED',
+            detail: 'Unable to continue verification at this time.',
+            ...(request_id ? { request_id } : {})
+          });
+        }
+
+        console.log('[candidate-submit] duplicate_unverified_recovery_success', {
+          request_id,
+          candidate_id,
+          role_id: roleId,
+          email
+        });
+        res.status(200).json({
+          message: 'If your information is accepted, a verification code will be sent shortly.',
+          candidate_id,
+          role_id: roleId,
+          resume_url: existingByEmail.resume_url || null,
+        });
+
+        setImmediate(async () => {
+          console.log('[candidate-submit] duplicate_unverified_recovery_email_start', {
+            request_id,
+            candidate_id,
+            role_id: roleId,
+            email
+          });
+          try {
+            if (!SENDGRID_KEY || !FROM_EMAIL) throw new Error('SENDGRID_API_KEY or SENDGRID_FROM not configured');
+            const [resp] = await sg.send({
+              to: email,
+              from: { email: FROM_EMAIL, name: APP_NAME },
+              subject: `Your ${APP_NAME} verification code`,
+              text: `Your verification code is ${freshCode}. It expires in 10 minutes.`,
+              html: buildOtpEmailHtml(APP_NAME, freshCode),
+            });
+            console.log('[candidate-submit] duplicate_unverified_recovery_email_success', {
+              request_id,
+              candidate_id,
+              role_id: roleId,
+              email,
+              status: resp?.statusCode || null
+            });
+          } catch (e) {
+            const status = e?.response?.status || e?.code || null;
+            const message = e?.message || 'send_failed';
+            console.warn('[candidate-submit] duplicate_unverified_recovery_email_failure', {
+              request_id,
+              candidate_id,
+              role_id: roleId,
+              email,
+              status,
+              message
+            });
+            Sentry.captureException(e, {
+              tags: {
+                route_name: 'candidate_submit',
+                surface: 'backend',
+                task: 'duplicate_unverified_recovery_email',
+                request_id: request_id || undefined,
+                candidate_id: candidate_id || undefined,
+                role_id: roleId || undefined,
+                client_id: role?.client_id || undefined
+              },
+              extra: {
+                request_id,
+                candidate_id,
+                role_id: roleId,
+                client_id: role?.client_id || null,
+                email,
+                status,
+                message
+              }
+            });
+          }
+        });
+        return;
       }
       return submissionFailed('duplicate_email', {
         role_id: roleId,
