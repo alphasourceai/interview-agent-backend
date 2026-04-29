@@ -580,8 +580,19 @@ function extractCandidateQuestions(transcriptText) {
   const lines = transcriptText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   const out = new Set();
   const interrogativeRe = /^(who|what|when|where|why|how|can|could|would|do|does|is|are|should)\b/i;
+  const closingQuestionRe = /\b(do you have|any|any other)\b.{0,40}\bquestions?\b|\bquestions?\b.{0,40}\bbefore we wrap up\b/i;
   const refusalRe = /note it for the hiring manager|i don't have that information|i do not have that information|i can't answer|i cannot answer|i will pass it to the hiring manager|i'll pass it to the hiring manager|i will note it for the hiring manager|i'll note it for the hiring manager/i;
-  let lastCandidate = '';
+  const candidateQuestionText = (text) => {
+    const cleanedText = String(text || '').trim();
+    if (!cleanedText) return '';
+    const words = cleanedText.split(/\s+/).filter(Boolean);
+    const sentenceMarks = cleanedText.match(/[.!?]+(?=\s|$)/g) || [];
+    if (words.length > 35 || sentenceMarks.length > 2) return '';
+    const lead = cleanedText.replace(/^(?:um+|uh+|so|and|also|just|yeah|yes|no|ok(?:ay)?|hey|hi)[,\s]+/i, '').trim();
+    return cleanedText.includes('?') || interrogativeRe.test(lead) ? cleanedText : '';
+  };
+  let closingQuestionAsked = false;
+  let lastCandidateQuestion = '';
   for (const line of lines) {
     const upper = line.toUpperCase();
     const isInterviewer = upper.startsWith('INTERVIEWER:');
@@ -591,15 +602,20 @@ function extractCandidateQuestions(transcriptText) {
     if (isCandidate) cleaned = line.slice('CANDIDATE:'.length).trim();
 
     if (isCandidate) {
-      if (cleaned) lastCandidate = cleaned;
-      if (cleaned && (cleaned.includes('?') || interrogativeRe.test(cleaned))) {
-        out.add(cleaned);
+      const question = candidateQuestionText(cleaned);
+      lastCandidateQuestion = question;
+      if (question && closingQuestionAsked) {
+        out.add(question);
       }
       continue;
     }
 
-    if (isInterviewer && refusalRe.test(cleaned) && lastCandidate) {
-      out.add(lastCandidate);
+    if (isInterviewer && closingQuestionRe.test(cleaned)) {
+      closingQuestionAsked = true;
+    }
+
+    if (isInterviewer && refusalRe.test(cleaned) && lastCandidateQuestion) {
+      out.add(lastCandidateQuestion);
     }
   }
   return Array.from(out).slice(0, 10);
@@ -804,7 +820,7 @@ async function putJsonToStorage(bucket, pathName, jsonOrUrl) {
   return `${bucket}/${pathName}`;
 }
 
-function extractSanitizedContent(item) {
+function extractSanitizedContent(item, options = {}) {
   if (!item) return null;
 
   const role = typeof item.role === 'string' ? item.role.trim().toLowerCase() : '';
@@ -825,11 +841,13 @@ function extractSanitizedContent(item) {
 
   // Strip the "unanswered" marker artifacts so they don't appear in stored transcripts or get read aloud in reports.
   // NOTE: We still capture unanswered questions via `extractCandidateQuestions(...)` using refusal heuristics.
-  text = text
-    .replace(/\[\[UNANSWERED_QUESTION:[^\]]*\]\]/g, '')
-    .replace(/\[\s*\]/g, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
+  if (!options.preserveQuestionMarkers) {
+    text = text
+      .replace(/\[\[UNANSWERED_QUESTION:[^\]]*\]\]/g, '')
+      .replace(/\[\s*\]/g, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+  }
 
   if (!text) return null;
 
@@ -1051,6 +1069,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
     let analysisMissing = false;
     let shouldTriggerAnalysisRun = false;
     let transcriptText = '';
+    let transcriptQuestionText = '';
 
     if (isToolCall && toolName === 'end_interview' && conversationId && interview?.id) {
       try {
@@ -1167,6 +1186,10 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
               ? fromAny(body, 'transcript')
               : null;
 
+      const questionLines = transcriptItems
+        ? transcriptItems.map(item => extractSanitizedContent(item, { preserveQuestionMarkers: true })).filter(Boolean)
+        : [];
+      transcriptQuestionText = questionLines.join('\n\n').trim();
       const sanitizedLines = transcriptItems ? sanitizeTranscriptArray(transcriptItems) : [];
       transcriptText = sanitizedLines.join('\n\n').trim();
       if (transcriptText) {
@@ -1370,7 +1393,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
     }
 
     let freshAfterTranscript = null;
-    let transcriptForQuestions = transcriptText;
+    let transcriptForQuestions = transcriptQuestionText || transcriptText;
     if (isTranscriptionReady) {
       const { data: fresh, error: freshErr } = await supabaseAdmin
         .from('interviews')
