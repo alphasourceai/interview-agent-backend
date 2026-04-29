@@ -86,16 +86,35 @@ Resume:
 ${resumeText || '[no extractable text]'}
 
 Score definitions:
+- Score whether the candidate can perform the posted duties.
+- Do not score primarily on exact industry, exact employer type, exact title, or exact department match.
+- Exact match is a plus, not a requirement unless the JD states it as a hard requirement.
 - skills_match_percent: match between resume skills, tools, domain knowledge, and role requirements.
 - experience_match_percent: match between work history, responsibilities, seniority, and role experience needs.
 - education_match_percent: match between education/certifications and role education requirements. If the role has no education requirement, score based on relevant credentials and explain uncertainty in summary.
 - resume_score: overall resume fit for the role, primarily weighted toward skills and experience.
 - overall_resume_match_percent: aggregate role match score; should generally align with resume_score unless there is a clear reason.
 
+Calibration rules:
+- For entry-level or broad admin/customer-service roles, strong adjacent customer-facing, office, operations, retail, healthcare/dental/patient-service, phone, escalation, documentation, or team-support experience should usually score moderate-to-high for skills and experience.
+- Do not assign low scores solely because the experience is more senior than the role.
+- Mention overqualification or role-level mismatch in the summary as a practical fit concern, but do not crater the score unless it directly prevents success in the role.
+- If the JD says open to all majors or has no hard education requirement, do not score education low merely because the candidate lacks suggested majors or interests.
+- Score relevant credentials and business, HR, management, administration, communication, technology, customer-service, or general college education where applicable.
+
+Score bands:
+- 80-100 = strong direct evidence for most key duties.
+- 60-79 = strong transferable evidence or partial direct evidence that clearly maps to duties.
+- 40-59 = some related evidence but important gaps.
+- 1-39 = weak relationship to duties.
+- 0 = explicit no match only, not missing or non-exact evidence.
+- null = insufficient evidence to score.
+
 Insufficient evidence rules:
 - If resume text is not extractable, return null for scores and explain in summary.
 - If role/JD requirements are missing or too thin, return null for unsupported scores and explain in summary.
 - Never fabricate scores.
+- Summary must concisely explain direct matches, transferable matches, meaningful gaps, and any overqualification or role-level mismatch without over-penalizing capability.
 
 Return strict JSON only in this exact shape:
 {
