@@ -79,7 +79,7 @@ function isDownloadableRecordingUrl(url) {
 
 function isMissingColumnError(error) {
   const msg = String(error?.message || '');
-  return /column .* does not exist/i.test(msg);
+  return /column .* does not exist/i.test(msg) || /could not find .* column .* schema cache/i.test(msg);
 }
 
 function pruneMetadata(meta) {
@@ -980,7 +980,12 @@ async function applyInterviewUpdates(interviewId, updates, recordingMeta) {
     return;
   }
 
-  const combined = { ...(baseUpdates || {}), ...cleanedMeta };
+  const recordingUpdates = {
+    recording_metadata: cleanedMeta,
+    recording_status: 'ready',
+    recording_ready_at: new Date().toISOString()
+  };
+  const combined = { ...(baseUpdates || {}), ...recordingUpdates };
   let { error } = await supabaseAdmin.from('interviews').update(combined).eq('id', interviewId);
   if (!error) return;
 
@@ -1731,9 +1736,17 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
     let updatesApplied = false;
     if (Object.keys(updates).length) {
       const { recording_metadata: recordingMeta, ...baseUpdates } = updates;
+      const hasRecordingMetadata = Object.keys(pruneMetadata(recordingMeta)).length > 0;
       try {
         await applyInterviewUpdates(interview.id, baseUpdates, recordingMeta);
         updatesApplied = true;
+        if (isRecordingReady && hasRecordingMetadata) {
+          console.log('[webhook] recording_metadata_stored', {
+            request_id: requestId || null,
+            interview_id: interview.id,
+            conversation_id: conversationId || null
+          });
+        }
       } catch (err) {
         console.error('[webhook] interview update failed', {
           request_id: requestId || null,
@@ -1743,6 +1756,16 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
           details: err?.details || null,
           hint: err?.hint || null
         });
+        if (isRecordingReady && hasRecordingMetadata) {
+          console.error('[webhook] recording_metadata_store_failed', {
+            request_id: requestId || null,
+            interview_id: interview.id,
+            conversation_id: conversationId || null,
+            error: err?.message || err,
+            details: err?.details || null,
+            hint: err?.hint || null
+          });
+        }
       }
     }
 
