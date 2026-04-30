@@ -21,6 +21,15 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   const REPLICA_ID = String(process.env.TAVUS_REPLICA_ID || '').trim();
   const PERSONA_ID = String(process.env.TAVUS_PERSONA_ID || '').trim();
   const RETRIEVAL = String(process.env.TAVUS_DOCUMENT_STRATEGY || 'balanced').trim();
+  const RECORDING_AWS_ASSUME_ROLE_ARN = String(process.env.TAVUS_RECORDING_AWS_ASSUME_ROLE_ARN || '').trim();
+  const RECORDING_S3_BUCKET_REGION = String(process.env.TAVUS_RECORDING_S3_BUCKET_REGION || '').trim();
+  const RECORDING_S3_BUCKET_NAME = String(process.env.TAVUS_RECORDING_S3_BUCKET_NAME || '').trim();
+  const recordingRequested = process.env.TAVUS_ENABLE_RECORDING === 'true';
+  const recordingConfigComplete =
+    recordingRequested &&
+    !!RECORDING_AWS_ASSUME_ROLE_ARN &&
+    !!RECORDING_S3_BUCKET_REGION &&
+    !!RECORDING_S3_BUCKET_NAME;
 
   if (!API_KEY) {
     const err = new Error('TAVUS_API_KEY is not set');
@@ -32,7 +41,13 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   const envFlags = {
     TAVUS_API_KEY: !!process.env.TAVUS_API_KEY,
     TAVUS_REPLICA_ID: !!process.env.TAVUS_REPLICA_ID,
-    TAVUS_PERSONA_ID: !!process.env.TAVUS_PERSONA_ID
+    TAVUS_PERSONA_ID: !!process.env.TAVUS_PERSONA_ID,
+    TAVUS_ENABLE_RECORDING: recordingRequested,
+    recording_config_complete: recordingConfigComplete,
+    recording_config_included: recordingConfigComplete,
+    has_recording_aws_assume_role_arn: !!RECORDING_AWS_ASSUME_ROLE_ARN,
+    has_recording_s3_bucket_region: !!RECORDING_S3_BUCKET_REGION,
+    has_recording_s3_bucket_name: !!RECORDING_S3_BUCKET_NAME
   };
   console.log('[tavus-interview-debug]', {
     stage: 'handler_start',
@@ -41,6 +56,19 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     client_id: role?.client_id || candidate?.client_id || options?.clientId || null,
     env: envFlags
   });
+  if (recordingRequested && !recordingConfigComplete) {
+    console.warn('[tavus-interview] recording_config_incomplete', {
+      candidate_id: candidate?.id || candidate?.candidate_id || null,
+      role_id: role?.id || null,
+      client_id: role?.client_id || candidate?.client_id || options?.clientId || null,
+      TAVUS_ENABLE_RECORDING: recordingRequested,
+      recording_config_complete: recordingConfigComplete,
+      recording_config_included: false,
+      has_recording_aws_assume_role_arn: !!RECORDING_AWS_ASSUME_ROLE_ARN,
+      has_recording_s3_bucket_region: !!RECORDING_S3_BUCKET_REGION,
+      has_recording_s3_bucket_name: !!RECORDING_S3_BUCKET_NAME
+    });
+  }
 
   const parsedMaxInterviewMinutes = Number(options?.maxInterviewMinutes);
   const maxInterviewMinutes = Number.isFinite(parsedMaxInterviewMinutes) && parsedMaxInterviewMinutes > 0
@@ -76,7 +104,13 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     custom_greeting: customGreeting,
     properties: {
       max_call_duration: maxCallDurationSeconds,
-      participant_left_timeout: 60
+      participant_left_timeout: 60,
+      ...(recordingConfigComplete ? {
+        enable_recording: true,
+        aws_assume_role_arn: RECORDING_AWS_ASSUME_ROLE_ARN,
+        recording_s3_bucket_region: RECORDING_S3_BUCKET_REGION,
+        recording_s3_bucket_name: RECORDING_S3_BUCKET_NAME
+      } : {})
     }
   };
   let tavusDocumentId = role?.tavus_document_id || null;
