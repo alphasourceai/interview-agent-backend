@@ -3,12 +3,15 @@
 
 const express = require('express');
 const Sentry = require('@sentry/node');
+const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { supabase } = require('../src/lib/supabaseClient');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 
 
 const router = express.Router();
 const EXPOSE_INTERVIEW_ANALYSIS_V2 = process.env.EXPOSE_INTERVIEW_ANALYSIS_V2 === 'true';
+const s3ClientsByRegion = new Map();
 
 function getRequestId(req) {
   return (
@@ -86,6 +89,38 @@ function toScoreOrNull(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+function getScopedClientIds(req) {
+  if (Array.isArray(req?.clientScope?.memberships)) {
+    return req.clientScope.memberships.map(m => String(m?.client_id || '').trim()).filter(Boolean);
+  }
+  if (Array.isArray(req?.clientIds)) {
+    return req.clientIds.map(id => String(id || '').trim()).filter(Boolean);
+  }
+  return [];
+}
+
+function getRecordingSignedUrlTtl() {
+  const parsed = Number(process.env.S3_RECORDING_SIGNED_URL_TTL_SECONDS || 300);
+  const ttl = Number.isFinite(parsed) ? Math.floor(parsed) : 300;
+  return Math.max(60, Math.min(900, ttl));
+}
+
+function getS3Client(region) {
+  if (!s3ClientsByRegion.has(region)) {
+    s3ClientsByRegion.set(region, new S3Client({ region }));
+  }
+  return s3ClientsByRegion.get(region);
+}
+
+function recordingUnavailable(res, requestId, detail) {
+  return res.status(409).json({
+    error: 'recording_unavailable',
+    code: 'RECORDING_UNAVAILABLE',
+    detail,
+    request_id: requestId || null
+  });
+}
+
 function getTranscriptOverall(interviewRow) {
   const scores = parseJsonObject(interviewRow?.transcript_scores);
   return scores ? toScoreOrNull(scores.overall) : null;
@@ -125,6 +160,133 @@ function hasCanonicalAnalysis(interviewRow) {
   const legacyBody = toFiniteOrNull(raw?.body_language);
   return legacyBody !== null;
 }
+
+router.get('/interviews/:id/recording-url', requireAuth, withClientScope, async (req, res) => {
+  const request_id = getRequestId(req);
+  const interviewId = String(req.params?.id || '').trim();
+  Sentry.setTag('route_name', 'dashboard_interview_recording_url');
+  Sentry.setTag('surface', 'backend');
+  if (request_id) Sentry.setTag('request_id', String(request_id));
+
+  try {
+    if (!interviewId) {
+      return res.status(400).json({
+        error: 'bad_request',
+        code: 'INTERVIEW_ID_REQUIRED',
+        detail: 'Interview id is required.',
+        request_id: request_id || null
+      });
+    }
+
+    const { data: interview, error } = await supabase
+      .from('interviews')
+      .select('id, client_id, recording_status, recording_metadata, recording_ready_at')
+      .eq('id', interviewId)
+      .maybeSingle();
+
+    if (error) {
+      console.error('[dashboard/recording-url] interview lookup failed', {
+        request_id: request_id || null,
+        interview_id: interviewId,
+        error: error.message || error,
+        code: error.code || null
+      });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'RECORDING_LOOKUP_FAILED',
+        detail: 'Unable to load recording details.',
+        request_id: request_id || null
+      });
+    }
+
+    if (!interview) {
+      return res.status(404).json({
+        error: 'not_found',
+        code: 'INTERVIEW_NOT_FOUND',
+        detail: 'Interview not found.',
+        request_id: request_id || null
+      });
+    }
+
+    const clientId = String(interview.client_id || '').trim();
+    const scopedIds = getScopedClientIds(req);
+    if (!req.isGlobalAdmin && (!clientId || !scopedIds.includes(clientId))) {
+      return res.status(403).json({
+        error: 'forbidden',
+        code: 'INTERVIEW_FORBIDDEN',
+        detail: 'You do not have access to this interview.',
+        request_id: request_id || null
+      });
+    }
+
+    if (String(interview.recording_status || '').toLowerCase() !== 'ready') {
+      return recordingUnavailable(res, request_id, 'Recording is not ready.');
+    }
+
+    const metadata = parseJsonObject(interview.recording_metadata) || {};
+    const bucketName = String(metadata.bucket_name || '').trim();
+    const s3Key = String(metadata.s3_key || '').trim();
+    if (!bucketName || !s3Key) {
+      return recordingUnavailable(res, request_id, 'Recording metadata is incomplete.');
+    }
+
+    const region = String(process.env.AWS_REGION || process.env.TAVUS_RECORDING_S3_BUCKET_REGION || '').trim();
+    if (!region) {
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'RECORDING_SIGNING_NOT_CONFIGURED',
+        detail: 'Recording signing is not configured for this environment.',
+        hint: 'Set AWS_REGION or TAVUS_RECORDING_S3_BUCKET_REGION and AWS credentials with S3 read access.',
+        request_id: request_id || null
+      });
+    }
+
+    const expiresIn = getRecordingSignedUrlTtl();
+    let url;
+    try {
+      url = await getSignedUrl(
+        getS3Client(region),
+        new GetObjectCommand({ Bucket: bucketName, Key: s3Key }),
+        { expiresIn }
+      );
+    } catch (signErr) {
+      console.error('[dashboard/recording-url] signing failed', {
+        request_id: request_id || null,
+        interview_id: interviewId,
+        client_id: clientId || null,
+        error: signErr?.message || signErr,
+        name: signErr?.name || null
+      });
+      return res.status(500).json({
+        error: 'server_error',
+        code: 'RECORDING_URL_SIGN_FAILED',
+        detail: 'Unable to generate recording URL at this time.',
+        hint: 'Verify AWS credentials and S3 read permissions.',
+        request_id: request_id || null
+      });
+    }
+
+    return res.json({
+      ok: true,
+      url,
+      expires_in: expiresIn,
+      recording_ready_at: interview.recording_ready_at || null,
+      duration: toFiniteOrNull(metadata.duration)
+    });
+  } catch (e) {
+    console.error('[dashboard/recording-url] unexpected', {
+      request_id: request_id || null,
+      interview_id: interviewId || null,
+      error: e?.message || e
+    });
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'RECORDING_URL_FAILED',
+      detail: 'Unable to generate recording URL at this time.',
+      request_id: request_id || null
+    });
+  }
+});
 
 /**
  * GET /dashboard/rows
