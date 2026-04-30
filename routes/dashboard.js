@@ -8,6 +8,7 @@ const { requireAuth, withClientScope } = require('../src/middleware/auth');
 
 
 const router = express.Router();
+const EXPOSE_INTERVIEW_ANALYSIS_V2 = process.env.EXPOSE_INTERVIEW_ANALYSIS_V2 === 'true';
 
 function getRequestId(req) {
   return (
@@ -88,6 +89,15 @@ function toScoreOrNull(value) {
 function getTranscriptOverall(interviewRow) {
   const scores = parseJsonObject(interviewRow?.transcript_scores);
   return scores ? toScoreOrNull(scores.overall) : null;
+}
+
+function hasInsufficientInterviewSummary(summary) {
+  const lower = String(summary || '').toLowerCase();
+  return (
+    lower.includes('before any substantive responses were recorded') ||
+    lower.includes('before substantive responses were captured') ||
+    lower.includes('insufficient data')
+  );
 }
 
 function getPerceptionShape(interviewRow) {
@@ -195,23 +205,26 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
     // 3) Latest interview per candidate (within same client)
     let latestInterviewByCand = {};
     if (candIds.length) {
+      const interviewSelect = [
+        'id',
+        'candidate_id',
+        'client_id',
+        'created_at',
+        'video_url',
+        'transcript_url',
+        'transcript',
+        'analysis_url',
+        'analysis',
+        'perception_scores',
+        'transcript_scores',
+        'interview_summary',
+        'unanswered_candidate_questions'
+      ];
+      if (EXPOSE_INTERVIEW_ANALYSIS_V2) interviewSelect.push('interview_analysis_v2');
+
       const { data: ivs, error: iErr } = await supabase
         .from('interviews')
-        .select([
-          'id',
-          'candidate_id',
-          'client_id',
-          'created_at',
-          'video_url',
-          'transcript_url',
-          'transcript',
-          'analysis_url',
-          'analysis',
-          'perception_scores',
-          'transcript_scores',
-          'interview_summary',
-          'unanswered_candidate_questions'
-        ].join(', '))
+        .select(interviewSelect.join(', '))
         .eq('client_id', clientId)
         .in('candidate_id', candIds)
         .order('created_at', { ascending: false });
@@ -338,14 +351,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const perception = getPerceptionShape(iv);
       const interviewSummary = typeof iv?.interview_summary === 'string' ? iv.interview_summary : '';
       const transcriptOverall = getTranscriptOverall(iv);
-      const interviewSummaryLower = interviewSummary.toLowerCase();
-      const insufficientInterview =
-        transcriptOverall === null &&
-        (
-          interviewSummaryLower.includes('before any substantive responses were recorded') ||
-          interviewSummaryLower.includes('before substantive responses were captured') ||
-          interviewSummaryLower.includes('insufficient data')
-        );
+      const insufficientInterview = hasInsufficientInterviewSummary(interviewSummary);
       const interview_analysis = {
         clarity: insufficientInterview ? null : perception.clarity,
         confidence: insufficientInterview ? null : perception.confidence,
@@ -357,12 +363,20 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const latest_report_url = rep?.latest_report_url || rep?.report_url || null;
       const safeVideoUrl = iv?.video_url && !isDailyRoomUrl(iv.video_url) ? iv.video_url : null;
       const hasTranscript = !!iv?.transcript;
-      const interviewScore = Number.isFinite(transcriptOverall) ? transcriptOverall : null;
+      const interviewScore = insufficientInterview ? null : (Number.isFinite(transcriptOverall) ? transcriptOverall : null);
       const overall_score =
         Number.isFinite(resume_score) && Number.isFinite(interviewScore)
           ? Math.max(0, Math.min(100, Math.round((resume_score + interviewScore) / 2)))
           : null;
       const canonicalHasAnalysis = hasCanonicalAnalysis(iv);
+      const transcriptScores = parseJsonObject(iv?.transcript_scores) || null;
+      const exposedTranscriptScores = insufficientInterview && transcriptScores
+        ? { ...transcriptScores, overall: null, confidence: null, ai_aided_risk: null, ai_aided_risk_reason: null }
+        : transcriptScores;
+      const perceptionScores = parseJsonObject(iv?.perception_scores) || null;
+      const exposedPerceptionScores = insufficientInterview && perceptionScores
+        ? { ...perceptionScores, clarity: null, confidence: null, engagement: null, body_language: null }
+        : perceptionScores;
 
       return {
         // row identity is the candidate (FE now uses latest_interview_id for actions)
@@ -378,8 +392,8 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         video_url: safeVideoUrl,
         transcript_url: iv?.transcript_url || null,
         analysis_url: iv?.analysis_url || null,
-        transcript_scores: parseJsonObject(iv?.transcript_scores) || null,
-        perception_scores: parseJsonObject(iv?.perception_scores) || null,
+        transcript_scores: exposedTranscriptScores,
+        perception_scores: exposedPerceptionScores,
         interview_summary: interviewSummary || '',
         unanswered_candidate_questions: normalizeUnansweredQuestions(iv?.unanswered_candidate_questions, iv?.unanswered_candidate_questions_text),
         transcript: typeof iv?.transcript === 'string' ? iv.transcript : '',
@@ -393,6 +407,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         overall_score,
         resume_analysis,
         interview_analysis,
+        interview_analysis_v2: EXPOSE_INTERVIEW_ANALYSIS_V2 ? (parseJsonObject(iv?.interview_analysis_v2) || null) : undefined,
         latest_report_url,
         report_generated_at: rep?.created_at || null,
       };
@@ -444,9 +459,12 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
 
+    const interviewSelect = 'id, created_at, client_id, candidate_id, role_id, video_url, transcript_url, transcript, analysis_url, resume_score, interview_score, overall_score, resume_analysis, interview_analysis, latest_report_url, report_generated_at, perception_scores, transcript_scores, interview_summary, unanswered_candidate_questions' +
+      (EXPOSE_INTERVIEW_ANALYSIS_V2 ? ', interview_analysis_v2' : '');
+
     const { data: rows, error: iErr } = await supabase
       .from('interviews')
-      .select('id, created_at, client_id, candidate_id, role_id, video_url, transcript_url, transcript, analysis_url, resume_score, interview_score, overall_score, resume_analysis, interview_analysis, latest_report_url, report_generated_at, perception_scores, transcript_scores, interview_summary, unanswered_candidate_questions')
+      .select(interviewSelect)
       .eq('client_id', clientId)
       .order('created_at', { ascending: false })
       .limit(500);
@@ -506,15 +524,24 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
         const safeVideoUrl = r.video_url && !isDailyRoomUrl(r.video_url) ? r.video_url : null;
         const hasTranscript = !!r.transcript_url || !!r.transcript;
         const transcriptOverall = getTranscriptOverall(r);
-        const interviewScore = Number.isFinite(transcriptOverall) ? transcriptOverall : null;
+        const interviewSummary = typeof r?.interview_summary === 'string' ? r.interview_summary : '';
+        const insufficientInterview = hasInsufficientInterviewSummary(interviewSummary);
+        const interviewScore = insufficientInterview ? null : (Number.isFinite(transcriptOverall) ? transcriptOverall : null);
         const resumeScore = toScoreOrNull(r.resume_score);
         const overallScore =
           Number.isFinite(resumeScore) && Number.isFinite(interviewScore)
             ? Math.max(0, Math.min(100, Math.round((resumeScore + interviewScore) / 2)))
             : null;
         const perception = getPerceptionShape(r);
-        const interviewSummary = typeof r?.interview_summary === 'string' ? r.interview_summary : '';
         const canonicalHasAnalysis = hasCanonicalAnalysis(r);
+        const transcriptScores = parseJsonObject(r.transcript_scores) || null;
+        const exposedTranscriptScores = insufficientInterview && transcriptScores
+          ? { ...transcriptScores, overall: null, confidence: null, ai_aided_risk: null, ai_aided_risk_reason: null }
+          : transcriptScores;
+        const perceptionScores = parseJsonObject(r.perception_scores) || null;
+        const exposedPerceptionScores = insufficientInterview && perceptionScores
+          ? { ...perceptionScores, clarity: null, confidence: null, engagement: null, body_language: null }
+          : perceptionScores;
         return {
         id: r.id,
         created_at: r.created_at,
@@ -523,8 +550,8 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
         role: r.role_id ? (rolesById[r.role_id] || null) : null,
         video_url: safeVideoUrl,
         transcript_url: r.transcript_url || null,
-        transcript_scores: parseJsonObject(r.transcript_scores) || null,
-        perception_scores: parseJsonObject(r.perception_scores) || null,
+        transcript_scores: exposedTranscriptScores,
+        perception_scores: exposedPerceptionScores,
         interview_summary: interviewSummary || '',
         unanswered_candidate_questions: Array.isArray(r.unanswered_candidate_questions) ? r.unanswered_candidate_questions : [],
         analysis_url: r.analysis_url || null,
@@ -536,11 +563,12 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
         overall_score: overallScore,
         resume_analysis: r.resume_analysis || { experience: null, skills: null, education: null, summary: '' },
         interview_analysis: {
-          clarity: perception.clarity,
-          confidence: perception.confidence,
-          engagement: perception.engagement,
+          clarity: insufficientInterview ? null : perception.clarity,
+          confidence: insufficientInterview ? null : perception.confidence,
+          engagement: insufficientInterview ? null : perception.engagement,
           summary: interviewSummary
         },
+        interview_analysis_v2: EXPOSE_INTERVIEW_ANALYSIS_V2 ? (parseJsonObject(r?.interview_analysis_v2) || null) : undefined,
         latest_report_url: r.latest_report_url || null,
         report_generated_at: r.report_generated_at || null,
       };
