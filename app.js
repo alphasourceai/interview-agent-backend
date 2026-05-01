@@ -56,6 +56,7 @@ const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
 const { getRoleInterviewAvailability } = require('./src/lib/roleInterviewAvailability')
+const { cleanupNoSubstantiveRecordings } = require('./src/lib/recordingCleanup')
 const { createSubscriptionCheckoutSession } = require('./src/lib/subscriptionCheckout')
 const { sendSubscriptionCheckoutEmail, sendMemberRecoveryEmail } = require('./utils/mailer')
 const {
@@ -3856,6 +3857,31 @@ app.post('/internal/otp/cleanup', async (req, res) => {
     return res.status(500).json({
       error: 'otp_cleanup_failed',
       detail: e?.detail || e?.message || 'otp_cleanup_failed'
+    })
+  }
+})
+
+app.post('/internal/recordings/cleanup', async (req, res) => {
+  const expectedSecret = String(process.env.RECORDING_CLEANUP_CRON_SECRET || process.env.CONTRACTS_CRON_SECRET || '')
+  const providedSecret = String(req.get('x-cron-secret') || '')
+  if (!expectedSecret || providedSecret !== expectedSecret) {
+    return res.status(401).json({ error: 'unauthorized' })
+  }
+
+  try {
+    const result = await cleanupNoSubstantiveRecordings({ db: supabaseAdmin, logger: console })
+    return res.json({
+      ok: true,
+      scanned: result.scanned,
+      deleted: result.deleted,
+      skipped: result.skipped,
+      failed: result.failed
+    })
+  } catch (e) {
+    console.error('[recording-cleanup] unexpected', { error: e?.message || e })
+    return res.status(500).json({
+      error: 'recording_cleanup_failed',
+      detail: e?.message || 'recording_cleanup_failed'
     })
   }
 })
