@@ -209,6 +209,7 @@ router.get('/interviews/:id/recording-url', requireAuth, withClientScope, async 
     }
 
     const clientId = String(interview.client_id || '').trim();
+    const downloadRequested = String(req.query?.download || '').trim() === '1';
     const scopedIds = getScopedClientIds(req);
     if (!req.isGlobalAdmin && (!clientId || !scopedIds.includes(clientId))) {
       return res.status(403).json({
@@ -246,7 +247,13 @@ router.get('/interviews/:id/recording-url', requireAuth, withClientScope, async 
     try {
       url = await getSignedUrl(
         getS3Client(region),
-        new GetObjectCommand({ Bucket: bucketName, Key: s3Key }),
+        new GetObjectCommand({
+          Bucket: bucketName,
+          Key: s3Key,
+          ...(downloadRequested
+            ? { ResponseContentDisposition: `attachment; filename="interview-recording-${interviewId}.mp4"` }
+            : {})
+        }),
         { expiresIn }
       );
     } catch (signErr) {
@@ -380,6 +387,8 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         'perception_scores',
         'transcript_scores',
         'interview_summary',
+        'recording_status',
+        'recording_ready_at',
         'unanswered_candidate_questions'
       ];
       if (EXPOSE_INTERVIEW_ANALYSIS_V2) interviewSelect.push('interview_analysis_v2');
@@ -551,6 +560,8 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
 
         // latest interview bits for the expanded area + transcript button
         latest_interview_id: iv?.id || null,
+        recording_status: iv?.recording_status || null,
+        recording_ready_at: iv?.recording_ready_at || null,
         video_url: safeVideoUrl,
         transcript_url: iv?.transcript_url || null,
         analysis_url: iv?.analysis_url || null,
@@ -621,7 +632,7 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
 
-    const interviewSelect = 'id, created_at, client_id, candidate_id, role_id, video_url, transcript_url, transcript, analysis_url, resume_score, interview_score, overall_score, resume_analysis, interview_analysis, latest_report_url, report_generated_at, perception_scores, transcript_scores, interview_summary, unanswered_candidate_questions' +
+    const interviewSelect = 'id, created_at, client_id, candidate_id, role_id, video_url, transcript_url, transcript, analysis_url, resume_score, interview_score, overall_score, resume_analysis, interview_analysis, latest_report_url, report_generated_at, perception_scores, transcript_scores, interview_summary, recording_status, recording_ready_at, unanswered_candidate_questions' +
       (EXPOSE_INTERVIEW_ANALYSIS_V2 ? ', interview_analysis_v2' : '');
 
     const { data: rows, error: iErr } = await supabase
@@ -710,6 +721,8 @@ router.get('/interviews', requireAuth, withClientScope, async (req, res) => {
         client_id: r.client_id,
         candidate: candidatesById[r.candidate_id],
         role: r.role_id ? (rolesById[r.role_id] || null) : null,
+        recording_status: r.recording_status || null,
+        recording_ready_at: r.recording_ready_at || null,
         video_url: safeVideoUrl,
         transcript_url: r.transcript_url || null,
         transcript_scores: exposedTranscriptScores,
