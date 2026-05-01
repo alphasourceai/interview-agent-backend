@@ -2752,7 +2752,7 @@ adminRouter.get('/candidates', requireAuth, requireAdmin, async (req, res) => {
     if (candidateIds.length) {
       const { data: ivs, error: iErr } = await supabaseAdmin
         .from('interviews')
-        .select('candidate_id,created_at,transcript_scores')
+        .select('id,candidate_id,created_at,transcript_scores,recording_status,recording_ready_at')
         .eq('client_id', client_id)
         .in('candidate_id', candidateIds)
         .order('created_at', { ascending: false });
@@ -2839,6 +2839,9 @@ adminRouter.get('/candidates', requireAuth, requireAdmin, async (req, res) => {
         resume_score,
         interview_score,
         overall_score,
+        latest_interview_id: latestInterviewByCandidateId[c.id]?.id || null,
+        recording_status: latestInterviewByCandidateId[c.id]?.recording_status || null,
+        recording_ready_at: latestInterviewByCandidateId[c.id]?.recording_ready_at || null,
         latest_report_url: rep?.report_url || null,
         report_generated_at: rep?.created_at || null
       };
