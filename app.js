@@ -2532,10 +2532,19 @@ adminRouter.delete('/clients/:id', requireAuth, requireAdmin, async (req, res) =
 // List roles (optional client filter)
 adminRouter.get('/roles', requireAuth, requireAdmin, async (req, res) => {
   const { client_id } = req.query
+  const statusFilter = String(req.query.status || 'active').trim().toLowerCase()
+  if (!['active', 'inactive', 'all'].includes(statusFilter)) {
+    return res.status(400).json({
+      error: 'bad_request',
+      code: 'INVALID_ROLE_STATUS_FILTER',
+      detail: 'status must be active, inactive, or all'
+    })
+  }
   let q = supabaseAdmin.from('roles')
-    .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at')
+    .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at,status,closed_at,closed_by,inactive_reason')
     .order('created_at', { ascending: false })
   if (client_id) q = q.eq('client_id', client_id)
+  if (statusFilter !== 'all') q = q.eq('status', statusFilter)
   const { data, error } = await q
   if (error) return res.status(500).json({ error: 'list_roles_failed', detail: error.message })
   const availabilityFallback = {
@@ -2611,6 +2620,60 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
     .single()
 
   res.json({ item: updated || role })
+})
+
+adminRouter.patch('/roles/:id/status', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const roleId = String(req.params.id || '').trim()
+    const clientId = String(req.query.client_id || req.body?.client_id || '').trim()
+    const status = String(req.body?.status || '').trim().toLowerCase()
+    if (!roleId) return res.status(400).json({ error: 'id_required' })
+    if (!['active', 'inactive'].includes(status)) {
+      return res.status(400).json({
+        error: 'bad_request',
+        code: 'INVALID_ROLE_STATUS',
+        detail: 'status must be active or inactive'
+      })
+    }
+
+    let lookup = supabaseAdmin
+      .from('roles')
+      .select('id,client_id')
+      .eq('id', roleId)
+    if (clientId) lookup = lookup.eq('client_id', clientId)
+    const { data: roleRow, error: lookupErr } = await lookup.maybeSingle()
+    if (lookupErr) return res.status(500).json({ error: 'role_lookup_failed', detail: lookupErr.message })
+    if (!roleRow) return res.status(404).json({ error: 'not_found' })
+
+    const reason = String(req.body?.inactive_reason || '').trim()
+    const patch = status === 'inactive'
+      ? {
+        status: 'inactive',
+        closed_at: new Date().toISOString(),
+        closed_by: req.user?.id || null,
+        inactive_reason: reason || null
+      }
+      : {
+        status: 'active',
+        closed_at: null,
+        closed_by: null,
+        inactive_reason: null
+      }
+
+    const { data, error } = await supabaseAdmin
+      .from('roles')
+      .update(patch)
+      .eq('id', roleId)
+      .eq('client_id', roleRow.client_id)
+      .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at,status,closed_at,closed_by,inactive_reason')
+      .maybeSingle()
+    if (error) return res.status(500).json({ error: 'role_status_update_failed', detail: error.message })
+    if (!data) return res.status(404).json({ error: 'not_found' })
+    return res.json({ item: data })
+  } catch (e) {
+    console.error('role_status_update_exception:', e?.message || e)
+    return res.status(500).json({ error: 'server_error' })
+  }
 })
 
 // Delete role by id + client_id (matches FE call shape)

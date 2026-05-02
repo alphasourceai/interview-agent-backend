@@ -77,6 +77,30 @@ function hasScopedWriteAccess(req, clientId) {
   return role === 'manager' || role === 'admin';
 }
 
+const ROLE_STATUS_VALUES = new Set(['active', 'inactive', 'all']);
+
+function normalizeRoleStatus(value, fallback = 'active') {
+  return String(value || fallback).trim().toLowerCase();
+}
+
+function roleStatusPatch(status, inactiveReason, userId) {
+  if (status === 'inactive') {
+    const reason = String(inactiveReason || '').trim();
+    return {
+      status: 'inactive',
+      closed_at: new Date().toISOString(),
+      closed_by: userId || null,
+      inactive_reason: reason || null
+    };
+  }
+  return {
+    status: 'active',
+    closed_at: null,
+    closed_by: null,
+    inactive_reason: null
+  };
+}
+
 
 /**
  * GET /roles?client_id=...
@@ -91,13 +115,23 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
       null;
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
+    const statusFilter = normalizeRoleStatus(req.query.status);
+    if (!ROLE_STATUS_VALUES.has(statusFilter)) {
+      return res.status(400).json({
+        error: 'bad_request',
+        code: 'INVALID_ROLE_STATUS_FILTER',
+        detail: 'status must be active, inactive, or all'
+      });
+    }
 
-    const { data, error } = await db
+    let roleQuery = db
       .from('roles')
-      .select('id,client_id,title,interview_type,created_at,rubric,job_description_url,slug_or_token')
+      .select('id,client_id,title,interview_type,created_at,rubric,job_description_url,slug_or_token,status,closed_at,closed_by,inactive_reason')
       .eq('client_id', clientId)
       .order('created_at', { ascending: false })
       .limit(500);
+    if (statusFilter !== 'all') roleQuery = roleQuery.eq('status', statusFilter);
+    const { data, error } = await roleQuery;
 
     if (error) {
       console.error('[GET /roles] supabase error', error);
@@ -200,6 +234,50 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
   } catch (e) {
     console.error('[POST /roles] unexpected', e);
     return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+router.patch('/:id/status', requireAuth, withClientScope, async (req, res) => {
+  try {
+    const roleId = String(req.params.id || '').trim();
+    const status = normalizeRoleStatus(req.body?.status, '');
+    if (!roleId) return res.status(400).json({ error: 'id required' });
+    if (status !== 'active' && status !== 'inactive') {
+      return res.status(400).json({
+        error: 'bad_request',
+        code: 'INVALID_ROLE_STATUS',
+        detail: 'status must be active or inactive'
+      });
+    }
+
+    const { data: roleRow, error: roleErr } = await db
+      .from('roles')
+      .select('id,client_id')
+      .eq('id', roleId)
+      .maybeSingle();
+    if (roleErr) {
+      console.error('[PATCH /roles/:id/status] lookup error', roleErr);
+      return res.status(500).json({ error: 'role_lookup_failed', detail: roleErr.message });
+    }
+    if (!roleRow) return res.status(404).json({ error: 'not_found' });
+    if (!hasScopedWriteAccess(req, roleRow.client_id)) return res.status(403).json({ error: 'forbidden' });
+
+    const { data, error } = await db
+      .from('roles')
+      .update(roleStatusPatch(status, req.body?.inactive_reason, req.user?.id || null))
+      .eq('id', roleId)
+      .eq('client_id', roleRow.client_id)
+      .select('id,client_id,title,interview_type,created_at,rubric,job_description_url,slug_or_token,status,closed_at,closed_by,inactive_reason')
+      .maybeSingle();
+    if (error) {
+      console.error('[PATCH /roles/:id/status] update error', error);
+      return res.status(500).json({ error: 'role_status_update_failed', detail: error.message });
+    }
+    if (!data) return res.status(404).json({ error: 'not_found' });
+    return res.json({ role: data });
+  } catch (e) {
+    console.error('[PATCH /roles/:id/status] unexpected', e);
+    return res.status(500).json({ error: 'server_error' });
   }
 });
 
