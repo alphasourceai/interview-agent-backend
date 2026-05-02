@@ -5,6 +5,7 @@ const { supabaseAdmin } = require('./supabaseClient');
 const { INSUFFICIENT_SUMMARY, isSubstantiveTranscript } = require('./interviewScoring');
 
 const DELETE_REASON_NO_SUBSTANTIVE = 'no_substantive_interview';
+const DELETE_REASON_ROLE_INACTIVE_EXPIRED = 'role_inactive_expired';
 const s3ClientsByRegion = new Map();
 
 function getS3Client(region) {
@@ -50,14 +51,22 @@ function isNoSubstantiveInterview(row) {
   return !isSubstantiveTranscript(transcript).ok;
 }
 
+function isExpiredRecording(row, now) {
+  const raw = String(row?.recording_expires_at || '').trim();
+  if (!raw) return false;
+  const expiresAt = new Date(raw);
+  return Number.isFinite(expiresAt.getTime()) && expiresAt <= now;
+}
+
 async function cleanupNoSubstantiveRecordings(options = {}) {
   const db = options.db || supabaseAdmin;
   const logger = options.logger || console;
   const region = String(process.env.AWS_REGION || process.env.TAVUS_RECORDING_S3_BUCKET_REGION || '').trim();
   const expectedBucket = String(process.env.TAVUS_RECORDING_S3_BUCKET_NAME || '').trim();
   const summary = { ok: true, scanned: 0, deleted: 0, skipped: 0, failed: 0 };
+  const now = new Date();
 
-  logger.log('[recording-cleanup] start', { reason: DELETE_REASON_NO_SUBSTANTIVE });
+  logger.log('[recording-cleanup] start', { reasons: [DELETE_REASON_NO_SUBSTANTIVE, DELETE_REASON_ROLE_INACTIVE_EXPIRED] });
   if (!region) {
     throw new Error('AWS region missing for recording cleanup');
   }
@@ -67,7 +76,7 @@ async function cleanupNoSubstantiveRecordings(options = {}) {
 
   const { data: rows, error } = await db
     .from('interviews')
-    .select('id, recording_metadata, recording_status, interview_summary, transcript')
+    .select('id, recording_metadata, recording_status, recording_expires_at, interview_summary, transcript')
     .eq('recording_status', 'ready');
 
   if (error) throw error;
@@ -78,8 +87,14 @@ async function cleanupNoSubstantiveRecordings(options = {}) {
     const metadata = parseJsonObject(row.recording_metadata);
     const bucketName = String(metadata.bucket_name || '').trim();
     const s3Key = String(metadata.s3_key || '').trim();
+    const noSubstantive = isNoSubstantiveInterview(row);
+    const deleteReason = noSubstantive
+      ? DELETE_REASON_NO_SUBSTANTIVE
+      : isExpiredRecording(row, now)
+        ? DELETE_REASON_ROLE_INACTIVE_EXPIRED
+        : null;
 
-    if (!bucketName || !s3Key || !isNoSubstantiveInterview(row)) {
+    if (!bucketName || !s3Key || !deleteReason) {
       summary.skipped += 1;
       continue;
     }
@@ -98,6 +113,7 @@ async function cleanupNoSubstantiveRecordings(options = {}) {
       summary.failed += 1;
       logger.error('[recording-cleanup] delete_failed', {
         interview_id: row.id,
+        reason: deleteReason,
         error: sanitized
       });
       const { error: updateErr } = await db
@@ -122,8 +138,9 @@ async function cleanupNoSubstantiveRecordings(options = {}) {
       .update({
         recording_status: 'deleted',
         recording_deleted_at: new Date().toISOString(),
-        recording_delete_reason: DELETE_REASON_NO_SUBSTANTIVE,
-        recording_delete_error: null
+        recording_delete_reason: deleteReason,
+        recording_delete_error: null,
+        recording_expires_at: null
       })
       .eq('id', row.id)
       .eq('recording_status', 'ready');
