@@ -10,6 +10,7 @@ const { requireAuth } = require('../src/middleware/auth');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
 const { redactEmail } = require('../src/lib/recoveryHelper');
 const { checkDuplicateCandidate, normalizeEmail, normalizePhone } = require('../src/lib/duplicateCandidate');
+const { isRoleInactive, logInactiveRoleBlocked } = require('../src/lib/roleLifecycle');
 const { buildTextInterviewUrl } = require('../config/urlConfig');
 const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
 
@@ -688,7 +689,7 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
       attempted.push('id');
       const { data: roleById, error: idErr } = await supabaseAdmin
         .from('roles')
-        .select('id, title, client_id, slug_or_token, description, job_description_text')
+        .select('id, title, client_id, slug_or_token, description, job_description_text, status')
         .eq('id', role_lookup_value)
         .limit(1)
         .maybeSingle();
@@ -708,7 +709,7 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
       attempted.push('slug_or_token');
       const { data: roleBySlug, error: slugErr } = await supabaseAdmin
         .from('roles')
-        .select('id, title, client_id, slug_or_token, description, job_description_text')
+        .select('id, title, client_id, slug_or_token, description, job_description_text, status')
         .eq('slug_or_token', role_lookup_value)
         .limit(1)
         .maybeSingle();
@@ -725,6 +726,14 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
       }
     }
     if (!role) {
+      return sendPublicRequestFailed(res, request_id);
+    }
+    if (isRoleInactive(role)) {
+      logInactiveRoleBlocked(console, {
+        route_name: 'accommodation_request',
+        request_id,
+        role_id: role.id || null
+      });
       return sendPublicRequestFailed(res, request_id);
     }
 

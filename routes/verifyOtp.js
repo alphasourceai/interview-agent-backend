@@ -5,6 +5,7 @@ const sg = require('@sendgrid/mail');
 const { supabase, supabaseAdmin } = require("../src/lib/supabaseClient");
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
+const { isRoleInactive, buildRoleInactivePayload, logInactiveRoleBlocked } = require('../src/lib/roleLifecycle');
 const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
 
 const router = express.Router();
@@ -153,6 +154,21 @@ router.post("/resend", resendOtpRateLimit, async (req, res) => {
     if (!roleId) return generic();
     Sentry.setTag('candidate_id', String(candidate_id));
     Sentry.setTag('role_id', String(roleId));
+
+    const { data: resendRole, error: resendRoleErr } = await supabase
+      .from('roles')
+      .select('id,status')
+      .eq('id', roleId)
+      .maybeSingle();
+    if (resendRoleErr || !resendRole) return generic();
+    if (isRoleInactive(resendRole)) {
+      logInactiveRoleBlocked(console, {
+        route_name: 'resend_otp',
+        request_id,
+        role_id: roleId
+      });
+      return generic();
+    }
 
     const nowIso = new Date().toISOString();
     const { error: invalidateErr } = await supabase
@@ -382,7 +398,7 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
 
     const { data: role, error: roleErr } = await supabase
       .from('roles')
-      .select('id,client_id')
+      .select('id,client_id,status')
       .eq('id', roleId)
       .maybeSingle();
     if (roleErr || !role) {
@@ -396,6 +412,14 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
     }
     sentryClientId = role.client_id || null;
     if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
+    if (isRoleInactive(role)) {
+      logInactiveRoleBlocked(console, {
+        route_name: 'verify_otp',
+        request_id,
+        role_id: roleId
+      });
+      return res.status(403).json(buildRoleInactivePayload(request_id));
+    }
     Sentry.addBreadcrumb({
       category: 'verify_otp',
       message: 'role loaded',

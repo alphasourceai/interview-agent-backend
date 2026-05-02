@@ -7,6 +7,7 @@ const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
 const { createTavusInterviewHandler } = require('../handlers/createTavusInterview');
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
+const { isRoleInactive, buildRoleInactivePayload, logInactiveRoleBlocked } = require('../src/lib/roleLifecycle');
 const { resolvePublicBackendBase } = require('../config/urlConfig');
 
 const router = express.Router();
@@ -188,6 +189,15 @@ router.post('/', createTavusRateLimit, async (req, res) => {
         candidate_client_id: candidateClientId || null,
         role_client_id: role?.client_id || null
       });
+    }
+
+    if (isRoleInactive(role)) {
+      logInactiveRoleBlocked(console, {
+        route_name: 'create_tavus_interview',
+        request_id,
+        role_id: role?.id || roleId || null
+      });
+      return res.status(403).json(buildRoleInactivePayload(request_id));
     }
 
     const clientId = role.client_id || candidate.client_id || null;

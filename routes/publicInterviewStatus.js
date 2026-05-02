@@ -3,6 +3,7 @@
 const express = require('express');
 const { supabase } = require('../src/lib/supabaseClient');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
+const { isRoleInactive, buildRoleInactivePayload, logInactiveRoleBlocked } = require('../src/lib/roleLifecycle');
 
 const router = express.Router();
 const PUBLIC_STATUS_RATE_WINDOW_MS = 5 * 60 * 1000;
@@ -59,7 +60,7 @@ router.get('/public/interview-status', publicStatusRateLimit, async (req, res) =
 
     const { data: role, error: roleError } = await supabase
       .from('roles')
-      .select('id, client_id')
+      .select('id, client_id, status')
       .eq('slug_or_token', role_token)
       .maybeSingle();
 
@@ -71,6 +72,15 @@ router.get('/public/interview-status', publicStatusRateLimit, async (req, res) =
         hint: null,
         request_id
       });
+    }
+
+    if (!interview_id && isRoleInactive(role)) {
+      logInactiveRoleBlocked(console, {
+        route_name: 'public_interview_status',
+        request_id,
+        role_id: role.id || null
+      });
+      return res.status(403).json(buildRoleInactivePayload(request_id));
     }
 
     let max_interview_minutes = null;

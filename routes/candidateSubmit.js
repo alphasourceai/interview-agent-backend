@@ -7,6 +7,7 @@ const sg = require('@sendgrid/mail');
 const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
+const { isRoleInactive, buildRoleInactivePayload, logInactiveRoleBlocked } = require('../src/lib/roleLifecycle');
 const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
 const analyzeResume = require('../analyzeResume'); // resume analyzer
 
@@ -146,13 +147,13 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
     if (role_id_in) {
       ({ data: role, error: rErr } = await supabase
         .from('roles')
-        .select('id, title, description, job_description_text, kb_document_id, client_id')
+        .select('id, title, description, job_description_text, kb_document_id, client_id, status')
         .eq('id', role_id_in)
         .single());
     } else {
       ({ data: role, error: rErr } = await supabase
         .from('roles')
-        .select('id, title, description, job_description_text, kb_document_id, client_id')
+        .select('id, title, description, job_description_text, kb_document_id, client_id, status')
         .eq('slug_or_token', role_token)
         .single());
     }
@@ -165,6 +166,14 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
     const roleId = role.id;
     sentryRoleId = roleId || null;
     sentryClientId = role.client_id || null;
+    if (isRoleInactive(role)) {
+      logInactiveRoleBlocked(console, {
+        route_name: 'candidate_submit',
+        request_id,
+        role_id: roleId || null
+      });
+      return res.status(403).json(buildRoleInactivePayload(request_id));
+    }
     if (sentryRoleId) Sentry.setTag('role_id', String(sentryRoleId));
     if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
     Sentry.addBreadcrumb({

@@ -9,6 +9,7 @@ const analyzeResume = require('../analyzeResume');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { checkDuplicateCandidate } = require('../src/lib/duplicateCandidate');
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
+const { isRoleInactive, buildRoleInactivePayload, logInactiveRoleBlocked } = require('../src/lib/roleLifecycle');
 
 const router = express.Router();
 
@@ -417,7 +418,7 @@ router.post('/session', async (req, res) => {
 
     const { data: role, error: roleErr } = await supabaseAdmin
       .from('roles')
-      .select('id, title, rubric, client_id')
+      .select('id, title, rubric, client_id, status')
       .eq('id', reqRow.role_id)
       .maybeSingle();
     if (roleErr || !role) {
@@ -431,6 +432,14 @@ router.post('/session', async (req, res) => {
     }
     sentryClientId = role.client_id || null;
     if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
+    if (!reqRow.text_completed_at && isRoleInactive(role)) {
+      logInactiveRoleBlocked(console, {
+        route_name: 'text_interview_session',
+        request_id,
+        role_id: role.id || reqRow.role_id || null
+      });
+      return sendError(res, 403, buildRoleInactivePayload(request_id));
+    }
     let candidateAssistanceContact = '';
     if (role.client_id) {
       try {
@@ -542,6 +551,31 @@ router.post('/resume', upload.any(), async (req, res) => {
     if (sentryRoleId) Sentry.setTag('role_id', String(sentryRoleId));
     ensureApprovedStatus(reqRow.status);
 
+    const { data: role, error: roleErr } = await supabaseAdmin
+      .from('roles')
+      .select('id, title, client_id, description, job_description_text, status')
+      .eq('id', reqRow.role_id)
+      .maybeSingle();
+    if (roleErr || !role) {
+      return sendError(res, 404, {
+        error: 'role_not_found',
+        code: roleErr?.code || 'role_not_found',
+        detail: roleErr?.message || null,
+        hint: roleErr?.hint || null,
+        request_id,
+      });
+    }
+    sentryClientId = role.client_id || null;
+    if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
+    if (isRoleInactive(role)) {
+      logInactiveRoleBlocked(console, {
+        route_name: 'text_interview_resume',
+        request_id,
+        role_id: role.id || reqRow.role_id || null
+      });
+      return sendError(res, 403, buildRoleInactivePayload(request_id));
+    }
+
     const file = (req.files || []).find(f =>
       ['resume', 'resume_file', 'file', 'resumeFile', 'pdf'].includes(f.fieldname)
     );
@@ -627,22 +661,6 @@ router.post('/resume', upload.any(), async (req, res) => {
     }
 
     if (reqRow.candidate_id) {
-      const { data: role, error: roleErr } = await supabaseAdmin
-        .from('roles')
-        .select('id, title, client_id, description, job_description_text')
-        .eq('id', reqRow.role_id)
-        .maybeSingle();
-      if (roleErr || !role) {
-        return sendError(res, 404, {
-          error: 'role_not_found',
-          code: roleErr?.code || 'role_not_found',
-          detail: roleErr?.message || null,
-          hint: roleErr?.hint || null,
-          request_id,
-        });
-      }
-      sentryClientId = role.client_id || null;
-      if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
       const roleForResume = {
         ...role,
         description: role.description || role.job_description_text || ''
@@ -781,6 +799,31 @@ router.post('/answers', async (req, res) => {
     if (sentryRoleId) Sentry.setTag('role_id', String(sentryRoleId));
     ensureApprovedStatus(reqRow.status);
 
+    const { data: role, error: roleErr } = await supabaseAdmin
+      .from('roles')
+      .select('id, title, rubric, client_id, description, job_description_text, status')
+      .eq('id', reqRow.role_id)
+      .maybeSingle();
+    if (roleErr || !role) {
+      return sendError(res, 404, {
+        error: 'role_not_found',
+        code: roleErr?.code || 'role_not_found',
+        detail: roleErr?.message || null,
+        hint: roleErr?.hint || null,
+        request_id,
+      });
+    }
+    sentryClientId = role.client_id || null;
+    if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
+    if (isRoleInactive(role)) {
+      logInactiveRoleBlocked(console, {
+        route_name: 'text_interview_answers',
+        request_id,
+        role_id: role.id || reqRow.role_id || null
+      });
+      return sendError(res, 403, buildRoleInactivePayload(request_id));
+    }
+
     let resumePresent = !!(reqRow.resume_url || reqRow.resume_received_at);
     let candidateResumeUrl = null;
     if (!resumePresent && reqRow.candidate_id) {
@@ -808,22 +851,6 @@ router.post('/answers', async (req, res) => {
       });
     }
 
-    const { data: role } = await supabaseAdmin
-      .from('roles')
-      .select('id, title, rubric, client_id, description, job_description_text')
-      .eq('id', reqRow.role_id)
-      .maybeSingle();
-    if (!role) {
-      return sendError(res, 404, {
-        error: 'role_not_found',
-        code: 'role_not_found',
-        detail: null,
-        hint: null,
-        request_id,
-      });
-    }
-    sentryClientId = role.client_id || null;
-    if (sentryClientId) Sentry.setTag('client_id', String(sentryClientId));
     const rubricQuestions = parseQuestions(role.rubric);
 
     const firstSubmit = !reqRow.text_completed_at;
