@@ -41,10 +41,9 @@ function safeJSONParse(s) {
 
 function makeKBFromRubric(rubricObj) {
   const qs = Array.isArray(rubricObj?.questions) ? rubricObj.questions : []
-  // Normalize to simple { text, category } like your kbs/*.json
+  // Tavus-facing KB must contain only clean question text, not rubric categories or scoring labels.
   const questions = qs.map(q => ({
-    text: typeof q?.text === 'string' ? q.text : String(q),
-    category: q?.category || 'auto'
+    text: typeof q?.text === 'string' ? q.text : String(q)
   })).filter(q => q.text && q.text.trim())
   return { questions }
 }
