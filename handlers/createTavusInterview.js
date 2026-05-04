@@ -219,13 +219,14 @@ function extractInterviewQuestions(role) {
 }
 
 function buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestion) {
-  const roleClause = roleTitle && roleTitle !== 'this position' ? `the ${roleTitle} role` : 'this role';
-  const openingQuestion = firstQuestion || 'can you tell me a bit about your background and how it relates to this role?';
+  const safeCandidateName = String(candidateName || '').trim() || 'there';
+  const roleClause = roleTitle && roleTitle !== 'this position' ? `the ${roleTitle} position` : 'this role';
+  const openingQuestion = firstQuestion || 'Can you tell me a bit about your background and how it relates to this role?';
   const greeting = [
-    `Hi ${candidateName}.`,
-    'Thanks for joining.',
-    `We\'ll keep this focused on ${roleClause}.`,
-    'Let\'s start with this:'
+    `Hi ${safeCandidateName}. I hope your day is going well.`,
+    `Thanks for joining me today for this interview for ${roleClause}.`,
+    'I\'ll ask one question at a time, and you can answer naturally.',
+    'Let\'s start with the first question.'
   ].join(' ');
   return `${greeting} ${openingQuestion}`;
 }
