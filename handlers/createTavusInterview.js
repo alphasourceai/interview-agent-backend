@@ -219,15 +219,15 @@ function extractInterviewQuestions(role) {
 }
 
 function buildCustomGreeting(candidateName, roleTitle, companyName, firstQuestion) {
-  const companyClause = companyName ? ` at ${companyName}` : '';
+  const roleClause = roleTitle && roleTitle !== 'this position' ? `the ${roleTitle} role` : 'this role';
+  const openingQuestion = firstQuestion || 'can you tell me a bit about your background and how it relates to this role?';
   const greeting = [
     `Hi ${candidateName}.`,
-    'Thank you for taking the time to speak with me today.',
-    `I\'ll be conducting your interview for the ${roleTitle} position${companyClause}.`,
-    'I\'ll ask questions one at a time, and you can answer naturally.',
-    'Let\'s get started.'
+    'Thanks for joining.',
+    `We\'ll keep this focused on ${roleClause}.`,
+    'Let\'s start with this:'
   ].join(' ');
-  return `${greeting} ${firstQuestion}`;
+  return `${greeting} ${openingQuestion}`;
 }
 
 function buildConversationalContext(candidateName, roleTitle, companyName, rubricQuestions = []) {
@@ -249,15 +249,19 @@ function buildConversationalContext(candidateName, roleTitle, companyName, rubri
     '- Avoid rushed or compressed delivery, especially in the opening.',
     '- Sound like a human interviewer, not a disclaimer or scripted speed-read.',
     '- Ask questions one at a time from the rubric.',
+    '- After a candidate answers, briefly acknowledge in one short phrase, then ask the next question naturally.',
+    '- Do not score, evaluate, praise excessively, or summarize the answer at length during transitions.',
+    '- Keep transitions varied and brief, such as "Thanks, that helps.", "Got it.", or "That makes sense."',
     '- Expand common business/job-title abbreviations when speaking naturally.',
     '- Use these spoken expansions: Sr/SR = Senior, Jr/JR = Junior, VP = Vice President, SVP = Senior Vice President, EVP = Executive Vice President, Dir = Director, Mgr = Manager, Ops = Operations, HR = Human Resources, IT = Information Technology.',
-    '- After asking a question, if the candidate does not begin responding after about 5 to 7 seconds, check in once naturally and address the candidate by first name (for example, "Hi there, are you still with me?").',
-    '- If there is still no response after that one check-in, briefly restate the question once or move on naturally. Do not remain in indefinite silence.',
-    '- If an answer is very short, vague, non-specific, or does not answer the question, briefly acknowledge it and ask exactly one short follow-up (for example, "Could you tell me a little more about that?").',
+    '- After asking a question, if the candidate does not begin responding after a short pause, about 4 to 5 seconds, check in once naturally and address the candidate by first name (for example, "Hi there, are you still with me?").',
+    '- If there is still no response after that one check-in, briefly restate the question once or move on naturally. Do not remain in indefinite silence, sound annoyed, or repeat the same check-in.',
+    '- If an answer is very short, vague, non-specific, or does not answer the question, briefly acknowledge it and ask exactly one short follow-up tied to the candidate\'s answer.',
+    '- If no targeted follow-up is obvious, ask: "Could you share one specific example?"',
     '- After one follow-up attempt, if the candidate still does not elaborate, move on to the next rubric question.',
-    '- END OF INTERVIEW PROTOCOL: After the final rubric question is answered, ask exactly once: "Do you have any questions for me before we wrap up?"',
+    '- After the final rubric question is answered, ask exactly once: "Do you have any questions for me before we wrap up?"',
     '- If the candidate asks a question at the end, answer it briefly in no more than 2 sentences, then ask exactly once: "Any other questions? If not, just say \'no\'."',
-    '- If the candidate indicates they have no further questions (including no, nope, that\'s all, I\'m good, or similar), say exactly: "Thanks for your time today - this concludes the interview. I\'m ending the session now." Then end the call/session immediately with no additional prompts, silence, or follow-up questions.',
+    '- If the candidate indicates they have no further questions (including no, nope, that\'s all, I\'m good, or similar), say exactly: "Thanks for your time today. This concludes the interview, and I\'m ending the session now." Then end the call/session immediately with no additional prompts, silence, or follow-up questions.',
     '- Do not ask the end-of-interview questions more than twice total: the initial "Do you have any questions for me before we wrap up?" plus one "Any other questions? If not, just say \'no\'." follow-up maximum.',
     '- Do not sit silently waiting after the candidate says no. End immediately.',
     '- Use ONLY the provided knowledge base (KB) and rubric when answering questions about the role, company, or process.',
