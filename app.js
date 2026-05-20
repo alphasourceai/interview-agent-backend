@@ -56,7 +56,7 @@ const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
 const { buildClientScopeContext } = require('./src/lib/clientScope')
-const { requireParentClient } = require('./src/lib/clientBillingScope')
+const { requireParentClient, resolveBillingOwnerForScope } = require('./src/lib/clientBillingScope')
 const { getRoleInterviewAvailability } = require('./src/lib/roleInterviewAvailability')
 const { cleanupNoSubstantiveRecordings } = require('./src/lib/recordingCleanup')
 const { createSubscriptionCheckoutSession } = require('./src/lib/subscriptionCheckout')
@@ -358,13 +358,21 @@ function getClientMembershipRole(req, clientId) {
 function hasClientWriteAccess(req, clientId) {
   if (req?.isGlobalAdmin === true || req?.isAdmin === true) return true
   const role = getClientMembershipRole(req, clientId)
-  return role === 'manager' || role === 'admin'
+  return role === 'manager' || role === 'admin' || role === 'super_admin'
 }
 
 function wantsEmbeddedCheckout(value) {
   if (value === true) return true
   const raw = String(value || '').trim().toLowerCase()
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'embedded'
+}
+
+function respondWithBillingScopeError(res, result, fallbackError) {
+  const body = result?.body || {}
+  return res.status(result?.status || 500).json({
+    error: body.error || body.code || fallbackError || 'billing_client_lookup_failed',
+    detail: body.detail || 'Billing client lookup failed.'
+  })
 }
 
 app.post('/clients/billing/portal-session', requireAuth, withClientScope, async (req, res) => {
@@ -420,6 +428,10 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
     if (!Number.isInteger(quantity) || quantity <= 0) {
       return res.status(400).json({ error: 'invalid_quantity' })
     }
+    const billingScope = await resolveBillingOwnerForScope(supabaseAdmin, clientId)
+    if (!billingScope.ok) return respondWithBillingScopeError(res, billingScope, 'billing_client_lookup_failed')
+    const billingClient = billingScope.billingClient || {}
+    const billingClientId = billingScope.billingClientId || clientId
 
     const { data: role, error: roleErr } = await supabaseAdmin
       .from('roles')
@@ -430,18 +442,10 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
     if (roleErr) return res.status(500).json({ error: 'role_lookup_failed', detail: roleErr.message })
     if (!role) return res.status(404).json({ error: 'role_not_found' })
 
-    const { data: client, error: clientErr } = await supabaseAdmin
-      .from('clients')
-      .select('id,name,email,stripe_customer_id')
-      .eq('id', clientId)
-      .maybeSingle()
-    if (clientErr) return res.status(500).json({ error: 'client_lookup_failed', detail: clientErr.message })
-    if (!client) return res.status(404).json({ error: 'client_not_found' })
-
     const { data: planSettings, error: planSettingsErr } = await supabaseAdmin
       .from('client_plan_settings')
       .select('additional_interview_fee')
-      .eq('client_id', clientId)
+      .eq('client_id', billingClientId)
       .maybeSingle()
     if (planSettingsErr) return res.status(500).json({ error: 'plan_settings_lookup_failed', detail: planSettingsErr.message })
 
@@ -471,7 +475,7 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
     const Stripe = require('stripe')
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
 
-    let stripeCustomerId = String(client.stripe_customer_id || '').trim()
+    let stripeCustomerId = String(billingClient.stripe_customer_id || '').trim()
     if (stripeCustomerId) {
       try {
         await stripe.customers.retrieve(stripeCustomerId)
@@ -486,26 +490,30 @@ app.post('/clients/billing/additional-interviews/checkout-session', requireAuth,
       }
     }
     if (!stripeCustomerId) {
-      const email = String(client.email || '').trim()
+      const email = String(billingClient.email || '').trim()
       if (email) {
         const found = await stripe.customers.list({ email, limit: 1 })
         stripeCustomerId = String(found?.data?.[0]?.id || '').trim()
       }
       if (!stripeCustomerId) {
         const createdCustomer = await stripe.customers.create({
-          name: client.name || undefined,
-          email: String(client.email || '').trim() || undefined,
-          metadata: { client_id: client.id }
+          name: billingClient.name || undefined,
+          email: String(billingClient.email || '').trim() || undefined,
+          metadata: {
+            client_id: billingClientId,
+            billing_client_id: billingClientId,
+            scope_client_id: clientId
+          }
         })
         stripeCustomerId = String(createdCustomer?.id || '').trim()
       }
       if (!stripeCustomerId) return res.status(500).json({ error: 'stripe_customer_create_failed' })
 
-      if (stripeCustomerId !== String(client.stripe_customer_id || '').trim()) {
+      if (stripeCustomerId !== String(billingClient.stripe_customer_id || '').trim()) {
         const { error: saveCustomerError } = await supabaseAdmin
           .from('clients')
           .update({ stripe_customer_id: stripeCustomerId })
-          .eq('id', client.id)
+          .eq('id', billingClientId)
         if (saveCustomerError) {
           return res.status(500).json({ error: 'client_update_failed', detail: saveCustomerError.message })
         }
@@ -651,16 +659,20 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
         ? 'application/pdf'
         : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 
-    const { data: client, error: clientErr } = await supabaseAdmin
+    const billingScope = await resolveBillingOwnerForScope(supabaseAdmin, clientId)
+    if (!billingScope.ok) return respondWithBillingScopeError(res, billingScope, 'billing_client_lookup_failed')
+    const billingClientId = billingScope.billingClientId || clientId
+
+    const { data: billingClient, error: clientErr } = await supabaseAdmin
       .from('clients')
       .select('id,name,email,billing_status,access_override_mode,stripe_customer_id')
-      .eq('id', clientId)
+      .eq('id', billingClientId)
       .maybeSingle()
     if (clientErr) return res.status(500).json({ error: 'client_lookup_failed', detail: clientErr.message })
-    if (!client) return res.status(404).json({ error: 'client_not_found' })
+    if (!billingClient) return res.status(404).json({ error: 'client_not_found' })
 
-    const accessOverrideMode = String(client.access_override_mode || '').toLowerCase()
-    const billingStatus = String(client.billing_status || '').toLowerCase()
+    const accessOverrideMode = String(billingClient.access_override_mode || '').toLowerCase()
+    const billingStatus = String(billingClient.billing_status || '').toLowerCase()
     const allowedByBilling =
       accessOverrideMode === 'force_active' ||
       (accessOverrideMode !== 'force_inactive' && billingStatus === 'active')
@@ -669,7 +681,7 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
     const { data: planSettings, error: planSettingsErr } = await supabaseAdmin
       .from('client_plan_settings')
       .select('plan_tier,billing_interval,per_role_fee')
-      .eq('client_id', client.id)
+      .eq('client_id', billingClientId)
       .maybeSingle()
     if (planSettingsErr) return res.status(500).json({ error: 'plan_settings_lookup_failed', detail: planSettingsErr.message })
     if (!planSettings) return res.status(400).json({ error: 'missing_plan_settings' })
@@ -686,7 +698,7 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
     const Stripe = require('stripe')
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
 
-    let stripeCustomerId = String(client.stripe_customer_id || '').trim()
+    let stripeCustomerId = String(billingClient.stripe_customer_id || '').trim()
     if (stripeCustomerId) {
       try {
         await stripe.customers.retrieve(stripeCustomerId)
@@ -701,26 +713,30 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
       }
     }
     if (!stripeCustomerId) {
-      const email = String(client.email || '').trim()
+      const email = String(billingClient.email || '').trim()
       if (email) {
         const found = await stripe.customers.list({ email, limit: 1 })
         stripeCustomerId = String(found?.data?.[0]?.id || '').trim()
       }
       if (!stripeCustomerId) {
         const createdCustomer = await stripe.customers.create({
-          name: client.name || undefined,
-          email: String(client.email || '').trim() || undefined,
-          metadata: { client_id: client.id }
+          name: billingClient.name || undefined,
+          email: String(billingClient.email || '').trim() || undefined,
+          metadata: {
+            client_id: billingClientId,
+            billing_client_id: billingClientId,
+            scope_client_id: clientId
+          }
         })
         stripeCustomerId = String(createdCustomer?.id || '').trim()
       }
       if (!stripeCustomerId) return res.status(500).json({ error: 'stripe_customer_create_failed' })
 
-      if (stripeCustomerId !== String(client.stripe_customer_id || '').trim()) {
+      if (stripeCustomerId !== String(billingClient.stripe_customer_id || '').trim()) {
         const { error: saveCustomerError } = await supabaseAdmin
           .from('clients')
           .update({ stripe_customer_id: stripeCustomerId })
-          .eq('id', client.id)
+          .eq('id', billingClientId)
         if (saveCustomerError) {
           return res.status(500).json({ error: 'client_update_failed', detail: saveCustomerError.message })
         }
@@ -730,7 +746,7 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
     const { data: pendingRolePurchase, error: pendingRolePurchaseErr } = await supabaseAdmin
       .from('pending_role_purchases')
       .insert({
-        client_id: client.id,
+        client_id: clientId,
         stripe_customer_id: stripeCustomerId || null,
         status: 'pending',
         role_title: roleTitle,
@@ -744,7 +760,7 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
       return res.status(500).json({ error: 'create_pending_role_purchase_failed', detail: pendingRolePurchaseErr.message })
     }
 
-    const pendingJdObjectKey = `pending/${client.id}/${pendingRolePurchase.id}/${safeFilename}`
+    const pendingJdObjectKey = `pending/${clientId}/${pendingRolePurchase.id}/${safeFilename}`
     const pendingJdUpload = await supabaseAdmin.storage
       .from(ROLE_CHECKOUT_JD_BUCKET)
       .upload(pendingJdObjectKey, jdFile.buffer, { contentType, upsert: true })
@@ -765,7 +781,7 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
 
     const sessionMetadata = {
       source: 'client_role_purchase',
-      client_id: client.id,
+      client_id: clientId,
       pending_role_purchase_id: pendingRolePurchase.id,
       role_title: roleTitle,
       interview_type: interviewType,
@@ -781,12 +797,12 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
 
     const successParams = new URLSearchParams({
       role_checkout: 'success',
-      client_id: String(client.id),
+      client_id: String(clientId),
       tab
     })
     const cancelParams = new URLSearchParams({
       role_checkout: 'cancel',
-      client_id: String(client.id),
+      client_id: String(clientId),
       tab
     })
     if (roleId) {
