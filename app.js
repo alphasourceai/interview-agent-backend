@@ -56,6 +56,7 @@ const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
 const { buildClientScopeContext } = require('./src/lib/clientScope')
+const { requireParentClient } = require('./src/lib/clientBillingScope')
 const { getRoleInterviewAvailability } = require('./src/lib/roleInterviewAvailability')
 const { cleanupNoSubstantiveRecordings } = require('./src/lib/recordingCleanup')
 const { createSubscriptionCheckoutSession } = require('./src/lib/subscriptionCheckout')
@@ -1834,6 +1835,15 @@ async function countClientDeleteBlockers(clientId) {
   return { blockers, warnings, checkErrors }
 }
 
+async function rejectChildClientForAdminBilling(req, res, context) {
+  const result = await requireParentClient(supabaseAdmin, req.params?.id, context)
+  if (!result.ok) {
+    res.status(result.status || 500).json(result.body || { error: 'client_lookup_failed' })
+    return null
+  }
+  return result
+}
+
 // List all clients
 adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
   const { data, error } = await supabaseAdmin
@@ -2024,6 +2034,8 @@ adminRouter.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (r
   if (typeof autoRenew !== 'boolean') {
     return res.status(400).json({ error: 'invalid_auto_renew' })
   }
+  const parentGuard = await rejectChildClientForAdminBilling(req, res, { route: 'admin_clients_auto_renew' })
+  if (!parentGuard) return
   const { data: client, error: clientError } = await supabaseAdmin
     .from('clients')
     .select('id,stripe_subscription_id,subscription_status,auto_renew,cancel_at_term_end,billing_interval')
@@ -2097,6 +2109,8 @@ adminRouter.post('/clients/:id/cancel-contract', requireAuth, requireAdmin, asyn
     ? parsedFinalInvoiceAmount
     : null
   const nowIso = new Date().toISOString()
+  const parentGuard = await rejectChildClientForAdminBilling(req, res, { route: 'admin_clients_cancel_contract' })
+  if (!parentGuard) return
 
   const { data: client, error: clientError } = await supabaseAdmin
     .from('clients')
@@ -2409,6 +2423,8 @@ adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAd
       request_id
     })
   }
+  const parentGuard = await rejectChildClientForAdminBilling(req, res, { route: 'admin_clients_billing_checkout_session' })
+  if (!parentGuard) return
 
   const { data: client, error: clientError } = await supabaseAdmin
     .from('clients')
@@ -2556,6 +2572,9 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
   const billingInterval = String(req.body?.billing_interval || '').trim().toLowerCase()
   const returnTab = String(req.body?.tab || '').trim().toLowerCase()
 
+  const parentGuard = await rejectChildClientForAdminBilling(req, res, { route: 'admin_clients_subscription_checkout' })
+  if (!parentGuard) return
+
   try {
     const enterpriseFees = planTier === 'enterprise'
       ? {
@@ -2624,6 +2643,8 @@ adminRouter.post('/clients/:id/subscription-invoice', requireAuth, requireAdmin,
   if (!['monthly', 'annual'].includes(billingInterval)) {
     return res.status(400).json({ error: 'invalid_billing_interval' })
   }
+  const parentGuard = await rejectChildClientForAdminBilling(req, res, { route: 'admin_clients_subscription_invoice' })
+  if (!parentGuard) return
 
   const { data: client, error: clientError } = await supabaseAdmin
     .from('clients')
