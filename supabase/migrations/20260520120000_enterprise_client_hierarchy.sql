@@ -30,27 +30,23 @@ comment on column public.clients.entity_label is
 
 do $$
 begin
-  if to_regclass('public.client_members') is not null
-     and exists (
-       select 1
-       from pg_constraint
-       where conrelid = 'public.client_members'::regclass
-         and conname = 'client_members_role_check'
-         and contype = 'c'
-     ) then
+  if to_regclass('public.client_members') is not null then
     alter table public.client_members
-      drop constraint client_members_role_check;
+      drop constraint if exists client_members_role_check;
 
     alter table public.client_members
-      add constraint client_members_role_check
+      drop constraint if exists client_members_role_chk;
+
+    alter table public.client_members
+      add constraint client_members_role_chk
       check (
         role = any (
           array[
-            'owner'::text,
-            'admin'::text,
             'member'::text,
             'manager'::text,
+            'admin'::text,
             'tester'::text,
+            'owner'::text,
             'super_admin'::text
           ]
         )
