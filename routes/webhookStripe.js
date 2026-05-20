@@ -2,6 +2,7 @@
 const express = require('express');
 const Stripe = require('stripe');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
+const { requireParentClient } = require('../src/lib/clientBillingScope');
 const { getRoleInterviewAvailability } = require('../src/lib/roleInterviewAvailability');
 const router = express.Router();
 
@@ -85,6 +86,19 @@ const PLAN_SETTINGS_DEFAULTS = {
     max_interview_minutes: 10
   }
 };
+
+async function requireParentClientForStripeBilling(clientId, context = {}) {
+  const result = await requireParentClient(supabaseAdmin, clientId, context);
+  if (result.ok) return result;
+
+  const body = result.body || {};
+  const err = new Error(body.detail || body.error || body.code || 'Client billing scope check failed');
+  err.code = body.code || body.error || 'CLIENT_BILLING_SCOPE_CHECK_FAILED';
+  err.status = result.status || 500;
+  err.detail = body.detail || err.message;
+  err.context = body.context || context || null;
+  throw err;
+}
 
 function normalizeBillingInterval(raw, fallback = null) {
   const intervalRaw = String(raw || '').toLowerCase();
@@ -227,6 +241,11 @@ async function upsertClientPlanSettingsFromSubscription(subscription, clientId, 
     }
     return false;
   }
+  await requireParentClientForStripeBilling(clientId, {
+    route: 'stripe_webhook_client_plan_settings',
+    client_id: clientId,
+    subscription_id: pickId(subscription?.id) || null
+  });
   const { error } = await supabaseAdmin
     .from('client_plan_settings')
     .upsert(payload, { onConflict: 'client_id' });
@@ -290,6 +309,27 @@ async function markAgreementCheckoutPaid(agreementId, options = {}) {
   if (!normalizedAgreementId) return;
   const paidAt = String(options.paidAt || '').trim() || new Date().toISOString();
   const checkoutSessionId = String(options.checkoutSessionId || '').trim() || null;
+
+  const { data: agreement, error: agreementErr } = await supabaseAdmin
+    .from('membership_agreements')
+    .select('id,client_id')
+    .eq('id', normalizedAgreementId)
+    .maybeSingle();
+  if (agreementErr) throw new Error(agreementErr.message || 'Agreement lookup failed');
+  if (!agreement) return;
+
+  const agreementClientId = String(agreement.client_id || '').trim();
+  if (!agreementClientId) {
+    const err = new Error('Agreement is not linked to a client.');
+    err.code = 'missing_agreement_client_id';
+    err.agreement_id = normalizedAgreementId;
+    throw err;
+  }
+  await requireParentClientForStripeBilling(agreementClientId, {
+    route: 'stripe_webhook_agreement_checkout_paid',
+    agreement_id: normalizedAgreementId,
+    client_id: agreementClientId
+  });
 
   const payload = {
     checkout_status: 'paid',
@@ -374,6 +414,13 @@ router.post('/', async (req, res) => {
           .maybeSingle();
         if (clientErr) throw new Error(clientErr.message || 'Client lookup failed');
         if (client?.id && !shouldIgnoreStaleSubscriptionUpdate(client, incomingSubscriptionId, event.type)) {
+          await requireParentClientForStripeBilling(client.id, {
+            route: 'stripe_webhook_customer_subscription',
+            event_type: event.type,
+            client_id: client.id,
+            customer_id: customerId,
+            subscription_id: incomingSubscriptionId
+          });
           const updates = buildClientSubscriptionUpdatesFromStripe(eventObject, {
             fallbackCustomerId: customerId,
             fallbackSubscriptionId: incomingSubscriptionId
@@ -643,6 +690,13 @@ router.post('/', async (req, res) => {
             targetClientId = customerClient?.id || null;
           }
           if (targetClientId) {
+            await requireParentClientForStripeBilling(targetClientId, {
+              route: 'stripe_webhook_checkout_subscription',
+              client_id: targetClientId,
+              customer_id: customerId,
+              subscription_id: subscriptionId,
+              source: metadataSource || null
+            });
             const subscription = await stripe.subscriptions.retrieve(subscriptionId);
             const updates = buildClientSubscriptionUpdatesFromStripe(subscription, {
               fallbackCustomerId: customerId,
@@ -715,6 +769,12 @@ router.post('/', async (req, res) => {
           .maybeSingle();
         if (activationClientErr) throw new Error(activationClientErr.message || 'Client lookup failed');
         if (!activationClient?.id) throw new Error('Client lookup failed');
+        await requireParentClientForStripeBilling(activationClient.id, {
+          route: 'stripe_webhook_invoice_managed_activation',
+          client_id: activationClient.id,
+          subscription_id: subscriptionId,
+          source: metadataSource || null
+        });
 
         const contractStartAt = new Date().toISOString();
         const contractEndAt = addMonthsToIso(contractStartAt, 12);
@@ -759,6 +819,13 @@ router.post('/', async (req, res) => {
         if (clientErr) throw new Error(clientErr.message || 'Client lookup failed');
         if (client?.id) {
           if (subscriptionId && !shouldIgnoreStaleSubscriptionUpdate(client, subscriptionId, event.type)) {
+            await requireParentClientForStripeBilling(client.id, {
+              route: 'stripe_webhook_invoice_subscription_sync',
+              event_type: event.type,
+              client_id: client.id,
+              customer_id: customerId,
+              subscription_id: subscriptionId
+            });
             const subscription = await stripe.subscriptions.retrieve(subscriptionId);
             const updates = buildClientSubscriptionUpdatesFromStripe(subscription, {
               fallbackCustomerId: customerId,
