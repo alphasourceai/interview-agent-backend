@@ -9,6 +9,7 @@ try {
   console.error('[billing] stripe_client_load_failed', e?.message || e);
 }
 const { supabaseAnon, supabaseAdmin } = require('../src/lib/supabaseClient');
+const { requireParentClient } = require('../src/lib/clientBillingScope');
 const { htmlToPdf } = require('../utils/pdfRenderer');
 const { buildMembershipAgreementHtml, normalizeMembershipAgreementInput } = require('../utils/renderMembershipAgreement');
 const { sendMembershipAgreementEmail, sendMembershipAgreementInternalNotification } = require('../utils/mailer');
@@ -137,6 +138,21 @@ function validateAgreementPayload(payload) {
   }
 
   return { ok: true };
+}
+
+async function requireParentClientForAdminBilling(clientId, context) {
+  return requireParentClient(supabaseAdmin, clientId, context);
+}
+
+function respondWithParentClientGuard(res, result, request_id) {
+  return res.status(result.status || 500).json({
+    ...(result.body || {
+      error: 'client_lookup_failed',
+      code: 'client_lookup_failed',
+      detail: 'Client lookup failed.'
+    }),
+    request_id
+  });
 }
 
 async function resolveAgreementAdminUserId(email) {
@@ -495,6 +511,11 @@ router.get('/agreements/pending', async (req, res) => {
   }
 
   try {
+    if (scopedToClient) {
+      const parentGuard = await requireParentClientForAdminBilling(clientId, { route: 'admin_billing_agreements_pending' });
+      if (!parentGuard.ok) return respondWithParentClientGuard(res, parentGuard, request_id);
+    }
+
     let query = supabaseAdmin
       .from('membership_agreements')
       .select(AGREEMENT_PENDING_SELECT)
@@ -735,6 +756,11 @@ router.post('/agreements/preview-html', async (req, res) => {
       });
     }
 
+    if (payload.client_mode === AGREEMENT_CLIENT_MODE_ATTACH && payload.client_id) {
+      const parentGuard = await requireParentClientForAdminBilling(payload.client_id, { route: 'admin_billing_agreements_preview_html' });
+      if (!parentGuard.ok) return respondWithParentClientGuard(res, parentGuard, request_id);
+    }
+
     const { html } = buildMembershipAgreementHtml(payload);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(200).send(html);
@@ -756,6 +782,11 @@ async function renderAgreementPreviewPdf(req, res) {
         detail: validation.detail,
         request_id
       });
+    }
+
+    if (payload.client_mode === AGREEMENT_CLIENT_MODE_ATTACH && payload.client_id) {
+      const parentGuard = await requireParentClientForAdminBilling(payload.client_id, { route: 'admin_billing_agreements_preview_pdf' });
+      if (!parentGuard.ok) return respondWithParentClientGuard(res, parentGuard, request_id);
     }
 
     if (payload.client_mode === AGREEMENT_CLIENT_MODE_ATTACH && payload.client_id && !payload.confirm_replace_existing) {
@@ -821,6 +852,9 @@ router.post('/agreements/send', async (req, res) => {
         request_id
       });
     }
+
+    const parentGuard = await requireParentClientForAdminBilling(resolvedClientId, { route: 'admin_billing_agreements_send', client_mode: payload.client_mode });
+    if (!parentGuard.ok) return respondWithParentClientGuard(res, parentGuard, request_id);
 
     if (payload.client_mode === AGREEMENT_CLIENT_MODE_ATTACH && !payload.confirm_replace_existing) {
       const currentAgreement = await findCurrentSignedAgreementForClient(resolvedClientId);
@@ -1064,6 +1098,10 @@ router.post('/customers', async (req, res) => {
     if (!name || !primary_contact_name || !primary_contact_email) {
       return res.status(400).json({ error: 'missing_fields', code: 'missing_fields', detail: 'name, primary_contact_name, primary_contact_email required', request_id });
     }
+    if (client_id) {
+      const parentGuard = await requireParentClientForAdminBilling(client_id, { route: 'admin_billing_customers_create' });
+      if (!parentGuard.ok) return respondWithParentClientGuard(res, parentGuard, request_id);
+    }
 
     const { data, error } = await supabaseAdmin
       .from('billing_customers')
@@ -1216,6 +1254,10 @@ router.post('/invoices/send', async (req, res) => {
     if (!invoice_title || (!billing_customer_id && !client_id)) {
       return res.status(400).json({ error: 'missing_fields', code: 'missing_fields', detail: 'client_id (or billing_customer_id) and invoice_title are required', request_id });
     }
+    if (client_id) {
+      const parentGuard = await requireParentClientForAdminBilling(client_id, { route: 'admin_billing_invoices_send_client' });
+      if (!parentGuard.ok) return respondWithParentClientGuard(res, parentGuard, request_id);
+    }
 
     const normalizedItems = (line_items || []).map((li) => {
       const description = (li?.description || '').trim();
@@ -1254,7 +1296,7 @@ router.post('/invoices/send', async (req, res) => {
     if (billing_customer_id) {
       const { data: fetchedCustomer, error: fetchErr } = await supabaseAdmin
         .from('billing_customers')
-        .select('id,name,primary_contact_name,primary_contact_email,stripe_customer_id')
+        .select('id,client_id,name,primary_contact_name,primary_contact_email,stripe_customer_id')
         .eq('id', billing_customer_id)
         .maybeSingle();
       if (fetchErr) {
@@ -1262,6 +1304,10 @@ router.post('/invoices/send', async (req, res) => {
         return res.status(500).json({ error: 'customer_lookup_failed', code: fetchErr.code || 'customer_lookup_failed', detail: fetchErr.message, hint: fetchErr.hint, request_id });
       }
       billingCustomer = fetchedCustomer || null;
+      if (billingCustomer?.client_id) {
+        const parentGuard = await requireParentClientForAdminBilling(billingCustomer.client_id, { route: 'admin_billing_invoices_send_billing_customer' });
+        if (!parentGuard.ok) return respondWithParentClientGuard(res, parentGuard, request_id);
+      }
     } else {
       const { data: clientRow, error: clientErr } = await supabaseAdmin
         .from('clients')
