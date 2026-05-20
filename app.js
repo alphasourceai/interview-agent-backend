@@ -55,6 +55,7 @@ const axios = require('axios')
 const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
+const { buildClientScopeContext } = require('./src/lib/clientScope')
 const { getRoleInterviewAvailability } = require('./src/lib/roleInterviewAvailability')
 const { cleanupNoSubstantiveRecordings } = require('./src/lib/recordingCleanup')
 const { createSubscriptionCheckoutSession } = require('./src/lib/subscriptionCheckout')
@@ -182,8 +183,70 @@ app.get('/auth/ping', requireAuth, withClientScope, (req, res) => {
   res.json({ ok: true, user: req.user, client_ids: req.clientIds })
 })
 
+function uniqueClientIds(ids) {
+  return Array.from(new Set((Array.isArray(ids) ? ids : []).map(id => String(id || '').trim()).filter(Boolean)))
+}
+
+async function loadClientScopeContextForResponse(req, assignedClients) {
+  const assignedIds = uniqueClientIds(req.clientIds || [])
+  let clients = Array.isArray(assignedClients) ? assignedClients.slice() : []
+
+  if (assignedIds.length > 0 && !assignedClients) {
+    const { data, error } = await supabaseAdmin
+      .from('clients')
+      .select('id, name, parent_client_id, entity_label')
+      .in('id', assignedIds)
+    if (!error && Array.isArray(data)) clients = data
+  }
+
+  if (assignedIds.length > 0 && req.isGlobalAdmin !== true) {
+    const { data: childClients, error: childError } = await supabaseAdmin
+      .from('clients')
+      .select('id, name, parent_client_id, entity_label')
+      .in('parent_client_id', assignedIds)
+    if (!childError && Array.isArray(childClients)) clients = clients.concat(childClients)
+  }
+
+  return buildClientScopeContext({
+    memberships: req.memberships || [],
+    clients,
+  })
+}
+
+function clientScopeMetadata(scopeContext, clientId) {
+  const id = String(clientId || '').trim()
+  const client = scopeContext?.clientById?.[id] || { id }
+  const permissions = scopeContext?.permissionsByClientId?.[id] || {
+    can_create_roles: false,
+    can_purchase_interviews: false,
+    can_view_legal_billing: false,
+    can_manage_members: false,
+  }
+
+  return {
+    parent_client_id: client.parent_client_id || null,
+    entity_label: client.entity_label || null,
+    billing_client_id: client.billing_client_id || id || null,
+    is_parent_client: client.is_parent_client !== false,
+    is_child_client: client.is_child_client === true,
+    permissions,
+  }
+}
+
 // ---------- Auth me ----------
-app.get('/auth/me', requireAuth, withClientScope, (req, res) => {
+app.get('/auth/me', requireAuth, withClientScope, async (req, res) => {
+  let scopeContext = null
+  try {
+    scopeContext = await loadClientScopeContextForResponse(req)
+  } catch (_) {
+    scopeContext = buildClientScopeContext({ memberships: req.memberships || [], clients: [] })
+  }
+
+  const memberships = (req.memberships || []).map(m => ({
+    ...m,
+    ...clientScopeMetadata(scopeContext, m.client_id),
+  }))
+
   return res.json({
     user: {
       id: req.user?.id || null,
@@ -193,8 +256,10 @@ app.get('/auth/me', requireAuth, withClientScope, (req, res) => {
     client_scope: {
       client_ids: req.clientIds || [],
       client_ids_count: (req.clientIds || []).length,
-      memberships: req.memberships || [],
+      memberships,
       default_client_id: req.query?.client_id || null,
+      assigned_client_ids: scopeContext.assignedClientIds || [],
+      accessible_client_ids: scopeContext.accessibleClientIds || [],
     }
   })
 })
@@ -207,17 +272,29 @@ app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
 
     const { data: clients, error } = await supabaseAdmin
       .from('clients')
-      .select('id, name')
+      .select('id, name, parent_client_id, entity_label')
       .in('id', ids)
     if (error) return res.status(500).json({ error: 'Failed to load clients', detail: error.message })
+
+    let scopeContext = null
+    try {
+      scopeContext = await loadClientScopeContextForResponse(req, clients || [])
+    } catch (_) {
+      scopeContext = buildClientScopeContext({ memberships: req.memberships || [], clients: clients || [] })
+    }
 
     const roleById = Object.fromEntries((req.memberships || []).map(m => [m.client_id, m.role]))
     const items = (clients || []).map(c => ({
       client_id: c.id,
       name: c.name,
-      role: roleById[c.id] || 'member'
+      role: roleById[c.id] || 'member',
+      ...clientScopeMetadata(scopeContext, c.id),
     }))
-    res.json({ items })
+    res.json({
+      items,
+      assigned_client_ids: scopeContext.assignedClientIds || [],
+      accessible_client_ids: scopeContext.accessibleClientIds || [],
+    })
   } catch (e) {
     res.status(500).json({ error: 'Server error' })
   }
