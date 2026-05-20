@@ -3,6 +3,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
+const { requireParentClient } = require('../src/lib/clientBillingScope');
 const { buildMembershipAgreementSignUrl } = require('../config/urlConfig');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 const { htmlToPdf } = require('../utils/pdfRenderer');
@@ -167,6 +168,21 @@ function validateSignableAgreement(row) {
   return { ok: true };
 }
 
+async function requireParentAgreementClient(agreement, context) {
+  return requireParentClient(supabaseAdmin, agreement?.client_id, context);
+}
+
+function respondWithAgreementClientGuard(res, result, request_id) {
+  return res.status(result.status || 500).json({
+    ...(result.body || {
+      error: 'client_lookup_failed',
+      code: 'client_lookup_failed',
+      detail: 'Client lookup failed.'
+    }),
+    request_id
+  });
+}
+
 function resolveAgreementPublicSessionState(row) {
   if (!row) {
     return {
@@ -298,6 +314,8 @@ router.post('/session', async (req, res) => {
         request_id
       });
     }
+    const parentGuard = await requireParentAgreementClient(agreement, { route: 'membership_agreements_session', agreement_id: agreement.id });
+    if (!parentGuard.ok) return respondWithAgreementClientGuard(res, parentGuard, request_id);
 
     let openedAt = agreement.opened_at || null;
     if (sessionState.state === 'signable' && !openedAt) {
@@ -419,6 +437,8 @@ router.post('/sign', async (req, res) => {
         request_id
       });
     }
+    const parentGuard = await requireParentAgreementClient(agreement, { route: 'membership_agreements_sign', agreement_id: agreement.id });
+    if (!parentGuard.ok) return respondWithAgreementClientGuard(res, parentGuard, request_id);
 
     const signedAt = new Date().toISOString();
     const signatureSha256 = crypto.createHash('sha256').update(signaturePayload.buffer).digest('hex');
@@ -681,6 +701,8 @@ router.post('/checkout-session', async (req, res) => {
         request_id
       });
     }
+    const parentGuard = await requireParentAgreementClient(agreement, { route: 'membership_agreements_checkout_session', agreement_id: agreement.id });
+    if (!parentGuard.ok) return respondWithAgreementClientGuard(res, parentGuard, request_id);
 
     const agreementInput = buildAgreementInputFromRow(agreement);
     const planTier = String(agreementInput.membership_tier || '').trim().toLowerCase();
