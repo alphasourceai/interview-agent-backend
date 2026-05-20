@@ -1701,14 +1701,148 @@ async function processContractRenewals(context = {}) {
   }
 }
 
+function trimNullableString(value) {
+  const text = String(value ?? '').trim()
+  return text || null
+}
+
+function buildAdminClientHierarchyMaps(clients) {
+  const parentNameById = {}
+  const childCountByParentId = {}
+
+  for (const client of clients || []) {
+    if (client?.id) parentNameById[client.id] = client.name || null
+    const parentId = trimNullableString(client?.parent_client_id)
+    if (parentId) childCountByParentId[parentId] = (childCountByParentId[parentId] || 0) + 1
+  }
+
+  return { parentNameById, childCountByParentId }
+}
+
+function withAdminClientHierarchyMetadata(client, maps = {}) {
+  const parentClientId = trimNullableString(client?.parent_client_id)
+  return {
+    ...client,
+    parent_client_id: parentClientId,
+    entity_label: trimNullableString(client?.entity_label),
+    billing_client_id: parentClientId || client?.id || null,
+    is_parent_client: !parentClientId,
+    is_child_client: !!parentClientId,
+    parent_client_name: parentClientId ? (maps.parentNameById?.[parentClientId] || null) : null,
+    child_count: client?.id ? (maps.childCountByParentId?.[client.id] || 0) : 0
+  }
+}
+
+async function loadTopLevelParentClient(parentClientId) {
+  const id = trimNullableString(parentClientId)
+  if (!id) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'parent_client_id_required' }
+    }
+  }
+
+  const { data: parent, error } = await supabaseAdmin
+    .from('clients')
+    .select('id,name,email,parent_client_id,entity_label,candidate_assistance_contact')
+    .eq('id', id)
+    .maybeSingle()
+
+  if (error) {
+    return {
+      ok: false,
+      status: 500,
+      body: { error: 'parent_client_lookup_failed', detail: error.message }
+    }
+  }
+  if (!parent) {
+    return {
+      ok: false,
+      status: 404,
+      body: { error: 'parent_client_not_found' }
+    }
+  }
+  if (trimNullableString(parent.parent_client_id)) {
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: 'invalid_parent_client',
+        detail: 'Child entities can only be created under top-level parent clients.'
+      }
+    }
+  }
+
+  return { ok: true, client: parent }
+}
+
+function isUnavailableRelationError(error) {
+  const code = String(error?.code || '').trim()
+  const message = String(error?.message || '').toLowerCase()
+  return (
+    code === '42P01' ||
+    code === '42703' ||
+    code === 'PGRST200' ||
+    code === 'PGRST204' ||
+    code === 'PGRST205' ||
+    message.includes('does not exist') ||
+    message.includes('could not find')
+  )
+}
+
+async function countClientDeleteBlockers(clientId) {
+  const blockers = {}
+  const warnings = []
+  const checkErrors = []
+  const checks = [
+    { key: 'child_clients', table: 'clients', column: 'parent_client_id' },
+    { key: 'roles', table: 'roles', column: 'client_id' },
+    { key: 'candidates', table: 'candidates', column: 'client_id' },
+    { key: 'interviews', table: 'interviews', column: 'client_id' },
+    { key: 'reports', table: 'reports', column: 'client_id' },
+    { key: 'client_members', table: 'client_members', column: 'client_id' },
+    { key: 'membership_agreements', table: 'membership_agreements', column: 'client_id' },
+    { key: 'client_plan_settings', table: 'client_plan_settings', column: 'client_id' }
+  ]
+
+  for (const check of checks) {
+    const { count, error } = await supabaseAdmin
+      .from(check.table)
+      .select('*', { count: 'exact', head: true })
+      .eq(check.column, clientId)
+
+    if (error) {
+      const checkResult = {
+        key: check.key,
+        table: check.table,
+        column: check.column,
+        code: error.code || null,
+        detail: error.message || 'delete_blocker_check_failed'
+      }
+      if (isUnavailableRelationError(error)) {
+        warnings.push({ ...checkResult, skipped: true })
+      } else {
+        checkErrors.push(checkResult)
+      }
+      continue
+    }
+
+    if (Number(count) > 0) blockers[check.key] = Number(count)
+  }
+
+  return { blockers, warnings, checkErrors }
+}
+
 // List all clients
 adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
   const { data, error } = await supabaseAdmin
     .from('clients')
-    .select('id,name,email,client_admin_name,created_at,plan_tier,billing_status,manual_active_override,access_override_mode,candidate_assistance_contact,stripe_customer_id,stripe_subscription_id,subscription_status,current_term_end,cancel_at_term_end,billing_interval,contract_start_at,contract_end_at,auto_renew')
+    .select('id,name,email,client_admin_name,created_at,plan_tier,billing_status,manual_active_override,access_override_mode,candidate_assistance_contact,stripe_customer_id,stripe_subscription_id,subscription_status,current_term_end,cancel_at_term_end,billing_interval,contract_start_at,contract_end_at,auto_renew,parent_client_id,entity_label')
     .order('created_at', { ascending: false })
   if (error) return res.status(500).json({ error: 'list_clients_failed', detail: error.message })
   const items = data || []
+  const hierarchyMaps = buildAdminClientHierarchyMaps(items)
   const clientIds = items.map((item) => item?.id).filter(Boolean)
   if (!clientIds.length) return res.json({ items })
 
@@ -1729,7 +1863,7 @@ adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
   const enrichedItems = items.map((item) => {
     const settings = planSettingsByClientId[item.id] || null
     return {
-      ...item,
+      ...withAdminClientHierarchyMetadata(item, hierarchyMaps),
       plan_settings_plan_tier: settings?.plan_tier || null,
       plan_settings_billing_interval: settings?.billing_interval || null,
       plan_settings_platform_fee: settings?.platform_fee ?? null,
@@ -1810,6 +1944,79 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   }
 
   res.json({ item: client, seeded_member })
+})
+
+adminRouter.post('/clients/:parentClientId/entities', requireAuth, requireAdmin, async (req, res) => {
+  const name = trimNullableString(req.body?.name)
+  const entityLabel = trimNullableString(req.body?.entity_label)
+  if (!name) return res.status(400).json({ error: 'name_required' })
+
+  const parentResult = await loadTopLevelParentClient(req.params.parentClientId)
+  if (!parentResult.ok) return res.status(parentResult.status).json(parentResult.body)
+  const parent = parentResult.client
+
+  const { data: created, error } = await supabaseAdmin
+    .from('clients')
+    .insert({
+      name,
+      email: parent.email,
+      parent_client_id: parent.id,
+      entity_label: entityLabel,
+      candidate_assistance_contact: parent.candidate_assistance_contact || null
+    })
+    .select('id,name,email,created_at,parent_client_id,entity_label,candidate_assistance_contact')
+    .single()
+
+  if (error) return res.status(500).json({ error: 'create_client_entity_failed', detail: error.message, hint: error.hint })
+
+  const hierarchyMaps = buildAdminClientHierarchyMaps([parent, created])
+  return res.json({
+    ok: true,
+    item: withAdminClientHierarchyMetadata(created, hierarchyMaps)
+  })
+})
+
+adminRouter.patch('/clients/:parentClientId/entities/:entityClientId', requireAuth, requireAdmin, async (req, res) => {
+  const parentResult = await loadTopLevelParentClient(req.params.parentClientId)
+  if (!parentResult.ok) return res.status(parentResult.status).json(parentResult.body)
+  const parent = parentResult.client
+
+  const updates = {}
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'name')) {
+    const name = trimNullableString(req.body?.name)
+    if (!name) return res.status(400).json({ error: 'name_required' })
+    updates.name = name
+  }
+  if (Object.prototype.hasOwnProperty.call(req.body || {}, 'entity_label')) {
+    updates.entity_label = trimNullableString(req.body?.entity_label)
+  }
+  if (!Object.keys(updates).length) return res.status(400).json({ error: 'no_update_fields' })
+
+  const { data: entity, error: entityError } = await supabaseAdmin
+    .from('clients')
+    .select('id,parent_client_id')
+    .eq('id', req.params.entityClientId)
+    .maybeSingle()
+
+  if (entityError) return res.status(500).json({ error: 'client_entity_lookup_failed', detail: entityError.message })
+  if (!entity || String(entity.parent_client_id || '') !== String(parent.id)) {
+    return res.status(404).json({ error: 'client_entity_not_found' })
+  }
+
+  const { data: updated, error } = await supabaseAdmin
+    .from('clients')
+    .update(updates)
+    .eq('id', entity.id)
+    .select('id,name,email,created_at,parent_client_id,entity_label,candidate_assistance_contact')
+    .single()
+
+  if (error) return res.status(500).json({ error: 'update_client_entity_failed', detail: error.message, hint: error.hint })
+
+  const hierarchyMaps = buildAdminClientHierarchyMaps([parent, updated])
+  return res.json({
+    ok: true,
+    item: withAdminClientHierarchyMetadata(updated, hierarchyMaps)
+  })
 })
 
 adminRouter.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (req, res) => {
@@ -2601,6 +2808,29 @@ adminRouter.post('/clients/:id/subscription-invoice', requireAuth, requireAdmin,
 
 // Delete client
 adminRouter.delete('/clients/:id', requireAuth, requireAdmin, async (req, res) => {
+  const { blockers, warnings, checkErrors } = await countClientDeleteBlockers(req.params.id)
+  if (checkErrors.length > 0) {
+    return res.status(500).json({
+      error: 'Failed to verify client delete blockers',
+      code: 'CLIENT_DELETE_CHECK_FAILED',
+      detail: 'One or more related-record checks could not be completed.',
+      hint: 'Client was not deleted because related-record checks could not be completed safely.',
+      checks: checkErrors
+    })
+  }
+
+  if (Object.keys(blockers).length > 0) {
+    const body = {
+      error: 'Cannot delete client with related records',
+      code: 'CLIENT_DELETE_BLOCKED',
+      detail: 'Delete blocked because this client has related records.',
+      hint: 'Remove or reassign related records before deleting this client.',
+      blockers
+    }
+    if (warnings.length) body.warnings = warnings
+    return res.status(409).json(body)
+  }
+
   const { error } = await supabaseAdmin.from('clients').delete().eq('id', req.params.id)
   if (error) return res.status(500).json({ error: 'delete_client_failed', detail: error.message })
   res.json({ ok: true })
