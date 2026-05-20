@@ -2,6 +2,7 @@
 
 const Stripe = require('stripe')
 const { supabaseAdmin } = require('./supabaseClient')
+const { requireParentClient } = require('./clientBillingScope')
 const { resolvePublicBackendBase, buildClientDashboardReturnUrl } = require('../../config/urlConfig')
 
 function makeError(status, code, detail) {
@@ -131,6 +132,18 @@ async function createSubscriptionCheckoutSession({
   if (!normalizedPlanTier) throw makeError(400, 'invalid_plan_tier', 'Invalid plan tier.')
   if (!normalizedBillingInterval) throw makeError(400, 'invalid_billing_interval', 'Invalid billing interval.')
   if (!normalizedMetadataSource) throw makeError(400, 'invalid_metadata_source', 'Checkout source is required.')
+
+  const parentGuard = await requireParentClient(supabaseAdmin, normalizedClientId, {
+    source: normalizedMetadataSource
+  })
+  if (!parentGuard.ok) {
+    const body = parentGuard.body || {}
+    throw makeError(
+      parentGuard.status || 500,
+      body.code || body.error || 'client_lookup_failed',
+      body.detail || 'Client lookup failed.'
+    )
+  }
 
   const { data: client, error: clientError } = await supabaseAdmin
     .from('clients')
