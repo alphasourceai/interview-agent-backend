@@ -1,8 +1,10 @@
 // src/middleware/auth.js
 const jwt = require('jsonwebtoken');
 const { supabaseAdmin } = require('../lib/supabaseClient');
+const { buildClientScopeContext } = require('../lib/clientScope');
 
 const supabase = supabaseAdmin;
+const ROLE_PRIORITY = ['super_admin', 'owner', 'admin', 'manager', 'member', 'tester'];
 
 /**
  * Extract a bearer token from:
@@ -50,6 +52,23 @@ async function lookupGlobalAdmin(userEmail, userId) {
     console.error('[requireAuth] admin lookup error', err);
   }
   return false;
+}
+
+function normalizeClientRole(role) {
+  const normalized = String(role || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  return normalized === 'superadmin' ? 'super_admin' : normalized;
+}
+
+function uniqueValues(values) {
+  return Array.from(new Set((values || []).map(v => String(v || '').trim()).filter(Boolean)));
+}
+
+function strongestRole(roles, fallback = 'member') {
+  const roleSet = new Set((roles || []).map(normalizeClientRole).filter(Boolean));
+  for (const role of ROLE_PRIORITY) {
+    if (roleSet.has(role)) return role;
+  }
+  return normalizeClientRole(fallback) || 'member';
 }
 
 /**
@@ -101,8 +120,23 @@ async function withClientScope(req, res, next) {
       if (explicit) {
         req.client_memberships = [explicit];
         req.clientIds = [explicit];
+        req.assignedClientIds = [explicit];
+        req.effectiveClientIds = [explicit];
         req.memberships = [{ client_id: explicit, role: 'admin', name: null }];
-        req.clientScope = { user: req.user, memberships: req.memberships, defaultClientId: explicit, default_client_id: explicit };
+        req.assignedMemberships = req.memberships;
+        req.directMemberships = req.assignedMemberships;
+        req.effectiveMemberships = req.memberships;
+        req.clientScope = {
+          user: req.user,
+          memberships: req.effectiveMemberships,
+          assignedMemberships: req.assignedMemberships,
+          assignedClientIds: req.assignedClientIds,
+          accessibleClientIds: req.effectiveClientIds,
+          effectiveClientIds: req.effectiveClientIds,
+          effectiveMemberships: req.effectiveMemberships,
+          defaultClientId: explicit,
+          default_client_id: explicit
+        };
         req.client = { id: explicit, name: null };
         req.membership = { role: 'admin' };
         return next();
@@ -116,8 +150,13 @@ async function withClientScope(req, res, next) {
         console.error('[withClientScope] admin clients lookup error', clientsErr);
         req.client_memberships = [];
         req.clientIds = [];
+        req.assignedClientIds = [];
+        req.effectiveClientIds = [];
         req.memberships = [];
-        req.clientScope = { user: req.user, memberships: [] };
+        req.assignedMemberships = [];
+        req.directMemberships = [];
+        req.effectiveMemberships = [];
+        req.clientScope = { user: req.user, memberships: [], assignedMemberships: [], assignedClientIds: [], accessibleClientIds: [], effectiveClientIds: [], effectiveMemberships: [] };
         return next();
       }
 
@@ -129,9 +168,24 @@ async function withClientScope(req, res, next) {
       const ids = memberships.map(m => m.client_id).filter(Boolean);
       req.client_memberships = ids;
       req.clientIds = ids;
+      req.assignedClientIds = ids;
+      req.effectiveClientIds = ids;
       req.memberships = memberships;
+      req.assignedMemberships = memberships;
+      req.directMemberships = memberships;
+      req.effectiveMemberships = memberships;
       const defaultClientId = ids.length ? ids[0] : null;
-      req.clientScope = { user: req.user, memberships, defaultClientId, default_client_id: defaultClientId };
+      req.clientScope = {
+        user: req.user,
+        memberships,
+        assignedMemberships: memberships,
+        assignedClientIds: ids,
+        accessibleClientIds: ids,
+        effectiveClientIds: ids,
+        effectiveMemberships: memberships,
+        defaultClientId,
+        default_client_id: defaultClientId
+      };
       if (defaultClientId) {
         const m = memberships.find(x => x.client_id === defaultClientId) || null;
         req.client = { id: defaultClientId, name: m?.name || null };
@@ -144,17 +198,17 @@ async function withClientScope(req, res, next) {
     let rows = [];
     let { data, error } = await supabase
       .from('client_members')
-      .select('client_id, role, user_id_uuid, clients ( id, name )')
+      .select('client_id, role, user_id_uuid, clients ( id, name, parent_client_id, entity_label )')
       .eq('user_id_uuid', userId)
-      .limit(50);
+      .limit(5000);
 
     // Retry with legacy column if schema differs
     if (error && error.code === '42703') {
       const retry = await supabase
         .from('client_members')
-        .select('client_id, role, user_id, clients ( id, name )')
+        .select('client_id, role, user_id, clients ( id, name, parent_client_id, entity_label )')
         .eq('user_id', userId)
-        .limit(50);
+        .limit(5000);
       data = retry.data;
       error = retry.error;
     }
@@ -164,35 +218,97 @@ async function withClientScope(req, res, next) {
       // Don’t block every request due to a read failure; attach empty context
       req.client_memberships = [];
       req.clientIds = [];
+      req.assignedClientIds = [];
+      req.effectiveClientIds = [];
       req.memberships = [];
-      req.clientScope = { user: req.user, memberships: [] };
+      req.assignedMemberships = [];
+      req.directMemberships = [];
+      req.effectiveMemberships = [];
+      req.clientScope = { user: req.user, memberships: [], assignedMemberships: [], assignedClientIds: [], accessibleClientIds: [], effectiveClientIds: [], effectiveMemberships: [] };
       return next();
     }
 
     rows = Array.isArray(data) ? data : [];
     const memberships = rows.map(r => ({
       client_id: r.client_id,
-      role: r.role || 'member',
+      role: normalizeClientRole(r.role || 'member'),
       name: r.clients?.name || null,
+      client: r.clients || null,
     }));
 
-    const ids = memberships.map(m => m.client_id).filter(Boolean);
-    req.client_memberships = ids;
-    req.clientIds = ids;
-    req.memberships = memberships;
+    const ids = uniqueValues(memberships.map(m => m.client_id));
+    const directClients = rows.map(r => r.clients).filter(Boolean);
+    const parentSuperAdminIds = uniqueValues(
+      memberships
+        .filter(m => m.role === 'super_admin' && !m.client?.parent_client_id)
+        .map(m => m.client_id)
+    );
+    let childClients = [];
+    if (parentSuperAdminIds.length) {
+      const { data: childData, error: childError } = await supabase
+        .from('clients')
+        .select('id, name, parent_client_id, entity_label')
+        .in('parent_client_id', parentSuperAdminIds)
+        .limit(5000);
+      if (childError) {
+        console.error('[withClientScope] child client expansion error', childError);
+      } else if (Array.isArray(childData)) {
+        childClients = childData;
+      }
+    }
+
+    const scopeContext = buildClientScopeContext({
+      memberships,
+      clients: directClients.concat(childClients),
+    });
+    const effectiveIds = uniqueValues(scopeContext.accessibleClientIds || ids);
+    const effectiveMemberships = effectiveIds.map((clientId) => {
+      const assigned = memberships.find(m => m.client_id === clientId) || null;
+      const client = scopeContext.clientById?.[clientId] || assigned?.client || null;
+      const roles = scopeContext.effectiveRolesByClientId?.[clientId] || (assigned ? [assigned.role] : []);
+      const role = strongestRole(roles, assigned?.role || 'member');
+      const inheritedFrom = assigned ? null : String(client?.parent_client_id || '').trim() || null;
+      return {
+        client_id: clientId,
+        role,
+        name: assigned?.name || client?.name || null,
+        inherited: !!inheritedFrom,
+        inherited_from_client_id: inheritedFrom,
+        client
+      };
+    });
+
+    req.client_memberships = effectiveIds;
+    req.clientIds = effectiveIds;
+    req.assignedClientIds = ids;
+    req.effectiveClientIds = effectiveIds;
+    req.memberships = effectiveMemberships;
+    req.assignedMemberships = memberships;
+    req.directMemberships = memberships;
+    req.effectiveMemberships = effectiveMemberships;
 
     // Decide default
     let defaultClientId = null;
-    if (explicit && ids.includes(explicit)) {
+    if (explicit && effectiveIds.includes(explicit)) {
       defaultClientId = explicit;
-    } else if (ids.length) {
-      defaultClientId = ids[0];
+    } else if (effectiveIds.length) {
+      defaultClientId = effectiveIds[0];
     }
 
     // Attach helpers for routes that expect them
-    req.clientScope = { user: req.user, memberships, defaultClientId, default_client_id: defaultClientId };
+    req.clientScope = {
+      user: req.user,
+      memberships: effectiveMemberships,
+      assignedMemberships: memberships,
+      assignedClientIds: ids,
+      accessibleClientIds: effectiveIds,
+      effectiveClientIds: effectiveIds,
+      effectiveMemberships,
+      defaultClientId,
+      default_client_id: defaultClientId
+    };
     if (defaultClientId) {
-      const m = memberships.find(x => x.client_id === defaultClientId) || memberships[0] || null;
+      const m = effectiveMemberships.find(x => x.client_id === defaultClientId) || effectiveMemberships[0] || null;
       req.client = { id: defaultClientId, name: m?.name || null };
       req.membership = m ? { role: m.role } : null;
     }
@@ -204,8 +320,13 @@ async function withClientScope(req, res, next) {
     console.error('[withClientScope] error', err);
     req.client_memberships = [];
     req.clientIds = [];
+    req.assignedClientIds = [];
+    req.effectiveClientIds = [];
     req.memberships = [];
-    req.clientScope = { user: req.user, memberships: [] };
+    req.assignedMemberships = [];
+    req.directMemberships = [];
+    req.effectiveMemberships = [];
+    req.clientScope = { user: req.user, memberships: [], assignedMemberships: [], assignedClientIds: [], accessibleClientIds: [], effectiveClientIds: [], effectiveMemberships: [] };
     return next();
   }
 }
