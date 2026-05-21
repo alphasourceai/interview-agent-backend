@@ -123,10 +123,11 @@ function roleStatusPatch(status, inactiveReason, userId) {
  */
 router.get('/', requireAuth, withClientScope, async (req, res) => {
   try {
+    const explicitClientId = String(req.query.client_id || '').trim();
     const clientId =
+      explicitClientId ||
       req.client?.id ||
       req.clientScope?.defaultClientId ||
-      req.query.client_id ||
       null;
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
