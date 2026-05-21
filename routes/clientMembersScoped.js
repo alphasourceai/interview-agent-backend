@@ -120,6 +120,57 @@ function canManageTargetRole(actorRole, targetRole) {
   return true;
 }
 
+function normalizeRequiredString(value) {
+  return String(value || '').trim();
+}
+
+function dedupeClientIds(values) {
+  const seen = new Set();
+  const ids = [];
+  for (const value of values || []) {
+    const clientId = normalizeRequiredString(value);
+    if (!clientId || seen.has(clientId)) continue;
+    seen.add(clientId);
+    ids.push(clientId);
+  }
+  return ids;
+}
+
+function isDuplicateMembershipError(error) {
+  return error?.code === '23505' || error?.code === 'PGRST116';
+}
+
+async function loadExistingMemberClientIds({ clientIds, userId, email }) {
+  const existing = new Set();
+  if (!Array.isArray(clientIds) || clientIds.length === 0) return existing;
+
+  if (userId) {
+    const { data, error } = await supabaseAdmin
+      .from('client_members')
+      .select('client_id')
+      .in('client_id', clientIds)
+      .eq('user_id', userId);
+    if (error) throw error;
+    for (const row of data || []) {
+      if (row?.client_id) existing.add(String(row.client_id));
+    }
+  }
+
+  if (email) {
+    const { data, error } = await supabaseAdmin
+      .from('client_members')
+      .select('client_id')
+      .in('client_id', clientIds)
+      .eq('email', email);
+    if (error) throw error;
+    for (const row of data || []) {
+      if (row?.client_id) existing.add(String(row.client_id));
+    }
+  }
+
+  return existing;
+}
+
 async function applyTesterAck(clientId, userId, ipAddress) {
   const nowIso = new Date().toISOString();
   const row = await ensureMembershipRow(clientId, userId);
@@ -219,6 +270,175 @@ router.get('/me', requireAuth, withClientScope, async (req, res) => {
   } catch (e) {
     console.error('[client-members/me] unexpected', { request_id, error: e?.message || e });
     return res.status(500).json({ error: 'server_error', request_id });
+  }
+});
+
+router.post('/batch', requireAuth, withClientScope, async (req, res) => {
+  try {
+    const request_id = req.request_id || null;
+    const clientIds = dedupeClientIds(Array.isArray(req.body?.client_ids) ? req.body.client_ids : []);
+    const email = normalizeRequiredString(req.body?.email);
+    const name = normalizeRequiredString(req.body?.name);
+    const role = normalizeRole(req.body?.role || 'member');
+
+    if (!Array.isArray(req.body?.client_ids) || clientIds.length === 0) {
+      return res.status(400).json({ error: 'client_ids_required', request_id });
+    }
+    if (clientIds.length > 50) {
+      return res.status(400).json({ error: 'too_many_client_ids', detail: 'Batch member assignment is limited to 50 client scopes.', request_id });
+    }
+    if (!email || !name) {
+      return res.status(400).json({ error: 'client_id_email_name_required', request_id });
+    }
+    if (!['member', 'manager'].includes(role)) {
+      return res.status(400).json({ error: 'invalid_role', request_id });
+    }
+
+    const itemByClientId = new Map(clientIds.map((clientId) => [clientId, { client_id: clientId, ok: false, status: 'pending' }]));
+    const manageableClientIds = [];
+
+    for (const clientId of clientIds) {
+      if (canManageMembers(req, clientId)) {
+        manageableClientIds.push(clientId);
+      } else {
+        itemByClientId.set(clientId, { client_id: clientId, ok: false, status: 'forbidden' });
+      }
+    }
+
+    if (manageableClientIds.length === 0) {
+      return res.status(403).json({
+        error: 'forbidden',
+        detail: 'No manageable client scopes were provided.',
+        items: clientIds.map((clientId) => itemByClientId.get(clientId)),
+        request_id
+      });
+    }
+
+    const existingByEmail = await loadExistingMemberClientIds({ clientIds: manageableClientIds, email });
+    for (const clientId of existingByEmail) {
+      itemByClientId.set(clientId, { client_id: clientId, ok: false, status: 'already_exists' });
+    }
+
+    const needsUserClientIds = manageableClientIds.filter((clientId) => !existingByEmail.has(clientId));
+    if (needsUserClientIds.length === 0) {
+      return res.json({
+        ok: true,
+        created_user: false,
+        email_sent: false,
+        items: clientIds.map((clientId) => itemByClientId.get(clientId)),
+        request_id
+      });
+    }
+
+    const { userId, method, actionLink } = await ensureUserAndSendRecovery({
+      email,
+      redirectTo: buildClientPwResetUrl(),
+      request_id,
+      loggerPrefix: '[client-members/scoped-batch]'
+    });
+    if (!userId) {
+      console.error('[client-members/scoped-batch] add_member_no_user_id', { request_id, email: redactEmail(email), method });
+      return res.status(400).json({
+        error: 'add_member_failed',
+        detail: 'Could not create or locate user for this email.',
+        hint: 'Try again or send the magic link manually.',
+        request_id
+      });
+    }
+
+    const existingByUserOrEmail = await loadExistingMemberClientIds({ clientIds: manageableClientIds, userId, email });
+    for (const clientId of existingByUserOrEmail) {
+      itemByClientId.set(clientId, { client_id: clientId, ok: false, status: 'already_exists' });
+    }
+
+    const insertClientIds = manageableClientIds.filter((clientId) => !existingByUserOrEmail.has(clientId));
+    if (insertClientIds.length === 0) {
+      return res.json({
+        ok: true,
+        created_user: method === 'createUser',
+        email_sent: false,
+        items: clientIds.map((clientId) => itemByClientId.get(clientId)),
+        request_id
+      });
+    }
+
+    const emailResult = await sendMemberRecoveryEmail(email, actionLink, name);
+    if (emailResult?.statusCode !== 202) {
+      const err = new Error(emailResult?.skipped ? 'email_skipped' : 'email_send_failed');
+      err.code = 'send_member_recovery_email_failed';
+      err.detail = emailResult?.skipped ? 'email_skipped' : 'email_send_failed';
+      throw err;
+    }
+
+    for (const clientId of insertClientIds) {
+      const payload = { client_id: clientId, email, name, role, user_id: userId };
+      const { data, error } = await supabaseAdmin
+        .from('client_members')
+        .insert(payload)
+        .select('client_id,user_id,email,name,role,created_at')
+        .single();
+
+      if (error) {
+        console.error('[client-members/scoped-batch] add_member_insert_failed', {
+          request_id,
+          client_id: clientId,
+          error: error.message,
+          code: error.code,
+          hint: error.hint
+        });
+        if (isDuplicateMembershipError(error)) {
+          itemByClientId.set(clientId, { client_id: clientId, ok: false, status: 'already_exists' });
+        } else {
+          itemByClientId.set(clientId, {
+            client_id: clientId,
+            ok: false,
+            status: 'failed',
+            detail: error.message,
+            code: error.code || 'add_member_failed'
+          });
+        }
+        continue;
+      }
+
+      itemByClientId.set(clientId, {
+        client_id: clientId,
+        ok: true,
+        status: 'created',
+        item: { ...data, id: data.user_id || data.email }
+      });
+    }
+
+    return res.json({
+      ok: true,
+      created_user: method === 'createUser',
+      email_sent: true,
+      items: clientIds.map((clientId) => itemByClientId.get(clientId)),
+      request_id
+    });
+  } catch (e) {
+    if (e?.code === 'misconfigured_supabase_auth') {
+      return res.status(500).json({ error: 'misconfigured_supabase_auth', detail: e.detail || 'Missing SUPABASE_PUBLIC_ANON_KEY', request_id: req.request_id || null });
+    }
+    if (e?.code === 'add_member_no_user_id') {
+      return res.status(400).json({
+        error: 'add_member_failed',
+        detail: e?.detail || 'Could not create or locate user for this email.',
+        hint: 'Try again or send the magic link manually.',
+        request_id: req.request_id || null,
+        code: e.code
+      });
+    }
+    if (e?.code === 'recover_failed' || e?.code === 'create_user_failed' || e?.code === 'send_member_recovery_email_failed') {
+      return res.status(500).json({
+        error: e.code,
+        detail: e?.detail || e?.message || e.code,
+        request_id: req.request_id || null,
+        code: e.code,
+        helper_status: e?.status || null
+      });
+    }
+    console.error('[client-members/batch] unexpected', { request_id: req.request_id || null, error: e?.message || e });
+    return res.status(500).json({ error: 'server_error', request_id: req.request_id || null, code: 'server_error' });
   }
 });
 
