@@ -228,6 +228,109 @@ function clientScopeMetadata(scopeContext, clientId) {
   }
 }
 
+function normalizeTenantRole(role) {
+  const normalized = String(role || '').trim().toLowerCase().replace(/[\s-]+/g, '_')
+  return normalized === 'superadmin' ? 'super_admin' : normalized
+}
+
+function findEffectiveClientMembership(req, clientId) {
+  const targetClientId = String(clientId || '').trim()
+  if (!targetClientId) return null
+  const memberships = Array.isArray(req?.clientScope?.memberships)
+    ? req.clientScope.memberships
+    : Array.isArray(req?.effectiveMemberships)
+      ? req.effectiveMemberships
+      : Array.isArray(req?.memberships)
+        ? req.memberships
+        : []
+  return memberships.find(m => String(m?.client_id || '').trim() === targetClientId) || null
+}
+
+function hasTenantSuperAdminAccess(req, parentClientId) {
+  const parentId = String(parentClientId || '').trim()
+  if (!parentId) return false
+  if (req?.isGlobalAdmin === true || req?.isAdmin === true) return true
+
+  const parentMembership = findEffectiveClientMembership(req, parentId)
+  if (normalizeTenantRole(parentMembership?.role) === 'super_admin') return true
+
+  const memberships = Array.isArray(req?.clientScope?.memberships)
+    ? req.clientScope.memberships
+    : Array.isArray(req?.effectiveMemberships)
+      ? req.effectiveMemberships
+      : Array.isArray(req?.memberships)
+        ? req.memberships
+        : []
+  return memberships.some(m => (
+    normalizeTenantRole(m?.role) === 'super_admin' &&
+    m?.inherited === true &&
+    String(m?.inherited_from_client_id || '').trim() === parentId
+  ))
+}
+
+function formatTenantClientEntity(client) {
+  const parentClientId = String(client?.parent_client_id || '').trim() || null
+  return {
+    id: client?.id || null,
+    name: client?.name || null,
+    parent_client_id: parentClientId,
+    entity_label: String(client?.entity_label || '').trim() || null,
+    billing_client_id: parentClientId || client?.id || null,
+    is_parent_client: !parentClientId,
+    is_child_client: !!parentClientId,
+  }
+}
+
+async function resolveTenantEntityParent(req, selectedClientId) {
+  const clientId = String(selectedClientId || '').trim()
+  if (!clientId) {
+    return { ok: false, status: 400, body: { error: 'client_id_required' } }
+  }
+
+  const { data: selected, error: selectedError } = await supabaseAdmin
+    .from('clients')
+    .select('id,name,parent_client_id,entity_label')
+    .eq('id', clientId)
+    .maybeSingle()
+
+  if (selectedError) {
+    return { ok: false, status: 500, body: { error: 'client_lookup_failed', detail: selectedError.message } }
+  }
+  if (!selected) {
+    return { ok: false, status: 404, body: { error: 'client_not_found' } }
+  }
+
+  const selectedParentId = String(selected.parent_client_id || '').trim()
+  if (!selectedParentId) {
+    if (!hasTenantSuperAdminAccess(req, selected.id)) {
+      return { ok: false, status: 403, body: { error: 'forbidden' } }
+    }
+    return { ok: true, parent: selected, selected }
+  }
+
+  const { data: parent, error: parentError } = await supabaseAdmin
+    .from('clients')
+    .select('id,name,parent_client_id,entity_label')
+    .eq('id', selectedParentId)
+    .maybeSingle()
+
+  if (parentError) {
+    return { ok: false, status: 500, body: { error: 'parent_client_lookup_failed', detail: parentError.message } }
+  }
+  if (!parent || String(parent.parent_client_id || '').trim()) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: 'invalid_parent_client', detail: 'Client hierarchy could not be resolved safely.' }
+    }
+  }
+  if (!hasTenantSuperAdminAccess(req, parent.id)) {
+    return { ok: false, status: 403, body: { error: 'forbidden' } }
+  }
+
+  return { ok: true, parent, selected }
+}
+
 // ---------- Auth me ----------
 app.get('/auth/me', requireAuth, withClientScope, async (req, res) => {
   let scopeContext = null
@@ -305,6 +408,100 @@ app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
     })
   } catch (e) {
     res.status(500).json({ error: 'Server error' })
+  }
+})
+
+app.get('/clients/entities', requireAuth, withClientScope, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const selectedClientId = req.query?.client_id || req.client?.id || req.clientScope?.defaultClientId || null
+    const parentResult = await resolveTenantEntityParent(req, selectedClientId)
+    if (!parentResult.ok) return res.status(parentResult.status).json({ ...parentResult.body, request_id })
+
+    const { data: children, error } = await supabaseAdmin
+      .from('clients')
+      .select('id,name,parent_client_id,entity_label')
+      .eq('parent_client_id', parentResult.parent.id)
+      .order('name', { ascending: true })
+
+    if (error) return res.status(500).json({ error: 'list_client_entities_failed', detail: error.message, request_id })
+
+    return res.json({
+      ok: true,
+      parent: formatTenantClientEntity(parentResult.parent),
+      items: (children || []).map(formatTenantClientEntity),
+      request_id
+    })
+  } catch (e) {
+    console.error('[clients/entities] unexpected', { request_id, error: e?.message || e })
+    return res.status(500).json({ error: 'server_error', request_id })
+  }
+})
+
+app.patch('/clients/entities/:entityClientId', requireAuth, withClientScope, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const entityClientId = String(req.params?.entityClientId || '').trim()
+    if (!entityClientId) return res.status(404).json({ error: 'entity_client_not_found', request_id })
+
+    const { data: entity, error: entityError } = await supabaseAdmin
+      .from('clients')
+      .select('id,name,parent_client_id,entity_label')
+      .eq('id', entityClientId)
+      .maybeSingle()
+
+    if (entityError) return res.status(500).json({ error: 'entity_client_lookup_failed', detail: entityError.message, request_id })
+    if (!entity) return res.status(404).json({ error: 'entity_client_not_found', request_id })
+
+    const parentClientId = String(entity.parent_client_id || '').trim()
+    if (!parentClientId) return res.status(400).json({ error: 'child_entity_required', request_id })
+
+    const { data: parent, error: parentError } = await supabaseAdmin
+      .from('clients')
+      .select('id,name,parent_client_id,entity_label')
+      .eq('id', parentClientId)
+      .maybeSingle()
+
+    if (parentError) return res.status(500).json({ error: 'parent_client_lookup_failed', detail: parentError.message, request_id })
+    if (!parent || String(parent.parent_client_id || '').trim()) {
+      return res.status(400).json({
+        error: 'invalid_parent_client',
+        detail: 'Client hierarchy could not be resolved safely.',
+        request_id
+      })
+    }
+    if (!hasTenantSuperAdminAccess(req, parent.id)) {
+      return res.status(403).json({ error: 'forbidden', request_id })
+    }
+
+    const updates = {}
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'name')) {
+      const name = String(req.body?.name || '').trim()
+      if (!name) return res.status(400).json({ error: 'name_required', request_id })
+      updates.name = name
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'entity_label')) {
+      updates.entity_label = String(req.body?.entity_label || '').trim() || null
+    }
+    if (!Object.keys(updates).length) return res.status(400).json({ error: 'no_update_fields', request_id })
+
+    const { data: updated, error } = await supabaseAdmin
+      .from('clients')
+      .update(updates)
+      .eq('id', entity.id)
+      .select('id,name,parent_client_id,entity_label')
+      .single()
+
+    if (error) return res.status(500).json({ error: 'update_client_entity_failed', detail: error.message, hint: error.hint, request_id })
+
+    return res.json({
+      ok: true,
+      item: formatTenantClientEntity(updated),
+      request_id
+    })
+  } catch (e) {
+    console.error('[clients/entities/update] unexpected', { request_id, error: e?.message || e })
+    return res.status(500).json({ error: 'server_error', request_id })
   }
 })
 
