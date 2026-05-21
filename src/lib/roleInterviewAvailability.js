@@ -2,6 +2,7 @@
 
 const { sendRoleInterviewLimitReachedEmail } = require('../../utils/mailer');
 const { buildClientDashboardReturnUrl } = require('../../config/urlConfig');
+const { resolveBillingOwnerForScope } = require('./clientBillingScope');
 const EARLY_ENDED_SENTINEL_SUMMARY = 'Interview ended before substantive responses were captured.';
 const INSUFFICIENT_TRANSCRIPT_EARLY_END_SUMMARY_PREFIX = 'Interview ended before any substantive responses were recorded.';
 
@@ -63,10 +64,21 @@ async function getRoleInterviewAvailability({ db, roleId, clientId }) {
     };
   }
 
+  const billingScope = await resolveBillingOwnerForScope(db, clientId);
+  if (!billingScope.ok) {
+    return {
+      included_interviews_per_role: null,
+      purchased_interviews: null,
+      used_interviews: null,
+      remaining_interviews: null
+    };
+  }
+  const billingClientId = billingScope.billingClientId || clientId;
+
   const { data: planSettings, error: planSettingsError } = await db
     .from('client_plan_settings')
     .select('included_interviews_per_role')
-    .eq('client_id', clientId)
+    .eq('client_id', billingClientId)
     .maybeSingle();
   if (planSettingsError) {
     return {
