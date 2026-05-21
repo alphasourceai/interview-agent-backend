@@ -78,6 +78,48 @@ function getClientIp(req) {
   return req.ip || null;
 }
 
+function normalizeRole(role) {
+  const normalized = String(role || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  return normalized === 'superadmin' ? 'super_admin' : normalized;
+}
+
+function findEffectiveMembership(req, clientId) {
+  const targetClientId = String(clientId || '').trim();
+  if (!targetClientId) return null;
+  const memberships = Array.isArray(req?.clientScope?.memberships)
+    ? req.clientScope.memberships
+    : Array.isArray(req?.effectiveMemberships)
+      ? req.effectiveMemberships
+      : Array.isArray(req?.memberships)
+        ? req.memberships
+        : [];
+  return memberships.find((m) => String(m?.client_id || '').trim() === targetClientId) || null;
+}
+
+function getEffectiveRole(req, clientId) {
+  return normalizeRole(findEffectiveMembership(req, clientId)?.role);
+}
+
+function isManageCapableRole(role) {
+  return ['manager', 'admin', 'owner', 'super_admin'].includes(normalizeRole(role));
+}
+
+function isHighPrivilegeRole(role) {
+  return ['admin', 'owner', 'super_admin'].includes(normalizeRole(role));
+}
+
+function canManageMembers(req, clientId) {
+  if (req?.isGlobalAdmin === true || req?.isAdmin === true) return true;
+  return isManageCapableRole(getEffectiveRole(req, clientId));
+}
+
+function canManageTargetRole(actorRole, targetRole) {
+  const actor = normalizeRole(actorRole);
+  const target = normalizeRole(targetRole);
+  if (actor === 'manager' && isHighPrivilegeRole(target)) return false;
+  return true;
+}
+
 async function applyTesterAck(clientId, userId, ipAddress) {
   const nowIso = new Date().toISOString();
   const row = await ensureMembershipRow(clientId, userId);
@@ -111,9 +153,7 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
     const clientId = req.query.client_id || req.client?.id || req.clientScope?.defaultClientId || null;
     if (!clientId) return res.status(400).json({ error: 'client_id_required', request_id });
 
-    const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
-    const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
-    if (!isGlobalAdmin && !membership) {
+    if (!canManageMembers(req, clientId)) {
       return res.status(403).json({ error: 'forbidden', request_id });
     }
 
@@ -145,7 +185,7 @@ router.get('/me', requireAuth, withClientScope, async (req, res) => {
     if (!clientId) return res.status(400).json({ error: 'client_id_required', request_id });
     if (!userId) return res.status(401).json({ error: 'unauthorized', request_id });
 
-    const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
+    const membership = findEffectiveMembership(req, clientId);
     const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
     if (!isGlobalAdmin && !membership) {
       return res.status(403).json({ error: 'forbidden', request_id });
@@ -163,10 +203,15 @@ router.get('/me', requireAuth, withClientScope, async (req, res) => {
       return res.status(500).json({ error: 'fetch_member_failed', detail: error.message, code: error.code, request_id });
     }
     const member = data || null;
+    const effectiveMembership = membership || null;
     return res.json({
       ok: true,
       member,
       role: member?.role || null,
+      effective_role: effectiveMembership?.role || member?.role || null,
+      inherited: effectiveMembership?.inherited === true,
+      inherited_from_client_id: effectiveMembership?.inherited_from_client_id || null,
+      effective_membership: effectiveMembership,
       tester_acknowledged_at: member?.tester_acknowledged_at || null,
       tester_acknowledged_ip: member?.tester_acknowledged_ip || null,
       request_id
@@ -180,16 +225,13 @@ router.get('/me', requireAuth, withClientScope, async (req, res) => {
 router.post('/', requireAuth, withClientScope, async (req, res) => {
   try {
     const { client_id, email, name } = req.body || {};
-    const role = (req.body?.role || 'member').toLowerCase();
+    const role = normalizeRole(req.body?.role || 'member');
     const clientId = client_id || req.client?.id || req.clientScope?.defaultClientId || null;
     const request_id = req.request_id || null;
 
     if (!clientId || !email || !name) return res.status(400).json({ error: 'client_id_email_name_required', request_id });
 
-    const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
-    const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
-    const userRole = (membership?.role || '').toLowerCase();
-    if (!isGlobalAdmin && (!membership || !['manager', 'admin'].includes(userRole))) {
+    if (!canManageMembers(req, clientId)) {
       return res.status(403).json({ error: 'forbidden', request_id });
     }
     if (!['member', 'manager'].includes(role)) {
@@ -275,16 +317,14 @@ router.post('/send-password-reset', requireAuth, withClientScope, async (req, re
     const email = String(req.body?.email || '').trim();
     if (!clientId || !email) return res.status(400).json({ error: 'client_id_and_email_required', request_id });
 
-    const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === clientId);
-    const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
-    const userRole = (membership?.role || '').toLowerCase();
-    if (!isGlobalAdmin && (!membership || !['manager', 'admin'].includes(userRole))) {
+    const actorRole = getEffectiveRole(req, clientId);
+    if (!canManageMembers(req, clientId)) {
       return res.status(403).json({ error: 'forbidden', request_id });
     }
 
     const { data: existingMember, error: lookupErr } = await supabaseAdmin
       .from('client_members')
-      .select('email,name')
+      .select('email,name,role')
       .eq('client_id', clientId)
       .eq('email', email)
       .maybeSingle();
@@ -293,6 +333,9 @@ router.post('/send-password-reset', requireAuth, withClientScope, async (req, re
     }
     if (!existingMember) {
       return res.status(404).json({ error: 'member_not_found', request_id });
+    }
+    if ((req.isGlobalAdmin !== true && req.isAdmin !== true) && !canManageTargetRole(actorRole, existingMember.role)) {
+      return res.status(403).json({ error: 'forbidden', request_id });
     }
 
     const memberName = String(existingMember.name || req.body?.name || email).trim() || email;
@@ -346,16 +389,14 @@ router.delete('/:id', requireAuth, withClientScope, async (req, res) => {
     const client_id = req.query.client_id || req.client?.id || req.clientScope?.defaultClientId || null;
     if (!client_id) return res.status(400).json({ error: 'client_id_required', request_id });
 
-    const membership = (req.clientScope?.memberships || []).find((m) => m.client_id === client_id);
-    const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
-    const userRole = (membership?.role || '').toLowerCase();
-    if (!isGlobalAdmin && (!membership || !['manager', 'admin'].includes(userRole))) {
+    const actorRole = getEffectiveRole(req, client_id);
+    if (!canManageMembers(req, client_id)) {
       return res.status(403).json({ error: 'forbidden', request_id });
     }
 
     let targetLookup = supabaseAdmin
       .from('client_members')
-      .select('user_id,email')
+      .select('user_id,email,role')
       .eq('client_id', client_id);
     if (key.includes('@')) targetLookup = targetLookup.eq('email', key);
     else targetLookup = targetLookup.eq('user_id', key);
@@ -363,6 +404,9 @@ router.delete('/:id', requireAuth, withClientScope, async (req, res) => {
     const { data: targetMember, error: targetLookupError } = await targetLookup.maybeSingle();
     if (targetLookupError) {
       return res.status(500).json({ error: 'remove_member_failed', detail: targetLookupError.message, request_id });
+    }
+    if ((req.isGlobalAdmin !== true && req.isAdmin !== true) && !canManageTargetRole(actorRole, targetMember?.role)) {
+      return res.status(403).json({ error: 'forbidden', request_id });
     }
 
     // Block self-delete by either user id or email match.
