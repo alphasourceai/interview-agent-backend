@@ -289,7 +289,7 @@ async function resolveTenantEntityParent(req, selectedClientId) {
 
   const { data: selected, error: selectedError } = await supabaseAdmin
     .from('clients')
-    .select('id,name,parent_client_id,entity_label')
+    .select('id,name,email,parent_client_id,entity_label,candidate_assistance_contact')
     .eq('id', clientId)
     .maybeSingle()
 
@@ -310,7 +310,7 @@ async function resolveTenantEntityParent(req, selectedClientId) {
 
   const { data: parent, error: parentError } = await supabaseAdmin
     .from('clients')
-    .select('id,name,parent_client_id,entity_label')
+    .select('id,name,email,parent_client_id,entity_label,candidate_assistance_contact')
     .eq('id', selectedParentId)
     .maybeSingle()
 
@@ -434,6 +434,51 @@ app.get('/clients/entities', requireAuth, withClientScope, async (req, res) => {
     })
   } catch (e) {
     console.error('[clients/entities] unexpected', { request_id, error: e?.message || e })
+    return res.status(500).json({ error: 'server_error', request_id })
+  }
+})
+
+app.post('/clients/entities', requireAuth, withClientScope, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const selectedClientId = req.body?.client_id || req.query?.client_id || req.client?.id || req.clientScope?.defaultClientId || null
+    const name = String(req.body?.name || '').trim()
+    const entityLabel = String(req.body?.entity_label || '').trim() || null
+    if (!name) return res.status(400).json({ error: 'name_required', request_id })
+
+    const parentResult = await resolveTenantEntityParent(req, selectedClientId)
+    if (!parentResult.ok) return res.status(parentResult.status).json({ ...parentResult.body, request_id })
+
+    const parent = parentResult.parent
+    if (!parent || String(parent.parent_client_id || '').trim()) {
+      return res.status(400).json({
+        error: 'invalid_parent_client',
+        detail: 'Client hierarchy could not be resolved safely.',
+        request_id
+      })
+    }
+
+    const { data: created, error } = await supabaseAdmin
+      .from('clients')
+      .insert({
+        name,
+        email: parent.email,
+        parent_client_id: parent.id,
+        entity_label: entityLabel,
+        candidate_assistance_contact: parent.candidate_assistance_contact || null
+      })
+      .select('id,name,parent_client_id,entity_label')
+      .single()
+
+    if (error) return res.status(500).json({ error: 'create_client_entity_failed', detail: error.message, hint: error.hint, request_id })
+
+    return res.json({
+      ok: true,
+      item: formatTenantClientEntity(created),
+      request_id
+    })
+  } catch (e) {
+    console.error('[clients/entities/create] unexpected', { request_id, error: e?.message || e })
     return res.status(500).json({ error: 'server_error', request_id })
   }
 })
