@@ -63,18 +63,33 @@ function buildRubricChangeEmailHtml({ roleId, roleTitle, clientId, userEmail, re
   });
 }
 
+function normalizeRole(role) {
+  const normalized = String(role || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  return normalized === 'superadmin' ? 'super_admin' : normalized;
+}
+
 function getScopedMembershipRole(req, clientId) {
   const targetClientId = String(clientId || '').trim();
   if (!targetClientId) return '';
   const memberships = Array.isArray(req?.clientScope?.memberships) ? req.clientScope.memberships : [];
   const membership = memberships.find((item) => String(item?.client_id || '').trim() === targetClientId);
-  return String(membership?.role || '').trim().toLowerCase();
+  return normalizeRole(membership?.role);
+}
+
+function hasScopedReadAccess(req, clientId) {
+  if (req?.isGlobalAdmin === true || req?.isAdmin === true) return true;
+  const targetClientId = String(clientId || '').trim();
+  if (!targetClientId) return false;
+  const memberships = Array.isArray(req?.clientScope?.memberships) ? req.clientScope.memberships : [];
+  if (memberships.some((item) => String(item?.client_id || '').trim() === targetClientId)) return true;
+  const clientIds = Array.isArray(req?.clientIds) ? req.clientIds : [];
+  return clientIds.some((id) => String(id || '').trim() === targetClientId);
 }
 
 function hasScopedWriteAccess(req, clientId) {
   if (req?.isGlobalAdmin === true || req?.isAdmin === true) return true;
   const role = getScopedMembershipRole(req, clientId);
-  return role === 'manager' || role === 'admin';
+  return role === 'manager' || role === 'admin' || role === 'owner' || role === 'super_admin';
 }
 
 const ROLE_STATUS_VALUES = new Set(['active', 'inactive', 'all']);
@@ -115,6 +130,7 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
       null;
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
+    if (!hasScopedReadAccess(req, clientId)) return res.status(403).json({ error: 'forbidden' });
     const statusFilter = normalizeRoleStatus(req.query.status);
     if (!ROLE_STATUS_VALUES.has(statusFilter)) {
       return res.status(400).json({
@@ -535,6 +551,7 @@ router.post('/:id/rubric-request-changes', requireAuth, withClientScope, async (
     if (!clientId || !roleId) {
       return res.status(400).json({ error: 'client_id and id required' });
     }
+    if (!hasScopedReadAccess(req, clientId)) return res.status(403).json({ error: 'forbidden' });
 
     const { data: roleData, error: roleError } = await db
       .from('roles')
