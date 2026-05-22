@@ -2157,9 +2157,9 @@ adminRouter.post('/clients', requireAuth, requireAdmin, async (req, res) => {
   const adminEmail = (req.body?.admin_email || '').trim()
   const candidateAssistanceContact = (req.body?.candidate_assistance_contact || '').trim()
   const requestedInitialRole = String(req.body?.admin_role || '').trim().toLowerCase()
-  const seededMemberRole = ['admin', 'tester', 'member'].includes(requestedInitialRole)
+  const seededMemberRole = ['admin', 'tester', 'member', 'super_admin'].includes(requestedInitialRole)
     ? requestedInitialRole
-    : (requestedInitialRole === 'manager' ? 'admin' : 'admin')
+    : (requestedInitialRole === 'manager' ? 'admin' : 'super_admin')
   const explicitClientEmail = (req.body?.email || '').trim()
   if (!name) return res.status(400).json({ error: 'name_required' })
   if (!candidateAssistanceContact) return res.status(400).json({ error: 'candidate_assistance_contact_required' })
