@@ -12,6 +12,12 @@ const {
   normalizeCriteriaConfig,
   stableStringify
 } = require('../src/lib/candidateAutomationEvaluator');
+const {
+  createPendingAutomationAction,
+  listAutomationActions,
+  listAutomationActionEvents,
+  writeAutomationActionEvent
+} = require('../src/lib/automationActions');
 
 const router = express.Router();
 const db = supabaseAdmin;
@@ -55,6 +61,34 @@ const EVALUATION_SELECT = [
   'idempotency_key',
   'request_id',
   'created_at'
+].join(',');
+
+const ACTION_SELECT = [
+  'id',
+  'evaluation_id',
+  'rule_id',
+  'rule_version',
+  'client_id',
+  'role_id',
+  'candidate_id',
+  'report_id',
+  'interview_id',
+  'action_type',
+  'state',
+  'idempotency_key',
+  'candidate_snapshot',
+  'action_snapshot',
+  'approved_by_user_id',
+  'approved_by_email',
+  'approved_at',
+  'rejected_at',
+  'canceled_at',
+  'sent_at',
+  'failed_at',
+  'last_error',
+  'send_attempt_count',
+  'created_at',
+  'updated_at'
 ].join(',');
 
 function requestId(req) {
@@ -151,6 +185,20 @@ function cleanUserEmail(req) {
   return String(req?.user?.email || '').trim() || null;
 }
 
+function actorFromRequest(req) {
+  return {
+    type: req?.isGlobalAdmin === true || req?.isAdmin === true ? 'admin' : 'user',
+    userId: req?.user?.id || null,
+    email: cleanUserEmail(req)
+  };
+}
+
+function normalizeLimit(value, fallback = 100, max = 500) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.max(1, Math.min(max, Math.floor(n)));
+}
+
 async function loadRoleForClient(roleId, clientId) {
   const { data, error } = await db
     .from('roles')
@@ -163,6 +211,26 @@ async function loadRoleForClient(roleId, clientId) {
     err.status = 500;
     err.code = 'role_lookup_failed';
     err.detail = error.message || 'Role lookup failed.';
+    err.hint = error.hint || null;
+    throw err;
+  }
+  return data || null;
+}
+
+async function loadCandidateForClient(candidateId, clientId, roleId = null) {
+  let query = db
+    .from('candidates')
+    .select('id,client_id,role_id')
+    .eq('id', candidateId)
+    .eq('client_id', clientId);
+  if (roleId) query = query.eq('role_id', roleId);
+
+  const { data, error } = await query.maybeSingle();
+  if (error) {
+    const err = new Error(error.message || 'candidate_lookup_failed');
+    err.status = 500;
+    err.code = 'candidate_lookup_failed';
+    err.detail = error.message || 'Candidate lookup failed.';
     err.hint = error.hint || null;
     throw err;
   }
@@ -182,6 +250,26 @@ async function loadCandidateForClientRole(candidateId, clientId, roleId) {
     err.status = 500;
     err.code = 'candidate_lookup_failed';
     err.detail = error.message || 'Candidate lookup failed.';
+    err.hint = error.hint || null;
+    throw err;
+  }
+  return data || null;
+}
+
+async function loadAction(actionId, clientIds = null) {
+  if (Array.isArray(clientIds) && clientIds.length === 0) return null;
+  let query = db
+    .from('automation_actions')
+    .select(ACTION_SELECT)
+    .eq('id', actionId);
+  if (Array.isArray(clientIds)) query = query.in('client_id', clientIds);
+
+  const { data, error } = await query.maybeSingle();
+  if (error) {
+    const err = new Error(error.message || 'automation_action_lookup_failed');
+    err.status = 500;
+    err.code = 'automation_action_lookup_failed';
+    err.detail = error.message || 'Automation action lookup failed.';
     err.hint = error.hint || null;
     throw err;
   }
@@ -234,7 +322,8 @@ async function persistDryRunEvaluation({
   clientId,
   roleId,
   candidateId,
-  result
+  result,
+  triggerSource = 'dry_run'
 }) {
   const payload = {
     rule_id: rule?.id || null,
@@ -244,7 +333,7 @@ async function persistDryRunEvaluation({
     candidate_id: candidateId,
     report_id: result.reportId || null,
     interview_id: result.interviewId || null,
-    trigger_source: 'dry_run',
+    trigger_source: triggerSource,
     matched: result.matched,
     evaluation_status: result.evaluationStatus,
     criteria_config_snapshot: result.criteriaConfigSnapshot,
@@ -603,6 +692,90 @@ router.post('/rules/:id/dry-run', requireAuth, withClientScope, async (req, res)
   }
 });
 
+router.post('/rules/:id/evaluate-action', requireAuth, withClientScope, async (req, res) => {
+  const request_id = requestId(req);
+  try {
+    const ruleId = toRequiredId(req.params?.id, 'rule_id_required');
+    const candidateId = toRequiredId(req.body?.candidate_id, 'candidate_id_required');
+    const rule = await loadRule(ruleId, configurableClientIds(req));
+    if (!rule) {
+      return sendError(res, 404, {
+        error: 'not_found',
+        code: 'automation_rule_not_found',
+        detail: 'Automation rule not found.',
+        request_id
+      });
+    }
+    if (!canConfigureAutomation(req, rule.client_id)) {
+      return sendError(res, 403, {
+        error: 'forbidden',
+        code: 'forbidden',
+        detail: 'You do not have access to configure automation for this client.',
+        request_id
+      });
+    }
+    if (rule.enabled !== true) {
+      return sendError(res, 409, {
+        error: 'automation_rule_disabled',
+        code: 'automation_rule_disabled',
+        detail: 'Automation rule must be enabled before creating pending approval actions.',
+        request_id
+      });
+    }
+    const candidate = await loadCandidateForClientRole(candidateId, rule.client_id, rule.role_id);
+    if (!candidate) {
+      return sendError(res, 404, {
+        error: 'not_found',
+        code: 'candidate_not_found',
+        detail: 'Candidate not found.',
+        request_id
+      });
+    }
+
+    const result = await evaluateCandidateAutomation({
+      db,
+      clientId: rule.client_id,
+      roleId: rule.role_id,
+      candidateId,
+      criteriaConfig: rule.criteria_config || {},
+      triggerSource: 'manual',
+      ruleId: rule.id,
+      ruleVersion: rule.rule_version,
+      requestId: request_id
+    });
+    const persisted = await persistDryRunEvaluation({
+      req,
+      rule,
+      clientId: rule.client_id,
+      roleId: rule.role_id,
+      candidateId,
+      result,
+      triggerSource: 'manual'
+    });
+    const actionOutcome = await createPendingAutomationAction({
+      db,
+      evaluationRow: persisted?.row || null,
+      evaluationResult: result,
+      rule,
+      actor: actorFromRequest(req),
+      requestId: request_id
+    });
+    const base = evaluationResponse({ result, persisted, rule });
+    const actionsCreated = actionOutcome?.action && !actionOutcome?.deduped && !actionOutcome?.skipped ? 1 : 0;
+    return res.json({
+      ...base,
+      action: actionOutcome?.action || null,
+      side_effects: {
+        actions_created: actionsCreated,
+        emails_sent: 0,
+        digests_sent: 0
+      }
+    });
+  } catch (err) {
+    return handleCaughtError(res, req, err, 'automation_evaluate_action_failed');
+  }
+});
+
 router.post('/dry-run/candidate', requireAuth, withClientScope, async (req, res) => {
   const request_id = requestId(req);
   try {
@@ -657,6 +830,191 @@ router.post('/dry-run/candidate', requireAuth, withClientScope, async (req, res)
     return res.json(evaluationResponse({ result, persisted, rule: null }));
   } catch (err) {
     return handleCaughtError(res, req, err, 'automation_dry_run_failed');
+  }
+});
+
+router.get('/actions', requireAuth, withClientScope, async (req, res) => {
+  const request_id = requestId(req);
+  try {
+    const clientId = resolveClientId(req);
+    const roleId = String(req.query?.role_id || '').trim();
+    const candidateId = String(req.query?.candidate_id || '').trim();
+    const state = String(req.query?.state || '').trim();
+    const limit = normalizeLimit(req.query?.limit, 100, 500);
+
+    if (!clientId) {
+      return sendError(res, 400, {
+        error: 'client_id_required',
+        code: 'client_id_required',
+        detail: 'client_id is required.',
+        request_id
+      });
+    }
+    if (!canConfigureAutomation(req, clientId)) {
+      return sendError(res, 403, {
+        error: 'forbidden',
+        code: 'forbidden',
+        detail: 'You do not have access to view automation actions for this client.',
+        request_id
+      });
+    }
+    if (roleId) {
+      const role = await loadRoleForClient(roleId, clientId);
+      if (!role) {
+        return sendError(res, 404, {
+          error: 'not_found',
+          code: 'role_not_found',
+          detail: 'Role not found.',
+          request_id
+        });
+      }
+    }
+    if (candidateId) {
+      const candidate = await loadCandidateForClient(candidateId, clientId, roleId || null);
+      if (!candidate) {
+        return sendError(res, 404, {
+          error: 'not_found',
+          code: 'candidate_not_found',
+          detail: 'Candidate not found.',
+          request_id
+        });
+      }
+    }
+
+    const items = await listAutomationActions({
+      db,
+      clientId,
+      roleId: roleId || null,
+      candidateId: candidateId || null,
+      state: state || null,
+      limit
+    });
+    return res.json({ ok: true, items, request_id });
+  } catch (err) {
+    return handleCaughtError(res, req, err, 'automation_actions_lookup_failed');
+  }
+});
+
+router.get('/actions/:id/events', requireAuth, withClientScope, async (req, res) => {
+  const request_id = requestId(req);
+  try {
+    const actionId = toRequiredId(req.params?.id, 'action_id_required');
+    const action = await loadAction(actionId, configurableClientIds(req));
+    if (!action) {
+      return sendError(res, 404, {
+        error: 'not_found',
+        code: 'automation_action_not_found',
+        detail: 'Automation action not found.',
+        request_id
+      });
+    }
+    if (!canConfigureAutomation(req, action.client_id)) {
+      return sendError(res, 403, {
+        error: 'forbidden',
+        code: 'forbidden',
+        detail: 'You do not have access to view events for this automation action.',
+        request_id
+      });
+    }
+
+    const items = await listAutomationActionEvents({
+      db,
+      actionId: action.id,
+      clientId: action.client_id,
+      limit: normalizeLimit(req.query?.limit, 100, 500)
+    });
+    return res.json({ ok: true, items, request_id });
+  } catch (err) {
+    return handleCaughtError(res, req, err, 'automation_action_events_lookup_failed');
+  }
+});
+
+router.post('/actions/:id/reject', requireAuth, withClientScope, async (req, res) => {
+  const request_id = requestId(req);
+  try {
+    const actionId = toRequiredId(req.params?.id, 'action_id_required');
+    const action = await loadAction(actionId, configurableClientIds(req));
+    if (!action) {
+      return sendError(res, 404, {
+        error: 'not_found',
+        code: 'automation_action_not_found',
+        detail: 'Automation action not found.',
+        request_id
+      });
+    }
+    if (!canConfigureAutomation(req, action.client_id)) {
+      return sendError(res, 403, {
+        error: 'forbidden',
+        code: 'forbidden',
+        detail: 'You do not have access to reject this automation action.',
+        request_id
+      });
+    }
+    if (action.state !== 'pending_approval') {
+      return sendError(res, 409, {
+        error: 'invalid_action_state',
+        code: 'invalid_action_state',
+        detail: 'Only pending approval actions can be rejected.',
+        request_id
+      });
+    }
+
+    const now = new Date().toISOString();
+    const { data, error } = await db
+      .from('automation_actions')
+      .update({
+        state: 'rejected',
+        rejected_at: now,
+        updated_at: now
+      })
+      .eq('id', action.id)
+      .eq('state', 'pending_approval')
+      .select(ACTION_SELECT)
+      .maybeSingle();
+
+    if (error) {
+      return sendError(res, 500, {
+        error: 'server_error',
+        code: 'automation_action_reject_failed',
+        detail: error.message,
+        hint: error.hint || null,
+        request_id
+      });
+    }
+    if (!data) {
+      return sendError(res, 409, {
+        error: 'invalid_action_state',
+        code: 'invalid_action_state',
+        detail: 'Only pending approval actions can be rejected.',
+        request_id
+      });
+    }
+
+    const event = await writeAutomationActionEvent({
+      db,
+      actionId: data.id,
+      clientId: data.client_id,
+      eventType: 'action_rejected',
+      fromState: 'pending_approval',
+      toState: 'rejected',
+      actor: actorFromRequest(req),
+      requestId: request_id,
+      metadata: null
+    });
+
+    return res.json({
+      ok: true,
+      item: data,
+      event,
+      side_effects: {
+        actions_created: 0,
+        emails_sent: 0,
+        digests_sent: 0
+      },
+      request_id
+    });
+  } catch (err) {
+    return handleCaughtError(res, req, err, 'automation_action_reject_failed');
   }
 });
 
