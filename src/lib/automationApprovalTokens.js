@@ -351,11 +351,114 @@ async function rejectActionFromApprovalToken({
   return { action: updatedAction, tokenRow: updatedToken, event };
 }
 
+async function confirmActionFromApprovalToken({
+  db,
+  tokenRow,
+  action,
+  actor = { type: 'system' },
+  requestId = null
+} = {}) {
+  requireDb(db);
+  if (!tokenRow?.id || tokenRow.state !== 'active') {
+    throw approvalTokenError(
+      'invalid_approval_token',
+      'This approval link is invalid or no longer available.',
+      404
+    );
+  }
+  if (!action?.id || action.state !== 'pending_approval') {
+    throw approvalTokenError(
+      'invalid_action_state',
+      'Only pending approval actions can be approved.',
+      409
+    );
+  }
+
+  const now = new Date().toISOString();
+  const { data: updatedToken, error: tokenError } = await db
+    .from('automation_action_approval_tokens')
+    .update({
+      state: 'used',
+      used_at: now,
+      request_id: requestId || tokenRow.request_id || null,
+      updated_at: now
+    })
+    .eq('id', tokenRow.id)
+    .eq('state', 'active')
+    .select(TOKEN_SELECT)
+    .maybeSingle();
+
+  if (tokenError) {
+    throw approvalTokenError(
+      'automation_approval_token_confirm_failed',
+      tokenError.message || 'Approval token confirm failed.',
+      500,
+      tokenError.hint || null
+    );
+  }
+  if (!updatedToken) {
+    throw approvalTokenError(
+      'approval_token_confirm_conflict',
+      'Approval token could not be marked used.',
+      409
+    );
+  }
+
+  const { data: updatedAction, error: actionError } = await db
+    .from('automation_actions')
+    .update({
+      state: 'approved',
+      approved_at: now,
+      approved_by_user_id: null,
+      approved_by_email: cleanEmail(tokenRow.recipient_email),
+      updated_at: now
+    })
+    .eq('id', action.id)
+    .eq('client_id', action.client_id)
+    .eq('state', 'pending_approval')
+    .select(ACTION_SELECT)
+    .maybeSingle();
+
+  if (actionError) {
+    throw approvalTokenError(
+      'automation_action_approve_failed',
+      actionError.message || 'Automation action approve failed.',
+      500,
+      actionError.hint || null
+    );
+  }
+  if (!updatedAction) {
+    throw approvalTokenError(
+      'invalid_action_state',
+      'Only pending approval actions can be approved.',
+      409
+    );
+  }
+
+  const event = await writeAutomationActionEvent({
+    db,
+    actionId: updatedAction.id,
+    clientId: updatedAction.client_id,
+    eventType: 'action_approved_from_approval_token',
+    fromState: 'pending_approval',
+    toState: 'approved',
+    actor,
+    requestId,
+    metadata: {
+      approval_token_id: tokenRow.id,
+      token_purpose: tokenRow.token_purpose || 'manager_review'
+    }
+  });
+
+  return { action: updatedAction, tokenRow: updatedToken, event };
+}
+
 module.exports = {
   generateApprovalToken,
   hashApprovalToken,
   createApprovalTokenForAction,
   loadApprovalTokenContext,
   markApprovalTokenViewed,
-  rejectActionFromApprovalToken
+  rejectActionFromApprovalToken,
+  confirmActionFromApprovalToken
 };

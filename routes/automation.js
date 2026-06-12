@@ -22,7 +22,8 @@ const {
   createApprovalTokenForAction,
   loadApprovalTokenContext,
   markApprovalTokenViewed,
-  rejectActionFromApprovalToken
+  rejectActionFromApprovalToken,
+  confirmActionFromApprovalToken
 } = require('../src/lib/automationApprovalTokens');
 
 const router = express.Router();
@@ -1088,6 +1089,41 @@ router.post('/approval/:token/reject', async (req, res) => {
     });
   } catch (err) {
     return handleCaughtError(res, req, err, 'automation_approval_token_reject_failed');
+  }
+});
+
+router.post('/approval/:token/confirm', async (req, res) => {
+  const request_id = requestId(req);
+  setApprovalNoStore(res);
+  try {
+    const context = await loadApprovalTokenContext({
+      db,
+      token: req.params?.token
+    });
+    if (!context.valid) {
+      return sendApprovalTokenUnavailable(res, req, context);
+    }
+
+    const outcome = await confirmActionFromApprovalToken({
+      db,
+      tokenRow: context.tokenRow,
+      action: context.action,
+      actor: { type: 'system' },
+      requestId: request_id
+    });
+
+    return res.json({
+      ok: true,
+      state: outcome?.action?.state || 'approved',
+      side_effects: {
+        actions_created: 0,
+        emails_sent: 0,
+        digests_sent: 0
+      },
+      request_id
+    });
+  } catch (err) {
+    return handleCaughtError(res, req, err, 'automation_approval_token_confirm_failed');
   }
 });
 
