@@ -18,6 +18,12 @@ const {
   listAutomationActionEvents,
   writeAutomationActionEvent
 } = require('../src/lib/automationActions');
+const {
+  createApprovalTokenForAction,
+  loadApprovalTokenContext,
+  markApprovalTokenViewed,
+  rejectActionFromApprovalToken
+} = require('../src/lib/automationApprovalTokens');
 
 const router = express.Router();
 const db = supabaseAdmin;
@@ -314,6 +320,45 @@ function handleCaughtError(res, req, err, fallbackCode = 'server_error') {
     hint: err?.hint || null,
     request_id: requestId(req)
   });
+}
+
+function setApprovalNoStore(res) {
+  res.set('Cache-Control', 'no-store');
+}
+
+function sendApprovalTokenUnavailable(res, req, context = {}) {
+  const reason = String(context?.reason || '').trim();
+  const expired = reason === 'expired';
+  setApprovalNoStore(res);
+  return res.status(expired ? 410 : 404).json({
+    ok: false,
+    error: expired ? 'approval_token_expired' : 'approval_token_invalid',
+    code: expired ? 'approval_token_expired' : 'approval_token_invalid',
+    detail: expired
+      ? 'This approval link has expired or is no longer available.'
+      : 'This approval link is invalid or no longer available.',
+    request_id: requestId(req)
+  });
+}
+
+function buildApprovalActionSummary({ action, tokenRow } = {}) {
+  const snapshot = isPlainObject(action?.candidate_snapshot) ? action.candidate_snapshot : {};
+  const cleanText = (value) => String(value || '').trim() || null;
+  return {
+    action_id: action?.id || null,
+    state: action?.state || null,
+    candidate_name: cleanText(snapshot.candidate_name),
+    role_title: cleanText(snapshot.role_title),
+    scores: {
+      overall_score: snapshot.overall_score ?? null,
+      resume_score: snapshot.resume_score ?? null,
+      interview_score: snapshot.interview_score ?? null
+    },
+    content_sufficiency: isPlainObject(snapshot.content_sufficiency)
+      ? snapshot.content_sufficiency
+      : null,
+    expires_at: tokenRow?.expires_at || null
+  };
 }
 
 async function persistDryRunEvaluation({
@@ -895,6 +940,57 @@ router.get('/actions', requireAuth, withClientScope, async (req, res) => {
   }
 });
 
+router.post('/actions/:id/approval-token', requireAuth, withClientScope, async (req, res) => {
+  const request_id = requestId(req);
+  try {
+    const actionId = toRequiredId(req.params?.id, 'action_id_required');
+    const action = await loadAction(actionId, configurableClientIds(req));
+    if (!action) {
+      return sendError(res, 404, {
+        error: 'not_found',
+        code: 'automation_action_not_found',
+        detail: 'Automation action not found.',
+        request_id
+      });
+    }
+    if (!canConfigureAutomation(req, action.client_id)) {
+      return sendError(res, 403, {
+        error: 'forbidden',
+        code: 'forbidden',
+        detail: 'You do not have access to create approval tokens for this automation action.',
+        request_id
+      });
+    }
+    if (action.state !== 'pending_approval') {
+      return sendError(res, 409, {
+        error: 'invalid_action_state',
+        code: 'invalid_action_state',
+        detail: 'Only pending approval actions can receive approval tokens.',
+        request_id
+      });
+    }
+
+    const outcome = await createApprovalTokenForAction({
+      db,
+      action,
+      recipientUserId: req.body?.recipient_user_id || req.body?.recipientUserId || null,
+      recipientEmail: req.body?.recipient_email || req.body?.recipientEmail || null,
+      expiresInHours: req.body?.expires_in_hours ?? req.body?.expiresInHours,
+      requestId: request_id
+    });
+
+    return res.status(201).json({
+      ok: true,
+      approval_url_path: `/automation/approval/${outcome.token}`,
+      token: outcome.token,
+      expires_at: outcome.expires_at,
+      request_id
+    });
+  } catch (err) {
+    return handleCaughtError(res, req, err, 'automation_approval_token_create_failed');
+  }
+});
+
 router.get('/actions/:id/events', requireAuth, withClientScope, async (req, res) => {
   const request_id = requestId(req);
   try {
@@ -926,6 +1022,72 @@ router.get('/actions/:id/events', requireAuth, withClientScope, async (req, res)
     return res.json({ ok: true, items, request_id });
   } catch (err) {
     return handleCaughtError(res, req, err, 'automation_action_events_lookup_failed');
+  }
+});
+
+router.get('/approval/:token', async (req, res) => {
+  const request_id = requestId(req);
+  setApprovalNoStore(res);
+  try {
+    const context = await loadApprovalTokenContext({
+      db,
+      token: req.params?.token
+    });
+    if (!context.valid) {
+      return sendApprovalTokenUnavailable(res, req, context);
+    }
+
+    const viewedToken = await markApprovalTokenViewed({
+      db,
+      tokenRow: context.tokenRow,
+      requestId: request_id
+    });
+
+    return res.json({
+      ok: true,
+      item: buildApprovalActionSummary({
+        action: context.action,
+        tokenRow: viewedToken || context.tokenRow
+      }),
+      request_id
+    });
+  } catch (err) {
+    return handleCaughtError(res, req, err, 'automation_approval_token_lookup_failed');
+  }
+});
+
+router.post('/approval/:token/reject', async (req, res) => {
+  const request_id = requestId(req);
+  setApprovalNoStore(res);
+  try {
+    const context = await loadApprovalTokenContext({
+      db,
+      token: req.params?.token
+    });
+    if (!context.valid) {
+      return sendApprovalTokenUnavailable(res, req, context);
+    }
+
+    const outcome = await rejectActionFromApprovalToken({
+      db,
+      tokenRow: context.tokenRow,
+      action: context.action,
+      actor: { type: 'system' },
+      requestId: request_id
+    });
+
+    return res.json({
+      ok: true,
+      state: outcome?.action?.state || 'rejected',
+      side_effects: {
+        actions_created: 0,
+        emails_sent: 0,
+        digests_sent: 0
+      },
+      request_id
+    });
+  } catch (err) {
+    return handleCaughtError(res, req, err, 'automation_approval_token_reject_failed');
   }
 });
 
