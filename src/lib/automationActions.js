@@ -97,10 +97,24 @@ function cleanEmail(value) {
   return String(value || '').trim() || null;
 }
 
+function isValidEmail(value) {
+  const email = String(value || '').trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
 function cleanLimit(value, fallback = 100, max = 500) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return fallback;
   return Math.max(1, Math.min(max, Math.floor(n)));
+}
+
+function cleanText(value, maxLength = 200) {
+  return String(value || '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
+function sanitizeLastError(value, fallback = 'Scheduling email could not be sent.') {
+  const cleaned = cleanText(value || fallback, 500).replace(/[^\s@]+@[^\s@]+\.[^\s@]+/g, '[redacted-email]');
+  return cleaned || fallback;
 }
 
 function normalizeActor(actor = {}) {
@@ -176,6 +190,51 @@ function sanitizeCandidateSnapshot(snapshot) {
     report_id: cleanId(source.report_id),
     interview_id: cleanId(source.interview_id),
     content_sufficiency: isPlainObject(source.content_sufficiency) ? source.content_sufficiency : null
+  };
+}
+
+function actionConfigFromSnapshot(action) {
+  const snapshot = isPlainObject(action?.action_snapshot) ? action.action_snapshot : {};
+  return isPlainObject(snapshot.action_config) ? snapshot.action_config : {};
+}
+
+function schedulingConfigFromAction(action) {
+  const actionConfig = actionConfigFromSnapshot(action);
+  const source = String(actionConfig.second_round_scheduling_url || '').trim()
+    ? 'second_round_scheduling_url'
+    : 'scheduling_url';
+  const rawUrl = String(actionConfig.second_round_scheduling_url || actionConfig.scheduling_url || '').trim();
+  if (!rawUrl) {
+    throw actionError(
+      'scheduling_url_required',
+      'A valid scheduling URL is required before sending this automation action.',
+      409
+    );
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch (_) {
+    throw actionError(
+      'invalid_scheduling_url',
+      'Scheduling URL must be a valid http or https URL.',
+      409
+    );
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw actionError(
+      'invalid_scheduling_url',
+      'Scheduling URL must be a valid http or https URL.',
+      409
+    );
+  }
+
+  return {
+    schedulingUrl: parsed.href,
+    schedulingUrlSource: source,
+    schedulingLabel: cleanText(actionConfig.second_round_scheduling_label, 80) || 'Schedule next step',
+    hiringManagerName: cleanText(actionConfig.hiring_manager_name, 120) || null
   };
 }
 
@@ -470,10 +529,338 @@ async function listAutomationActionEvents({
   return data || [];
 }
 
+async function loadCandidateForSchedulingAction({ db, action } = {}) {
+  const { data, error } = await db
+    .from('candidates')
+    .select('id,client_id,role_id,name,email')
+    .eq('id', action.candidate_id)
+    .eq('client_id', action.client_id)
+    .eq('role_id', action.role_id)
+    .maybeSingle();
+
+  if (error) {
+    throw actionError(
+      'candidate_lookup_failed',
+      'Candidate lookup failed.',
+      500,
+      error.hint || null
+    );
+  }
+  return data || null;
+}
+
+async function loadRoleTitleForSchedulingAction({ db, action } = {}) {
+  const snapshot = isPlainObject(action?.candidate_snapshot) ? action.candidate_snapshot : {};
+  const snapshotTitle = cleanText(snapshot.role_title, 160);
+  if (snapshotTitle) return snapshotTitle;
+
+  const { data, error } = await db
+    .from('roles')
+    .select('id,client_id,title')
+    .eq('id', action.role_id)
+    .eq('client_id', action.client_id)
+    .maybeSingle();
+
+  if (error) {
+    throw actionError(
+      'role_lookup_failed',
+      'Role lookup failed.',
+      500,
+      error.hint || null
+    );
+  }
+  return cleanText(data?.title, 160);
+}
+
+async function markSchedulingEmailFailed({
+  db,
+  action,
+  actor,
+  requestId,
+  code,
+  detail,
+  status = 409
+} = {}) {
+  const safeDetail = sanitizeLastError(detail);
+  const now = new Date().toISOString();
+  const { data, error } = await db
+    .from('automation_actions')
+    .update({
+      state: 'failed',
+      failed_at: now,
+      last_error: safeDetail,
+      updated_at: now
+    })
+    .eq('id', action.id)
+    .eq('client_id', action.client_id)
+    .eq('state', 'sending')
+    .select(ACTION_SELECT)
+    .maybeSingle();
+
+  if (error) {
+    throw actionError(
+      'automation_action_failure_update_failed',
+      'Automation action failure update failed.',
+      500,
+      error.hint || null
+    );
+  }
+  if (!data) {
+    throw actionError(
+      'invalid_action_state',
+      'Only sending actions can be marked failed.',
+      409
+    );
+  }
+
+  const event = await writeAutomationActionEvent({
+    db,
+    actionId: data.id,
+    clientId: data.client_id,
+    eventType: 'candidate_scheduling_email_failed',
+    fromState: 'sending',
+    toState: 'failed',
+    actor,
+    requestId,
+    metadata: {
+      reason_code: code || 'scheduling_email_failed'
+    }
+  });
+
+  const err = actionError(code || 'scheduling_email_failed', safeDetail, status);
+  err.action = data;
+  err.event = event;
+  throw err;
+}
+
+async function sendApprovedAutomationActionSchedulingEmail({
+  db,
+  action,
+  actor = {},
+  requestId = null,
+  mailer = {}
+} = {}) {
+  requireDb(db);
+  if (!action?.id) throw actionError('automation_action_required', 'automation action is required.', 400);
+  if (['sent', 'delivered'].includes(action.state)) {
+    throw actionError(
+      'automation_action_already_sent',
+      'This automation action has already been sent.',
+      409
+    );
+  }
+  if (action.state !== 'approved') {
+    throw actionError(
+      'invalid_action_state',
+      'Only approved automation actions can send scheduling emails.',
+      409
+    );
+  }
+
+  const sendAttemptCount = Math.max(0, Number(action.send_attempt_count || 0)) + 1;
+  const startedAt = new Date().toISOString();
+  const { data: sendingAction, error: sendingError } = await db
+    .from('automation_actions')
+    .update({
+      state: 'sending',
+      send_attempt_count: sendAttemptCount,
+      last_error: null,
+      updated_at: startedAt
+    })
+    .eq('id', action.id)
+    .eq('client_id', action.client_id)
+    .eq('state', 'approved')
+    .select(ACTION_SELECT)
+    .maybeSingle();
+
+  if (sendingError) {
+    throw actionError(
+      'automation_action_send_start_failed',
+      'Automation action send start failed.',
+      500,
+      sendingError.hint || null
+    );
+  }
+  if (!sendingAction) {
+    throw actionError(
+      'invalid_action_state',
+      'Only approved automation actions can send scheduling emails.',
+      409
+    );
+  }
+
+  let schedulingConfig;
+  try {
+    schedulingConfig = schedulingConfigFromAction(sendingAction);
+  } catch (err) {
+    return markSchedulingEmailFailed({
+      db,
+      action: sendingAction,
+      actor,
+      requestId,
+      code: err?.code || 'invalid_scheduling_url',
+      detail: err?.detail || err?.message || 'Scheduling URL is invalid.',
+      status: err?.status || 409
+    });
+  }
+
+  let candidate;
+  try {
+    candidate = await loadCandidateForSchedulingAction({ db, action: sendingAction });
+  } catch (err) {
+    return markSchedulingEmailFailed({
+      db,
+      action: sendingAction,
+      actor,
+      requestId,
+      code: err?.code || 'candidate_lookup_failed',
+      detail: err?.detail || 'Candidate lookup failed.',
+      status: err?.status || 500
+    });
+  }
+  if (!candidate || !isValidEmail(candidate.email)) {
+    return markSchedulingEmailFailed({
+      db,
+      action: sendingAction,
+      actor,
+      requestId,
+      code: 'candidate_email_unavailable',
+      detail: 'Candidate email is unavailable for this action.',
+      status: 409
+    });
+  }
+
+  let roleTitle;
+  try {
+    roleTitle = await loadRoleTitleForSchedulingAction({ db, action: sendingAction });
+  } catch (err) {
+    return markSchedulingEmailFailed({
+      db,
+      action: sendingAction,
+      actor,
+      requestId,
+      code: err?.code || 'role_lookup_failed',
+      detail: err?.detail || 'Role lookup failed.',
+      status: err?.status || 500
+    });
+  }
+  if (!roleTitle) {
+    return markSchedulingEmailFailed({
+      db,
+      action: sendingAction,
+      actor,
+      requestId,
+      code: 'role_title_unavailable',
+      detail: 'Role title is unavailable for this action.',
+      status: 409
+    });
+  }
+
+  if (!mailer || typeof mailer.sendSecondRoundSchedulingEmail !== 'function') {
+    return markSchedulingEmailFailed({
+      db,
+      action: sendingAction,
+      actor,
+      requestId,
+      code: 'scheduling_email_sender_unavailable',
+      detail: 'Scheduling email could not be sent.',
+      status: 500
+    });
+  }
+
+  try {
+    const emailResult = await mailer.sendSecondRoundSchedulingEmail(candidate.email, {
+      candidateName: candidate.name || null,
+      roleTitle,
+      schedulingUrl: schedulingConfig.schedulingUrl,
+      schedulingLabel: schedulingConfig.schedulingLabel,
+      hiringManagerName: schedulingConfig.hiringManagerName,
+      automationActionId: sendingAction.id,
+      clientId: sendingAction.client_id,
+      roleId: sendingAction.role_id,
+      candidateId: sendingAction.candidate_id
+    });
+    if (emailResult?.skipped) {
+      return markSchedulingEmailFailed({
+        db,
+        action: sendingAction,
+        actor,
+        requestId,
+        code: 'scheduling_email_not_sent',
+        detail: 'Scheduling email could not be sent.',
+        status: 503
+      });
+    }
+  } catch (_) {
+    return markSchedulingEmailFailed({
+      db,
+      action: sendingAction,
+      actor,
+      requestId,
+      code: 'scheduling_email_send_failed',
+      detail: 'Scheduling email could not be sent.',
+      status: 502
+    });
+  }
+
+  const sentAt = new Date().toISOString();
+  const { data: sentAction, error: sentError } = await db
+    .from('automation_actions')
+    .update({
+      state: 'sent',
+      sent_at: sentAt,
+      last_error: null,
+      updated_at: sentAt
+    })
+    .eq('id', sendingAction.id)
+    .eq('client_id', sendingAction.client_id)
+    .eq('state', 'sending')
+    .select(ACTION_SELECT)
+    .maybeSingle();
+
+  if (sentError) {
+    throw actionError(
+      'automation_action_sent_update_failed',
+      'Automation action sent update failed.',
+      500,
+      sentError.hint || null
+    );
+  }
+  if (!sentAction) {
+    throw actionError(
+      'invalid_action_state',
+      'Only sending actions can be marked sent.',
+      409
+    );
+  }
+
+  const event = await writeAutomationActionEvent({
+    db,
+    actionId: sentAction.id,
+    clientId: sentAction.client_id,
+    eventType: 'candidate_scheduling_email_sent',
+    fromState: 'sending',
+    toState: 'sent',
+    actor,
+    requestId,
+    metadata: {
+      email_category: 'candidate_second_round_scheduling',
+      scheduling_url_source: schedulingConfig.schedulingUrlSource
+    }
+  });
+
+  return {
+    action: sentAction,
+    event,
+    sent: true
+  };
+}
+
 module.exports = {
   buildAutomationActionIdempotencyKey,
   createPendingAutomationAction,
   listAutomationActions,
   listAutomationActionEvents,
-  writeAutomationActionEvent
+  writeAutomationActionEvent,
+  sendApprovedAutomationActionSchedulingEmail
 };

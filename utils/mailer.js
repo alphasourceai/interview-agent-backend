@@ -564,6 +564,88 @@ async function sendMembershipAgreementCompletedInternalNotification(to, details 
   return { statusCode: resp?.statusCode || 0 }
 }
 
+function cleanEmailText(value, fallback = '') {
+  return String(value || fallback || '').replace(/[\r\n]+/g, ' ').trim()
+}
+
+function cleanFirstName(value) {
+  const firstNameRaw = String(value || '').trim().split(/\s+/).filter(Boolean)[0] || ''
+  return firstNameRaw.replace(/[^A-Za-z0-9'.-]/g, '').slice(0, 40)
+}
+
+async function sendSecondRoundSchedulingEmail(to, details = {}) {
+  if (!API_KEY) return { skipped: true }
+  const schedulingUrl = String(details.schedulingUrl || details.scheduling_url || '').trim()
+  const roleTitleText = cleanEmailText(details.roleTitle || details.role_title, 'the role')
+  const candidateFirstName = cleanFirstName(details.candidateName || details.candidate_name)
+  const greeting = /[A-Za-z0-9]/.test(candidateFirstName) ? `Hi ${candidateFirstName},` : 'Hi,'
+  const schedulingLabelText = cleanEmailText(
+    details.schedulingLabel || details.scheduling_label,
+    'Schedule next step'
+  )
+  const hiringManagerName = cleanEmailText(details.hiringManagerName || details.hiring_manager_name)
+  const safeSchedulingUrl = escapeHtml(schedulingUrl)
+  const safeRoleTitle = escapeHtml(roleTitleText)
+  const safeSchedulingLabel = escapeHtml(schedulingLabelText || 'Schedule next step')
+  const safeHiringManagerName = escapeHtml(hiringManagerName)
+  const actionId = cleanEmailText(details.automationActionId || details.automation_action_id)
+  const clientId = cleanEmailText(details.clientId || details.client_id)
+  const roleId = cleanEmailText(details.roleId || details.role_id)
+  const candidateId = cleanEmailText(details.candidateId || details.candidate_id)
+  const subjectRoleTitle = roleTitleText === 'the role' ? 'your opportunity' : roleTitleText
+  const subject = `Next step for ${subjectRoleTitle}`
+  const text = [
+    greeting,
+    '',
+    `The hiring team would like to invite you to schedule the next step for the ${roleTitleText} opportunity.`,
+    '',
+    'Please use the link below to choose a time:',
+    schedulingUrl,
+    '',
+    'If the time options do not work for you, please contact the hiring team directly.'
+  ].join('\n')
+
+  const msg = {
+    to,
+    from: FROM,
+    subject,
+    text,
+    html: buildBrandedEmailShell({
+      title: 'Schedule your next step',
+      preheader: `Schedule the next step for the ${roleTitleText} opportunity.`,
+      helpEmail: 'info@alphasourceai.com',
+      contentHtml: `
+        <p style="margin:0 0 12px;font-size:15px;line-height:1.6;">${escapeHtml(greeting)}</p>
+        <p style="margin:0 0 16px;font-size:15px;line-height:1.6;">
+          The hiring team would like to invite you to schedule the next step for the <strong>${safeRoleTitle}</strong> opportunity.
+        </p>
+        ${safeHiringManagerName ? `<p style="margin:0 0 14px;font-size:14px;line-height:1.55;">Contact: <strong>${safeHiringManagerName}</strong></p>` : ''}
+        <p style="margin:0 0 10px;font-size:15px;line-height:1.6;">
+          Please use the link below to choose a time:
+        </p>
+        <p style="margin:0 0 18px;">
+          <a class="cta" href="${safeSchedulingUrl}" target="_blank" rel="noopener noreferrer">
+            ${safeSchedulingLabel}
+          </a>
+        </p>
+        <p style="margin:0 0 16px;font-size:14px;line-height:1.55;">
+          If the time options do not work for you, please contact the hiring team directly.
+        </p>
+      `
+    }),
+    categories: ['candidate_second_round_scheduling'],
+    customArgs: {
+      email_category: 'candidate_second_round_scheduling',
+      automation_action_id: actionId,
+      client_id: clientId,
+      role_id: roleId,
+      candidate_id: candidateId
+    }
+  }
+  const [resp] = await sg.send(msg)
+  return { statusCode: resp?.statusCode || 0 }
+}
+
 module.exports = {
   escapeHtml,
   buildBrandedEmailShell,
@@ -575,5 +657,6 @@ module.exports = {
   sendMembershipAgreementEmail,
   sendMembershipAgreementInternalNotification,
   sendMembershipAgreementSignedCopyEmail,
-  sendMembershipAgreementCompletedInternalNotification
+  sendMembershipAgreementCompletedInternalNotification,
+  sendSecondRoundSchedulingEmail
 }

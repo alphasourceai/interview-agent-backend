@@ -2,6 +2,7 @@
 
 const express = require('express');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
+const mailer = require('../utils/mailer');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 const {
   buildClientScopeContext,
@@ -16,7 +17,8 @@ const {
   createPendingAutomationAction,
   listAutomationActions,
   listAutomationActionEvents,
-  writeAutomationActionEvent
+  writeAutomationActionEvent,
+  sendApprovedAutomationActionSchedulingEmail
 } = require('../src/lib/automationActions');
 const {
   createApprovalTokenForAction,
@@ -359,6 +361,21 @@ function buildApprovalActionSummary({ action, tokenRow } = {}) {
       ? snapshot.content_sufficiency
       : null,
     expires_at: tokenRow?.expires_at || null
+  };
+}
+
+function buildAutomationActionPublicSummary(action = {}) {
+  return {
+    id: action?.id || null,
+    state: action?.state || null,
+    action_type: action?.action_type || null,
+    client_id: action?.client_id || null,
+    role_id: action?.role_id || null,
+    candidate_id: action?.candidate_id || null,
+    sent_at: action?.sent_at || null,
+    failed_at: action?.failed_at || null,
+    last_error: action?.last_error || null,
+    send_attempt_count: action?.send_attempt_count ?? null
   };
 }
 
@@ -1023,6 +1040,66 @@ router.get('/actions/:id/events', requireAuth, withClientScope, async (req, res)
     return res.json({ ok: true, items, request_id });
   } catch (err) {
     return handleCaughtError(res, req, err, 'automation_action_events_lookup_failed');
+  }
+});
+
+router.post('/actions/:id/send-scheduling-email', requireAuth, withClientScope, async (req, res) => {
+  const request_id = requestId(req);
+  try {
+    const actionId = toRequiredId(req.params?.id, 'action_id_required');
+    const action = await loadAction(actionId, configurableClientIds(req));
+    if (!action) {
+      return sendError(res, 404, {
+        error: 'not_found',
+        code: 'automation_action_not_found',
+        detail: 'Automation action not found.',
+        request_id
+      });
+    }
+    if (!canConfigureAutomation(req, action.client_id)) {
+      return sendError(res, 403, {
+        error: 'forbidden',
+        code: 'forbidden',
+        detail: 'You do not have access to send this automation action.',
+        request_id
+      });
+    }
+    if (action.state !== 'approved') {
+      return sendError(res, 409, {
+        error: action.state === 'sent' || action.state === 'delivered'
+          ? 'automation_action_already_sent'
+          : 'invalid_action_state',
+        code: action.state === 'sent' || action.state === 'delivered'
+          ? 'automation_action_already_sent'
+          : 'invalid_action_state',
+        detail: action.state === 'sent' || action.state === 'delivered'
+          ? 'This automation action has already been sent.'
+          : 'Only approved automation actions can send scheduling emails.',
+        request_id
+      });
+    }
+
+    const outcome = await sendApprovedAutomationActionSchedulingEmail({
+      db,
+      action,
+      actor: actorFromRequest(req),
+      requestId: request_id,
+      mailer
+    });
+
+    return res.json({
+      ok: true,
+      item: outcome?.action ? buildAutomationActionPublicSummary(outcome.action) : null,
+      event: outcome?.event || null,
+      side_effects: {
+        actions_created: 0,
+        emails_sent: outcome?.sent ? 1 : 0,
+        digests_sent: 0
+      },
+      request_id
+    });
+  } catch (err) {
+    return handleCaughtError(res, req, err, 'automation_action_send_scheduling_email_failed');
   }
 });
 
