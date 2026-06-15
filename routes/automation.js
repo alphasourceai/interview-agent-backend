@@ -31,6 +31,8 @@ const {
 
 const router = express.Router();
 const db = supabaseAdmin;
+const DEFAULT_PENDING_APPROVAL_DIGEST_TIMEZONE = 'America/Denver';
+const MAX_PENDING_APPROVAL_DIGEST_RECIPIENTS = 10;
 
 const RULE_SELECT = [
   'id',
@@ -165,6 +167,16 @@ function normalizeJsonObject(value, fieldName, fallback = {}) {
   return value;
 }
 
+function normalizeConfigBoolean(value, fieldPath, fallback = false) {
+  if (value === undefined) return fallback;
+  if (value === true || value === false) return value;
+  throw routeError(
+    `invalid_${fieldPath.replace(/[^\w]+/g, '_')}`,
+    `${fieldPath} must be a boolean.`,
+    400
+  );
+}
+
 function buildScopeContext(req) {
   const memberships =
     (Array.isArray(req?.clientScope?.memberships) && req.clientScope.memberships) ||
@@ -212,6 +224,23 @@ function cleanRouteText(value, fallback = null, maxLength = 200) {
 function isValidEmail(value) {
   const email = String(value || '').trim();
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function normalizeEmail(value, code, detail) {
+  const email = String(value || '').trim().toLowerCase();
+  if (!isValidEmail(email)) {
+    throw routeError(code, detail, 400);
+  }
+  return email;
+}
+
+function isValidTimeZone(value) {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: value }).format(new Date());
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 function actorFromRequest(req) {
@@ -450,6 +479,135 @@ function resolveDigestApprovalBaseUrl(value) {
   );
 }
 
+function normalizeOptionalApprovalBaseUrl(value) {
+  if (value === undefined || value === null || String(value).trim() === '') return undefined;
+  return parseApprovalBaseUrl(value, 'digest_config', 400).baseUrl;
+}
+
+function normalizeSendTimeLocal(value) {
+  if (value === undefined || value === null || String(value).trim() === '') return undefined;
+  const cleaned = String(value).trim();
+  if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(cleaned)) {
+    throw routeError(
+      'invalid_pending_approval_digest_send_time_local',
+      'digest_config.pending_approval_digest.send_time_local must use HH:MM 24-hour format.',
+      400
+    );
+  }
+  return cleaned;
+}
+
+function normalizeDigestTimezone(value) {
+  const timezone = String(value || DEFAULT_PENDING_APPROVAL_DIGEST_TIMEZONE).trim();
+  if (!timezone || !isValidTimeZone(timezone)) {
+    throw routeError(
+      'invalid_pending_approval_digest_timezone',
+      'digest_config.pending_approval_digest.timezone must be a valid timezone.',
+      400
+    );
+  }
+  return timezone;
+}
+
+function normalizePendingApprovalDigestConfig(value = {}) {
+  const source = value === undefined ? {} : value;
+  if (!isPlainObject(source)) {
+    throw routeError(
+      'invalid_pending_approval_digest_config',
+      'digest_config.pending_approval_digest must be a JSON object.',
+      400
+    );
+  }
+
+  const recipientEmails = [];
+  const seenEmails = new Set();
+  if (source.recipient_emails !== undefined) {
+    if (!Array.isArray(source.recipient_emails)) {
+      throw routeError(
+        'invalid_pending_approval_digest_recipient_emails',
+        'digest_config.pending_approval_digest.recipient_emails must be an array.',
+        400
+      );
+    }
+    for (const rawEmail of source.recipient_emails) {
+      const email = normalizeEmail(
+        rawEmail,
+        'invalid_pending_approval_digest_recipient_email',
+        'digest_config.pending_approval_digest.recipient_emails must contain valid email addresses.'
+      );
+      if (!seenEmails.has(email)) {
+        seenEmails.add(email);
+        recipientEmails.push(email);
+      }
+    }
+    if (recipientEmails.length > MAX_PENDING_APPROVAL_DIGEST_RECIPIENTS) {
+      throw routeError(
+        'pending_approval_digest_recipient_limit_exceeded',
+        'digest_config.pending_approval_digest.recipient_emails must include 10 or fewer unique emails.',
+        400
+      );
+    }
+  }
+
+  const recipientNames = {};
+  if (source.recipient_names !== undefined) {
+    if (!isPlainObject(source.recipient_names)) {
+      throw routeError(
+        'invalid_pending_approval_digest_recipient_names',
+        'digest_config.pending_approval_digest.recipient_names must be a JSON object.',
+        400
+      );
+    }
+    for (const [rawEmail, rawName] of Object.entries(source.recipient_names)) {
+      const email = normalizeEmail(
+        rawEmail,
+        'invalid_pending_approval_digest_recipient_name_email',
+        'digest_config.pending_approval_digest.recipient_names keys must be valid email addresses.'
+      );
+      if (typeof rawName !== 'string') {
+        throw routeError(
+          'invalid_pending_approval_digest_recipient_name',
+          'digest_config.pending_approval_digest.recipient_names values must be strings.',
+          400
+        );
+      }
+      const name = rawName.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+      if (name.length > 120) {
+        throw routeError(
+          'pending_approval_digest_recipient_name_too_long',
+          'digest_config.pending_approval_digest.recipient_names values must be 120 characters or fewer.',
+          400
+        );
+      }
+      if (name) recipientNames[email] = name;
+    }
+  }
+
+  const normalized = {
+    enabled: normalizeConfigBoolean(
+      source.enabled,
+      'digest_config.pending_approval_digest.enabled',
+      false
+    ),
+    recipient_emails: recipientEmails,
+    recipient_names: recipientNames,
+    timezone: normalizeDigestTimezone(source.timezone)
+  };
+  const approvalBaseUrl = normalizeOptionalApprovalBaseUrl(source.approval_base_url);
+  if (approvalBaseUrl) normalized.approval_base_url = approvalBaseUrl;
+  const sendTimeLocal = normalizeSendTimeLocal(source.send_time_local);
+  if (sendTimeLocal) normalized.send_time_local = sendTimeLocal;
+  return normalized;
+}
+
+function normalizeDigestConfig(value = {}) {
+  const source = isPlainObject(value) ? value : {};
+  return {
+    ...source,
+    pending_approval_digest: normalizePendingApprovalDigestConfig(source.pending_approval_digest)
+  };
+}
+
 function buildApprovalUrl(baseUrl, token) {
   return `${String(baseUrl || '').replace(/\/+$/, '')}/automation/approval/${encodeURIComponent(String(token || ''))}`;
 }
@@ -657,7 +815,7 @@ router.post('/rules', requireAuth, withClientScope, async (req, res) => {
       mode,
       criteria_config: normalizeCriteriaConfig(normalizeJsonObject(req.body?.criteria_config, 'criteria_config', {})),
       action_config: normalizeJsonObject(req.body?.action_config, 'action_config', {}),
-      digest_config: normalizeJsonObject(req.body?.digest_config, 'digest_config', {}),
+      digest_config: normalizeDigestConfig(normalizeJsonObject(req.body?.digest_config, 'digest_config', {})),
       created_by_user_id: req.user?.id || null,
       created_by_email: cleanUserEmail(req),
       updated_by_user_id: req.user?.id || null,
@@ -740,7 +898,7 @@ router.patch('/rules/:id', requireAuth, withClientScope, async (req, res) => {
       if (stableStringify(next) !== stableStringify(rule.action_config || {})) configChanged = true;
     }
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'digest_config')) {
-      const next = normalizeJsonObject(req.body.digest_config, 'digest_config');
+      const next = normalizeDigestConfig(normalizeJsonObject(req.body.digest_config, 'digest_config'));
       updates.digest_config = next;
       hasEditableField = true;
       if (stableStringify(next) !== stableStringify(rule.digest_config || {})) configChanged = true;
