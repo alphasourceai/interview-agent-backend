@@ -164,6 +164,12 @@ function validAutomationSchedulerSecret(req) {
   return Boolean(expected && provided && provided === expected);
 }
 
+function automationDigestSchedulerSendEnabled() {
+  return ['true', '1', 'yes'].includes(
+    String(process.env.AUTOMATION_DIGEST_SCHEDULER_SEND_ENABLED || '').trim().toLowerCase()
+  );
+}
+
 function requireAutomationRunnerAccess(req, res, next) {
   if (automationSchedulerSecretHeader(req) !== null) {
     if (validAutomationSchedulerSecret(req)) {
@@ -2126,6 +2132,7 @@ router.post('/actions/run-configured-pending-approval-digests', requireAutomatio
         readiness_check: true,
         runner_access: req.isAutomationScheduler === true ? 'scheduler_secret' : 'authenticated',
         config_reachable: true,
+        scheduler_send_enabled: automationDigestSchedulerSendEnabled(),
         dry_run: true,
         can_send: false,
         side_effects: {
@@ -2149,6 +2156,14 @@ router.post('/actions/run-configured-pending-approval-digests', requireAutomatio
     const dryRunRequested = normalizeOptionalBoolean(req.body?.dry_run, 'dry_run', true);
     const sendRequested = normalizeOptionalBoolean(req.body?.send, 'send', false);
     const shouldSend = sendRequested === true && dryRunRequested === false;
+    if (req.isAutomationScheduler === true && shouldSend && !automationDigestSchedulerSendEnabled()) {
+      return sendError(res, 403, {
+        error: 'forbidden',
+        code: 'automation_digest_scheduler_send_disabled',
+        detail: 'Scheduled digest sending is disabled.',
+        request_id
+      });
+    }
     const nowIso = validateNowIso(req.body?.now_iso);
     const now = nowIso ? new Date(nowIso) : new Date();
     const limitPerDigest = normalizeLimit(req.body?.limit_per_digest, 25, 100);

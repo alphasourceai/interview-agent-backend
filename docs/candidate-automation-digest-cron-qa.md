@@ -43,6 +43,34 @@ Recommended cadence:
 
 Do not set `"send": true` or `"dry_run": false` in the Cron Job until a later phase.
 
+## Scheduled Send Guardrail
+
+Scheduler-secret send mode requires both:
+
+- `AUTOMATION_DIGEST_RUNNER_SECRET`
+- `AUTOMATION_DIGEST_SCHEDULER_SEND_ENABLED=true`
+
+QA dry-run cron does not require `AUTOMATION_DIGEST_SCHEDULER_SEND_ENABLED`. Keep the QA Cron Job body in dry-run mode until scheduled sends are explicitly approved:
+
+```json
+{
+  "dry_run": true,
+  "send": false,
+  "limit_per_digest": 25
+}
+```
+
+If the scheduler secret is valid but scheduled send mode is not enabled, a request with `"send": true` and `"dry_run": false` should return:
+
+```json
+{
+  "code": "automation_digest_scheduler_send_disabled",
+  "detail": "Scheduled digest sending is disabled."
+}
+```
+
+Production must not enable `AUTOMATION_DIGEST_SCHEDULER_SEND_ENABLED` until the production promotion phase.
+
 ## Local Smoke Script
 
 The helper script uses the same dry-run body and never enables sending:
@@ -58,11 +86,12 @@ The script fails before making a request if `AUTOMATION_DIGEST_RUNNER_SECRET` is
 ## QA Validation Checklist
 
 1. Wrong secret returns `401`.
-2. Readiness check passes:
+2. Readiness check passes and reports scheduler send disabled until the explicit QA send test phase:
 
    ```json
    {
-     "readiness_check": true
+     "readiness_check": true,
+     "scheduler_send_enabled": false
    }
    ```
 
@@ -82,6 +111,7 @@ The script fails before making a request if `AUTOMATION_DIGEST_RUNNER_SECRET` is
 5. No approval tokens are created by dry-run.
 6. No automation action events are created by dry-run.
 7. Digest grouping remains one email preview per recipient, aggregating pending actions across relevant roles/rules.
+8. Scheduler-secret send mode returns `automation_digest_scheduler_send_disabled` while `AUTOMATION_DIGEST_SCHEDULER_SEND_ENABLED` is absent or disabled.
 
 ## Safety Notes
 
