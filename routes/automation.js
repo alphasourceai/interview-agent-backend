@@ -140,36 +140,51 @@ function sendError(res, status, payload = {}) {
   });
 }
 
-function validAutomationSchedulerSecret(req) {
-  const expected = String(
+function configuredAutomationSchedulerSecret() {
+  return String(
     process.env.AUTOMATION_DIGEST_RUNNER_SECRET ||
     process.env.AUTOMATION_DIGEST_CRON_SECRET ||
     process.env.CONTRACTS_CRON_SECRET ||
     ''
   ).trim();
-  if (!expected) return false;
-  const provided = String(
-    req.get('x-cron-secret') ||
-    req.get('x-automation-cron-secret') ||
-    req.get('x-scheduler-secret') ||
-    ''
-  ).trim();
-  return provided && provided === expected;
+}
+
+function automationSchedulerSecretHeader(req) {
+  const headerNames = ['x-cron-secret', 'x-automation-cron-secret', 'x-scheduler-secret'];
+  for (const headerName of headerNames) {
+    const value = req.get(headerName);
+    if (value !== undefined) return String(value || '').trim();
+  }
+  return null;
+}
+
+function validAutomationSchedulerSecret(req) {
+  const expected = configuredAutomationSchedulerSecret();
+  const provided = automationSchedulerSecretHeader(req);
+  return Boolean(expected && provided && provided === expected);
 }
 
 function requireAutomationRunnerAccess(req, res, next) {
-  if (validAutomationSchedulerSecret(req)) {
-    req.isAutomationScheduler = true;
-    req.isGlobalAdmin = true;
-    req.isAdmin = true;
-    req.user = { id: null, email: null };
-    req.clientScope = {
-      user: req.user,
-      memberships: [],
-      accessibleClientIds: [],
-      effectiveClientIds: []
-    };
-    return next();
+  if (automationSchedulerSecretHeader(req) !== null) {
+    if (validAutomationSchedulerSecret(req)) {
+      req.isAutomationScheduler = true;
+      req.isGlobalAdmin = true;
+      req.isAdmin = true;
+      req.user = { id: null, email: null };
+      req.clientScope = {
+        user: req.user,
+        memberships: [],
+        accessibleClientIds: [],
+        effectiveClientIds: []
+      };
+      return next();
+    }
+    return sendError(res, 401, {
+      error: 'unauthorized',
+      code: 'unauthorized',
+      detail: 'Unauthorized.',
+      request_id: requestId(req)
+    });
   }
   return requireAuth(req, res, () => withClientScope(req, res, next));
 }
@@ -2091,6 +2106,37 @@ router.post('/actions/preview-pending-approval-digests', requireAuth, withClient
 router.post('/actions/run-configured-pending-approval-digests', requireAutomationRunnerAccess, async (req, res) => {
   const request_id = requestId(req);
   try {
+    const readinessCheck = normalizeOptionalBoolean(req.body?.readiness_check, 'readiness_check', false);
+    if (readinessCheck) {
+      const { error: readinessError } = await db
+        .from('automation_rules')
+        .select('id', { head: true })
+        .limit(1);
+      if (readinessError) {
+        return sendError(res, 500, {
+          error: 'server_error',
+          code: 'automation_digest_runner_config_unreachable',
+          detail: readinessError.message,
+          hint: readinessError.hint || null,
+          request_id
+        });
+      }
+      return res.json({
+        ok: true,
+        readiness_check: true,
+        runner_access: req.isAutomationScheduler === true ? 'scheduler_secret' : 'authenticated',
+        config_reachable: true,
+        dry_run: true,
+        can_send: false,
+        side_effects: {
+          actions_created: 0,
+          emails_sent: 0,
+          digests_sent: 0
+        },
+        request_id
+      });
+    }
+
     const clientId = String(req.body?.client_id || '').trim();
     const roleId = String(req.body?.role_id || '').trim();
     const recipientEmail = req.body?.recipient_email
