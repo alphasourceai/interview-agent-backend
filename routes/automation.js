@@ -608,6 +608,156 @@ function normalizeDigestConfig(value = {}) {
   };
 }
 
+function validateNowIso(value) {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  const raw = String(value).trim();
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/.test(raw)) {
+    throw routeError(
+      'invalid_now_iso',
+      'now_iso must be an ISO date/time string.',
+      400
+    );
+  }
+  const parsed = new Date(raw);
+  if (!Number.isFinite(parsed.getTime())) {
+    throw routeError(
+      'invalid_now_iso',
+      'now_iso must be an ISO date/time string.',
+      400
+    );
+  }
+  return parsed.toISOString();
+}
+
+function getPendingApprovalDigestConfig(rule = {}) {
+  const digestConfig = isPlainObject(rule.digest_config) ? rule.digest_config : {};
+  const pendingConfig = isPlainObject(digestConfig.pending_approval_digest)
+    ? digestConfig.pending_approval_digest
+    : null;
+  if (!pendingConfig || pendingConfig.enabled !== true) return null;
+
+  const recipientEmails = [];
+  const seenEmails = new Set();
+  for (const rawEmail of Array.isArray(pendingConfig.recipient_emails) ? pendingConfig.recipient_emails : []) {
+    const email = String(rawEmail || '').trim().toLowerCase();
+    if (!isValidEmail(email) || seenEmails.has(email)) continue;
+    seenEmails.add(email);
+    recipientEmails.push(email);
+  }
+  if (recipientEmails.length === 0) return null;
+
+  const recipientNames = {};
+  const sourceNames = isPlainObject(pendingConfig.recipient_names) ? pendingConfig.recipient_names : {};
+  for (const [rawEmail, rawName] of Object.entries(sourceNames)) {
+    const email = String(rawEmail || '').trim().toLowerCase();
+    if (!seenEmails.has(email) || typeof rawName !== 'string') continue;
+    const name = cleanRouteText(rawName, null, 120);
+    if (name) recipientNames[email] = name;
+  }
+
+  const timezone = isValidTimeZone(pendingConfig.timezone)
+    ? pendingConfig.timezone
+    : DEFAULT_PENDING_APPROVAL_DIGEST_TIMEZONE;
+  const sendTimeLocal = /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(String(pendingConfig.send_time_local || '').trim())
+    ? String(pendingConfig.send_time_local).trim()
+    : null;
+  const approvalBaseUrl = String(pendingConfig.approval_base_url || '').trim() || null;
+
+  return {
+    recipient_emails: recipientEmails,
+    recipient_names: recipientNames,
+    approval_base_url: approvalBaseUrl,
+    timezone,
+    send_time_local: sendTimeLocal
+  };
+}
+
+function resolvePreviewApprovalBaseUrlOverride(value) {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  return parseApprovalBaseUrl(value, 'override', 400);
+}
+
+function buildPreviewActionSummary(action = {}) {
+  const snapshot = isPlainObject(action.candidate_snapshot) ? action.candidate_snapshot : {};
+  return {
+    id: action.id || null,
+    role_id: action.role_id || null,
+    candidate_id: action.candidate_id || null,
+    candidate_name: cleanRouteText(snapshot.candidate_name, null, 160),
+    role_title: cleanRouteText(snapshot.role_title, null, 160),
+    created_at: action.created_at || null
+  };
+}
+
+function buildPendingApprovalDigestPreview({
+  rules = [],
+  actions = [],
+  recipientEmail = null,
+  limitPerDigest = 25,
+  approvalBaseOverride = null
+} = {}) {
+  const rulesById = new Map();
+  for (const rule of rules) {
+    const config = getPendingApprovalDigestConfig(rule);
+    if (!config) continue;
+    rulesById.set(rule.id, { rule, config });
+  }
+
+  const requestedRecipient = recipientEmail ? String(recipientEmail).trim().toLowerCase() : null;
+  const groups = new Map();
+  const ensureGroup = (email, config) => {
+    if (!groups.has(email)) {
+      groups.set(email, {
+        recipient_email: email,
+        recipient_name: config.recipient_names[email] || null,
+        approval_base_url_source: approvalBaseOverride
+          ? 'override'
+          : config.approval_base_url
+            ? 'rule_config'
+            : 'none',
+        timezone: config.timezone || DEFAULT_PENDING_APPROVAL_DIGEST_TIMEZONE,
+        send_time_local: config.send_time_local || null,
+        items: [],
+        seenActionIds: new Set()
+      });
+    }
+    const group = groups.get(email);
+    if (!group.recipient_name && config.recipient_names[email]) {
+      group.recipient_name = config.recipient_names[email];
+    }
+    if (!approvalBaseOverride && group.approval_base_url_source === 'none' && config.approval_base_url) {
+      group.approval_base_url_source = 'rule_config';
+    }
+    return group;
+  };
+
+  for (const action of actions) {
+    const ruleContext = rulesById.get(action.rule_id);
+    if (!ruleContext) continue;
+    const { config } = ruleContext;
+    for (const email of config.recipient_emails) {
+      if (requestedRecipient && email !== requestedRecipient) continue;
+      const group = ensureGroup(email, config);
+      if (group.seenActionIds.has(action.id) || group.items.length >= limitPerDigest) continue;
+      group.seenActionIds.add(action.id);
+      group.items.push(buildPreviewActionSummary(action));
+    }
+  }
+
+  return Array.from(groups.values())
+    .filter((group) => group.items.length > 0)
+    .sort((a, b) => a.recipient_email.localeCompare(b.recipient_email))
+    .map((group) => ({
+      recipient_email: group.recipient_email,
+      recipient_name: group.recipient_name,
+      items_count: group.items.length,
+      approval_base_url_source: group.approval_base_url_source,
+      timezone: group.timezone,
+      send_time_local: group.send_time_local,
+      items: group.items
+    }));
+}
+
 function buildApprovalUrl(baseUrl, token) {
   return `${String(baseUrl || '').replace(/\/+$/, '')}/automation/approval/${encodeURIComponent(String(token || ''))}`;
 }
@@ -1142,6 +1292,128 @@ router.post('/dry-run/candidate', requireAuth, withClientScope, async (req, res)
     return res.json(evaluationResponse({ result, persisted, rule: null }));
   } catch (err) {
     return handleCaughtError(res, req, err, 'automation_dry_run_failed');
+  }
+});
+
+router.post('/actions/preview-pending-approval-digests', requireAuth, withClientScope, async (req, res) => {
+  const request_id = requestId(req);
+  try {
+    const clientId = toRequiredId(req.body?.client_id, 'client_id_required');
+    const roleId = String(req.body?.role_id || '').trim();
+    const recipientEmail = req.body?.recipient_email
+      ? normalizeEmail(
+        req.body.recipient_email,
+        'invalid_recipient_email',
+        'recipient_email must be a valid email address.'
+      )
+      : null;
+    const limitPerDigest = normalizeLimit(req.body?.limit_per_digest, 25, 100);
+    validateNowIso(req.body?.now_iso);
+    const approvalBaseOverride = resolvePreviewApprovalBaseUrlOverride(
+      req.body?.approval_base_url_override ?? req.body?.approvalBaseUrlOverride
+    );
+
+    if (!canConfigureAutomation(req, clientId)) {
+      return sendError(res, 403, {
+        error: 'forbidden',
+        code: 'forbidden',
+        detail: 'You do not have access to preview automation digests for this client.',
+        request_id
+      });
+    }
+    if (roleId) {
+      const role = await loadRoleForClient(roleId, clientId);
+      if (!role) {
+        return sendError(res, 404, {
+          error: 'not_found',
+          code: 'role_not_found',
+          detail: 'Role not found.',
+          request_id
+        });
+      }
+    }
+
+    let rulesQuery = db
+      .from('automation_rules')
+      .select(RULE_SELECT)
+      .eq('client_id', clientId)
+      .eq('enabled', true)
+      .is('archived_at', null)
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
+      .limit(500);
+    if (roleId) rulesQuery = rulesQuery.eq('role_id', roleId);
+
+    const { data: ruleRows, error: rulesError } = await rulesQuery;
+    if (rulesError) {
+      return sendError(res, 500, {
+        error: 'server_error',
+        code: 'automation_rules_lookup_failed',
+        detail: rulesError.message,
+        hint: rulesError.hint || null,
+        request_id
+      });
+    }
+
+    const digestRules = (Array.isArray(ruleRows) ? ruleRows : [])
+      .filter((rule) => getPendingApprovalDigestConfig(rule));
+    if (digestRules.length === 0) {
+      return res.json({
+        ok: true,
+        digests_count: 0,
+        digests: [],
+        side_effects: {
+          actions_created: 0,
+          emails_sent: 0,
+          digests_sent: 0
+        },
+        request_id
+      });
+    }
+
+    let actionsQuery = db
+      .from('automation_actions')
+      .select(ACTION_SELECT)
+      .eq('client_id', clientId)
+      .eq('state', 'pending_approval')
+      .in('rule_id', digestRules.map((rule) => rule.id))
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
+      .limit(1000);
+    if (roleId) actionsQuery = actionsQuery.eq('role_id', roleId);
+
+    const { data: actionRows, error: actionsError } = await actionsQuery;
+    if (actionsError) {
+      return sendError(res, 500, {
+        error: 'server_error',
+        code: 'automation_pending_approval_actions_lookup_failed',
+        detail: actionsError.message,
+        hint: actionsError.hint || null,
+        request_id
+      });
+    }
+
+    const digests = buildPendingApprovalDigestPreview({
+      rules: digestRules,
+      actions: Array.isArray(actionRows) ? actionRows : [],
+      recipientEmail,
+      limitPerDigest,
+      approvalBaseOverride
+    });
+
+    return res.json({
+      ok: true,
+      digests_count: digests.length,
+      digests,
+      side_effects: {
+        actions_created: 0,
+        emails_sent: 0,
+        digests_sent: 0
+      },
+      request_id
+    });
+  } catch (err) {
+    return handleCaughtError(res, req, err, 'automation_pending_approval_digest_preview_failed');
   }
 });
 
