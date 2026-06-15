@@ -32,6 +32,17 @@ const {
 const router = express.Router();
 const db = supabaseAdmin;
 const DEFAULT_PENDING_APPROVAL_DIGEST_TIMEZONE = 'America/Denver';
+const DEFAULT_PENDING_APPROVAL_DIGEST_FREQUENCY = 'daily';
+const PENDING_APPROVAL_DIGEST_FREQUENCIES = new Set(['daily', 'weekdays', 'weekly']);
+const PENDING_APPROVAL_DIGEST_WEEKLY_DAYS = new Set([
+  'monday',
+  'tuesday',
+  'wednesday',
+  'thursday',
+  'friday',
+  'saturday',
+  'sunday'
+]);
 const MAX_PENDING_APPROVAL_DIGEST_RECIPIENTS = 10;
 
 const RULE_SELECT = [
@@ -597,6 +608,41 @@ function normalizeDigestTimezone(value) {
   return timezone;
 }
 
+function normalizeDigestFrequency(value) {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return DEFAULT_PENDING_APPROVAL_DIGEST_FREQUENCY;
+  }
+  const frequency = String(value).trim().toLowerCase();
+  if (!PENDING_APPROVAL_DIGEST_FREQUENCIES.has(frequency)) {
+    throw routeError(
+      'invalid_pending_approval_digest_frequency',
+      'digest_config.pending_approval_digest.frequency must be daily, weekdays, or weekly.',
+      400
+    );
+  }
+  return frequency;
+}
+
+function normalizeDigestWeeklyDay(value, frequency) {
+  if (frequency !== 'weekly') return undefined;
+  if (value === undefined || value === null || String(value).trim() === '') {
+    throw routeError(
+      'missing_pending_approval_digest_weekly_day',
+      'digest_config.pending_approval_digest.weekly_day is required when frequency is weekly.',
+      400
+    );
+  }
+  const weeklyDay = String(value).trim().toLowerCase();
+  if (!PENDING_APPROVAL_DIGEST_WEEKLY_DAYS.has(weeklyDay)) {
+    throw routeError(
+      'invalid_pending_approval_digest_weekly_day',
+      'digest_config.pending_approval_digest.weekly_day must be a weekday name.',
+      400
+    );
+  }
+  return weeklyDay;
+}
+
 function normalizePendingApprovalDigestConfig(value = {}) {
   const source = value === undefined ? {} : value;
   if (!isPlainObject(source)) {
@@ -679,8 +725,11 @@ function normalizePendingApprovalDigestConfig(value = {}) {
     ),
     recipient_emails: recipientEmails,
     recipient_names: recipientNames,
-    timezone: normalizeDigestTimezone(source.timezone)
+    timezone: normalizeDigestTimezone(source.timezone),
+    frequency: normalizeDigestFrequency(source.frequency)
   };
+  const weeklyDay = normalizeDigestWeeklyDay(source.weekly_day, normalized.frequency);
+  if (weeklyDay) normalized.weekly_day = weeklyDay;
   const approvalBaseUrl = normalizeOptionalApprovalBaseUrl(source.approval_base_url);
   if (approvalBaseUrl) normalized.approval_base_url = approvalBaseUrl;
   const sendTimeLocal = normalizeSendTimeLocal(source.send_time_local);
@@ -750,13 +799,23 @@ function getPendingApprovalDigestConfig(rule = {}) {
     ? String(pendingConfig.send_time_local).trim()
     : null;
   const approvalBaseUrl = String(pendingConfig.approval_base_url || '').trim() || null;
+  const rawFrequency = String(pendingConfig.frequency || DEFAULT_PENDING_APPROVAL_DIGEST_FREQUENCY).trim().toLowerCase();
+  const frequency = PENDING_APPROVAL_DIGEST_FREQUENCIES.has(rawFrequency)
+    ? rawFrequency
+    : DEFAULT_PENDING_APPROVAL_DIGEST_FREQUENCY;
+  const rawWeeklyDay = String(pendingConfig.weekly_day || '').trim().toLowerCase();
+  const weeklyDay = frequency === 'weekly' && PENDING_APPROVAL_DIGEST_WEEKLY_DAYS.has(rawWeeklyDay)
+    ? rawWeeklyDay
+    : null;
 
   return {
     recipient_emails: recipientEmails,
     recipient_names: recipientNames,
     approval_base_url: approvalBaseUrl,
     timezone,
-    send_time_local: sendTimeLocal
+    send_time_local: sendTimeLocal,
+    frequency,
+    weekly_day: weeklyDay
   };
 }
 
@@ -798,18 +857,48 @@ function localTimeForTimezone(timezone, now = new Date()) {
   return `${partValue('hour')}:${partValue('minute')}`;
 }
 
+function localWeekdayForTimezone(timezone, now = new Date()) {
+  const safeTimezone = isValidTimeZone(timezone) ? timezone : DEFAULT_PENDING_APPROVAL_DIGEST_TIMEZONE;
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: safeTimezone,
+    weekday: 'long'
+  }).format(now).trim().toLowerCase();
+}
+
+function digestCadenceResponseFields(source = {}) {
+  const frequency = PENDING_APPROVAL_DIGEST_FREQUENCIES.has(source.frequency)
+    ? source.frequency
+    : DEFAULT_PENDING_APPROVAL_DIGEST_FREQUENCY;
+  return frequency === 'weekly'
+    ? { frequency, weekly_day: source.weekly_day || null }
+    : { frequency };
+}
+
 function pendingApprovalDigestDueInfo(config = {}, now = new Date()) {
   const timezone = isValidTimeZone(config.timezone) ? config.timezone : DEFAULT_PENDING_APPROVAL_DIGEST_TIMEZONE;
   const sendTimeLocal = /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(String(config.send_time_local || '').trim())
     ? String(config.send_time_local).trim()
     : null;
+  const frequency = PENDING_APPROVAL_DIGEST_FREQUENCIES.has(config.frequency)
+    ? config.frequency
+    : DEFAULT_PENDING_APPROVAL_DIGEST_FREQUENCY;
+  const weeklyDay = frequency === 'weekly' && PENDING_APPROVAL_DIGEST_WEEKLY_DAYS.has(config.weekly_day)
+    ? config.weekly_day
+    : null;
   const localTime = localTimeForTimezone(timezone, now);
+  const localWeekday = localWeekdayForTimezone(timezone, now);
+  const cadenceDue =
+    frequency === 'daily' ||
+    (frequency === 'weekdays' && !['saturday', 'sunday'].includes(localWeekday)) ||
+    (frequency === 'weekly' && Boolean(weeklyDay) && localWeekday === weeklyDay);
   return {
-    due: !sendTimeLocal || localTime >= sendTimeLocal,
+    due: cadenceDue && (!sendTimeLocal || localTime >= sendTimeLocal),
     delivery_date: deliveryDateForTimezone(timezone, now),
     local_time: localTime,
     timezone,
-    send_time_local: sendTimeLocal
+    send_time_local: sendTimeLocal,
+    frequency,
+    weekly_day: weeklyDay
   };
 }
 
@@ -865,6 +954,7 @@ function buildPendingApprovalDigestPreview({
             : 'none',
         timezone: config.timezone || DEFAULT_PENDING_APPROVAL_DIGEST_TIMEZONE,
         send_time_local: config.send_time_local || null,
+        ...digestCadenceResponseFields(config),
         items: [],
         seenActionIds: new Set()
       });
@@ -902,6 +992,7 @@ function buildPendingApprovalDigestPreview({
       approval_base_url_source: group.approval_base_url_source,
       timezone: group.timezone,
       send_time_local: group.send_time_local,
+      ...digestCadenceResponseFields(group),
       items: group.items
     }));
 }
@@ -930,6 +1021,7 @@ function buildConfiguredPendingApprovalDigestGroups({
         recipient_name: config.recipient_names[email] || null,
         timezone: config.timezone || DEFAULT_PENDING_APPROVAL_DIGEST_TIMEZONE,
         send_time_local: config.send_time_local || null,
+        ...digestCadenceResponseFields(config),
         items: [],
         seenActionIds: new Set()
       });
@@ -986,6 +1078,8 @@ function buildRunnerDigestSeeds({ rules = [], recipientEmail = null, now = new D
           timezone: dueInfo.timezone,
           send_time_local: dueInfo.send_time_local,
           delivery_date: dueInfo.delivery_date,
+          frequency: dueInfo.frequency,
+          weekly_day: dueInfo.weekly_day,
           due_rule_ids: new Set(),
           not_due_rule_ids: new Set()
         });
@@ -999,6 +1093,8 @@ function buildRunnerDigestSeeds({ rules = [], recipientEmail = null, now = new D
           seed.timezone = dueInfo.timezone;
           seed.send_time_local = dueInfo.send_time_local;
           seed.delivery_date = dueInfo.delivery_date;
+          seed.frequency = dueInfo.frequency;
+          seed.weekly_day = dueInfo.weekly_day;
         }
         seed.due_rule_ids.add(rule.id);
       } else {
@@ -1017,6 +1113,8 @@ function attachRunnerSeedMetadata(groups = [], seeds = new Map()) {
     group.timezone = seed.timezone || group.timezone;
     group.send_time_local = seed.send_time_local || null;
     group.delivery_date = seed.delivery_date || null;
+    group.frequency = seed.frequency || group.frequency || DEFAULT_PENDING_APPROVAL_DIGEST_FREQUENCY;
+    group.weekly_day = group.frequency === 'weekly' ? seed.weekly_day || group.weekly_day || null : null;
     if (!group.recipient_name && seed.recipient_name) group.recipient_name = seed.recipient_name;
   }
 }
@@ -1058,6 +1156,7 @@ function buildRunnerNoActionDigests({ seeds = new Map(), sendGroups = [] } = {})
       timezone: seed.timezone,
       send_time_local: seed.send_time_local,
       delivery_date: seed.delivery_date,
+      ...digestCadenceResponseFields(seed),
       items: []
     }));
 }
@@ -1088,6 +1187,7 @@ async function buildRunnerDryRunDigests({ groups = [], roleId = null } = {}) {
       timezone: group.timezone,
       send_time_local: group.send_time_local,
       delivery_date: deliveryDate,
+      ...digestCadenceResponseFields(group),
       items: buildUnsentDigestItems(group)
     });
   }
@@ -1303,6 +1403,7 @@ async function sendConfiguredPendingApprovalDigestGroups({
         timezone: group.timezone,
         send_time_local: group.send_time_local,
         delivery_date: deliveryDate,
+        ...digestCadenceResponseFields(group),
         delivery_status: existingDelivery.status === 'sent' ? 'already_sent' : 'skipped',
         delivery_id: existingDelivery.id,
         items: buildUnsentDigestItems(group)
@@ -1329,6 +1430,7 @@ async function sendConfiguredPendingApprovalDigestGroups({
         timezone: group.timezone,
         send_time_local: group.send_time_local,
         delivery_date: deliveryDate,
+        ...digestCadenceResponseFields(group),
         delivery_status: delivery?.status === 'sent' ? 'already_sent' : 'skipped',
         delivery_id: delivery?.id || null,
         items: buildUnsentDigestItems(group)
@@ -1437,6 +1539,7 @@ async function sendConfiguredPendingApprovalDigestGroups({
       timezone: group.timezone,
       send_time_local: group.send_time_local,
       delivery_date: deliveryDate,
+      ...digestCadenceResponseFields(group),
       delivery_status: 'sent',
       delivery_id: sentDelivery?.id || delivery?.id || null,
       items: items.map(({ approval_url_source, ...item }) => item)

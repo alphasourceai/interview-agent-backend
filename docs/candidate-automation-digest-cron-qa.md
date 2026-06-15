@@ -43,6 +43,18 @@ Recommended cadence:
 
 Do not set `"send": true` or `"dry_run": false` in the Cron Job until a later phase.
 
+## Supported Digest Cadence
+
+Pending approval digest rules support a constrained cadence model in `digest_config.pending_approval_digest`:
+
+- `daily`: due every local date at or after `send_time_local`.
+- `weekdays`: due Monday-Friday in the configured timezone at or after `send_time_local`.
+- `weekly`: due only on the configured `weekly_day` in the configured timezone at or after `send_time_local`.
+
+If `frequency` is omitted, the backend defaults to `daily` for backward compatibility. Weekly rules must include `weekly_day` as one of `monday`, `tuesday`, `wednesday`, `thursday`, `friday`, `saturday`, or `sunday`.
+
+The QA Cron Job can continue running hourly in dry-run mode. The backend determines whether each configured digest is due based on the rule cadence.
+
 ## Scheduled Send Guardrail
 
 Scheduler-secret send mode requires both:
