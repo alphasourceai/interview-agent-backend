@@ -758,6 +758,85 @@ function buildPendingApprovalDigestPreview({
     }));
 }
 
+function buildConfiguredPendingApprovalDigestGroups({
+  rules = [],
+  actions = [],
+  recipientEmail = null,
+  limitPerDigest = 25
+} = {}) {
+  const rulesById = new Map();
+  for (const rule of rules) {
+    const config = getPendingApprovalDigestConfig(rule);
+    if (!config) continue;
+    rulesById.set(rule.id, { rule, config });
+  }
+
+  const requestedRecipient = recipientEmail ? String(recipientEmail).trim().toLowerCase() : null;
+  const groups = new Map();
+  const ensureGroup = (email, config) => {
+    if (!groups.has(email)) {
+      groups.set(email, {
+        recipient_email: email,
+        recipient_name: config.recipient_names[email] || null,
+        timezone: config.timezone || DEFAULT_PENDING_APPROVAL_DIGEST_TIMEZONE,
+        send_time_local: config.send_time_local || null,
+        items: [],
+        seenActionIds: new Set()
+      });
+    }
+    const group = groups.get(email);
+    if (!group.recipient_name && config.recipient_names[email]) {
+      group.recipient_name = config.recipient_names[email];
+    }
+    return group;
+  };
+
+  for (const action of actions) {
+    const ruleContext = rulesById.get(action.rule_id);
+    if (!ruleContext) continue;
+    const { config } = ruleContext;
+    for (const email of config.recipient_emails) {
+      if (requestedRecipient && email !== requestedRecipient) continue;
+      const group = ensureGroup(email, config);
+      if (group.seenActionIds.has(action.id) || group.items.length >= limitPerDigest) continue;
+      group.seenActionIds.add(action.id);
+      group.items.push({
+        action,
+        config,
+        summary: buildPreviewActionSummary(action),
+        approvalBase: null
+      });
+    }
+  }
+
+  return Array.from(groups.values())
+    .filter((group) => group.items.length > 0)
+    .sort((a, b) => a.recipient_email.localeCompare(b.recipient_email));
+}
+
+function resolveConfiguredDigestApprovalBase({ config, approvalBaseOverride } = {}) {
+  if (approvalBaseOverride) return approvalBaseOverride;
+  if (config?.approval_base_url) {
+    return parseApprovalBaseUrl(config.approval_base_url, 'rule_config', 500);
+  }
+  return resolveDigestApprovalBaseUrl(null);
+}
+
+function prepareConfiguredDigestApprovalBases(groups = [], approvalBaseOverride = null) {
+  for (const group of groups) {
+    const sources = new Set();
+    for (const item of group.items) {
+      const approvalBase = resolveConfiguredDigestApprovalBase({
+        config: item.config,
+        approvalBaseOverride
+      });
+      item.approvalBase = approvalBase;
+      sources.add(approvalBase.source);
+    }
+    group.approval_base_url_source = sources.size === 1 ? Array.from(sources)[0] : 'mixed';
+  }
+}
+
 function buildApprovalUrl(baseUrl, token) {
   return `${String(baseUrl || '').replace(/\/+$/, '')}/automation/approval/${encodeURIComponent(String(token || ''))}`;
 }
@@ -1414,6 +1493,229 @@ router.post('/actions/preview-pending-approval-digests', requireAuth, withClient
     });
   } catch (err) {
     return handleCaughtError(res, req, err, 'automation_pending_approval_digest_preview_failed');
+  }
+});
+
+router.post('/actions/send-configured-pending-approval-digests', requireAuth, withClientScope, async (req, res) => {
+  const request_id = requestId(req);
+  try {
+    const clientId = toRequiredId(req.body?.client_id, 'client_id_required');
+    const roleId = String(req.body?.role_id || '').trim();
+    const recipientEmail = req.body?.recipient_email
+      ? normalizeEmail(
+        req.body.recipient_email,
+        'invalid_recipient_email',
+        'recipient_email must be a valid email address.'
+      )
+      : null;
+    const limitPerDigest = normalizeLimit(req.body?.limit_per_digest, 25, 100);
+    const approvalBaseOverride = resolvePreviewApprovalBaseUrlOverride(
+      req.body?.approval_base_url_override ?? req.body?.approvalBaseUrlOverride
+    );
+
+    if (!canConfigureAutomation(req, clientId)) {
+      return sendError(res, 403, {
+        error: 'forbidden',
+        code: 'forbidden',
+        detail: 'You do not have access to send configured automation digests for this client.',
+        request_id
+      });
+    }
+    if (roleId) {
+      const role = await loadRoleForClient(roleId, clientId);
+      if (!role) {
+        return sendError(res, 404, {
+          error: 'not_found',
+          code: 'role_not_found',
+          detail: 'Role not found.',
+          request_id
+        });
+      }
+    }
+    if (!mailer || typeof mailer.sendPendingApprovalDigestEmail !== 'function') {
+      return sendError(res, 500, {
+        error: 'server_error',
+        code: 'automation_pending_approval_digest_sender_unavailable',
+        detail: 'Pending approval digest email could not be sent.',
+        request_id
+      });
+    }
+
+    let rulesQuery = db
+      .from('automation_rules')
+      .select(RULE_SELECT)
+      .eq('client_id', clientId)
+      .eq('enabled', true)
+      .is('archived_at', null)
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
+      .limit(500);
+    if (roleId) rulesQuery = rulesQuery.eq('role_id', roleId);
+
+    const { data: ruleRows, error: rulesError } = await rulesQuery;
+    if (rulesError) {
+      return sendError(res, 500, {
+        error: 'server_error',
+        code: 'automation_rules_lookup_failed',
+        detail: rulesError.message,
+        hint: rulesError.hint || null,
+        request_id
+      });
+    }
+
+    const digestRules = (Array.isArray(ruleRows) ? ruleRows : [])
+      .filter((rule) => getPendingApprovalDigestConfig(rule));
+    if (digestRules.length === 0) {
+      return res.json({
+        ok: true,
+        digests_count: 0,
+        digests: [],
+        side_effects: {
+          actions_created: 0,
+          emails_sent: 0,
+          digests_sent: 0
+        },
+        request_id
+      });
+    }
+
+    let actionsQuery = db
+      .from('automation_actions')
+      .select(ACTION_SELECT)
+      .eq('client_id', clientId)
+      .eq('state', 'pending_approval')
+      .in('rule_id', digestRules.map((rule) => rule.id))
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
+      .limit(1000);
+    if (roleId) actionsQuery = actionsQuery.eq('role_id', roleId);
+
+    const { data: actionRows, error: actionsError } = await actionsQuery;
+    if (actionsError) {
+      return sendError(res, 500, {
+        error: 'server_error',
+        code: 'automation_pending_approval_actions_lookup_failed',
+        detail: actionsError.message,
+        hint: actionsError.hint || null,
+        request_id
+      });
+    }
+
+    const groups = buildConfiguredPendingApprovalDigestGroups({
+      rules: digestRules,
+      actions: Array.isArray(actionRows) ? actionRows : [],
+      recipientEmail,
+      limitPerDigest
+    });
+    if (groups.length === 0) {
+      return res.json({
+        ok: true,
+        digests_count: 0,
+        digests: [],
+        side_effects: {
+          actions_created: 0,
+          emails_sent: 0,
+          digests_sent: 0
+        },
+        request_id
+      });
+    }
+
+    prepareConfiguredDigestApprovalBases(groups, approvalBaseOverride);
+
+    const digests = [];
+    let emailsSent = 0;
+    let digestsSent = 0;
+    const actor = actorFromRequest(req);
+    for (const group of groups) {
+      const items = [];
+      for (const item of group.items) {
+        const tokenOutcome = await createApprovalTokenForAction({
+          db,
+          action: item.action,
+          recipientEmail: group.recipient_email,
+          requestId: request_id
+        });
+        items.push({
+          ...item.summary,
+          approval_url: buildApprovalUrl(item.approvalBase.baseUrl, tokenOutcome.token),
+          approval_expires_at: tokenOutcome.expires_at,
+          approval_url_source: item.approvalBase.source
+        });
+      }
+
+      try {
+        const emailResult = await mailer.sendPendingApprovalDigestEmail(group.recipient_email, {
+          recipientName: group.recipient_name,
+          clientId,
+          roleId: roleId || null,
+          digestActionCount: items.length,
+          actions: items
+        });
+        if (emailResult?.skipped) {
+          return sendError(res, 503, {
+            error: 'automation_pending_approval_digest_email_not_sent',
+            code: 'automation_pending_approval_digest_email_not_sent',
+            detail: 'Pending approval digest email could not be sent.',
+            request_id
+          });
+        }
+      } catch (_) {
+        return sendError(res, 502, {
+          error: 'automation_pending_approval_digest_send_failed',
+          code: 'automation_pending_approval_digest_send_failed',
+          detail: 'Pending approval digest email could not be sent.',
+          request_id
+        });
+      }
+
+      const recipientDomain = group.recipient_email.split('@')[1] || null;
+      for (const item of group.items) {
+        await writeAutomationActionEvent({
+          db,
+          actionId: item.action.id,
+          clientId: item.action.client_id,
+          eventType: 'pending_approval_digest_email_sent',
+          fromState: 'pending_approval',
+          toState: 'pending_approval',
+          actor,
+          requestId: request_id,
+          metadata: {
+            email_category: 'automation_pending_approval_digest',
+            digest_recipient_email_domain: recipientDomain,
+            digest_action_count: items.length,
+            approval_url_source: item.approvalBase.source,
+            configured_digest: true
+          }
+        });
+      }
+
+      emailsSent += 1;
+      digestsSent += 1;
+      digests.push({
+        recipient_email: group.recipient_email,
+        recipient_name: group.recipient_name,
+        items_count: items.length,
+        approval_base_url_source: group.approval_base_url_source,
+        timezone: group.timezone,
+        send_time_local: group.send_time_local,
+        items: items.map(({ approval_url_source, ...item }) => item)
+      });
+    }
+
+    return res.json({
+      ok: true,
+      digests_count: digests.length,
+      digests,
+      side_effects: {
+        actions_created: 0,
+        emails_sent: emailsSent,
+        digests_sent: digestsSent
+      },
+      request_id
+    });
+  } catch (err) {
+    return handleCaughtError(res, req, err, 'automation_configured_pending_approval_digest_failed');
   }
 });
 
