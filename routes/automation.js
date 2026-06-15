@@ -22,6 +22,7 @@ const {
 } = require('../src/lib/automationActions');
 const {
   createApprovalTokenForAction,
+  createDigestApprovalTokenForAction,
   loadApprovalTokenContext,
   markApprovalTokenViewed,
   rejectActionFromApprovalToken,
@@ -114,6 +115,15 @@ function sendError(res, status, payload = {}) {
   });
 }
 
+function routeError(code, detail, status = 400, hint = null) {
+  const err = new Error(detail || code);
+  err.status = status;
+  err.code = code;
+  err.detail = detail || null;
+  err.hint = hint;
+  return err;
+}
+
 function isPlainObject(value) {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
@@ -192,6 +202,16 @@ function resolveClientId(req) {
 
 function cleanUserEmail(req) {
   return String(req?.user?.email || '').trim() || null;
+}
+
+function cleanRouteText(value, fallback = null, maxLength = 200) {
+  const cleaned = String(value || '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return cleaned ? cleaned.slice(0, maxLength) : fallback;
+}
+
+function isValidEmail(value) {
+  const email = String(value || '').trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
 function actorFromRequest(req) {
@@ -376,6 +396,77 @@ function buildAutomationActionPublicSummary(action = {}) {
     failed_at: action?.failed_at || null,
     last_error: action?.last_error || null,
     send_attempt_count: action?.send_attempt_count ?? null
+  };
+}
+
+function parseApprovalBaseUrl(rawValue, source, status) {
+  const raw = String(rawValue || '').trim();
+  if (!raw) return null;
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch (_) {
+    throw routeError(
+      'invalid_approval_base_url',
+      'approval_base_url must be a valid http or https URL.',
+      status
+    );
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw routeError(
+      'invalid_approval_base_url',
+      'approval_base_url must be a valid http or https URL.',
+      status
+    );
+  }
+  return {
+    baseUrl: parsed.href.replace(/\/+$/, ''),
+    source
+  };
+}
+
+function resolveDigestApprovalBaseUrl(value) {
+  const requested = String(value || '').trim();
+  if (requested) return parseApprovalBaseUrl(requested, 'request', 400);
+
+  const candidates = [
+    ['APP_BASE_URL', process.env.APP_BASE_URL],
+    ['FRONTEND_URL', process.env.FRONTEND_URL]
+  ];
+  for (const [source, raw] of candidates) {
+    const trimmed = String(raw || '').trim();
+    if (!trimmed) continue;
+    try {
+      return parseApprovalBaseUrl(trimmed, source, 500);
+    } catch (_) {
+      continue;
+    }
+  }
+
+  throw routeError(
+    'approval_base_url_unavailable',
+    'A valid approval base URL is required before sending a pending approval digest.',
+    500
+  );
+}
+
+function buildApprovalUrl(baseUrl, token) {
+  return `${String(baseUrl || '').replace(/\/+$/, '')}/automation/approval/${encodeURIComponent(String(token || ''))}`;
+}
+
+function buildPendingApprovalDigestSummary({ action, approvalUrl, expiresAt } = {}) {
+  const snapshot = isPlainObject(action?.candidate_snapshot) ? action.candidate_snapshot : {};
+  return {
+    id: action?.id || null,
+    state: action?.state || null,
+    action_type: action?.action_type || null,
+    role_id: action?.role_id || null,
+    candidate_id: action?.candidate_id || null,
+    candidate_name: cleanRouteText(snapshot.candidate_name, null, 160),
+    role_title: cleanRouteText(snapshot.role_title, null, 160),
+    approval_url: approvalUrl || null,
+    approval_expires_at: expiresAt || null,
+    created_at: action?.created_at || null
   };
 }
 
@@ -893,6 +984,168 @@ router.post('/dry-run/candidate', requireAuth, withClientScope, async (req, res)
     return res.json(evaluationResponse({ result, persisted, rule: null }));
   } catch (err) {
     return handleCaughtError(res, req, err, 'automation_dry_run_failed');
+  }
+});
+
+router.post('/actions/send-pending-approval-digest', requireAuth, withClientScope, async (req, res) => {
+  const request_id = requestId(req);
+  try {
+    const clientId = toRequiredId(req.body?.client_id, 'client_id_required');
+    const roleId = String(req.body?.role_id || '').trim();
+    const recipientEmail = String(req.body?.recipient_email || '').trim().toLowerCase();
+    const recipientName = cleanRouteText(req.body?.recipient_name, null, 120);
+    const limit = normalizeLimit(req.body?.limit, 25, 100);
+    if (!isValidEmail(recipientEmail)) {
+      return sendError(res, 400, {
+        error: 'invalid_recipient_email',
+        code: 'invalid_recipient_email',
+        detail: 'recipient_email must be a valid email address.',
+        request_id
+      });
+    }
+    if (!canConfigureAutomation(req, clientId)) {
+      return sendError(res, 403, {
+        error: 'forbidden',
+        code: 'forbidden',
+        detail: 'You do not have access to send automation digests for this client.',
+        request_id
+      });
+    }
+    if (roleId) {
+      const role = await loadRoleForClient(roleId, clientId);
+      if (!role) {
+        return sendError(res, 404, {
+          error: 'not_found',
+          code: 'role_not_found',
+          detail: 'Role not found.',
+          request_id
+        });
+      }
+    }
+
+    const approvalBase = resolveDigestApprovalBaseUrl(
+      req.body?.approval_base_url ?? req.body?.approvalBaseUrl
+    );
+
+    let query = db
+      .from('automation_actions')
+      .select(ACTION_SELECT)
+      .eq('client_id', clientId)
+      .eq('state', 'pending_approval')
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
+      .limit(limit);
+    if (roleId) query = query.eq('role_id', roleId);
+
+    const { data, error } = await query;
+    if (error) {
+      return sendError(res, 500, {
+        error: 'server_error',
+        code: 'automation_pending_approval_actions_lookup_failed',
+        detail: error.message,
+        hint: error.hint || null,
+        request_id
+      });
+    }
+
+    const actions = Array.isArray(data) ? data : [];
+    if (actions.length === 0) {
+      return res.json({
+        ok: true,
+        items_count: 0,
+        items: [],
+        side_effects: {
+          actions_created: 0,
+          emails_sent: 0,
+          digests_sent: 0
+        },
+        request_id
+      });
+    }
+
+    const items = [];
+    for (const action of actions) {
+      const tokenOutcome = await createDigestApprovalTokenForAction({
+        db,
+        action,
+        recipientEmail,
+        requestId: request_id
+      });
+      items.push(buildPendingApprovalDigestSummary({
+        action,
+        approvalUrl: buildApprovalUrl(approvalBase.baseUrl, tokenOutcome.token),
+        expiresAt: tokenOutcome.expires_at
+      }));
+    }
+
+    if (!mailer || typeof mailer.sendPendingApprovalDigestEmail !== 'function') {
+      return sendError(res, 500, {
+        error: 'server_error',
+        code: 'automation_pending_approval_digest_sender_unavailable',
+        detail: 'Pending approval digest email could not be sent.',
+        request_id
+      });
+    }
+
+    try {
+      const emailResult = await mailer.sendPendingApprovalDigestEmail(recipientEmail, {
+        recipientName,
+        clientId,
+        roleId: roleId || null,
+        digestActionCount: items.length,
+        actions: items
+      });
+      if (emailResult?.skipped) {
+        return sendError(res, 503, {
+          error: 'automation_pending_approval_digest_email_not_sent',
+          code: 'automation_pending_approval_digest_email_not_sent',
+          detail: 'Pending approval digest email could not be sent.',
+          request_id
+        });
+      }
+    } catch (_) {
+      return sendError(res, 502, {
+        error: 'automation_pending_approval_digest_send_failed',
+        code: 'automation_pending_approval_digest_send_failed',
+        detail: 'Pending approval digest email could not be sent.',
+        request_id
+      });
+    }
+
+    const recipientDomain = recipientEmail.split('@')[1] || null;
+    const actor = actorFromRequest(req);
+    for (const action of actions) {
+      await writeAutomationActionEvent({
+        db,
+        actionId: action.id,
+        clientId: action.client_id,
+        eventType: 'pending_approval_digest_email_sent',
+        fromState: 'pending_approval',
+        toState: 'pending_approval',
+        actor,
+        requestId: request_id,
+        metadata: {
+          email_category: 'automation_pending_approval_digest',
+          digest_recipient_email_domain: recipientDomain,
+          digest_action_count: items.length,
+          approval_url_source: approvalBase.source
+        }
+      });
+    }
+
+    return res.json({
+      ok: true,
+      items_count: items.length,
+      items,
+      side_effects: {
+        actions_created: 0,
+        emails_sent: 1,
+        digests_sent: 1
+      },
+      request_id
+    });
+  } catch (err) {
+    return handleCaughtError(res, req, err, 'automation_pending_approval_digest_failed');
   }
 });
 

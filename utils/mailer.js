@@ -646,6 +646,82 @@ async function sendSecondRoundSchedulingEmail(to, details = {}) {
   return { statusCode: resp?.statusCode || 0 }
 }
 
+async function sendPendingApprovalDigestEmail(to, details = {}) {
+  if (!API_KEY) return { skipped: true }
+  const actions = Array.isArray(details.actions) ? details.actions : []
+  const actionCount = Math.max(0, Number(details.digestActionCount || details.digest_action_count || actions.length) || 0)
+  const recipientFirstName = cleanFirstName(details.recipientName || details.recipient_name)
+  const greeting = /[A-Za-z0-9]/.test(recipientFirstName) ? `Hi ${recipientFirstName},` : 'Hi,'
+  const clientId = cleanEmailText(details.clientId || details.client_id)
+  const roleId = cleanEmailText(details.roleId || details.role_id)
+  const rows = actions.map((action, index) => {
+    const candidateName = cleanEmailText(action.candidateName || action.candidate_name, 'Candidate')
+    const roleTitle = cleanEmailText(action.roleTitle || action.role_title, 'Role')
+    const approvalUrl = String(action.approvalUrl || action.approval_url || '').trim()
+    const safeCandidateName = escapeHtml(candidateName)
+    const safeRoleTitle = escapeHtml(roleTitle)
+    const safeApprovalUrl = escapeHtml(approvalUrl)
+    return `
+      <tr>
+        <td style="padding:14px 0;border-top:${index === 0 ? '0' : '1px solid rgba(10,21,71,0.12)'};">
+          <p style="margin:0 0 4px;font-size:15px;line-height:1.45;font-weight:700;">${safeCandidateName}</p>
+          <p style="margin:0 0 10px;font-size:13px;line-height:1.5;color:#46527C;">${safeRoleTitle}</p>
+          <p style="margin:0;">
+            <a class="cta" href="${safeApprovalUrl}" target="_blank" rel="noopener noreferrer">
+              Review approval
+            </a>
+          </p>
+        </td>
+      </tr>
+    `
+  }).join('')
+  const text = [
+    greeting,
+    '',
+    `${actionCount} candidate automation approval${actionCount === 1 ? '' : 's'} need review.`,
+    'Candidates matched configured automation rules. Review is required before any candidate-facing scheduling email is sent.',
+    '',
+    ...actions.flatMap((action, index) => [
+      `${index + 1}. ${cleanEmailText(action.candidateName || action.candidate_name, 'Candidate')} - ${cleanEmailText(action.roleTitle || action.role_title, 'Role')}`,
+      String(action.approvalUrl || action.approval_url || '').trim(),
+      ''
+    ])
+  ].join('\n')
+
+  const msg = {
+    to,
+    from: FROM,
+    subject: 'Candidate automation approvals needed',
+    text,
+    html: buildBrandedEmailShell({
+      title: 'Candidate automation approvals needed',
+      preheader: `${actionCount} candidate automation approval${actionCount === 1 ? '' : 's'} need review.`,
+      helpEmail: 'info@alphasourceai.com',
+      contentHtml: `
+        <p style="margin:0 0 12px;font-size:15px;line-height:1.6;">${escapeHtml(greeting)}</p>
+        <p style="margin:0 0 12px;font-size:15px;line-height:1.6;">
+          ${actionCount} candidate automation approval${actionCount === 1 ? '' : 's'} need review.
+        </p>
+        <p style="margin:0 0 16px;font-size:14px;line-height:1.55;">
+          Candidates matched configured automation rules. Review is required before any candidate-facing scheduling email is sent.
+        </p>
+        <table role="presentation" width="100%" style="border-collapse:collapse;">
+          ${rows}
+        </table>
+      `
+    }),
+    categories: ['automation_pending_approval_digest'],
+    customArgs: {
+      email_category: 'automation_pending_approval_digest',
+      client_id: clientId,
+      role_id: roleId,
+      digest_action_count: String(actionCount)
+    }
+  }
+  const [resp] = await sg.send(msg)
+  return { statusCode: resp?.statusCode || 0 }
+}
+
 module.exports = {
   escapeHtml,
   buildBrandedEmailShell,
@@ -658,5 +734,6 @@ module.exports = {
   sendMembershipAgreementInternalNotification,
   sendMembershipAgreementSignedCopyEmail,
   sendMembershipAgreementCompletedInternalNotification,
-  sendSecondRoundSchedulingEmail
+  sendSecondRoundSchedulingEmail,
+  sendPendingApprovalDigestEmail
 }

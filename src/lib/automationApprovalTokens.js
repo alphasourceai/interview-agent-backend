@@ -161,6 +161,58 @@ async function createApprovalTokenForAction({
   };
 }
 
+async function createDigestApprovalTokenForAction({
+  db,
+  action,
+  recipientUserId = null,
+  recipientEmail = null,
+  expiresInHours,
+  requestId = null
+} = {}) {
+  requireDb(db);
+  if (!action?.id) {
+    throw approvalTokenError('automation_action_required', 'automation action is required.', 400);
+  }
+  if (action.state !== 'pending_approval') {
+    throw approvalTokenError(
+      'invalid_action_state',
+      'Only pending approval actions can receive approval tokens.',
+      409
+    );
+  }
+
+  // Raw token values are not stored, so digest links require a fresh active token.
+  const now = new Date().toISOString();
+  const { error: revokeError } = await db
+    .from('automation_action_approval_tokens')
+    .update({
+      state: 'revoked',
+      request_id: requestId || null,
+      updated_at: now
+    })
+    .eq('action_id', action.id)
+    .eq('client_id', action.client_id)
+    .eq('state', 'active');
+
+  if (revokeError) {
+    throw approvalTokenError(
+      'automation_approval_token_rotate_failed',
+      revokeError.message || 'Approval token rotate failed.',
+      500,
+      revokeError.hint || null
+    );
+  }
+
+  return createApprovalTokenForAction({
+    db,
+    action,
+    recipientUserId,
+    recipientEmail,
+    expiresInHours,
+    requestId
+  });
+}
+
 async function loadApprovalTokenContext({ db, token } = {}) {
   requireDb(db);
   const rawToken = String(token || '').trim();
@@ -457,6 +509,7 @@ module.exports = {
   generateApprovalToken,
   hashApprovalToken,
   createApprovalTokenForAction,
+  createDigestApprovalTokenForAction,
   loadApprovalTokenContext,
   markApprovalTokenViewed,
   rejectActionFromApprovalToken,
