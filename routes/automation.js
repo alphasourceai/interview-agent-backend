@@ -874,6 +874,98 @@ function digestCadenceResponseFields(source = {}) {
     : { frequency };
 }
 
+function buildAutomationRuleConfigOptions() {
+  return {
+    criteria_config: {
+      fields: {
+        min_overall_score: {
+          type: 'number',
+          min: 0,
+          max: 100,
+          nullable: true
+        },
+        min_resume_score: {
+          type: 'number',
+          min: 0,
+          max: 100,
+          nullable: true
+        },
+        min_interview_score: {
+          type: 'number',
+          min: 0,
+          max: 100,
+          nullable: true
+        },
+        allow_resume_only: {
+          type: 'boolean',
+          default: false
+        },
+        require_sufficient_content: {
+          type: 'boolean',
+          default: true
+        }
+      }
+    },
+    action_config: {
+      action_types: [
+        {
+          value: 'send_second_round_scheduling_email',
+          label: 'Send second-round scheduling email',
+          requires_approval: true,
+          fields: {
+            second_round_scheduling_url: {
+              type: 'url',
+              required: true,
+              allowed_protocols: ['http', 'https']
+            },
+            second_round_scheduling_label: {
+              type: 'string',
+              required: false,
+              max_length: 80
+            }
+          }
+        }
+      ]
+    },
+    digest_config: {
+      pending_approval_digest: {
+        recipient_limit: MAX_PENDING_APPROVAL_DIGEST_RECIPIENTS,
+        frequencies: [
+          {
+            value: 'daily',
+            label: 'Daily',
+            requires_weekly_day: false
+          },
+          {
+            value: 'weekdays',
+            label: 'Weekdays',
+            requires_weekly_day: false
+          },
+          {
+            value: 'weekly',
+            label: 'Weekly',
+            requires_weekly_day: true
+          }
+        ],
+        weekly_days: Array.from(PENDING_APPROVAL_DIGEST_WEEKLY_DAYS),
+        default_frequency: DEFAULT_PENDING_APPROVAL_DIGEST_FREQUENCY,
+        default_timezone: DEFAULT_PENDING_APPROVAL_DIGEST_TIMEZONE,
+        send_time_local_format: 'HH:MM',
+        approval_base_url: {
+          type: 'url',
+          allowed_protocols: ['http', 'https']
+        }
+      }
+    },
+    safety: {
+      digest_requires_approval: true,
+      digest_aggregates_by_recipient: true,
+      scheduler_send_requires_env_flag: true,
+      candidate_email_send_is_manual_after_approval: true
+    }
+  };
+}
+
 function pendingApprovalDigestDueInfo(config = {}, now = new Date()) {
   const timezone = isValidTimeZone(config.timezone) ? config.timezone : DEFAULT_PENDING_APPROVAL_DIGEST_TIMEZONE;
   const sendTimeLocal = /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(String(config.send_time_local || '').trim())
@@ -1719,6 +1811,14 @@ router.get('/rules', requireAuth, withClientScope, async (req, res) => {
   } catch (err) {
     return handleCaughtError(res, req, err, 'automation_rules_lookup_failed');
   }
+});
+
+router.get('/rules/config-options', requireAuth, withClientScope, async (req, res) => {
+  return res.json({
+    ok: true,
+    item: buildAutomationRuleConfigOptions(),
+    request_id: requestId(req)
+  });
 });
 
 router.post('/rules', requireAuth, withClientScope, async (req, res) => {
