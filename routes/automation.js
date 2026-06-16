@@ -22,7 +22,6 @@ const {
 } = require('../src/lib/automationActions');
 const {
   createApprovalTokenForAction,
-  createDigestApprovalTokenForAction,
   loadApprovalTokenContext,
   markApprovalTokenViewed,
   rejectActionFromApprovalToken,
@@ -2080,28 +2079,8 @@ async function sendConfiguredPendingApprovalDigestGroups({
   };
 }
 
-function buildApprovalUrl(baseUrl, token) {
-  return `${String(baseUrl || '').replace(/\/+$/, '')}/automation/approval/${encodeURIComponent(String(token || ''))}`;
-}
-
 function buildDigestApprovalUrl(baseUrl, token) {
   return `${String(baseUrl || '').replace(/\/+$/, '')}/automation/digest-approval/${encodeURIComponent(String(token || ''))}`;
-}
-
-function buildPendingApprovalDigestSummary({ action, approvalUrl, expiresAt } = {}) {
-  const snapshot = isPlainObject(action?.candidate_snapshot) ? action.candidate_snapshot : {};
-  return {
-    id: action?.id || null,
-    state: action?.state || null,
-    action_type: action?.action_type || null,
-    role_id: action?.role_id || null,
-    candidate_id: action?.candidate_id || null,
-    candidate_name: cleanRouteText(snapshot.candidate_name, null, 160),
-    role_title: cleanRouteText(snapshot.role_title, null, 160),
-    approval_url: approvalUrl || null,
-    approval_expires_at: expiresAt || null,
-    created_at: action?.created_at || null
-  };
 }
 
 async function persistDryRunEvaluation({
@@ -3221,22 +3200,102 @@ router.post('/actions/send-pending-approval-digest', requireAuth, withClientScop
       });
     }
 
-    const items = [];
-    for (const action of actions) {
-      const tokenOutcome = await createDigestApprovalTokenForAction({
-        db,
-        action,
-        recipientEmail,
-        requestId: request_id
+    const timezone = DEFAULT_PENDING_APPROVAL_DIGEST_TIMEZONE;
+    const sendTimeLocal = localTimeForTimezone(timezone);
+    const deliveryDate = deliveryDateForTimezone(timezone);
+    const existingDelivery = await findActiveDigestDelivery({
+      clientId,
+      roleId: roleId || null,
+      recipientEmail,
+      deliveryDate
+    });
+    if (existingDelivery) {
+      return res.json({
+        ok: true,
+        items_count: Number(existingDelivery.action_count || 0),
+        delivery_status: existingDelivery.status === 'sent' ? 'already_sent' : 'skipped',
+        delivery_id: existingDelivery.id,
+        items: [],
+        side_effects: {
+          actions_created: 0,
+          emails_sent: 0,
+          digests_sent: 0
+        },
+        request_id
       });
-      items.push(buildPendingApprovalDigestSummary({
-        action,
-        approvalUrl: buildApprovalUrl(approvalBase.baseUrl, tokenOutcome.token),
-        expiresAt: tokenOutcome.expires_at
-      }));
     }
 
+    const manualGroup = {
+      recipient_email: recipientEmail,
+      recipient_name: recipientName,
+      timezone,
+      send_time_local: sendTimeLocal,
+      items: actions.map((action) => ({
+        action,
+        summary: buildPreviewActionSummary(action)
+      }))
+    };
+    const claim = await insertDigestDelivery({
+      req,
+      clientId,
+      roleId: roleId || null,
+      group: manualGroup,
+      deliveryDate,
+      requestId: request_id
+    });
+    const delivery = claim.delivery;
+    if (!claim.claimed) {
+      return res.json({
+        ok: true,
+        items_count: Number(delivery?.action_count || 0),
+        delivery_status: delivery?.status === 'sent' ? 'already_sent' : 'skipped',
+        delivery_id: delivery?.id || null,
+        items: [],
+        side_effects: {
+          actions_created: 0,
+          emails_sent: 0,
+          digests_sent: 0
+        },
+        request_id
+      });
+    }
+
+    const actionIds = actions.map((action) => action.id).filter(Boolean);
+    let digestTokenOutcome;
+    try {
+      digestTokenOutcome = await createDigestApprovalTokenForDelivery({
+        db,
+        delivery,
+        requestId: request_id
+      });
+    } catch (err) {
+      await markDigestDeliveryFailed({
+        delivery,
+        actionIds,
+        requestId: request_id,
+        detail: err?.detail || err?.message || 'Digest approval token creation failed.'
+      });
+      throw err;
+    }
+
+    const digestApprovalUrl = buildDigestApprovalUrl(approvalBase.baseUrl, digestTokenOutcome.token);
+    const items = actions.map((action) => ({
+      ...buildPreviewActionSummary(action),
+      approval_expires_at: digestTokenOutcome.expires_at
+    }));
+
     if (!mailer || typeof mailer.sendPendingApprovalDigestEmail !== 'function') {
+      await revokeDigestApprovalTokenForDelivery({
+        db,
+        deliveryId: delivery.id,
+        requestId: request_id
+      });
+      await markDigestDeliveryFailed({
+        delivery,
+        actionIds,
+        requestId: request_id,
+        detail: 'Pending approval digest email could not be sent.'
+      });
       return sendError(res, 500, {
         error: 'server_error',
         code: 'automation_pending_approval_digest_sender_unavailable',
@@ -3251,9 +3310,22 @@ router.post('/actions/send-pending-approval-digest', requireAuth, withClientScop
         clientId,
         roleId: roleId || null,
         digestActionCount: items.length,
+        digestApprovalUrl,
+        digestApprovalExpiresAt: digestTokenOutcome.expires_at,
         actions: items
       });
       if (emailResult?.skipped) {
+        await revokeDigestApprovalTokenForDelivery({
+          db,
+          deliveryId: delivery.id,
+          requestId: request_id
+        });
+        await markDigestDeliveryFailed({
+          delivery,
+          actionIds,
+          requestId: request_id,
+          detail: 'Pending approval digest email could not be sent.'
+        });
         return sendError(res, 503, {
           error: 'automation_pending_approval_digest_email_not_sent',
           code: 'automation_pending_approval_digest_email_not_sent',
@@ -3262,6 +3334,17 @@ router.post('/actions/send-pending-approval-digest', requireAuth, withClientScop
         });
       }
     } catch (_) {
+      await revokeDigestApprovalTokenForDelivery({
+        db,
+        deliveryId: delivery.id,
+        requestId: request_id
+      });
+      await markDigestDeliveryFailed({
+        delivery,
+        actionIds,
+        requestId: request_id,
+        detail: 'Pending approval digest email could not be sent.'
+      });
       return sendError(res, 502, {
         error: 'automation_pending_approval_digest_send_failed',
         code: 'automation_pending_approval_digest_send_failed',
@@ -3270,6 +3353,11 @@ router.post('/actions/send-pending-approval-digest', requireAuth, withClientScop
       });
     }
 
+    const sentDelivery = await markDigestDeliverySent({
+      delivery,
+      actionIds,
+      requestId: request_id
+    });
     const recipientDomain = recipientEmail.split('@')[1] || null;
     const actor = actorFromRequest(req);
     for (const action of actions) {
@@ -3286,7 +3374,9 @@ router.post('/actions/send-pending-approval-digest', requireAuth, withClientScop
           email_category: 'automation_pending_approval_digest',
           digest_recipient_email_domain: recipientDomain,
           digest_action_count: items.length,
-          approval_url_source: approvalBase.source
+          approval_url_source: approvalBase.source,
+          approval_link_type: 'digest',
+          manual_digest: true
         }
       });
     }
@@ -3294,6 +3384,8 @@ router.post('/actions/send-pending-approval-digest', requireAuth, withClientScop
     return res.json({
       ok: true,
       items_count: items.length,
+      delivery_status: 'sent',
+      delivery_id: sentDelivery?.id || delivery?.id || null,
       items,
       side_effects: {
         actions_created: 0,

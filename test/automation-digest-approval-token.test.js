@@ -623,6 +623,137 @@ test('configured digest email failure revokes delivery token', async () => {
   assert.equal(db.deliveries.find((delivery) => delivery.id === 'created-delivery-1').status, 'failed');
 });
 
+test('manual pending approval digest creates one delivery token and one digest review URL', async () => {
+  const db = new FakeDb({
+    tokenRow: null,
+    delivery: null,
+    actions: [
+      baseAction('action-1'),
+      baseAction('action-2'),
+    ],
+  });
+  const mailer = createMailerStub();
+  const result = await request(
+    buildApp(db, mailer),
+    'POST',
+    '/api/automation/actions/send-pending-approval-digest',
+    {
+      client_id: 'client-1',
+      role_id: 'role-1',
+      recipient_email: 'Reviewer@Example.com ',
+      recipient_name: 'Reviewer',
+      approval_base_url: 'https://app.example.com',
+      limit: 10,
+    }
+  );
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body.items_count, 2);
+  assert.equal(result.body.delivery_status, 'sent');
+  assert.equal(result.body.side_effects.emails_sent, 1);
+  assert.equal(result.body.side_effects.digests_sent, 1);
+  assert.equal(mailer.pendingDigests.length, 1);
+
+  const deliveryInsert = db.inserts.find((entry) => entry.table === 'automation_digest_deliveries');
+  assert.ok(deliveryInsert);
+  assert.equal(deliveryInsert.payload.client_id, 'client-1');
+  assert.equal(deliveryInsert.payload.role_id, 'role-1');
+  assert.equal(deliveryInsert.payload.recipient_email, 'reviewer@example.com');
+  assert.equal(deliveryInsert.payload.digest_type, 'pending_approval');
+  assert.equal(deliveryInsert.payload.status, 'sending');
+  assert.equal(deliveryInsert.payload.timezone, 'America/Denver');
+  assert.match(deliveryInsert.payload.send_time_local, /^(?:[01]\d|2[0-3]):[0-5]\d$/);
+
+  const sentDelivery = db.deliveries.find((delivery) => delivery.id === 'created-delivery-1');
+  assert.equal(sentDelivery.status, 'sent');
+  assert.equal(sentDelivery.action_count, 2);
+  assert.deepEqual(sentDelivery.action_ids, ['action-1', 'action-2']);
+
+  const tokenInserts = db.inserts.filter((entry) => entry.table === 'automation_digest_approval_tokens');
+  assert.equal(tokenInserts.length, 1);
+  assert.equal(tokenInserts[0].payload.delivery_id, 'created-delivery-1');
+  assert.equal(tokenInserts[0].payload.token_purpose, 'pending_approval_digest');
+  assert.equal(tokenInserts[0].payload.state, 'active');
+
+  const digestUrl = mailer.pendingDigests[0].payload.digestApprovalUrl;
+  const rawTokenFromUrl = digestUrl.split('/').pop();
+  assert.match(digestUrl, /^https:\/\/app\.example\.com\/automation\/digest-approval\//);
+  assert.equal(tokenInserts[0].payload.token_hash, hashDigestApprovalToken(rawTokenFromUrl));
+  assert.ok(!JSON.stringify(tokenInserts[0].payload).includes(rawTokenFromUrl));
+  assert.ok(!JSON.stringify(result.body).includes(rawTokenFromUrl));
+  assert.ok(!JSON.stringify(result.body).includes('/automation/digest-approval/'));
+  assert.equal(mailer.pendingDigests[0].payload.actions.length, 2);
+  assert.ok(mailer.pendingDigests[0].payload.actions.every((item) => item.approval_url === undefined));
+  assert.ok(result.body.items.every((item) => item.approval_url === undefined));
+  assert.ok(!JSON.stringify(mailer.pendingDigests[0].payload).includes('/automation/approval/'));
+  assert.ok(!JSON.stringify(result.body).includes('/automation/approval/'));
+});
+
+test('manual pending approval digest retry skips existing sent delivery without duplicate token or send', async () => {
+  const db = new FakeDb({
+    tokenRow: null,
+    delivery: null,
+    actions: [
+      baseAction('action-1'),
+      baseAction('action-2'),
+    ],
+  });
+  const mailer = createMailerStub();
+  const app = buildApp(db, mailer);
+  const body = {
+    client_id: 'client-1',
+    role_id: 'role-1',
+    recipient_email: 'reviewer@example.com',
+    recipient_name: 'Reviewer',
+    approval_base_url: 'https://app.example.com',
+    limit: 10,
+  };
+
+  const first = await request(app, 'POST', '/api/automation/actions/send-pending-approval-digest', body);
+  const second = await request(app, 'POST', '/api/automation/actions/send-pending-approval-digest', body);
+
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(first.body.side_effects.digests_sent, 1);
+  assert.equal(second.body.side_effects.digests_sent, 0);
+  assert.equal(second.body.delivery_status, 'already_sent');
+  assert.equal(mailer.pendingDigests.length, 1);
+  assert.equal(db.inserts.filter((entry) => entry.table === 'automation_digest_deliveries').length, 1);
+  assert.equal(db.inserts.filter((entry) => entry.table === 'automation_digest_approval_tokens').length, 1);
+});
+
+test('manual pending approval digest failure revokes delivery token and marks delivery failed', async () => {
+  const db = new FakeDb({
+    tokenRow: null,
+    delivery: null,
+    actions: [
+      baseAction('action-1'),
+      baseAction('action-2'),
+    ],
+  });
+  const mailer = createMailerStub({ digestSkipped: true });
+  const result = await request(
+    buildApp(db, mailer),
+    'POST',
+    '/api/automation/actions/send-pending-approval-digest',
+    {
+      client_id: 'client-1',
+      role_id: 'role-1',
+      recipient_email: 'reviewer@example.com',
+      recipient_name: 'Reviewer',
+      approval_base_url: 'https://app.example.com',
+      limit: 10,
+    }
+  );
+
+  assert.equal(result.status, 503);
+  assert.equal(mailer.pendingDigests.length, 1);
+  const createdToken = db.digestTokens.find((token) => token.id === 'created-digest-token-1');
+  assert.ok(createdToken);
+  assert.equal(createdToken.state, 'revoked');
+  assert.equal(db.deliveries.find((delivery) => delivery.id === 'created-delivery-1').status, 'failed');
+});
+
 test('sendPendingApprovalDigestEmail renders one digest-level CTA without per-action links', async () => {
   const originalApiKey = process.env.SENDGRID_API_KEY;
   const sentMessages = [];
