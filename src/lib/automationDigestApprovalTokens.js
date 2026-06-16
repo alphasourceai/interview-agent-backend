@@ -171,6 +171,41 @@ async function createDigestApprovalTokenForDelivery({
   };
 }
 
+async function revokeDigestApprovalTokenForDelivery({
+  db,
+  deliveryId,
+  requestId = null
+} = {}) {
+  requireDb(db);
+  const cleanDeliveryId = cleanId(deliveryId);
+  if (!cleanDeliveryId) {
+    throw digestApprovalTokenError('digest_delivery_required', 'digest delivery is required.', 400);
+  }
+
+  const now = new Date().toISOString();
+  const { data, error } = await db
+    .from('automation_digest_approval_tokens')
+    .update({
+      state: 'revoked',
+      request_id: requestId || null,
+      updated_at: now
+    })
+    .eq('delivery_id', cleanDeliveryId)
+    .eq('state', 'active')
+    .select(TOKEN_SELECT)
+    .maybeSingle();
+
+  if (error) {
+    throw digestApprovalTokenError(
+      'automation_digest_approval_token_revoke_failed',
+      error.message || 'Digest approval token revoke failed.',
+      500,
+      error.hint || null
+    );
+  }
+  return data || null;
+}
+
 async function loadDigestApprovalTokenContext({ db, token } = {}) {
   requireDb(db);
   const rawToken = String(token || '').trim();
@@ -273,6 +308,7 @@ module.exports = {
   buildDigestApprovalItemId,
   resolveDigestApprovalItemId,
   createDigestApprovalTokenForDelivery,
+  revokeDigestApprovalTokenForDelivery,
   loadDigestApprovalTokenContext,
   markDigestApprovalTokenViewed
 };

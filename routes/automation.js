@@ -30,6 +30,8 @@ const {
 } = require('../src/lib/automationApprovalTokens');
 const {
   buildDigestApprovalItemId,
+  createDigestApprovalTokenForDelivery,
+  revokeDigestApprovalTokenForDelivery,
   loadDigestApprovalTokenContext,
   markDigestApprovalTokenViewed
 } = require('../src/lib/automationDigestApprovalTokens');
@@ -1949,29 +1951,43 @@ async function sendConfiguredPendingApprovalDigestGroups({
 
     const items = [];
     const actionIds = group.items.map((item) => item.action.id).filter(Boolean);
+    const digestApprovalBase = group.items.find((item) => item.approvalBase)?.approvalBase;
+    if (!digestApprovalBase?.baseUrl) {
+      await markDigestDeliveryFailed({
+        delivery,
+        actionIds,
+        requestId: request_id,
+        detail: 'A valid approval base URL is required before sending a pending approval digest.'
+      });
+      throw routeError(
+        'approval_base_url_unavailable',
+        'A valid approval base URL is required before sending a pending approval digest.',
+        500
+      );
+    }
+
+    let digestTokenOutcome;
+    try {
+      digestTokenOutcome = await createDigestApprovalTokenForDelivery({
+        db,
+        delivery,
+        requestId: request_id
+      });
+    } catch (err) {
+      await markDigestDeliveryFailed({
+        delivery,
+        actionIds,
+        requestId: request_id,
+        detail: err?.detail || err?.message || 'Digest approval token creation failed.'
+      });
+      throw err;
+    }
+
+    const digestApprovalUrl = buildDigestApprovalUrl(digestApprovalBase?.baseUrl, digestTokenOutcome.token);
     for (const item of group.items) {
-      let tokenOutcome;
-      try {
-        tokenOutcome = await createApprovalTokenForAction({
-          db,
-          action: item.action,
-          recipientEmail: group.recipient_email,
-          requestId: request_id
-        });
-      } catch (err) {
-        await markDigestDeliveryFailed({
-          delivery,
-          actionIds,
-          requestId: request_id,
-          detail: err?.detail || err?.message || 'Approval token creation failed.'
-        });
-        throw err;
-      }
       items.push({
         ...item.summary,
-        approval_url: buildApprovalUrl(item.approvalBase.baseUrl, tokenOutcome.token),
-        approval_expires_at: tokenOutcome.expires_at,
-        approval_url_source: item.approvalBase.source
+        approval_expires_at: digestTokenOutcome.expires_at
       });
     }
 
@@ -1981,15 +1997,11 @@ async function sendConfiguredPendingApprovalDigestGroups({
         clientId: groupClientId,
         roleId: roleId || null,
         digestActionCount: items.length,
+        digestApprovalUrl,
+        digestApprovalExpiresAt: digestTokenOutcome.expires_at,
         actions: items
       });
       if (emailResult?.skipped) {
-        await markDigestDeliveryFailed({
-          delivery,
-          actionIds,
-          requestId: request_id,
-          detail: 'Pending approval digest email could not be sent.'
-        });
         throw routeError(
           'automation_pending_approval_digest_email_not_sent',
           'Pending approval digest email could not be sent.',
@@ -1997,6 +2009,11 @@ async function sendConfiguredPendingApprovalDigestGroups({
         );
       }
     } catch (err) {
+      await revokeDigestApprovalTokenForDelivery({
+        db,
+        deliveryId: delivery.id,
+        requestId: request_id
+      });
       await markDigestDeliveryFailed({
         delivery,
         actionIds,
@@ -2031,7 +2048,8 @@ async function sendConfiguredPendingApprovalDigestGroups({
           email_category: 'automation_pending_approval_digest',
           digest_recipient_email_domain: recipientDomain,
           digest_action_count: items.length,
-          approval_url_source: item.approvalBase.source,
+          approval_url_source: digestApprovalBase?.source || group.approval_base_url_source || null,
+          approval_link_type: 'digest',
           configured_digest: true
         }
       });
@@ -2064,6 +2082,10 @@ async function sendConfiguredPendingApprovalDigestGroups({
 
 function buildApprovalUrl(baseUrl, token) {
   return `${String(baseUrl || '').replace(/\/+$/, '')}/automation/approval/${encodeURIComponent(String(token || ''))}`;
+}
+
+function buildDigestApprovalUrl(baseUrl, token) {
+  return `${String(baseUrl || '').replace(/\/+$/, '')}/automation/digest-approval/${encodeURIComponent(String(token || ''))}`;
 }
 
 function buildPendingApprovalDigestSummary({ action, approvalUrl, expiresAt } = {}) {

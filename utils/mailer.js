@@ -654,6 +654,9 @@ async function sendPendingApprovalDigestEmail(to, details = {}) {
   const greeting = /[A-Za-z0-9]/.test(recipientFirstName) ? `Hi ${recipientFirstName},` : 'Hi,'
   const clientId = cleanEmailText(details.clientId || details.client_id)
   const roleId = cleanEmailText(details.roleId || details.role_id)
+  const digestApprovalUrl = String(details.digestApprovalUrl || details.digest_approval_url || '').trim()
+  const hasDigestApprovalUrl = Boolean(digestApprovalUrl)
+  const safeDigestApprovalUrl = escapeHtml(digestApprovalUrl)
   const rows = actions.map((action, index) => {
     const candidateName = cleanEmailText(action.candidateName || action.candidate_name, 'Candidate')
     const roleTitle = cleanEmailText(action.roleTitle || action.role_title, 'Role')
@@ -665,17 +668,30 @@ async function sendPendingApprovalDigestEmail(to, details = {}) {
       <tr>
         <td style="padding:14px 0;border-top:${index === 0 ? '0' : '1px solid rgba(10,21,71,0.12)'};">
           <p style="margin:0 0 4px;font-size:15px;line-height:1.45;font-weight:700;">${safeCandidateName}</p>
-          <p style="margin:0 0 10px;font-size:13px;line-height:1.5;color:#46527C;">${safeRoleTitle}</p>
-          <p style="margin:0;">
+          <p style="margin:0${hasDigestApprovalUrl ? '' : ' 0 10px'};font-size:13px;line-height:1.5;color:#46527C;">${safeRoleTitle}</p>
+          ${hasDigestApprovalUrl ? '' : `<p style="margin:0;">
             <a class="cta" href="${safeApprovalUrl}" target="_blank" rel="noopener noreferrer">
               Review approval
             </a>
-          </p>
+          </p>`}
         </td>
       </tr>
     `
   }).join('')
-  const text = [
+  const text = hasDigestApprovalUrl ? [
+    greeting,
+    '',
+    `${actionCount} candidate automation approval${actionCount === 1 ? '' : 's'} need review.`,
+    'Open the review page to approve or decline each candidate.',
+    'Approving a candidate sends the second-round scheduling email.',
+    '',
+    digestApprovalUrl,
+    '',
+    ...actions.flatMap((action, index) => [
+      `${index + 1}. ${cleanEmailText(action.candidateName || action.candidate_name, 'Candidate')} - ${cleanEmailText(action.roleTitle || action.role_title, 'Role')}`,
+      ''
+    ])
+  ].join('\n') : [
     greeting,
     '',
     `${actionCount} candidate automation approval${actionCount === 1 ? '' : 's'} need review.`,
@@ -703,8 +719,15 @@ async function sendPendingApprovalDigestEmail(to, details = {}) {
           ${actionCount} candidate automation approval${actionCount === 1 ? '' : 's'} need review.
         </p>
         <p style="margin:0 0 16px;font-size:14px;line-height:1.55;">
-          Candidates matched configured automation rules. Review is required before any candidate-facing scheduling email is sent.
+          ${hasDigestApprovalUrl
+            ? 'Open the review page to approve or decline each candidate. Approving a candidate sends the second-round scheduling email.'
+            : 'Candidates matched configured automation rules. Review is required before any candidate-facing scheduling email is sent.'}
         </p>
+        ${hasDigestApprovalUrl ? `<p style="margin:0 0 18px;">
+          <a class="cta" href="${safeDigestApprovalUrl}" target="_blank" rel="noopener noreferrer">
+            Review candidates
+          </a>
+        </p>` : ''}
         <table role="presentation" width="100%" style="border-collapse:collapse;">
           ${rows}
         </table>

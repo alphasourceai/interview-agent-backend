@@ -12,6 +12,7 @@ const supabaseClientPath = path.join(projectRoot, 'src', 'lib', 'supabaseClient.
 const authMiddlewarePath = path.join(projectRoot, 'src', 'middleware', 'auth.js');
 const mailerPath = path.join(projectRoot, 'utils', 'mailer.js');
 const digestTokenHelpersPath = path.join(projectRoot, 'src', 'lib', 'automationDigestApprovalTokens.js');
+const sendgridMailPath = require.resolve('@sendgrid/mail');
 
 const {
   createDigestApprovalTokenForDelivery,
@@ -150,6 +151,19 @@ class FakeQuery {
     return this;
   }
 
+  is(column, value) {
+    this.filters.push({ op: 'is', column, value });
+    return this;
+  }
+
+  order() {
+    return this;
+  }
+
+  limit() {
+    return this;
+  }
+
   insert(payload) {
     this.operation = 'insert';
     this.payload = payload;
@@ -174,9 +188,13 @@ class FakeQuery {
 }
 
 class FakeDb {
-  constructor({ tokenRow, delivery, actions, candidates } = {}) {
+  constructor({ tokenRow, delivery, deliveries, actions, candidates, rules } = {}) {
     this.tokenRow = tokenRow === undefined ? baseTokenRow() : tokenRow;
     this.delivery = delivery === undefined ? baseDelivery() : delivery;
+    this.deliveries = deliveries === undefined
+      ? (this.delivery ? [this.delivery] : [])
+      : deliveries;
+    this.digestTokens = this.tokenRow ? [this.tokenRow] : [];
     this.actions = actions === undefined
       ? [
         baseAction('action-1'),
@@ -202,6 +220,34 @@ class FakeDb {
         },
       ]
       : candidates;
+    this.rules = rules === undefined
+      ? [
+        {
+          id: 'rule-1',
+          name: 'Digest rule',
+          client_id: 'client-1',
+          role_id: 'role-1',
+          enabled: true,
+          mode: 'daily_digest_pending_approval',
+          criteria_config: {},
+          action_config: {},
+          digest_config: {
+            pending_approval_digest: {
+              enabled: true,
+              recipient_emails: ['reviewer@example.com'],
+              recipient_names: {
+                'reviewer@example.com': 'Reviewer',
+              },
+              approval_base_url: 'https://app.example.com',
+            },
+          },
+          rule_version: 1,
+          archived_at: null,
+          created_at: '2026-06-16T00:00:00.000Z',
+          updated_at: '2026-06-16T00:00:00.000Z',
+        },
+      ]
+      : rules;
     this.events = [];
     this.inserts = [];
     this.updates = [];
@@ -229,6 +275,12 @@ class FakeDb {
     if (query.table === 'automation_action_events') {
       return this.resolveEventQuery(query);
     }
+    if (query.table === 'automation_rules') {
+      return this.resolveRulesQuery(query, single);
+    }
+    if (query.table === 'roles') {
+      return { data: single ? { id: 'role-1', client_id: 'client-1', title: 'Account Executive' } : [], error: null };
+    }
     if (query.table === 'candidates') {
       return this.resolveCandidateQuery(query);
     }
@@ -237,41 +289,59 @@ class FakeDb {
 
   resolveTokenQuery(query) {
     if (query.operation === 'insert') {
+      const token = {
+        id: `created-digest-token-${this.digestTokens.length + 1}`,
+        ...query.payload,
+        last_viewed_at: null,
+        view_count: 0,
+        created_at: '2026-06-16T00:00:00.000Z',
+        updated_at: '2026-06-16T00:00:00.000Z',
+      };
+      this.digestTokens.push(token);
       return {
-        data: {
-          id: 'created-digest-token',
-          ...query.payload,
-          last_viewed_at: null,
-          view_count: 0,
-          created_at: '2026-06-16T00:00:00.000Z',
-          updated_at: '2026-06-16T00:00:00.000Z',
-        },
+        data: token,
         error: null,
       };
     }
     if (query.operation === 'update') {
-      if (!this.tokenRow) return { data: null, error: null };
-      this.tokenRow = {
-        ...this.tokenRow,
-        ...query.payload,
-      };
-      return { data: this.tokenRow, error: null };
+      const token = this.digestTokens.find((row) => this.matchesFilters(row, query.filters));
+      if (!token) return { data: null, error: null };
+      Object.assign(token, query.payload);
+      if (this.tokenRow?.id === token.id) this.tokenRow = token;
+      return { data: token, error: null };
     }
 
     const hash = this.findFilter(query, 'token_hash')?.value;
-    if (!this.tokenRow || this.tokenRow.token_hash !== hash) {
+    const token = this.digestTokens.find((row) => row.token_hash === hash);
+    if (!token) {
       return { data: null, error: null };
     }
-    return { data: this.tokenRow, error: null };
+    return { data: token, error: null };
   }
 
   resolveDeliveryQuery(query) {
-    const id = this.findFilter(query, 'id')?.value;
-    const clientId = this.findFilter(query, 'client_id')?.value;
-    if (!this.delivery || this.delivery.id !== id || this.delivery.client_id !== clientId) {
-      return { data: null, error: null };
+    if (query.operation === 'insert') {
+      const delivery = {
+        id: `created-delivery-${this.deliveries.length + 1}`,
+        sent_at: null,
+        failed_at: null,
+        last_error: null,
+        created_at: '2026-06-16T09:00:00.000Z',
+        updated_at: '2026-06-16T09:00:00.000Z',
+        ...query.payload,
+      };
+      this.deliveries.push(delivery);
+      return { data: delivery, error: null };
     }
-    return { data: this.delivery, error: null };
+    if (query.operation === 'update') {
+      const delivery = this.deliveries.find((row) => this.matchesFilters(row, query.filters));
+      if (!delivery) return { data: null, error: null };
+      Object.assign(delivery, query.payload);
+      if (this.delivery?.id === delivery.id) this.delivery = delivery;
+      return { data: delivery, error: null };
+    }
+    const rows = this.deliveries.filter((delivery) => this.matchesFilters(delivery, query.filters));
+    return { data: rows[0] || null, error: null };
   }
 
   resolveActionsQuery(query, single) {
@@ -302,9 +372,15 @@ class FakeDb {
     return { data: row || null, error: null };
   }
 
+  resolveRulesQuery(query, single) {
+    const rows = this.rules.filter((rule) => this.matchesFilters(rule, query.filters));
+    return { data: single ? rows[0] || null : rows, error: null };
+  }
+
   matchesFilters(row, filters) {
     return filters.every((filter) => {
       if (filter.op === 'eq') return row[filter.column] === filter.value;
+      if (filter.op === 'is') return row[filter.column] === filter.value;
       if (filter.op === 'in') {
         const values = Array.isArray(filter.value) ? filter.value : [];
         return values.includes(row[filter.column]);
@@ -368,23 +444,35 @@ function assertSafeDigestActionResponse(body) {
   assert.ok(!bodyText.includes('rubric'));
 }
 
-function createMailerStub() {
+function createMailerStub(options = {}) {
   const sent = [];
+  const pendingDigests = [];
   return {
     sent,
+    pendingDigests,
     async sendSecondRoundSchedulingEmail(email, payload) {
       sent.push({ email, payload });
+      return { ok: true };
+    },
+    async sendPendingApprovalDigestEmail(email, payload) {
+      pendingDigests.push({ email, payload });
+      if (options.digestThrows) throw new Error('send failed');
+      if (options.digestSkipped) return { skipped: true };
       return { ok: true };
     },
   };
 }
 
-async function request(app, method, pathname) {
+async function request(app, method, pathname, body = null) {
   const server = http.createServer(app);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();
   try {
-    const response = await fetch(`http://127.0.0.1:${port}${pathname}`, { method });
+    const response = await fetch(`http://127.0.0.1:${port}${pathname}`, {
+      method,
+      headers: body ? { 'content-type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
     const text = await response.text();
     return {
       status: response.status,
@@ -425,6 +513,166 @@ test('createDigestApprovalTokenForDelivery stores only token hash', async () => 
   assert.notEqual(insert.payload.token_hash, outcome.token);
   assert.ok(!Object.values(insert.payload).includes(outcome.token));
   assert.ok(insert.payload.item_salt);
+});
+
+test('configured digest email creates one delivery token and one digest review URL', async () => {
+  const db = new FakeDb({
+    tokenRow: null,
+    delivery: null,
+    actions: [
+      baseAction('action-1'),
+      baseAction('action-2'),
+    ],
+  });
+  const mailer = createMailerStub();
+  const result = await request(
+    buildApp(db, mailer),
+    'POST',
+    '/api/automation/actions/send-configured-pending-approval-digests',
+    {
+      client_id: 'client-1',
+      approval_base_url_override: 'https://app.example.com',
+    }
+  );
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body.side_effects.emails_sent, 1);
+  assert.equal(result.body.side_effects.digests_sent, 1);
+  assert.equal(mailer.pendingDigests.length, 1);
+
+  const tokenInserts = db.inserts.filter((entry) => entry.table === 'automation_digest_approval_tokens');
+  assert.equal(tokenInserts.length, 1);
+  const deliveryInsert = db.inserts.find((entry) => entry.table === 'automation_digest_deliveries');
+  assert.ok(deliveryInsert);
+  assert.equal(tokenInserts[0].payload.delivery_id, 'created-delivery-1');
+  assert.equal(tokenInserts[0].payload.token_purpose, 'pending_approval_digest');
+  assert.equal(tokenInserts[0].payload.state, 'active');
+
+  const payloadText = JSON.stringify(tokenInserts[0].payload);
+  const digestUrl = mailer.pendingDigests[0].payload.digestApprovalUrl;
+  const rawTokenFromUrl = digestUrl.split('/').pop();
+  assert.match(digestUrl, /^https:\/\/app\.example\.com\/automation\/digest-approval\//);
+  assert.equal(tokenInserts[0].payload.token_hash, hashDigestApprovalToken(rawTokenFromUrl));
+  assert.ok(!payloadText.includes(rawTokenFromUrl));
+  assert.ok(!JSON.stringify(result.body).includes(rawTokenFromUrl));
+  assert.ok(!JSON.stringify(result.body).includes('/automation/digest-approval/'));
+  assert.equal(mailer.pendingDigests[0].payload.actions.length, 2);
+  assert.ok(mailer.pendingDigests[0].payload.actions.every((item) => item.approval_url === undefined));
+  assert.ok(!JSON.stringify(mailer.pendingDigests[0].payload.actions).includes('/automation/approval/'));
+});
+
+test('configured digest email retry skips existing sent delivery without duplicate token or send', async () => {
+  const db = new FakeDb({
+    tokenRow: null,
+    delivery: null,
+    actions: [
+      baseAction('action-1'),
+      baseAction('action-2'),
+    ],
+  });
+  const mailer = createMailerStub();
+  const app = buildApp(db, mailer);
+  const body = {
+    client_id: 'client-1',
+    approval_base_url_override: 'https://app.example.com',
+  };
+
+  const first = await request(app, 'POST', '/api/automation/actions/send-configured-pending-approval-digests', body);
+  const second = await request(app, 'POST', '/api/automation/actions/send-configured-pending-approval-digests', body);
+
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(first.body.side_effects.digests_sent, 1);
+  assert.equal(second.body.side_effects.digests_sent, 0);
+  assert.equal(second.body.digests[0].delivery_status, 'already_sent');
+  assert.equal(mailer.pendingDigests.length, 1);
+  assert.equal(db.inserts.filter((entry) => entry.table === 'automation_digest_approval_tokens').length, 1);
+});
+
+test('configured digest email failure revokes delivery token', async () => {
+  const db = new FakeDb({
+    tokenRow: null,
+    delivery: null,
+    actions: [
+      baseAction('action-1'),
+      baseAction('action-2'),
+    ],
+  });
+  const mailer = createMailerStub({ digestSkipped: true });
+  const originalConsoleError = console.error;
+  let result;
+  console.error = () => {};
+  try {
+    result = await request(
+      buildApp(db, mailer),
+      'POST',
+      '/api/automation/actions/send-configured-pending-approval-digests',
+      {
+        client_id: 'client-1',
+        approval_base_url_override: 'https://app.example.com',
+      }
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(result.status, 503);
+  const createdToken = db.digestTokens.find((token) => token.id === 'created-digest-token-1');
+  assert.ok(createdToken);
+  assert.equal(createdToken.state, 'revoked');
+  assert.equal(db.deliveries.find((delivery) => delivery.id === 'created-delivery-1').status, 'failed');
+});
+
+test('sendPendingApprovalDigestEmail renders one digest-level CTA without per-action links', async () => {
+  const originalApiKey = process.env.SENDGRID_API_KEY;
+  const sentMessages = [];
+  delete require.cache[mailerPath];
+  delete require.cache[sendgridMailPath];
+  injectModule(sendgridMailPath, {
+    setApiKey() {},
+    async send(message) {
+      sentMessages.push(message);
+      return [{ statusCode: 202 }];
+    },
+  });
+  process.env.SENDGRID_API_KEY = 'test-key';
+  try {
+    const { sendPendingApprovalDigestEmail } = require(mailerPath);
+    await sendPendingApprovalDigestEmail('reviewer@example.com', {
+      recipientName: 'Reviewer',
+      clientId: 'client-1',
+      roleId: 'role-1',
+      digestActionCount: 2,
+      digestApprovalUrl: 'https://app.example.com/automation/digest-approval/raw-digest-token',
+      actions: [
+        {
+          candidate_name: 'Alex Candidate',
+          role_title: 'Account Executive',
+          approval_url: 'https://app.example.com/automation/approval/action-token-1',
+        },
+        {
+          candidate_name: 'Jordan Applicant',
+          role_title: 'Account Executive',
+          approval_url: 'https://app.example.com/automation/approval/action-token-2',
+        },
+      ],
+    });
+  } finally {
+    if (originalApiKey === undefined) delete process.env.SENDGRID_API_KEY;
+    else process.env.SENDGRID_API_KEY = originalApiKey;
+    delete require.cache[mailerPath];
+    delete require.cache[sendgridMailPath];
+  }
+
+  assert.equal(sentMessages.length, 1);
+  const messageText = `${sentMessages[0].text}\n${sentMessages[0].html}`;
+  assert.match(messageText, /Review candidates/);
+  assert.match(messageText, /Open the review page to approve or decline each candidate/);
+  assert.match(messageText, /Approving a candidate sends the second-round scheduling email/);
+  assert.equal((messageText.match(/automation\/digest-approval\/raw-digest-token/g) || []).length, 2);
+  assert.ok(!messageText.includes('automation/approval/action-token-1'));
+  assert.ok(!messageText.includes('automation/approval/action-token-2'));
+  assert.ok(!messageText.includes('Review approval'));
 });
 
 test('GET /api/automation/digest-approval/:token returns multiple safe items', async () => {
