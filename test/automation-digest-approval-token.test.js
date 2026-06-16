@@ -15,7 +15,8 @@ const digestTokenHelpersPath = path.join(projectRoot, 'src', 'lib', 'automationD
 
 const {
   createDigestApprovalTokenForDelivery,
-  hashDigestApprovalToken
+  hashDigestApprovalToken,
+  buildDigestApprovalItemId
 } = require(digestTokenHelpersPath);
 
 const rawToken = 'digest-token-1234567890';
@@ -83,7 +84,7 @@ function baseAction(id, overrides = {}) {
     candidate_id: `candidate-${id}`,
     report_id: `report-${id}`,
     interview_id: `interview-${id}`,
-    action_type: 'send_scheduling_email',
+    action_type: 'send_second_round_scheduling_email',
     state: 'pending_approval',
     idempotency_key: `key-${id}`,
     candidate_snapshot: {
@@ -101,9 +102,11 @@ function baseAction(id, overrides = {}) {
       },
     },
     action_snapshot: {
-      scheduling_url: 'https://schedule.example.com/secret',
-      rubric: {
-        internal: true,
+      action_config: {
+        scheduling_url: 'https://schedule.example.com/secret',
+        rubric: {
+          internal: true,
+        },
       },
     },
     approved_by_user_id: null,
@@ -171,7 +174,7 @@ class FakeQuery {
 }
 
 class FakeDb {
-  constructor({ tokenRow, delivery, actions } = {}) {
+  constructor({ tokenRow, delivery, actions, candidates } = {}) {
     this.tokenRow = tokenRow === undefined ? baseTokenRow() : tokenRow;
     this.delivery = delivery === undefined ? baseDelivery() : delivery;
     this.actions = actions === undefined
@@ -186,6 +189,20 @@ class FakeDb {
         }),
       ]
       : actions;
+    this.candidates = candidates === undefined
+      ? [
+        { id: 'candidate-action-1', client_id: 'client-1', role_id: 'role-1', name: 'Alex Candidate', email: 'alex@example.com' },
+        { id: 'candidate-action-2', client_id: 'client-1', role_id: 'role-1', name: 'Jordan Applicant', email: 'jordan@example.com' },
+        {
+          id: 'candidate-action-outside-delivery',
+          client_id: 'client-1',
+          role_id: 'role-1',
+          name: 'Outside Candidate',
+          email: 'outside@example.com',
+        },
+      ]
+      : candidates;
+    this.events = [];
     this.inserts = [];
     this.updates = [];
     this.selects = [];
@@ -208,6 +225,12 @@ class FakeDb {
     }
     if (query.table === 'automation_actions') {
       return this.resolveActionsQuery(query, single);
+    }
+    if (query.table === 'automation_action_events') {
+      return this.resolveEventQuery(query);
+    }
+    if (query.table === 'candidates') {
+      return this.resolveCandidateQuery(query);
     }
     return { data: single ? null : [], error: null };
   }
@@ -252,13 +275,42 @@ class FakeDb {
   }
 
   resolveActionsQuery(query, single) {
-    const clientId = this.findFilter(query, 'client_id')?.value;
-    const idFilter = this.findFilter(query, 'id', 'in')?.value || [];
-    const ids = new Set(Array.isArray(idFilter) ? idFilter : []);
-    const rows = this.actions.filter((action) => (
-      action.client_id === clientId && ids.has(action.id)
-    ));
+    if (query.operation === 'update') {
+      const action = this.actions.find((row) => this.matchesFilters(row, query.filters));
+      if (!action) return { data: null, error: null };
+      Object.assign(action, query.payload);
+      return { data: { ...action }, error: null };
+    }
+
+    const rows = this.actions.filter((action) => this.matchesFilters(action, query.filters));
     return { data: single ? rows[0] || null : rows, error: null };
+  }
+
+  resolveEventQuery(query) {
+    if (query.operation !== 'insert') return { data: null, error: null };
+    const event = {
+      id: `event-${this.events.length + 1}`,
+      created_at: '2026-06-16T09:00:00.000Z',
+      ...query.payload,
+    };
+    this.events.push(event);
+    return { data: event, error: null };
+  }
+
+  resolveCandidateQuery(query) {
+    const row = this.candidates.find((candidate) => this.matchesFilters(candidate, query.filters));
+    return { data: row || null, error: null };
+  }
+
+  matchesFilters(row, filters) {
+    return filters.every((filter) => {
+      if (filter.op === 'eq') return row[filter.column] === filter.value;
+      if (filter.op === 'in') {
+        const values = Array.isArray(filter.value) ? filter.value : [];
+        return values.includes(row[filter.column]);
+      }
+      return true;
+    });
   }
 }
 
@@ -271,7 +323,7 @@ function injectModule(filename, exports) {
   };
 }
 
-function buildApp(db) {
+function buildApp(db, mailer = {}) {
   delete require.cache[routePath];
   delete require.cache[supabaseClientPath];
   delete require.cache[authMiddlewarePath];
@@ -287,13 +339,44 @@ function buildApp(db) {
     },
     withClientScope: (_req, _res, next) => next(),
   });
-  injectModule(mailerPath, {});
+  injectModule(mailerPath, mailer);
 
   const router = require(routePath);
   const app = express();
   app.use(express.json());
   app.use('/api/automation', router);
   return app;
+}
+
+function itemIdFor(actionId, tokenRow = baseTokenRow()) {
+  return buildDigestApprovalItemId(tokenRow.item_salt, actionId);
+}
+
+function assertSafeDigestActionResponse(body) {
+  const bodyText = JSON.stringify(body);
+  assert.ok(!bodyText.includes('action-1'));
+  assert.ok(!bodyText.includes('action-2'));
+  assert.ok(!bodyText.includes('delivery-1'));
+  assert.ok(!bodyText.includes(rawToken));
+  assert.ok(!bodyText.includes('token_hash'));
+  assert.ok(!bodyText.includes('candidate_email'));
+  assert.ok(!bodyText.includes('alex@example.com'));
+  assert.ok(!bodyText.includes('jordan@example.com'));
+  assert.ok(!bodyText.includes('schedule.example.com'));
+  assert.ok(!bodyText.includes('content_sufficiency'));
+  assert.ok(!bodyText.includes('score_thresholds'));
+  assert.ok(!bodyText.includes('rubric'));
+}
+
+function createMailerStub() {
+  const sent = [];
+  return {
+    sent,
+    async sendSecondRoundSchedulingEmail(email, payload) {
+      sent.push({ email, payload });
+      return { ok: true };
+    },
+  };
 }
 
 async function request(app, method, pathname) {
@@ -471,4 +554,150 @@ test('GET /api/automation/digest-approval/:token does not mark unavailable reads
   assert.equal(result.body.code, 'digest_approval_unavailable');
   assert.equal(db.tokenRow.view_count, 0);
   assert.equal(db.updates.length, 0);
+});
+
+test('POST digest approve-send sends exactly once for pending action', async () => {
+  const db = new FakeDb();
+  const mailer = createMailerStub();
+  const result = await request(
+    buildApp(db, mailer),
+    'POST',
+    `/api/automation/digest-approval/${encodeURIComponent(rawToken)}/items/${itemIdFor('action-1')}/approve-send`
+  );
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body.ok, true);
+  assert.equal(result.body.item.item_id, itemIdFor('action-1'));
+  assert.equal(result.body.item.status, 'sent');
+  assert.equal(result.body.item.can_approve_send, false);
+  assert.equal(result.body.item.can_reject, false);
+  assert.equal(result.body.side_effects.emails_sent, 1);
+  assert.equal(mailer.sent.length, 1);
+  assert.equal(mailer.sent[0].email, 'alex@example.com');
+  assert.equal(db.actions.find((action) => action.id === 'action-1').state, 'sent');
+  assert.deepEqual(db.events.map((event) => event.event_type), [
+    'action_approved_from_digest_approval_token',
+    'candidate_scheduling_email_sent',
+  ]);
+  assertSafeDigestActionResponse(result.body);
+});
+
+test('POST digest approve-send retry does not send duplicate email', async () => {
+  const db = new FakeDb();
+  const mailer = createMailerStub();
+  const app = buildApp(db, mailer);
+  const path = `/api/automation/digest-approval/${encodeURIComponent(rawToken)}/items/${itemIdFor('action-1')}/approve-send`;
+
+  const first = await request(app, 'POST', path);
+  const second = await request(app, 'POST', path);
+
+  assert.equal(first.status, 200);
+  assert.equal(first.body.side_effects.emails_sent, 1);
+  assert.equal(second.status, 200);
+  assert.equal(second.body.item.status, 'sent');
+  assert.equal(second.body.side_effects.emails_sent, 0);
+  assert.equal(mailer.sent.length, 1);
+  assertSafeDigestActionResponse(second.body);
+});
+
+test('POST digest approve-send rejects item outside digest', async () => {
+  const db = new FakeDb();
+  const mailer = createMailerStub();
+  const result = await request(
+    buildApp(db, mailer),
+    'POST',
+    `/api/automation/digest-approval/${encodeURIComponent(rawToken)}/items/${itemIdFor('action-outside-delivery')}/approve-send`
+  );
+
+  assert.equal(result.status, 404);
+  assert.equal(result.body.code, 'digest_approval_item_unavailable');
+  assert.equal(mailer.sent.length, 0);
+});
+
+test('POST digest approve-send rejects expired token', async () => {
+  const db = new FakeDb({
+    tokenRow: baseTokenRow({ expires_at: pastIso() }),
+  });
+  const mailer = createMailerStub();
+  const result = await request(
+    buildApp(db, mailer),
+    'POST',
+    `/api/automation/digest-approval/${encodeURIComponent(rawToken)}/items/${itemIdFor('action-1')}/approve-send`
+  );
+
+  assert.equal(result.status, 410);
+  assert.equal(result.body.code, 'digest_approval_token_expired');
+  assert.equal(mailer.sent.length, 0);
+});
+
+test('POST digest approve-send rejects invalid token', async () => {
+  const db = new FakeDb({ tokenRow: null });
+  const mailer = createMailerStub();
+  const result = await request(
+    buildApp(db, mailer),
+    'POST',
+    `/api/automation/digest-approval/${encodeURIComponent(rawToken)}/items/${itemIdFor('action-1')}/approve-send`
+  );
+
+  assert.equal(result.status, 404);
+  assert.equal(result.body.code, 'digest_approval_token_invalid');
+  assert.equal(mailer.sent.length, 0);
+});
+
+test('POST digest reject marks pending action rejected and sends no email', async () => {
+  const db = new FakeDb();
+  const mailer = createMailerStub();
+  const result = await request(
+    buildApp(db, mailer),
+    'POST',
+    `/api/automation/digest-approval/${encodeURIComponent(rawToken)}/items/${itemIdFor('action-1')}/reject`
+  );
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body.ok, true);
+  assert.equal(result.body.item.item_id, itemIdFor('action-1'));
+  assert.equal(result.body.item.status, 'rejected');
+  assert.equal(result.body.side_effects.emails_sent, 0);
+  assert.equal(mailer.sent.length, 0);
+  assert.equal(db.actions.find((action) => action.id === 'action-1').state, 'rejected');
+  assert.deepEqual(db.events.map((event) => event.event_type), [
+    'action_rejected_from_digest_approval_token',
+  ]);
+  assertSafeDigestActionResponse(result.body);
+});
+
+test('POST digest reject is idempotent for already rejected action', async () => {
+  const db = new FakeDb({
+    actions: [
+      baseAction('action-1', { state: 'rejected' }),
+      baseAction('action-2', { state: 'sent' }),
+    ],
+  });
+  const mailer = createMailerStub();
+  const result = await request(
+    buildApp(db, mailer),
+    'POST',
+    `/api/automation/digest-approval/${encodeURIComponent(rawToken)}/items/${itemIdFor('action-1')}/reject`
+  );
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body.item.status, 'rejected');
+  assert.equal(result.body.side_effects.emails_sent, 0);
+  assert.equal(db.events.length, 0);
+  assert.equal(mailer.sent.length, 0);
+  assertSafeDigestActionResponse(result.body);
+});
+
+test('POST digest reject conflicts after action was sent', async () => {
+  const db = new FakeDb();
+  const mailer = createMailerStub();
+  const result = await request(
+    buildApp(db, mailer),
+    'POST',
+    `/api/automation/digest-approval/${encodeURIComponent(rawToken)}/items/${itemIdFor('action-2')}/reject`
+  );
+
+  assert.equal(result.status, 409);
+  assert.equal(result.body.code, 'automation_digest_approval_action_already_sent');
+  assert.equal(mailer.sent.length, 0);
 });

@@ -600,6 +600,14 @@ function digestApprovalActionIds(delivery = {}) {
   return Array.from(new Set(ids.map((id) => String(id || '').trim()).filter(Boolean)));
 }
 
+function resolveDigestApprovalActionId({ tokenRow, delivery, itemId } = {}) {
+  const requested = String(itemId || '').trim();
+  if (!requested) return null;
+  const matches = digestApprovalActionIds(delivery)
+    .filter((actionId) => buildDigestApprovalItemId(tokenRow?.item_salt, actionId) === requested);
+  return matches.length === 1 ? matches[0] : null;
+}
+
 async function loadDigestApprovalActions(delivery = {}) {
   const actionIds = digestApprovalActionIds(delivery);
   if (actionIds.length === 0) return [];
@@ -621,6 +629,27 @@ async function loadDigestApprovalActions(delivery = {}) {
   const actionsById = new Map((Array.isArray(data) ? data : [])
     .map((action) => [String(action?.id || ''), action]));
   return actionIds.map((id) => actionsById.get(id)).filter(Boolean);
+}
+
+async function loadDigestApprovalActionForItem({ tokenRow, delivery, itemId } = {}) {
+  const actionId = resolveDigestApprovalActionId({ tokenRow, delivery, itemId });
+  if (!actionId) return null;
+  const { data, error } = await db
+    .from('automation_actions')
+    .select(ACTION_SELECT)
+    .eq('id', actionId)
+    .eq('client_id', delivery.client_id)
+    .maybeSingle();
+
+  if (error) {
+    throw routeError(
+      'automation_digest_approval_action_lookup_failed',
+      error.message || 'Digest approval action lookup failed.',
+      500,
+      error.hint || null
+    );
+  }
+  return data || null;
 }
 
 function digestApprovalPublicStatus(state) {
@@ -653,6 +682,26 @@ function buildDigestApprovalReviewItem({ action, tokenRow } = {}) {
   };
 }
 
+function digestApprovalActionResultStatus(state) {
+  const normalized = String(state || '').trim();
+  if (normalized === 'pending_approval') return 'pending';
+  if (['sent', 'delivered'].includes(normalized)) return 'sent';
+  if (normalized === 'rejected') return 'rejected';
+  if (normalized === 'failed') return 'failed';
+  return 'unavailable';
+}
+
+function buildDigestApprovalActionResultItem({ action, tokenRow } = {}) {
+  const status = digestApprovalActionResultStatus(action?.state);
+  const pending = status === 'pending';
+  return {
+    item_id: buildDigestApprovalItemId(tokenRow?.item_salt, action?.id),
+    status,
+    can_approve_send: pending,
+    can_reject: pending
+  };
+}
+
 function buildAutomationActionPublicSummary(action = {}) {
   return {
     id: action?.id || null,
@@ -666,6 +715,233 @@ function buildAutomationActionPublicSummary(action = {}) {
     last_error: action?.last_error || null,
     send_attempt_count: action?.send_attempt_count ?? null
   };
+}
+
+function sendDigestApprovalItemUnavailable(res, req) {
+  setApprovalNoStore(res);
+  return sendError(res, 404, {
+    error: 'digest_approval_item_unavailable',
+    code: 'digest_approval_item_unavailable',
+    detail: 'This review item is invalid or no longer available.',
+    hint: null,
+    request_id: requestId(req)
+  });
+}
+
+function digestApprovalActionConflict(code, detail) {
+  return routeError(code, detail || 'This review item is no longer available for this action.', 409);
+}
+
+async function markDigestApprovalActionApproved({ action, tokenRow, itemId, requestId: request_id } = {}) {
+  const now = new Date().toISOString();
+  const { data, error } = await db
+    .from('automation_actions')
+    .update({
+      state: 'approved',
+      approved_at: now,
+      approved_by_user_id: null,
+      approved_by_email: cleanRouteText(tokenRow?.recipient_email, null, 254),
+      updated_at: now
+    })
+    .eq('id', action.id)
+    .eq('client_id', action.client_id)
+    .eq('state', 'pending_approval')
+    .select(ACTION_SELECT)
+    .maybeSingle();
+
+  if (error) {
+    throw routeError(
+      'automation_digest_approval_action_approve_failed',
+      error.message || 'Digest approval action approve failed.',
+      500,
+      error.hint || null
+    );
+  }
+  if (!data) {
+    throw digestApprovalActionConflict(
+      'automation_digest_approval_action_state_conflict',
+      'This review item is already being handled.'
+    );
+  }
+
+  const event = await writeAutomationActionEvent({
+    db,
+    actionId: data.id,
+    clientId: data.client_id,
+    eventType: 'action_approved_from_digest_approval_token',
+    fromState: 'pending_approval',
+    toState: 'approved',
+    actor: { type: 'system', email: tokenRow?.recipient_email || null },
+    requestId: request_id,
+    metadata: {
+      digest_approval_token_id: tokenRow?.id || null,
+      digest_item_id: itemId || null,
+      token_purpose: tokenRow?.token_purpose || 'pending_approval_digest'
+    }
+  });
+
+  return { action: data, event };
+}
+
+async function sendApprovedDigestApprovalAction({ action, tokenRow, requestId: request_id } = {}) {
+  try {
+    const outcome = await sendApprovedAutomationActionSchedulingEmail({
+      db,
+      action,
+      actor: { type: 'system', email: tokenRow?.recipient_email || null },
+      requestId: request_id,
+      mailer
+    });
+    return {
+      action: outcome?.action || action,
+      emailsSent: outcome?.sent ? 1 : 0
+    };
+  } catch (err) {
+    if (['automation_action_already_sent', 'invalid_action_state'].includes(String(err?.code || ''))) {
+      const latest = await loadAction(action.id);
+      if (['sent', 'delivered'].includes(String(latest?.state || ''))) {
+        return { action: latest, emailsSent: 0 };
+      }
+      if (['approved', 'queued', 'sending'].includes(String(latest?.state || ''))) {
+        throw digestApprovalActionConflict(
+          'automation_digest_approval_action_in_progress',
+          'This review item is already being handled.'
+        );
+      }
+      if (latest) {
+        throw digestApprovalActionConflict(
+          'automation_digest_approval_action_unavailable',
+          'This review item is no longer available for approval.'
+        );
+      }
+    }
+    throw err;
+  }
+}
+
+async function approveSendDigestApprovalAction({ action, tokenRow, itemId, requestId: request_id } = {}) {
+  const state = String(action?.state || '').trim();
+  if (['sent', 'delivered'].includes(state)) {
+    return { action, emailsSent: 0 };
+  }
+  if (['sending', 'queued'].includes(state)) {
+    throw digestApprovalActionConflict(
+      'automation_digest_approval_action_in_progress',
+      'This review item is already being handled.'
+    );
+  }
+  if (['rejected', 'failed', 'canceled', 'skipped_duplicate', 'expired'].includes(state)) {
+    throw digestApprovalActionConflict(
+      'automation_digest_approval_action_unavailable',
+      'This review item is no longer available for approval.'
+    );
+  }
+
+  let approvedAction = action;
+  if (state === 'pending_approval') {
+    const approved = await markDigestApprovalActionApproved({
+      action,
+      tokenRow,
+      itemId,
+      requestId: request_id
+    });
+    approvedAction = approved.action;
+  } else if (state !== 'approved') {
+    throw digestApprovalActionConflict(
+      'automation_digest_approval_action_unavailable',
+      'This review item is no longer available for approval.'
+    );
+  }
+
+  return sendApprovedDigestApprovalAction({
+    action: approvedAction,
+    tokenRow,
+    requestId: request_id
+  });
+}
+
+async function rejectDigestApprovalAction({ action, tokenRow, itemId, requestId: request_id } = {}) {
+  const state = String(action?.state || '').trim();
+  if (state === 'rejected') {
+    return { action };
+  }
+  if (['sent', 'delivered'].includes(state)) {
+    throw digestApprovalActionConflict(
+      'automation_digest_approval_action_already_sent',
+      'This review item has already been approved and sent.'
+    );
+  }
+  if (['approved', 'queued', 'sending'].includes(state)) {
+    throw digestApprovalActionConflict(
+      'automation_digest_approval_action_in_progress',
+      'This review item is already being handled.'
+    );
+  }
+  if (state !== 'pending_approval') {
+    throw digestApprovalActionConflict(
+      'automation_digest_approval_action_unavailable',
+      'This review item is no longer available for rejection.'
+    );
+  }
+
+  const now = new Date().toISOString();
+  const { data, error } = await db
+    .from('automation_actions')
+    .update({
+      state: 'rejected',
+      rejected_at: now,
+      updated_at: now
+    })
+    .eq('id', action.id)
+    .eq('client_id', action.client_id)
+    .eq('state', 'pending_approval')
+    .select(ACTION_SELECT)
+    .maybeSingle();
+
+  if (error) {
+    throw routeError(
+      'automation_digest_approval_action_reject_failed',
+      error.message || 'Digest approval action reject failed.',
+      500,
+      error.hint || null
+    );
+  }
+  if (!data) {
+    throw digestApprovalActionConflict(
+      'automation_digest_approval_action_state_conflict',
+      'This review item is already being handled.'
+    );
+  }
+
+  const event = await writeAutomationActionEvent({
+    db,
+    actionId: data.id,
+    clientId: data.client_id,
+    eventType: 'action_rejected_from_digest_approval_token',
+    fromState: 'pending_approval',
+    toState: 'rejected',
+    actor: { type: 'system', email: tokenRow?.recipient_email || null },
+    requestId: request_id,
+    metadata: {
+      digest_approval_token_id: tokenRow?.id || null,
+      digest_item_id: itemId || null,
+      token_purpose: tokenRow?.token_purpose || 'pending_approval_digest'
+    }
+  });
+
+  return { action: data, event };
+}
+
+async function loadDigestApprovalContextForItem({ token, itemId } = {}) {
+  const context = await loadDigestApprovalTokenContext({ db, token });
+  if (!context.valid) return { context, action: null };
+
+  const action = await loadDigestApprovalActionForItem({
+    tokenRow: context.tokenRow,
+    delivery: context.delivery,
+    itemId
+  });
+  return { context, action };
 }
 
 function parseApprovalBaseUrl(rawValue, source, status) {
@@ -3254,6 +3530,82 @@ router.get('/digest-approval/:token', async (req, res) => {
     });
   } catch (err) {
     return handleCaughtError(res, req, err, 'automation_digest_approval_token_lookup_failed');
+  }
+});
+
+router.post('/digest-approval/:token/items/:itemId/approve-send', async (req, res) => {
+  const request_id = requestId(req);
+  setApprovalNoStore(res);
+  try {
+    const { context, action } = await loadDigestApprovalContextForItem({
+      token: req.params?.token,
+      itemId: req.params?.itemId
+    });
+    if (!context.valid) {
+      return sendDigestApprovalTokenUnavailable(res, req, context);
+    }
+    if (!action) {
+      return sendDigestApprovalItemUnavailable(res, req);
+    }
+
+    const outcome = await approveSendDigestApprovalAction({
+      action,
+      tokenRow: context.tokenRow,
+      itemId: req.params?.itemId,
+      requestId: request_id
+    });
+
+    return res.json({
+      ok: true,
+      item: buildDigestApprovalActionResultItem({
+        action: outcome.action,
+        tokenRow: context.tokenRow
+      }),
+      side_effects: {
+        emails_sent: outcome.emailsSent || 0
+      },
+      request_id
+    });
+  } catch (err) {
+    return handleCaughtError(res, req, err, 'automation_digest_approval_item_approve_send_failed');
+  }
+});
+
+router.post('/digest-approval/:token/items/:itemId/reject', async (req, res) => {
+  const request_id = requestId(req);
+  setApprovalNoStore(res);
+  try {
+    const { context, action } = await loadDigestApprovalContextForItem({
+      token: req.params?.token,
+      itemId: req.params?.itemId
+    });
+    if (!context.valid) {
+      return sendDigestApprovalTokenUnavailable(res, req, context);
+    }
+    if (!action) {
+      return sendDigestApprovalItemUnavailable(res, req);
+    }
+
+    const outcome = await rejectDigestApprovalAction({
+      action,
+      tokenRow: context.tokenRow,
+      itemId: req.params?.itemId,
+      requestId: request_id
+    });
+
+    return res.json({
+      ok: true,
+      item: buildDigestApprovalActionResultItem({
+        action: outcome.action,
+        tokenRow: context.tokenRow
+      }),
+      side_effects: {
+        emails_sent: 0
+      },
+      request_id
+    });
+  } catch (err) {
+    return handleCaughtError(res, req, err, 'automation_digest_approval_item_reject_failed');
   }
 });
 
