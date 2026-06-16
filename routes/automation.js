@@ -28,6 +28,11 @@ const {
   rejectActionFromApprovalToken,
   confirmActionFromApprovalToken
 } = require('../src/lib/automationApprovalTokens');
+const {
+  buildDigestApprovalItemId,
+  loadDigestApprovalTokenContext,
+  markDigestApprovalTokenViewed
+} = require('../src/lib/automationDigestApprovalTokens');
 
 const router = express.Router();
 const db = supabaseAdmin;
@@ -113,6 +118,15 @@ const ACTION_SELECT = [
   'failed_at',
   'last_error',
   'send_attempt_count',
+  'created_at',
+  'updated_at'
+].join(',');
+
+const DIGEST_APPROVAL_ACTION_SELECT = [
+  'id',
+  'client_id',
+  'state',
+  'candidate_snapshot',
   'created_at',
   'updated_at'
 ].join(',');
@@ -537,6 +551,30 @@ function sendApprovalTokenUnavailable(res, req, context = {}) {
   });
 }
 
+function sendDigestApprovalTokenUnavailable(res, req, context = {}) {
+  const reason = String(context?.reason || '').trim();
+  const expired = reason === 'expired';
+  const unavailable = reason === 'no_actions' || reason === 'delivery_unavailable';
+  setApprovalNoStore(res);
+  return sendError(res, expired ? 410 : 404, {
+    error: expired
+      ? 'digest_approval_token_expired'
+      : unavailable
+        ? 'digest_approval_unavailable'
+        : 'digest_approval_token_invalid',
+    code: expired
+      ? 'digest_approval_token_expired'
+      : unavailable
+        ? 'digest_approval_unavailable'
+        : 'digest_approval_token_invalid',
+    detail: expired
+      ? 'This review link has expired or is no longer available.'
+      : 'This review link is invalid or no longer available.',
+    hint: null,
+    request_id: requestId(req)
+  });
+}
+
 function buildApprovalActionSummary({ action, tokenRow } = {}) {
   const snapshot = isPlainObject(action?.candidate_snapshot) ? action.candidate_snapshot : {};
   const cleanText = (value) => String(value || '').trim() || null;
@@ -554,6 +592,64 @@ function buildApprovalActionSummary({ action, tokenRow } = {}) {
       ? snapshot.content_sufficiency
       : null,
     expires_at: tokenRow?.expires_at || null
+  };
+}
+
+function digestApprovalActionIds(delivery = {}) {
+  const ids = Array.isArray(delivery.action_ids) ? delivery.action_ids : [];
+  return Array.from(new Set(ids.map((id) => String(id || '').trim()).filter(Boolean)));
+}
+
+async function loadDigestApprovalActions(delivery = {}) {
+  const actionIds = digestApprovalActionIds(delivery);
+  if (actionIds.length === 0) return [];
+  const { data, error } = await db
+    .from('automation_actions')
+    .select(DIGEST_APPROVAL_ACTION_SELECT)
+    .eq('client_id', delivery.client_id)
+    .in('id', actionIds);
+
+  if (error) {
+    throw routeError(
+      'automation_digest_approval_actions_lookup_failed',
+      error.message || 'Digest approval actions lookup failed.',
+      500,
+      error.hint || null
+    );
+  }
+
+  const actionsById = new Map((Array.isArray(data) ? data : [])
+    .map((action) => [String(action?.id || ''), action]));
+  return actionIds.map((id) => actionsById.get(id)).filter(Boolean);
+}
+
+function digestApprovalPublicStatus(state) {
+  const normalized = String(state || '').trim();
+  if (normalized === 'pending_approval') return 'pending';
+  if (['approved', 'queued', 'sending', 'sent', 'delivered'].includes(normalized)) {
+    return 'approved_or_sent';
+  }
+  if (normalized === 'rejected') return 'rejected';
+  if (normalized === 'failed') return 'failed';
+  return 'unavailable';
+}
+
+function buildDigestApprovalReviewItem({ action, tokenRow } = {}) {
+  const snapshot = isPlainObject(action?.candidate_snapshot) ? action.candidate_snapshot : {};
+  const status = digestApprovalPublicStatus(action?.state);
+  const pending = status === 'pending';
+  return {
+    item_id: buildDigestApprovalItemId(tokenRow?.item_salt, action?.id),
+    candidate_name: cleanRouteText(snapshot.candidate_name, null, 160),
+    role_title: cleanRouteText(snapshot.role_title, null, 160),
+    scores: {
+      overall_score: snapshot.overall_score ?? null,
+      resume_score: snapshot.resume_score ?? null,
+      interview_score: snapshot.interview_score ?? null
+    },
+    status,
+    can_approve_send: pending,
+    can_reject: pending
   };
 }
 
@@ -3117,6 +3213,47 @@ router.post('/actions/:id/send-scheduling-email', requireAuth, withClientScope, 
     });
   } catch (err) {
     return handleCaughtError(res, req, err, 'automation_action_send_scheduling_email_failed');
+  }
+});
+
+router.get('/digest-approval/:token', async (req, res) => {
+  const request_id = requestId(req);
+  setApprovalNoStore(res);
+  try {
+    const context = await loadDigestApprovalTokenContext({
+      db,
+      token: req.params?.token
+    });
+    if (!context.valid) {
+      return sendDigestApprovalTokenUnavailable(res, req, context);
+    }
+
+    const tokenRow = context.tokenRow;
+    const actions = await loadDigestApprovalActions(context.delivery);
+    const items = actions
+      .map((action) => buildDigestApprovalReviewItem({ action, tokenRow }))
+      .filter((item) => item.item_id);
+
+    if (items.length === 0) {
+      return sendDigestApprovalTokenUnavailable(res, req, { reason: 'no_actions' });
+    }
+
+    const viewedToken = await markDigestApprovalTokenViewed({
+      db,
+      tokenRow,
+      requestId: request_id
+    });
+
+    return res.json({
+      ok: true,
+      item: {
+        expires_at: viewedToken?.expires_at || tokenRow?.expires_at || null,
+        items
+      },
+      request_id
+    });
+  } catch (err) {
+    return handleCaughtError(res, req, err, 'automation_digest_approval_token_lookup_failed');
   }
 });
 
