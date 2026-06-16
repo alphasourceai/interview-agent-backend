@@ -3,6 +3,7 @@
 const express = require('express');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
+const { loadEntityMap, resolveEntityFilter, uniqueIds, withEntityFields } = require('../src/lib/entityScopeFilter');
 const { ensureUserAndSendRecovery, redactEmail } = require('../src/lib/recoveryHelper');
 const { sendMemberRecoveryEmail } = require('../utils/mailer');
 const crypto = require('crypto');
@@ -204,22 +205,50 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
     const clientId = req.query.client_id || req.client?.id || req.clientScope?.defaultClientId || null;
     if (!clientId) return res.status(400).json({ error: 'client_id_required', request_id });
 
-    if (!canManageMembers(req, clientId)) {
-      return res.status(403).json({ error: 'forbidden', request_id });
+    const entityScope = await resolveEntityFilter({
+      db: supabaseAdmin,
+      req,
+      clientId,
+      entityFilter: req.query.entity_filter || req.query.entity_id || null,
+      requestId: request_id
+    });
+    if (!entityScope.ok) return res.status(entityScope.status).json(entityScope.body);
+
+    const requestedClientIds = entityScope.clientIds.length ? entityScope.clientIds : [clientId];
+    let memberClientIds = uniqueIds(requestedClientIds).filter((id) => canManageMembers(req, id));
+    if (!memberClientIds.length) {
+      return res.status(403).json({
+        error: 'forbidden',
+        code: 'CLIENT_SCOPE_MISMATCH',
+        detail: 'You do not have permission to manage members for the requested entity scope.',
+        hint: null,
+        request_id
+      });
     }
 
-    const { data, error } = await supabaseAdmin
+    let query = supabaseAdmin
       .from('client_members')
       .select('client_id,user_id,email,name,role,created_at,tester_acknowledged_at,tester_acknowledged_ip')
-      .eq('client_id', clientId)
       .order('created_at', { ascending: false });
+    if (memberClientIds.length === 1) query = query.eq('client_id', memberClientIds[0]);
+    else query = query.in('client_id', memberClientIds);
+
+    const { data, error } = await query;
 
     if (error) {
       console.error('[client-members] list error', error.message);
       return res.status(500).json({ error: 'list_members_failed', detail: error.message, request_id });
     }
 
-    const items = (data || []).map((m) => ({ ...m, id: m.user_id || m.email }));
+    const entityMap = { ...(entityScope.entitiesById || {}), ...(await loadEntityMap(supabaseAdmin, memberClientIds)) };
+    const items = (data || []).map((m) => {
+      const baseId = m.user_id || m.email;
+      return withEntityFields({
+        ...m,
+        id: baseId,
+        row_id: `${m.client_id}:${baseId || m.email || m.created_at || 'member'}`
+      }, entityMap, m.client_id);
+    });
     res.json({ items, request_id });
   } catch (e) {
     const request_id = req.request_id || null;

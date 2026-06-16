@@ -5,6 +5,7 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
 const { getRoleInterviewAvailability } = require('../src/lib/roleInterviewAvailability');
+const { loadEntityMap, resolveEntityFilter, uniqueIds, withEntityFields } = require('../src/lib/entityScopeFilter');
 const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
 
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
@@ -122,6 +123,7 @@ function roleStatusPatch(status, inactiveReason, userId) {
  * Returns roles for the specified (or scoped) client.
  */
 router.get('/', requireAuth, withClientScope, async (req, res) => {
+  const request_id = req.request_id || null;
   try {
     const explicitClientId = String(req.query.client_id || '').trim();
     const clientId =
@@ -130,29 +132,42 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
       req.clientScope?.defaultClientId ||
       null;
 
-    if (!clientId) return res.status(400).json({ error: 'client_id required' });
-    if (!hasScopedReadAccess(req, clientId)) return res.status(403).json({ error: 'forbidden' });
+    if (!clientId) return res.status(400).json({ error: 'client_id required', code: 'CLIENT_ID_REQUIRED', detail: null, hint: null, request_id });
+    if (!hasScopedReadAccess(req, clientId)) return res.status(403).json({ error: 'forbidden', code: 'CLIENT_SCOPE_MISMATCH', detail: null, hint: null, request_id });
     const statusFilter = normalizeRoleStatus(req.query.status);
     if (!ROLE_STATUS_VALUES.has(statusFilter)) {
       return res.status(400).json({
         error: 'bad_request',
         code: 'INVALID_ROLE_STATUS_FILTER',
-        detail: 'status must be active, inactive, or all'
+        detail: 'status must be active, inactive, or all',
+        hint: null,
+        request_id
       });
     }
+
+    const entityScope = await resolveEntityFilter({
+      db,
+      req,
+      clientId,
+      entityFilter: req.query.entity_filter || req.query.entity_id || null,
+      requestId: request_id
+    });
+    if (!entityScope.ok) return res.status(entityScope.status).json(entityScope.body);
+    const scopedClientIds = entityScope.clientIds.length ? entityScope.clientIds : [clientId];
 
     let roleQuery = db
       .from('roles')
       .select('id,client_id,title,interview_type,created_at,rubric,job_description_url,slug_or_token,status,closed_at,closed_by,inactive_reason')
-      .eq('client_id', clientId)
       .order('created_at', { ascending: false })
       .limit(500);
+    if (scopedClientIds.length === 1) roleQuery = roleQuery.eq('client_id', scopedClientIds[0]);
+    else roleQuery = roleQuery.in('client_id', scopedClientIds);
     if (statusFilter !== 'all') roleQuery = roleQuery.eq('status', statusFilter);
     const { data, error } = await roleQuery;
 
     if (error) {
       console.error('[GET /roles] supabase error', error);
-      return res.status(500).json({ error: 'query failed (roles)' });
+      return res.status(500).json({ error: 'query failed (roles)', code: 'LIST_ROLES_FAILED', detail: error.message, hint: error.hint || null, request_id });
     }
 
     const roles = data || [];
@@ -162,16 +177,19 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
       return Math.max(0, Math.floor(n));
     };
 
-    let maxInterviewMinutes = null;
+    const planClientIds = uniqueIds(roles.map((role) => role.client_id).concat(scopedClientIds));
+    const maxInterviewMinutesByClientId = {};
     const { data: planSettings, error: planSettingsError } = await db
       .from('client_plan_settings')
-      .select('max_interview_minutes')
-      .eq('client_id', clientId)
-      .maybeSingle();
+      .select('client_id,max_interview_minutes')
+      .in('client_id', planClientIds.length ? planClientIds : [clientId]);
     if (planSettingsError) {
       console.warn('[GET /roles] plan settings lookup failed', planSettingsError?.message || planSettingsError);
-    } else if (planSettings) {
-      maxInterviewMinutes = parseWholeNonNegative(planSettings.max_interview_minutes);
+    } else {
+      for (const row of planSettings || []) {
+        const rowClientId = String(row?.client_id || '').trim();
+        if (rowClientId) maxInterviewMinutesByClientId[rowClientId] = parseWholeNonNegative(row.max_interview_minutes);
+      }
     }
 
     const availabilityByRoleId = {};
@@ -180,7 +198,7 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
         if (!role?.id) {
           return [null, null];
         }
-        const availability = await getRoleInterviewAvailability({ db, roleId: role.id, clientId });
+        const availability = await getRoleInterviewAvailability({ db, roleId: role.id, clientId: role.client_id || clientId });
         return [role.id, availability];
       }));
       for (const [roleId, availability] of availabilityRows) {
@@ -189,22 +207,30 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
       }
     }
 
+    let entityMap = entityScope.entitiesById || {};
+    const missingEntityIds = roles
+      .map((role) => String(role?.client_id || '').trim())
+      .filter((id) => id && !entityMap[id]);
+    if (missingEntityIds.length) {
+      entityMap = { ...entityMap, ...(await loadEntityMap(db, missingEntityIds)) };
+    }
+
     const items = roles.map((role) => {
       const availability = availabilityByRoleId[role.id] || null;
-      return {
+      return withEntityFields({
         ...role,
         included_interviews_per_role: availability?.included_interviews_per_role ?? null,
         purchased_interviews: availability?.purchased_interviews ?? null,
         used_interviews: availability?.used_interviews ?? null,
         remaining_interviews: availability?.remaining_interviews ?? null,
-        max_interview_minutes: maxInterviewMinutes
-      };
+        max_interview_minutes: maxInterviewMinutesByClientId[role.client_id] ?? null
+      }, entityMap, role.client_id);
     });
 
     return res.json({ items });
   } catch (e) {
     console.error('[GET /roles] unexpected', e);
-    return res.status(500).json({ error: 'Server error' });
+    return res.status(500).json({ error: 'Server error', code: 'SERVER_ERROR', detail: e?.message || null, hint: null, request_id });
   }
 });
 

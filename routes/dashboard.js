@@ -7,6 +7,7 @@ const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { supabase } = require('../src/lib/supabaseClient');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
+const { entityFieldsForClientId, loadEntityMap, resolveEntityFilter } = require('../src/lib/entityScopeFilter');
 
 
 const router = express.Router();
@@ -328,13 +329,26 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
 
+    const entityScope = await resolveEntityFilter({
+      db: supabase,
+      req,
+      clientId,
+      entityFilter: req.query.entity_filter || req.query.entity_id || null,
+      requestId: request_id
+    });
+    if (!entityScope.ok) return res.status(entityScope.status).json(entityScope.body);
+    const scopedClientIds = entityScope.clientIds.length ? entityScope.clientIds : [clientId];
+
     // 1) Candidates for this client
-    const { data: cands, error: cErr } = await supabase
+    let candidateQuery = supabase
       .from('candidates')
       .select('id, first_name, last_name, name, email, role_id, created_at, client_id, analysis_summary, resume_url')
-      .eq('client_id', clientId)
       .order('created_at', { ascending: false })
       .limit(1000);
+    if (scopedClientIds.length === 1) candidateQuery = candidateQuery.eq('client_id', scopedClientIds[0]);
+    else candidateQuery = candidateQuery.in('client_id', scopedClientIds);
+
+    const { data: cands, error: cErr } = await candidateQuery;
 
     if (cErr) {
       Sentry.addBreadcrumb({
@@ -357,11 +371,14 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
     // 2) Roles (title)
     let rolesById = {};
     if (roleIds.length) {
-      const { data: roles, error: rErr } = await supabase
+      let roleQuery = supabase
         .from('roles')
         .select('id, title, client_id')
-        .in('id', roleIds)
-        .eq('client_id', clientId);
+        .in('id', roleIds);
+      if (scopedClientIds.length === 1) roleQuery = roleQuery.eq('client_id', scopedClientIds[0]);
+      else roleQuery = roleQuery.in('client_id', scopedClientIds);
+
+      const { data: roles, error: rErr } = await roleQuery;
       if (rErr) {
         console.error('[dashboard/rows] roles error', rErr);
       } else {
@@ -393,12 +410,15 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       ];
       if (EXPOSE_INTERVIEW_ANALYSIS_V2) interviewSelect.push('interview_analysis_v2');
 
-      const { data: ivs, error: iErr } = await supabase
+      let interviewQuery = supabase
         .from('interviews')
         .select(interviewSelect.join(', '))
-        .eq('client_id', clientId)
         .in('candidate_id', candIds)
         .order('created_at', { ascending: false });
+      if (scopedClientIds.length === 1) interviewQuery = interviewQuery.eq('client_id', scopedClientIds[0]);
+      else interviewQuery = interviewQuery.in('client_id', scopedClientIds);
+
+      const { data: ivs, error: iErr } = await interviewQuery;
 
       if (iErr) {
         Sentry.addBreadcrumb({
@@ -444,7 +464,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
     // If your reports table uses different column names, adjust here.
     let latestReportByCand = {};
     if (candIds.length) {
-      const { data: reps, error: repErr } = await supabase
+      let reportQuery = supabase
         .from('reports')
         .select([
           'id',
@@ -462,9 +482,12 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
           'unanswered_candidate_questions',
           'candidate_external_id',
         ].join(', '))
-        .eq('client_id', clientId)
         .in('candidate_id', candIds)
         .order('created_at', { ascending: false });
+      if (scopedClientIds.length === 1) reportQuery = reportQuery.eq('client_id', scopedClientIds[0]);
+      else reportQuery = reportQuery.in('client_id', scopedClientIds);
+
+      const { data: reps, error: repErr } = await reportQuery;
 
       if (repErr) {
         Sentry.addBreadcrumb({
@@ -493,6 +516,15 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
     }
 
     // 5) Normalize: one row per candidate
+    const entityClientIds = [
+      ...(cands || []).map((candidate) => candidate.client_id),
+      ...Object.values(rolesById).map((role) => role?.client_id)
+    ];
+    const entityMap = {
+      ...(entityScope.entitiesById || {}),
+      ...(await loadEntityMap(supabase, entityClientIds))
+    };
+
     const items = (cands || []).map(c => {
       const fullName =
         c.name ||
@@ -502,6 +534,8 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const role = c.role_id ? (rolesById[c.role_id] || null) : null;
       const iv = latestInterviewByCand[c.id] || null;
       const rep = latestReportByCand[c.id] || null;
+      const entityClientId = role?.client_id || c.client_id;
+      const entityFields = entityFieldsForClientId(entityMap, entityClientId);
 
       const parsed = parseJsonObject(c?.analysis_summary) || {};
       const rs = parsed.resume_score ?? parsed.resume ?? parsed.resume_match_percent ?? parsed.resumeMatchPercent ?? null;
@@ -554,9 +588,10 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         id: c.id,
         created_at: c.created_at,
         client_id: c.client_id,
+        ...entityFields,
 
         candidate: { id: c.id, name: fullName, email: c.email || '', resume_url: c.resume_url || null },
-        role, // { id, title, client_id } | null
+        role: role ? { ...role, ...entityFieldsForClientId(entityMap, role.client_id) } : null, // { id, title, client_id } | null
 
         // latest interview bits for the expanded area + transcript button
         latest_interview_id: iv?.id || null,

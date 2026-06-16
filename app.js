@@ -54,8 +54,16 @@ const { ensureTavusDocumentForRole } = require('./lib/tavusDocuments')
 const axios = require('axios')
 const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
+const automationRouter = require('./routes/automation')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
 const { buildClientScopeContext } = require('./src/lib/clientScope')
+const {
+  entityFieldsForClientId,
+  loadEntityMap,
+  resolveEntityFilter,
+  uniqueIds: uniqueEntityIds,
+  withEntityFields,
+} = require('./src/lib/entityScopeFilter')
 const { requireParentClient, resolveBillingOwnerForScope } = require('./src/lib/clientBillingScope')
 const { getRoleInterviewAvailability } = require('./src/lib/roleInterviewAvailability')
 const { cleanupNoSubstantiveRecordings } = require('./src/lib/recordingCleanup')
@@ -1140,6 +1148,8 @@ app.use('/dashboard', dashboardRouter)
 app.use('/api/dashboard', dashboardRouter)
 app.use('/roles', rolesRouter)
 app.use('/api/roles', rolesRouter)
+app.use('/automation', automationRouter)
+app.use('/api/automation', automationRouter)
 app.use('/feedback', require('./routes/feedback'))
 app.use('/api/feedback', require('./routes/feedback'))
 
@@ -3124,50 +3134,74 @@ adminRouter.delete('/clients/:id', requireAuth, requireAdmin, async (req, res) =
 
 // List roles (optional client filter)
 adminRouter.get('/roles', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
   const { client_id } = req.query
   const statusFilter = String(req.query.status || 'active').trim().toLowerCase()
   if (!['active', 'inactive', 'all'].includes(statusFilter)) {
     return res.status(400).json({
       error: 'bad_request',
       code: 'INVALID_ROLE_STATUS_FILTER',
-      detail: 'status must be active, inactive, or all'
+      detail: 'status must be active, inactive, or all',
+      hint: null,
+      request_id
     })
+  }
+  const entityFilter = req.query.entity_filter || req.query.entity_id || null
+  let scopedClientIds = client_id ? [String(client_id).trim()].filter(Boolean) : []
+  let entityScope = { entitiesById: {} }
+  if (entityFilter) {
+    const resolved = await resolveEntityFilter({
+      db: supabaseAdmin,
+      req,
+      clientId: client_id,
+      entityFilter,
+      requestId: request_id
+    })
+    if (!resolved.ok) return res.status(resolved.status).json(resolved.body)
+    scopedClientIds = resolved.clientIds
+    entityScope = resolved
   }
   let q = supabaseAdmin.from('roles')
     .select('id,title,client_id,slug_or_token,interview_type,job_description_url,description,rubric,kb_document_id,created_at,status,closed_at,closed_by,inactive_reason')
     .order('created_at', { ascending: false })
-  if (client_id) q = q.eq('client_id', client_id)
+  if (scopedClientIds.length === 1) q = q.eq('client_id', scopedClientIds[0])
+  else if (scopedClientIds.length > 1) q = q.in('client_id', scopedClientIds)
   if (statusFilter !== 'all') q = q.eq('status', statusFilter)
   const { data, error } = await q
-  if (error) return res.status(500).json({ error: 'list_roles_failed', detail: error.message })
+  if (error) return res.status(500).json({ error: 'list_roles_failed', code: 'LIST_ROLES_FAILED', detail: error.message, hint: error.hint || null, request_id })
+  const rows = data || []
+  const entityMap = {
+    ...(entityScope.entitiesById || {}),
+    ...(await loadEntityMap(supabaseAdmin, rows.map((role) => role.client_id)))
+  }
   const availabilityFallback = {
     included_interviews_per_role: null,
     purchased_interviews: null,
     used_interviews: null,
     remaining_interviews: null
   }
-  const items = await Promise.all((data || []).map(async (role) => {
+  const items = await Promise.all(rows.map(async (role) => {
     try {
-      if (!role?.id || !role?.client_id) return { ...role, ...availabilityFallback }
+      if (!role?.id || !role?.client_id) return withEntityFields({ ...role, ...availabilityFallback }, entityMap, role?.client_id)
       const availability = await getRoleInterviewAvailability({
         db: supabaseAdmin,
         roleId: role.id,
         clientId: role.client_id
       })
-      return {
+      return withEntityFields({
         ...role,
         included_interviews_per_role: availability?.included_interviews_per_role ?? null,
         purchased_interviews: availability?.purchased_interviews ?? null,
         used_interviews: availability?.used_interviews ?? null,
         remaining_interviews: availability?.remaining_interviews ?? null
-      }
+      }, entityMap, role.client_id)
     } catch (e) {
       console.warn('[admin/roles] availability lookup failed', {
         role_id: role?.id || null,
         client_id: role?.client_id || null,
         error: e?.message || e
       })
-      return { ...role, ...availabilityFallback }
+      return withEntityFields({ ...role, ...availabilityFallback }, entityMap, role?.client_id)
     }
   }))
   res.json({ items })
@@ -3337,16 +3371,33 @@ adminRouter.get('/candidates', requireAuth, requireAdmin, async (req, res) => {
   try {
     const client_id = String(req.query?.client_id || '').trim();
     const role_id = String(req.query?.role_id || '').trim();
+    const entityFilter = req.query?.entity_filter || req.query?.entity_id || null;
 
     if (!client_id) {
       return res.json({ candidates: [], message: 'Select a client to view candidates.' });
     }
 
+    let scopedClientIds = [client_id];
+    let entityScope = { entitiesById: {} };
+    if (entityFilter) {
+      const resolved = await resolveEntityFilter({
+        db: supabaseAdmin,
+        req,
+        clientId: client_id,
+        entityFilter,
+        requestId: request_id
+      });
+      if (!resolved.ok) return res.status(resolved.status).json(resolved.body);
+      scopedClientIds = resolved.clientIds;
+      entityScope = resolved;
+    }
+
     let cq = supabaseAdmin
       .from('candidates')
       .select('id,created_at,client_id,role_id,name,email,status,interview_status,resume_url,analysis_summary,candidate_id,first_name,last_name')
-      .eq('client_id', client_id)
       .order('created_at', { ascending: false });
+    if (scopedClientIds.length === 1) cq = cq.eq('client_id', scopedClientIds[0]);
+    else cq = cq.in('client_id', scopedClientIds);
 
     if (role_id) cq = cq.eq('role_id', role_id);
 
@@ -3369,15 +3420,40 @@ adminRouter.get('/candidates', requireAuth, requireAdmin, async (req, res) => {
     }
 
     const candidateIds = Array.from(new Set((cands || []).map(c => c.id).filter(Boolean)));
+    const roleIds = uniqueEntityIds((cands || []).map(c => c.role_id));
     const latestReportByCandidateId = {};
+    let roleClientById = {};
+
+    if (roleIds.length) {
+      let rolesQuery = supabaseAdmin
+        .from('roles')
+        .select('id,client_id')
+        .in('id', roleIds);
+      if (scopedClientIds.length === 1) rolesQuery = rolesQuery.eq('client_id', scopedClientIds[0]);
+      else rolesQuery = rolesQuery.in('client_id', scopedClientIds);
+      const { data: roles, error: rolesError } = await rolesQuery;
+      if (rolesError) {
+        console.error('[admin/candidates] roles lookup failed', {
+          request_id,
+          client_id,
+          code: rolesError.code,
+          message: rolesError.message
+        });
+      } else {
+        roleClientById = Object.fromEntries((roles || []).map((role) => [role.id, role.client_id]));
+      }
+    }
 
     if (candidateIds.length) {
-      const { data: reports, error: rErr } = await supabaseAdmin
+      let reportsQuery = supabaseAdmin
         .from('reports')
         .select('candidate_id,resume_score,interview_score,overall_score,report_url,created_at')
-        .eq('client_id', client_id)
         .in('candidate_id', candidateIds)
         .order('created_at', { ascending: false });
+      if (scopedClientIds.length === 1) reportsQuery = reportsQuery.eq('client_id', scopedClientIds[0]);
+      else reportsQuery = reportsQuery.in('client_id', scopedClientIds);
+
+      const { data: reports, error: rErr } = await reportsQuery;
 
       if (rErr) {
         console.error('[admin/candidates] reports lookup failed', {
@@ -3407,12 +3483,15 @@ adminRouter.get('/candidates', requireAuth, requireAdmin, async (req, res) => {
     const transcriptOverallByCandidateId = {};
 
     if (candidateIds.length) {
-      const { data: ivs, error: iErr } = await supabaseAdmin
+      let interviewsQuery = supabaseAdmin
         .from('interviews')
         .select('id,candidate_id,created_at,transcript_scores,recording_status,recording_ready_at')
-        .eq('client_id', client_id)
         .in('candidate_id', candidateIds)
         .order('created_at', { ascending: false });
+      if (scopedClientIds.length === 1) interviewsQuery = interviewsQuery.eq('client_id', scopedClientIds[0]);
+      else interviewsQuery = interviewsQuery.in('client_id', scopedClientIds);
+
+      const { data: ivs, error: iErr } = await interviewsQuery;
 
       if (iErr) {
         console.error('[admin/candidates] interviews lookup failed', {
@@ -3447,9 +3526,16 @@ adminRouter.get('/candidates', requireAuth, requireAdmin, async (req, res) => {
       }
     }
 
+    const entityMap = {
+      ...(entityScope.entitiesById || {}),
+      ...(await loadEntityMap(supabaseAdmin, (cands || []).map((candidate) => roleClientById[candidate.role_id] || candidate.client_id)))
+    };
+
     const candidates = (cands || []).map((c) => {
       const rep = latestReportByCandidateId[c.id] || null;
       const resume_score = Number.isFinite(Number(rep?.resume_score)) ? Number(rep.resume_score) : null;
+      const entityClientId = roleClientById[c.role_id] || c.client_id;
+      const entityFields = entityFieldsForClientId(entityMap, entityClientId);
 
       const transcriptOverall = Object.prototype.hasOwnProperty.call(transcriptOverallByCandidateId, c.id)
         ? transcriptOverallByCandidateId[c.id]
@@ -3483,6 +3569,7 @@ adminRouter.get('/candidates', requireAuth, requireAdmin, async (req, res) => {
         id: c.id,
         created_at: c.created_at,
         client_id: c.client_id,
+        ...entityFields,
         role_id: c.role_id,
         name: c.name || '',
         email: c.email || '',
@@ -4244,16 +4331,45 @@ adminRouter.patch('/roles/:id/interview-config', requireAuth, requireAdmin, asyn
 
 // List members for a client (synthetic id)
 adminRouter.get('/client-members', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
   const { client_id } = req.query
-  if (!client_id) return res.status(400).json({ error: 'client_id_required' })
-  const { data, error } = await supabaseAdmin
+  const entityFilter = req.query?.entity_filter || req.query?.entity_id || null
+  if (!client_id) return res.status(400).json({ error: 'client_id_required', code: 'CLIENT_ID_REQUIRED', detail: null, hint: null, request_id })
+
+  let scopedClientIds = [String(client_id).trim()].filter(Boolean)
+  let entityScope = { entitiesById: {} }
+  if (entityFilter) {
+    const resolved = await resolveEntityFilter({
+      db: supabaseAdmin,
+      req,
+      clientId: client_id,
+      entityFilter,
+      requestId: request_id
+    })
+    if (!resolved.ok) return res.status(resolved.status).json(resolved.body)
+    scopedClientIds = resolved.clientIds
+    entityScope = resolved
+  }
+
+  let query = supabaseAdmin
     .from('client_members')
     .select('client_id,user_id,email,name,role,created_at')
-    .eq('client_id', client_id)
     .order('created_at', { ascending: false })
+  if (scopedClientIds.length === 1) query = query.eq('client_id', scopedClientIds[0])
+  else query = query.in('client_id', scopedClientIds)
+
+  const { data, error } = await query
   if (error) return res.status(500).json({ error: 'list_members_failed', detail: error.message })
 
-  const items = (data || []).map(m => ({ ...m, id: m.user_id || m.email }))
+  const entityMap = { ...(entityScope.entitiesById || {}), ...(await loadEntityMap(supabaseAdmin, scopedClientIds)) }
+  const items = (data || []).map(m => {
+    const baseId = m.user_id || m.email
+    return withEntityFields({
+      ...m,
+      id: baseId,
+      row_id: `${m.client_id}:${baseId || m.email || m.created_at || 'member'}`
+    }, entityMap, m.client_id)
+  })
   res.json({ items })
 })
 
