@@ -19,6 +19,9 @@ const {
   hashDigestApprovalToken,
   buildDigestApprovalItemId
 } = require(digestTokenHelpersPath);
+const {
+  hashApprovalToken
+} = require(path.join(projectRoot, 'src', 'lib', 'automationApprovalTokens.js'));
 
 const rawToken = 'digest-token-1234567890';
 const now = Date.now();
@@ -188,7 +191,7 @@ class FakeQuery {
 }
 
 class FakeDb {
-  constructor({ tokenRow, delivery, deliveries, actions, candidates, rules } = {}) {
+  constructor({ tokenRow, delivery, deliveries, actions, candidates, rules, actionTokens } = {}) {
     this.tokenRow = tokenRow === undefined ? baseTokenRow() : tokenRow;
     this.delivery = delivery === undefined ? baseDelivery() : delivery;
     this.deliveries = deliveries === undefined
@@ -248,6 +251,7 @@ class FakeDb {
         },
       ]
       : rules;
+    this.actionTokens = actionTokens === undefined ? [] : actionTokens;
     this.events = [];
     this.inserts = [];
     this.updates = [];
@@ -274,6 +278,9 @@ class FakeDb {
     }
     if (query.table === 'automation_action_events') {
       return this.resolveEventQuery(query);
+    }
+    if (query.table === 'automation_action_approval_tokens') {
+      return this.resolveActionApprovalTokenQuery(query);
     }
     if (query.table === 'automation_rules') {
       return this.resolveRulesQuery(query, single);
@@ -317,6 +324,32 @@ class FakeDb {
       return { data: null, error: null };
     }
     return { data: token, error: null };
+  }
+
+  resolveActionApprovalTokenQuery(query) {
+    if (query.operation === 'insert') {
+      const token = {
+        id: `created-action-token-${this.actionTokens.length + 1}`,
+        used_at: null,
+        last_viewed_at: null,
+        view_count: 0,
+        rejected_at: null,
+        created_at: '2026-06-16T00:00:00.000Z',
+        updated_at: '2026-06-16T00:00:00.000Z',
+        ...query.payload,
+      };
+      this.actionTokens.push(token);
+      return { data: token, error: null };
+    }
+    if (query.operation === 'update') {
+      const token = this.actionTokens.find((row) => this.matchesFilters(row, query.filters));
+      if (!token) return { data: null, error: null };
+      Object.assign(token, query.payload);
+      return { data: token, error: null };
+    }
+
+    const token = this.actionTokens.find((row) => this.matchesFilters(row, query.filters));
+    return { data: token || null, error: null };
   }
 
   resolveDeliveryQuery(query) {
@@ -513,6 +546,91 @@ test('createDigestApprovalTokenForDelivery stores only token hash', async () => 
   assert.notEqual(insert.payload.token_hash, outcome.token);
   assert.ok(!Object.values(insert.payload).includes(outcome.token));
   assert.ok(insert.payload.item_salt);
+});
+
+test('direct legacy action approval token creation requires explicit opt-in', async () => {
+  const db = new FakeDb();
+  const result = await request(
+    buildApp(db),
+    'POST',
+    '/api/automation/actions/action-1/approval-token',
+    {
+      recipient_email: 'reviewer@example.com',
+    }
+  );
+
+  assert.equal(result.status, 400);
+  assert.equal(result.body.code, 'legacy_action_approval_link_requires_explicit_opt_in');
+  assert.match(result.body.detail, /Action-level approval links are legacy/);
+  assert.equal(db.inserts.filter((entry) => entry.table === 'automation_action_approval_tokens').length, 0);
+});
+
+test('direct legacy action approval token creation works with explicit opt-in metadata', async () => {
+  const db = new FakeDb();
+  const result = await request(
+    buildApp(db),
+    'POST',
+    '/api/automation/actions/action-1/approval-token',
+    {
+      allow_legacy_action_approval_link: true,
+      recipient_email: 'Reviewer@Example.com ',
+    }
+  );
+
+  assert.equal(result.status, 201);
+  assert.equal(result.body.ok, true);
+  assert.equal(result.body.legacy, true);
+  assert.equal(result.body.emails_sent_on_confirm, false);
+  assert.match(result.body.approval_url_path, /^\/automation\/approval\//);
+  assert.ok(!JSON.stringify(result.body).includes('/automation/digest-approval/'));
+
+  const tokenInsert = db.inserts.find((entry) => entry.table === 'automation_action_approval_tokens');
+  assert.ok(tokenInsert);
+  assert.equal(tokenInsert.payload.action_id, 'action-1');
+  assert.equal(tokenInsert.payload.client_id, 'client-1');
+  assert.equal(tokenInsert.payload.recipient_email, 'Reviewer@Example.com');
+  assert.equal(tokenInsert.payload.token_hash, hashApprovalToken(result.body.token));
+  assert.ok(!JSON.stringify(tokenInsert.payload).includes(result.body.token));
+
+  const event = db.events.find((entry) => entry.event_type === 'legacy_action_approval_token_created');
+  assert.ok(event);
+  assert.equal(event.action_id, 'action-1');
+  assert.equal(event.metadata.explicit_legacy_opt_in, true);
+  assert.equal(event.metadata.approval_link_type, 'legacy_action');
+  assert.equal(event.metadata.emails_sent_on_confirm, false);
+});
+
+test('public legacy approval confirm still approves without sending email', async () => {
+  const db = new FakeDb();
+  const app = buildApp(db);
+  const created = await request(
+    app,
+    'POST',
+    '/api/automation/actions/action-1/approval-token',
+    {
+      allow_legacy_action_approval_link: true,
+      recipient_email: 'reviewer@example.com',
+    }
+  );
+
+  assert.equal(created.status, 201);
+  const confirmed = await request(
+    app,
+    'POST',
+    `/api/automation/approval/${encodeURIComponent(created.body.token)}/confirm`
+  );
+
+  assert.equal(confirmed.status, 200);
+  assert.equal(confirmed.body.ok, true);
+  assert.equal(confirmed.body.state, 'approved');
+  assert.equal(confirmed.body.side_effects.emails_sent, 0);
+  assert.equal(confirmed.body.side_effects.digests_sent, 0);
+  assert.equal(db.actions.find((action) => action.id === 'action-1').state, 'approved');
+  assert.equal(db.actionTokens[0].state, 'used');
+  assert.deepEqual(db.events.map((event) => event.event_type), [
+    'legacy_action_approval_token_created',
+    'action_approved_from_approval_token',
+  ]);
 });
 
 test('configured digest email creates one delivery token and one digest review URL', async () => {

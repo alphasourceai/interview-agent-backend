@@ -3490,6 +3490,14 @@ router.post('/actions/:id/approval-token', requireAuth, withClientScope, async (
         request_id
       });
     }
+    if (req.body?.allow_legacy_action_approval_link !== true) {
+      return sendError(res, 400, {
+        error: 'legacy_action_approval_link_requires_explicit_opt_in',
+        code: 'legacy_action_approval_link_requires_explicit_opt_in',
+        detail: 'Action-level approval links are legacy. Use digest approval links for client-facing approval workflows.',
+        request_id
+      });
+    }
 
     const outcome = await createApprovalTokenForAction({
       db,
@@ -3500,8 +3508,29 @@ router.post('/actions/:id/approval-token', requireAuth, withClientScope, async (
       requestId: request_id
     });
 
+    await writeAutomationActionEvent({
+      db,
+      actionId: action.id,
+      clientId: action.client_id,
+      eventType: 'legacy_action_approval_token_created',
+      actor: {
+        type: 'user',
+        userId: req.user?.id || null,
+        email: req.user?.email || null
+      },
+      requestId: request_id,
+      metadata: {
+        approval_token_id: outcome.tokenRow?.id || null,
+        explicit_legacy_opt_in: true,
+        approval_link_type: 'legacy_action',
+        emails_sent_on_confirm: false
+      }
+    });
+
     return res.status(201).json({
       ok: true,
+      legacy: true,
+      emails_sent_on_confirm: false,
       approval_url_path: `/automation/approval/${outcome.token}`,
       token: outcome.token,
       expires_at: outcome.expires_at,
