@@ -33,6 +33,8 @@ const router = express.Router();
 const db = supabaseAdmin;
 const DEFAULT_PENDING_APPROVAL_DIGEST_TIMEZONE = 'America/Denver';
 const DEFAULT_PENDING_APPROVAL_DIGEST_FREQUENCY = 'daily';
+const DEFAULT_AUTOMATION_RULE_NAME = 'Automation rule';
+const MAX_AUTOMATION_RULE_NAME_LENGTH = 120;
 const PENDING_APPROVAL_DIGEST_FREQUENCIES = new Set(['daily', 'weekdays', 'weekly']);
 const PENDING_APPROVAL_DIGEST_WEEKLY_DAYS = new Set([
   'monday',
@@ -47,6 +49,7 @@ const MAX_PENDING_APPROVAL_DIGEST_RECIPIENTS = 10;
 
 const RULE_SELECT = [
   'id',
+  'name',
   'client_id',
   'role_id',
   'enabled',
@@ -242,6 +245,48 @@ function normalizeEnabled(value, fallback = false) {
   err.code = 'invalid_enabled';
   err.detail = 'enabled must be a boolean.';
   throw err;
+}
+
+function normalizeAutomationRuleName(value, { allowOmitted = false } = {}) {
+  if (value === undefined) {
+    if (allowOmitted) return DEFAULT_AUTOMATION_RULE_NAME;
+    throw routeError(
+      'automation_rule_name_required',
+      'name is required.',
+      400
+    );
+  }
+  if (value === null) {
+    throw routeError(
+      'automation_rule_name_required',
+      'name is required.',
+      400
+    );
+  }
+  if (typeof value !== 'string') {
+    throw routeError(
+      'invalid_automation_rule_name',
+      'name must be a string.',
+      400
+    );
+  }
+
+  const cleaned = value.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!cleaned) {
+    throw routeError(
+      'automation_rule_name_required',
+      'name is required.',
+      400
+    );
+  }
+  if (cleaned.length > MAX_AUTOMATION_RULE_NAME_LENGTH) {
+    throw routeError(
+      'automation_rule_name_too_long',
+      `name must be ${MAX_AUTOMATION_RULE_NAME_LENGTH} characters or fewer.`,
+      400
+    );
+  }
+  return cleaned;
 }
 
 function normalizeJsonObject(value, fieldName, fallback = {}) {
@@ -1856,6 +1901,7 @@ router.post('/rules', requireAuth, withClientScope, async (req, res) => {
     const payload = {
       client_id: clientId,
       role_id: roleId,
+      name: normalizeAutomationRuleName(req.body?.name, { allowOmitted: true }),
       enabled: normalizeEnabled(req.body?.enabled, false),
       mode,
       criteria_config: normalizeCriteriaConfig(normalizeJsonObject(req.body?.criteria_config, 'criteria_config', {})),
@@ -1930,6 +1976,10 @@ router.patch('/rules/:id', requireAuth, withClientScope, async (req, res) => {
       updates.enabled = normalizeEnabled(req.body.enabled, rule.enabled === true);
       hasEditableField = true;
     }
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'name')) {
+      updates.name = normalizeAutomationRuleName(req.body.name);
+      hasEditableField = true;
+    }
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'criteria_config')) {
       const next = normalizeCriteriaConfig(normalizeJsonObject(req.body.criteria_config, 'criteria_config'));
       updates.criteria_config = next;
@@ -1953,7 +2003,7 @@ router.patch('/rules/:id', requireAuth, withClientScope, async (req, res) => {
       return sendError(res, 400, {
         error: 'no_update_fields',
         code: 'no_update_fields',
-        detail: 'Provide enabled, criteria_config, action_config, or digest_config.',
+        detail: 'Provide name, enabled, criteria_config, action_config, or digest_config.',
         request_id
       });
     }
