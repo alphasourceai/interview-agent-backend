@@ -580,7 +580,6 @@ function buildApprovalActionSummary({ action, tokenRow } = {}) {
   const snapshot = isPlainObject(action?.candidate_snapshot) ? action.candidate_snapshot : {};
   const cleanText = (value) => String(value || '').trim() || null;
   return {
-    action_id: action?.id || null,
     state: action?.state || null,
     candidate_name: cleanText(snapshot.candidate_name),
     role_title: cleanText(snapshot.role_title),
@@ -589,9 +588,6 @@ function buildApprovalActionSummary({ action, tokenRow } = {}) {
       resume_score: snapshot.resume_score ?? null,
       interview_score: snapshot.interview_score ?? null
     },
-    content_sufficiency: isPlainObject(snapshot.content_sufficiency)
-      ? snapshot.content_sufficiency
-      : null,
     expires_at: tokenRow?.expires_at || null
   };
 }

@@ -600,6 +600,45 @@ test('direct legacy action approval token creation works with explicit opt-in me
   assert.equal(event.metadata.emails_sent_on_confirm, false);
 });
 
+test('public legacy approval GET returns minimized safe candidate summary', async () => {
+  const db = new FakeDb();
+  const app = buildApp(db);
+  const created = await request(
+    app,
+    'POST',
+    '/api/automation/actions/action-1/approval-token',
+    {
+      allow_legacy_action_approval_link: true,
+      recipient_email: 'reviewer@example.com',
+    }
+  );
+
+  assert.equal(created.status, 201);
+  const result = await request(
+    app,
+    'GET',
+    `/api/automation/approval/${encodeURIComponent(created.body.token)}`
+  );
+
+  assert.equal(result.status, 200);
+  assert.equal(result.body.ok, true);
+  assert.equal(result.body.item.candidate_name, 'Alex Candidate');
+  assert.equal(result.body.item.role_title, 'Account Executive');
+  assert.equal(result.body.item.scores.overall_score, 85);
+
+  const bodyText = JSON.stringify(result.body);
+  assert.ok(!Object.prototype.hasOwnProperty.call(result.body.item, 'action_id'));
+  assert.ok(!Object.prototype.hasOwnProperty.call(result.body.item, 'content_sufficiency'));
+  assert.ok(!bodyText.includes('action-1'));
+  assert.ok(!bodyText.includes(created.body.token));
+  assert.ok(!bodyText.includes('token_hash'));
+  assert.ok(!bodyText.includes('created-action-token'));
+  assert.ok(!bodyText.includes('candidate_email'));
+  assert.ok(!bodyText.includes('raw_notes'));
+  assert.ok(!bodyText.includes('score_thresholds'));
+  assert.ok(!bodyText.includes('rubric'));
+});
+
 test('public legacy approval confirm still approves without sending email', async () => {
   const db = new FakeDb();
   const app = buildApp(db);
