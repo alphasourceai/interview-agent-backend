@@ -68,6 +68,7 @@ const { requireParentClient, resolveBillingOwnerForScope } = require('./src/lib/
 const { getRoleInterviewAvailability } = require('./src/lib/roleInterviewAvailability')
 const { cleanupNoSubstantiveRecordings } = require('./src/lib/recordingCleanup')
 const { createSubscriptionCheckoutSession } = require('./src/lib/subscriptionCheckout')
+const { validateClientEntityImportRows } = require('./src/lib/clientEntityImport')
 const { sendSubscriptionCheckoutEmail, sendMemberRecoveryEmail } = require('./utils/mailer')
 const {
   frontendUrl: FRONTEND_URL,
@@ -488,6 +489,165 @@ app.post('/clients/entities', requireAuth, withClientScope, async (req, res) => 
   } catch (e) {
     console.error('[clients/entities/create] unexpected', { request_id, error: e?.message || e })
     return res.status(500).json({ error: 'server_error', request_id })
+  }
+})
+
+app.post('/clients/entities/import', requireAuth, withClientScope, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const selectedClientId = req.body?.parent_client_id || req.body?.client_id || req.query?.client_id || req.client?.id || req.clientScope?.defaultClientId || null
+    const rawRows = Array.isArray(req.body?.rows) ? req.body.rows : null
+    if (!rawRows) {
+      return res.status(400).json({
+        error: 'rows_required',
+        code: 'ROWS_REQUIRED',
+        detail: 'rows must be an array.',
+        hint: null,
+        request_id
+      })
+    }
+    if (rawRows.length > 250) {
+      return res.status(400).json({
+        error: 'too_many_rows',
+        code: 'TOO_MANY_ROWS',
+        detail: 'Entity import is limited to 250 rows per upload.',
+        hint: null,
+        request_id
+      })
+    }
+
+    const parentResult = await resolveTenantEntityParent(req, selectedClientId)
+    if (!parentResult.ok) {
+      return res.status(parentResult.status).json({
+        error: parentResult.body?.error || 'client_scope_failed',
+        code: parentResult.body?.code || String(parentResult.body?.error || 'client_scope_failed').toUpperCase(),
+        detail: parentResult.body?.detail || null,
+        hint: parentResult.body?.hint || null,
+        request_id
+      })
+    }
+
+    const parent = parentResult.parent
+    if (!parent || String(parent.parent_client_id || '').trim()) {
+      return res.status(400).json({
+        error: 'invalid_parent_client',
+        code: 'INVALID_PARENT_CLIENT',
+        detail: 'Client hierarchy could not be resolved safely.',
+        hint: null,
+        request_id
+      })
+    }
+
+    const { data: existingChildren, error: existingError } = await supabaseAdmin
+      .from('clients')
+      .select('id,name,parent_client_id,entity_label')
+      .eq('parent_client_id', parent.id)
+
+    if (existingError) {
+      return res.status(500).json({
+        error: 'existing_entities_lookup_failed',
+        code: 'EXISTING_ENTITIES_LOOKUP_FAILED',
+        detail: existingError.message,
+        hint: existingError.hint || null,
+        request_id
+      })
+    }
+
+    const validatedRows = validateClientEntityImportRows(rawRows, {
+      existingNames: (existingChildren || []).map((item) => item?.name)
+    })
+
+    const results = []
+    const counts = {
+      total: validatedRows.length,
+      valid: 0,
+      created: 0,
+      skipped: 0,
+      failed: 0
+    }
+
+    for (const row of validatedRows) {
+      if (row.errors.length > 0) {
+        counts.failed += 1
+        results.push({
+          ...row,
+          status: 'failed',
+          assignment: null,
+        })
+        continue
+      }
+
+      counts.valid += 1
+
+      if (row.skip_reason === 'duplicate_existing_entity') {
+        counts.skipped += 1
+        results.push({
+          ...row,
+          status: 'skipped',
+          detail: 'An entity with this name already exists under the selected parent client.',
+          assignment: null,
+        })
+        continue
+      }
+
+      const { data: created, error: createError } = await supabaseAdmin
+        .from('clients')
+        .insert({
+          name: row.name,
+          email: parent.email,
+          parent_client_id: parent.id,
+          entity_label: row.location_type || parent.entity_label || null,
+          candidate_assistance_contact: parent.candidate_assistance_contact || null
+        })
+        .select('id,name,parent_client_id,entity_label')
+        .single()
+
+      if (createError) {
+        counts.failed += 1
+        results.push({
+          ...row,
+          status: 'failed',
+          errors: [createError.message || 'Entity could not be created.'],
+          code: createError.code || 'CREATE_CLIENT_ENTITY_FAILED',
+          hint: createError.hint || null,
+          assignment: null,
+        })
+        continue
+      }
+
+      counts.created += 1
+      const hasAssignmentInput = Boolean(row.location_user_email || row.member_role)
+      results.push({
+        ...row,
+        status: 'created',
+        item: formatTenantClientEntity(created),
+        assignment: hasAssignmentInput
+          ? {
+              status: 'skipped',
+              code: 'ASSIGNMENT_NOT_CREATED',
+              detail: 'Member assignment was not created during entity import. Add the user from the Members page so the existing account setup and notification flow remains explicit.'
+            }
+          : null,
+      })
+    }
+
+    return res.json({
+      ok: true,
+      parent: formatTenantClientEntity(parent),
+      counts,
+      results,
+      created: results.filter((row) => row.status === 'created').map((row) => row.item).filter(Boolean),
+      request_id
+    })
+  } catch (e) {
+    console.error('[clients/entities/import] unexpected', { request_id, error: e?.message || e })
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'SERVER_ERROR',
+      detail: e?.message || null,
+      hint: null,
+      request_id
+    })
   }
 })
 
