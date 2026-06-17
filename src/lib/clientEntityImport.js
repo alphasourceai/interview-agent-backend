@@ -31,6 +31,7 @@ function isEmptyImportRow(row) {
   return [
     readField(row, ['name', 'Name']),
     readField(row, ['location_type', 'Location type', 'Location Type']),
+    readField(row, ['location_user_name', 'Location user name', 'Location User Name']),
     readField(row, ['location_user_email', 'Location user email', 'Location User Email']),
     readField(row, ['member_role', 'Manager/Member designation', 'Manager/Member Designation']),
   ].every((value) => !cleanText(value));
@@ -39,13 +40,16 @@ function isEmptyImportRow(row) {
 function normalizeImportRow(row, index) {
   const name = cleanText(readField(row, ['name', 'Name']));
   const locationType = cleanLower(readField(row, ['location_type', 'Location type', 'Location Type']));
+  const locationUserName = cleanText(readField(row, ['location_user_name', 'Location user name', 'Location User Name']));
   const locationUserEmail = cleanLower(readField(row, ['location_user_email', 'Location user email', 'Location User Email']));
   const memberRole = normalizeImportRole(readField(row, ['member_role', 'Manager/Member designation', 'Manager/Member Designation']));
+  const suppliedRowNumber = Number(readField(row, ['row_number', 'rowNumber', 'Row']));
 
   return {
-    row_number: index + 1,
+    row_number: Number.isFinite(suppliedRowNumber) && suppliedRowNumber > 0 ? suppliedRowNumber : index + 1,
     name,
     location_type: locationType,
+    location_user_name: locationUserName,
     location_user_email: locationUserEmail,
     member_role: memberRole,
     errors: [],
@@ -72,6 +76,9 @@ function validateClientEntityImportRows(rows, options = {}) {
 
   for (const row of normalizedRows) {
     const nameKey = cleanLower(row.name);
+    const hasMemberName = Boolean(row.location_user_name);
+    const hasMemberEmail = Boolean(row.location_user_email);
+    const hasMemberRole = Boolean(row.member_role);
     if (!row.name) row.errors.push('Name is required.');
     if (nameKey && nameCounts.get(nameKey) > 1) row.errors.push('Duplicate entity name in this CSV.');
     if (nameKey && existingNames.has(nameKey)) row.skip_reason = 'duplicate_existing_entity';
@@ -81,11 +88,17 @@ function validateClientEntityImportRows(rows, options = {}) {
     if (row.member_role && !['manager', 'member'].includes(row.member_role)) {
       row.errors.push('Manager/Member designation must be blank, Manager, or Member.');
     }
-    if (row.member_role && !row.location_user_email) {
-      row.errors.push('Location user email is required when Manager/Member designation is supplied.');
+    if ((hasMemberEmail || hasMemberRole) && !hasMemberName) {
+      row.errors.push('Location user name is required when Location user email or Manager/Member designation is supplied.');
     }
-    if (row.location_user_email || row.member_role) {
-      row.warnings.push('Member assignment is not created during entity import.');
+    if ((hasMemberName || hasMemberRole) && !hasMemberEmail) {
+      row.errors.push('Location user email is required when Location user name or Manager/Member designation is supplied.');
+    }
+    if ((hasMemberName || hasMemberEmail) && !hasMemberRole) {
+      row.errors.push('Manager/Member designation is required when Location user name or Location user email is supplied.');
+    }
+    if (hasMemberName || hasMemberEmail || hasMemberRole) {
+      row.warnings.push('No automatic emails will be sent for imported member assignments.');
     }
   }
 

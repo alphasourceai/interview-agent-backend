@@ -68,7 +68,7 @@ const { requireParentClient, resolveBillingOwnerForScope } = require('./src/lib/
 const { getRoleInterviewAvailability } = require('./src/lib/roleInterviewAvailability')
 const { cleanupNoSubstantiveRecordings } = require('./src/lib/recordingCleanup')
 const { createSubscriptionCheckoutSession } = require('./src/lib/subscriptionCheckout')
-const { validateClientEntityImportRows } = require('./src/lib/clientEntityImport')
+const { processClientEntityImport } = require('./src/lib/clientEntityImportService')
 const { sendSubscriptionCheckoutEmail, sendMemberRecoveryEmail } = require('./utils/mailer')
 const {
   frontendUrl: FRONTEND_URL,
@@ -553,90 +553,23 @@ app.post('/clients/entities/import', requireAuth, withClientScope, async (req, r
       })
     }
 
-    const validatedRows = validateClientEntityImportRows(rawRows, {
-      existingNames: (existingChildren || []).map((item) => item?.name)
+    const importResult = await processClientEntityImport({
+      db: supabaseAdmin,
+      authAdmin: supabaseAdmin.auth?.admin,
+      parent,
+      rawRows,
+      existingChildren,
+      formatEntity: formatTenantClientEntity
     })
-
-    const results = []
-    const counts = {
-      total: validatedRows.length,
-      valid: 0,
-      created: 0,
-      skipped: 0,
-      failed: 0
-    }
-
-    for (const row of validatedRows) {
-      if (row.errors.length > 0) {
-        counts.failed += 1
-        results.push({
-          ...row,
-          status: 'failed',
-          assignment: null,
-        })
-        continue
-      }
-
-      counts.valid += 1
-
-      if (row.skip_reason === 'duplicate_existing_entity') {
-        counts.skipped += 1
-        results.push({
-          ...row,
-          status: 'skipped',
-          detail: 'An entity with this name already exists under the selected parent client.',
-          assignment: null,
-        })
-        continue
-      }
-
-      const { data: created, error: createError } = await supabaseAdmin
-        .from('clients')
-        .insert({
-          name: row.name,
-          email: parent.email,
-          parent_client_id: parent.id,
-          entity_label: row.location_type || parent.entity_label || null,
-          candidate_assistance_contact: parent.candidate_assistance_contact || null
-        })
-        .select('id,name,parent_client_id,entity_label')
-        .single()
-
-      if (createError) {
-        counts.failed += 1
-        results.push({
-          ...row,
-          status: 'failed',
-          errors: [createError.message || 'Entity could not be created.'],
-          code: createError.code || 'CREATE_CLIENT_ENTITY_FAILED',
-          hint: createError.hint || null,
-          assignment: null,
-        })
-        continue
-      }
-
-      counts.created += 1
-      const hasAssignmentInput = Boolean(row.location_user_email || row.member_role)
-      results.push({
-        ...row,
-        status: 'created',
-        item: formatTenantClientEntity(created),
-        assignment: hasAssignmentInput
-          ? {
-              status: 'skipped',
-              code: 'ASSIGNMENT_NOT_CREATED',
-              detail: 'Member assignment was not created during entity import. Add the user from the Members page so the existing account setup and notification flow remains explicit.'
-            }
-          : null,
-      })
-    }
 
     return res.json({
       ok: true,
       parent: formatTenantClientEntity(parent),
-      counts,
-      results,
-      created: results.filter((row) => row.status === 'created').map((row) => row.item).filter(Boolean),
+      counts: importResult.counts,
+      results: importResult.results,
+      created: importResult.created,
+      temporary_credentials: importResult.temporary_credentials,
+      sensitive_result: importResult.temporary_credentials.length > 0,
       request_id
     })
   } catch (e) {
