@@ -1,6 +1,6 @@
 'use strict';
 
-const { resolveEntityFilter, uniqueIds } = require('./entityScopeFilter');
+const { resolveEntityFilter } = require('./entityScopeFilter');
 
 const DEFAULT_RANGE_DAYS = 30;
 const MISSING_REPORT_THRESHOLD_MS = 60 * 60 * 1000;
@@ -217,20 +217,36 @@ function isActiveRole(role) {
   return lowerText(role?.status || 'active') !== 'inactive';
 }
 
-function isCompletedInterview(interview) {
-  if (parseDateMs(interview?.completed_at)) return true;
-  const status = lowerText(interview?.interview_status || interview?.status);
-  return status.includes('complete') || status === 'completed';
+function candidateStatusForInterview(candidateById, interview) {
+  const candidate = candidateById?.[trimText(interview?.candidate_id)];
+  return lowerText(candidate?.interview_status || candidate?.status);
 }
 
-function interviewCompletedAt(interview) {
-  return (
-    trimText(interview?.completed_at) ||
-    trimText(interview?.interview_completed_at) ||
-    trimText(interview?.updated_at) ||
-    trimText(interview?.created_at) ||
-    null
-  );
+function isCompletedInterview(interview, context = {}) {
+  const status = lowerText(interview?.status);
+  if (status.includes('complete') || status === 'completed' || status === 'analyzed') return true;
+  const candidateStatus = candidateStatusForInterview(context.candidateById, interview);
+  if (candidateStatus.includes('complete')) return true;
+  if (context.reportsByCandidateRole?.has(reportKey(interview?.candidate_id, interview?.role_id))) return true;
+  return false;
+}
+
+function latestReportAtForInterview(reportCreatedAtByCandidateRole, interview) {
+  return reportCreatedAtByCandidateRole?.[reportKey(interview?.candidate_id, interview?.role_id)] || null;
+}
+
+function interviewCompletedAt(interview, context = {}) {
+  const status = lowerText(interview?.status);
+  const candidateStatus = candidateStatusForInterview(context.candidateById, interview);
+  const reportAt = latestReportAtForInterview(context.reportCreatedAtByCandidateRole, interview);
+  if (reportAt) return reportAt;
+  // The current interviews schema has no completed_at column. When a row or its
+  // candidate has an explicit completed/analyzed status, updated_at is the safest
+  // available completion proxy for delay thresholds.
+  if (status.includes('complete') || status === 'completed' || status === 'analyzed' || candidateStatus.includes('complete')) {
+    return trimText(interview?.updated_at) || trimText(interview?.created_at) || null;
+  }
+  return null;
 }
 
 function isTranscriptReady(interview) {
@@ -266,6 +282,18 @@ function hasNoSubstanceOrDeletedRecording(interview) {
 
 function reportKey(candidateId, roleId) {
   return `${trimText(candidateId)}::${trimText(roleId)}`;
+}
+
+function buildReportCreatedAtByCandidateRole(reports) {
+  const byKey = {};
+  for (const report of reports || []) {
+    const key = reportKey(report?.candidate_id, report?.role_id);
+    const createdAt = trimText(report?.created_at);
+    if (!key || !createdAt) continue;
+    const current = byKey[key];
+    if (!current || parseDateMs(createdAt) > parseDateMs(current)) byKey[key] = createdAt;
+  }
+  return byKey;
 }
 
 function normalizeEmailEvent(row) {
@@ -392,14 +420,16 @@ function buildAttentionItems({
   const roleById = Object.fromEntries(roles.map((role) => [role.id, role]));
   const candidateById = Object.fromEntries(candidates.map((candidate) => [candidate.id, candidate]));
   const reportKeys = new Set(reports.map((report) => reportKey(report.candidate_id, report.role_id)));
+  const reportCreatedAtByCandidateRole = buildReportCreatedAtByCandidateRole(reports);
   const perceptionInterviewIds = new Set(perceptionEvents.map((event) => trimText(event.interview_id)).filter(Boolean));
   const items = [];
   const nowMs = now.getTime();
 
   for (const interview of interviews) {
-    const completedAt = interviewCompletedAt(interview);
+    const completionContext = { candidateById, reportsByCandidateRole: reportKeys, reportCreatedAtByCandidateRole };
+    const completedAt = interviewCompletedAt(interview, completionContext);
     const completedMs = parseDateMs(completedAt);
-    if (!isCompletedInterview(interview) || !completedMs) continue;
+    if (!isCompletedInterview(interview, completionContext) || !completedMs) continue;
     const candidate = candidateById[trimText(interview.candidate_id)];
     const base = {
       client_id: interview.client_id || null,
@@ -547,6 +577,303 @@ function tokenCounts(tokens, now) {
   return { active, expired, revoked_or_used };
 }
 
+function envConfigured(env, keys) {
+  return keys.some((key) => trimText(env?.[key]));
+}
+
+function envEnabled(env, key) {
+  return ['true', '1', 'yes'].includes(lowerText(env?.[key]));
+}
+
+function schedulerSendEnabled(env) {
+  return envEnabled(env, 'AUTOMATION_DIGEST_SCHEDULER_SEND_ENABLED');
+}
+
+function schedulerSecretConfigured(env) {
+  return envConfigured(env, [
+    'AUTOMATION_DIGEST_RUNNER_SECRET',
+    'AUTOMATION_DIGEST_CRON_SECRET',
+    'CONTRACTS_CRON_SECRET',
+  ]);
+}
+
+function healthStatusFromProblems({ problem = 0, warning = 0, healthyWhenZero = true, unknownWhenZero = false }) {
+  if (problem > 0) return 'problem';
+  if (warning > 0) return 'warning';
+  if (unknownWhenZero && healthyWhenZero && problem === 0 && warning === 0) return 'unknown';
+  return 'healthy';
+}
+
+function estimateRecordingMinutes(interviews) {
+  let seconds = 0;
+  for (const interview of interviews || []) {
+    const metadata = interview?.recording_metadata && typeof interview.recording_metadata === 'object'
+      ? interview.recording_metadata
+      : {};
+    const candidates = [
+      metadata.duration_seconds,
+      metadata.duration_secs,
+      metadata.duration,
+      metadata.recording_duration_seconds,
+      metadata.recording_duration,
+      metadata.video_duration_seconds,
+      metadata.video_duration,
+    ];
+    const nested = metadata.recording && typeof metadata.recording === 'object'
+      ? [metadata.recording.duration_seconds, metadata.recording.duration]
+      : [];
+    for (const value of [...candidates, ...nested]) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        seconds += parsed > 1800 && parsed % 1 === 0 ? parsed : parsed;
+        break;
+      }
+    }
+  }
+  return seconds > 0 ? Math.round(seconds / 60) : null;
+}
+
+function buildVendorUsage({
+  now,
+  dateRange,
+  env,
+  overview,
+  readiness,
+  emailCategoryCounts,
+  interviews,
+  reports,
+  candidates,
+  roles,
+  clients,
+  automationRules,
+  automationActions,
+  digestDeliveries,
+  warnings,
+}) {
+  const lastChecked = now.toISOString();
+  const recordingPendingOrProblem = Number(readiness.recording_pending || 0) + Number(readiness.recording_problem || 0);
+  const estimatedVideoMinutes = estimateRecordingMinutes(interviews);
+  const openaiConfigured = envConfigured(env, ['OPENAI_API_KEY']);
+  const tavusConfigured = envConfigured(env, ['TAVUS_API_KEY']);
+  const supabaseConfigured = envConfigured(env, ['SUPABASE_URL']) && envConfigured(env, ['SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SERVICE_KEY', 'SUPABASE_ANON_KEY']);
+  const sendgridConfigured = envConfigured(env, ['SENDGRID_API_KEY']);
+  const renderConfigured = envConfigured(env, ['RENDER_API_KEY', 'RENDER_SERVICE_ID']);
+  const sentryConfigured = envEnabled(env, 'SENTRY_ENABLED') && envConfigured(env, ['SENTRY_DSN']);
+
+  const reportProblemCount = Number(readiness.missing_report_after_complete || 0);
+  const videoProblemCount = Number(readiness.recording_problem || 0) + Number(readiness.perception_missing_after_video_completion || 0);
+  const emailProblemCount = Number(emailCategoryCounts.problem || 0);
+
+  return {
+    period: {
+      date_from: dateRange.date_from,
+      date_to: dateRange.date_to,
+      date_from_display: dateRange.date_from_display,
+      date_to_display: dateRange.date_to_display,
+    },
+    services: [
+      {
+        key: 'openai',
+        name: 'OpenAI / Scoring',
+        status: reportProblemCount > 0 ? 'warning' : reports.length > 0 ? 'healthy' : 'unknown',
+        configured: openaiConfigured,
+        source: 'database_estimate',
+        current_period: {
+          reports_generated: Number(overview.reports_generated || 0),
+          missing_reports_after_complete: reportProblemCount,
+          transcript_ready: Number(readiness.transcript_ready || 0),
+          interviews_completed_proxy: Number(overview.interviews_completed || 0),
+        },
+        estimated_cost: null,
+        notes: [
+          openaiConfigured ? 'OpenAI key presence is confirmed without exposing the key.' : 'Live OpenAI usage API is not configured for this admin page.',
+          'Usage is estimated from reports and scoring readiness stored in the database.',
+        ],
+        last_checked: lastChecked,
+      },
+      {
+        key: 'tavus',
+        name: 'Tavus / Video',
+        status: videoProblemCount > 0 ? 'problem' : recordingPendingOrProblem > 0 ? 'warning' : interviews.length > 0 ? 'healthy' : 'unknown',
+        configured: tavusConfigured,
+        source: 'database_estimate',
+        current_period: {
+          interviews_started: Number(overview.interviews_started || 0),
+          recording_ready: Number(readiness.recording_ready || 0),
+          recording_pending: Number(readiness.recording_pending || 0),
+          recording_problem: Number(readiness.recording_problem || 0),
+          recording_deleted: Number(readiness.recording_deleted || 0),
+          perception_events_received: Number(readiness.perception_event_received || 0),
+          perception_missing_after_completion: Number(readiness.perception_missing_after_video_completion || 0),
+          estimated_minutes: estimatedVideoMinutes,
+        },
+        estimated_cost: null,
+        notes: [
+          tavusConfigured ? 'Tavus key presence is confirmed without exposing the key.' : 'Live Tavus usage API is not configured for this admin page.',
+          estimatedVideoMinutes === null ? 'Recording duration metadata was not available for a minute estimate.' : 'Estimated minutes come from recording metadata only.',
+        ],
+        last_checked: lastChecked,
+      },
+      {
+        key: 'supabase',
+        name: 'Supabase',
+        status: warnings.length ? 'warning' : 'healthy',
+        configured: supabaseConfigured,
+        source: 'environment_check',
+        current_period: {
+          clients_loaded: clients.length,
+          roles_loaded: roles.length,
+          candidates_loaded: candidates.length,
+          interviews_loaded: interviews.length,
+          reports_loaded: reports.length,
+        },
+        estimated_cost: null,
+        notes: [
+          'Database is reachable because the metrics query completed.',
+          warnings.length ? `${warnings.length} optional source warning(s) were returned.` : 'No optional source warnings were returned.',
+        ],
+        last_checked: lastChecked,
+      },
+      {
+        key: 'sendgrid',
+        name: 'SendGrid',
+        status: emailProblemCount > 0 ? 'problem' : Object.values(emailCategoryCounts).some((count) => Number(count) > 0) ? 'healthy' : 'unknown',
+        configured: sendgridConfigured,
+        source: 'database_estimate',
+        current_period: {
+          sent_delivered: Number(emailCategoryCounts.sent_delivered || 0),
+          engagement: Number(emailCategoryCounts.engagement || 0),
+          problem: emailProblemCount,
+          unknown: Number(emailCategoryCounts.unknown || 0),
+        },
+        estimated_cost: null,
+        notes: [
+          sendgridConfigured ? 'SendGrid key presence is confirmed without exposing the key.' : 'Live SendGrid usage API is not configured for this admin page.',
+          'email_delivery_events currently lacks client_id, so SendGrid metrics are platform-wide for the selected date range.',
+        ],
+        last_checked: lastChecked,
+      },
+      {
+        key: 'render',
+        name: 'Render',
+        status: renderConfigured ? 'unknown' : 'not_configured',
+        configured: renderConfigured,
+        source: 'not_available',
+        current_period: {},
+        estimated_cost: null,
+        notes: [
+          renderConfigured ? 'Render configuration presence is detected, but no live Render API integration is used here.' : 'No live Render usage source is configured.',
+        ],
+        last_checked: lastChecked,
+      },
+      {
+        key: 'sentry',
+        name: 'Sentry',
+        status: sentryConfigured ? 'unknown' : 'not_configured',
+        configured: sentryConfigured,
+        source: 'environment_check',
+        current_period: {},
+        estimated_cost: null,
+        notes: [
+          sentryConfigured ? 'Sentry is configured for backend capture, but live issue counts are not integrated here.' : 'No live Sentry usage source is configured.',
+        ],
+        last_checked: lastChecked,
+      },
+    ],
+  };
+}
+
+function buildHealthSummary({
+  now,
+  env,
+  overview,
+  readiness,
+  emailCategoryCounts,
+  automationRules,
+  automationActions,
+  digestDeliveries,
+  warnings,
+}) {
+  const lastChecked = now.toISOString();
+  const schedulerEnabled = schedulerSendEnabled(env);
+  const schedulerSecret = schedulerSecretConfigured(env);
+  const automationConfigured = automationRules.length > 0 || automationActions.length > 0 || digestDeliveries.length > 0;
+  const interviewProblems = Number(readiness.missing_report_after_complete || 0) + Number(readiness.recording_problem || 0) + Number(readiness.perception_missing_after_video_completion || 0);
+  const interviewWarnings = Number(readiness.recording_pending || 0);
+  const emailProblems = Number(emailCategoryCounts.problem || 0);
+  const videoProblems = Number(readiness.recording_problem || 0) + Number(readiness.perception_missing_after_video_completion || 0);
+  const videoWarnings = Number(readiness.recording_pending || 0);
+  const scoringProblems = Number(readiness.missing_report_after_complete || 0);
+  const sentryConfigured = envEnabled(env, 'SENTRY_ENABLED') && envConfigured(env, ['SENTRY_DSN']);
+
+  return [
+    {
+      key: 'backend_api',
+      label: 'Backend API',
+      status: 'healthy',
+      detail: 'Current admin metrics request succeeded.',
+      source: 'current_request',
+      last_checked: lastChecked,
+    },
+    {
+      key: 'database',
+      label: 'Database',
+      status: warnings.length ? 'warning' : 'healthy',
+      detail: warnings.length ? `${warnings.length} optional source warning(s).` : 'Metrics queries completed.',
+      source: 'database',
+      last_checked: lastChecked,
+    },
+    {
+      key: 'interview_pipeline',
+      label: 'Interview pipeline',
+      status: healthStatusFromProblems({ problem: interviewProblems, warning: interviewWarnings, unknownWhenZero: Number(overview.interviews_started || 0) === 0 }),
+      detail: `${Number(overview.interviews_completed || 0)} completed proxy, ${interviewProblems} readiness issue(s).`,
+      source: 'database_estimate',
+      last_checked: lastChecked,
+    },
+    {
+      key: 'automation_scheduler',
+      label: 'Automation scheduler',
+      status: !automationConfigured ? 'unknown' : schedulerEnabled && schedulerSecret ? 'healthy' : 'warning',
+      detail: schedulerEnabled && schedulerSecret ? 'Send guard and scheduler secret are configured.' : 'Scheduler send guard or secret is not fully configured.',
+      source: 'environment_check',
+      last_checked: lastChecked,
+    },
+    {
+      key: 'email_delivery',
+      label: 'Email delivery',
+      status: emailProblems > 0 ? 'problem' : Object.values(emailCategoryCounts).some((count) => Number(count) > 0) ? 'healthy' : 'unknown',
+      detail: `${emailProblems} platform email problem event(s) in range.`,
+      source: 'database_estimate',
+      last_checked: lastChecked,
+    },
+    {
+      key: 'tavus_video',
+      label: 'Tavus / Video',
+      status: healthStatusFromProblems({ problem: videoProblems, warning: videoWarnings, unknownWhenZero: Number(overview.interviews_started || 0) === 0 }),
+      detail: `${Number(readiness.recording_ready || 0)} recording(s) ready, ${videoProblems + videoWarnings} pending/problem.`,
+      source: 'database_estimate',
+      last_checked: lastChecked,
+    },
+    {
+      key: 'openai_scoring',
+      label: 'OpenAI / Scoring',
+      status: scoringProblems > 0 ? 'warning' : Number(overview.reports_generated || 0) > 0 ? 'healthy' : 'unknown',
+      detail: `${Number(overview.reports_generated || 0)} report(s), ${scoringProblems} missing after threshold.`,
+      source: 'database_estimate',
+      last_checked: lastChecked,
+    },
+    {
+      key: 'error_monitoring',
+      label: 'Error monitoring',
+      status: sentryConfigured ? 'unknown' : 'not_configured',
+      detail: sentryConfigured ? 'Sentry configured; live issue counts are not integrated.' : 'No Sentry live metrics source configured.',
+      source: 'environment_check',
+      last_checked: lastChecked,
+    },
+  ];
+}
+
 function buildSourceSummary(rowsByName, warnings, scopeNotes) {
   return {
     row_counts: Object.fromEntries(Object.entries(rowsByName).map(([key, rows]) => [key, rows.length])),
@@ -555,7 +882,7 @@ function buildSourceSummary(rowsByName, warnings, scopeNotes) {
   };
 }
 
-async function buildAdminMetricsPayload({ db, req = {}, query = {}, requestId = null, now = new Date() }) {
+async function buildAdminMetricsPayload({ db, req = {}, query = {}, requestId = null, now = new Date(), env = process.env }) {
   const warnings = [];
   const dateRange = parseMetricsDateRange(query, now);
   const scope = await resolveMetricsScope({ db, req, query, requestId });
@@ -563,6 +890,7 @@ async function buildAdminMetricsPayload({ db, req = {}, query = {}, requestId = 
   const scopedClientIds = Array.isArray(scope.clientIds) ? scope.clientIds : null;
   const scopeNotes = [
     ...scope.notes,
+    'Interview completion uses interviews.status, candidate completed status, or matching report rows; interviews.completed_at is not present in the current schema.',
     'Email delivery events are date-filtered platform-wide because email_delivery_events does not store client_id in the current schema.',
     'Approval link metrics count token state and expiry only; token hashes, salts, recipients, and raw links are never selected or returned.',
   ];
@@ -589,7 +917,7 @@ async function buildAdminMetricsPayload({ db, req = {}, query = {}, requestId = 
     readRows({ db, table: 'clients', columns: 'id,name,parent_client_id,entity_label,archived_at', clientIds: scopedClientIds, clientField: 'id', orderBy: 'name', ascending: true, warnings }),
     readRows({ db, table: 'roles', columns: 'id,title,client_id,status,created_at', clientIds: scopedClientIds, orderBy: 'created_at', roleId, warnings }),
     readRows({ db, table: 'candidates', columns: 'id,client_id,role_id,name,first_name,last_name,status,interview_status,created_at', clientIds: scopedClientIds, roleId, dateField: 'created_at', dateRange, orderBy: 'created_at', warnings }),
-    readRows({ db, table: 'interviews', columns: 'id,client_id,role_id,candidate_id,created_at,updated_at,completed_at,interview_status,video_url,transcript_url,transcript,transcript_scores,interview_summary,interview_analysis_v2,perception_scores,recording_status,recording_ready_at,recording_deleted_at,recording_delete_reason,recording_delete_error', clientIds: scopedClientIds, roleId, dateField: 'created_at', dateRange, orderBy: 'created_at', warnings }),
+    readRows({ db, table: 'interviews', columns: 'id,client_id,role_id,candidate_id,created_at,updated_at,status,video_url,transcript_url,transcript,transcript_scores,interview_summary,interview_analysis_v2,perception_scores,recording_status,recording_ready_at,recording_metadata,recording_deleted_at,recording_delete_reason,recording_delete_error', clientIds: scopedClientIds, roleId, dateField: 'created_at', dateRange, orderBy: 'created_at', warnings }),
     readRows({ db, table: 'reports', columns: 'id,client_id,role_id,candidate_id,created_at', clientIds: scopedClientIds, roleId, dateField: 'created_at', dateRange, orderBy: 'created_at', warnings }),
     readRows({ db, table: 'interview_perception_events', columns: 'id,client_id,interview_id,event_type,received_at', clientIds: scopedClientIds, dateField: 'received_at', dateRange, orderBy: 'received_at', optional: true, warnings }),
     readRows({ db, table: 'email_delivery_events', columns: 'id,created_at,event_at,event_type,email_category,category,status,is_problem,reason', dateField: 'created_at', dateRange, orderBy: 'created_at', optional: true, warnings }),
@@ -603,17 +931,20 @@ async function buildAdminMetricsPayload({ db, req = {}, query = {}, requestId = 
   ]);
 
   const clientById = Object.fromEntries(clients.map((client) => [client.id, client]));
-  const completedInterviews = interviews.filter(isCompletedInterview);
-  const transcriptReady = interviews.filter(isTranscriptReady);
   const reportsByCandidateRole = new Set(reports.map((report) => reportKey(report.candidate_id, report.role_id)));
+  const reportCreatedAtByCandidateRole = buildReportCreatedAtByCandidateRole(reports);
+  const candidateById = Object.fromEntries(candidates.map((candidate) => [candidate.id, candidate]));
+  const completionContext = { candidateById, reportsByCandidateRole, reportCreatedAtByCandidateRole };
+  const completedInterviews = interviews.filter((interview) => isCompletedInterview(interview, completionContext));
+  const transcriptReady = interviews.filter(isTranscriptReady);
   const missingReportAfterComplete = completedInterviews.filter((interview) => {
-    const completedMs = parseDateMs(interviewCompletedAt(interview));
+    const completedMs = parseDateMs(interviewCompletedAt(interview, completionContext));
     return completedMs && now.getTime() - completedMs > MISSING_REPORT_THRESHOLD_MS &&
       !reportsByCandidateRole.has(reportKey(interview.candidate_id, interview.role_id));
   });
   const perceptionInterviewIds = new Set(perceptionEvents.map((event) => trimText(event.interview_id)).filter(Boolean));
   const perceptionMissing = completedInterviews.filter((interview) => {
-    const completedMs = parseDateMs(interviewCompletedAt(interview));
+    const completedMs = parseDateMs(interviewCompletedAt(interview, completionContext));
     return completedMs && now.getTime() - completedMs > RECORDING_THRESHOLD_MS && !perceptionInterviewIds.has(trimText(interview.id));
   });
   const recordingCounts = interviews.reduce((counts, interview) => {
@@ -649,6 +980,55 @@ async function buildAdminMetricsPayload({ db, req = {}, query = {}, requestId = 
     digestDeliveries,
     emailEvents,
   });
+  const overview = {
+    active_clients: clients.filter(isActiveClient).length,
+    active_roles: roles.filter(isActiveRole).length,
+    candidates_in_range: candidates.length,
+    interviews_started: interviews.length,
+    interviews_completed: completedInterviews.length,
+    reports_generated: reports.length,
+    automation_pending_approvals: actionStateCounts.pending_approval || 0,
+    email_delivery_failures: emailCategoryCounts.problem || 0,
+  };
+  const readiness = {
+    recording_ready: recordingCounts.ready || 0,
+    recording_pending: recordingCounts.pending || 0,
+    recording_problem: recordingCounts.problem || 0,
+    recording_deleted: recordingCounts.deleted || 0,
+    report_generated: reports.length,
+    missing_report_after_complete: missingReportAfterComplete.length,
+    perception_event_received: perceptionEvents.length,
+    perception_missing_after_video_completion: perceptionMissing.length,
+    transcript_ready: transcriptReady.length,
+  };
+  const healthSummary = buildHealthSummary({
+    now,
+    env,
+    overview,
+    readiness,
+    emailCategoryCounts,
+    automationRules,
+    automationActions,
+    digestDeliveries,
+    warnings,
+  });
+  const vendorUsage = buildVendorUsage({
+    now,
+    dateRange,
+    env,
+    overview,
+    readiness,
+    emailCategoryCounts,
+    interviews,
+    reports,
+    candidates,
+    roles,
+    clients,
+    automationRules,
+    automationActions,
+    digestDeliveries,
+    warnings,
+  });
 
   return {
     ok: true,
@@ -665,16 +1045,9 @@ async function buildAdminMetricsPayload({ db, req = {}, query = {}, requestId = 
       date_to_display: dateRange.date_to_display,
       default_range_days: DEFAULT_RANGE_DAYS,
     },
-    overview: {
-      active_clients: clients.filter(isActiveClient).length,
-      active_roles: roles.filter(isActiveRole).length,
-      candidates_in_range: candidates.length,
-      interviews_started: interviews.length,
-      interviews_completed: completedInterviews.length,
-      reports_generated: reports.length,
-      automation_pending_approvals: actionStateCounts.pending_approval || 0,
-      email_delivery_failures: emailCategoryCounts.problem || 0,
-    },
+    health_summary: healthSummary,
+    vendor_usage: vendorUsage,
+    overview,
     interview_funnel: [
       { key: 'candidate_created', label: 'Candidate created', count: candidates.length },
       { key: 'interview_started', label: 'Interview started', count: interviews.length },
@@ -726,17 +1099,7 @@ async function buildAdminMetricsPayload({ db, req = {}, query = {}, requestId = 
         })),
       scope: 'platform_date_range',
     },
-    readiness: {
-      recording_ready: recordingCounts.ready || 0,
-      recording_pending: recordingCounts.pending || 0,
-      recording_problem: recordingCounts.problem || 0,
-      recording_deleted: recordingCounts.deleted || 0,
-      report_generated: reports.length,
-      missing_report_after_complete: missingReportAfterComplete.length,
-      perception_event_received: perceptionEvents.length,
-      perception_missing_after_video_completion: perceptionMissing.length,
-      transcript_ready: transcriptReady.length,
-    },
+    readiness,
     entity_operations: entityOperations,
     attention: {
       thresholds: {
