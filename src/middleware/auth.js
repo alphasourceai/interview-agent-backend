@@ -144,7 +144,8 @@ async function withClientScope(req, res, next) {
 
       const { data: clients, error: clientsErr } = await supabase
         .from('clients')
-        .select('id, name')
+        .select('id, name, parent_client_id, entity_label, archived_at')
+        .is('archived_at', null)
         .limit(5000);
       if (clientsErr) {
         console.error('[withClientScope] admin clients lookup error', clientsErr);
@@ -198,7 +199,7 @@ async function withClientScope(req, res, next) {
     let rows = [];
     let { data, error } = await supabase
       .from('client_members')
-      .select('client_id, role, user_id_uuid, clients ( id, name, parent_client_id, entity_label )')
+      .select('client_id, role, user_id_uuid, clients ( id, name, parent_client_id, entity_label, archived_at )')
       .eq('user_id_uuid', userId)
       .limit(5000);
 
@@ -206,7 +207,7 @@ async function withClientScope(req, res, next) {
     if (error && error.code === '42703') {
       const retry = await supabase
         .from('client_members')
-        .select('client_id, role, user_id, clients ( id, name, parent_client_id, entity_label )')
+        .select('client_id, role, user_id, clients ( id, name, parent_client_id, entity_label, archived_at )')
         .eq('user_id', userId)
         .limit(5000);
       data = retry.data;
@@ -247,8 +248,9 @@ async function withClientScope(req, res, next) {
     if (parentSuperAdminIds.length) {
       const { data: childData, error: childError } = await supabase
         .from('clients')
-        .select('id, name, parent_client_id, entity_label')
+        .select('id, name, parent_client_id, entity_label, archived_at')
         .in('parent_client_id', parentSuperAdminIds)
+        .is('archived_at', null)
         .limit(5000);
       if (childError) {
         console.error('[withClientScope] child client expansion error', childError);

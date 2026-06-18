@@ -64,6 +64,7 @@ function formatClientEntity(client) {
     name: String(client?.name || '').trim() || id,
     parent_client_id: parentClientId,
     entity_label: String(client?.entity_label || '').trim() || null,
+    archived_at: String(client?.archived_at || '').trim() || null,
     billing_client_id: parentClientId || id,
     is_parent_client: !parentClientId,
     is_child_client: !!parentClientId,
@@ -85,7 +86,7 @@ async function loadEntityMap(db, clientIds) {
 
   const { data, error } = await db
     .from('clients')
-    .select('id,name,parent_client_id,entity_label')
+    .select('id,name,parent_client_id,entity_label,archived_at')
     .in('id', ids);
   if (error) throw error;
   return buildEntityMap(data || []);
@@ -106,7 +107,7 @@ async function loadSelectedHierarchy(db, selectedClientId, requestId) {
 
   const { data: selected, error: selectedError } = await db
     .from('clients')
-    .select('id,name,parent_client_id,entity_label')
+    .select('id,name,parent_client_id,entity_label,archived_at')
     .eq('id', clientId)
     .maybeSingle();
   if (selectedError) {
@@ -128,7 +129,7 @@ async function loadSelectedHierarchy(db, selectedClientId, requestId) {
   if (selectedEntity.parent_client_id) {
     const { data: parentRow, error: parentError } = await db
       .from('clients')
-      .select('id,name,parent_client_id,entity_label')
+      .select('id,name,parent_client_id,entity_label,archived_at')
       .eq('id', selectedEntity.parent_client_id)
       .maybeSingle();
     if (parentError) {
@@ -156,8 +157,9 @@ async function loadSelectedHierarchy(db, selectedClientId, requestId) {
 
   const { data: childRows, error: childrenError } = await db
     .from('clients')
-    .select('id,name,parent_client_id,entity_label')
+    .select('id,name,parent_client_id,entity_label,archived_at')
     .eq('parent_client_id', parent.id)
+    .is('archived_at', null)
     .order('name', { ascending: true });
   if (childrenError) {
     return scopedError(

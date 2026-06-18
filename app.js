@@ -69,6 +69,7 @@ const { getRoleInterviewAvailability } = require('./src/lib/roleInterviewAvailab
 const { cleanupNoSubstantiveRecordings } = require('./src/lib/recordingCleanup')
 const { createSubscriptionCheckoutSession } = require('./src/lib/subscriptionCheckout')
 const { processClientEntityImport } = require('./src/lib/clientEntityImportService')
+const { archiveChildClientEntity } = require('./src/lib/clientEntityArchive')
 const { sendSubscriptionCheckoutEmail, sendMemberRecoveryEmail } = require('./utils/mailer')
 const {
   frontendUrl: FRONTEND_URL,
@@ -206,7 +207,7 @@ async function loadClientScopeContextForResponse(req, knownClients) {
   if (missingClientIds.length > 0) {
     const { data, error } = await supabaseAdmin
       .from('clients')
-      .select('id, name, parent_client_id, entity_label')
+      .select('id, name, parent_client_id, entity_label, archived_at')
       .in('id', missingClientIds)
     if (!error && Array.isArray(data)) clients = clients.concat(data)
   }
@@ -230,6 +231,7 @@ function clientScopeMetadata(scopeContext, clientId) {
   return {
     parent_client_id: client.parent_client_id || null,
     entity_label: client.entity_label || null,
+    archived_at: client.archived_at || null,
     billing_client_id: client.billing_client_id || id || null,
     is_parent_client: client.is_parent_client !== false,
     is_child_client: client.is_child_client === true,
@@ -284,6 +286,10 @@ function formatTenantClientEntity(client) {
     name: client?.name || null,
     parent_client_id: parentClientId,
     entity_label: String(client?.entity_label || '').trim() || null,
+    archived_at: String(client?.archived_at || '').trim() || null,
+    archived_reason: String(client?.archived_reason || '').trim() || null,
+    archived_by_user_id: String(client?.archived_by_user_id || '').trim() || null,
+    archived: Boolean(String(client?.archived_at || '').trim()),
     billing_client_id: parentClientId || client?.id || null,
     is_parent_client: !parentClientId,
     is_child_client: !!parentClientId,
@@ -298,7 +304,7 @@ async function resolveTenantEntityParent(req, selectedClientId) {
 
   const { data: selected, error: selectedError } = await supabaseAdmin
     .from('clients')
-    .select('id,name,email,parent_client_id,entity_label,candidate_assistance_contact')
+    .select('id,name,email,parent_client_id,entity_label,candidate_assistance_contact,archived_at')
     .eq('id', clientId)
     .maybeSingle()
 
@@ -319,7 +325,7 @@ async function resolveTenantEntityParent(req, selectedClientId) {
 
   const { data: parent, error: parentError } = await supabaseAdmin
     .from('clients')
-    .select('id,name,email,parent_client_id,entity_label,candidate_assistance_contact')
+    .select('id,name,email,parent_client_id,entity_label,candidate_assistance_contact,archived_at')
     .eq('id', selectedParentId)
     .maybeSingle()
 
@@ -386,19 +392,24 @@ app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
 
     const { data: clients, error } = await supabaseAdmin
       .from('clients')
-      .select('id, name, parent_client_id, entity_label')
+      .select('id, name, parent_client_id, entity_label, archived_at')
       .in('id', ids)
     if (error) return res.status(500).json({ error: 'Failed to load clients', detail: error.message })
 
+    const activeClients = (clients || []).filter((client) => (
+      !String(client?.parent_client_id || '').trim() ||
+      !String(client?.archived_at || '').trim()
+    ))
+
     let scopeContext = null
     try {
-      scopeContext = await loadClientScopeContextForResponse(req, clients || [])
+      scopeContext = await loadClientScopeContextForResponse(req, activeClients)
     } catch (_) {
-      scopeContext = buildClientScopeContext({ memberships: req.memberships || [], clients: clients || [] })
+      scopeContext = buildClientScopeContext({ memberships: req.memberships || [], clients: activeClients })
     }
 
     const membershipById = Object.fromEntries((req.effectiveMemberships || req.memberships || []).map(m => [m.client_id, m]))
-    const items = (clients || []).map((c) => {
+    const items = activeClients.map((c) => {
       const membership = membershipById[c.id] || {}
       const inherited = membership.inherited === true
       return {
@@ -413,7 +424,7 @@ app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
     res.json({
       items,
       assigned_client_ids: uniqueClientIds(req.assignedClientIds || []),
-      accessible_client_ids: ids,
+      accessible_client_ids: activeClients.map((client) => client.id).filter(Boolean),
     })
   } catch (e) {
     res.status(500).json({ error: 'Server error' })
@@ -429,8 +440,9 @@ app.get('/clients/entities', requireAuth, withClientScope, async (req, res) => {
 
     const { data: children, error } = await supabaseAdmin
       .from('clients')
-      .select('id,name,parent_client_id,entity_label')
+      .select('id,name,parent_client_id,entity_label,archived_at,archived_reason,archived_by_user_id')
       .eq('parent_client_id', parentResult.parent.id)
+      .is('archived_at', null)
       .order('name', { ascending: true })
 
     if (error) return res.status(500).json({ error: 'list_client_entities_failed', detail: error.message, request_id })
@@ -476,7 +488,7 @@ app.post('/clients/entities', requireAuth, withClientScope, async (req, res) => 
         entity_label: entityLabel,
         candidate_assistance_contact: parent.candidate_assistance_contact || null
       })
-      .select('id,name,parent_client_id,entity_label')
+      .select('id,name,parent_client_id,entity_label,archived_at,archived_reason,archived_by_user_id')
       .single()
 
     if (error) return res.status(500).json({ error: 'create_client_entity_failed', detail: error.message, hint: error.hint, request_id })
@@ -540,8 +552,9 @@ app.post('/clients/entities/import', requireAuth, withClientScope, async (req, r
 
     const { data: existingChildren, error: existingError } = await supabaseAdmin
       .from('clients')
-      .select('id,name,parent_client_id,entity_label')
+      .select('id,name,parent_client_id,entity_label,archived_at')
       .eq('parent_client_id', parent.id)
+      .is('archived_at', null)
 
     if (existingError) {
       return res.status(500).json({
@@ -592,7 +605,7 @@ app.patch('/clients/entities/:entityClientId', requireAuth, withClientScope, asy
 
     const { data: entity, error: entityError } = await supabaseAdmin
       .from('clients')
-      .select('id,name,parent_client_id,entity_label')
+      .select('id,name,parent_client_id,entity_label,archived_at')
       .eq('id', entityClientId)
       .maybeSingle()
 
@@ -604,7 +617,7 @@ app.patch('/clients/entities/:entityClientId', requireAuth, withClientScope, asy
 
     const { data: parent, error: parentError } = await supabaseAdmin
       .from('clients')
-      .select('id,name,parent_client_id,entity_label')
+      .select('id,name,parent_client_id,entity_label,archived_at')
       .eq('id', parentClientId)
       .maybeSingle()
 
@@ -635,7 +648,7 @@ app.patch('/clients/entities/:entityClientId', requireAuth, withClientScope, asy
       .from('clients')
       .update(updates)
       .eq('id', entity.id)
-      .select('id,name,parent_client_id,entity_label')
+      .select('id,name,parent_client_id,entity_label,archived_at,archived_reason,archived_by_user_id')
       .single()
 
     if (error) return res.status(500).json({ error: 'update_client_entity_failed', detail: error.message, hint: error.hint, request_id })
@@ -648,6 +661,41 @@ app.patch('/clients/entities/:entityClientId', requireAuth, withClientScope, asy
   } catch (e) {
     console.error('[clients/entities/update] unexpected', { request_id, error: e?.message || e })
     return res.status(500).json({ error: 'server_error', request_id })
+  }
+})
+
+app.patch('/clients/entities/:entityClientId/archive', requireAuth, withClientScope, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const selectedClientId = req.body?.client_id || req.query?.client_id || req.client?.id || req.clientScope?.defaultClientId || null
+    const parentResult = await resolveTenantEntityParent(req, selectedClientId)
+    if (!parentResult.ok) return res.status(parentResult.status).json({ ...parentResult.body, request_id })
+
+    const result = await archiveChildClientEntity({
+      db: supabaseAdmin,
+      parentClientId: parentResult.parent.id,
+      entityClientId: req.params?.entityClientId,
+      actorUserId: req.user?.id || null,
+      reason: req.body?.reason || null,
+      requestId: request_id
+    })
+
+    if (!result.ok) return res.status(result.status).json(result.body)
+
+    return res.json({
+      ok: true,
+      entity: {
+        id: result.entity?.id || null,
+        name: result.entity?.name || null,
+        archived: true,
+        archived_at: result.entity?.archived_at || null,
+      },
+      item: formatTenantClientEntity(result.entity),
+      request_id
+    })
+  } catch (e) {
+    console.error('[clients/entities/archive] unexpected', { request_id, error: e?.message || e })
+    return res.status(500).json({ error: 'server_error', code: 'SERVER_ERROR', detail: e?.message || null, request_id })
   }
 })
 
@@ -2090,10 +2138,15 @@ function buildAdminClientHierarchyMaps(clients) {
 
 function withAdminClientHierarchyMetadata(client, maps = {}) {
   const parentClientId = trimNullableString(client?.parent_client_id)
+  const archivedAt = trimNullableString(client?.archived_at)
   return {
     ...client,
     parent_client_id: parentClientId,
     entity_label: trimNullableString(client?.entity_label),
+    archived_at: archivedAt,
+    archived_reason: trimNullableString(client?.archived_reason),
+    archived_by_user_id: trimNullableString(client?.archived_by_user_id),
+    archived: !!archivedAt,
     billing_client_id: parentClientId || client?.id || null,
     is_parent_client: !parentClientId,
     is_child_client: !!parentClientId,
@@ -2114,7 +2167,7 @@ async function loadTopLevelParentClient(parentClientId) {
 
   const { data: parent, error } = await supabaseAdmin
     .from('clients')
-    .select('id,name,email,parent_client_id,entity_label,candidate_assistance_contact')
+    .select('id,name,email,parent_client_id,entity_label,candidate_assistance_contact,archived_at')
     .eq('id', id)
     .maybeSingle()
 
@@ -2212,11 +2265,302 @@ async function rejectChildClientForAdminBilling(req, res, context) {
   return result
 }
 
+function sendAdminError(res, status, payload = {}) {
+  return res.status(status).json({
+    error: payload.error || payload.code || 'server_error',
+    code: payload.code || payload.error || 'server_error',
+    detail: payload.detail || null,
+    hint: payload.hint || null,
+    request_id: payload.request_id || null
+  })
+}
+
+function automationSchedulerSendEnabled() {
+  return ['true', '1', 'yes'].includes(String(process.env.AUTOMATION_DIGEST_SCHEDULER_SEND_ENABLED || '').trim().toLowerCase())
+}
+
+function automationSchedulerSecretConfigured() {
+  return Boolean(String(
+    process.env.AUTOMATION_DIGEST_RUNNER_SECRET ||
+    process.env.AUTOMATION_DIGEST_CRON_SECRET ||
+    process.env.CONTRACTS_CRON_SECRET ||
+    ''
+  ).trim())
+}
+
+function asJsonObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+}
+
+function summarizeKeyValues(value, fallback = 'Default criteria') {
+  const source = asJsonObject(value)
+  const entries = Object.entries(source)
+    .filter(([, entryValue]) => entryValue !== undefined && entryValue !== null && entryValue !== '')
+    .slice(0, 4)
+    .map(([key, entryValue]) => {
+      const label = key.replace(/_/g, ' ')
+      if (Array.isArray(entryValue)) return `${label}: ${entryValue.length}`
+      if (typeof entryValue === 'object') return `${label}: configured`
+      return `${label}: ${String(entryValue)}`
+    })
+  return entries.length ? entries.join(' · ') : fallback
+}
+
+function summarizeAutomationRecipients(rule) {
+  const digestConfig = asJsonObject(rule?.digest_config)
+  const actionConfig = asJsonObject(rule?.action_config)
+  const recipients = Array.isArray(digestConfig.recipients)
+    ? digestConfig.recipients
+    : Array.isArray(actionConfig.recipients)
+      ? actionConfig.recipients
+      : []
+  if (recipients.length > 0) return `${recipients.length} configured recipient${recipients.length === 1 ? '' : 's'}`
+  if (digestConfig.recipient_email || actionConfig.recipient_email) return '1 configured recipient'
+  return 'No configured recipients'
+}
+
+function summarizeAutomationCadence(rule) {
+  const digestConfig = asJsonObject(rule?.digest_config)
+  const frequency = trimNullableString(digestConfig.frequency) || trimNullableString(digestConfig.cadence)
+  const sendTime = trimNullableString(digestConfig.send_time_local)
+  if (frequency && sendTime) return `${frequency} at ${sendTime}`
+  return frequency || trimNullableString(rule?.mode) || 'Manual review'
+}
+
+function maskEmail(value) {
+  const email = trimNullableString(value)
+  if (!email || !email.includes('@')) return email || null
+  const [local, domain] = email.split('@')
+  const start = local.slice(0, 1)
+  return `${start}${local.length > 1 ? '***' : ''}@${domain}`
+}
+
+function deriveAutomationApprovalStatus(action) {
+  const state = String(action?.state || '').trim().toLowerCase()
+  if (action?.rejected_at || state === 'rejected') return 'rejected'
+  if (action?.approved_at || ['approved', 'queued', 'sending', 'sent', 'delivered'].includes(state)) return 'approved'
+  if (state === 'pending_approval') return 'pending approval'
+  if (state === 'failed') return 'failed'
+  if (state === 'canceled') return 'canceled'
+  return state || 'unknown'
+}
+
+function collectUniqueIds(rows, fields) {
+  const ids = new Set()
+  for (const row of rows || []) {
+    for (const field of fields || []) {
+      const id = trimNullableString(row?.[field])
+      if (id) ids.add(id)
+    }
+  }
+  return Array.from(ids)
+}
+
+async function loadAutomationLookupMap(table, columns, ids) {
+  const lookupIds = uniqueClientIds(ids)
+  if (!lookupIds.length) return {}
+  const { data, error } = await supabaseAdmin
+    .from(table)
+    .select(columns)
+    .in('id', lookupIds)
+  if (error) throw error
+  return Object.fromEntries((data || []).map((row) => [row.id, row]))
+}
+
+function countRowsByStatus(rows, field = 'state') {
+  const counts = {}
+  for (const row of rows || []) {
+    const status = String(row?.[field] || 'unknown').trim().toLowerCase() || 'unknown'
+    counts[status] = (counts[status] || 0) + 1
+  }
+  return counts
+}
+
+// Read-only platform automation visibility. Do not add send/approve/reject controls here.
+adminRouter.get('/automation/overview', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const [
+      rulesResult,
+      actionsResult,
+      digestsResult,
+      eventsResult
+    ] = await Promise.all([
+      supabaseAdmin
+        .from('automation_rules')
+        .select('id,name,client_id,role_id,enabled,mode,criteria_config,action_config,digest_config,rule_version,archived_at,created_at,updated_at')
+        .order('updated_at', { ascending: false })
+        .limit(250),
+      supabaseAdmin
+        .from('automation_actions')
+        .select('id,evaluation_id,rule_id,rule_version,client_id,role_id,candidate_id,report_id,interview_id,action_type,state,approved_by_email,approved_at,rejected_at,canceled_at,sent_at,failed_at,last_error,send_attempt_count,created_at,updated_at')
+        .order('created_at', { ascending: false })
+        .limit(250),
+      supabaseAdmin
+        .from('automation_digest_deliveries')
+        .select('id,client_id,role_id,recipient_email,recipient_email_domain,digest_type,delivery_date,timezone,send_time_local,status,action_count,sent_at,failed_at,last_error,created_by_email,created_at,updated_at')
+        .order('created_at', { ascending: false })
+        .limit(150),
+      supabaseAdmin
+        .from('automation_action_events')
+        .select('id,action_id,client_id,event_type,from_state,to_state,actor_type,actor_email,created_at')
+        .order('created_at', { ascending: false })
+        .limit(300)
+    ])
+
+    const firstError = rulesResult.error || actionsResult.error || digestsResult.error || eventsResult.error
+    if (firstError) {
+      return sendAdminError(res, 500, {
+        error: 'admin_automation_overview_failed',
+        code: 'ADMIN_AUTOMATION_OVERVIEW_FAILED',
+        detail: firstError.message,
+        hint: firstError.hint || null,
+        request_id
+      })
+    }
+
+    const rules = rulesResult.data || []
+    const actions = actionsResult.data || []
+    const digests = digestsResult.data || []
+    const events = eventsResult.data || []
+
+    const clientIds = collectUniqueIds([...rules, ...actions, ...digests, ...events], ['client_id'])
+    const roleIds = collectUniqueIds([...rules, ...actions, ...digests], ['role_id'])
+    const candidateIds = collectUniqueIds(actions, ['candidate_id'])
+
+    const [clientMap, roleMap, candidateMap] = await Promise.all([
+      loadAutomationLookupMap('clients', 'id,name,parent_client_id,entity_label,archived_at', clientIds),
+      loadAutomationLookupMap('roles', 'id,title,client_id,status', roleIds),
+      loadAutomationLookupMap('candidates', 'id,name,email,client_id', candidateIds)
+    ])
+
+    const latestEventByActionId = {}
+    for (const event of events) {
+      const actionId = trimNullableString(event?.action_id)
+      if (!actionId || latestEventByActionId[actionId]) continue
+      latestEventByActionId[actionId] = event
+    }
+
+    const activeRules = rules.filter((rule) => !trimNullableString(rule.archived_at))
+    const digestStatusCounts = countRowsByStatus(digests, 'status')
+    const actionStateCounts = countRowsByStatus(actions, 'state')
+    const overview = {
+      total_rules: activeRules.length,
+      enabled_rules: activeRules.filter((rule) => rule.enabled === true).length,
+      disabled_rules: activeRules.filter((rule) => rule.enabled !== true).length,
+      pending_approval_count: actions.filter((action) => String(action.state || '').toLowerCase() === 'pending_approval').length,
+      recent_sent_action_count: actions.filter((action) => ['sent', 'delivered'].includes(String(action.state || '').toLowerCase())).length,
+      recent_rejected_action_count: actions.filter((action) => String(action.state || '').toLowerCase() === 'rejected' || action.rejected_at).length,
+      recent_failed_action_count: actions.filter((action) => String(action.state || '').toLowerCase() === 'failed' || action.failed_at).length,
+      recent_digest_delivery_count: digests.length,
+      action_state_counts: actionStateCounts,
+      digest_status_counts: digestStatusCounts,
+      scheduler_send_enabled: automationSchedulerSendEnabled(),
+      scheduler_secret_configured: automationSchedulerSecretConfigured(),
+      scheduler_send_mode: automationSchedulerSendEnabled() ? 'send_enabled' : 'dry_run_guarded',
+      digest_frequencies: ['daily', 'weekdays', 'weekly']
+    }
+
+    const safeRules = activeRules.map((rule) => {
+      const client = clientMap[rule.client_id] || null
+      const role = roleMap[rule.role_id] || null
+      const digestConfig = asJsonObject(rule.digest_config)
+      return {
+        id: rule.id,
+        name: trimNullableString(rule.name) || 'Automation rule',
+        client_id: rule.client_id || null,
+        client_name: client?.name || rule.client_id || null,
+        role_id: rule.role_id || null,
+        role_title: role?.title || rule.role_id || null,
+        enabled: rule.enabled === true,
+        mode: rule.mode || null,
+        criteria_summary: summarizeKeyValues(rule.criteria_config),
+        recipients_summary: summarizeAutomationRecipients(rule),
+        cadence_summary: summarizeAutomationCadence(rule),
+        scheduling_url_configured: Boolean(trimNullableString(asJsonObject(rule.action_config).scheduling_url || digestConfig.scheduling_url)),
+        rule_version: rule.rule_version || null,
+        created_at: rule.created_at || null,
+        updated_at: rule.updated_at || null,
+      }
+    })
+
+    const safeActions = actions.map((action) => {
+      const client = clientMap[action.client_id] || null
+      const role = roleMap[action.role_id] || null
+      const candidate = candidateMap[action.candidate_id] || null
+      const event = latestEventByActionId[action.id] || null
+      const eventSummary = event
+        ? `${event.event_type || 'event'}${event.to_state ? ` to ${event.to_state}` : ''}`
+        : 'No recent event'
+      return {
+        id: action.id,
+        client_id: action.client_id || null,
+        client_name: client?.name || action.client_id || null,
+        role_id: action.role_id || null,
+        role_title: role?.title || action.role_id || null,
+        candidate_id: action.candidate_id || null,
+        candidate_name: candidate?.name || maskEmail(candidate?.email) || action.candidate_id || null,
+        action_type: action.action_type || null,
+        state: action.state || null,
+        approval_status: deriveAutomationApprovalStatus(action),
+        send_attempt_count: action.send_attempt_count || 0,
+        last_error: action.last_error ? 'Error recorded' : null,
+        event_summary: eventSummary,
+        event_at: event?.created_at || null,
+        created_at: action.created_at || null,
+        updated_at: action.updated_at || null,
+      }
+    })
+
+    const safeDigests = digests.map((digest) => {
+      const client = clientMap[digest.client_id] || null
+      const role = roleMap[digest.role_id] || null
+      return {
+        id: digest.id,
+        client_id: digest.client_id || null,
+        client_name: client?.name || digest.client_id || null,
+        role_id: digest.role_id || null,
+        role_title: role?.title || digest.role_id || null,
+        recipient_summary: maskEmail(digest.recipient_email) || digest.recipient_email_domain || 'Configured recipient',
+        recipient_domain: digest.recipient_email_domain || null,
+        digest_type: digest.digest_type || null,
+        delivery_date: digest.delivery_date || null,
+        timezone: digest.timezone || null,
+        send_time_local: digest.send_time_local || null,
+        status: digest.status || null,
+        pending_count: digest.action_count || 0,
+        sent_at: digest.sent_at || null,
+        failed_at: digest.failed_at || null,
+        last_error: digest.last_error ? 'Error recorded' : null,
+        created_at: digest.created_at || null,
+        updated_at: digest.updated_at || null,
+      }
+    })
+
+    return res.json({
+      ok: true,
+      overview,
+      rules: safeRules,
+      actions: safeActions,
+      digests: safeDigests,
+      request_id
+    })
+  } catch (e) {
+    console.error('[admin/automation/overview] unexpected', { request_id, error: e?.message || e })
+    return sendAdminError(res, 500, {
+      error: 'admin_automation_overview_failed',
+      code: 'ADMIN_AUTOMATION_OVERVIEW_FAILED',
+      detail: e?.message || null,
+      request_id
+    })
+  }
+})
+
 // List all clients
 adminRouter.get('/clients', requireAuth, requireAdmin, async (_req, res) => {
   const { data, error } = await supabaseAdmin
     .from('clients')
-    .select('id,name,email,client_admin_name,created_at,plan_tier,billing_status,manual_active_override,access_override_mode,candidate_assistance_contact,stripe_customer_id,stripe_subscription_id,subscription_status,current_term_end,cancel_at_term_end,billing_interval,contract_start_at,contract_end_at,auto_renew,parent_client_id,entity_label')
+    .select('id,name,email,client_admin_name,created_at,plan_tier,billing_status,manual_active_override,access_override_mode,candidate_assistance_contact,stripe_customer_id,stripe_subscription_id,subscription_status,current_term_end,cancel_at_term_end,billing_interval,contract_start_at,contract_end_at,auto_renew,parent_client_id,entity_label,archived_at,archived_reason,archived_by_user_id')
     .order('created_at', { ascending: false })
   if (error) return res.status(500).json({ error: 'list_clients_failed', detail: error.message })
   const items = data || []
@@ -2342,7 +2686,7 @@ adminRouter.post('/clients/:parentClientId/entities', requireAuth, requireAdmin,
       entity_label: entityLabel,
       candidate_assistance_contact: parent.candidate_assistance_contact || null
     })
-    .select('id,name,email,created_at,parent_client_id,entity_label,candidate_assistance_contact')
+    .select('id,name,email,created_at,parent_client_id,entity_label,candidate_assistance_contact,archived_at,archived_reason,archived_by_user_id')
     .single()
 
   if (error) return res.status(500).json({ error: 'create_client_entity_failed', detail: error.message, hint: error.hint })
@@ -2372,7 +2716,7 @@ adminRouter.patch('/clients/:parentClientId/entities/:entityClientId', requireAu
 
   const { data: entity, error: entityError } = await supabaseAdmin
     .from('clients')
-    .select('id,parent_client_id')
+    .select('id,parent_client_id,archived_at')
     .eq('id', req.params.entityClientId)
     .maybeSingle()
 
@@ -2385,7 +2729,7 @@ adminRouter.patch('/clients/:parentClientId/entities/:entityClientId', requireAu
     .from('clients')
     .update(updates)
     .eq('id', entity.id)
-    .select('id,name,email,created_at,parent_client_id,entity_label,candidate_assistance_contact')
+    .select('id,name,email,created_at,parent_client_id,entity_label,candidate_assistance_contact,archived_at,archived_reason,archived_by_user_id')
     .single()
 
   if (error) return res.status(500).json({ error: 'update_client_entity_failed', detail: error.message, hint: error.hint })
@@ -2395,6 +2739,45 @@ adminRouter.patch('/clients/:parentClientId/entities/:entityClientId', requireAu
     ok: true,
     item: withAdminClientHierarchyMetadata(updated, hierarchyMaps)
   })
+})
+
+adminRouter.patch('/clients/:parentClientId/entities/:entityClientId/archive', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const result = await archiveChildClientEntity({
+      db: supabaseAdmin,
+      parentClientId: req.params?.parentClientId,
+      entityClientId: req.params?.entityClientId,
+      actorUserId: req.user?.id || null,
+      reason: req.body?.reason || null,
+      requestId: request_id
+    })
+
+    if (!result.ok) return res.status(result.status).json(result.body)
+
+    const hierarchyMaps = buildAdminClientHierarchyMaps([result.parent, result.entity])
+    const item = withAdminClientHierarchyMetadata(result.entity, hierarchyMaps)
+    return res.json({
+      ok: true,
+      entity: {
+        id: result.entity?.id || null,
+        name: result.entity?.name || null,
+        archived: true,
+        archived_at: result.entity?.archived_at || null,
+      },
+      item,
+      request_id
+    })
+  } catch (e) {
+    console.error('[admin/clients/entities/archive] unexpected', { request_id, error: e?.message || e })
+    return res.status(500).json({
+      error: 'server_error',
+      code: 'SERVER_ERROR',
+      detail: e?.message || null,
+      hint: null,
+      request_id
+    })
+  }
 })
 
 adminRouter.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (req, res) => {

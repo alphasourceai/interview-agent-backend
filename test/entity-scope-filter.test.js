@@ -11,6 +11,7 @@ const CLIENTS = [
   { id: 'parent-1', name: 'Acme Dental', parent_client_id: null, entity_label: 'office' },
   { id: 'child-1', name: 'Castle Rock Office', parent_client_id: 'parent-1', entity_label: 'office' },
   { id: 'child-2', name: 'Denver Office', parent_client_id: 'parent-1', entity_label: 'office' },
+  { id: 'child-archived', name: 'Archived Office', parent_client_id: 'parent-1', entity_label: 'office', archived_at: '2026-06-18T12:00:00.000Z' },
   { id: 'parent-2', name: 'Other Parent', parent_client_id: null, entity_label: 'location' },
   { id: 'child-3', name: 'Other Child', parent_client_id: 'parent-2', entity_label: 'location' },
 ];
@@ -37,6 +38,11 @@ class FakeQuery {
     return this;
   }
 
+  is(column, value) {
+    this.filters.push({ column, isValue: value });
+    return this;
+  }
+
   order() {
     return this;
   }
@@ -51,6 +57,11 @@ class FakeQuery {
     for (const filter of this.filters) {
       if (filter.allowed) {
         data = data.filter((row) => filter.allowed.has(String(row[filter.column] || '')));
+      } else if (Object.prototype.hasOwnProperty.call(filter, 'isValue')) {
+        data = data.filter((row) => {
+          if (filter.isValue === null) return row[filter.column] === null || row[filter.column] === undefined;
+          return row[filter.column] === filter.isValue;
+        });
       } else {
         data = data.filter((row) => String(row[filter.column] || '') === filter.value);
       }
@@ -100,6 +111,34 @@ test('entity filter parent returns direct parent only from a child selection', a
   assert.equal(result.ok, true);
   assert.deepEqual(result.clientIds, ['parent-1']);
   assert.equal(result.entitiesById['parent-1'].name, 'Acme Dental');
+});
+
+test('entity filter all omits archived child entities from active hierarchy options', async () => {
+  const result = await resolveEntityFilter({
+    db: makeDb(),
+    req: makeReq(['parent-1', 'child-1', 'child-2', 'child-archived']),
+    clientId: 'parent-1',
+    entityFilter: 'all',
+    requestId: 'req-archived-all',
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.clientIds, ['parent-1', 'child-1', 'child-2']);
+  assert.equal(result.entitiesById['child-archived'], undefined);
+});
+
+test('entity filter rejects a specific archived child entity as inactive scope', async () => {
+  const result = await resolveEntityFilter({
+    db: makeDb(),
+    req: makeReq(['parent-1', 'child-1', 'child-2', 'child-archived']),
+    clientId: 'parent-1',
+    entityFilter: 'child-archived',
+    requestId: 'req-archived-specific',
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 403);
+  assert.equal(result.body.code, 'ENTITY_SCOPE_MISMATCH');
 });
 
 test('entity filter all returns parent and child ids in the selected hierarchy', async () => {
