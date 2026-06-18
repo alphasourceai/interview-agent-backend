@@ -9,6 +9,7 @@ const {
   normalizeEmailEvent,
 } = require('../src/lib/adminMetricsService');
 const { buildOpenAIHealth } = require('../src/lib/platformHealth/openaiHealth');
+const { buildRenderHealth } = require('../src/lib/platformHealth/renderHealth');
 
 const PLATFORM_HEALTH_FILES = [
   'index.js',
@@ -165,6 +166,35 @@ function openAIHealthContext(overrides = {}) {
       OPENAI_USAGE_ENABLED: 'true',
       ...(overrides.env || {}),
     },
+  };
+}
+
+function renderHealthContext(overrides = {}) {
+  return {
+    now: new Date('2026-06-18T12:00:00.000Z'),
+    env: {},
+    liveChecksEnabled: true,
+    cacheEnabled: false,
+    ...overrides,
+    env: {
+      ...(overrides.env || {}),
+    },
+  };
+}
+
+function renderStatusSummary(overrides = {}) {
+  return {
+    page: {
+      updated_at: '2026-06-18T11:45:00.000Z',
+    },
+    status: {
+      indicator: 'none',
+      description: 'All Systems Operational',
+    },
+    components: [],
+    incidents: [],
+    scheduled_maintenances: [],
+    ...overrides,
   };
 }
 
@@ -819,6 +849,200 @@ test('admin metrics OpenAI cost marks invalid response shape as failed without r
   assert.equal(service.diagnostics.openai_cost_exception_kind, null);
   assert.equal(service.diagnostics.openai_cost_exception_message_safe, null);
   assert.doesNotMatch(JSON.stringify(payload), /sk-admin-secret|invalid raw cost payload detail/i);
+});
+
+test('admin metrics Render status summary operational combines API and status page', async () => {
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url: String(url), authorization: String(options.headers?.Authorization || '') });
+    if (String(url).includes('status.render.com/api/v2/summary.json')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(renderStatusSummary()),
+      };
+    }
+    if (String(url).includes('/services/srv-backend/deploys')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify([{ status: 'live', finishedAt: '2026-06-18T11:00:00.000Z' }]),
+      };
+    }
+    if (String(url).includes('/services/srv-backend')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ name: 'QA Backend', type: 'web_service' }),
+      };
+    }
+    throw new Error('unexpected_url');
+  };
+
+  const service = await buildRenderHealth(renderHealthContext({
+    env: {
+      RENDER_API_KEY: 'render-secret',
+      RENDER_SERVICE_ID: 'srv-backend',
+    },
+    fetchImpl,
+  }));
+
+  assert.equal(service.live_api_connected, true);
+  assert.equal(service.source_label, 'Live Render API and Render status page');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Render platform status').value, 'All Systems Operational');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Active Render incidents').value, 'None');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Scheduled maintenance').value, 'None');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Affected components').value, 'None reported');
+  assert.equal(service.diagnostics.render_api_connected, true);
+  assert.equal(service.diagnostics.render_status_page_connected, true);
+  assert.equal(service.diagnostics.render_status_indicator, 'none');
+  assert.equal(service.diagnostics.render_active_incident_count, 0);
+  assert.equal(service.diagnostics.render_scheduled_maintenance_count, 0);
+  assert.equal(service.diagnostics.render_status_error_kind, null);
+  assert.ok(calls.some((call) => call.url.includes('/services/srv-backend')));
+  assert.ok(calls.some((call) => call.url.includes('status.render.com/api/v2/summary.json')));
+  assert.equal(calls.find((call) => call.url.includes('status.render.com'))?.authorization, '');
+  assert.doesNotMatch(JSON.stringify(service), /render-secret/i);
+});
+
+test('admin metrics Render status summary reports active incident safely', async () => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes('status.render.com/api/v2/summary.json')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(renderStatusSummary({
+          status: { indicator: 'major', description: 'Partial System Outage' },
+          components: [{ name: 'Builds and Deploys', status: 'degraded_performance' }],
+          incidents: [{
+            name: 'raw incident title',
+            status: 'investigating',
+            components: [{ name: 'Web Services', status: 'major_outage' }],
+          }],
+        })),
+      };
+    }
+    throw new Error('unexpected_url');
+  };
+
+  const service = await buildRenderHealth(renderHealthContext({ fetchImpl }));
+
+  assert.equal(service.source_label, 'Render status page');
+  assert.equal(service.status, 'problem');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Render platform status').value, 'Partial System Outage');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Active Render incidents').value, '1 active incident');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Affected components').value, 'Builds and Deploys, Web Services');
+  assert.equal(service.diagnostics.render_api_connected, false);
+  assert.equal(service.diagnostics.render_status_page_connected, true);
+  assert.equal(service.diagnostics.render_status_indicator, 'major');
+  assert.equal(service.diagnostics.render_active_incident_count, 1);
+  assert.equal(service.diagnostics.render_status_error_kind, null);
+});
+
+test('admin metrics Render status summary reports scheduled maintenance safely', async () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    if (String(url) === 'https://status.example.test/render-summary.json') {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(renderStatusSummary({
+          scheduled_maintenances: [{
+            name: 'raw maintenance title',
+            status: 'in_progress',
+            components: [{ name: 'PostgreSQL', status: 'under_maintenance' }],
+          }],
+        })),
+      };
+    }
+    throw new Error('unexpected_url');
+  };
+
+  const service = await buildRenderHealth(renderHealthContext({
+    env: {
+      RENDER_STATUS_SUMMARY_URL: 'https://status.example.test/render-summary.json',
+    },
+    fetchImpl,
+  }));
+
+  assert.deepEqual(calls, ['https://status.example.test/render-summary.json']);
+  assert.equal(service.source_label, 'Render status page');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Scheduled maintenance').value, '1 scheduled maintenance');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Affected components').value, 'PostgreSQL');
+  assert.equal(service.diagnostics.render_status_page_connected, true);
+  assert.equal(service.diagnostics.render_scheduled_maintenance_count, 1);
+  assert.equal(service.diagnostics.render_status_error_kind, null);
+});
+
+test('admin metrics Render status endpoint failure does not crash service health', async () => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes('status.render.com/api/v2/summary.json')) {
+      return {
+        ok: false,
+        status: 503,
+        text: async () => JSON.stringify({ raw_error: 'do not expose' }),
+      };
+    }
+    if (String(url).includes('/services/srv-backend/deploys')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify([{ status: 'live', finishedAt: '2026-06-18T11:00:00.000Z' }]),
+      };
+    }
+    if (String(url).includes('/services/srv-backend')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ name: 'QA Backend', type: 'web_service' }),
+      };
+    }
+    throw new Error('unexpected_url');
+  };
+
+  const service = await buildRenderHealth(renderHealthContext({
+    env: {
+      RENDER_API_KEY: 'render-secret',
+      RENDER_SERVICE_ID: 'srv-backend',
+    },
+    fetchImpl,
+  }));
+
+  assert.equal(service.live_api_connected, true);
+  assert.equal(service.source_label, 'Live Render API');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Render platform status').value, 'Not available');
+  assert.equal(service.problem_summary.find((row) => row.label === 'Render status page check').value, 'Check failed');
+  assert.equal(service.diagnostics.render_api_connected, true);
+  assert.equal(service.diagnostics.render_status_page_connected, false);
+  assert.equal(service.diagnostics.render_status_error_kind, 'http_error');
+  assert.doesNotMatch(JSON.stringify(service), /render-secret|do not expose/i);
+});
+
+test('admin metrics Render service API missing still uses public status page', async () => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes('status.render.com/api/v2/summary.json')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(renderStatusSummary()),
+      };
+    }
+    throw new Error('unexpected_url');
+  };
+
+  const service = await buildRenderHealth(renderHealthContext({ fetchImpl }));
+
+  assert.equal(service.configured, false);
+  assert.equal(service.live_api_connected, true);
+  assert.equal(service.connection_label, 'Connected');
+  assert.equal(service.source_label, 'Render status page');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Render platform status').value, 'All Systems Operational');
+  assert.equal(service.diagnostics.render_api_connected, false);
+  assert.equal(service.diagnostics.render_status_page_connected, true);
+  assert.equal(service.diagnostics.render_status_indicator, 'none');
+  assert.equal(service.readiness_items.find((row) => row.label === 'Credentials').status, 'Missing');
+  assert.equal(service.readiness_items.find((row) => row.label === 'Render status page').status, 'Connected');
 });
 
 test('admin metrics AWS/S3 diagnostics align with recording storage env names', async () => {
