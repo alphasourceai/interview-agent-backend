@@ -1,6 +1,7 @@
 'use strict';
 
 const {
+  DEFAULT_TIMEOUT_MS,
   cachedLiveCall,
   costSummary,
   envConfigured,
@@ -50,6 +51,11 @@ function baseOpenAIDiagnostics(env) {
     openai_cost_response_kind: 'not_called',
     openai_cost_bucket_count: null,
     openai_cost_total_seen: false,
+    openai_cost_request_attempted: false,
+    openai_cost_request_url_valid: false,
+    openai_cost_query_param_keys: [],
+    openai_cost_exception_kind: null,
+    openai_cost_exception_message_safe: null,
     openai_key_source: openAIKeySource(env),
     openai_project_scope: envConfigured(env, ['OPENAI_PROJECT_ID']) ? 'present' : 'absent',
     openai_org_scope: envConfigured(env, ['OPENAI_ORG_ID', 'OPENAI_ORGANIZATION_ID']) ? 'present' : 'absent',
@@ -61,8 +67,30 @@ function openAIErrorKind(error) {
   if (status === 401 || status === 403) return 'permission';
   if (status === 404) return 'not_found';
   if (status === 400 || status === 422) return 'bad_request';
-  if (status === 408 || status === 409 || status === 429 || status >= 500 || error?.code === 'live_api_timeout') return 'unavailable';
+  if (status === 408 || status === 409 || status === 429 || status >= 500 || error?.code === 'live_api_timeout' || error?.name === 'TypeError') return 'unavailable';
   return status ? 'unknown' : 'unknown';
+}
+
+function openAIExceptionKind(error) {
+  const message = String(error?.message || '');
+  if (error?.name === 'AbortError' || error?.code === 'live_api_timeout') return 'abort';
+  if (error?.code === 'ERR_INVALID_URL' || /invalid url/i.test(message)) return 'url';
+  if (error?.code === 'openai_cost_parse_error') return 'parse';
+  if (error?.name === 'TypeError') return 'fetch';
+  return 'unknown';
+}
+
+function safeOpenAIExceptionMessage(error) {
+  return safeErrorMessage(error, 'OpenAI cost request failed.')
+    .replace(/https?:\/\/[^\s"')]+/gi, '[redacted-url]')
+    .replace(/[?&][A-Za-z0-9_./~%+-]+=[A-Za-z0-9_./~%+-]+/g, '')
+    .slice(0, 160);
+}
+
+function getFetchImpl(context) {
+  if (typeof context?.fetchImpl === 'function') return context.fetchImpl;
+  if (typeof fetch === 'function') return fetch;
+  return require('node-fetch');
 }
 
 function sumOpenAIUsage(data) {
@@ -146,6 +174,62 @@ function parseOpenAICost(data) {
   };
 }
 
+function buildOpenAICostsUrl({ context, env, start, end }) {
+  const base = context?.openAICostOrganizationBaseUrl || 'https://api.openai.com/v1/organization';
+  const costsUrl = new URL(`${base}/costs`);
+  costsUrl.searchParams.set('start_time', String(start));
+  costsUrl.searchParams.set('end_time', String(end));
+  costsUrl.searchParams.set('bucket_width', '1d');
+  costsUrl.searchParams.set('limit', '180');
+  const projectId = envValue(env, ['OPENAI_PROJECT_ID']);
+  if (projectId) costsUrl.searchParams.append('project_ids', projectId);
+  return costsUrl;
+}
+
+async function fetchOpenAICostResponse(context, url, options = {}) {
+  const fetchImpl = getFetchImpl(context);
+  const timeoutMs = Number(options.timeoutMs || context?.timeoutMs || DEFAULT_TIMEOUT_MS);
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = controller
+    ? setTimeout(() => controller.abort(), timeoutMs)
+    : null;
+  try {
+    const response = await fetchImpl(url, {
+      method: options.method || 'GET',
+      headers: options.headers || {},
+      body: options.body,
+      signal: controller?.signal,
+    });
+    const text = typeof response.text === 'function' ? await response.text() : '';
+    let data = null;
+    let parseError = null;
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch (error) {
+        parseError = error;
+        parseError.code = 'openai_cost_parse_error';
+      }
+    }
+    return {
+      ok: response.ok === true,
+      status: Number(response.status || 0) || null,
+      data,
+      parseError,
+    };
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      const timeoutError = new Error('Timed out while checking OpenAI costs.');
+      timeoutError.code = 'live_api_timeout';
+      timeoutError.name = 'AbortError';
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function fetchOpenAIUsage(context) {
   const { env, dateRange } = context;
   const diagnostics = baseOpenAIDiagnostics(env);
@@ -159,14 +243,6 @@ async function fetchOpenAIUsage(context) {
   usageUrl.searchParams.set('bucket_width', '1d');
   usageUrl.searchParams.set('group_by', 'model');
   usageUrl.searchParams.set('limit', '31');
-
-  const costsUrl = new URL(`${base}/costs`);
-  costsUrl.searchParams.set('start_time', String(start));
-  costsUrl.searchParams.set('end_time', String(end));
-  costsUrl.searchParams.set('bucket_width', '1d');
-  costsUrl.searchParams.set('limit', '180');
-  const projectId = envValue(env, ['OPENAI_PROJECT_ID']);
-  if (projectId) costsUrl.searchParams.append('project_ids', projectId);
 
   let usageData = null;
   try {
@@ -192,19 +268,69 @@ async function fetchOpenAIUsage(context) {
   }
 
   let costData = null;
-  let costFetched = false;
+  let costResponse = null;
+  let costsUrl = null;
   try {
-    diagnostics.openai_cost_call_status = 'skipped_before_request';
-    costData = await fetchJson(context, costsUrl.toString(), { headers });
-    costFetched = true;
+    costsUrl = buildOpenAICostsUrl({ context, env, start, end });
+    diagnostics.openai_cost_request_url_valid = true;
+    diagnostics.openai_cost_query_param_keys = Array.from(new Set(costsUrl.searchParams.keys()));
   } catch (error) {
     diagnostics.openai_cost_status = 'failed';
     diagnostics.openai_cost_call_status = 'called_failed';
-    diagnostics.openai_cost_http_status = Number(error?.status || 0) || null;
+    diagnostics.openai_cost_response_kind = 'request_exception';
+    diagnostics.openai_cost_error_kind = 'unknown';
+    diagnostics.openai_cost_exception_kind = openAIExceptionKind(error);
+    diagnostics.openai_cost_exception_message_safe = safeOpenAIExceptionMessage(error);
+    return {
+      usage: sumOpenAIUsage(usageData),
+      cost: null,
+      diagnostics,
+    };
+  }
+
+  try {
+    diagnostics.openai_cost_call_status = 'skipped_before_request';
+    diagnostics.openai_cost_request_attempted = true;
+    costResponse = await fetchOpenAICostResponse(context, costsUrl.toString(), { headers });
+    diagnostics.openai_cost_http_status = costResponse.status;
+    costData = costResponse.data;
+  } catch (error) {
+    diagnostics.openai_cost_status = 'failed';
+    diagnostics.openai_cost_call_status = 'called_failed';
+    diagnostics.openai_cost_response_kind = 'request_exception';
     diagnostics.openai_cost_error_kind = openAIErrorKind(error);
+    diagnostics.openai_cost_exception_kind = openAIExceptionKind(error);
+    diagnostics.openai_cost_exception_message_safe = safeOpenAIExceptionMessage(error);
     costData = null;
   }
-  const costResult = costFetched ? parseOpenAICost(costData) : null;
+
+  if (costResponse && !costResponse.ok) {
+    diagnostics.openai_cost_status = 'failed';
+    diagnostics.openai_cost_call_status = 'called_failed';
+    diagnostics.openai_cost_response_kind = 'http_error';
+    diagnostics.openai_cost_error_kind = openAIErrorKind({ status: costResponse.status });
+    return {
+      usage: sumOpenAIUsage(usageData),
+      cost: null,
+      diagnostics,
+    };
+  }
+
+  if (costResponse?.parseError) {
+    diagnostics.openai_cost_status = 'failed';
+    diagnostics.openai_cost_call_status = 'called_failed';
+    diagnostics.openai_cost_response_kind = 'invalid_shape';
+    diagnostics.openai_cost_error_kind = 'unknown';
+    diagnostics.openai_cost_exception_kind = 'parse';
+    diagnostics.openai_cost_exception_message_safe = safeOpenAIExceptionMessage(costResponse.parseError);
+    return {
+      usage: sumOpenAIUsage(usageData),
+      cost: null,
+      diagnostics,
+    };
+  }
+
+  const costResult = costResponse ? parseOpenAICost(costData) : null;
   if (costResult) {
     diagnostics.openai_cost_response_kind = costResult.responseKind;
     diagnostics.openai_cost_bucket_count = costResult.bucketCount;
@@ -212,12 +338,10 @@ async function fetchOpenAIUsage(context) {
     if (costResult.valid) {
       diagnostics.openai_cost_status = 'connected';
       diagnostics.openai_cost_call_status = 'called_connected';
-      diagnostics.openai_cost_http_status = null;
       diagnostics.openai_cost_error_kind = null;
     } else {
       diagnostics.openai_cost_status = 'failed';
       diagnostics.openai_cost_call_status = 'called_failed';
-      diagnostics.openai_cost_http_status = null;
       diagnostics.openai_cost_error_kind = 'unknown';
     }
   }

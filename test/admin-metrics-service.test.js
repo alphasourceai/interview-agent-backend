@@ -8,6 +8,7 @@ const {
   buildAdminMetricsPayload,
   normalizeEmailEvent,
 } = require('../src/lib/adminMetricsService');
+const { buildOpenAIHealth } = require('../src/lib/platformHealth/openaiHealth');
 
 const PLATFORM_HEALTH_FILES = [
   'index.js',
@@ -134,6 +135,37 @@ function makeDb(tables = emptyTables()) {
 
 function serviceByKey(payload, key) {
   return (payload.services || []).find((service) => service.key === key) || null;
+}
+
+function openAIHealthContext(overrides = {}) {
+  const now = new Date('2026-06-18T12:00:00.000Z');
+  return {
+    now,
+    env: {
+      OPENAI_ADMIN_KEY: 'sk-admin-secret',
+      OPENAI_USAGE_ENABLED: 'true',
+    },
+    dateRange: {
+      from: new Date('2026-06-11T12:00:00.000Z'),
+      to: now,
+      date_from: '2026-06-11T12:00:00.000Z',
+      date_to: '2026-06-18T12:00:00.000Z',
+    },
+    signals: {
+      missingReports: 0,
+      reports: [],
+      completedInterviews: [],
+      lastReportAt: null,
+    },
+    liveChecksEnabled: true,
+    cacheEnabled: false,
+    ...overrides,
+    env: {
+      OPENAI_ADMIN_KEY: 'sk-admin-secret',
+      OPENAI_USAGE_ENABLED: 'true',
+      ...(overrides.env || {}),
+    },
+  };
 }
 
 test('GET /admin/metrics route is registered behind admin auth', () => {
@@ -338,6 +370,7 @@ test('admin metrics uses live vendor APIs when configured and still returns safe
     if (String(url).includes('/organization/costs')) {
       return {
         ok: true,
+        status: 200,
         text: async () => JSON.stringify({
           data: [{ results: [{ amount: { value: 1.23, currency: 'usd' } }] }],
         }),
@@ -385,12 +418,17 @@ test('admin metrics uses live vendor APIs when configured and still returns safe
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_usage_status, 'connected');
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_status, 'connected');
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_call_status, 'called_connected');
-  assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_http_status, null);
+  assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_http_status, 200);
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_error_kind, null);
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_endpoint_version, 'organization_costs');
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_response_kind, 'buckets');
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_bucket_count, 1);
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_total_seen, true);
+  assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_request_attempted, true);
+  assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_request_url_valid, true);
+  assert.deepEqual(serviceByKey(payload, 'openai').diagnostics.openai_cost_query_param_keys, ['start_time', 'end_time', 'bucket_width', 'limit']);
+  assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_exception_kind, null);
+  assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_exception_message_safe, null);
   assert.equal(serviceByKey(payload, 'sendgrid').live_api_connected, true);
   assert.equal(serviceByKey(payload, 'sendgrid').usage.find((row) => row.label === 'Delivered').value, 4);
   assert.doesNotMatch(JSON.stringify(payload), /sk-test-secret|sendgrid-secret/i);
@@ -437,6 +475,8 @@ test('admin metrics OpenAI cost skips when OPENAI_COSTS_ENABLED is false', async
   assert.equal(service.diagnostics.openai_cost_response_kind, 'not_called');
   assert.equal(service.diagnostics.openai_cost_bucket_count, null);
   assert.equal(service.diagnostics.openai_cost_total_seen, false);
+  assert.equal(service.diagnostics.openai_cost_request_attempted, false);
+  assert.equal(service.diagnostics.openai_cost_request_url_valid, false);
   assert.doesNotMatch(JSON.stringify(payload), /sk-admin-secret/i);
 });
 
@@ -478,6 +518,8 @@ test('admin metrics OpenAI cost skips without OPENAI_ADMIN_KEY', async () => {
   assert.equal(service.diagnostics.openai_cost_status, 'not_called');
   assert.equal(service.diagnostics.openai_cost_call_status, 'skipped_missing_admin_key');
   assert.equal(service.diagnostics.openai_cost_response_kind, 'not_called');
+  assert.equal(service.diagnostics.openai_cost_request_attempted, false);
+  assert.equal(service.diagnostics.openai_cost_request_url_valid, false);
   assert.doesNotMatch(JSON.stringify(payload), /sk-standard-secret/i);
 });
 
@@ -523,12 +565,17 @@ test('admin metrics OpenAI cost treats empty buckets as connected zero cost', as
   assert.equal(service.diagnostics.openai_usage_status, 'connected');
   assert.equal(service.diagnostics.openai_cost_status, 'connected');
   assert.equal(service.diagnostics.openai_cost_call_status, 'called_connected');
-  assert.equal(service.diagnostics.openai_cost_http_status, null);
+  assert.equal(service.diagnostics.openai_cost_http_status, 200);
   assert.equal(service.diagnostics.openai_cost_error_kind, null);
   assert.equal(service.diagnostics.openai_cost_endpoint_version, 'organization_costs');
   assert.equal(service.diagnostics.openai_cost_response_kind, 'empty_buckets');
   assert.equal(service.diagnostics.openai_cost_bucket_count, 0);
   assert.equal(service.diagnostics.openai_cost_total_seen, false);
+  assert.equal(service.diagnostics.openai_cost_request_attempted, true);
+  assert.equal(service.diagnostics.openai_cost_request_url_valid, true);
+  assert.deepEqual(service.diagnostics.openai_cost_query_param_keys, ['start_time', 'end_time', 'bucket_width', 'limit']);
+  assert.equal(service.diagnostics.openai_cost_exception_kind, null);
+  assert.equal(service.diagnostics.openai_cost_exception_message_safe, null);
   assert.doesNotMatch(JSON.stringify(payload), /sk-admin-secret/i);
 });
 
@@ -595,15 +642,126 @@ test('admin metrics OpenAI diagnostics use admin key and classify cost permissio
     openai_cost_http_status: 403,
     openai_cost_error_kind: 'permission',
     openai_cost_endpoint_version: 'organization_costs',
-    openai_cost_response_kind: 'not_called',
+    openai_cost_response_kind: 'http_error',
     openai_cost_bucket_count: null,
     openai_cost_total_seen: false,
+    openai_cost_request_attempted: true,
+    openai_cost_request_url_valid: true,
+    openai_cost_query_param_keys: ['start_time', 'end_time', 'bucket_width', 'limit', 'project_ids'],
+    openai_cost_exception_kind: null,
+    openai_cost_exception_message_safe: null,
     openai_key_source: 'admin_key',
     openai_project_scope: 'present',
     openai_org_scope: 'present',
   });
   assert.equal(serviceByKey(payload, 'openai').cost_summary.display, 'Not available');
   assert.doesNotMatch(JSON.stringify(payload), /sk-admin-secret|sk-standard-secret|forbidden raw detail/i);
+});
+
+test('admin metrics OpenAI cost captures fetch TypeError as request exception', async () => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes('/organization/usage/completions')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          data: [{ results: [{ num_model_requests: 1, input_tokens: 10, output_tokens: 5, model: 'gpt-test' }] }],
+        }),
+      };
+    }
+    if (String(url).includes('/organization/costs')) {
+      throw new TypeError('fetch failed for https://api.openai.com/v1/organization/costs?api_key=sk-admin-secret');
+    }
+    throw new Error('unexpected_url');
+  };
+
+  const service = await buildOpenAIHealth(openAIHealthContext({ fetchImpl }));
+  const diagnostics = service.diagnostics;
+  assert.equal(diagnostics.openai_usage_status, 'connected');
+  assert.equal(diagnostics.openai_cost_status, 'failed');
+  assert.equal(diagnostics.openai_cost_call_status, 'called_failed');
+  assert.equal(diagnostics.openai_cost_http_status, null);
+  assert.equal(diagnostics.openai_cost_error_kind, 'unavailable');
+  assert.equal(diagnostics.openai_cost_response_kind, 'request_exception');
+  assert.equal(diagnostics.openai_cost_request_attempted, true);
+  assert.equal(diagnostics.openai_cost_request_url_valid, true);
+  assert.deepEqual(diagnostics.openai_cost_query_param_keys, ['start_time', 'end_time', 'bucket_width', 'limit']);
+  assert.equal(diagnostics.openai_cost_exception_kind, 'fetch');
+  assert.match(diagnostics.openai_cost_exception_message_safe, /fetch failed/i);
+  assert.doesNotMatch(JSON.stringify(service), /sk-admin-secret|api\.openai\.com\/v1\/organization\/costs\?api_key/i);
+});
+
+test('admin metrics OpenAI cost captures AbortController timeout as request exception', async () => {
+  const fetchImpl = async (url, options = {}) => {
+    if (String(url).includes('/organization/usage/completions')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          data: [{ results: [{ num_model_requests: 1, input_tokens: 10, output_tokens: 5, model: 'gpt-test' }] }],
+        }),
+      };
+    }
+    if (String(url).includes('/organization/costs')) {
+      return new Promise((resolve, reject) => {
+        const rejectAbort = () => {
+          const error = new Error('raw abort detail for https://api.openai.com/v1/organization/costs');
+          error.name = 'AbortError';
+          reject(error);
+        };
+        if (options.signal?.aborted) rejectAbort();
+        else options.signal?.addEventListener('abort', rejectAbort, { once: true });
+      });
+    }
+    throw new Error('unexpected_url');
+  };
+
+  const service = await buildOpenAIHealth(openAIHealthContext({ fetchImpl, timeoutMs: 1 }));
+  const diagnostics = service.diagnostics;
+  assert.equal(diagnostics.openai_usage_status, 'connected');
+  assert.equal(diagnostics.openai_cost_status, 'failed');
+  assert.equal(diagnostics.openai_cost_call_status, 'called_failed');
+  assert.equal(diagnostics.openai_cost_http_status, null);
+  assert.equal(diagnostics.openai_cost_error_kind, 'unavailable');
+  assert.equal(diagnostics.openai_cost_response_kind, 'request_exception');
+  assert.equal(diagnostics.openai_cost_request_attempted, true);
+  assert.equal(diagnostics.openai_cost_request_url_valid, true);
+  assert.equal(diagnostics.openai_cost_exception_kind, 'abort');
+  assert.match(diagnostics.openai_cost_exception_message_safe, /timed out/i);
+  assert.doesNotMatch(JSON.stringify(service), /sk-admin-secret|api\.openai\.com\/v1\/organization\/costs/i);
+});
+
+test('admin metrics OpenAI cost captures invalid URL construction safely', async () => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes('/organization/usage/completions')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          data: [{ results: [{ num_model_requests: 1, input_tokens: 10, output_tokens: 5, model: 'gpt-test' }] }],
+        }),
+      };
+    }
+    throw new Error('cost_should_not_be_called');
+  };
+
+  const service = await buildOpenAIHealth(openAIHealthContext({
+    fetchImpl,
+    openAICostOrganizationBaseUrl: 'https://[invalid-openai-url',
+  }));
+  const diagnostics = service.diagnostics;
+  assert.equal(diagnostics.openai_usage_status, 'connected');
+  assert.equal(diagnostics.openai_cost_status, 'failed');
+  assert.equal(diagnostics.openai_cost_call_status, 'called_failed');
+  assert.equal(diagnostics.openai_cost_http_status, null);
+  assert.equal(diagnostics.openai_cost_error_kind, 'unknown');
+  assert.equal(diagnostics.openai_cost_response_kind, 'request_exception');
+  assert.equal(diagnostics.openai_cost_request_attempted, false);
+  assert.equal(diagnostics.openai_cost_request_url_valid, false);
+  assert.deepEqual(diagnostics.openai_cost_query_param_keys, []);
+  assert.equal(diagnostics.openai_cost_exception_kind, 'url');
+  assert.match(diagnostics.openai_cost_exception_message_safe, /invalid url/i);
+  assert.doesNotMatch(JSON.stringify(service), /sk-admin-secret|invalid-openai-url/i);
 });
 
 test('admin metrics OpenAI cost marks invalid response shape as failed without raw payload', async () => {
@@ -649,12 +807,17 @@ test('admin metrics OpenAI cost marks invalid response shape as failed without r
   assert.equal(service.diagnostics.openai_usage_status, 'connected');
   assert.equal(service.diagnostics.openai_cost_status, 'failed');
   assert.equal(service.diagnostics.openai_cost_call_status, 'called_failed');
-  assert.equal(service.diagnostics.openai_cost_http_status, null);
+  assert.equal(service.diagnostics.openai_cost_http_status, 200);
   assert.equal(service.diagnostics.openai_cost_error_kind, 'unknown');
   assert.equal(service.diagnostics.openai_cost_endpoint_version, 'organization_costs');
   assert.equal(service.diagnostics.openai_cost_response_kind, 'invalid_shape');
   assert.equal(service.diagnostics.openai_cost_bucket_count, null);
   assert.equal(service.diagnostics.openai_cost_total_seen, false);
+  assert.equal(service.diagnostics.openai_cost_request_attempted, true);
+  assert.equal(service.diagnostics.openai_cost_request_url_valid, true);
+  assert.deepEqual(service.diagnostics.openai_cost_query_param_keys, ['start_time', 'end_time', 'bucket_width', 'limit']);
+  assert.equal(service.diagnostics.openai_cost_exception_kind, null);
+  assert.equal(service.diagnostics.openai_cost_exception_message_safe, null);
   assert.doesNotMatch(JSON.stringify(payload), /sk-admin-secret|invalid raw cost payload detail/i);
 });
 
