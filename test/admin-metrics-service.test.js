@@ -9,6 +9,7 @@ const {
   normalizeEmailEvent,
 } = require('../src/lib/adminMetricsService');
 const { buildOpenAIHealth } = require('../src/lib/platformHealth/openaiHealth');
+const { buildTavusHealth } = require('../src/lib/platformHealth/tavusHealth');
 const { buildRenderHealth } = require('../src/lib/platformHealth/renderHealth');
 
 const PLATFORM_HEALTH_FILES = [
@@ -195,6 +196,56 @@ function renderStatusSummary(overrides = {}) {
     incidents: [],
     scheduled_maintenances: [],
     ...overrides,
+  };
+}
+
+function tavusHealthContext(overrides = {}) {
+  const now = new Date('2026-06-18T12:00:00.000Z');
+  const rows = {
+    interviews: [],
+    ...(overrides.rows || {}),
+  };
+  const signals = {
+    interviews: rows.interviews,
+    recordingReady: 0,
+    transcriptReady: [],
+    perceptionEvents: [],
+    estimatedMinutes: null,
+    recordingPending: 0,
+    recordingProblems: 0,
+    recordingDeleted: 0,
+    perceptionMissing: 0,
+    lastTavusWebhookAt: null,
+    ...(overrides.signals || {}),
+  };
+  return {
+    now,
+    env: {
+      TAVUS_API_KEY: 'tavus-secret',
+      TAVUS_WEBHOOK_SECRET: 'webhook-secret',
+      ...(overrides.env || {}),
+    },
+    dateRange: {
+      from: new Date('2026-06-11T12:00:00.000Z'),
+      to: now,
+      date_from: '2026-06-11T12:00:00.000Z',
+      date_to: '2026-06-18T12:00:00.000Z',
+    },
+    rows,
+    signals,
+    liveChecksEnabled: true,
+    cacheEnabled: false,
+    fetchImpl: overrides.fetchImpl || (async (url) => {
+      if (String(url).includes('/conversations')) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ data: [] }),
+        };
+      }
+      throw new Error('unexpected_url');
+    }),
+    ...Object.fromEntries(Object.entries(overrides).filter(([key]) => !['env', 'rows', 'signals', 'fetchImpl'].includes(key))),
   };
 }
 
@@ -462,6 +513,157 @@ test('admin metrics uses live vendor APIs when configured and still returns safe
   assert.equal(serviceByKey(payload, 'sendgrid').live_api_connected, true);
   assert.equal(serviceByKey(payload, 'sendgrid').usage.find((row) => row.label === 'Delivered').value, 4);
   assert.doesNotMatch(JSON.stringify(payload), /sk-test-secret|sendgrid-secret/i);
+});
+
+test('admin metrics Tavus connected with no recent webhook events stays healthy', async () => {
+  const service = await buildTavusHealth(tavusHealthContext({
+    signals: {
+      estimatedMinutes: 61.8,
+    },
+  }));
+
+  assert.equal(service.status, 'healthy');
+  assert.equal(service.live_api_connected, true);
+  assert.equal(service.health_summary, 'Tavus API is reachable. No recent Tavus connectivity or webhook processing issues were found.');
+  assert.equal(service.readiness_items.find((row) => row.label === 'Webhook receiver').status, 'No recent events');
+  assert.equal(service.diagnostics.tavus_api_connected, true);
+  assert.equal(service.diagnostics.tavus_webhook_recent_event_present, false);
+  assert.equal(service.diagnostics.tavus_warning_reason_count, 0);
+  assert.equal(service.cost_summary.display, '$0.00');
+  assert.equal(service.cost_summary.source_label, 'Estimated from Tavus invoice rate card');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Estimated blended allocation').value, '$59.00');
+  assert.doesNotMatch(JSON.stringify(service), /tavus-secret|webhook-secret/i);
+});
+
+test('admin metrics Tavus zero perception events does not create warning by itself', async () => {
+  const rows = {
+    interviews: [{
+      id: 'interview-ready',
+      video_url: 'https://example.invalid/video',
+      recording_status: 'ready',
+      recording_ready_at: '2026-06-18T11:00:00.000Z',
+      recording_metadata: { duration_seconds: 600 },
+      updated_at: '2026-06-18T11:00:00.000Z',
+    }],
+  };
+  const service = await buildTavusHealth(tavusHealthContext({
+    rows,
+    signals: {
+      interviews: rows.interviews,
+      recordingReady: 1,
+      perceptionEvents: [],
+      perceptionMissing: 1,
+      estimatedMinutes: 10,
+    },
+  }));
+
+  assert.equal(service.status, 'healthy');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Perception events').value, 0);
+  assert.equal(service.problem_summary.find((row) => row.label === 'Perception missing proxy').value, 1);
+  assert.equal(service.diagnostics.tavus_warning_reason_count, 0);
+  assert.equal(service.cost_summary.display, '$0.00');
+});
+
+test('admin metrics Tavus API unreachable creates problem', async () => {
+  const service = await buildTavusHealth(tavusHealthContext({
+    fetchImpl: async (url) => {
+      if (String(url).includes('/conversations')) {
+        return {
+          ok: false,
+          status: 503,
+          text: async () => JSON.stringify({ raw_error: 'do not expose tavus failure' }),
+        };
+      }
+      throw new Error('unexpected_url');
+    },
+  }));
+
+  assert.equal(service.status, 'problem');
+  assert.equal(service.live_api_connected, false);
+  assert.equal(service.health_summary, 'Tavus API or webhook connectivity failed.');
+  assert.equal(service.diagnostics.tavus_api_connected, false);
+  assert.doesNotMatch(JSON.stringify(service), /tavus-secret|webhook-secret|do not expose/i);
+});
+
+test('admin metrics Tavus recent delayed recording creates warning', async () => {
+  const rows = {
+    interviews: [{
+      id: 'interview-pending',
+      video_url: 'https://example.invalid/video',
+      recording_status: 'pending',
+      updated_at: '2026-06-18T10:00:00.000Z',
+      created_at: '2026-06-18T10:00:00.000Z',
+    }],
+  };
+  const service = await buildTavusHealth(tavusHealthContext({
+    rows,
+    signals: {
+      interviews: rows.interviews,
+      recordingPending: 1,
+      estimatedMinutes: 5,
+    },
+  }));
+
+  assert.equal(service.status, 'warning');
+  assert.equal(service.health_summary, 'Tavus API is reachable, but recent recording or webhook processing issues need review.');
+  assert.equal(service.problem_summary.find((row) => row.label === 'Actionable recording delays').value, 1);
+  assert.equal(service.diagnostics.tavus_warning_reason_count, 1);
+});
+
+test('admin metrics Tavus persistent recording problem creates problem', async () => {
+  const rows = {
+    interviews: [{
+      id: 'interview-failed',
+      video_url: 'https://example.invalid/video',
+      recording_status: 'failed',
+      recording_delete_error: 'safe synthetic failure',
+      updated_at: '2026-06-18T11:00:00.000Z',
+    }],
+  };
+  const service = await buildTavusHealth(tavusHealthContext({
+    rows,
+    signals: {
+      interviews: rows.interviews,
+      recordingProblems: 1,
+      estimatedMinutes: 5,
+    },
+  }));
+
+  assert.equal(service.status, 'problem');
+  assert.equal(service.problem_summary.find((row) => row.label === 'Persistent recording problems').value, 1);
+});
+
+test('admin metrics Tavus estimated minutes below included tier produces zero variable cost', async () => {
+  const service = await buildTavusHealth(tavusHealthContext({
+    signals: {
+      estimatedMinutes: 60,
+    },
+  }));
+
+  assert.equal(service.cost_summary.display, '$0.00');
+  assert.equal(service.cost_summary.value, 0);
+  assert.equal(service.cost_summary.help, 'Variable usage estimate based on invoice rates. This is an internal estimate, not a Tavus invoice.');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Conversation overage minutes').value, 0);
+  assert.equal(service.usage_summary.find((row) => row.label === 'Estimated variable usage cost').value, '$0.00');
+  assert.equal(service.diagnostics.tavus_cost_source, 'invoice_rate_card');
+  assert.equal(service.diagnostics.tavus_estimated_minutes_source, 'recording_metadata');
+  assert.equal(service.diagnostics.tavus_variable_cost_calculated, true);
+  assert.ok(service.notes.some((note) => note.includes('internal estimates')));
+});
+
+test('admin metrics Tavus estimated minutes above included tier calculates variable cost', async () => {
+  const service = await buildTavusHealth(tavusHealthContext({
+    signals: {
+      estimatedMinutes: 125,
+    },
+  }));
+
+  assert.equal(service.cost_summary.display, '$9.25');
+  assert.equal(service.cost_summary.value, 9.25);
+  assert.equal(service.cost_summary.source_label, 'Estimated from Tavus invoice rate card');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Conversation overage minutes').value, 25);
+  assert.equal(service.usage_summary.find((row) => row.label === 'Estimated variable usage cost').value, '$9.25');
+  assert.equal(service.diagnostics.tavus_variable_cost_calculated, true);
 });
 
 test('admin metrics OpenAI cost skips when OPENAI_COSTS_ENABLED is false', async () => {
