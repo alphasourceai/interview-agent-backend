@@ -4,6 +4,7 @@ const {
   cachedLiveCall,
   costSummary,
   envConfigured,
+  envDisabled,
   envValue,
   fetchJson,
   metric,
@@ -32,10 +33,17 @@ function openAIKeySource(env) {
   return 'missing';
 }
 
+function openAICostSkipStatus(env, fallback = 'skipped_before_request') {
+  if (envDisabled(env, 'OPENAI_COSTS_ENABLED') || envDisabled(env, 'OPENAI_USAGE_ENABLED')) return 'skipped_by_env';
+  if (!envConfigured(env, ['OPENAI_ADMIN_KEY'])) return 'skipped_missing_admin_key';
+  return fallback;
+}
+
 function baseOpenAIDiagnostics(env) {
   return {
     openai_usage_status: 'not_called',
     openai_cost_status: 'not_called',
+    openai_cost_call_status: openAICostSkipStatus(env),
     openai_cost_http_status: null,
     openai_cost_error_kind: null,
     openai_cost_endpoint_version: 'organization_costs',
@@ -167,17 +175,31 @@ async function fetchOpenAIUsage(context) {
   } catch (error) {
     diagnostics.openai_usage_status = 'failed';
     diagnostics.openai_cost_status = 'not_called';
+    diagnostics.openai_cost_call_status = openAICostSkipStatus(env);
     error.diagnostics = diagnostics;
     throw error;
+  }
+
+  const costSkipStatus = openAICostSkipStatus(env, null);
+  if (costSkipStatus) {
+    diagnostics.openai_cost_status = 'not_called';
+    diagnostics.openai_cost_call_status = costSkipStatus;
+    return {
+      usage: sumOpenAIUsage(usageData),
+      cost: null,
+      diagnostics,
+    };
   }
 
   let costData = null;
   let costFetched = false;
   try {
+    diagnostics.openai_cost_call_status = 'skipped_before_request';
     costData = await fetchJson(context, costsUrl.toString(), { headers });
     costFetched = true;
   } catch (error) {
     diagnostics.openai_cost_status = 'failed';
+    diagnostics.openai_cost_call_status = 'called_failed';
     diagnostics.openai_cost_http_status = Number(error?.status || 0) || null;
     diagnostics.openai_cost_error_kind = openAIErrorKind(error);
     costData = null;
@@ -189,10 +211,12 @@ async function fetchOpenAIUsage(context) {
     diagnostics.openai_cost_total_seen = costResult.totalSeen;
     if (costResult.valid) {
       diagnostics.openai_cost_status = 'connected';
+      diagnostics.openai_cost_call_status = 'called_connected';
       diagnostics.openai_cost_http_status = null;
       diagnostics.openai_cost_error_kind = null;
     } else {
       diagnostics.openai_cost_status = 'failed';
+      diagnostics.openai_cost_call_status = 'called_failed';
       diagnostics.openai_cost_http_status = null;
       diagnostics.openai_cost_error_kind = 'unknown';
     }
@@ -212,11 +236,17 @@ async function buildOpenAIHealth(context) {
   let liveError = null;
   let diagnostics = baseOpenAIDiagnostics(env);
 
+  if (configured && !canCheckLive) {
+    diagnostics.openai_cost_call_status = context.liveChecksEnabled === false
+      ? 'skipped_by_env'
+      : openAICostSkipStatus(env);
+  }
+
   if (canCheckLive) {
     try {
       live = await cachedLiveCall(
         context,
-        `openai:${context.dateRange.date_from}:${context.dateRange.date_to}:${envConfigured(env, ['OPENAI_ADMIN_KEY'])}:${envConfigured(env, ['OPENAI_PROJECT_ID'])}`,
+        `openai:${context.dateRange.date_from}:${context.dateRange.date_to}:${envConfigured(env, ['OPENAI_ADMIN_KEY'])}:${envConfigured(env, ['OPENAI_PROJECT_ID'])}:${envDisabled(env, 'OPENAI_COSTS_ENABLED')}`,
         () => fetchOpenAIUsage(context)
       );
       diagnostics = live?.diagnostics || diagnostics;

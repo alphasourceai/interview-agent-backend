@@ -359,7 +359,8 @@ test('admin metrics uses live vendor APIs when configured and still returns safe
     query: { date_range: '7d' },
     now: new Date('2026-06-18T12:00:00.000Z'),
     env: {
-      OPENAI_API_KEY: 'sk-test-secret',
+      OPENAI_ADMIN_KEY: 'sk-test-secret',
+      OPENAI_USAGE_ENABLED: 'true',
       SENDGRID_API_KEY: 'sendgrid-secret',
     },
     fetchImpl,
@@ -383,6 +384,7 @@ test('admin metrics uses live vendor APIs when configured and still returns safe
   assert.equal(serviceByKey(payload, 'openai').cost_summary.display, '$1.23');
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_usage_status, 'connected');
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_status, 'connected');
+  assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_call_status, 'called_connected');
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_http_status, null);
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_error_kind, null);
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_endpoint_version, 'organization_costs');
@@ -392,6 +394,91 @@ test('admin metrics uses live vendor APIs when configured and still returns safe
   assert.equal(serviceByKey(payload, 'sendgrid').live_api_connected, true);
   assert.equal(serviceByKey(payload, 'sendgrid').usage.find((row) => row.label === 'Delivered').value, 4);
   assert.doesNotMatch(JSON.stringify(payload), /sk-test-secret|sendgrid-secret/i);
+});
+
+test('admin metrics OpenAI cost skips when OPENAI_COSTS_ENABLED is false', async () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    if (String(url).includes('/organization/usage/completions')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          data: [{ results: [{ num_model_requests: 1, input_tokens: 10, output_tokens: 5, model: 'gpt-test' }] }],
+        }),
+      };
+    }
+    throw new Error('cost_should_not_be_called');
+  };
+
+  const payload = await buildAdminMetricsPayload({
+    db: makeDb(),
+    query: { date_range: '7d' },
+    now: new Date('2026-06-18T12:00:00.000Z'),
+    env: {
+      OPENAI_ADMIN_KEY: 'sk-admin-secret',
+      OPENAI_USAGE_ENABLED: 'true',
+      OPENAI_COSTS_ENABLED: 'false',
+    },
+    fetchImpl,
+    liveChecksEnabled: true,
+    cacheEnabled: false,
+  });
+
+  const service = serviceByKey(payload, 'openai');
+  assert.equal(calls.some((url) => url.includes('/organization/usage/completions')), true);
+  assert.equal(calls.some((url) => url.includes('/organization/costs')), false);
+  assert.equal(service.live_api_connected, true);
+  assert.equal(service.cost_summary.display, 'Not available');
+  assert.equal(service.diagnostics.openai_usage_status, 'connected');
+  assert.equal(service.diagnostics.openai_cost_status, 'not_called');
+  assert.equal(service.diagnostics.openai_cost_call_status, 'skipped_by_env');
+  assert.equal(service.diagnostics.openai_cost_response_kind, 'not_called');
+  assert.equal(service.diagnostics.openai_cost_bucket_count, null);
+  assert.equal(service.diagnostics.openai_cost_total_seen, false);
+  assert.doesNotMatch(JSON.stringify(payload), /sk-admin-secret/i);
+});
+
+test('admin metrics OpenAI cost skips without OPENAI_ADMIN_KEY', async () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    if (String(url).includes('/organization/usage/completions')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          data: [{ results: [{ num_model_requests: 1, input_tokens: 10, output_tokens: 5, model: 'gpt-test' }] }],
+        }),
+      };
+    }
+    throw new Error('cost_should_not_be_called');
+  };
+
+  const payload = await buildAdminMetricsPayload({
+    db: makeDb(),
+    query: { date_range: '7d' },
+    now: new Date('2026-06-18T12:00:00.000Z'),
+    env: {
+      OPENAI_API_KEY: 'sk-standard-secret',
+      OPENAI_USAGE_ENABLED: 'true',
+    },
+    fetchImpl,
+    liveChecksEnabled: true,
+    cacheEnabled: false,
+  });
+
+  const service = serviceByKey(payload, 'openai');
+  assert.equal(calls.some((url) => url.includes('/organization/usage/completions')), true);
+  assert.equal(calls.some((url) => url.includes('/organization/costs')), false);
+  assert.equal(service.live_api_connected, true);
+  assert.equal(service.diagnostics.openai_key_source, 'standard_key');
+  assert.equal(service.diagnostics.openai_usage_status, 'connected');
+  assert.equal(service.diagnostics.openai_cost_status, 'not_called');
+  assert.equal(service.diagnostics.openai_cost_call_status, 'skipped_missing_admin_key');
+  assert.equal(service.diagnostics.openai_cost_response_kind, 'not_called');
+  assert.doesNotMatch(JSON.stringify(payload), /sk-standard-secret/i);
 });
 
 test('admin metrics OpenAI cost treats empty buckets as connected zero cost', async () => {
@@ -421,6 +508,7 @@ test('admin metrics OpenAI cost treats empty buckets as connected zero cost', as
     now: new Date('2026-06-18T12:00:00.000Z'),
     env: {
       OPENAI_ADMIN_KEY: 'sk-admin-secret',
+      OPENAI_USAGE_ENABLED: 'true',
     },
     fetchImpl,
     liveChecksEnabled: true,
@@ -434,6 +522,7 @@ test('admin metrics OpenAI cost treats empty buckets as connected zero cost', as
   assert.equal(service.notes.includes('No cost returned for selected period'), true);
   assert.equal(service.diagnostics.openai_usage_status, 'connected');
   assert.equal(service.diagnostics.openai_cost_status, 'connected');
+  assert.equal(service.diagnostics.openai_cost_call_status, 'called_connected');
   assert.equal(service.diagnostics.openai_cost_http_status, null);
   assert.equal(service.diagnostics.openai_cost_error_kind, null);
   assert.equal(service.diagnostics.openai_cost_endpoint_version, 'organization_costs');
@@ -476,6 +565,7 @@ test('admin metrics OpenAI diagnostics use admin key and classify cost permissio
     env: {
       OPENAI_ADMIN_KEY: 'sk-admin-secret',
       OPENAI_API_KEY: 'sk-standard-secret',
+      OPENAI_USAGE_ENABLED: 'true',
       OPENAI_PROJECT_ID: 'proj-test',
       OPENAI_ORG_ID: 'org-test',
     },
@@ -501,6 +591,7 @@ test('admin metrics OpenAI diagnostics use admin key and classify cost permissio
   assert.deepEqual(diagnostics, {
     openai_usage_status: 'connected',
     openai_cost_status: 'failed',
+    openai_cost_call_status: 'called_failed',
     openai_cost_http_status: 403,
     openai_cost_error_kind: 'permission',
     openai_cost_endpoint_version: 'organization_costs',
@@ -545,6 +636,7 @@ test('admin metrics OpenAI cost marks invalid response shape as failed without r
     now: new Date('2026-06-18T12:00:00.000Z'),
     env: {
       OPENAI_ADMIN_KEY: 'sk-admin-secret',
+      OPENAI_USAGE_ENABLED: 'true',
     },
     fetchImpl,
     liveChecksEnabled: true,
@@ -556,6 +648,7 @@ test('admin metrics OpenAI cost marks invalid response shape as failed without r
   assert.equal(service.cost_summary.display, 'Not available');
   assert.equal(service.diagnostics.openai_usage_status, 'connected');
   assert.equal(service.diagnostics.openai_cost_status, 'failed');
+  assert.equal(service.diagnostics.openai_cost_call_status, 'called_failed');
   assert.equal(service.diagnostics.openai_cost_http_status, null);
   assert.equal(service.diagnostics.openai_cost_error_kind, 'unknown');
   assert.equal(service.diagnostics.openai_cost_endpoint_version, 'organization_costs');
