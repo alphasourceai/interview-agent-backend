@@ -9,6 +9,19 @@ const {
   normalizeEmailEvent,
 } = require('../src/lib/adminMetricsService');
 
+const PLATFORM_HEALTH_FILES = [
+  'index.js',
+  'openaiHealth.js',
+  'tavusHealth.js',
+  'supabaseHealth.js',
+  'sendgridHealth.js',
+  'renderHealth.js',
+  'sentryHealth.js',
+  'awsS3Health.js',
+  'stripeHealth.js',
+  'normalizePlatformHealth.js',
+];
+
 const TABLE_NAMES = [
   'clients',
   'roles',
@@ -129,6 +142,13 @@ test('GET /admin/metrics route is registered behind admin auth', () => {
   assert.match(source, /adminRouter\.get\('\/metrics', requireAuth, requireAdmin/);
 });
 
+test('platform health adapter framework includes all required service files', () => {
+  for (const file of PLATFORM_HEALTH_FILES) {
+    const fullPath = path.resolve(__dirname, '../src/lib/platformHealth', file);
+    assert.equal(fs.existsSync(fullPath), true, `${file} should exist`);
+  }
+});
+
 test('admin metrics returns platform-only service shape with all required services', async () => {
   const payload = await buildAdminMetricsPayload({
     db: makeDb(),
@@ -136,6 +156,7 @@ test('admin metrics returns platform-only service shape with all required servic
     requestId: 'req-empty',
     now: new Date('2026-06-18T12:00:00.000Z'),
     env: {},
+    liveChecksEnabled: false,
   });
 
   assert.equal(payload.ok, true);
@@ -162,6 +183,15 @@ test('admin metrics returns platform-only service shape with all required servic
   assert.equal(payload.email, undefined);
   assert.equal(serviceByKey(payload, 'render').status, 'not_configured');
   assert.equal(serviceByKey(payload, 'sentry').status, 'not_configured');
+  for (const service of payload.services) {
+    assert.equal(typeof service.connection_label, 'string');
+    assert.equal(typeof service.source_label, 'string');
+    assert.equal(typeof service.meaning, 'string');
+    assert.ok(Array.isArray(service.usage_summary));
+    assert.ok(Array.isArray(service.problem_summary));
+    assert.ok(Array.isArray(service.readiness_items));
+    assert.equal(typeof service.live_api_connected, 'boolean');
+  }
 });
 
 test('admin metrics applies platform date range filters and preserves interview completion bug fix', async () => {
@@ -195,6 +225,7 @@ test('admin metrics applies platform date range filters and preserves interview 
     query: { client_id: 'ignored-client', entity_filter: 'ignored-entity', role_id: 'ignored-role', date_range: '30d' },
     now: new Date('2026-06-18T12:00:00.000Z'),
     env: {},
+    liveChecksEnabled: false,
   });
 
   assert.equal(payload.filters.date_range, '30d');
@@ -256,6 +287,7 @@ test('admin metrics response does not expose raw secrets, tokens, raw links, or 
       AUTOMATION_DIGEST_RUNNER_SECRET: 'scheduler-secret',
       SENTRY_ENABLED: '1',
     },
+    liveChecksEnabled: false,
   });
   const serialized = JSON.stringify(payload);
 
@@ -264,6 +296,7 @@ test('admin metrics response does not expose raw secrets, tokens, raw links, or 
   assert.equal(payload.services.find((service) => service.key === 'sendgrid').recent_problem_events, undefined);
   assert.equal(payload.services.find((service) => service.key === 'sendgrid').events, undefined);
   assert.doesNotMatch(serialized, /super-secret|raw-sendgrid-payload|reviewer@example\.com|digest@example\.com|person@example\.com|https:\/\/example\.test|sk-test-secret|tavus-secret|sendgrid-secret|supabase-secret|render-secret|sentry-dsn-secret|sentry-token-secret|aws-access-secret|aws-secret-key-secret|stripe-secret|stripe-webhook-secret|scheduler-secret/i);
+  assert.doesNotMatch(serialized, /api_key|webhook_secret|service_role|private_key|access_key|approval_token|digest_token|token_hash|item_salt|raw_payload|bearer/i);
 });
 
 test('admin metrics marks missing live integrations as not connected without fake usage', async () => {
@@ -272,14 +305,77 @@ test('admin metrics marks missing live integrations as not connected without fak
     query: { date_range: '7d' },
     now: new Date('2026-06-18T12:00:00.000Z'),
     env: {},
+    liveChecksEnabled: false,
   });
 
   assert.equal(payload.filters.date_range, '7d');
-  assert.equal(serviceByKey(payload, 'render').source, 'not_connected');
-  assert.equal(serviceByKey(payload, 'sentry').source, 'not_connected');
+  assert.equal(serviceByKey(payload, 'render').source_label, 'Configuration check');
+  assert.equal(serviceByKey(payload, 'sentry').source_label, 'Not connected yet');
   assert.equal(serviceByKey(payload, 'aws_s3').status, 'not_configured');
   assert.equal(serviceByKey(payload, 'stripe').status, 'not_configured');
   assert.equal(payload.integration_readiness.find((row) => row.service === 'Render').live_usage_connected, false);
+});
+
+test('admin metrics uses live vendor APIs when configured and still returns safe summaries', async () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    if (String(url).includes('/organization/usage/completions')) {
+      return {
+        ok: true,
+        text: async () => JSON.stringify({
+          data: [{
+            results: [{
+              num_model_requests: 3,
+              input_tokens: 100,
+              output_tokens: 50,
+              model: 'gpt-test',
+            }],
+          }],
+        }),
+      };
+    }
+    if (String(url).includes('/organization/costs')) {
+      return {
+        ok: true,
+        text: async () => JSON.stringify({
+          data: [{ results: [{ amount: { value: 1.23, currency: 'usd' } }] }],
+        }),
+      };
+    }
+    if (String(url).includes('sendgrid.com')) {
+      return {
+        ok: true,
+        text: async () => JSON.stringify([
+          { stats: [{ metrics: { requests: 5, delivered: 4, bounces: 1, drops: 0, blocks: 0, deferred: 0, spam_reports: 0 } }] },
+        ]),
+      };
+    }
+    throw new Error('unexpected_url');
+  };
+
+  const payload = await buildAdminMetricsPayload({
+    db: makeDb(),
+    query: { date_range: '7d' },
+    now: new Date('2026-06-18T12:00:00.000Z'),
+    env: {
+      OPENAI_API_KEY: 'sk-test-secret',
+      SENDGRID_API_KEY: 'sendgrid-secret',
+    },
+    fetchImpl,
+    liveChecksEnabled: true,
+    cacheEnabled: false,
+  });
+
+  assert.ok(calls.some((url) => url.includes('/organization/usage/completions')));
+  assert.ok(calls.some((url) => url.includes('sendgrid.com/v3/stats')));
+  assert.equal(serviceByKey(payload, 'openai').live_api_connected, true);
+  assert.equal(serviceByKey(payload, 'openai').source_label, 'Live OpenAI API');
+  assert.equal(serviceByKey(payload, 'openai').usage.find((row) => row.label === 'Requests').value, 3);
+  assert.equal(serviceByKey(payload, 'openai').cost_summary.display, '$1.23');
+  assert.equal(serviceByKey(payload, 'sendgrid').live_api_connected, true);
+  assert.equal(serviceByKey(payload, 'sendgrid').usage.find((row) => row.label === 'Delivered').value, 4);
+  assert.doesNotMatch(JSON.stringify(payload), /sk-test-secret|sendgrid-secret/i);
 });
 
 test('email event taxonomy normalizes delivery, engagement, problem, and unknown events', () => {

@@ -1,6 +1,7 @@
 'use strict';
 
 const { resolveEntityFilter } = require('./entityScopeFilter');
+const { buildPlatformHealthServices } = require('./platformHealth');
 
 const DEFAULT_RANGE_DAYS = 30;
 const MISSING_REPORT_THRESHOLD_MS = 60 * 60 * 1000;
@@ -957,8 +958,8 @@ function statusCard(key, label, serviceOrStatus, detail, source, lastChecked) {
     key,
     label,
     status: service?.status || serviceOrStatus || 'unknown',
-    detail: detail || service?.health_detail || 'No live signal connected.',
-    source: source || service?.source || 'not_connected',
+    detail: detail || service?.health_summary || service?.health_detail || 'No live signal connected.',
+    source: source || service?.source_label || service?.source || 'Not connected yet',
     last_checked: lastChecked || service?.last_checked || null,
   };
 }
@@ -1249,14 +1250,14 @@ function buildPlatformServices({
 function buildPlatformStatusCards({ services, generatedAt }) {
   const serviceByKey = Object.fromEntries(services.map((service) => [service.key, service]));
   return [
-    statusCard('backend_api', 'Backend API', 'healthy', 'Current admin metrics request succeeded.', 'health_check', generatedAt),
-    statusCard('database', 'Database', serviceByKey.supabase, serviceByKey.supabase?.health_detail, 'health_check', generatedAt),
-    statusCard('openai', 'OpenAI', serviceByKey.openai, serviceByKey.openai?.health_detail),
-    statusCard('tavus', 'Tavus', serviceByKey.tavus, serviceByKey.tavus?.health_detail),
-    statusCard('sendgrid', 'SendGrid', serviceByKey.sendgrid, serviceByKey.sendgrid?.health_detail),
-    statusCard('storage', 'Storage', serviceByKey.aws_s3, serviceByKey.aws_s3?.health_detail),
-    statusCard('error_monitoring', 'Error Monitoring', serviceByKey.sentry, serviceByKey.sentry?.health_detail),
-    statusCard('billing_stripe', 'Billing / Stripe', serviceByKey.stripe, serviceByKey.stripe?.health_detail),
+    statusCard('backend_api', 'Backend API', 'healthy', 'Current admin metrics request succeeded.', 'Configuration check', generatedAt),
+    statusCard('database', 'Database', serviceByKey.supabase, serviceByKey.supabase?.health_summary, 'Configuration check', generatedAt),
+    statusCard('openai', 'OpenAI', serviceByKey.openai, serviceByKey.openai?.health_summary),
+    statusCard('tavus', 'Tavus', serviceByKey.tavus, serviceByKey.tavus?.health_summary),
+    statusCard('sendgrid', 'SendGrid', serviceByKey.sendgrid, serviceByKey.sendgrid?.health_summary),
+    statusCard('storage', 'Storage', serviceByKey.aws_s3, serviceByKey.aws_s3?.health_summary),
+    statusCard('error_monitoring', 'Error Monitoring', serviceByKey.sentry, serviceByKey.sentry?.health_summary),
+    statusCard('billing_stripe', 'Billing / Stripe', serviceByKey.stripe, serviceByKey.stripe?.health_summary),
   ];
 }
 
@@ -1268,16 +1269,27 @@ function buildSourceSummary(rowsByName, warnings, scopeNotes) {
   };
 }
 
-async function buildAdminMetricsPayload({ db, req = {}, query = {}, requestId = null, now = new Date(), env = process.env }) {
+async function buildAdminMetricsPayload({
+  db,
+  req = {},
+  query = {},
+  requestId = null,
+  now = new Date(),
+  env = process.env,
+  fetchImpl = null,
+  liveChecksEnabled = undefined,
+  cacheEnabled = true,
+  stripeClientFactory = null,
+} = {}) {
   const warnings = [];
   const dateRange = parseMetricsDateRange(query, now);
   const scopeNotes = [
     'Metrics are platform-wide. Client, entity, and role filters are intentionally ignored on this page.',
     'Interview completion uses interviews.status, candidate completed status, or matching report rows; interviews.completed_at is not present in the current schema.',
-    'DB-backed estimates are operational proxies and are not vendor invoices.',
-    'Vendor live APIs are shown as not connected where safe usage integrations are not configured.',
+    'alphaScreen-record estimates are operational proxies and are not vendor invoices.',
+    'Live vendor API checks are attempted where the current environment has the required configuration.',
     'SendGrid events are platform-wide because email_delivery_events does not store client_id.',
-    'Secrets, tokens, raw links, and raw vendor payloads are never returned.',
+    'Sensitive credential values and raw vendor payloads are never returned.',
   ];
 
   const [
@@ -1302,9 +1314,15 @@ async function buildAdminMetricsPayload({ db, req = {}, query = {}, requestId = 
     readRows({ db, table: 'contract_cancellation_runs', columns: 'id,status,error,started_at,completed_at,created_at', dateField: 'created_at', dateRange, orderBy: 'created_at', optional: true, warnings }),
   ]);
 
-  const { services, readiness } = buildPlatformServices({
+  const { services, readiness } = await buildPlatformHealthServices({
     now,
     env,
+    db,
+    dateRange,
+    fetchImpl,
+    liveChecksEnabled,
+    cacheEnabled,
+    stripeClientFactory,
     clients,
     clientsBilling,
     roles,
