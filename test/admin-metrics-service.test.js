@@ -373,9 +373,74 @@ test('admin metrics uses live vendor APIs when configured and still returns safe
   assert.equal(serviceByKey(payload, 'openai').source_label, 'Live OpenAI API');
   assert.equal(serviceByKey(payload, 'openai').usage.find((row) => row.label === 'Requests').value, 3);
   assert.equal(serviceByKey(payload, 'openai').cost_summary.display, '$1.23');
+  assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_usage_status, 'connected');
+  assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_status, 'connected');
+  assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_http_status, null);
   assert.equal(serviceByKey(payload, 'sendgrid').live_api_connected, true);
   assert.equal(serviceByKey(payload, 'sendgrid').usage.find((row) => row.label === 'Delivered').value, 4);
   assert.doesNotMatch(JSON.stringify(payload), /sk-test-secret|sendgrid-secret/i);
+});
+
+test('admin metrics OpenAI diagnostics use admin key and classify cost permission failures', async () => {
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({
+      url: String(url),
+      authorization: String(options.headers?.Authorization || ''),
+    });
+    if (String(url).includes('/organization/usage/completions')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          data: [{ results: [{ num_model_requests: 1, input_tokens: 10, output_tokens: 5, model: 'gpt-test' }] }],
+        }),
+      };
+    }
+    if (String(url).includes('/organization/costs')) {
+      return {
+        ok: false,
+        status: 403,
+        text: async () => JSON.stringify({ error: { message: 'forbidden raw detail' } }),
+      };
+    }
+    throw new Error('unexpected_url');
+  };
+
+  const payload = await buildAdminMetricsPayload({
+    db: makeDb(),
+    query: { date_range: '7d' },
+    now: new Date('2026-06-18T12:00:00.000Z'),
+    env: {
+      OPENAI_ADMIN_KEY: 'sk-admin-secret',
+      OPENAI_API_KEY: 'sk-standard-secret',
+      OPENAI_PROJECT_ID: 'proj-test',
+      OPENAI_ORG_ID: 'org-test',
+    },
+    fetchImpl,
+    liveChecksEnabled: true,
+    cacheEnabled: false,
+  });
+
+  const usageCall = calls.find((call) => call.url.includes('/organization/usage/completions'));
+  const costCall = calls.find((call) => call.url.includes('/organization/costs'));
+  assert.ok(usageCall);
+  assert.ok(costCall);
+  assert.equal(usageCall.authorization, 'Bearer sk-admin-secret');
+  assert.equal(costCall.authorization, 'Bearer sk-admin-secret');
+
+  const diagnostics = serviceByKey(payload, 'openai').diagnostics;
+  assert.deepEqual(diagnostics, {
+    openai_usage_status: 'connected',
+    openai_cost_status: 'failed',
+    openai_cost_http_status: 403,
+    openai_cost_error_kind: 'permission',
+    openai_key_source: 'admin_key',
+    openai_project_scope: 'present',
+    openai_org_scope: 'present',
+  });
+  assert.equal(serviceByKey(payload, 'openai').cost_summary.display, 'Not available');
+  assert.doesNotMatch(JSON.stringify(payload), /sk-admin-secret|sk-standard-secret|forbidden raw detail/i);
 });
 
 test('email event taxonomy normalizes delivery, engagement, problem, and unknown events', () => {

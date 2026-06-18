@@ -162,7 +162,7 @@ async function cachedLiveCall(context, cacheKey, producer) {
 
 function costSummary({ value = null, currency = 'USD', sourceLabel = 'Not available', help = 'Live cost data is not available for this service.' } = {}) {
   const numeric = Number(value);
-  const hasValue = Number.isFinite(numeric);
+  const hasValue = value !== null && value !== undefined && value !== '' && Number.isFinite(numeric);
   const display = hasValue
     ? new Intl.NumberFormat('en-US', { style: 'currency', currency: currency || 'USD' }).format(numeric)
     : 'Not available';
@@ -407,6 +407,9 @@ function normalizeService(service) {
     cost,
     readiness_items: toArray(service.readiness_items || service.readiness),
     readiness: toArray(service.readiness_items || service.readiness),
+    diagnostics: service.diagnostics && typeof service.diagnostics === 'object' && !Array.isArray(service.diagnostics)
+      ? service.diagnostics
+      : undefined,
     last_checked: service.last_checked || new Date().toISOString(),
     troubleshooting_note: service.troubleshooting_note || null,
     notes: toArray(service.notes),

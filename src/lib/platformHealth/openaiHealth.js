@@ -26,6 +26,33 @@ function openAIHeaders(env) {
   return headers;
 }
 
+function openAIKeySource(env) {
+  if (envConfigured(env, ['OPENAI_ADMIN_KEY'])) return 'admin_key';
+  if (envConfigured(env, ['OPENAI_API_KEY'])) return 'standard_key';
+  return 'missing';
+}
+
+function baseOpenAIDiagnostics(env) {
+  return {
+    openai_usage_status: 'not_called',
+    openai_cost_status: 'not_called',
+    openai_cost_http_status: null,
+    openai_cost_error_kind: null,
+    openai_key_source: openAIKeySource(env),
+    openai_project_scope: envConfigured(env, ['OPENAI_PROJECT_ID']) ? 'present' : 'absent',
+    openai_org_scope: envConfigured(env, ['OPENAI_ORG_ID', 'OPENAI_ORGANIZATION_ID']) ? 'present' : 'absent',
+  };
+}
+
+function openAIErrorKind(error) {
+  const status = Number(error?.status || 0);
+  if (status === 401 || status === 403) return 'permission';
+  if (status === 404) return 'not_found';
+  if (status === 400 || status === 422) return 'bad_request';
+  if (status === 408 || status === 409 || status === 429 || status >= 500 || error?.code === 'live_api_timeout') return 'unavailable';
+  return status ? 'unknown' : 'unknown';
+}
+
 function sumOpenAIUsage(data) {
   const totals = {
     requests: 0,
@@ -62,6 +89,7 @@ function sumOpenAICost(data) {
 
 async function fetchOpenAIUsage(context) {
   const { env, dateRange } = context;
+  const diagnostics = baseOpenAIDiagnostics(env);
   const start = unixSeconds(dateRange.from);
   const end = unixSeconds(dateRange.to);
   const headers = openAIHeaders(env);
@@ -79,16 +107,33 @@ async function fetchOpenAIUsage(context) {
   costsUrl.searchParams.set('bucket_width', '1d');
   costsUrl.searchParams.set('limit', '31');
 
-  const usageData = await fetchJson(context, usageUrl.toString(), { headers });
+  let usageData = null;
+  try {
+    usageData = await fetchJson(context, usageUrl.toString(), { headers });
+    diagnostics.openai_usage_status = 'connected';
+  } catch (error) {
+    diagnostics.openai_usage_status = 'failed';
+    diagnostics.openai_cost_status = 'not_called';
+    error.diagnostics = diagnostics;
+    throw error;
+  }
+
   let costData = null;
   try {
     costData = await fetchJson(context, costsUrl.toString(), { headers });
-  } catch {
+    diagnostics.openai_cost_status = 'connected';
+    diagnostics.openai_cost_http_status = null;
+    diagnostics.openai_cost_error_kind = null;
+  } catch (error) {
+    diagnostics.openai_cost_status = 'failed';
+    diagnostics.openai_cost_http_status = Number(error?.status || 0) || null;
+    diagnostics.openai_cost_error_kind = openAIErrorKind(error);
     costData = null;
   }
   return {
     usage: sumOpenAIUsage(usageData),
     cost: sumOpenAICost(costData),
+    diagnostics,
   };
 }
 
@@ -98,6 +143,7 @@ async function buildOpenAIHealth(context) {
   const canCheckLive = configured && shouldRunLiveCheck(context, 'OPENAI_USAGE_ENABLED');
   let live = null;
   let liveError = null;
+  let diagnostics = baseOpenAIDiagnostics(env);
 
   if (canCheckLive) {
     try {
@@ -106,8 +152,10 @@ async function buildOpenAIHealth(context) {
         `openai:${context.dateRange.date_from}:${context.dateRange.date_to}:${envConfigured(env, ['OPENAI_ADMIN_KEY'])}:${envConfigured(env, ['OPENAI_PROJECT_ID'])}`,
         () => fetchOpenAIUsage(context)
       );
+      diagnostics = live?.diagnostics || diagnostics;
     } catch (error) {
       liveError = error;
+      diagnostics = error?.diagnostics || diagnostics;
     }
   }
 
@@ -150,6 +198,7 @@ async function buildOpenAIHealth(context) {
     cost_summary: live?.cost
       ? costSummary({ value: live.cost.value, currency: live.cost.currency, sourceLabel: 'Live vendor API', help: 'Cost reported by the OpenAI organization costs endpoint.' })
       : costSummary({ help: 'OpenAI live cost data is unavailable unless organization cost access is enabled.' }),
+    diagnostics,
     readiness_items: [
       readiness('Credentials', configured ? 'Configured' : 'Missing', 'Required before alphaScreen can call OpenAI.'),
       readiness('Live usage API', liveConnected ? 'Connected' : 'Not connected', 'Requires OpenAI organization usage access.'),
