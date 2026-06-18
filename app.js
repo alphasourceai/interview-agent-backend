@@ -71,6 +71,7 @@ const { cleanupNoSubstantiveRecordings } = require('./src/lib/recordingCleanup')
 const { createSubscriptionCheckoutSession } = require('./src/lib/subscriptionCheckout')
 const { processClientEntityImport } = require('./src/lib/clientEntityImportService')
 const { archiveChildClientEntity, restoreChildClientEntity } = require('./src/lib/clientEntityArchive')
+const { buildAdminMetricsPayload, safeErrorBody } = require('./src/lib/adminMetricsService')
 const { sendSubscriptionCheckoutEmail, sendMemberRecoveryEmail } = require('./utils/mailer')
 const {
   frontendUrl: FRONTEND_URL,
@@ -2446,6 +2447,29 @@ function countRowsByStatus(rows, field = 'state') {
   }
   return counts
 }
+
+// Read-only internal metrics foundation. This route intentionally returns counts
+// and sanitized operational summaries, not raw tokens, webhook payloads, or links.
+adminRouter.get('/metrics', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const payload = await buildAdminMetricsPayload({
+      db: supabaseAdmin,
+      req,
+      query: req.query || {},
+      requestId: request_id
+    })
+    return res.json(payload)
+  } catch (error) {
+    const body = safeErrorBody(error, request_id)
+    console.error('[admin/metrics] failed', {
+      request_id,
+      code: body.code,
+      detail: body.detail
+    })
+    return sendAdminError(res, error?.status || 500, body)
+  }
+})
 
 async function loadAdminAutomationRule(ruleId) {
   const id = trimNullableString(ruleId)
