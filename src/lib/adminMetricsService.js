@@ -7,6 +7,7 @@ const MISSING_REPORT_THRESHOLD_MS = 60 * 60 * 1000;
 const RECORDING_THRESHOLD_MS = 60 * 60 * 1000;
 const PENDING_APPROVAL_THRESHOLD_MS = 3 * 24 * 60 * 60 * 1000;
 const ATTENTION_LIMIT = 50;
+const PLATFORM_DATE_RANGES = new Set(['today', '7d', '30d', 'mtd', '6m', 'ytd', '1y']);
 
 function trimText(value) {
   return String(value == null ? '' : value).trim();
@@ -55,7 +56,28 @@ function metricsError(code, detail, status = 500, hint = null, requestId = null)
 
 function parseMetricsDateRange(query = {}, now = new Date()) {
   const nowMs = now.getTime();
-  const defaultFrom = new Date(nowMs - (DEFAULT_RANGE_DAYS * 24 * 60 * 60 * 1000));
+  const rawRange = lowerText(query.date_range || query.timeframe || `${DEFAULT_RANGE_DAYS}d`);
+  const dateRange = PLATFORM_DATE_RANGES.has(rawRange) ? rawRange : `${DEFAULT_RANGE_DAYS}d`;
+  let defaultFrom = new Date(nowMs - (DEFAULT_RANGE_DAYS * 24 * 60 * 60 * 1000));
+  const dayStart = new Date(now);
+  dayStart.setUTCHours(0, 0, 0, 0);
+
+  if (dateRange === 'today') {
+    defaultFrom = dayStart;
+  } else if (dateRange === '7d') {
+    defaultFrom = new Date(nowMs - (7 * 24 * 60 * 60 * 1000));
+  } else if (dateRange === 'mtd') {
+    defaultFrom = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  } else if (dateRange === '6m') {
+    defaultFrom = new Date(now);
+    defaultFrom.setUTCMonth(defaultFrom.getUTCMonth() - 6);
+  } else if (dateRange === 'ytd') {
+    defaultFrom = new Date(Date.UTC(now.getUTCFullYear(), 0, 1));
+  } else if (dateRange === '1y') {
+    defaultFrom = new Date(now);
+    defaultFrom.setUTCFullYear(defaultFrom.getUTCFullYear() - 1);
+  }
+
   const from = trimText(query.date_from) ? parseBoundary(query.date_from, false) : defaultFrom;
   const to = trimText(query.date_to) ? parseBoundary(query.date_to, true) : now;
   if (!from || !to || from.getTime() > to.getTime()) {
@@ -68,6 +90,7 @@ function parseMetricsDateRange(query = {}, now = new Date()) {
   return {
     from,
     to,
+    date_range: trimText(query.date_from) || trimText(query.date_to) ? 'custom' : dateRange,
     date_from: from.toISOString(),
     date_to: to.toISOString(),
     date_from_display: isoDateOnly(from),
@@ -874,6 +897,369 @@ function buildHealthSummary({
   ];
 }
 
+function metric(label, value) {
+  return { label, value };
+}
+
+function costUnavailable(note = 'Live vendor cost data is not connected.') {
+  return {
+    estimated: null,
+    currency: 'USD',
+    source: 'not_available',
+    note,
+  };
+}
+
+function latestTimestamp(rows, fields) {
+  let latest = 0;
+  for (const row of rows || []) {
+    for (const field of fields || []) {
+      latest = Math.max(latest, parseDateMs(row?.[field]));
+    }
+  }
+  return latest ? new Date(latest).toISOString() : null;
+}
+
+function problemRate(problem, total) {
+  const safeTotal = Number(total || 0);
+  if (!safeTotal) return 0;
+  return Math.round((Number(problem || 0) / safeTotal) * 1000) / 10;
+}
+
+function serviceStatusCounts(services) {
+  const summary = {
+    healthy_count: 0,
+    warning_count: 0,
+    problem_count: 0,
+    unknown_count: 0,
+  };
+  for (const service of services || []) {
+    const status = lowerText(service?.status);
+    if (status === 'healthy') summary.healthy_count += 1;
+    else if (status === 'warning') summary.warning_count += 1;
+    else if (status === 'problem') summary.problem_count += 1;
+    else summary.unknown_count += 1;
+  }
+  return summary;
+}
+
+function overallServiceStatus(counts) {
+  if (counts.problem_count > 0) return 'problem';
+  if (counts.warning_count > 0) return 'warning';
+  if (counts.healthy_count > 0 && counts.unknown_count === 0) return 'healthy';
+  if (counts.healthy_count > 0) return 'warning';
+  return 'unknown';
+}
+
+function statusCard(key, label, serviceOrStatus, detail, source, lastChecked) {
+  const service = serviceOrStatus && typeof serviceOrStatus === 'object' ? serviceOrStatus : null;
+  return {
+    key,
+    label,
+    status: service?.status || serviceOrStatus || 'unknown',
+    detail: detail || service?.health_detail || 'No live signal connected.',
+    source: source || service?.source || 'not_connected',
+    last_checked: lastChecked || service?.last_checked || null,
+  };
+}
+
+function configuredReadiness(service, liveUsageConnected, eventSource, notes) {
+  return {
+    service: service.name,
+    configured: service.configured,
+    live_usage_connected: liveUsageConnected,
+    event_source: eventSource,
+    notes,
+  };
+}
+
+function buildPlatformServices({
+  now,
+  env,
+  clients,
+  clientsBilling,
+  roles,
+  candidates,
+  interviews,
+  reports,
+  perceptionEvents,
+  emailEvents,
+  cancellationRuns,
+  warnings,
+}) {
+  const lastChecked = now.toISOString();
+  const clientById = Object.fromEntries(candidates.map((candidate) => [candidate.id, candidate]));
+  const reportsByCandidateRole = new Set(reports.map((report) => reportKey(report.candidate_id, report.role_id)));
+  const reportCreatedAtByCandidateRole = buildReportCreatedAtByCandidateRole(reports);
+  const completionContext = { candidateById: clientById, reportsByCandidateRole, reportCreatedAtByCandidateRole };
+  const completedInterviews = interviews.filter((interview) => isCompletedInterview(interview, completionContext));
+  const transcriptReady = interviews.filter(isTranscriptReady);
+  const recordingCounts = interviews.reduce((counts, interview) => {
+    const status = recordingStatus(interview);
+    counts[status] = (counts[status] || 0) + 1;
+    return counts;
+  }, {});
+  const missingReports = completedInterviews.filter((interview) => {
+    const completedMs = parseDateMs(interviewCompletedAt(interview, completionContext));
+    return completedMs && now.getTime() - completedMs > MISSING_REPORT_THRESHOLD_MS &&
+      !reportsByCandidateRole.has(reportKey(interview.candidate_id, interview.role_id));
+  }).length;
+  const perceptionMissing = completedInterviews.filter((interview) => {
+    const completedMs = parseDateMs(interviewCompletedAt(interview, completionContext));
+    const eventIds = new Set(perceptionEvents.map((event) => trimText(event.interview_id)).filter(Boolean));
+    return completedMs && now.getTime() - completedMs > RECORDING_THRESHOLD_MS && !eventIds.has(trimText(interview.id));
+  }).length;
+  const recordingProblems = Number(recordingCounts.problem || 0);
+  const recordingPending = Number(recordingCounts.pending || 0);
+  const recordingReady = Number(recordingCounts.ready || 0);
+  const recordingDeleted = Number(recordingCounts.deleted || 0);
+  const recordingDeleteErrors = interviews.filter((interview) => trimText(interview.recording_delete_error)).length;
+  const estimatedMinutes = estimateRecordingMinutes(interviews);
+  const emailCategoryCounts = emailEvents.reduce((counts, event) => {
+    const category = normalizeEmailEvent(event);
+    counts[category] = (counts[category] || 0) + 1;
+    return counts;
+  }, {});
+  const emailEventTypeCounts = countBy(emailEvents, 'event_type');
+  const emailProblems = Number(emailCategoryCounts.problem || 0);
+  const emailProblemPercent = problemRate(emailProblems, emailEvents.length);
+  const bounced = (emailEventTypeCounts.bounce || 0) + (emailEventTypeCounts.bounced || 0);
+  const droppedBlockedDeferred = (emailEventTypeCounts.dropped || 0) + (emailEventTypeCounts.drop || 0) +
+    (emailEventTypeCounts.blocked || 0) + (emailEventTypeCounts.deferred || 0);
+  const spamReports = (emailEventTypeCounts.spamreport || 0) + (emailEventTypeCounts.spam_report || 0);
+  const failedCancellations = cancellationRuns.filter((row) => {
+    const status = lowerText(row.status);
+    return status.includes('fail') || trimText(row.error);
+  }).length;
+  const activeStripeClients = clientsBilling.filter((client) => ['active', 'trialing'].includes(lowerText(client.subscription_status))).length;
+  const stripeCustomers = clientsBilling.filter((client) => trimText(client.stripe_customer_id)).length;
+  const stripeSubscriptions = clientsBilling.filter((client) => trimText(client.stripe_subscription_id)).length;
+
+  const openaiConfigured = envConfigured(env, ['OPENAI_API_KEY']);
+  const tavusConfigured = envConfigured(env, ['TAVUS_API_KEY']);
+  const supabaseConfigured = envConfigured(env, ['SUPABASE_URL']) && envConfigured(env, ['SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SERVICE_KEY', 'SUPABASE_ANON_KEY']);
+  const sendgridConfigured = envConfigured(env, ['SENDGRID_API_KEY']);
+  const renderLiveConnected = envConfigured(env, ['RENDER_API_KEY']) && envConfigured(env, ['RENDER_SERVICE_ID', 'RENDER_SERVICE_IDS']);
+  const sentryConfigured = envEnabled(env, 'SENTRY_ENABLED') && envConfigured(env, ['SENTRY_DSN']);
+  const sentryLiveConnected = envConfigured(env, ['SENTRY_AUTH_TOKEN', 'SENTRY_ORG', 'SENTRY_PROJECT']);
+  const storageBucketConfigured = envConfigured(env, ['TAVUS_RECORDING_S3_BUCKET_NAME', 'AWS_S3_BUCKET', 'S3_BUCKET']);
+  const storageRegionConfigured = envConfigured(env, ['AWS_REGION', 'TAVUS_RECORDING_S3_BUCKET_REGION']);
+  const storageCredentialConfigured = envConfigured(env, ['AWS_ACCESS_KEY_ID']) && envConfigured(env, ['AWS_SECRET_ACCESS_KEY']);
+  const awsConfigured = storageBucketConfigured && storageRegionConfigured;
+  const stripeConfigured = envConfigured(env, ['STRIPE_SECRET_KEY']);
+  const stripeWebhookConfigured = envConfigured(env, ['STRIPE_WEBHOOK_SECRET']);
+
+  const openaiStatus = missingReports >= 5 ? 'problem' : missingReports > 0 ? 'warning' : openaiConfigured ? 'warning' : 'not_configured';
+  const tavusStatus = recordingProblems >= 5 ? 'problem' : (recordingProblems + perceptionMissing + recordingPending) > 0 ? 'warning' : tavusConfigured ? 'warning' : 'not_configured';
+  const supabaseStatus = warnings.length ? 'warning' : 'healthy';
+  const sendgridStatus = emailProblems >= 5 && emailProblemPercent >= 20 ? 'problem' : emailProblems > 0 ? 'warning' : sendgridConfigured ? 'warning' : 'not_configured';
+  const renderStatus = renderLiveConnected ? 'unknown' : 'not_configured';
+  const sentryStatus = sentryLiveConnected ? 'unknown' : sentryConfigured ? 'unknown' : 'not_configured';
+  const awsStatus = recordingDeleteErrors > 0 ? 'warning' : awsConfigured ? 'unknown' : 'not_configured';
+  const stripeStatus = failedCancellations > 0 ? 'warning' : stripeConfigured ? 'unknown' : 'not_configured';
+
+  const services = [
+    {
+      key: 'openai',
+      name: 'OpenAI',
+      status: openaiStatus,
+      configured: openaiConfigured,
+      source: 'internal_db',
+      usage: [
+        metric('Reports generated', reports.length),
+        metric('Completed interview proxy', completedInterviews.length),
+      ],
+      errors: [
+        metric('Missing reports', missingReports),
+        metric('Failed scoring/report attempts', 'Not tracked'),
+      ],
+      cost: costUnavailable('OpenAI live usage and cost API is not connected.'),
+      health_detail: openaiConfigured
+        ? 'Configured for scoring; using report-generation proxy because live usage is not connected.'
+        : 'OpenAI key is not configured for this environment.',
+      last_checked: lastChecked,
+    },
+    {
+      key: 'tavus',
+      name: 'Tavus',
+      status: tavusStatus,
+      configured: tavusConfigured,
+      source: 'internal_db',
+      usage: [
+        metric('Interview starts', interviews.length),
+        metric('Recording ready', recordingReady),
+        metric('Transcript ready', transcriptReady.length),
+        metric('Perception events', perceptionEvents.length),
+        metric('Estimated minutes', estimatedMinutes === null ? 'Not available' : estimatedMinutes),
+      ],
+      errors: [
+        metric('Pending/problem recordings', recordingPending + recordingProblems),
+        metric('Deleted recordings', recordingDeleted),
+        metric('Perception missing proxy', perceptionMissing),
+      ],
+      cost: costUnavailable('Tavus live usage and cost API is not connected.'),
+      health_detail: tavusConfigured
+        ? 'Configured for video; using recording/transcript/perception database proxies.'
+        : 'Tavus key is not configured for this environment.',
+      last_checked: lastChecked,
+    },
+    {
+      key: 'supabase',
+      name: 'Supabase',
+      status: supabaseStatus,
+      configured: supabaseConfigured,
+      source: 'health_check',
+      usage: [
+        metric('Clients loaded', clients.length),
+        metric('Roles loaded', roles.length),
+        metric('Candidates in range', candidates.length),
+        metric('Reports in range', reports.length),
+      ],
+      errors: [
+        metric('Optional source warnings', warnings.length),
+        metric('Management usage API', 'Not connected'),
+      ],
+      cost: costUnavailable('Supabase management usage API is not connected.'),
+      health_detail: warnings.length ? 'Database responded with optional source warnings.' : 'Database queries completed successfully.',
+      last_checked: lastChecked,
+    },
+    {
+      key: 'sendgrid',
+      name: 'SendGrid',
+      status: sendgridStatus,
+      configured: sendgridConfigured,
+      source: 'internal_db',
+      usage: [
+        metric('Sent/delivered', Number(emailCategoryCounts.sent_delivered || 0)),
+        metric('Engagement', Number(emailCategoryCounts.engagement || 0)),
+        metric('Events in range', emailEvents.length),
+        metric('Last event', latestTimestamp(emailEvents, ['event_at', 'created_at']) || 'Not available'),
+      ],
+      errors: [
+        metric('Bounces', bounced),
+        metric('Drops/blocks/deferred', droppedBlockedDeferred),
+        metric('Spam reports', spamReports),
+        metric('Unknown/problem rate', `${emailProblemPercent}%`),
+      ],
+      cost: costUnavailable('SendGrid account-level usage API is not connected.'),
+      health_detail: sendgridConfigured
+        ? 'Configured for email; using webhook event summaries from the database.'
+        : 'SendGrid key is not configured for this environment.',
+      last_checked: lastChecked,
+    },
+    {
+      key: 'render',
+      name: 'Render',
+      status: renderStatus,
+      configured: renderLiveConnected,
+      source: renderLiveConnected ? 'environment_check' : 'not_connected',
+      usage: [
+        metric('Backend request', 'Succeeded'),
+        metric('Deploy status', 'Not connected'),
+      ],
+      errors: [
+        metric('Live service alerts', 'Not connected'),
+      ],
+      cost: costUnavailable('Render live usage API is not connected.'),
+      health_detail: renderLiveConnected
+        ? 'Render API configuration is present, but no live service status query is implemented here.'
+        : 'Render live API is not connected for this admin page.',
+      last_checked: lastChecked,
+    },
+    {
+      key: 'sentry',
+      name: 'Sentry',
+      status: sentryStatus,
+      configured: sentryConfigured,
+      source: sentryLiveConnected ? 'environment_check' : 'not_connected',
+      usage: [
+        metric('Capture configured', sentryConfigured ? 'Yes' : 'No'),
+        metric('Live issue API', sentryLiveConnected ? 'Configured' : 'Not connected'),
+      ],
+      errors: [
+        metric('Open issues', 'Not connected'),
+        metric('New issues', 'Not connected'),
+      ],
+      cost: costUnavailable('Sentry live usage API is not connected.'),
+      health_detail: sentryConfigured
+        ? 'Configured for capture; live issue counts are not integrated.'
+        : 'Sentry capture is not configured for this environment.',
+      last_checked: lastChecked,
+    },
+    {
+      key: 'aws_s3',
+      name: 'AWS/S3',
+      status: awsStatus,
+      configured: awsConfigured,
+      source: 'internal_db',
+      usage: [
+        metric('Bucket configured', storageBucketConfigured ? 'Yes' : 'No'),
+        metric('Region configured', storageRegionConfigured ? 'Yes' : 'No'),
+        metric('Credentials configured', storageCredentialConfigured ? 'Yes' : 'Unknown/IAM'),
+        metric('Recording ready proxy', recordingReady),
+      ],
+      errors: [
+        metric('Recording pending/problem', recordingPending + recordingProblems),
+        metric('Storage/delete errors', recordingDeleteErrors),
+      ],
+      cost: costUnavailable('S3 object count, size, and cost are not connected.'),
+      health_detail: awsConfigured
+        ? 'Storage configuration is present; usage is estimated from recording metadata in the database.'
+        : 'Recording storage bucket or region is not configured.',
+      last_checked: lastChecked,
+    },
+    {
+      key: 'stripe',
+      name: 'Stripe',
+      status: stripeStatus,
+      configured: stripeConfigured,
+      source: 'internal_db',
+      usage: [
+        metric('Stripe customers', stripeCustomers),
+        metric('Stripe subscriptions', stripeSubscriptions),
+        metric('Active/trial subscriptions', activeStripeClients),
+        metric('Cancellation runs', cancellationRuns.length),
+      ],
+      errors: [
+        metric('Failed cancellation runs', failedCancellations),
+        metric('Webhook secret configured', stripeWebhookConfigured ? 'Yes' : 'No'),
+      ],
+      cost: costUnavailable('Stripe live balance/payment analytics are not connected here.'),
+      health_detail: stripeConfigured
+        ? 'Stripe is configured; using internal billing/cancellation proxies.'
+        : 'Stripe secret key is not configured for this environment.',
+      last_checked: lastChecked,
+    },
+  ];
+
+  const readiness = services.map((service) => {
+    if (service.key === 'openai') return configuredReadiness(service, false, 'internal_db', 'Reports and missing-report proxies are used until live usage is connected.');
+    if (service.key === 'tavus') return configuredReadiness(service, false, perceptionEvents.length ? 'webhook' : 'internal_db', 'Recording/transcript/perception database proxies are used.');
+    if (service.key === 'supabase') return configuredReadiness(service, false, 'internal_db', 'Database query health is checked; management usage API is not connected.');
+    if (service.key === 'sendgrid') return configuredReadiness(service, false, emailEvents.length ? 'webhook' : 'none', 'Event summaries are platform-wide because email events do not store client_id.');
+    if (service.key === 'render') return configuredReadiness(service, renderLiveConnected, 'none', 'Live Render deploy/service status is not queried.');
+    if (service.key === 'sentry') return configuredReadiness(service, sentryLiveConnected, 'none', 'Capture may be configured; live issue counts are not queried.');
+    if (service.key === 'aws_s3') return configuredReadiness(service, false, 'internal_db', 'Storage usage is estimated from recording DB fields only.');
+    return configuredReadiness(service, false, cancellationRuns.length ? 'internal_db' : 'none', 'Live Stripe analytics are not queried; internal billing proxies are used.');
+  });
+
+  return { services, readiness };
+}
+
+function buildPlatformStatusCards({ services, generatedAt }) {
+  const serviceByKey = Object.fromEntries(services.map((service) => [service.key, service]));
+  return [
+    statusCard('backend_api', 'Backend API', 'healthy', 'Current admin metrics request succeeded.', 'health_check', generatedAt),
+    statusCard('database', 'Database', serviceByKey.supabase, serviceByKey.supabase?.health_detail, 'health_check', generatedAt),
+    statusCard('openai', 'OpenAI', serviceByKey.openai, serviceByKey.openai?.health_detail),
+    statusCard('tavus', 'Tavus', serviceByKey.tavus, serviceByKey.tavus?.health_detail),
+    statusCard('sendgrid', 'SendGrid', serviceByKey.sendgrid, serviceByKey.sendgrid?.health_detail),
+    statusCard('storage', 'Storage', serviceByKey.aws_s3, serviceByKey.aws_s3?.health_detail),
+    statusCard('error_monitoring', 'Error Monitoring', serviceByKey.sentry, serviceByKey.sentry?.health_detail),
+    statusCard('billing_stripe', 'Billing / Stripe', serviceByKey.stripe, serviceByKey.stripe?.health_detail),
+  ];
+}
+
 function buildSourceSummary(rowsByName, warnings, scopeNotes) {
   return {
     row_counts: Object.fromEntries(Object.entries(rowsByName).map(([key, rows]) => [key, rows.length])),
@@ -885,231 +1271,91 @@ function buildSourceSummary(rowsByName, warnings, scopeNotes) {
 async function buildAdminMetricsPayload({ db, req = {}, query = {}, requestId = null, now = new Date(), env = process.env }) {
   const warnings = [];
   const dateRange = parseMetricsDateRange(query, now);
-  const scope = await resolveMetricsScope({ db, req, query, requestId });
-  const roleId = trimText(query.role_id) || null;
-  const scopedClientIds = Array.isArray(scope.clientIds) ? scope.clientIds : null;
   const scopeNotes = [
-    ...scope.notes,
+    'Metrics are platform-wide. Client, entity, and role filters are intentionally ignored on this page.',
     'Interview completion uses interviews.status, candidate completed status, or matching report rows; interviews.completed_at is not present in the current schema.',
-    'Email delivery events are date-filtered platform-wide because email_delivery_events does not store client_id in the current schema.',
-    'Approval link metrics count token state and expiry only; token hashes, salts, recipients, and raw links are never selected or returned.',
+    'DB-backed estimates are operational proxies and are not vendor invoices.',
+    'Vendor live APIs are shown as not connected where safe usage integrations are not configured.',
+    'SendGrid events are platform-wide because email_delivery_events does not store client_id.',
+    'Secrets, tokens, raw links, and raw vendor payloads are never returned.',
   ];
-  if (roleId) {
-    scopeNotes.push('role_id filters metrics with direct role_id columns; approval token counts remain client-scoped.');
-  }
 
   const [
     clients,
+    clientsBilling,
     roles,
     candidates,
     interviews,
     reports,
     perceptionEvents,
     emailEvents,
-    automationRules,
-    automationEvaluations,
-    automationActions,
-    digestDeliveries,
-    actionTokens,
-    digestTokens,
-    members,
+    cancellationRuns,
   ] = await Promise.all([
-    readRows({ db, table: 'clients', columns: 'id,name,parent_client_id,entity_label,archived_at', clientIds: scopedClientIds, clientField: 'id', orderBy: 'name', ascending: true, warnings }),
-    readRows({ db, table: 'roles', columns: 'id,title,client_id,status,created_at', clientIds: scopedClientIds, orderBy: 'created_at', roleId, warnings }),
-    readRows({ db, table: 'candidates', columns: 'id,client_id,role_id,name,first_name,last_name,status,interview_status,created_at', clientIds: scopedClientIds, roleId, dateField: 'created_at', dateRange, orderBy: 'created_at', warnings }),
-    readRows({ db, table: 'interviews', columns: 'id,client_id,role_id,candidate_id,created_at,updated_at,status,video_url,transcript_url,transcript,transcript_scores,interview_summary,interview_analysis_v2,perception_scores,recording_status,recording_ready_at,recording_metadata,recording_deleted_at,recording_delete_reason,recording_delete_error', clientIds: scopedClientIds, roleId, dateField: 'created_at', dateRange, orderBy: 'created_at', warnings }),
-    readRows({ db, table: 'reports', columns: 'id,client_id,role_id,candidate_id,created_at', clientIds: scopedClientIds, roleId, dateField: 'created_at', dateRange, orderBy: 'created_at', warnings }),
-    readRows({ db, table: 'interview_perception_events', columns: 'id,client_id,interview_id,event_type,received_at', clientIds: scopedClientIds, dateField: 'received_at', dateRange, orderBy: 'received_at', optional: true, warnings }),
+    readRows({ db, table: 'clients', columns: 'id,name,parent_client_id,entity_label,archived_at', orderBy: 'name', ascending: true, warnings }),
+    readRows({ db, table: 'clients', columns: 'id,billing_status,stripe_customer_id,stripe_subscription_id,subscription_status,created_at', orderBy: 'created_at', optional: true, warnings }),
+    readRows({ db, table: 'roles', columns: 'id,title,client_id,status,created_at', orderBy: 'created_at', warnings }),
+    readRows({ db, table: 'candidates', columns: 'id,client_id,role_id,status,interview_status,created_at', dateField: 'created_at', dateRange, orderBy: 'created_at', warnings }),
+    readRows({ db, table: 'interviews', columns: 'id,client_id,role_id,candidate_id,created_at,updated_at,status,video_url,transcript_url,transcript,transcript_scores,interview_summary,interview_analysis_v2,perception_scores,recording_status,recording_ready_at,recording_metadata,recording_deleted_at,recording_delete_reason,recording_delete_error', dateField: 'created_at', dateRange, orderBy: 'created_at', warnings }),
+    readRows({ db, table: 'reports', columns: 'id,client_id,role_id,candidate_id,created_at', dateField: 'created_at', dateRange, orderBy: 'created_at', warnings }),
+    readRows({ db, table: 'interview_perception_events', columns: 'id,client_id,interview_id,event_type,received_at', dateField: 'received_at', dateRange, orderBy: 'received_at', optional: true, warnings }),
     readRows({ db, table: 'email_delivery_events', columns: 'id,created_at,event_at,event_type,email_category,category,status,is_problem,reason', dateField: 'created_at', dateRange, orderBy: 'created_at', optional: true, warnings }),
-    readRows({ db, table: 'automation_rules', columns: 'id,client_id,role_id,enabled,archived_at,created_at,updated_at', clientIds: scopedClientIds, roleId, orderBy: 'updated_at', optional: true, warnings }),
-    readRows({ db, table: 'automation_evaluations', columns: 'id,client_id,role_id,matched,evaluation_status,created_at', clientIds: scopedClientIds, roleId, dateField: 'created_at', dateRange, orderBy: 'created_at', optional: true, warnings }),
-    readRows({ db, table: 'automation_actions', columns: 'id,client_id,role_id,candidate_id,state,created_at,updated_at,approved_at,rejected_at,sent_at,failed_at', clientIds: scopedClientIds, roleId, dateField: 'created_at', dateRange, orderBy: 'created_at', optional: true, warnings }),
-    readRows({ db, table: 'automation_digest_deliveries', columns: 'id,client_id,role_id,status,delivery_date,action_count,sent_at,failed_at,created_at,updated_at', clientIds: scopedClientIds, roleId, dateField: 'created_at', dateRange, orderBy: 'created_at', optional: true, warnings }),
-    readRows({ db, table: 'automation_action_approval_tokens', columns: 'id,client_id,action_id,state,expires_at,used_at,created_at', clientIds: scopedClientIds, dateField: 'created_at', dateRange, orderBy: 'created_at', optional: true, warnings }),
-    readRows({ db, table: 'automation_digest_approval_tokens', columns: 'id,client_id,delivery_id,state,expires_at,created_at', clientIds: scopedClientIds, dateField: 'created_at', dateRange, orderBy: 'created_at', optional: true, warnings }),
-    readRows({ db, table: 'client_members', columns: 'client_id,user_id,role,created_at', clientIds: scopedClientIds, orderBy: 'created_at', optional: true, warnings }),
+    readRows({ db, table: 'contract_cancellation_runs', columns: 'id,status,error,started_at,completed_at,created_at', dateField: 'created_at', dateRange, orderBy: 'created_at', optional: true, warnings }),
   ]);
 
-  const clientById = Object.fromEntries(clients.map((client) => [client.id, client]));
-  const reportsByCandidateRole = new Set(reports.map((report) => reportKey(report.candidate_id, report.role_id)));
-  const reportCreatedAtByCandidateRole = buildReportCreatedAtByCandidateRole(reports);
-  const candidateById = Object.fromEntries(candidates.map((candidate) => [candidate.id, candidate]));
-  const completionContext = { candidateById, reportsByCandidateRole, reportCreatedAtByCandidateRole };
-  const completedInterviews = interviews.filter((interview) => isCompletedInterview(interview, completionContext));
-  const transcriptReady = interviews.filter(isTranscriptReady);
-  const missingReportAfterComplete = completedInterviews.filter((interview) => {
-    const completedMs = parseDateMs(interviewCompletedAt(interview, completionContext));
-    return completedMs && now.getTime() - completedMs > MISSING_REPORT_THRESHOLD_MS &&
-      !reportsByCandidateRole.has(reportKey(interview.candidate_id, interview.role_id));
-  });
-  const perceptionInterviewIds = new Set(perceptionEvents.map((event) => trimText(event.interview_id)).filter(Boolean));
-  const perceptionMissing = completedInterviews.filter((interview) => {
-    const completedMs = parseDateMs(interviewCompletedAt(interview, completionContext));
-    return completedMs && now.getTime() - completedMs > RECORDING_THRESHOLD_MS && !perceptionInterviewIds.has(trimText(interview.id));
-  });
-  const recordingCounts = interviews.reduce((counts, interview) => {
-    const status = recordingStatus(interview);
-    counts[status] = (counts[status] || 0) + 1;
-    return counts;
-  }, {});
-  const emailCategoryCounts = emailEvents.reduce((counts, event) => {
-    const category = normalizeEmailEvent(event);
-    counts[category] = (counts[category] || 0) + 1;
-    return counts;
-  }, {});
-  const actionStateCounts = countBy(automationActions, 'state');
-  const digestStatusCounts = countBy(digestDeliveries, 'status');
-  const evaluationStatusCounts = countBy(automationEvaluations, 'evaluation_status');
-  const ruleStatusCounts = {
-    enabled: automationRules.filter((rule) => rule.enabled === true && !trimText(rule.archived_at)).length,
-    paused: automationRules.filter((rule) => rule.enabled !== true && !trimText(rule.archived_at)).length,
-    archived: automationRules.filter((rule) => trimText(rule.archived_at)).length,
-  };
-  const actionApprovalTokenCounts = tokenCounts(actionTokens, now);
-  const digestApprovalTokenCounts = tokenCounts(digestTokens, now);
-  const entityOperations = buildEntityOperations({ clients, roles, candidates, members });
-  const attentionItems = buildAttentionItems({
+  const { services, readiness } = buildPlatformServices({
     now,
+    env,
     clients,
+    clientsBilling,
     roles,
     candidates,
     interviews,
     reports,
     perceptionEvents,
-    automationActions,
-    digestDeliveries,
     emailEvents,
-  });
-  const overview = {
-    active_clients: clients.filter(isActiveClient).length,
-    active_roles: roles.filter(isActiveRole).length,
-    candidates_in_range: candidates.length,
-    interviews_started: interviews.length,
-    interviews_completed: completedInterviews.length,
-    reports_generated: reports.length,
-    automation_pending_approvals: actionStateCounts.pending_approval || 0,
-    email_delivery_failures: emailCategoryCounts.problem || 0,
-  };
-  const readiness = {
-    recording_ready: recordingCounts.ready || 0,
-    recording_pending: recordingCounts.pending || 0,
-    recording_problem: recordingCounts.problem || 0,
-    recording_deleted: recordingCounts.deleted || 0,
-    report_generated: reports.length,
-    missing_report_after_complete: missingReportAfterComplete.length,
-    perception_event_received: perceptionEvents.length,
-    perception_missing_after_video_completion: perceptionMissing.length,
-    transcript_ready: transcriptReady.length,
-  };
-  const healthSummary = buildHealthSummary({
-    now,
-    env,
-    overview,
-    readiness,
-    emailCategoryCounts,
-    automationRules,
-    automationActions,
-    digestDeliveries,
+    cancellationRuns,
     warnings,
   });
-  const vendorUsage = buildVendorUsage({
-    now,
-    dateRange,
-    env,
-    overview,
-    readiness,
-    emailCategoryCounts,
-    interviews,
-    reports,
-    candidates,
-    roles,
-    clients,
-    automationRules,
-    automationActions,
-    digestDeliveries,
-    warnings,
-  });
+  const generatedAt = now.toISOString();
+  const summaryCounts = serviceStatusCounts(services);
+  const summary = {
+    overall_status: overallServiceStatus(summaryCounts),
+    ...summaryCounts,
+    last_checked: generatedAt,
+  };
+  const statusCards = buildPlatformStatusCards({ services, generatedAt });
 
   return {
     ok: true,
     request_id: requestId || null,
-    generated_at: now.toISOString(),
+    generated_at: generatedAt,
     filters: {
-      selected_client_id: scope.selected_client_id,
-      entity_filter: scope.entity_filter,
-      scoped_client_ids: scopedClientIds,
-      role_id: roleId,
+      date_range: dateRange.date_range,
       date_from: dateRange.date_from,
       date_to: dateRange.date_to,
       date_from_display: dateRange.date_from_display,
       date_to_display: dateRange.date_to_display,
       default_range_days: DEFAULT_RANGE_DAYS,
     },
-    health_summary: healthSummary,
-    vendor_usage: vendorUsage,
-    overview,
-    interview_funnel: [
-      { key: 'candidate_created', label: 'Candidate created', count: candidates.length },
-      { key: 'interview_started', label: 'Interview started', count: interviews.length },
-      { key: 'interview_completed', label: 'Interview completed', count: completedInterviews.length },
-      { key: 'transcript_ready', label: 'Transcript ready', count: transcriptReady.length },
-      { key: 'report_generated', label: 'Report generated', count: reports.length },
-      { key: 'recording_ready', label: 'Recording ready', count: recordingCounts.ready || 0 },
-      {
-        key: 'recording_no_substance_or_deleted',
-        label: 'No-substance/failed/deleted recordings',
-        count: interviews.filter(hasNoSubstanceOrDeletedRecording).length + (recordingCounts.problem || 0),
+    summary,
+    status_cards: statusCards,
+    services,
+    integration_readiness: readiness,
+    source_notes: scopeNotes,
+    sources: {
+      row_counts: {
+        clients: clients.length,
+        roles: roles.length,
+        candidates: candidates.length,
+        interviews: interviews.length,
+        reports: reports.length,
+        interview_perception_events: perceptionEvents.length,
+        email_delivery_events: emailEvents.length,
+        contract_cancellation_runs: cancellationRuns.length,
       },
-    ],
-    automation: {
-      rule_status_counts: ruleStatusCounts,
-      evaluation_status_counts: evaluationStatusCounts,
-      evaluations_matched: automationEvaluations.filter((row) => row.matched === true).length,
-      action_state_counts: actionStateCounts,
-      digest_status_counts: digestStatusCounts,
-      approval_links: {
-        action: actionApprovalTokenCounts,
-        digest: digestApprovalTokenCounts,
-        active: actionApprovalTokenCounts.active + digestApprovalTokenCounts.active,
-        expired: actionApprovalTokenCounts.expired + digestApprovalTokenCounts.expired,
-      },
-      pending_approvals: actionStateCounts.pending_approval || 0,
-      approved_actions: actionStateCounts.approved || 0,
-      rejected_actions: actionStateCounts.rejected || 0,
-      sent_actions: (actionStateCounts.sent || 0) + (actionStateCounts.delivered || 0),
-      failed_actions: actionStateCounts.failed || 0,
+      warnings,
     },
-    email: {
-      normalized_counts: {
-        sent_delivered: emailCategoryCounts.sent_delivered || 0,
-        engagement: emailCategoryCounts.engagement || 0,
-        problem: emailCategoryCounts.problem || 0,
-        unknown: emailCategoryCounts.unknown || 0,
-      },
-      event_type_counts: countBy(emailEvents, 'event_type'),
-      recent_problem_events: emailEvents
-        .filter((event) => normalizeEmailEvent(event) === 'problem')
-        .slice(0, 20)
-        .map((event) => ({
-          id: event.id || null,
-          event_at: event.event_at || event.created_at || null,
-          event_type: event.event_type || event.status || 'problem',
-          category: event.email_category || event.category || null,
-          detail: sanitizeSummary(event.reason || event.status),
-        })),
-      scope: 'platform_date_range',
-    },
-    readiness,
-    entity_operations: entityOperations,
-    attention: {
-      thresholds: {
-        missing_report_minutes: Math.round(MISSING_REPORT_THRESHOLD_MS / 60000),
-        recording_or_transcript_minutes: Math.round(RECORDING_THRESHOLD_MS / 60000),
-        pending_approval_days: Math.round(PENDING_APPROVAL_THRESHOLD_MS / (24 * 60 * 60 * 1000)),
-      },
-      items: attentionItems,
-    },
-    sources: buildSourceSummary({
+    source_counts: buildSourceSummary({
       clients,
       roles,
       candidates,
@@ -1117,20 +1363,8 @@ async function buildAdminMetricsPayload({ db, req = {}, query = {}, requestId = 
       reports,
       interview_perception_events: perceptionEvents,
       email_delivery_events: emailEvents,
-      automation_rules: automationRules,
-      automation_evaluations: automationEvaluations,
-      automation_actions: automationActions,
-      automation_digest_deliveries: digestDeliveries,
-      automation_action_approval_tokens: actionTokens,
-      automation_digest_approval_tokens: digestTokens,
-      client_members: members,
+      contract_cancellation_runs: cancellationRuns,
     }, warnings, scopeNotes),
-    entities_by_id: Object.fromEntries(Object.entries(clientById).map(([id, client]) => [id, {
-      id,
-      name: client.name || id,
-      parent_client_id: client.parent_client_id || null,
-      archived: Boolean(trimText(client.archived_at)),
-    }])),
   };
 }
 
