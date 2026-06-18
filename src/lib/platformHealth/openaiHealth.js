@@ -38,6 +38,10 @@ function baseOpenAIDiagnostics(env) {
     openai_cost_status: 'not_called',
     openai_cost_http_status: null,
     openai_cost_error_kind: null,
+    openai_cost_endpoint_version: 'organization_costs',
+    openai_cost_response_kind: 'not_called',
+    openai_cost_bucket_count: null,
+    openai_cost_total_seen: false,
     openai_key_source: openAIKeySource(env),
     openai_project_scope: envConfigured(env, ['OPENAI_PROJECT_ID']) ? 'present' : 'absent',
     openai_org_scope: envConfigured(env, ['OPENAI_ORG_ID', 'OPENAI_ORGANIZATION_ID']) ? 'present' : 'absent',
@@ -73,18 +77,65 @@ function sumOpenAIUsage(data) {
   return totals;
 }
 
-function sumOpenAICost(data) {
+function parseOpenAICost(data) {
+  if (!data || typeof data !== 'object' || !Array.isArray(data.data)) {
+    return {
+      valid: false,
+      responseKind: 'invalid_shape',
+      bucketCount: null,
+      totalSeen: false,
+      cost: null,
+    };
+  }
+
   let value = 0;
   let currency = 'USD';
-  for (const bucket of Array.isArray(data?.data) ? data.data : []) {
-    for (const result of Array.isArray(bucket?.results) ? bucket.results : []) {
+  let resultCount = 0;
+  let totalSeen = false;
+  for (const bucket of data.data) {
+    if (!bucket || typeof bucket !== 'object' || !Array.isArray(bucket.results)) {
+      return {
+        valid: false,
+        responseKind: 'invalid_shape',
+        bucketCount: data.data.length,
+        totalSeen,
+        cost: null,
+      };
+    }
+
+    for (const result of bucket.results) {
+      if (!result || typeof result !== 'object') {
+        return {
+          valid: false,
+          responseKind: 'invalid_shape',
+          bucketCount: data.data.length,
+          totalSeen,
+          cost: null,
+        };
+      }
+
+      resultCount += 1;
       const amount = result?.amount || {};
       const amountValue = Number(amount.value);
-      if (Number.isFinite(amountValue)) value += amountValue;
+      if (Number.isFinite(amountValue)) {
+        value += amountValue;
+        totalSeen = true;
+      }
       if (amount.currency) currency = String(amount.currency).toUpperCase();
     }
   }
-  return Number.isFinite(value) && value > 0 ? { value: Math.round(value * 100) / 100, currency } : null;
+
+  return {
+    valid: true,
+    responseKind: resultCount > 0 ? 'buckets' : 'empty_buckets',
+    bucketCount: data.data.length,
+    totalSeen,
+    cost: {
+      value: Math.round(value * 100) / 100,
+      currency,
+      note: totalSeen ? null : 'No cost returned for selected period',
+    },
+  };
 }
 
 async function fetchOpenAIUsage(context) {
@@ -105,7 +156,9 @@ async function fetchOpenAIUsage(context) {
   costsUrl.searchParams.set('start_time', String(start));
   costsUrl.searchParams.set('end_time', String(end));
   costsUrl.searchParams.set('bucket_width', '1d');
-  costsUrl.searchParams.set('limit', '31');
+  costsUrl.searchParams.set('limit', '180');
+  const projectId = envValue(env, ['OPENAI_PROJECT_ID']);
+  if (projectId) costsUrl.searchParams.append('project_ids', projectId);
 
   let usageData = null;
   try {
@@ -119,20 +172,34 @@ async function fetchOpenAIUsage(context) {
   }
 
   let costData = null;
+  let costFetched = false;
   try {
     costData = await fetchJson(context, costsUrl.toString(), { headers });
-    diagnostics.openai_cost_status = 'connected';
-    diagnostics.openai_cost_http_status = null;
-    diagnostics.openai_cost_error_kind = null;
+    costFetched = true;
   } catch (error) {
     diagnostics.openai_cost_status = 'failed';
     diagnostics.openai_cost_http_status = Number(error?.status || 0) || null;
     diagnostics.openai_cost_error_kind = openAIErrorKind(error);
     costData = null;
   }
+  const costResult = costFetched ? parseOpenAICost(costData) : null;
+  if (costResult) {
+    diagnostics.openai_cost_response_kind = costResult.responseKind;
+    diagnostics.openai_cost_bucket_count = costResult.bucketCount;
+    diagnostics.openai_cost_total_seen = costResult.totalSeen;
+    if (costResult.valid) {
+      diagnostics.openai_cost_status = 'connected';
+      diagnostics.openai_cost_http_status = null;
+      diagnostics.openai_cost_error_kind = null;
+    } else {
+      diagnostics.openai_cost_status = 'failed';
+      diagnostics.openai_cost_http_status = null;
+      diagnostics.openai_cost_error_kind = 'unknown';
+    }
+  }
   return {
     usage: sumOpenAIUsage(usageData),
-    cost: sumOpenAICost(costData),
+    cost: costResult?.valid ? costResult.cost : null,
     diagnostics,
   };
 }
@@ -196,7 +263,7 @@ async function buildOpenAIHealth(context) {
       metric('Live API check', liveError ? 'Failed' : liveConnected ? 'Connected' : 'Not connected', 'Whether alphaScreen could read OpenAI organization usage for this date range.'),
     ],
     cost_summary: live?.cost
-      ? costSummary({ value: live.cost.value, currency: live.cost.currency, sourceLabel: 'Live vendor API', help: 'Cost reported by the OpenAI organization costs endpoint.' })
+      ? costSummary({ value: live.cost.value, currency: live.cost.currency, sourceLabel: 'Live vendor API', help: live.cost.note || 'Cost reported by the OpenAI organization costs endpoint.' })
       : costSummary({ help: 'OpenAI live cost data is unavailable unless organization cost access is enabled.' }),
     diagnostics,
     readiness_items: [
@@ -206,7 +273,10 @@ async function buildOpenAIHealth(context) {
     ],
     troubleshooting_note: liveError ? safeErrorMessage(liveError, 'OpenAI live usage check failed.') : null,
     last_checked: now.toISOString(),
-    notes: liveError ? ['OpenAI live usage could not be read; alphaScreen records are still shown.'] : [],
+    notes: [
+      ...(liveError ? ['OpenAI live usage could not be read; alphaScreen records are still shown.'] : []),
+      ...(live?.cost?.note ? [live.cost.note] : []),
+    ],
   };
 }
 

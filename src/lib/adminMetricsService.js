@@ -1043,7 +1043,7 @@ function buildPlatformServices({
   const renderLiveConnected = envConfigured(env, ['RENDER_API_KEY']) && envConfigured(env, ['RENDER_SERVICE_ID', 'RENDER_SERVICE_IDS']);
   const sentryConfigured = envEnabled(env, 'SENTRY_ENABLED') && envConfigured(env, ['SENTRY_DSN']);
   const sentryLiveConnected = envConfigured(env, ['SENTRY_AUTH_TOKEN', 'SENTRY_ORG', 'SENTRY_PROJECT']);
-  const storageBucketConfigured = envConfigured(env, ['TAVUS_RECORDING_S3_BUCKET_NAME', 'AWS_S3_BUCKET', 'S3_BUCKET']);
+  const storageBucketConfigured = envConfigured(env, ['TAVUS_RECORDING_S3_BUCKET_NAME']);
   const storageRegionConfigured = envConfigured(env, ['AWS_REGION', 'TAVUS_RECORDING_S3_BUCKET_REGION']);
   const storageCredentialConfigured = envConfigured(env, ['AWS_ACCESS_KEY_ID']) && envConfigured(env, ['AWS_SECRET_ACCESS_KEY']);
   const awsConfigured = storageBucketConfigured && storageRegionConfigured;
@@ -1280,6 +1280,7 @@ async function buildAdminMetricsPayload({
   liveChecksEnabled = undefined,
   cacheEnabled = true,
   stripeClientFactory = null,
+  awsS3ClientFactory = null,
 } = {}) {
   const warnings = [];
   const dateRange = parseMetricsDateRange(query, now);
@@ -1323,6 +1324,7 @@ async function buildAdminMetricsPayload({
     liveChecksEnabled,
     cacheEnabled,
     stripeClientFactory,
+    awsS3ClientFactory,
     clients,
     clientsBilling,
     roles,

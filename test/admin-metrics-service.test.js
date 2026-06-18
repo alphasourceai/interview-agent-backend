@@ -369,6 +369,14 @@ test('admin metrics uses live vendor APIs when configured and still returns safe
 
   assert.ok(calls.some((url) => url.includes('/organization/usage/completions')));
   assert.ok(calls.some((url) => url.includes('sendgrid.com/v3/stats')));
+  const costCall = new URL(calls.find((url) => url.includes('/organization/costs')));
+  assert.equal(costCall.pathname, '/v1/organization/costs');
+  assert.equal(costCall.searchParams.has('start_time'), true);
+  assert.equal(costCall.searchParams.has('end_time'), true);
+  assert.equal(costCall.searchParams.get('bucket_width'), '1d');
+  assert.equal(costCall.searchParams.get('limit'), '180');
+  assert.equal(costCall.searchParams.has('group_by'), false);
+  assert.equal(costCall.searchParams.has('project_ids'), false);
   assert.equal(serviceByKey(payload, 'openai').live_api_connected, true);
   assert.equal(serviceByKey(payload, 'openai').source_label, 'Live OpenAI API');
   assert.equal(serviceByKey(payload, 'openai').usage.find((row) => row.label === 'Requests').value, 3);
@@ -376,9 +384,63 @@ test('admin metrics uses live vendor APIs when configured and still returns safe
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_usage_status, 'connected');
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_status, 'connected');
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_http_status, null);
+  assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_error_kind, null);
+  assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_endpoint_version, 'organization_costs');
+  assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_response_kind, 'buckets');
+  assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_bucket_count, 1);
+  assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_total_seen, true);
   assert.equal(serviceByKey(payload, 'sendgrid').live_api_connected, true);
   assert.equal(serviceByKey(payload, 'sendgrid').usage.find((row) => row.label === 'Delivered').value, 4);
   assert.doesNotMatch(JSON.stringify(payload), /sk-test-secret|sendgrid-secret/i);
+});
+
+test('admin metrics OpenAI cost treats empty buckets as connected zero cost', async () => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes('/organization/usage/completions')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          data: [{ results: [{ num_model_requests: 1, input_tokens: 10, output_tokens: 5, model: 'gpt-test' }] }],
+        }),
+      };
+    }
+    if (String(url).includes('/organization/costs')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ object: 'page', data: [], has_more: false, next_page: null }),
+      };
+    }
+    throw new Error('unexpected_url');
+  };
+
+  const payload = await buildAdminMetricsPayload({
+    db: makeDb(),
+    query: { date_range: '7d' },
+    now: new Date('2026-06-18T12:00:00.000Z'),
+    env: {
+      OPENAI_ADMIN_KEY: 'sk-admin-secret',
+    },
+    fetchImpl,
+    liveChecksEnabled: true,
+    cacheEnabled: false,
+  });
+
+  const service = serviceByKey(payload, 'openai');
+  assert.equal(service.live_api_connected, true);
+  assert.equal(service.cost_summary.display, '$0.00');
+  assert.equal(service.cost_summary.help, 'No cost returned for selected period');
+  assert.equal(service.notes.includes('No cost returned for selected period'), true);
+  assert.equal(service.diagnostics.openai_usage_status, 'connected');
+  assert.equal(service.diagnostics.openai_cost_status, 'connected');
+  assert.equal(service.diagnostics.openai_cost_http_status, null);
+  assert.equal(service.diagnostics.openai_cost_error_kind, null);
+  assert.equal(service.diagnostics.openai_cost_endpoint_version, 'organization_costs');
+  assert.equal(service.diagnostics.openai_cost_response_kind, 'empty_buckets');
+  assert.equal(service.diagnostics.openai_cost_bucket_count, 0);
+  assert.equal(service.diagnostics.openai_cost_total_seen, false);
+  assert.doesNotMatch(JSON.stringify(payload), /sk-admin-secret/i);
 });
 
 test('admin metrics OpenAI diagnostics use admin key and classify cost permission failures', async () => {
@@ -428,6 +490,12 @@ test('admin metrics OpenAI diagnostics use admin key and classify cost permissio
   assert.ok(costCall);
   assert.equal(usageCall.authorization, 'Bearer sk-admin-secret');
   assert.equal(costCall.authorization, 'Bearer sk-admin-secret');
+  const costUrl = new URL(costCall.url);
+  assert.equal(costUrl.pathname, '/v1/organization/costs');
+  assert.equal(costUrl.searchParams.get('project_ids'), 'proj-test');
+  assert.equal(costUrl.searchParams.get('bucket_width'), '1d');
+  assert.equal(costUrl.searchParams.get('limit'), '180');
+  assert.equal(costUrl.searchParams.has('group_by'), false);
 
   const diagnostics = serviceByKey(payload, 'openai').diagnostics;
   assert.deepEqual(diagnostics, {
@@ -435,12 +503,137 @@ test('admin metrics OpenAI diagnostics use admin key and classify cost permissio
     openai_cost_status: 'failed',
     openai_cost_http_status: 403,
     openai_cost_error_kind: 'permission',
+    openai_cost_endpoint_version: 'organization_costs',
+    openai_cost_response_kind: 'not_called',
+    openai_cost_bucket_count: null,
+    openai_cost_total_seen: false,
     openai_key_source: 'admin_key',
     openai_project_scope: 'present',
     openai_org_scope: 'present',
   });
   assert.equal(serviceByKey(payload, 'openai').cost_summary.display, 'Not available');
   assert.doesNotMatch(JSON.stringify(payload), /sk-admin-secret|sk-standard-secret|forbidden raw detail/i);
+});
+
+test('admin metrics OpenAI cost marks invalid response shape as failed without raw payload', async () => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes('/organization/usage/completions')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          data: [{ results: [{ num_model_requests: 1, input_tokens: 10, output_tokens: 5, model: 'gpt-test' }] }],
+        }),
+      };
+    }
+    if (String(url).includes('/organization/costs')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          object: 'page',
+          data: { raw_detail: 'invalid raw cost payload detail' },
+        }),
+      };
+    }
+    throw new Error('unexpected_url');
+  };
+
+  const payload = await buildAdminMetricsPayload({
+    db: makeDb(),
+    query: { date_range: '7d' },
+    now: new Date('2026-06-18T12:00:00.000Z'),
+    env: {
+      OPENAI_ADMIN_KEY: 'sk-admin-secret',
+    },
+    fetchImpl,
+    liveChecksEnabled: true,
+    cacheEnabled: false,
+  });
+
+  const service = serviceByKey(payload, 'openai');
+  assert.equal(service.live_api_connected, true);
+  assert.equal(service.cost_summary.display, 'Not available');
+  assert.equal(service.diagnostics.openai_usage_status, 'connected');
+  assert.equal(service.diagnostics.openai_cost_status, 'failed');
+  assert.equal(service.diagnostics.openai_cost_http_status, null);
+  assert.equal(service.diagnostics.openai_cost_error_kind, 'unknown');
+  assert.equal(service.diagnostics.openai_cost_endpoint_version, 'organization_costs');
+  assert.equal(service.diagnostics.openai_cost_response_kind, 'invalid_shape');
+  assert.equal(service.diagnostics.openai_cost_bucket_count, null);
+  assert.equal(service.diagnostics.openai_cost_total_seen, false);
+  assert.doesNotMatch(JSON.stringify(payload), /sk-admin-secret|invalid raw cost payload detail/i);
+});
+
+test('admin metrics AWS/S3 diagnostics align with recording storage env names', async () => {
+  const sentCommands = [];
+  const payload = await buildAdminMetricsPayload({
+    db: makeDb(),
+    query: { date_range: '7d' },
+    now: new Date('2026-06-18T12:00:00.000Z'),
+    env: {
+      TAVUS_RECORDING_S3_BUCKET_NAME: 'recordings-secret-bucket',
+      AWS_REGION: 'us-west-2',
+      AWS_ACCESS_KEY_ID: 'aws-access-secret',
+      AWS_SECRET_ACCESS_KEY: 'aws-secret-key-secret',
+      AWS_S3_BUCKET: 'wrong-generic-bucket',
+    },
+    liveChecksEnabled: true,
+    cacheEnabled: false,
+    awsS3ClientFactory: ({ region }) => ({
+      send: async (command) => {
+        sentCommands.push({ region, input: command.input });
+        return {};
+      },
+    }),
+  });
+
+  const service = serviceByKey(payload, 'aws_s3');
+  assert.equal(service.live_api_connected, true);
+  assert.equal(service.diagnostics.aws_key_source, 'explicit_credentials');
+  assert.equal(service.diagnostics.aws_bucket_source, 'TAVUS_RECORDING_S3_BUCKET_NAME');
+  assert.equal(service.diagnostics.aws_region_source, 'AWS_REGION');
+  assert.equal(service.diagnostics.aws_health_check, 'head_bucket');
+  assert.equal(service.diagnostics.aws_health_status, 'connected');
+  assert.equal(service.diagnostics.aws_error_kind, null);
+  assert.equal(service.diagnostics.aws_error_http_status, null);
+  assert.equal(sentCommands[0].region, 'us-west-2');
+  assert.equal(sentCommands[0].input.Bucket, 'recordings-secret-bucket');
+  assert.doesNotMatch(JSON.stringify(payload), /recordings-secret-bucket|wrong-generic-bucket|aws-access-secret|aws-secret-key-secret/i);
+});
+
+test('admin metrics AWS/S3 diagnostics classify HeadBucket AccessDenied safely', async () => {
+  const payload = await buildAdminMetricsPayload({
+    db: makeDb(),
+    query: { date_range: '7d' },
+    now: new Date('2026-06-18T12:00:00.000Z'),
+    env: {
+      TAVUS_RECORDING_S3_BUCKET_NAME: 'recordings-secret-bucket',
+      TAVUS_RECORDING_S3_BUCKET_REGION: 'us-east-1',
+      AWS_ACCESS_KEY_ID: 'aws-access-secret',
+      AWS_SECRET_ACCESS_KEY: 'aws-secret-key-secret',
+    },
+    liveChecksEnabled: true,
+    cacheEnabled: false,
+    awsS3ClientFactory: () => ({
+      send: async () => {
+        const error = new Error('raw aws access denied detail for recordings-secret-bucket');
+        error.name = 'AccessDenied';
+        error.$metadata = { httpStatusCode: 403 };
+        throw error;
+      },
+    }),
+  });
+
+  const service = serviceByKey(payload, 'aws_s3');
+  assert.equal(service.live_api_connected, false);
+  assert.equal(service.diagnostics.aws_bucket_source, 'TAVUS_RECORDING_S3_BUCKET_NAME');
+  assert.equal(service.diagnostics.aws_region_source, 'TAVUS_RECORDING_S3_BUCKET_REGION');
+  assert.equal(service.diagnostics.aws_health_check, 'head_bucket');
+  assert.equal(service.diagnostics.aws_health_status, 'failed');
+  assert.equal(service.diagnostics.aws_error_kind, 'permission');
+  assert.equal(service.diagnostics.aws_error_http_status, 403);
+  assert.doesNotMatch(JSON.stringify(payload), /recordings-secret-bucket|aws-access-secret|aws-secret-key-secret|raw aws access denied detail/i);
 });
 
 test('email event taxonomy normalizes delivery, engagement, problem, and unknown events', () => {
