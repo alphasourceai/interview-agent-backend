@@ -405,6 +405,7 @@ function normalizeService(service) {
     errors: problems,
     cost_summary: cost,
     cost,
+    recent_issues: toArray(service.recent_issues || service.recentIssues),
     readiness_items: toArray(service.readiness_items || service.readiness),
     readiness: toArray(service.readiness_items || service.readiness),
     diagnostics: service.diagnostics && typeof service.diagnostics === 'object' && !Array.isArray(service.diagnostics)

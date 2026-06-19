@@ -35,6 +35,59 @@ function sentryPeriod(dateRange) {
   return `${Math.min(days, 90)}d`;
 }
 
+function parseDateMs(value) {
+  const parsed = new Date(value || '').getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function safeIssueText(value, fallback = 'Not available') {
+  const raw = trimText(value);
+  if (!raw) return fallback;
+  return raw
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [redacted]')
+    .replace(/sk-[A-Za-z0-9._-]+/gi, '[redacted]')
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[redacted-email]')
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[redacted-ip]')
+    .replace(/https?:\/\/[^\s"')]+/gi, '[redacted-url]')
+    .slice(0, 180);
+}
+
+function safeSentryPermalink(value) {
+  const raw = trimText(value);
+  if (!raw) return null;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'https:' || !parsed.hostname.endsWith('sentry.io')) return null;
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function safeDateText(value) {
+  const parsed = new Date(value || '');
+  return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : null;
+}
+
+function safeIssueDetail(issue, project) {
+  return {
+    project: safeIssueText(project, 'Unknown project'),
+    title: safeIssueText(issue?.title || issue?.metadata?.title || issue?.shortId || issue?.id),
+    culprit: safeIssueText(issue?.culprit || issue?.metadata?.function || issue?.metadata?.filename || issue?.type),
+    level: safeIssueText(issue?.level),
+    status: safeIssueText(issue?.status),
+    count: Number.isFinite(Number(issue?.count)) ? Number(issue.count) : null,
+    user_count: Number.isFinite(Number(issue?.userCount)) ? Number(issue.userCount) : null,
+    first_seen: safeDateText(issue?.firstSeen),
+    last_seen: safeDateText(issue?.lastSeen),
+    permalink: safeSentryPermalink(issue?.permalink),
+    platform: safeIssueText(issue?.platform),
+    environment: safeIssueText(issue?.environment || issue?.metadata?.environment),
+  };
+}
+
 async function fetchSentryIssues(context) {
   const org = envValue(context.env, ['SENTRY_ORG']);
   const headers = {
@@ -43,30 +96,51 @@ async function fetchSentryIssues(context) {
   };
   const period = sentryPeriod(context.dateRange);
   const projects = sentryProjects(context.env);
-  const rows = [];
+  const projectRows = [];
+  const recentIssues = [];
+  const fromMs = context.dateRange?.from instanceof Date
+    ? context.dateRange.from.getTime()
+    : parseDateMs(context.dateRange?.date_from);
   for (const project of projects) {
     const url = new URL(`https://sentry.io/api/0/projects/${encodeURIComponent(org)}/${encodeURIComponent(project)}/issues/`);
     url.searchParams.set('query', 'is:unresolved');
     url.searchParams.set('statsPeriod', period);
-    url.searchParams.set('limit', '25');
+    url.searchParams.set('limit', '5');
     const data = await fetchJson(context, url.toString(), { headers });
     const issues = Array.isArray(data) ? data : [];
-    rows.push({
+    projectRows.push({
       project,
       unresolved: issues.length,
-      newIssues: issues.filter((issue) => trimText(issue?.firstSeen)).length,
+      newIssues: issues.filter((issue) => {
+        const firstSeenMs = parseDateMs(issue?.firstSeen);
+        return firstSeenMs && (!fromMs || firstSeenMs >= fromMs);
+      }).length,
       latest: issues[0]?.lastSeen || issues[0]?.firstSeen || null,
     });
+    for (const issue of issues) {
+      recentIssues.push(safeIssueDetail(issue, project));
+    }
   }
-  return rows;
+  recentIssues.sort((left, right) => parseDateMs(right.last_seen || right.first_seen) - parseDateMs(left.last_seen || left.first_seen));
+  return {
+    projects: projectRows,
+    recentIssues: recentIssues.slice(0, 5),
+  };
 }
 
 async function buildSentryHealth(context) {
   const { env, now } = context;
   const captureConfigured = envEnabled(env, 'SENTRY_ENABLED') && envConfigured(env, ['SENTRY_DSN']);
   const apiConfigured = envConfigured(env, ['SENTRY_AUTH_TOKEN', 'SENTRY_ORG']) && sentryProjects(env).length > 0;
-  let live = [];
+  let live = null;
   let liveError = null;
+  const diagnostics = {
+    sentry_capture_configured: captureConfigured,
+    sentry_api_status: apiConfigured ? 'not_called' : 'not_configured',
+    sentry_project_count: sentryProjects(env).length,
+    sentry_projects_checked: 0,
+    sentry_recent_issue_count: 0,
+  };
 
   if (apiConfigured && shouldRunLiveCheck(context, 'SENTRY_METRICS_ENABLED')) {
     try {
@@ -75,14 +149,22 @@ async function buildSentryHealth(context) {
         `sentry:${envValue(env, ['SENTRY_ORG'])}:${sentryProjects(env).join(',')}:${sentryPeriod(context.dateRange)}`,
         () => fetchSentryIssues(context)
       );
+      diagnostics.sentry_api_status = 'connected';
     } catch (error) {
       liveError = error;
+      diagnostics.sentry_api_status = 'failed';
     }
+  } else if (apiConfigured) {
+    diagnostics.sentry_api_status = 'skipped';
   }
 
-  const liveConnected = live.length > 0;
-  const unresolved = live.reduce((sum, row) => sum + Number(row.unresolved || 0), 0);
-  const newIssues = live.reduce((sum, row) => sum + Number(row.newIssues || 0), 0);
+  const projectRows = Array.isArray(live?.projects) ? live.projects : [];
+  const recentIssues = Array.isArray(live?.recentIssues) ? live.recentIssues : [];
+  const liveConnected = projectRows.length > 0;
+  diagnostics.sentry_projects_checked = projectRows.length;
+  diagnostics.sentry_recent_issue_count = recentIssues.length;
+  const unresolved = projectRows.reduce((sum, row) => sum + Number(row.unresolved || 0), 0);
+  const newIssues = projectRows.reduce((sum, row) => sum + Number(row.newIssues || 0), 0);
   const warning = Boolean(liveError || unresolved > 0 || (apiConfigured && !liveConnected) || (captureConfigured && !apiConfigured));
 
   return {
@@ -103,14 +185,17 @@ async function buildSentryHealth(context) {
     usage_summary: [
       metric('Capture configured', captureConfigured ? 'Yes' : 'No', 'Whether the app is configured to send errors to Sentry.'),
       metric('Projects configured', sentryProjects(env).length, 'Sentry project slugs configured for live issue checks.'),
-      metric('Projects checked', live.length, 'Projects successfully read through the Sentry API.'),
+      metric('Projects checked', projectRows.length, 'Projects successfully read through the Sentry API.'),
+      metric('Recent issue details', liveConnected ? recentIssues.length : 'Not available', 'Sanitized unresolved issue details included for troubleshooting handoff when API access is connected.'),
     ],
     problem_summary: [
       metric('Open unresolved issues', liveConnected ? unresolved : 'Not available', 'Unresolved issue count returned by Sentry.'),
       metric('New issues in range', liveConnected ? newIssues : 'Not available', 'Issues returned by Sentry for the selected time window.'),
-      metric('Most recent issue', live.find((row) => row.latest)?.latest || 'Not available', 'Latest issue timestamp returned by Sentry.'),
+      metric('Most recent issue', projectRows.find((row) => row.latest)?.latest || 'Not available', 'Latest issue timestamp returned by Sentry.'),
     ],
     cost_summary: costSummary({ help: 'Sentry cost and event quota usage are not available through the current issue-count check.' }),
+    recent_issues: recentIssues,
+    diagnostics,
     readiness_items: [
       readiness('Capture setup', captureConfigured ? 'Configured' : 'Missing', 'Required before alphaScreen can send errors to Sentry.'),
       readiness('Issue API', liveConnected ? 'Connected' : 'Not connected', 'Requires Sentry organization, project, and API access.'),

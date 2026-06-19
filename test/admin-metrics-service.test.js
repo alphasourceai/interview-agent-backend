@@ -12,6 +12,8 @@ const { buildOpenAIHealth } = require('../src/lib/platformHealth/openaiHealth');
 const { buildTavusHealth } = require('../src/lib/platformHealth/tavusHealth');
 const { buildRenderHealth } = require('../src/lib/platformHealth/renderHealth');
 const { buildSupabaseHealth } = require('../src/lib/platformHealth/supabaseHealth');
+const { buildSendGridHealth } = require('../src/lib/platformHealth/sendgridHealth');
+const { buildSentryHealth } = require('../src/lib/platformHealth/sentryHealth');
 
 const PLATFORM_HEALTH_FILES = [
   'index.js',
@@ -200,6 +202,70 @@ function renderStatusSummary(overrides = {}) {
   };
 }
 
+function sendGridStatusSummary(overrides = {}) {
+  return {
+    page: {
+      updated_at: '2026-06-18T11:50:00.000Z',
+    },
+    status: {
+      indicator: 'none',
+      description: 'All Systems Operational',
+    },
+    components: [],
+    incidents: [],
+    scheduled_maintenances: [],
+    ...overrides,
+  };
+}
+
+function sendGridHealthContext(overrides = {}) {
+  const now = new Date('2026-06-18T12:00:00.000Z');
+  return {
+    now,
+    env: {
+      ...(overrides.env || {}),
+    },
+    dateRange: {
+      from: new Date('2026-06-11T12:00:00.000Z'),
+      to: now,
+      date_from: '2026-06-11T12:00:00.000Z',
+      date_to: '2026-06-18T12:00:00.000Z',
+    },
+    signals: {
+      emailProblems: 0,
+      emailProblemPercent: 0,
+      emailCategoryCounts: {},
+      emailEvents: [],
+      lastEmailEventAt: null,
+      ...(overrides.signals || {}),
+    },
+    liveChecksEnabled: true,
+    cacheEnabled: false,
+    fetchImpl: overrides.fetchImpl,
+    timeoutMs: overrides.timeoutMs,
+  };
+}
+
+function sentryHealthContext(overrides = {}) {
+  const now = new Date('2026-06-18T12:00:00.000Z');
+  return {
+    now,
+    env: {
+      ...(overrides.env || {}),
+    },
+    dateRange: {
+      from: new Date('2026-06-11T12:00:00.000Z'),
+      to: now,
+      date_from: '2026-06-11T12:00:00.000Z',
+      date_to: '2026-06-18T12:00:00.000Z',
+    },
+    liveChecksEnabled: true,
+    cacheEnabled: false,
+    fetchImpl: overrides.fetchImpl,
+    timeoutMs: overrides.timeoutMs,
+  };
+}
+
 function supabaseHealthContext(overrides = {}) {
   const now = new Date('2026-06-18T12:00:00.000Z');
   return {
@@ -377,7 +443,8 @@ test('admin metrics applies platform date range filters and preserves interview 
   assert.equal(serviceByKey(payload, 'openai').usage.find((row) => row.label === 'Reports generated').value, 1);
   assert.equal(serviceByKey(payload, 'tavus').usage.find((row) => row.label === 'Interview starts').value, 1);
   assert.equal(serviceByKey(payload, 'tavus').usage.find((row) => row.label === 'Estimated minutes').value, 10);
-  assert.equal(serviceByKey(payload, 'sendgrid').errors.find((row) => row.label === 'Bounces').value, 1);
+  assert.equal(serviceByKey(payload, 'sendgrid').errors.find((row) => row.label === 'Delivery diagnostics').value, 'Audit Logs');
+  assert.equal(serviceByKey(payload, 'sendgrid').errors.find((row) => row.label === 'Bounces'), undefined);
   const interviewSelect = db.selects.find((entry) => entry.table === 'interviews')?.columns || '';
   assert.doesNotMatch(interviewSelect, /completed_at|interview_status/);
   assert.match(interviewSelect, /\bstatus\b/);
@@ -458,6 +525,225 @@ test('admin metrics marks missing live integrations as not connected without fak
   assert.equal(serviceByKey(payload, 'aws_s3').status, 'not_configured');
   assert.equal(serviceByKey(payload, 'stripe').status, 'not_configured');
   assert.equal(payload.integration_readiness.find((row) => row.service === 'Render').live_usage_connected, false);
+});
+
+test('admin metrics SendGrid delivery events do not drive Metrics status', async () => {
+  const tables = emptyTables();
+  for (let index = 0; index < 10; index += 1) {
+    tables.email_delivery_events.push({
+      id: `email-${index}`,
+      created_at: '2026-06-12T00:00:00.000Z',
+      event_type: 'bounce',
+      is_problem: true,
+      reason: 'Failed for person@example.com with raw SendGrid detail',
+    });
+  }
+
+  const payload = await buildAdminMetricsPayload({
+    db: makeDb(tables),
+    query: { date_range: '30d' },
+    now: new Date('2026-06-18T12:00:00.000Z'),
+    env: {},
+    liveChecksEnabled: false,
+  });
+
+  const sendGrid = serviceByKey(payload, 'sendgrid');
+  assert.notEqual(sendGrid.status, 'problem');
+  assert.equal(sendGrid.errors.find((row) => row.label === 'Delivery diagnostics').value, 'Audit Logs');
+  assert.equal(sendGrid.errors.find((row) => row.label === 'Bounces'), undefined);
+  assert.equal(sendGrid.errors.find((row) => row.label === 'Problem rate'), undefined);
+  assert.equal(sendGrid.usage.find((row) => row.label === 'Events in range'), undefined);
+  assert.doesNotMatch(JSON.stringify(sendGrid), /person@example\.com|raw SendGrid detail/i);
+});
+
+test('admin metrics SendGrid status-only behavior is safe', async () => {
+  const calls = [];
+  const service = await buildSendGridHealth(sendGridHealthContext({
+    env: {
+      SENDGRID_API_KEY: 'sendgrid-secret',
+      SENDGRID_EVENT_WEBHOOK_SECRET: 'webhook-secret',
+    },
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url: String(url), authorization: String(options.headers?.Authorization || '') });
+      if (String(url).includes('api.sendgrid.com/v3/scopes')) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ scopes: ['mail.send', 'alerts.read'] }),
+        };
+      }
+      if (String(url).includes('status.sendgrid.com/api/v2/summary.json')) {
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify(sendGridStatusSummary()),
+        };
+      }
+      throw new Error('unexpected_url');
+    },
+  }));
+  const serialized = JSON.stringify(service);
+
+  assert.equal(service.status, 'healthy');
+  assert.equal(service.live_api_connected, true);
+  assert.equal(service.source_label, 'Live SendGrid API and SendGrid status page');
+  assert.equal(service.usage_summary.find((row) => row.label === 'SendGrid API reachability').value, 'Connected');
+  assert.equal(service.usage_summary.find((row) => row.label === 'SendGrid platform status').value, 'All Systems Operational');
+  assert.equal(service.problem_summary.find((row) => row.label === 'Delivery diagnostics').value, 'Audit Logs');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Delivered'), undefined);
+  assert.equal(service.problem_summary.find((row) => row.label === 'Bounces'), undefined);
+  assert.equal(service.diagnostics.sendgrid_api_connected, true);
+  assert.equal(service.diagnostics.sendgrid_status_page_connected, true);
+  assert.equal(calls.find((call) => call.url.includes('/v3/scopes'))?.authorization, 'Bearer sendgrid-secret');
+  assert.equal(calls.find((call) => call.url.includes('status.sendgrid.com'))?.authorization, '');
+  assert.doesNotMatch(serialized, /sendgrid-secret|webhook-secret|mail\.send|alerts\.read/i);
+});
+
+test('admin metrics Sentry not configured behavior remains safe', async () => {
+  const service = await buildSentryHealth(sentryHealthContext());
+
+  assert.equal(service.status, 'not_configured');
+  assert.equal(service.configured, false);
+  assert.equal(service.live_api_connected, false);
+  assert.equal(service.connection_label, 'Configuration missing');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Capture configured').value, 'No');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Projects configured').value, 0);
+  assert.equal(service.usage_summary.find((row) => row.label === 'Recent issue details').value, 'Not available');
+  assert.deepEqual(service.recent_issues, []);
+  assert.equal(service.diagnostics.sentry_capture_configured, false);
+  assert.equal(service.diagnostics.sentry_api_status, 'not_configured');
+  assert.equal(service.diagnostics.sentry_project_count, 0);
+});
+
+test('admin metrics Sentry API connected includes safe summary and recent issue details', async () => {
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url: String(url), authorization: String(options.headers?.Authorization || '') });
+    if (String(url).includes('status.sendgrid.com/api/v2/summary.json')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(sendGridStatusSummary()),
+      };
+    }
+    if (String(url).includes('status.render.com/api/v2/summary.json')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(renderStatusSummary()),
+      };
+    }
+    if (String(url).includes('/projects/alpha-org/backend/issues/')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify([{
+          title: 'TypeError for person@example.com from 192.168.1.4 using Bearer abc123 at https://secret.example/path?token=sk-test',
+          culprit: 'POST /api/private 10.0.0.2',
+          level: 'error',
+          status: 'unresolved',
+          count: '12',
+          userCount: '3',
+          firstSeen: '2026-06-17T10:00:00.000Z',
+          lastSeen: '2026-06-18T11:00:00.000Z',
+          permalink: 'https://alpha.sentry.io/issues/123/?query=secret-token',
+          platform: 'node',
+          metadata: { environment: 'production', request_body: 'raw secret body' },
+          stacktrace: { frames: [{ raw: 'raw stack trace secret' }] },
+          headers: { Authorization: 'Bearer raw-header-token' },
+          cookies: 'raw-cookie-secret',
+        }]),
+      };
+    }
+    if (String(url).includes('/projects/alpha-org/frontend/issues/')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify([]),
+      };
+    }
+    throw new Error('unexpected_url');
+  };
+
+  const payload = await buildAdminMetricsPayload({
+    db: makeDb(),
+    query: { date_range: '7d' },
+    now: new Date('2026-06-18T12:00:00.000Z'),
+    env: {
+      SENTRY_ENABLED: 'true',
+      SENTRY_DSN: 'sentry-dsn-secret',
+      SENTRY_AUTH_TOKEN: 'sentry-token-secret',
+      SENTRY_ORG: 'alpha-org',
+      SENTRY_PROJECT_BACKEND: 'backend',
+      SENTRY_PROJECT_FRONTEND: 'frontend',
+      SENTRY_METRICS_ENABLED: 'true',
+    },
+    fetchImpl,
+    liveChecksEnabled: true,
+    cacheEnabled: false,
+  });
+
+  const service = serviceByKey(payload, 'sentry');
+  const issue = service.recent_issues[0];
+  const serialized = JSON.stringify(service);
+
+  assert.equal(service.status, 'warning');
+  assert.equal(service.live_api_connected, true);
+  assert.equal(service.usage.find((row) => row.label === 'Projects checked').value, 2);
+  assert.equal(service.usage.find((row) => row.label === 'Recent issue details').value, 1);
+  assert.equal(service.errors.find((row) => row.label === 'Open unresolved issues').value, 1);
+  assert.equal(service.errors.find((row) => row.label === 'New issues in range').value, 1);
+  assert.equal(service.diagnostics.sentry_capture_configured, true);
+  assert.equal(service.diagnostics.sentry_api_status, 'connected');
+  assert.equal(service.diagnostics.sentry_project_count, 2);
+  assert.equal(service.diagnostics.sentry_projects_checked, 2);
+  assert.equal(service.diagnostics.sentry_recent_issue_count, 1);
+  assert.equal(service.recent_issues.length, 1);
+  assert.equal(issue.project, 'backend');
+  assert.match(issue.title, /\[redacted-email\]/);
+  assert.match(issue.title, /\[redacted-ip\]/);
+  assert.match(issue.title, /Bearer \[redacted\]/);
+  assert.match(issue.title, /\[redacted-url\]/);
+  assert.equal(issue.count, 12);
+  assert.equal(issue.user_count, 3);
+  assert.equal(issue.first_seen, '2026-06-17T10:00:00.000Z');
+  assert.equal(issue.last_seen, '2026-06-18T11:00:00.000Z');
+  assert.equal(issue.permalink, 'https://alpha.sentry.io/issues/123/');
+  assert.equal(calls.filter((call) => call.url.includes('sentry.io/api/0/projects')).length, 2);
+  assert.equal(calls.find((call) => call.url.includes('/backend/issues/'))?.authorization, 'Bearer sentry-token-secret');
+  assert.doesNotMatch(serialized, /sentry-token-secret|sentry-dsn-secret|person@example\.com|192\.168\.1\.4|10\.0\.0\.2|secret\.example|secret-token|sk-test|raw secret body|raw stack trace|raw-header-token|raw-cookie-secret/i);
+});
+
+test('admin metrics Sentry API failure does not leak secrets or raw payloads', async () => {
+  const service = await buildSentryHealth(sentryHealthContext({
+    env: {
+      SENTRY_ENABLED: 'true',
+      SENTRY_DSN: 'sentry-dsn-secret',
+      SENTRY_AUTH_TOKEN: 'sentry-token-secret',
+      SENTRY_ORG: 'alpha-org',
+      SENTRY_PROJECT_BACKEND: 'backend',
+      SENTRY_METRICS_ENABLED: 'true',
+    },
+    fetchImpl: async () => ({
+      ok: false,
+      status: 403,
+      text: async () => JSON.stringify({
+        message: 'raw Sentry failure for sentry-token-secret person@example.com with stack trace',
+      }),
+    }),
+  }));
+  const serialized = JSON.stringify(service);
+
+  assert.equal(service.status, 'warning');
+  assert.equal(service.configured, true);
+  assert.equal(service.live_api_connected, false);
+  assert.equal(service.connection_label, 'Live API not connected');
+  assert.deepEqual(service.recent_issues, []);
+  assert.equal(service.diagnostics.sentry_capture_configured, true);
+  assert.equal(service.diagnostics.sentry_api_status, 'failed');
+  assert.equal(service.diagnostics.sentry_projects_checked, 0);
+  assert.equal(service.troubleshooting_note, 'Live API returned 403.');
+  assert.doesNotMatch(serialized, /sentry-token-secret|sentry-dsn-secret|person@example\.com|raw Sentry failure|stack trace/i);
 });
 
 test('admin metrics Supabase app DB healthy without management config stays healthy', async () => {
@@ -583,12 +869,18 @@ test('admin metrics uses live vendor APIs when configured and still returns safe
         }),
       };
     }
-    if (String(url).includes('sendgrid.com')) {
+    if (String(url).includes('api.sendgrid.com/v3/scopes')) {
       return {
         ok: true,
-        text: async () => JSON.stringify([
-          { stats: [{ metrics: { requests: 5, delivered: 4, bounces: 1, drops: 0, blocks: 0, deferred: 0, spam_reports: 0 } }] },
-        ]),
+        status: 200,
+        text: async () => JSON.stringify({ scopes: ['mail.send'] }),
+      };
+    }
+    if (String(url).includes('status.sendgrid.com/api/v2/summary.json')) {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(sendGridStatusSummary()),
       };
     }
     throw new Error('unexpected_url');
@@ -609,7 +901,8 @@ test('admin metrics uses live vendor APIs when configured and still returns safe
   });
 
   assert.ok(calls.some((url) => url.includes('/organization/usage/completions')));
-  assert.ok(calls.some((url) => url.includes('sendgrid.com/v3/stats')));
+  assert.ok(calls.some((url) => url.includes('api.sendgrid.com/v3/scopes')));
+  assert.ok(calls.some((url) => url.includes('status.sendgrid.com/api/v2/summary.json')));
   const costCall = new URL(calls.find((url) => url.includes('/organization/costs')));
   assert.equal(costCall.pathname, '/v1/organization/costs');
   assert.equal(costCall.searchParams.has('start_time'), true);
@@ -636,8 +929,15 @@ test('admin metrics uses live vendor APIs when configured and still returns safe
   assert.deepEqual(serviceByKey(payload, 'openai').diagnostics.openai_cost_query_param_keys, ['start_time', 'end_time', 'bucket_width', 'limit']);
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_exception_kind, null);
   assert.equal(serviceByKey(payload, 'openai').diagnostics.openai_cost_exception_message_safe, null);
-  assert.equal(serviceByKey(payload, 'sendgrid').live_api_connected, true);
-  assert.equal(serviceByKey(payload, 'sendgrid').usage.find((row) => row.label === 'Delivered').value, 4);
+  const sendGrid = serviceByKey(payload, 'sendgrid');
+  assert.equal(sendGrid.live_api_connected, true);
+  assert.equal(sendGrid.source_label, 'Live SendGrid API and SendGrid status page');
+  assert.equal(sendGrid.usage.find((row) => row.label === 'SendGrid API reachability').value, 'Connected');
+  assert.equal(sendGrid.usage.find((row) => row.label === 'SendGrid platform status').value, 'All Systems Operational');
+  assert.equal(sendGrid.usage.find((row) => row.label === 'Delivered'), undefined);
+  assert.equal(sendGrid.errors.find((row) => row.label === 'Delivery diagnostics').value, 'Audit Logs');
+  assert.equal(sendGrid.diagnostics.sendgrid_api_connected, true);
+  assert.equal(sendGrid.diagnostics.sendgrid_status_page_connected, true);
   assert.doesNotMatch(JSON.stringify(payload), /sk-test-secret|sendgrid-secret/i);
 });
 
