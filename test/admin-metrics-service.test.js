@@ -11,6 +11,7 @@ const {
 const { buildOpenAIHealth } = require('../src/lib/platformHealth/openaiHealth');
 const { buildTavusHealth } = require('../src/lib/platformHealth/tavusHealth');
 const { buildRenderHealth } = require('../src/lib/platformHealth/renderHealth');
+const { buildSupabaseHealth } = require('../src/lib/platformHealth/supabaseHealth');
 
 const PLATFORM_HEALTH_FILES = [
   'index.js',
@@ -196,6 +197,36 @@ function renderStatusSummary(overrides = {}) {
     incidents: [],
     scheduled_maintenances: [],
     ...overrides,
+  };
+}
+
+function supabaseHealthContext(overrides = {}) {
+  const now = new Date('2026-06-18T12:00:00.000Z');
+  return {
+    now,
+    env: {
+      SUPABASE_URL: 'https://example.supabase.co',
+      SUPABASE_SERVICE_ROLE_KEY: 'supabase-service-secret',
+      ...(overrides.env || {}),
+    },
+    dateRange: {
+      from: new Date('2026-06-11T12:00:00.000Z'),
+      to: now,
+      date_from: '2026-06-11T12:00:00.000Z',
+      date_to: '2026-06-18T12:00:00.000Z',
+    },
+    db: overrides.db || makeDb(),
+    signals: {
+      clients: [{ id: 'client-1' }],
+      roles: [{ id: 'role-1' }],
+      candidates: [{ id: 'candidate-1' }],
+      ...(overrides.signals || {}),
+    },
+    warnings: overrides.warnings || [],
+    liveChecksEnabled: true,
+    cacheEnabled: false,
+    fetchImpl: overrides.fetchImpl,
+    timeoutMs: overrides.timeoutMs,
   };
 }
 
@@ -427,6 +458,101 @@ test('admin metrics marks missing live integrations as not connected without fak
   assert.equal(serviceByKey(payload, 'aws_s3').status, 'not_configured');
   assert.equal(serviceByKey(payload, 'stripe').status, 'not_configured');
   assert.equal(payload.integration_readiness.find((row) => row.service === 'Render').live_usage_connected, false);
+});
+
+test('admin metrics Supabase app DB healthy without management config stays healthy', async () => {
+  const service = await buildSupabaseHealth(supabaseHealthContext());
+
+  assert.equal(service.status, 'healthy');
+  assert.equal(service.connection_label, 'Connected');
+  assert.equal(service.live_api_connected, false);
+  assert.equal(service.source_label, 'Database health check');
+  assert.match(service.health_summary, /Database health check succeeded/);
+  assert.match(service.health_summary, /Management API is not configured/);
+  assert.equal(service.usage_summary.find((row) => row.label === 'App database health').value, 'Connected');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Management API').value, 'Not configured');
+  assert.equal(service.problem_summary.find((row) => row.label === 'Management API check').value, 'Not configured');
+  assert.equal(service.diagnostics.supabase_app_db_status, 'connected');
+  assert.equal(service.diagnostics.supabase_management_status, 'not_configured');
+  assert.equal(service.diagnostics.supabase_project_scope, 'absent');
+  assert.equal(service.diagnostics.supabase_management_auth, 'absent');
+  assert.equal(service.troubleshooting_note, null);
+});
+
+test('admin metrics Supabase management API connected returns safe project summary', async () => {
+  const calls = [];
+  const service = await buildSupabaseHealth(supabaseHealthContext({
+    env: {
+      SUPABASE_ACCESS_TOKEN: 'supabase-access-secret',
+      SUPABASE_PROJECT_REF: 'secret-project-ref',
+      SUPABASE_METRICS_ENABLED: 'true',
+    },
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url: String(url), authorization: String(options.headers?.Authorization || '') });
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          id: 'secret-project-ref',
+          name: 'Hidden project name',
+          region: 'us-west-2',
+          status: 'ACTIVE_HEALTHY',
+          database: { status: 'AVAILABLE' },
+        }),
+      };
+    },
+  }));
+  const serialized = JSON.stringify(service);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url.includes('/v1/projects/secret-project-ref'), true);
+  assert.equal(calls[0].authorization, 'Bearer supabase-access-secret');
+  assert.equal(service.status, 'healthy');
+  assert.equal(service.live_api_connected, true);
+  assert.equal(service.source_label, 'Database health check and Supabase Management API');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Management API').value, 'Connected');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Project status').value, 'ACTIVE_HEALTHY');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Project region').value, 'us-west-2');
+  assert.equal(service.problem_summary.find((row) => row.label === 'Usage and cost availability').value, 'Unavailable');
+  assert.equal(service.cost_summary.display, 'Not available');
+  assert.equal(service.diagnostics.supabase_management_status, 'connected');
+  assert.equal(service.diagnostics.supabase_management_http_status, null);
+  assert.equal(service.diagnostics.supabase_management_error_kind, null);
+  assert.equal(service.diagnostics.supabase_project_scope, 'present');
+  assert.equal(service.diagnostics.supabase_management_auth, 'present');
+  assert.doesNotMatch(serialized, /supabase-access-secret|secret-project-ref|Hidden project name/i);
+});
+
+test('admin metrics Supabase management API failure degrades safely without secret leakage', async () => {
+  const service = await buildSupabaseHealth(supabaseHealthContext({
+    env: {
+      SUPABASE_ACCESS_TOKEN: 'supabase-access-secret',
+      SUPABASE_PROJECT_REF: 'secret-project-ref',
+      SUPABASE_METRICS_ENABLED: 'true',
+    },
+    fetchImpl: async () => ({
+      ok: false,
+      status: 403,
+      text: async () => JSON.stringify({
+        message: 'raw failure for supabase-access-secret and secret-project-ref',
+      }),
+    }),
+  }));
+  const serialized = JSON.stringify(service);
+
+  assert.equal(service.status, 'warning');
+  assert.equal(service.connection_label, 'Connected');
+  assert.equal(service.live_api_connected, false);
+  assert.equal(service.usage_summary.find((row) => row.label === 'App database health').value, 'Connected');
+  assert.equal(service.usage_summary.find((row) => row.label === 'Management API').value, 'Check failed');
+  assert.equal(service.problem_summary.find((row) => row.label === 'Management API check').value, 'Check failed');
+  assert.equal(service.diagnostics.supabase_app_db_status, 'connected');
+  assert.equal(service.diagnostics.supabase_management_status, 'failed');
+  assert.equal(service.diagnostics.supabase_management_http_status, 403);
+  assert.equal(service.diagnostics.supabase_management_error_kind, 'permission');
+  assert.equal(service.troubleshooting_note, 'Live API returned 403.');
+  assert.match(service.notes.join(' '), /app database health is still checked/);
+  assert.doesNotMatch(serialized, /supabase-access-secret|secret-project-ref|raw failure/i);
 });
 
 test('admin metrics uses live vendor APIs when configured and still returns safe summaries', async () => {
