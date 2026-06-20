@@ -1294,6 +1294,8 @@ app.use('/automation', automationRouter)
 app.use('/api/automation', automationRouter)
 app.use('/feedback', require('./routes/feedback'))
 app.use('/api/feedback', require('./routes/feedback'))
+app.use('/api/public-analytics', require('./routes/publicAnalytics'))
+app.use('/api/public-leads', require('./routes/publicLeads'))
 
 // ---------- Dashboard: scoped rows ----------
 async function buildDashboardRows(req, res) {
