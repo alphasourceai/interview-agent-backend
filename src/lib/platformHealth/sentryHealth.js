@@ -15,6 +15,8 @@ const {
   trimText,
 } = require('./normalizePlatformHealth');
 
+const DEFAULT_SENTRY_API_BASE_URL = 'https://sentry.io/api/0';
+
 function sentryProjects(env) {
   const projects = [
     envValue(env, ['SENTRY_PROJECT_BACKEND']),
@@ -33,6 +35,59 @@ function sentryPeriod(dateRange) {
   const to = dateRange?.to instanceof Date ? dateRange.to.getTime() : new Date(dateRange?.date_to || Date.now()).getTime();
   const days = Math.max(1, Math.ceil((to - from) / (24 * 60 * 60 * 1000)));
   return `${Math.min(days, 90)}d`;
+}
+
+function stripSurroundingQuotes(value) {
+  const text = trimText(value);
+  if (text.length >= 2) {
+    const first = text[0];
+    const last = text[text.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      return trimText(text.slice(1, -1));
+    }
+  }
+  return text;
+}
+
+function sentryAuthToken(env) {
+  let token = stripSurroundingQuotes(envValue(env, ['SENTRY_AUTH_TOKEN']));
+  token = token.replace(/^Bearer\s+/i, '').trim();
+  return stripSurroundingQuotes(token);
+}
+
+function sentryApiBase(env) {
+  const raw = envValue(env, ['SENTRY_API_BASE_URL']);
+  if (!raw) {
+    return {
+      baseUrl: DEFAULT_SENTRY_API_BASE_URL,
+      source: 'default',
+      cacheKey: 'default:sentry.io:/api/0',
+      error: null,
+    };
+  }
+
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'https:' || !parsed.hostname || parsed.search || parsed.hash) {
+      throw new Error('invalid_sentry_api_base_url');
+    }
+    const path = parsed.pathname.replace(/\/+$/, '');
+    return {
+      baseUrl: `${parsed.origin}${path}`,
+      source: 'env',
+      cacheKey: `env:${parsed.hostname}:${path}`,
+      error: null,
+    };
+  } catch {
+    const error = new Error('Invalid Sentry API base URL.');
+    error.code = 'sentry_api_base_url_invalid';
+    return {
+      baseUrl: DEFAULT_SENTRY_API_BASE_URL,
+      source: 'invalid',
+      cacheKey: 'invalid',
+      error,
+    };
+  }
 }
 
 function parseDateMs(value) {
@@ -89,9 +144,11 @@ function safeIssueDetail(issue, project) {
 }
 
 async function fetchSentryIssues(context) {
+  const apiBase = sentryApiBase(context.env);
+  if (apiBase.error) throw apiBase.error;
   const org = envValue(context.env, ['SENTRY_ORG']);
   const headers = {
-    Authorization: `Bearer ${envValue(context.env, ['SENTRY_AUTH_TOKEN'])}`,
+    Authorization: `Bearer ${sentryAuthToken(context.env)}`,
     'Content-Type': 'application/json',
   };
   const period = sentryPeriod(context.dateRange);
@@ -102,7 +159,7 @@ async function fetchSentryIssues(context) {
     ? context.dateRange.from.getTime()
     : parseDateMs(context.dateRange?.date_from);
   for (const project of projects) {
-    const url = new URL(`https://sentry.io/api/0/projects/${encodeURIComponent(org)}/${encodeURIComponent(project)}/issues/`);
+    const url = new URL(`${apiBase.baseUrl}/projects/${encodeURIComponent(org)}/${encodeURIComponent(project)}/issues/`);
     url.searchParams.set('query', 'is:unresolved');
     url.searchParams.set('statsPeriod', period);
     url.searchParams.set('limit', '5');
@@ -130,23 +187,27 @@ async function fetchSentryIssues(context) {
 
 async function buildSentryHealth(context) {
   const { env, now } = context;
+  const apiBase = sentryApiBase(env);
+  const projects = sentryProjects(env);
   const captureConfigured = envEnabled(env, 'SENTRY_ENABLED') && envConfigured(env, ['SENTRY_DSN']);
-  const apiConfigured = envConfigured(env, ['SENTRY_AUTH_TOKEN', 'SENTRY_ORG']) && sentryProjects(env).length > 0;
+  const apiConfigured = Boolean(sentryAuthToken(env) && envConfigured(env, ['SENTRY_ORG']) && projects.length > 0);
   let live = null;
   let liveError = null;
   const diagnostics = {
     sentry_capture_configured: captureConfigured,
     sentry_api_status: apiConfigured ? 'not_called' : 'not_configured',
-    sentry_project_count: sentryProjects(env).length,
+    sentry_project_count: projects.length,
     sentry_projects_checked: 0,
     sentry_recent_issue_count: 0,
+    sentry_api_base_source: apiBase.source,
   };
 
   if (apiConfigured && shouldRunLiveCheck(context, 'SENTRY_METRICS_ENABLED')) {
     try {
+      if (apiBase.error) throw apiBase.error;
       live = await cachedLiveCall(
         context,
-        `sentry:${envValue(env, ['SENTRY_ORG'])}:${sentryProjects(env).join(',')}:${sentryPeriod(context.dateRange)}`,
+        `sentry:${apiBase.cacheKey}:${envValue(env, ['SENTRY_ORG'])}:${projects.join(',')}:${sentryPeriod(context.dateRange)}`,
         () => fetchSentryIssues(context)
       );
       diagnostics.sentry_api_status = 'connected';
@@ -184,7 +245,7 @@ async function buildSentryHealth(context) {
         : 'Sentry is not configured for this environment.',
     usage_summary: [
       metric('Capture configured', captureConfigured ? 'Yes' : 'No', 'Whether the app is configured to send errors to Sentry.'),
-      metric('Projects configured', sentryProjects(env).length, 'Sentry project slugs configured for live issue checks.'),
+      metric('Projects configured', projects.length, 'Sentry project slugs configured for live issue checks.'),
       metric('Projects checked', projectRows.length, 'Projects successfully read through the Sentry API.'),
       metric('Recent issue details', liveConnected ? recentIssues.length : 'Not available', 'Sanitized unresolved issue details included for troubleshooting handoff when API access is connected.'),
     ],
@@ -199,7 +260,7 @@ async function buildSentryHealth(context) {
     readiness_items: [
       readiness('Capture setup', captureConfigured ? 'Configured' : 'Missing', 'Required before alphaScreen can send errors to Sentry.'),
       readiness('Issue API', liveConnected ? 'Connected' : 'Not connected', 'Requires Sentry organization, project, and API access.'),
-      readiness('Projects', sentryProjects(env).length ? 'Configured' : 'Missing', 'Backend/frontend project slugs used for issue counts.'),
+      readiness('Projects', projects.length ? 'Configured' : 'Missing', 'Backend/frontend project slugs used for issue counts.'),
     ],
     troubleshooting_note: liveError ? safeErrorMessage(liveError, 'Sentry live issue check failed.') : null,
     last_checked: now.toISOString(),
