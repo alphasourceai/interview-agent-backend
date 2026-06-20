@@ -633,11 +633,12 @@ test('admin metrics Sentry API connected includes safe summary and recent issue 
         text: async () => JSON.stringify(renderStatusSummary()),
       };
     }
-    if (String(url).includes('/projects/alpha-org/backend/issues/')) {
+    if (String(url).includes('/organizations/alpha-org/issues/')) {
       return {
         ok: true,
         status: 200,
         text: async () => JSON.stringify([{
+          project: { slug: 'backend', name: 'Backend', id: '2' },
           title: 'TypeError for person@example.com from 192.168.1.4 using Bearer abc123 at https://secret.example/path?token=sk-test',
           culprit: 'POST /api/private 10.0.0.2',
           level: 'error',
@@ -653,13 +654,6 @@ test('admin metrics Sentry API connected includes safe summary and recent issue 
           headers: { Authorization: 'Bearer raw-header-token' },
           cookies: 'raw-cookie-secret',
         }]),
-      };
-    }
-    if (String(url).includes('/projects/alpha-org/frontend/issues/')) {
-      return {
-        ok: true,
-        status: 200,
-        text: async () => JSON.stringify([]),
       };
     }
     throw new Error('unexpected_url');
@@ -699,6 +693,7 @@ test('admin metrics Sentry API connected includes safe summary and recent issue 
   assert.equal(service.diagnostics.sentry_projects_checked, 2);
   assert.equal(service.diagnostics.sentry_recent_issue_count, 1);
   assert.equal(service.diagnostics.sentry_api_base_source, 'default');
+  assert.equal(service.diagnostics.sentry_issue_endpoint_source, 'organization_issues');
   assert.equal(service.recent_issues.length, 1);
   assert.equal(issue.project, 'backend');
   assert.match(issue.title, /\[redacted-email\]/);
@@ -710,8 +705,16 @@ test('admin metrics Sentry API connected includes safe summary and recent issue 
   assert.equal(issue.first_seen, '2026-06-17T10:00:00.000Z');
   assert.equal(issue.last_seen, '2026-06-18T11:00:00.000Z');
   assert.equal(issue.permalink, 'https://alpha.sentry.io/issues/123/');
-  assert.equal(calls.filter((call) => call.url.includes('sentry.io/api/0/projects')).length, 2);
-  assert.equal(calls.find((call) => call.url.includes('/backend/issues/'))?.authorization, 'Bearer sentry-token-secret');
+  const sentryCall = calls.find((call) => call.url.includes('sentry.io/api/0/organizations/alpha-org/issues/'));
+  assert.ok(sentryCall);
+  const sentryUrl = new URL(sentryCall.url);
+  assert.equal(sentryUrl.pathname, '/api/0/organizations/alpha-org/issues/');
+  assert.equal(sentryUrl.searchParams.get('query'), 'is:unresolved');
+  assert.equal(sentryUrl.searchParams.get('statsPeriod'), '7d');
+  assert.equal(sentryUrl.searchParams.get('sort'), 'date');
+  assert.equal(sentryUrl.searchParams.get('limit'), '10');
+  assert.deepEqual(sentryUrl.searchParams.getAll('project'), ['backend', 'frontend']);
+  assert.equal(sentryCall.authorization, 'Bearer sentry-token-secret');
   assert.doesNotMatch(serialized, /sentry-token-secret|sentry-dsn-secret|person@example\.com|192\.168\.1\.4|10\.0\.0\.2|secret\.example|secret-token|sk-test|raw secret body|raw stack trace|raw-header-token|raw-cookie-secret/i);
 });
 
@@ -737,7 +740,8 @@ test('admin metrics Sentry uses custom API base URL and trims trailing slash', a
   const serialized = JSON.stringify(service);
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].url.startsWith('https://us.sentry.io/api/0/projects/alpha-org/backend/issues/'), true);
+  assert.equal(calls[0].url.startsWith('https://us.sentry.io/api/0/organizations/alpha-org/issues/'), true);
+  assert.deepEqual(new URL(calls[0].url).searchParams.getAll('project'), ['backend']);
   assert.equal(calls[0].authorization, 'Bearer sentry-token-secret');
   assert.equal(service.live_api_connected, true);
   assert.equal(service.diagnostics.sentry_api_status, 'connected');
@@ -839,6 +843,32 @@ test('admin metrics Sentry 401 failure sanitizes response body', async () => {
   assert.equal(service.diagnostics.sentry_api_base_source, 'default');
   assert.equal(service.troubleshooting_note, 'Live API returned 401.');
   assert.doesNotMatch(serialized, /sentry-token-secret|person@example\.com|raw Sentry 401/i);
+});
+
+test('admin metrics Sentry 400 failure sanitizes response body', async () => {
+  const service = await buildSentryHealth(sentryHealthContext({
+    env: {
+      SENTRY_AUTH_TOKEN: 'sentry-token-secret',
+      SENTRY_ORG: 'alpha-org',
+      SENTRY_PROJECT_BACKEND: 'backend',
+      SENTRY_METRICS_ENABLED: 'true',
+    },
+    fetchImpl: async () => ({
+      ok: false,
+      status: 400,
+      text: async () => JSON.stringify({
+        detail: 'raw Sentry 400 for sentry-token-secret and person@example.com',
+      }),
+    }),
+  }));
+  const serialized = JSON.stringify(service);
+
+  assert.equal(service.status, 'warning');
+  assert.equal(service.live_api_connected, false);
+  assert.equal(service.diagnostics.sentry_api_status, 'failed');
+  assert.equal(service.diagnostics.sentry_issue_endpoint_source, 'organization_issues');
+  assert.equal(service.troubleshooting_note, 'Live API returned 400.');
+  assert.doesNotMatch(serialized, /sentry-token-secret|person@example\.com|raw Sentry 400/i);
 });
 
 test('admin metrics Sentry API failure does not leak secrets or raw payloads', async () => {

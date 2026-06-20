@@ -126,9 +126,16 @@ function safeDateText(value) {
   return Number.isFinite(parsed.getTime()) ? parsed.toISOString() : null;
 }
 
+function issueProjectSlug(issue) {
+  if (issue?.project && typeof issue.project === 'object' && !Array.isArray(issue.project)) {
+    return trimText(issue.project.slug || issue.project.name || issue.project.id);
+  }
+  return trimText(issue?.project);
+}
+
 function safeIssueDetail(issue, project) {
   return {
-    project: safeIssueText(project, 'Unknown project'),
+    project: safeIssueText(project || issueProjectSlug(issue), 'Unknown project'),
     title: safeIssueText(issue?.title || issue?.metadata?.title || issue?.shortId || issue?.id),
     culprit: safeIssueText(issue?.culprit || issue?.metadata?.function || issue?.metadata?.filename || issue?.type),
     level: safeIssueText(issue?.level),
@@ -158,13 +165,18 @@ async function fetchSentryIssues(context) {
   const fromMs = context.dateRange?.from instanceof Date
     ? context.dateRange.from.getTime()
     : parseDateMs(context.dateRange?.date_from);
+  const url = new URL(`${apiBase.baseUrl}/organizations/${encodeURIComponent(org)}/issues/`);
+  url.searchParams.set('query', 'is:unresolved');
+  url.searchParams.set('statsPeriod', period);
+  url.searchParams.set('sort', 'date');
+  url.searchParams.set('limit', String(Math.min(25, Math.max(5, projects.length * 5))));
   for (const project of projects) {
-    const url = new URL(`${apiBase.baseUrl}/projects/${encodeURIComponent(org)}/${encodeURIComponent(project)}/issues/`);
-    url.searchParams.set('query', 'is:unresolved');
-    url.searchParams.set('statsPeriod', period);
-    url.searchParams.set('limit', '5');
-    const data = await fetchJson(context, url.toString(), { headers });
-    const issues = Array.isArray(data) ? data : [];
+    url.searchParams.append('project', project);
+  }
+  const data = await fetchJson(context, url.toString(), { headers });
+  const allIssues = Array.isArray(data) ? data : [];
+  for (const project of projects) {
+    const issues = allIssues.filter((issue) => issueProjectSlug(issue) === project);
     projectRows.push({
       project,
       unresolved: issues.length,
@@ -174,9 +186,9 @@ async function fetchSentryIssues(context) {
       }).length,
       latest: issues[0]?.lastSeen || issues[0]?.firstSeen || null,
     });
-    for (const issue of issues) {
-      recentIssues.push(safeIssueDetail(issue, project));
-    }
+  }
+  for (const issue of allIssues) {
+    recentIssues.push(safeIssueDetail(issue, issueProjectSlug(issue)));
   }
   recentIssues.sort((left, right) => parseDateMs(right.last_seen || right.first_seen) - parseDateMs(left.last_seen || left.first_seen));
   return {
@@ -200,6 +212,7 @@ async function buildSentryHealth(context) {
     sentry_projects_checked: 0,
     sentry_recent_issue_count: 0,
     sentry_api_base_source: apiBase.source,
+    sentry_issue_endpoint_source: 'organization_issues',
   };
 
   if (apiConfigured && shouldRunLiveCheck(context, 'SENTRY_METRICS_ENABLED')) {
