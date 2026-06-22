@@ -72,7 +72,13 @@ const { createSubscriptionCheckoutSession } = require('./src/lib/subscriptionChe
 const { processClientEntityImport } = require('./src/lib/clientEntityImportService')
 const { archiveChildClientEntity, restoreChildClientEntity } = require('./src/lib/clientEntityArchive')
 const { buildAdminMetricsPayload, safeErrorBody } = require('./src/lib/adminMetricsService')
-const { buildAdminPublicAnalyticsLeadsCsv, buildAdminPublicAnalyticsPayload, safePublicAnalyticsErrorBody } = require('./src/lib/adminPublicAnalyticsService')
+const {
+  archivePublicLeadCapture,
+  buildAdminPublicAnalyticsLeadsCsv,
+  buildAdminPublicAnalyticsPayload,
+  safePublicAnalyticsErrorBody,
+  unarchivePublicLeadCapture,
+} = require('./src/lib/adminPublicAnalyticsService')
 const { sendSubscriptionCheckoutEmail, sendMemberRecoveryEmail } = require('./utils/mailer')
 const {
   frontendUrl: FRONTEND_URL,
@@ -2507,6 +2513,48 @@ adminRouter.get('/public-analytics/leads.csv', requireAuth, requireAdmin, async 
   } catch (error) {
     const body = safePublicAnalyticsErrorBody(error, request_id)
     console.error('[admin/public-analytics/leads.csv] failed', {
+      request_id,
+      code: body.code,
+      detail: body.detail
+    })
+    return sendAdminError(res, error?.status || 500, body)
+  }
+})
+
+adminRouter.post('/public-analytics/leads/:id/archive', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const payload = await archivePublicLeadCapture({
+      db: supabaseAdmin,
+      leadId: req.params.id,
+      actorUserId: req.user?.id || null,
+      reason: req.body?.reason || '',
+      requestId: request_id
+    })
+    return res.json(payload)
+  } catch (error) {
+    const body = safePublicAnalyticsErrorBody(error, request_id)
+    console.error('[admin/public-analytics/leads/archive] failed', {
+      request_id,
+      code: body.code,
+      detail: body.detail
+    })
+    return sendAdminError(res, error?.status || 500, body)
+  }
+})
+
+adminRouter.post('/public-analytics/leads/:id/unarchive', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const payload = await unarchivePublicLeadCapture({
+      db: supabaseAdmin,
+      leadId: req.params.id,
+      requestId: request_id
+    })
+    return res.json(payload)
+  } catch (error) {
+    const body = safePublicAnalyticsErrorBody(error, request_id)
+    console.error('[admin/public-analytics/leads/unarchive] failed', {
       request_id,
       code: body.code,
       detail: body.detail

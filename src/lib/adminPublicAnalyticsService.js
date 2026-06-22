@@ -7,8 +7,11 @@ const MAX_LIMIT = 100;
 const SUMMARY_LIMIT = 500;
 const CSV_EXPORT_LIMIT = 1000;
 const VALID_LEAD_STATUSES = new Set(['partial', 'abandoned', 'submitted']);
+const VALID_ARCHIVE_STATUSES = new Set(['active', 'archived', 'all']);
 const SAFE_EVENT_NAME_RE = /^[a-z][a-z0-9_]{1,80}$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SENSITIVE_META_KEY_RE = /(authorization|bearer|cookie|token|secret|password|credential|email|phone|message|body|payload|form|name|ip|user[_-]?agent)/i;
+const LEAD_SELECT_COLUMNS = 'id,status,form_id,form_type,product_interest,first_name,last_name,email,phone,message,fields_completed,last_field,source_path,source_referrer_path,source_cta,utm,privacy_notice_version,submitted_at,expires_at,archived_at,archived_by_user_id,archive_reason,created_at,updated_at';
 const PAGE_DISPLAY_NAMES = {
   '/': 'Homepage',
   '/alphascreen': 'alphaScreen',
@@ -80,10 +83,12 @@ function pageDisplayName(path) {
 function parseFilters(query = {}, now = new Date()) {
   const dateRange = parseDateRange(query, now);
   const leadStatus = trimText(query.status || query.lead_status, 40).toLowerCase();
+  const archiveStatus = trimText(query.archive_status, 40).toLowerCase();
   const eventName = trimText(query.event_name || query.event, 100).toLowerCase();
   return {
     ...dateRange,
     lead_status: VALID_LEAD_STATUSES.has(leadStatus) ? leadStatus : '',
+    archive_status: VALID_ARCHIVE_STATUSES.has(archiveStatus) ? archiveStatus : 'active',
     event_name: SAFE_EVENT_NAME_RE.test(eventName) ? eventName : '',
     path: cleanPath(query.path || query.page_path),
     lead_page: parsePositiveInt(query.lead_page || query.page, 1, 10000),
@@ -103,6 +108,8 @@ function applyLeadFilters(query, filters) {
   let next = applyDateRange(query, 'updated_at', filters);
   if (filters.lead_status) next = next.eq('status', filters.lead_status);
   if (filters.path) next = next.eq('source_path', filters.path);
+  if (filters.archive_status === 'active') next = next.is('archived_at', null);
+  if (filters.archive_status === 'archived') next = next.not('archived_at', 'is', null);
   return next;
 }
 
@@ -132,7 +139,7 @@ function pageRange(page, limit) {
 async function readLeadRows(db, filters, { page = 1, limit = DEFAULT_LIMIT, summary = false, exportRows = false } = {}) {
   let query = db
     .from('public_lead_drafts')
-    .select('id,status,form_id,form_type,product_interest,first_name,last_name,email,phone,message,fields_completed,last_field,source_path,source_referrer_path,source_cta,utm,privacy_notice_version,submitted_at,expires_at,created_at,updated_at');
+    .select(LEAD_SELECT_COLUMNS);
   query = applyLeadFilters(query, filters).order('updated_at', { ascending: false });
   if (summary) query = query.limit(SUMMARY_LIMIT);
   else if (exportRows) query = query.limit(CSV_EXPORT_LIMIT + 1);
@@ -260,6 +267,9 @@ function sanitizeLead(row) {
     message_preview: preview,
     message_character_count: trimText(row?.message, 5000).length || 0,
     privacy_notice_version: trimText(row?.privacy_notice_version, 120) || null,
+    archived: Boolean(trimText(row?.archived_at, 40)),
+    archived_at: trimText(row?.archived_at, 40) || null,
+    archive_reason: trimText(row?.archive_reason, 200) || null,
     submitted_at: trimText(row?.submitted_at, 40) || null,
     expires_at: trimText(row?.expires_at, 40) || null,
     created_at: trimText(row?.created_at, 40) || null,
@@ -529,6 +539,9 @@ function buildLeadCsvRow(lead) {
     lead.progress?.last_field || '',
     lead.source?.cta || '',
     lead.message_preview || '',
+    lead.archived ? 'archived' : 'active',
+    lead.archived_at || '',
+    lead.archive_reason || '',
   ];
 }
 
@@ -536,7 +549,7 @@ function csvFilename(filters) {
   const from = filters.date_from_display || 'start';
   const to = filters.date_to_display || 'end';
   const status = filters.lead_status || 'all';
-  return `public-leads-${from}-to-${to}-${status}.csv`;
+  return `public-leads-${from}-to-${to}-${status}-${filters.archive_status}.csv`;
 }
 
 async function buildAdminPublicAnalyticsLeadsCsv({ db, query = {}, now = new Date() } = {}) {
@@ -571,6 +584,9 @@ async function buildAdminPublicAnalyticsLeadsCsv({ db, query = {}, now = new Dat
     'last_field',
     'cta',
     'submitted_message_preview_redacted',
+    'archive_status',
+    'archived_at',
+    'archive_reason',
   ];
   return {
     content_type: 'text/csv; charset=utf-8',
@@ -610,6 +626,7 @@ async function buildAdminPublicAnalyticsPayload({ db, query = {}, now = new Date
       date_from_display: filters.date_from_display,
       date_to_display: filters.date_to_display,
       lead_status: filters.lead_status || 'all',
+      archive_status: filters.archive_status,
       event_name: filters.event_name || 'all',
       path: filters.path || 'all',
       lead_page: filters.lead_page,
@@ -631,6 +648,106 @@ async function buildAdminPublicAnalyticsPayload({ db, query = {}, now = new Date
   };
 }
 
+function publicAnalyticsServiceError(status, code, detail, requestId = null) {
+  const error = new Error(detail || 'Public analytics request failed.');
+  error.status = status;
+  error.code = code;
+  error.request_id = requestId || null;
+  return error;
+}
+
+async function readLeadForMutation(db, leadId, requestId) {
+  const { data, error } = await db
+    .from('public_lead_drafts')
+    .select(LEAD_SELECT_COLUMNS)
+    .eq('id', leadId)
+    .maybeSingle();
+  if (error) {
+    throw publicAnalyticsServiceError(503, 'public_lead_lookup_failed', 'Could not load public lead capture.', requestId);
+  }
+  if (!data) {
+    throw publicAnalyticsServiceError(404, 'public_lead_not_found', 'Public lead capture was not found.', requestId);
+  }
+  return data;
+}
+
+async function updateLeadArchiveState(db, leadId, updates, requestId) {
+  const { data, error } = await db
+    .from('public_lead_drafts')
+    .update(updates)
+    .eq('id', leadId)
+    .select(LEAD_SELECT_COLUMNS)
+    .maybeSingle();
+  if (error) {
+    throw publicAnalyticsServiceError(503, 'public_lead_archive_failed', 'Could not update public lead capture archive state.', requestId);
+  }
+  if (!data) {
+    throw publicAnalyticsServiceError(404, 'public_lead_not_found', 'Public lead capture was not found.', requestId);
+  }
+  return data;
+}
+
+async function archivePublicLeadCapture({ db, leadId, actorUserId = null, reason = '', now = new Date(), requestId = null } = {}) {
+  if (!db || typeof db.from !== 'function') {
+    throw publicAnalyticsServiceError(503, 'public_analytics_db_missing', 'Database client is not configured.', requestId);
+  }
+  const id = trimText(leadId, 80);
+  if (!UUID_RE.test(id)) {
+    throw publicAnalyticsServiceError(400, 'invalid_public_lead_id', 'A valid public lead capture id is required.', requestId);
+  }
+
+  const existing = await readLeadForMutation(db, id, requestId);
+  if (trimText(existing.archived_at, 40)) {
+    return {
+      ok: true,
+      item: sanitizeLead(existing),
+      request_id: requestId || null,
+    };
+  }
+
+  const archivedAt = (now instanceof Date && Number.isFinite(now.getTime()) ? now : new Date()).toISOString();
+  const updated = await updateLeadArchiveState(db, id, {
+    archived_at: archivedAt,
+    archived_by_user_id: trimText(actorUserId, 120) || null,
+    archive_reason: trimText(reason, 200) || 'Manual admin archive',
+  }, requestId);
+  return {
+    ok: true,
+    item: sanitizeLead(updated),
+    request_id: requestId || null,
+  };
+}
+
+async function unarchivePublicLeadCapture({ db, leadId, requestId = null } = {}) {
+  if (!db || typeof db.from !== 'function') {
+    throw publicAnalyticsServiceError(503, 'public_analytics_db_missing', 'Database client is not configured.', requestId);
+  }
+  const id = trimText(leadId, 80);
+  if (!UUID_RE.test(id)) {
+    throw publicAnalyticsServiceError(400, 'invalid_public_lead_id', 'A valid public lead capture id is required.', requestId);
+  }
+
+  const existing = await readLeadForMutation(db, id, requestId);
+  if (!trimText(existing.archived_at, 40)) {
+    return {
+      ok: true,
+      item: sanitizeLead(existing),
+      request_id: requestId || null,
+    };
+  }
+
+  const updated = await updateLeadArchiveState(db, id, {
+    archived_at: null,
+    archived_by_user_id: null,
+    archive_reason: null,
+  }, requestId);
+  return {
+    ok: true,
+    item: sanitizeLead(updated),
+    request_id: requestId || null,
+  };
+}
+
 function safePublicAnalyticsErrorBody(error, requestId) {
   return {
     error: error?.code || 'admin_public_analytics_failed',
@@ -642,6 +759,7 @@ function safePublicAnalyticsErrorBody(error, requestId) {
 }
 
 module.exports = {
+  archivePublicLeadCapture,
   buildAdminPublicAnalyticsLeadsCsv,
   buildAdminPublicAnalyticsPayload,
   CSV_EXPORT_LIMIT,
@@ -650,4 +768,5 @@ module.exports = {
   sanitizeEvent,
   sanitizeLead,
   buildInsights,
+  unarchivePublicLeadCapture,
 };

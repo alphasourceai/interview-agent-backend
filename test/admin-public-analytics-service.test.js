@@ -5,9 +5,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { test } = require('node:test');
 const {
+  archivePublicLeadCapture,
   buildAdminPublicAnalyticsLeadsCsv,
   buildAdminPublicAnalyticsPayload,
   CSV_EXPORT_LIMIT,
+  unarchivePublicLeadCapture,
 } = require('../src/lib/adminPublicAnalyticsService');
 
 class FakeQuery {
@@ -16,11 +18,15 @@ class FakeQuery {
     this.table = table;
     this.filters = [];
     this.ranges = [];
+    this.nullFilters = [];
+    this.notNullFilters = [];
     this.orderField = null;
     this.ascending = false;
     this.limitCount = null;
     this.rangeFrom = null;
     this.rangeTo = null;
+    this.updatePayload = null;
+    this.singleMode = '';
   }
 
   select(columns) {
@@ -30,6 +36,16 @@ class FakeQuery {
 
   eq(column, value) {
     this.filters.push({ type: 'eq', column, value: String(value) });
+    return this;
+  }
+
+  is(column, value) {
+    if (value === null) this.nullFilters.push(column);
+    return this;
+  }
+
+  not(column, operator, value) {
+    if (operator === 'is' && value === null) this.notNullFilters.push(column);
     return this;
   }
 
@@ -60,6 +76,21 @@ class FakeQuery {
     return this;
   }
 
+  update(payload) {
+    this.updatePayload = { ...(payload || {}) };
+    return this;
+  }
+
+  single() {
+    this.singleMode = 'single';
+    return this;
+  }
+
+  maybeSingle() {
+    this.singleMode = 'maybeSingle';
+    return this;
+  }
+
   execute() {
     let rows = (this.db.tables[this.table] || []).map((row) => ({ ...row }));
     for (const filter of this.filters) {
@@ -74,6 +105,22 @@ class FakeQuery {
         return range.type === 'gte' ? value >= range.value : value <= range.value;
       });
     }
+    for (const column of this.nullFilters) {
+      rows = rows.filter((row) => row[column] === null || row[column] === undefined || row[column] === '');
+    }
+    for (const column of this.notNullFilters) {
+      rows = rows.filter((row) => row[column] !== null && row[column] !== undefined && row[column] !== '');
+    }
+
+    if (this.updatePayload) {
+      const tableRows = this.db.tables[this.table] || [];
+      const ids = new Set(rows.map((row) => String(row.id || '')));
+      for (const row of tableRows) {
+        if (ids.has(String(row.id || ''))) Object.assign(row, this.updatePayload);
+      }
+      rows = tableRows.filter((row) => ids.has(String(row.id || ''))).map((row) => ({ ...row }));
+    }
+
     if (this.orderField) {
       rows.sort((a, b) => {
         const left = String(a[this.orderField] || '');
@@ -86,6 +133,8 @@ class FakeQuery {
     } else if (this.limitCount) {
       rows = rows.slice(0, this.limitCount);
     }
+    if (this.singleMode === 'single') return { data: rows[0] || null, error: rows[0] ? null : { message: 'No rows returned' } };
+    if (this.singleMode === 'maybeSingle') return { data: rows[0] || null, error: null };
     return { data: rows, error: null };
   }
 
@@ -118,10 +167,67 @@ test('admin public analytics route is registered behind admin auth and public wr
   const appSource = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
   assert.match(appSource, /adminRouter\.get\('\/public-analytics', requireAuth, requireAdmin/);
   assert.match(appSource, /adminRouter\.get\('\/public-analytics\/leads\.csv', requireAuth, requireAdmin/);
+  assert.match(appSource, /adminRouter\.post\('\/public-analytics\/leads\/:id\/archive', requireAuth, requireAdmin/);
+  assert.match(appSource, /adminRouter\.post\('\/public-analytics\/leads\/:id\/unarchive', requireAuth, requireAdmin/);
   assert.match(appSource, /Content-Disposition/);
   assert.match(appSource, /X-Export-Row-Count/);
   assert.match(appSource, /app\.use\('\/api\/public-analytics', require\('\.\/routes\/publicAnalytics'\)\)/);
   assert.match(appSource, /app\.use\('\/api\/public-leads', require\('\.\/routes\/publicLeads'\)\)/);
+});
+
+test('admin public analytics archive filter defaults to active leads', async () => {
+  const db = makeDb({
+    public_lead_drafts: [
+      {
+        id: '10000000-1000-4000-8000-000000000001',
+        status: 'submitted',
+        email: 'active@example.com',
+        source_path: '/alphascreen',
+        archived_at: null,
+        created_at: '2026-06-21T09:00:00.000Z',
+        updated_at: '2026-06-21T10:00:00.000Z',
+      },
+      {
+        id: '10000000-1000-4000-8000-000000000002',
+        status: 'submitted',
+        email: 'archived@example.com',
+        source_path: '/alphascreen',
+        archived_at: '2026-06-22T10:00:00.000Z',
+        archive_reason: 'No longer relevant',
+        created_at: '2026-06-21T08:00:00.000Z',
+        updated_at: '2026-06-21T09:00:00.000Z',
+      },
+    ],
+  });
+
+  const activePayload = await buildAdminPublicAnalyticsPayload({
+    db,
+    now: NOW,
+    query: { days: '30' },
+  });
+  const archivedPayload = await buildAdminPublicAnalyticsPayload({
+    db,
+    now: NOW,
+    query: { days: '30', archive_status: 'archived' },
+  });
+  const allPayload = await buildAdminPublicAnalyticsPayload({
+    db,
+    now: NOW,
+    query: { days: '30', archive_status: 'all' },
+  });
+
+  assert.equal(activePayload.filters.archive_status, 'active');
+  assert.deepEqual(activePayload.leads.items.map((lead) => lead.id), ['10000000-1000-4000-8000-000000000001']);
+  assert.equal(activePayload.summary.submitted_leads, 1);
+  assert.equal(archivedPayload.filters.archive_status, 'archived');
+  assert.deepEqual(archivedPayload.leads.items.map((lead) => lead.id), ['10000000-1000-4000-8000-000000000002']);
+  assert.equal(archivedPayload.leads.items[0].archived, true);
+  assert.equal(archivedPayload.leads.items[0].archive_reason, 'No longer relevant');
+  assert.equal(allPayload.filters.archive_status, 'all');
+  assert.deepEqual(allPayload.leads.items.map((lead) => lead.id), [
+    '10000000-1000-4000-8000-000000000001',
+    '10000000-1000-4000-8000-000000000002',
+  ]);
 });
 
 test('admin public analytics payload returns sanitized leads and events', async () => {
@@ -346,7 +452,7 @@ test('admin public analytics lead CSV export is sanitized and respects filters',
   });
 
   assert.equal(payload.content_type, 'text/csv; charset=utf-8');
-  assert.equal(payload.filename, 'public-leads-2026-06-20-to-2026-06-22-submitted.csv');
+  assert.equal(payload.filename, 'public-leads-2026-06-20-to-2026-06-22-submitted-active.csv');
   assert.equal(payload.row_count, 1);
   assert.equal(payload.truncated, false);
   assert.match(payload.csv, /^created_at,updated_at,status,submitted,submitted_at,source_page,source_path/m);
@@ -358,6 +464,135 @@ test('admin public analytics lead CSV export is sanitized and respects filters',
   assert.doesNotMatch(payload.csv, /lead-export-1|anonymous-raw|session-raw|request-raw/i);
   assert.doesNotMatch(payload.csv, /sk-live-raw|person@example\.com|555-111-2222|Partial draft message|partial@example\.com|other@example\.com/i);
   assert.doesNotMatch(payload.csv, /^=/m);
+});
+
+test('admin public analytics lead CSV excludes archived leads by default and can include archived', async () => {
+  const db = makeDb({
+    public_lead_drafts: [
+      {
+        id: '10000000-1000-4000-8000-000000000011',
+        status: 'submitted',
+        email: 'active@example.com',
+        source_path: '/alphascreen',
+        archived_at: null,
+        created_at: '2026-06-21T09:00:00.000Z',
+        updated_at: '2026-06-21T10:00:00.000Z',
+      },
+      {
+        id: '10000000-1000-4000-8000-000000000012',
+        status: 'submitted',
+        email: 'archived@example.com',
+        source_path: '/alphascreen',
+        archived_at: '2026-06-22T10:00:00.000Z',
+        archive_reason: 'Manual admin archive',
+        created_at: '2026-06-21T08:00:00.000Z',
+        updated_at: '2026-06-21T09:00:00.000Z',
+      },
+    ],
+  });
+
+  const activePayload = await buildAdminPublicAnalyticsLeadsCsv({
+    db,
+    now: NOW,
+    query: { days: '30' },
+  });
+  const archivedPayload = await buildAdminPublicAnalyticsLeadsCsv({
+    db,
+    now: NOW,
+    query: { days: '30', archive_status: 'archived' },
+  });
+  const allPayload = await buildAdminPublicAnalyticsLeadsCsv({
+    db,
+    now: NOW,
+    query: { days: '30', archive_status: 'all' },
+  });
+
+  assert.equal(activePayload.row_count, 1);
+  assert.match(activePayload.csv, /active@example\.com/);
+  assert.doesNotMatch(activePayload.csv, /archived@example\.com|Manual admin archive/i);
+  assert.equal(archivedPayload.row_count, 1);
+  assert.match(archivedPayload.csv, /archived@example\.com/);
+  assert.match(archivedPayload.csv, /archived,2026-06-22T10:00:00.000Z,Manual admin archive/);
+  assert.equal(allPayload.row_count, 2);
+  assert.match(allPayload.csv, /active@example\.com/);
+  assert.match(allPayload.csv, /archived@example\.com/);
+});
+
+test('admin public analytics archive and unarchive are idempotent and preserve lead data', async () => {
+  const db = makeDb({
+    public_lead_drafts: [
+      {
+        id: '10000000-1000-4000-8000-000000000021',
+        status: 'submitted',
+        email: 'lead@example.com',
+        phone: '+1 555 111 2222',
+        message: 'Submitted message remains on the record.',
+        source_path: '/alphascreen',
+        fields_completed: ['email', 'phone', 'message'],
+        archived_at: null,
+        created_at: '2026-06-21T09:00:00.000Z',
+        updated_at: '2026-06-21T10:00:00.000Z',
+      },
+    ],
+  });
+
+  const archived = await archivePublicLeadCapture({
+    db,
+    leadId: '10000000-1000-4000-8000-000000000021',
+    actorUserId: 'admin-user-1',
+    reason: 'Handled',
+    now: new Date('2026-06-22T10:00:00.000Z'),
+    requestId: 'req-archive',
+  });
+  const archivedAgain = await archivePublicLeadCapture({
+    db,
+    leadId: '10000000-1000-4000-8000-000000000021',
+    actorUserId: 'admin-user-2',
+    reason: 'Should not overwrite',
+    now: new Date('2026-06-23T10:00:00.000Z'),
+    requestId: 'req-archive-again',
+  });
+  const activePayload = await buildAdminPublicAnalyticsPayload({
+    db,
+    now: NOW,
+    query: { days: '30' },
+  });
+  const archivedPayload = await buildAdminPublicAnalyticsPayload({
+    db,
+    now: NOW,
+    query: { days: '30', archive_status: 'archived' },
+  });
+  const unarchived = await unarchivePublicLeadCapture({
+    db,
+    leadId: '10000000-1000-4000-8000-000000000021',
+    requestId: 'req-unarchive',
+  });
+  const unarchivedAgain = await unarchivePublicLeadCapture({
+    db,
+    leadId: '10000000-1000-4000-8000-000000000021',
+    requestId: 'req-unarchive-again',
+  });
+  const restoredPayload = await buildAdminPublicAnalyticsPayload({
+    db,
+    now: NOW,
+    query: { days: '30' },
+  });
+
+  assert.equal(archived.ok, true);
+  assert.equal(archived.item.archived, true);
+  assert.equal(archived.item.archived_at, '2026-06-22T10:00:00.000Z');
+  assert.equal(archived.item.archive_reason, 'Handled');
+  assert.equal(archivedAgain.item.archived_at, '2026-06-22T10:00:00.000Z');
+  assert.equal(archivedAgain.item.archive_reason, 'Handled');
+  assert.deepEqual(activePayload.leads.items, []);
+  assert.equal(archivedPayload.leads.items[0].id, '10000000-1000-4000-8000-000000000021');
+  assert.equal(unarchived.item.archived, false);
+  assert.equal(unarchived.item.archived_at, null);
+  assert.equal(unarchivedAgain.item.archived, false);
+  assert.equal(restoredPayload.leads.items[0].id, '10000000-1000-4000-8000-000000000021');
+  assert.equal(db.tables.public_lead_drafts.length, 1);
+  assert.equal(db.tables.public_lead_drafts[0].email, 'lead@example.com');
+  assert.equal(db.tables.public_lead_drafts[0].message, 'Submitted message remains on the record.');
 });
 
 test('admin public analytics lead CSV export is bounded', async () => {

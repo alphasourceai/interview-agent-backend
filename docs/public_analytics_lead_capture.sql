@@ -52,9 +52,21 @@ create table if not exists public.public_lead_drafts (
   request_id text,
   submitted_at timestamptz,
   expires_at timestamptz not null default (now() + interval '90 days'),
+  archived_at timestamptz,
+  archived_by_user_id text,
+  archive_reason text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.public_lead_drafts
+  add column if not exists archived_at timestamptz;
+
+alter table public.public_lead_drafts
+  add column if not exists archived_by_user_id text;
+
+alter table public.public_lead_drafts
+  add column if not exists archive_reason text;
 
 create index if not exists public_lead_drafts_status_idx
   on public.public_lead_drafts (status, updated_at desc);
@@ -65,5 +77,8 @@ create index if not exists public_lead_drafts_email_idx
 
 create index if not exists public_lead_drafts_source_path_idx
   on public.public_lead_drafts (source_path, updated_at desc);
+
+create index if not exists public_lead_drafts_archive_status_idx
+  on public.public_lead_drafts (archived_at, updated_at desc);
 
 alter table public.public_lead_drafts enable row level security;
