@@ -1,7 +1,6 @@
 'use strict';
 
 const {
-  cachedLiveCall,
   costSummary,
   envConfigured,
   envEnabled,
@@ -16,6 +15,8 @@ const {
 } = require('./normalizePlatformHealth');
 
 const DEFAULT_SENTRY_API_BASE_URL = 'https://sentry.io/api/0';
+const OPEN_SENTRY_STATUSES = new Set(['unresolved', 'open']);
+const CLOSED_SENTRY_STATUSES = new Set(['resolved', 'ignored', 'archived', 'closed']);
 
 function sentryProjects(env) {
   const projects = [
@@ -133,6 +134,47 @@ function issueProjectSlug(issue) {
   return trimText(issue?.project);
 }
 
+function lowerIssueState(value) {
+  return trimText(value).toLowerCase();
+}
+
+function issueStatusDetail(issue, field) {
+  const details = issue?.statusDetails;
+  if (!details || typeof details !== 'object' || Array.isArray(details)) return '';
+  return lowerIssueState(details[field]);
+}
+
+function isClosedSentrySubstatus(substatus) {
+  if (!substatus) return false;
+  return CLOSED_SENTRY_STATUSES.has(substatus)
+    || substatus.startsWith('archived')
+    || substatus.startsWith('ignored')
+    || substatus.startsWith('resolved');
+}
+
+function hasSnoozeStatusDetails(issue) {
+  const details = issue?.statusDetails;
+  if (!details || typeof details !== 'object' || Array.isArray(details)) return false;
+  return Boolean(
+    details.ignoreUntil
+      || details.ignoreCount
+      || details.ignoreWindow
+      || details.ignoreUserCount
+      || details.ignoreUserWindow
+  );
+}
+
+function isOpenSentryIssue(issue) {
+  const status = lowerIssueState(issue?.status);
+  const statusDetailsStatus = issueStatusDetail(issue, 'status');
+  const substatus = lowerIssueState(issue?.substatus) || issueStatusDetail(issue, 'substatus');
+
+  if (CLOSED_SENTRY_STATUSES.has(status) || CLOSED_SENTRY_STATUSES.has(statusDetailsStatus)) return false;
+  if (isClosedSentrySubstatus(substatus) || hasSnoozeStatusDetails(issue)) return false;
+
+  return OPEN_SENTRY_STATUSES.has(status);
+}
+
 function safeIssueDetail(issue, project) {
   return {
     project: safeIssueText(project || issueProjectSlug(issue), 'Unknown project'),
@@ -174,7 +216,7 @@ async function fetchSentryIssues(context) {
     url.searchParams.append('project', project);
   }
   const data = await fetchJson(context, url.toString(), { headers });
-  const allIssues = Array.isArray(data) ? data : [];
+  const allIssues = (Array.isArray(data) ? data : []).filter(isOpenSentryIssue);
   for (const project of projects) {
     const issues = allIssues.filter((issue) => issueProjectSlug(issue) === project);
     projectRows.push({
@@ -218,11 +260,7 @@ async function buildSentryHealth(context) {
   if (apiConfigured && shouldRunLiveCheck(context, 'SENTRY_METRICS_ENABLED')) {
     try {
       if (apiBase.error) throw apiBase.error;
-      live = await cachedLiveCall(
-        context,
-        `sentry:${apiBase.cacheKey}:${envValue(env, ['SENTRY_ORG'])}:${projects.join(',')}:${sentryPeriod(context.dateRange)}`,
-        () => fetchSentryIssues(context)
-      );
+      live = await fetchSentryIssues(context);
       diagnostics.sentry_api_status = 'connected';
     } catch (error) {
       liveError = error;

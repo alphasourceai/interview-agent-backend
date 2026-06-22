@@ -240,7 +240,8 @@ function sendGridHealthContext(overrides = {}) {
       ...(overrides.signals || {}),
     },
     liveChecksEnabled: true,
-    cacheEnabled: false,
+    cacheEnabled: overrides.cacheEnabled === undefined ? false : overrides.cacheEnabled,
+    cacheTtlMs: overrides.cacheTtlMs,
     fetchImpl: overrides.fetchImpl,
     timeoutMs: overrides.timeoutMs,
   };
@@ -716,6 +717,122 @@ test('admin metrics Sentry API connected includes safe summary and recent issue 
   assert.deepEqual(sentryUrl.searchParams.getAll('project'), ['backend', 'frontend']);
   assert.equal(sentryCall.authorization, 'Bearer sentry-token-secret');
   assert.doesNotMatch(serialized, /sentry-token-secret|sentry-dsn-secret|person@example\.com|192\.168\.1\.4|10\.0\.0\.2|secret\.example|secret-token|sk-test|raw secret body|raw stack trace|raw-header-token|raw-cookie-secret/i);
+});
+
+test('admin metrics Sentry filters non-open issues after API response', async () => {
+  const service = await buildSentryHealth(sentryHealthContext({
+    env: {
+      SENTRY_AUTH_TOKEN: 'sentry-token-secret',
+      SENTRY_ORG: 'alpha-org',
+      SENTRY_PROJECT_BACKEND: 'backend',
+      SENTRY_PROJECT_FRONTEND: 'frontend',
+      SENTRY_METRICS_ENABLED: 'true',
+    },
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify([
+        {
+          project: { slug: 'backend' },
+          title: 'Unresolved TypeError',
+          status: 'unresolved',
+          count: '7',
+          userCount: '2',
+          firstSeen: '2026-06-17T10:00:00.000Z',
+          lastSeen: '2026-06-18T11:00:00.000Z',
+          permalink: 'https://alpha.sentry.io/issues/123/',
+        },
+        {
+          project: { slug: 'backend' },
+          title: 'Closed marker with raw-secret',
+          status: 'resolved',
+          count: '4',
+          firstSeen: '2026-06-17T10:00:00.000Z',
+          lastSeen: '2026-06-18T10:00:00.000Z',
+          metadata: { request_body: 'raw resolved payload' },
+        },
+        {
+          project: { slug: 'frontend' },
+          title: 'Ignored marker with raw-secret',
+          status: 'ignored',
+          count: '3',
+          firstSeen: '2026-06-17T10:00:00.000Z',
+          lastSeen: '2026-06-18T09:00:00.000Z',
+          statusDetails: { ignoreUntil: '2026-06-19T00:00:00.000Z' },
+        },
+        {
+          project: { slug: 'frontend' },
+          title: 'Archived marker with raw-secret',
+          status: 'unresolved',
+          substatus: 'archived_until_escalating',
+          count: '2',
+          firstSeen: '2026-06-17T10:00:00.000Z',
+          lastSeen: '2026-06-18T08:00:00.000Z',
+        },
+        {
+          project: { slug: 'frontend' },
+          title: 'Snoozed marker with raw-secret',
+          status: 'unresolved',
+          statusDetails: { substatus: 'archived_until_condition_met' },
+          count: '1',
+          firstSeen: '2026-06-17T10:00:00.000Z',
+          lastSeen: '2026-06-18T07:00:00.000Z',
+        },
+      ]),
+    }),
+  }));
+  const serialized = JSON.stringify(service);
+
+  assert.equal(service.live_api_connected, true);
+  assert.equal(service.usage_summary.find((row) => row.label === 'Recent issue details').value, 1);
+  assert.equal(service.problem_summary.find((row) => row.label === 'Open unresolved issues').value, 1);
+  assert.equal(service.problem_summary.find((row) => row.label === 'New issues in range').value, 1);
+  assert.equal(service.diagnostics.sentry_recent_issue_count, 1);
+  assert.equal(service.recent_issues.length, 1);
+  assert.equal(service.recent_issues[0].title, 'Unresolved TypeError');
+  assert.equal(service.recent_issues[0].status, 'unresolved');
+  assert.equal(service.recent_issues[0].count, 7);
+  assert.doesNotMatch(serialized, /Closed marker|Ignored marker|Archived marker|Snoozed marker|raw-secret|raw resolved payload/i);
+});
+
+test('admin metrics Sentry refresh does not reuse stale issue cache', async () => {
+  let calls = 0;
+  const context = sentryHealthContext({
+    cacheEnabled: true,
+    env: {
+      SENTRY_AUTH_TOKEN: 'sentry-token-secret',
+      SENTRY_ORG: 'alpha-org',
+      SENTRY_PROJECT_BACKEND: 'backend',
+      SENTRY_METRICS_ENABLED: 'true',
+    },
+    fetchImpl: async () => {
+      calls += 1;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(calls === 1 ? [{
+          project: { slug: 'backend' },
+          title: 'Issue resolved after first refresh',
+          status: 'unresolved',
+          count: '1',
+          firstSeen: '2026-06-17T10:00:00.000Z',
+          lastSeen: '2026-06-18T11:00:00.000Z',
+        }] : []),
+      };
+    },
+  });
+
+  const first = await buildSentryHealth(context);
+  const second = await buildSentryHealth({
+    ...context,
+    now: new Date('2026-06-18T12:00:30.000Z'),
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(first.problem_summary.find((row) => row.label === 'Open unresolved issues').value, 1);
+  assert.equal(first.recent_issues.length, 1);
+  assert.equal(second.problem_summary.find((row) => row.label === 'Open unresolved issues').value, 0);
+  assert.deepEqual(second.recent_issues, []);
 });
 
 test('admin metrics Sentry uses custom API base URL and trims trailing slash', async () => {
