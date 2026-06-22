@@ -180,6 +180,31 @@ test('admin public analytics payload returns sanitized leads and events', async 
         occurred_at: '2026-06-21T10:05:00.000Z',
         created_at: '2026-06-21T10:06:00.000Z',
       },
+      {
+        id: 'event-2',
+        event_name: 'cta_clicked',
+        path: '/',
+        properties: {
+          cta_label: 'Request a Demo',
+          cta_target: '/alphascreen',
+          placement: 'hero',
+          email: 'cta@example.com',
+        },
+        occurred_at: '2026-06-21T10:04:00.000Z',
+        created_at: '2026-06-21T10:04:30.000Z',
+      },
+      {
+        id: 'event-3',
+        event_name: 'lead_form_started',
+        path: '/alphascreen',
+        properties: {
+          form_id: 'home-contact',
+          form_type: 'contact',
+          first_field: 'email',
+        },
+        occurred_at: '2026-06-21T10:03:00.000Z',
+        created_at: '2026-06-21T10:03:30.000Z',
+      },
     ],
   });
 
@@ -192,7 +217,8 @@ test('admin public analytics payload returns sanitized leads and events', async 
 
   assert.equal(payload.summary.submitted_leads, 1);
   assert.equal(payload.summary.draft_or_partial_leads, 1);
-  assert.equal(payload.summary.public_analytics_events, 1);
+  assert.equal(payload.summary.public_analytics_events, 3);
+  assert.equal(payload.summary.most_active_page.display_name, 'alphaScreen');
   assert.equal(payload.leads.items[0].message_preview.includes('[redacted]'), true);
   assert.equal(payload.leads.items[1].message_preview, null);
   assert.deepEqual(payload.events.items[0].metadata_summary, [
@@ -200,10 +226,21 @@ test('admin public analytics payload returns sanitized leads and events', async 
     { key: 'scroll_depth', value: '75' },
     { key: 'nested', value: 'object' },
   ]);
+  assert.deepEqual(payload.insights.cta_activity[0], {
+    label: 'Request a Demo',
+    placement: 'hero',
+    target_path: '/alphascreen',
+    count: 1,
+    last_clicked_at: '2026-06-21T10:04:00.000Z',
+  });
+  assert.equal(payload.insights.page_activity[0].display_name, 'alphaScreen');
+  assert.equal(payload.insights.page_activity[0].form_activity, 2);
+  assert.equal(payload.insights.form_activity.some((item) => item.form_id === 'home-contact'), true);
+  assert.equal(payload.insights.event_types.some((item) => item.event_name === 'cta_clicked' && item.count === 1), true);
 
   const serialized = JSON.stringify(payload);
   assert.doesNotMatch(serialized, /anonymous-raw|session-raw|request-raw|anonymous-event|session-event|request-event/i);
-  assert.doesNotMatch(serialized, /sk-live-raw|person@example\.com|utm@example\.com|metadata@example\.com|raw-token|raw-secret|Partial draft message/i);
+  assert.doesNotMatch(serialized, /sk-live-raw|person@example\.com|utm@example\.com|metadata@example\.com|cta@example\.com|raw-token|raw-secret|Partial draft message/i);
 });
 
 test('admin public analytics supports filters and page-size pagination without raw payloads', async () => {

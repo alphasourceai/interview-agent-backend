@@ -8,6 +8,15 @@ const SUMMARY_LIMIT = 500;
 const VALID_LEAD_STATUSES = new Set(['partial', 'abandoned', 'submitted']);
 const SAFE_EVENT_NAME_RE = /^[a-z][a-z0-9_]{1,80}$/;
 const SENSITIVE_META_KEY_RE = /(authorization|bearer|cookie|token|secret|password|credential|email|phone|message|body|payload|form|name|ip|user[_-]?agent)/i;
+const PAGE_DISPLAY_NAMES = {
+  '/': 'Homepage',
+  '/alphascreen': 'alphaScreen',
+  '/about': 'About',
+  '/support': 'Support',
+  '/faq': 'FAQ',
+  '/privacy': 'Privacy Policy',
+  '/terms': 'Terms & Conditions',
+};
 
 function trimText(value, max = 300) {
   return String(value == null ? '' : value).trim().slice(0, max);
@@ -59,6 +68,12 @@ function cleanPath(value) {
   } catch (_) {
     return trimText(raw.split('?')[0].split('#')[0], 300);
   }
+}
+
+function pageDisplayName(path) {
+  const clean = cleanPath(path) || '/';
+  if (PAGE_DISPLAY_NAMES[clean]) return PAGE_DISPLAY_NAMES[clean];
+  return clean;
 }
 
 function parseFilters(query = {}, now = new Date()) {
@@ -148,11 +163,38 @@ function safeMetaValue(value) {
       .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [redacted]')
       .replace(/sk-[A-Za-z0-9._-]+/gi, '[redacted]')
       .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[redacted-email]')
+      .replace(/\+?\d[\d\s().-]{6,}\d/g, '[redacted-phone]')
       .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[redacted-ip]');
   }
   if (Array.isArray(value)) return `array(${Math.min(value.length, 20)})`;
   if (typeof value === 'object') return 'object';
   return '';
+}
+
+function eventDisplayName(eventName) {
+  const raw = trimText(eventName, 100) || 'unknown';
+  return raw
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function safeSummaryText(value, fallback = 'Unknown') {
+  const safe = safeMetaValue(value);
+  return trimText(safe, 120) || fallback;
+}
+
+function incrementCount(target, key, amount = 1) {
+  target[key] = (target[key] || 0) + amount;
+}
+
+function latestIso(...values) {
+  let latest = '';
+  for (const value of values) {
+    const raw = trimText(value, 40);
+    if (raw && (!latest || raw > latest)) latest = raw;
+  }
+  return latest;
 }
 
 function summarizeObject(value, maxItems = 4) {
@@ -275,7 +317,7 @@ function buildSummary(leadRows, eventRows) {
   }
   const mostActivePage = Object.entries(pageCounts)
     .sort((left, right) => Number(right[1]) - Number(left[1]))
-    .map(([path, count]) => ({ path, count }))
+    .map(([path, count]) => ({ path, display_name: pageDisplayName(path), count }))
     .at(0) || null;
   return {
     submitted_leads: leadCounts.submitted,
@@ -286,6 +328,168 @@ function buildSummary(leadRows, eventRows) {
     most_active_page: mostActivePage,
     recent_activity_at: recentActivityAt || null,
     sampled: leadRows.length >= SUMMARY_LIMIT || eventRows.length >= SUMMARY_LIMIT,
+  };
+}
+
+function buildPageActivitySummary(leadRows, eventRows) {
+  const pages = new Map();
+  const ensure = (path) => {
+    const clean = cleanPath(path) || '/';
+    if (!pages.has(clean)) {
+      pages.set(clean, {
+        path: clean,
+        display_name: pageDisplayName(clean),
+        event_count: 0,
+        page_views: 0,
+        cta_clicks: 0,
+        form_activity: 0,
+        lead_count: 0,
+        submitted_leads: 0,
+        draft_or_partial_leads: 0,
+        last_activity_at: null,
+      });
+    }
+    return pages.get(clean);
+  };
+
+  for (const event of eventRows) {
+    const page = ensure(event?.path);
+    const eventName = trimText(event?.event_name, 100);
+    page.event_count += 1;
+    if (eventName === 'page_viewed') page.page_views += 1;
+    if (eventName === 'cta_clicked') page.cta_clicks += 1;
+    if (eventName.startsWith('lead_form_') || eventName.startsWith('lead_draft_')) page.form_activity += 1;
+    page.last_activity_at = latestIso(page.last_activity_at, event?.occurred_at, event?.created_at) || null;
+  }
+
+  for (const lead of leadRows) {
+    const page = ensure(lead?.source_path);
+    const status = trimText(lead?.status, 40).toLowerCase();
+    page.lead_count += 1;
+    if (status === 'submitted') page.submitted_leads += 1;
+    if (status === 'partial' || status === 'abandoned') page.draft_or_partial_leads += 1;
+    page.last_activity_at = latestIso(page.last_activity_at, lead?.updated_at, lead?.submitted_at, lead?.created_at) || null;
+  }
+
+  return Array.from(pages.values())
+    .sort((left, right) => {
+      const activityDelta = Number(right.event_count + right.lead_count) - Number(left.event_count + left.lead_count);
+      if (activityDelta !== 0) return activityDelta;
+      return String(right.last_activity_at || '').localeCompare(String(left.last_activity_at || ''));
+    })
+    .slice(0, 8);
+}
+
+function buildEventTypeSummary(eventRows) {
+  const counts = {};
+  for (const event of eventRows) {
+    const eventName = trimText(event?.event_name, 100) || 'unknown';
+    incrementCount(counts, eventName);
+  }
+  return Object.entries(counts)
+    .sort((left, right) => Number(right[1]) - Number(left[1]))
+    .slice(0, 10)
+    .map(([event_name, count]) => ({
+      event_name,
+      display_name: eventDisplayName(event_name),
+      count,
+    }));
+}
+
+function buildCtaActivitySummary(eventRows) {
+  const ctas = new Map();
+  for (const event of eventRows) {
+    if (trimText(event?.event_name, 100) !== 'cta_clicked') continue;
+    const properties = event?.properties && typeof event.properties === 'object' ? event.properties : {};
+    const label = safeSummaryText(properties.cta_label, 'Unknown CTA');
+    const placement = safeSummaryText(properties.placement, 'Unknown placement');
+    const targetPath = cleanPath(properties.cta_target) || safeSummaryText(properties.cta_target, 'Unknown target');
+    const key = `${label}|${placement}|${targetPath}`;
+    const existing = ctas.get(key) || {
+      label,
+      placement,
+      target_path: targetPath,
+      count: 0,
+      last_clicked_at: null,
+    };
+    existing.count += 1;
+    existing.last_clicked_at = latestIso(existing.last_clicked_at, event?.occurred_at || event?.created_at) || null;
+    ctas.set(key, existing);
+  }
+  return Array.from(ctas.values())
+    .sort((left, right) => {
+      const countDelta = Number(right.count) - Number(left.count);
+      if (countDelta !== 0) return countDelta;
+      return String(right.last_clicked_at || '').localeCompare(String(left.last_clicked_at || ''));
+    })
+    .slice(0, 8);
+}
+
+function buildFormActivitySummary(leadRows, eventRows) {
+  const forms = new Map();
+  const ensure = (formId, formType = '', productInterest = '') => {
+    const safeFormId = safeSummaryText(formId, 'unknown-form');
+    const safeFormType = safeSummaryText(formType, 'unknown');
+    const safeProductInterest = safeSummaryText(productInterest, '');
+    const key = `${safeFormId}|${safeFormType}|${safeProductInterest}`;
+    if (!forms.has(key)) {
+      forms.set(key, {
+        form_id: safeFormId,
+        form_type: safeFormType,
+        product_interest: safeProductInterest || null,
+        event_count: 0,
+        viewed: 0,
+        started: 0,
+        submitted_events: 0,
+        abandoned_events: 0,
+        draft_saved_events: 0,
+        lead_count: 0,
+        submitted_leads: 0,
+        draft_or_partial_leads: 0,
+        last_activity_at: null,
+      });
+    }
+    return forms.get(key);
+  };
+
+  for (const event of eventRows) {
+    const eventName = trimText(event?.event_name, 100);
+    if (!eventName.startsWith('lead_form_') && !eventName.startsWith('lead_draft_')) continue;
+    const properties = event?.properties && typeof event.properties === 'object' ? event.properties : {};
+    const form = ensure(properties.form_id, properties.form_type);
+    form.event_count += 1;
+    if (eventName === 'lead_form_viewed') form.viewed += 1;
+    if (eventName === 'lead_form_started') form.started += 1;
+    if (eventName === 'lead_form_submit_succeeded') form.submitted_events += 1;
+    if (eventName === 'lead_form_abandoned') form.abandoned_events += 1;
+    if (eventName === 'lead_draft_saved') form.draft_saved_events += 1;
+    form.last_activity_at = latestIso(form.last_activity_at, event?.occurred_at, event?.created_at) || null;
+  }
+
+  for (const lead of leadRows) {
+    const form = ensure(lead?.form_id, lead?.form_type, lead?.product_interest);
+    const status = trimText(lead?.status, 40).toLowerCase();
+    form.lead_count += 1;
+    if (status === 'submitted') form.submitted_leads += 1;
+    if (status === 'partial' || status === 'abandoned') form.draft_or_partial_leads += 1;
+    form.last_activity_at = latestIso(form.last_activity_at, lead?.updated_at, lead?.submitted_at, lead?.created_at) || null;
+  }
+
+  return Array.from(forms.values())
+    .sort((left, right) => {
+      const activityDelta = Number(right.lead_count + right.event_count) - Number(left.lead_count + left.event_count);
+      if (activityDelta !== 0) return activityDelta;
+      return String(right.last_activity_at || '').localeCompare(String(left.last_activity_at || ''));
+    })
+    .slice(0, 8);
+}
+
+function buildInsights(leadRows, eventRows) {
+  return {
+    page_activity: buildPageActivitySummary(leadRows, eventRows),
+    event_types: buildEventTypeSummary(eventRows),
+    cta_activity: buildCtaActivitySummary(eventRows),
+    form_activity: buildFormActivitySummary(leadRows, eventRows),
   };
 }
 
@@ -322,6 +526,7 @@ async function buildAdminPublicAnalyticsPayload({ db, query = {}, now = new Date
       event_limit: filters.event_limit,
     },
     summary: buildSummary(leadSummaryRows, eventSummaryRows),
+    insights: buildInsights(leadSummaryRows, eventSummaryRows),
     leads: {
       items: leadRows.slice(0, filters.lead_limit),
       pagination: paginate(leadRowsRaw, filters.lead_page, filters.lead_limit),
@@ -350,4 +555,5 @@ module.exports = {
   safePublicAnalyticsErrorBody,
   sanitizeEvent,
   sanitizeLead,
+  buildInsights,
 };
