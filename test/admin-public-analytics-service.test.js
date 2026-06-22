@@ -6,10 +6,12 @@ const path = require('node:path');
 const { test } = require('node:test');
 const {
   archivePublicLeadCapture,
+  BULK_ARCHIVE_LIMIT,
   buildAdminPublicAnalyticsLeadsCsv,
   buildAdminPublicAnalyticsPayload,
   CSV_EXPORT_LIMIT,
   unarchivePublicLeadCapture,
+  updatePublicLeadCaptureArchiveBatch,
 } = require('../src/lib/adminPublicAnalyticsService');
 
 class FakeQuery {
@@ -167,6 +169,8 @@ test('admin public analytics route is registered behind admin auth and public wr
   const appSource = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
   assert.match(appSource, /adminRouter\.get\('\/public-analytics', requireAuth, requireAdmin/);
   assert.match(appSource, /adminRouter\.get\('\/public-analytics\/leads\.csv', requireAuth, requireAdmin/);
+  assert.match(appSource, /adminRouter\.post\('\/public-analytics\/leads\/archive', requireAuth, requireAdmin/);
+  assert.match(appSource, /adminRouter\.post\('\/public-analytics\/leads\/unarchive', requireAuth, requireAdmin/);
   assert.match(appSource, /adminRouter\.post\('\/public-analytics\/leads\/:id\/archive', requireAuth, requireAdmin/);
   assert.match(appSource, /adminRouter\.post\('\/public-analytics\/leads\/:id\/unarchive', requireAuth, requireAdmin/);
   assert.match(appSource, /Content-Disposition/);
@@ -593,6 +597,141 @@ test('admin public analytics archive and unarchive are idempotent and preserve l
   assert.equal(db.tables.public_lead_drafts.length, 1);
   assert.equal(db.tables.public_lead_drafts[0].email, 'lead@example.com');
   assert.equal(db.tables.public_lead_drafts[0].message, 'Submitted message remains on the record.');
+});
+
+test('admin public analytics bulk archive and unarchive selected leads safely', async () => {
+  const db = makeDb({
+    public_lead_drafts: [
+      {
+        id: '10000000-1000-4000-8000-000000000031',
+        status: 'submitted',
+        email: 'lead-one@example.com',
+        source_path: '/alphascreen',
+        archived_at: null,
+        created_at: '2026-06-21T09:00:00.000Z',
+        updated_at: '2026-06-21T10:00:00.000Z',
+      },
+      {
+        id: '10000000-1000-4000-8000-000000000032',
+        status: 'partial',
+        email: 'lead-two@example.com',
+        source_path: '/alphascreen',
+        archived_at: null,
+        created_at: '2026-06-21T08:00:00.000Z',
+        updated_at: '2026-06-21T09:00:00.000Z',
+      },
+      {
+        id: '10000000-1000-4000-8000-000000000033',
+        status: 'submitted',
+        email: 'already-archived@example.com',
+        source_path: '/alphascreen',
+        archived_at: '2026-06-22T09:00:00.000Z',
+        archive_reason: 'Handled earlier',
+        created_at: '2026-06-21T07:00:00.000Z',
+        updated_at: '2026-06-21T08:00:00.000Z',
+      },
+    ],
+  });
+
+  const archived = await updatePublicLeadCaptureArchiveBatch({
+    db,
+    leadIds: [
+      '10000000-1000-4000-8000-000000000031',
+      '10000000-1000-4000-8000-000000000032',
+      '10000000-1000-4000-8000-000000000033',
+    ],
+    archive: true,
+    actorUserId: 'admin-user-1',
+    reason: 'Selected in admin',
+    now: new Date('2026-06-22T10:00:00.000Z'),
+    requestId: 'req-bulk-archive',
+  });
+  const activeAfterArchive = await buildAdminPublicAnalyticsPayload({
+    db,
+    now: NOW,
+    query: { days: '30' },
+  });
+  const archivedAfterArchive = await buildAdminPublicAnalyticsPayload({
+    db,
+    now: NOW,
+    query: { days: '30', archive_status: 'archived' },
+  });
+  const unarchived = await updatePublicLeadCaptureArchiveBatch({
+    db,
+    leadIds: [
+      '10000000-1000-4000-8000-000000000031',
+      '10000000-1000-4000-8000-000000000032',
+    ],
+    archive: false,
+    requestId: 'req-bulk-unarchive',
+  });
+  const activeAfterUnarchive = await buildAdminPublicAnalyticsPayload({
+    db,
+    now: NOW,
+    query: { days: '30' },
+  });
+
+  assert.deepEqual(archived, {
+    ok: true,
+    requested_count: 3,
+    updated_count: 2,
+    skipped_count: 1,
+    request_id: 'req-bulk-archive',
+  });
+  assert.deepEqual(activeAfterArchive.leads.items, []);
+  assert.deepEqual(archivedAfterArchive.leads.items.map((lead) => lead.id), [
+    '10000000-1000-4000-8000-000000000031',
+    '10000000-1000-4000-8000-000000000032',
+    '10000000-1000-4000-8000-000000000033',
+  ]);
+  assert.equal(db.tables.public_lead_drafts.length, 3);
+  assert.equal(db.tables.public_lead_drafts[0].email, 'lead-one@example.com');
+  assert.equal(archivedAfterArchive.leads.items[0].archived_at, '2026-06-22T10:00:00.000Z');
+  assert.equal(db.tables.public_lead_drafts[2].archive_reason, 'Handled earlier');
+  assert.deepEqual(unarchived, {
+    ok: true,
+    requested_count: 2,
+    updated_count: 2,
+    skipped_count: 0,
+    request_id: 'req-bulk-unarchive',
+  });
+  assert.deepEqual(activeAfterUnarchive.leads.items.map((lead) => lead.id), [
+    '10000000-1000-4000-8000-000000000031',
+    '10000000-1000-4000-8000-000000000032',
+  ]);
+  assert.equal(db.tables.public_lead_drafts[0].archived_at, null);
+});
+
+test('admin public analytics bulk archive rejects invalid and oversized selections', async () => {
+  const db = makeDb();
+  await assert.rejects(
+    () => updatePublicLeadCaptureArchiveBatch({
+      db,
+      leadIds: ['not-a-valid-id'],
+      archive: true,
+      requestId: 'req-invalid',
+    }),
+    (error) => error.status === 400 && error.code === 'invalid_public_lead_id'
+  );
+  await assert.rejects(
+    () => updatePublicLeadCaptureArchiveBatch({
+      db,
+      leadIds: [],
+      archive: true,
+      requestId: 'req-empty',
+    }),
+    (error) => error.status === 400 && error.code === 'public_lead_ids_required'
+  );
+  await assert.rejects(
+    () => updatePublicLeadCaptureArchiveBatch({
+      db,
+      leadIds: Array.from({ length: BULK_ARCHIVE_LIMIT + 1 }, (_, index) => `10000000-1000-4000-8000-${String(index).padStart(12, '0')}`),
+      archive: true,
+      requestId: 'req-too-many',
+    }),
+    (error) => error.status === 400 && error.code === 'too_many_public_lead_ids'
+  );
+  assert.deepEqual(db.tables.public_lead_drafts, []);
 });
 
 test('admin public analytics lead CSV export is bounded', async () => {

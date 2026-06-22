@@ -78,6 +78,7 @@ const {
   buildAdminPublicAnalyticsPayload,
   safePublicAnalyticsErrorBody,
   unarchivePublicLeadCapture,
+  updatePublicLeadCaptureArchiveBatch,
 } = require('./src/lib/adminPublicAnalyticsService')
 const { sendSubscriptionCheckoutEmail, sendMemberRecoveryEmail } = require('./utils/mailer')
 const {
@@ -2513,6 +2514,50 @@ adminRouter.get('/public-analytics/leads.csv', requireAuth, requireAdmin, async 
   } catch (error) {
     const body = safePublicAnalyticsErrorBody(error, request_id)
     console.error('[admin/public-analytics/leads.csv] failed', {
+      request_id,
+      code: body.code,
+      detail: body.detail
+    })
+    return sendAdminError(res, error?.status || 500, body)
+  }
+})
+
+adminRouter.post('/public-analytics/leads/archive', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const payload = await updatePublicLeadCaptureArchiveBatch({
+      db: supabaseAdmin,
+      leadIds: req.body?.lead_ids,
+      archive: true,
+      actorUserId: req.user?.id || null,
+      reason: req.body?.reason || '',
+      requestId: request_id
+    })
+    return res.json(payload)
+  } catch (error) {
+    const body = safePublicAnalyticsErrorBody(error, request_id)
+    console.error('[admin/public-analytics/leads/bulk-archive] failed', {
+      request_id,
+      code: body.code,
+      detail: body.detail
+    })
+    return sendAdminError(res, error?.status || 500, body)
+  }
+})
+
+adminRouter.post('/public-analytics/leads/unarchive', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const payload = await updatePublicLeadCaptureArchiveBatch({
+      db: supabaseAdmin,
+      leadIds: req.body?.lead_ids,
+      archive: false,
+      requestId: request_id
+    })
+    return res.json(payload)
+  } catch (error) {
+    const body = safePublicAnalyticsErrorBody(error, request_id)
+    console.error('[admin/public-analytics/leads/bulk-unarchive] failed', {
       request_id,
       code: body.code,
       detail: body.detail

@@ -6,6 +6,7 @@ const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
 const SUMMARY_LIMIT = 500;
 const CSV_EXPORT_LIMIT = 1000;
+const BULK_ARCHIVE_LIMIT = 50;
 const VALID_LEAD_STATUSES = new Set(['partial', 'abandoned', 'submitted']);
 const VALID_ARCHIVE_STATUSES = new Set(['active', 'archived', 'all']);
 const SAFE_EVENT_NAME_RE = /^[a-z][a-z0-9_]{1,80}$/;
@@ -748,6 +749,70 @@ async function unarchivePublicLeadCapture({ db, leadId, requestId = null } = {})
   };
 }
 
+function normalizeBulkLeadIds(value, requestId) {
+  const ids = Array.isArray(value) ? value : [];
+  const unique = Array.from(new Set(ids.map((id) => trimText(id, 80)).filter(Boolean)));
+  if (unique.length === 0) {
+    throw publicAnalyticsServiceError(400, 'public_lead_ids_required', 'At least one public lead capture id is required.', requestId);
+  }
+  if (unique.length > BULK_ARCHIVE_LIMIT) {
+    throw publicAnalyticsServiceError(400, 'too_many_public_lead_ids', `Select ${BULK_ARCHIVE_LIMIT} or fewer lead captures at a time.`, requestId);
+  }
+  if (unique.some((id) => !UUID_RE.test(id))) {
+    throw publicAnalyticsServiceError(400, 'invalid_public_lead_id', 'All public lead capture ids must be valid ids.', requestId);
+  }
+  return unique;
+}
+
+async function updatePublicLeadCaptureArchiveBatch({
+  db,
+  leadIds,
+  archive = true,
+  actorUserId = null,
+  reason = '',
+  now = new Date(),
+  requestId = null,
+} = {}) {
+  if (!db || typeof db.from !== 'function') {
+    throw publicAnalyticsServiceError(503, 'public_analytics_db_missing', 'Database client is not configured.', requestId);
+  }
+  const ids = normalizeBulkLeadIds(leadIds, requestId);
+  const archivedAt = (now instanceof Date && Number.isFinite(now.getTime()) ? now : new Date()).toISOString();
+  let updatedCount = 0;
+  let skippedCount = 0;
+
+  for (const id of ids) {
+    const existing = await readLeadForMutation(db, id, requestId);
+    const isArchived = Boolean(trimText(existing.archived_at, 40));
+    if (archive && isArchived) {
+      skippedCount += 1;
+      continue;
+    }
+    if (!archive && !isArchived) {
+      skippedCount += 1;
+      continue;
+    }
+    await updateLeadArchiveState(db, id, archive ? {
+      archived_at: archivedAt,
+      archived_by_user_id: trimText(actorUserId, 120) || null,
+      archive_reason: trimText(reason, 200) || 'Manual admin archive',
+    } : {
+      archived_at: null,
+      archived_by_user_id: null,
+      archive_reason: null,
+    }, requestId);
+    updatedCount += 1;
+  }
+
+  return {
+    ok: true,
+    requested_count: ids.length,
+    updated_count: updatedCount,
+    skipped_count: skippedCount,
+    request_id: requestId || null,
+  };
+}
+
 function safePublicAnalyticsErrorBody(error, requestId) {
   return {
     error: error?.code || 'admin_public_analytics_failed',
@@ -760,6 +825,7 @@ function safePublicAnalyticsErrorBody(error, requestId) {
 
 module.exports = {
   archivePublicLeadCapture,
+  BULK_ARCHIVE_LIMIT,
   buildAdminPublicAnalyticsLeadsCsv,
   buildAdminPublicAnalyticsPayload,
   CSV_EXPORT_LIMIT,
@@ -769,4 +835,5 @@ module.exports = {
   sanitizeLead,
   buildInsights,
   unarchivePublicLeadCapture,
+  updatePublicLeadCaptureArchiveBatch,
 };
