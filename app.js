@@ -72,7 +72,7 @@ const { createSubscriptionCheckoutSession } = require('./src/lib/subscriptionChe
 const { processClientEntityImport } = require('./src/lib/clientEntityImportService')
 const { archiveChildClientEntity, restoreChildClientEntity } = require('./src/lib/clientEntityArchive')
 const { buildAdminMetricsPayload, safeErrorBody } = require('./src/lib/adminMetricsService')
-const { buildAdminPublicAnalyticsPayload, safePublicAnalyticsErrorBody } = require('./src/lib/adminPublicAnalyticsService')
+const { buildAdminPublicAnalyticsLeadsCsv, buildAdminPublicAnalyticsPayload, safePublicAnalyticsErrorBody } = require('./src/lib/adminPublicAnalyticsService')
 const { sendSubscriptionCheckoutEmail, sendMemberRecoveryEmail } = require('./utils/mailer')
 const {
   frontendUrl: FRONTEND_URL,
@@ -2484,6 +2484,29 @@ adminRouter.get('/public-analytics', requireAuth, requireAdmin, async (req, res)
   } catch (error) {
     const body = safePublicAnalyticsErrorBody(error, request_id)
     console.error('[admin/public-analytics] failed', {
+      request_id,
+      code: body.code,
+      detail: body.detail
+    })
+    return sendAdminError(res, error?.status || 500, body)
+  }
+})
+
+adminRouter.get('/public-analytics/leads.csv', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const payload = await buildAdminPublicAnalyticsLeadsCsv({
+      db: supabaseAdmin,
+      query: req.query || {}
+    })
+    res.setHeader('Content-Type', payload.content_type)
+    res.setHeader('Content-Disposition', `attachment; filename="${payload.filename}"`)
+    res.setHeader('X-Export-Row-Count', String(payload.row_count))
+    res.setHeader('X-Export-Truncated', payload.truncated ? 'true' : 'false')
+    return res.status(200).send(payload.csv)
+  } catch (error) {
+    const body = safePublicAnalyticsErrorBody(error, request_id)
+    console.error('[admin/public-analytics/leads.csv] failed', {
       request_id,
       code: body.code,
       detail: body.detail

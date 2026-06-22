@@ -5,6 +5,7 @@ const MAX_DAYS = 365;
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 100;
 const SUMMARY_LIMIT = 500;
+const CSV_EXPORT_LIMIT = 1000;
 const VALID_LEAD_STATUSES = new Set(['partial', 'abandoned', 'submitted']);
 const SAFE_EVENT_NAME_RE = /^[a-z][a-z0-9_]{1,80}$/;
 const SENSITIVE_META_KEY_RE = /(authorization|bearer|cookie|token|secret|password|credential|email|phone|message|body|payload|form|name|ip|user[_-]?agent)/i;
@@ -128,12 +129,13 @@ function pageRange(page, limit) {
   return { from: offset, to: offset + limit };
 }
 
-async function readLeadRows(db, filters, { page = 1, limit = DEFAULT_LIMIT, summary = false } = {}) {
+async function readLeadRows(db, filters, { page = 1, limit = DEFAULT_LIMIT, summary = false, exportRows = false } = {}) {
   let query = db
     .from('public_lead_drafts')
     .select('id,status,form_id,form_type,product_interest,first_name,last_name,email,phone,message,fields_completed,last_field,source_path,source_referrer_path,source_cta,utm,privacy_notice_version,submitted_at,expires_at,created_at,updated_at');
   query = applyLeadFilters(query, filters).order('updated_at', { ascending: false });
   if (summary) query = query.limit(SUMMARY_LIMIT);
+  else if (exportRows) query = query.limit(CSV_EXPORT_LIMIT + 1);
   else {
     const range = pageRange(page, limit);
     query = query.range(range.from, range.to);
@@ -493,6 +495,96 @@ function buildInsights(leadRows, eventRows) {
   };
 }
 
+function csvCell(value) {
+  let text = trimText(value, 500).replace(/\r?\n|\r/g, ' ');
+  if (/^[=+\-@]/.test(text)) text = `'${text}`;
+  if (/[",\n\r]/.test(text)) text = `"${text.replace(/"/g, '""')}"`;
+  return text;
+}
+
+function csvLine(values) {
+  return values.map(csvCell).join(',');
+}
+
+function buildLeadCsvRow(lead) {
+  const submitted = String(lead.status || '').toLowerCase() === 'submitted';
+  return [
+    lead.created_at || '',
+    lead.updated_at || '',
+    lead.status || '',
+    submitted ? 'yes' : 'no',
+    lead.submitted_at || '',
+    pageDisplayName(lead.source?.path),
+    lead.source?.path || '/',
+    lead.form_id || '',
+    lead.form_type || '',
+    lead.product_interest || '',
+    lead.contact?.full_name || '',
+    lead.contact?.first_name || '',
+    lead.contact?.last_name || '',
+    lead.contact?.email || '',
+    lead.contact?.phone || '',
+    String(lead.progress?.fields_completed_count || 0),
+    Array.isArray(lead.progress?.fields_completed) ? lead.progress.fields_completed.join('; ') : '',
+    lead.progress?.last_field || '',
+    lead.source?.cta || '',
+    lead.message_preview || '',
+  ];
+}
+
+function csvFilename(filters) {
+  const from = filters.date_from_display || 'start';
+  const to = filters.date_to_display || 'end';
+  const status = filters.lead_status || 'all';
+  return `public-leads-${from}-to-${to}-${status}.csv`;
+}
+
+async function buildAdminPublicAnalyticsLeadsCsv({ db, query = {}, now = new Date() } = {}) {
+  if (!db || typeof db.from !== 'function') {
+    const error = new Error('Database client is not configured.');
+    error.code = 'public_analytics_db_missing';
+    error.status = 503;
+    throw error;
+  }
+  const filters = parseFilters(query, now);
+  const rawRows = await readLeadRows(db, filters, { exportRows: true });
+  const truncated = rawRows.length > CSV_EXPORT_LIMIT;
+  const leads = rawRows.slice(0, CSV_EXPORT_LIMIT).map(sanitizeLead);
+  const header = [
+    'created_at',
+    'updated_at',
+    'status',
+    'submitted',
+    'submitted_at',
+    'source_page',
+    'source_path',
+    'form_id',
+    'form_type',
+    'product_interest',
+    'full_name',
+    'first_name',
+    'last_name',
+    'email',
+    'phone',
+    'fields_completed_count',
+    'fields_completed',
+    'last_field',
+    'cta',
+    'submitted_message_preview_redacted',
+  ];
+  return {
+    content_type: 'text/csv; charset=utf-8',
+    filename: csvFilename(filters),
+    row_count: leads.length,
+    limit: CSV_EXPORT_LIMIT,
+    truncated,
+    csv: [
+      csvLine(header),
+      ...leads.map(buildLeadCsvRow).map(csvLine),
+    ].join('\n') + '\n',
+  };
+}
+
 async function buildAdminPublicAnalyticsPayload({ db, query = {}, now = new Date(), requestId = null } = {}) {
   if (!db || typeof db.from !== 'function') {
     const error = new Error('Database client is not configured.');
@@ -550,7 +642,9 @@ function safePublicAnalyticsErrorBody(error, requestId) {
 }
 
 module.exports = {
+  buildAdminPublicAnalyticsLeadsCsv,
   buildAdminPublicAnalyticsPayload,
+  CSV_EXPORT_LIMIT,
   parseFilters,
   safePublicAnalyticsErrorBody,
   sanitizeEvent,

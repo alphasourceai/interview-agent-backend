@@ -5,7 +5,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { test } = require('node:test');
 const {
+  buildAdminPublicAnalyticsLeadsCsv,
   buildAdminPublicAnalyticsPayload,
+  CSV_EXPORT_LIMIT,
 } = require('../src/lib/adminPublicAnalyticsService');
 
 class FakeQuery {
@@ -115,6 +117,9 @@ const NOW = new Date('2026-06-22T12:00:00.000Z');
 test('admin public analytics route is registered behind admin auth and public write routes remain mounted', () => {
   const appSource = fs.readFileSync(path.join(__dirname, '..', 'app.js'), 'utf8');
   assert.match(appSource, /adminRouter\.get\('\/public-analytics', requireAuth, requireAdmin/);
+  assert.match(appSource, /adminRouter\.get\('\/public-analytics\/leads\.csv', requireAuth, requireAdmin/);
+  assert.match(appSource, /Content-Disposition/);
+  assert.match(appSource, /X-Export-Row-Count/);
   assert.match(appSource, /app\.use\('\/api\/public-analytics', require\('\.\/routes\/publicAnalytics'\)\)/);
   assert.match(appSource, /app\.use\('\/api\/public-leads', require\('\.\/routes\/publicLeads'\)\)/);
 });
@@ -281,4 +286,98 @@ test('admin public analytics supports filters and page-size pagination without r
   assert.equal(payload.events.items.length, 2);
   assert.equal(payload.events.pagination.has_more, true);
   assert.deepEqual(payload.events.items.map((item) => item.id), ['event-1', 'event-2']);
+});
+
+test('admin public analytics lead CSV export is sanitized and respects filters', async () => {
+  const db = makeDb({
+    public_lead_drafts: [
+      {
+        id: 'lead-export-1',
+        status: 'submitted',
+        form_id: 'demo-form',
+        form_type: 'demo',
+        product_interest: 'alphaScreen',
+        first_name: 'Ada',
+        last_name: 'Lovelace',
+        email: 'lead@example.com',
+        phone: '+1 555 111 2222',
+        message: '=Formula token sk-live-raw person@example.com 555-111-2222',
+        fields_completed: ['first_name', 'email', 'message'],
+        last_field: 'message',
+        source_path: '/alphascreen',
+        source_cta: 'hero-demo',
+        anonymous_id: 'anonymous-raw',
+        session_id: 'session-raw',
+        request_id: 'request-raw',
+        submitted_at: '2026-06-21T10:00:00.000Z',
+        created_at: '2026-06-21T09:45:00.000Z',
+        updated_at: '2026-06-21T10:00:00.000Z',
+      },
+      {
+        id: 'lead-export-2',
+        status: 'partial',
+        email: 'partial@example.com',
+        message: 'Partial draft message should not export.',
+        fields_completed: ['email'],
+        source_path: '/alphascreen',
+        created_at: '2026-06-21T09:00:00.000Z',
+        updated_at: '2026-06-21T09:00:00.000Z',
+      },
+      {
+        id: 'lead-export-3',
+        status: 'submitted',
+        email: 'other@example.com',
+        source_path: '/about',
+        created_at: '2026-06-21T08:00:00.000Z',
+        updated_at: '2026-06-21T08:00:00.000Z',
+      },
+    ],
+  });
+
+  const payload = await buildAdminPublicAnalyticsLeadsCsv({
+    db,
+    now: NOW,
+    query: {
+      date_from: '2026-06-20',
+      date_to: '2026-06-22',
+      status: 'submitted',
+      path: '/alphascreen?ignored=true',
+    },
+  });
+
+  assert.equal(payload.content_type, 'text/csv; charset=utf-8');
+  assert.equal(payload.filename, 'public-leads-2026-06-20-to-2026-06-22-submitted.csv');
+  assert.equal(payload.row_count, 1);
+  assert.equal(payload.truncated, false);
+  assert.match(payload.csv, /^created_at,updated_at,status,submitted,submitted_at,source_page,source_path/m);
+  assert.match(payload.csv, /lead@example\.com/);
+  assert.match(payload.csv, /alphaScreen,\/alphascreen/);
+  assert.match(payload.csv, /hero-demo/);
+  assert.match(payload.csv, /\[redacted\]/);
+
+  assert.doesNotMatch(payload.csv, /lead-export-1|anonymous-raw|session-raw|request-raw/i);
+  assert.doesNotMatch(payload.csv, /sk-live-raw|person@example\.com|555-111-2222|Partial draft message|partial@example\.com|other@example\.com/i);
+  assert.doesNotMatch(payload.csv, /^=/m);
+});
+
+test('admin public analytics lead CSV export is bounded', async () => {
+  const publicLeadDrafts = Array.from({ length: CSV_EXPORT_LIMIT + 5 }, (_, index) => ({
+    id: `lead-${index}`,
+    status: 'submitted',
+    email: `lead${index}@example.com`,
+    source_path: '/alphascreen',
+    created_at: '2026-06-21T08:00:00.000Z',
+    updated_at: `2026-06-21T08:${String(index % 60).padStart(2, '0')}:00.000Z`,
+  }));
+  const db = makeDb({ public_lead_drafts: publicLeadDrafts });
+
+  const payload = await buildAdminPublicAnalyticsLeadsCsv({
+    db,
+    now: NOW,
+    query: { days: '30' },
+  });
+
+  assert.equal(payload.row_count, CSV_EXPORT_LIMIT);
+  assert.equal(payload.truncated, true);
+  assert.equal(payload.csv.trim().split('\n').length, CSV_EXPORT_LIMIT + 1);
 });
