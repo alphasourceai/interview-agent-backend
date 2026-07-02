@@ -1,9 +1,9 @@
 'use strict';
 
 const MANAGE_SCOPE_ROLES = new Set(['manager', 'admin', 'owner', 'super_admin']);
-const MANAGE_MEMBER_ROLES = new Set(['admin', 'owner', 'super_admin']);
-const LEGAL_BILLING_ROLES = new Set(['admin', 'owner', 'super_admin']);
-const CHILD_EXPANSION_ROLES = new Set(['admin', 'owner', 'super_admin']);
+const MANAGE_MEMBER_ROLES = new Set(['manager', 'admin', 'owner', 'super_admin']);
+const LEGAL_BILLING_ROLES = new Set(['manager', 'admin', 'owner', 'super_admin']);
+const CHILD_EXPANSION_ROLES = new Set(['manager', 'admin', 'owner', 'super_admin']);
 const ROLE_RANK = {
   tester: 0,
   member: 1,

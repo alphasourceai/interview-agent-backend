@@ -1,10 +1,10 @@
 // src/middleware/auth.js
-const jwt = require('jsonwebtoken');
-const { supabaseAdmin } = require('../lib/supabaseClient');
+const { supabaseAdmin, supabaseAnon } = require('../lib/supabaseClient');
 const { buildClientScopeContext } = require('../lib/clientScope');
 
 const supabase = supabaseAdmin;
 const ROLE_PRIORITY = ['super_admin', 'owner', 'admin', 'manager', 'member', 'tester'];
+const PARENT_CHILD_EXPANSION_ROLES = new Set(['manager', 'admin', 'owner', 'super_admin']);
 
 /**
  * Extract a bearer token from:
@@ -73,7 +73,7 @@ function strongestRole(roles, fallback = 'member') {
 
 /**
  * Auth middleware
- * - Decodes the Supabase JWT (no verification here; Supabase will verify on DB calls via RLS)
+ * - Verifies the Supabase access token with Supabase Auth before trusting identity
  * - Attaches req.user and req.userToken
  */
 async function requireAuth(req, res, next) {
@@ -81,12 +81,22 @@ async function requireAuth(req, res, next) {
     const token = getToken(req);
     if (!token) return res.status(401).json({ error: 'Missing bearer token' });
 
-    const decoded = jwt.decode(token);
-    // Supabase JWT normally includes `sub` as the user id
-    const sub = decoded && (decoded.sub || decoded.user_id);
-    if (!decoded || !sub) return res.status(401).json({ error: 'Invalid token' });
+    const authClient = supabaseAnon || supabaseAdmin;
+    if (!authClient?.auth?.getUser) {
+      console.error('[requireAuth] Supabase auth client not configured.');
+      return res.status(500).json({ error: 'Server not configured' });
+    }
 
-    req.user = { id: sub, email: decoded.email || decoded.user_email || null };
+    const { data, error } = await authClient.auth.getUser(token);
+    const authUser = data?.user || null;
+    if (error || !authUser?.id) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+
+    req.user = {
+      id: authUser.id,
+      email: authUser.email || null
+    };
     req.userToken = token;
     req.isGlobalAdmin = await lookupGlobalAdmin(req.user.email, req.user.id);
     req.isAdmin = req.isGlobalAdmin;
@@ -239,17 +249,17 @@ async function withClientScope(req, res, next) {
 
     const ids = uniqueValues(memberships.map(m => m.client_id));
     const directClients = rows.map(r => r.clients).filter(Boolean);
-    const parentSuperAdminIds = uniqueValues(
+    const parentExpansionIds = uniqueValues(
       memberships
-        .filter(m => m.role === 'super_admin' && !m.client?.parent_client_id)
+        .filter(m => PARENT_CHILD_EXPANSION_ROLES.has(m.role) && !m.client?.parent_client_id)
         .map(m => m.client_id)
     );
     let childClients = [];
-    if (parentSuperAdminIds.length) {
+    if (parentExpansionIds.length) {
       const { data: childData, error: childError } = await supabase
         .from('clients')
         .select('id, name, parent_client_id, entity_label, archived_at')
-        .in('parent_client_id', parentSuperAdminIds)
+        .in('parent_client_id', parentExpansionIds)
         .is('archived_at', null)
         .limit(5000);
       if (childError) {
@@ -299,6 +309,7 @@ async function withClientScope(req, res, next) {
 
     // Attach helpers for routes that expect them
     req.clientScope = {
+      ...scopeContext,
       user: req.user,
       memberships: effectiveMemberships,
       assignedMemberships: memberships,

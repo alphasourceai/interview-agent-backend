@@ -1,4 +1,6 @@
 // utils/mailer.js
+const fs = require('fs')
+const path = require('path')
 const sg = require('@sendgrid/mail')
 
 const API_KEY = process.env.SENDGRID_API_KEY
@@ -13,6 +15,8 @@ const FROM = process.env.SENDGRID_FROM || 'no-reply@yourdomain.com'
 const PUBLIC_SITE_BASE = String(process.env.PUBLIC_SITE_BASE || process.env.PUBLIC_SITE_BASE_FALLBACK || 'https://www.alphasourceai.com').trim().replace(/\/+$/, '')
 const BRAND_LOGO_URL = process.env.BRANDED_EMAIL_LOGO_URL || `${PUBLIC_SITE_BASE}/logo-dark-text-clear.png`
 const DEFAULT_HELP_EMAIL = process.env.BRANDED_EMAIL_HELP_EMAIL || 'info@alphasourceai.com'
+const ALPHASCREEN_WELCOME_PLAYBOOK_PATH = path.join(__dirname, '..', 'templates', 'email-attachments', 'alphascreen-getting-started-playbook.pdf')
+const ALPHASCREEN_WELCOME_PLAYBOOK_FILENAME = 'alphaScreen Getting Started Playbook.pdf'
 
 function escapeHtml(value) {
   return String(value || '')
@@ -58,6 +62,25 @@ function formatTimestampAsCst(value) {
   if (!month || !day || !year || !Number.isFinite(hour24) || !minute) return raw
   const hour12 = hour24 % 12 === 0 ? 12 : hour24 % 12
   return `${month}-${day}-${year} ${String(hour12).padStart(2, '0')}:${minute} CST`
+}
+
+function buildAlphaScreenWelcomePlaybookAttachment(filePath = ALPHASCREEN_WELCOME_PLAYBOOK_PATH, logger = console) {
+  try {
+    const content = fs.readFileSync(filePath)
+    return {
+      content: content.toString('base64'),
+      type: 'application/pdf',
+      filename: ALPHASCREEN_WELCOME_PLAYBOOK_FILENAME,
+      disposition: 'attachment'
+    }
+  } catch (error) {
+    logger.warn?.('[mailer] alphascreen_welcome_playbook_attachment_missing', {
+      attachment_missing: true,
+      filename: ALPHASCREEN_WELCOME_PLAYBOOK_FILENAME,
+      reason: error?.code === 'ENOENT' ? 'not_found' : 'read_failed'
+    })
+    return null
+  }
 }
 
 function buildBrandedEmailShell({
@@ -192,91 +215,6 @@ async function sendInvite(to, acceptUrl, inviterEmail) {
   return { statusCode: resp?.statusCode || 0 }
 }
 
-async function sendPasswordResetEmail(to, resetUrl) {
-  if (!API_KEY) return { skipped: true }
-  const safeResetUrl = resetUrl
-  const msg = {
-    to,
-    from: FROM,
-    subject: 'Reset your alphaScreen password',
-    html: `
-      <!doctype html>
-      <html lang="en">
-      <head>
-        <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width,initial-scale=1" />
-        <meta name="color-scheme" content="light dark" />
-        <meta name="supported-color-schemes" content="light dark" />
-        <title>Reset your alphaScreen password</title>
-        <style>
-          body { margin: 0; padding: 0; background: #0F1E5D; font-family: -apple-system, Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
-          table { border-collapse: collapse; }
-          a { text-decoration: none; }
-          @media (max-width: 640px) {
-            .container { width: 100% !important; padding: 16px !important; }
-            .card { padding: 18px !important; border-radius: 14px !important; }
-            .cta { display: block !important; width: 100% !important; text-align: center !important; box-sizing: border-box !important; }
-          }
-        </style>
-      </head>
-      <body>
-        <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
-          Reset your alphaScreen password securely.
-        </div>
-        <table role="presentation" width="100%" style="background:#0F1E5D;color:#C9D3FF;">
-          <tr>
-            <td align="center" style="padding: 24px 16px;">
-              <table role="presentation" width="100%" class="container" style="max-width: 640px;">
-                <tr>
-                  <td>
-                    <table role="presentation" width="100%" class="card" style="background:#0F1E5D;color:#C9D3FF;border:0;border-radius:0;box-shadow:none;padding:24px;">
-                      <tr>
-                        <td align="left" style="padding-bottom:16px;">
-                          <img src="http://cdn.mcauto-images-production.sendgrid.net/fe2f293446641ea1/9d2d6663-bd5f-4b91-8bf2-5704f37cbc78/3163x752.png" alt="AlphaSource" width="208" style="display:block;border:0;outline:none;text-decoration:none;height:auto;max-width:100%;" />
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="color:#E6EBFF;font-size:24px;line-height:1.25;font-weight:700;padding-bottom:10px;">
-                          Reset your alphaScreen password
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="color:#C9D3FF;font-size:15px;line-height:1.6;padding-bottom:20px;">
-                          Use the button below to set a new password for your account.
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="padding-bottom:18px;">
-                          <a class="cta" href="${safeResetUrl}" target="_blank" rel="noopener noreferrer" style="display:inline-block;background:#A78BFA;color:#0A1547;border:1px solid #CFCBFF;border-radius:10px;padding:11px 18px;font-size:14px;font-weight:700;line-height:1;">
-                            Reset password
-                          </a>
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="color:#C9D3FF;font-size:14px;line-height:1.55;padding-bottom:16px;">
-                          If the button doesn’t work, <a href="${safeResetUrl}" target="_blank" rel="noopener noreferrer" style="color:#FFFFFF;">click here</a> to reset your password.
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="border-top:1px solid rgba(255,255,255,0.10);padding-top:14px;color:#6B77C9;font-size:13px;line-height:1.55;">
-                          If you did not request this, you can safely ignore this email.
-                        </td>
-                      </tr>
-                    </table>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-        </table>
-      </body>
-      </html>
-    `,
-  }
-  const [resp] = await sg.send(msg)
-  return { statusCode: resp?.statusCode || 0 }
-}
-
 async function sendSubscriptionCheckoutEmail(to, checkoutUrl, recipientName) {
   if (!API_KEY) return { skipped: true }
   const safeCheckoutUrl = escapeHtml(String(checkoutUrl || '').trim())
@@ -380,6 +318,67 @@ async function sendMemberRecoveryEmail(to, recoveryUrl, recipientName) {
       `
     })
   }
+  const [resp] = await sg.send(msg)
+  return { statusCode: resp?.statusCode || 0 }
+}
+
+async function sendAlphaScreenWelcomeEmail(to, details = {}) {
+  if (!API_KEY) return { skipped: true }
+  const firstNameRaw = String(details.firstName || details.first_name || details.recipientName || details.recipient_name || '').trim().split(/\s+/).filter(Boolean)[0] || ''
+  const safeFirstName = firstNameRaw.replace(/[^A-Za-z0-9'.-]/g, '').slice(0, 40)
+  const greeting = /[A-Za-z0-9]/.test(safeFirstName) ? `Hi ${safeFirstName},` : 'Hi there,'
+  const helpEmail = String(details.helpEmail || details.help_email || DEFAULT_HELP_EMAIL).trim() || DEFAULT_HELP_EMAIL
+  const safeEmail = escapeHtml(String(to || '').trim())
+  const safeHelpEmail = escapeHtml(helpEmail)
+  const clientId = cleanEmailText(details.clientId || details.client_id)
+  const agreementId = cleanEmailText(details.agreementId || details.agreement_id)
+  const purchaseIntentId = cleanEmailText(details.purchaseIntentId || details.purchase_intent_id)
+  const playbookAttachment = buildAlphaScreenWelcomePlaybookAttachment(
+    details.playbookAttachmentPath || details.playbook_attachment_path || ALPHASCREEN_WELCOME_PLAYBOOK_PATH,
+    details.logger || console
+  )
+  const msg = {
+    to,
+    from: FROM,
+    subject: 'Welcome to alphaScreen',
+    html: buildBrandedEmailShell({
+      title: 'Welcome to alphaScreen',
+      preheader: 'Your alphaScreen membership is active and account setup is being prepared.',
+      helpEmail,
+      contentHtml: `
+        <p style="margin:0 0 12px;font-size:15px;line-height:1.6;">${escapeHtml(greeting)}</p>
+        <p style="margin:0 0 12px;font-size:15px;line-height:1.6;">
+          Thank you for signing up for alphaScreen. I appreciate you trusting alphaSource with your candidate screening workflow.
+        </p>
+        <p style="margin:0 0 12px;font-size:15px;line-height:1.6;">
+          Your membership is now active, and your account setup is being prepared. The next step is to set your password using the setup email we send to ${safeEmail}.
+        </p>
+        <p style="margin:0 0 12px;font-size:15px;line-height:1.6;">
+          After that, you can sign in, create your first role, review the AI-generated screening questions, make any edits you want, and start inviting candidates.
+        </p>
+        <p style="margin:0 0 8px;font-size:15px;line-height:1.6;">A few helpful starting points:</p>
+        <ul style="margin:0 0 14px;padding:0;">
+          <li style="margin:0 0 6px 18px;">Start with one role so you can get familiar with the workflow before adding more.</li>
+          <li style="margin:0 0 6px 18px;">Review the AI-generated screening questions before inviting candidates.</li>
+          <li style="margin:0 0 6px 18px;">Use the FAQ if you need help with setup, candidate links, memberships, billing, or interview limits.</li>
+          <li style="margin:0 0 6px 18px;">The attached alphaScreen playbook walks through the recommended getting-started flow.</li>
+        </ul>
+        <p style="margin:0 0 12px;font-size:15px;line-height:1.6;">
+          Need help? Email us at <a href="mailto:${safeHelpEmail}">${safeHelpEmail}</a> and we will help you get set up.
+        </p>
+        <p style="margin:0 0 2px;font-size:15px;line-height:1.6;">Thank you again,</p>
+        <p style="margin:0;font-size:15px;line-height:1.6;">Jason Gardner<br />alphaSource</p>
+      `
+    }),
+    categories: ['public_purchase_welcome'],
+    customArgs: {
+      email_category: 'public_purchase_welcome',
+      client_id: clientId,
+      agreement_id: agreementId,
+      purchase_intent_id: purchaseIntentId
+    }
+  }
+  if (playbookAttachment) msg.attachments = [playbookAttachment]
   const [resp] = await sg.send(msg)
   return { statusCode: resp?.statusCode || 0 }
 }
@@ -749,10 +748,10 @@ module.exports = {
   escapeHtml,
   buildBrandedEmailShell,
   sendInvite,
-  sendPasswordResetEmail,
   sendSubscriptionCheckoutEmail,
   sendRoleInterviewLimitReachedEmail,
   sendMemberRecoveryEmail,
+  sendAlphaScreenWelcomeEmail,
   sendMembershipAgreementEmail,
   sendMembershipAgreementInternalNotification,
   sendMembershipAgreementSignedCopyEmail,

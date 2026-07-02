@@ -58,6 +58,42 @@ function normalizeWholeNumberInput(value) {
   return `${parsed}`;
 }
 
+function normalizeCentsInput(value) {
+  const raw = normalizeText(value).replace(/[$,\s]/g, '');
+  if (!raw) return null;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.round(parsed);
+}
+
+function normalizeFirstRolePrepayInput(value) {
+  const source = value && typeof value === 'object' ? value : null;
+  if (!source) {
+    return {
+      present: false,
+      selected: false,
+      credit_type: 'first_role_prepay',
+      normal_role_fee_cents: null,
+      discounted_credit_amount_cents: null,
+      discount_percent: null,
+      non_refundable: true,
+      expires: false
+    };
+  }
+  return {
+    present: true,
+    selected: normalizeBooleanFlag(source.selected),
+    credit_type: normalizeText(source.credit_type || source.creditType) || 'first_role_prepay',
+    normal_role_fee_cents: normalizeCentsInput(source.normal_role_fee_cents || source.normalRoleFeeCents),
+    discounted_credit_amount_cents: normalizeCentsInput(source.discounted_credit_amount_cents || source.discountedCreditAmountCents || source.amount_cents || source.amountCents),
+    discount_percent: normalizeCentsInput(source.discount_percent || source.discountPercent),
+    non_refundable: source.non_refundable === undefined && source.nonRefundable === undefined
+      ? true
+      : normalizeBooleanFlag(source.non_refundable ?? source.nonRefundable),
+    expires: normalizeBooleanFlag(source.expires)
+  };
+}
+
 function normalizeDateInput(value) {
   const raw = normalizeText(value);
   if (!raw) return '';
@@ -108,6 +144,12 @@ function formatUsd(value) {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2
   }).format(parsed);
+}
+
+function formatUsdCents(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return '—';
+  return formatUsd(parsed / 100);
 }
 
 function normalizeExecutionInput(input = {}) {
@@ -171,6 +213,8 @@ function normalizeMembershipAgreementInput(input = {}) {
     per_role_fee: normalizeMoneyInput(input.per_role_fee || input.perRoleFee),
     additional_interview_fee: normalizeMoneyInput(input.additional_interview_fee || input.additionalInterviewFee),
     included_interviews_per_role: normalizeWholeNumberInput(input.included_interviews_per_role || input.includedInterviewsPerRole),
+    max_interview_minutes: normalizeWholeNumberInput(input.max_interview_minutes || input.maxInterviewMinutes || input.interview_duration_minutes || input.interviewDurationMinutes),
+    first_role_prepay: normalizeFirstRolePrepayInput(input.first_role_prepay || input.firstRolePrepay),
     initial_term_start: normalizeDateInput(input.initial_term_start || input.initialTermStart),
     initial_renewal_date: normalizeDateInput(input.initial_renewal_date || input.initialRenewalDate),
     billing_option: normalizeBillingOption(input.billing_option || input.billingOption),
@@ -179,9 +223,28 @@ function normalizeMembershipAgreementInput(input = {}) {
   };
 }
 
+function normalizeBooleanFlag(value) {
+  if (value === true) return true;
+  if (value === false || value === null || value === undefined) return false;
+  const normalized = String(value).trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+}
+
+function shouldShowPackageTerms(payload, options) {
+  return normalizeBooleanFlag(
+    options.showPackageTerms ??
+      options.show_package_terms ??
+      payload.showPackageTerms ??
+      payload.show_package_terms ??
+      payload.renderPackageTerms ??
+      payload.render_package_terms
+  );
+}
+
 function buildMembershipAgreementHtml(payload = {}, options = {}) {
   const normalized = normalizeMembershipAgreementInput(payload);
   const execution = normalizeExecutionInput(options.execution || payload.execution || {});
+  const showPackageTerms = shouldShowPackageTerms(payload, options);
   const now = new Date();
   const generatedAtIso = now.toISOString();
   const generatedAtLabel = now.toLocaleDateString('en-US', {
@@ -200,11 +263,18 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
     admin_email: normalized.admin_email || '______________________________',
     membership_tier: titleCase(normalized.membership_tier),
     is_enterprise: normalized.membership_tier === 'enterprise',
-    enterprise_platform_fee: formatUsd(normalized.platform_fee),
-    enterprise_per_role_fee: formatUsd(normalized.per_role_fee),
-    enterprise_additional_interview_fee: formatUsd(normalized.additional_interview_fee),
-    enterprise_included_interviews_per_role: normalized.included_interviews_per_role || '—',
-    enterprise_fee_period_label: normalized.billing_option === 'annual' ? 'per year' : 'per month',
+    show_package_terms: showPackageTerms,
+    package_platform_fee: formatUsd(normalized.platform_fee),
+    package_per_role_fee: formatUsd(normalized.per_role_fee),
+    package_additional_interview_fee: formatUsd(normalized.additional_interview_fee),
+    package_included_interviews_per_role: normalized.included_interviews_per_role || '—',
+    package_max_interview_minutes: normalized.max_interview_minutes || '—',
+    package_fee_period_label: normalized.billing_option === 'annual' ? 'per year' : 'per month',
+    show_first_role_prepay_terms: showPackageTerms && normalized.first_role_prepay.present,
+    first_role_prepay_selected: normalized.first_role_prepay.selected,
+    first_role_prepay_amount: formatUsdCents(normalized.first_role_prepay.discounted_credit_amount_cents),
+    first_role_normal_role_fee: formatUsdCents(normalized.first_role_prepay.normal_role_fee_cents),
+    first_role_prepay_discount_percent: normalized.first_role_prepay.discount_percent || '10',
     initial_term_start_display: formatDateShort(normalized.initial_term_start),
     initial_renewal_date_display: formatDateShort(normalized.initial_renewal_date),
     billing_option: normalized.billing_option === 'annual' ? 'Annual' : 'Monthly',

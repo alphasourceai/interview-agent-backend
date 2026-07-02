@@ -16,6 +16,7 @@ const LEAD_SELECT_COLUMNS = 'id,status,form_id,form_type,product_interest,first_
 const PAGE_DISPLAY_NAMES = {
   '/': 'Homepage',
   '/alphascreen': 'alphaScreen',
+  '/alphascreen/pricing': 'alphaScreen Pricing',
   '/about': 'About',
   '/support': 'Support',
   '/faq': 'FAQ',

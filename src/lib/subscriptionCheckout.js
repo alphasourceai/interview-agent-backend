@@ -3,6 +3,10 @@
 const Stripe = require('stripe')
 const { supabaseAdmin } = require('./supabaseClient')
 const { requireParentClient } = require('./clientBillingScope')
+const {
+  getAlphaScreenStripePriceId,
+  getAlphaScreenFirstRolePrepayStripePriceId
+} = require('./alphaScreenPackages')
 const { resolvePublicBackendBase, buildClientDashboardReturnUrl } = require('../../config/urlConfig')
 
 function makeError(status, code, detail) {
@@ -55,6 +59,39 @@ function wantsEmbeddedCheckout(value) {
   if (value === true) return true
   const raw = String(value || '').trim().toLowerCase()
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'embedded'
+}
+
+function normalizeIdempotencyKey(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  return raw.replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 255)
+}
+
+function normalizeFirstRolePrepayCheckout(value) {
+  const source = value && typeof value === 'object' ? value : null
+  if (!source || source.selected !== true) return null
+  const amountCents = Number(source.amount_cents ?? source.discounted_credit_amount_cents)
+  const normalRoleFeeCents = Number(source.normal_role_fee_cents)
+  const discountPercent = Number(source.discount_percent)
+  const creditType = String(source.credit_type || 'first_role_prepay').trim()
+  if (
+    creditType !== 'first_role_prepay' ||
+    !Number.isInteger(amountCents) ||
+    amountCents <= 0 ||
+    !Number.isInteger(normalRoleFeeCents) ||
+    normalRoleFeeCents <= 0 ||
+    !Number.isInteger(discountPercent) ||
+    discountPercent <= 0
+  ) {
+    throw makeError(400, 'invalid_first_role_prepay', 'Invalid first-role prepay checkout values.')
+  }
+  return {
+    selected: true,
+    credit_type: creditType,
+    amount_cents: amountCents,
+    normal_role_fee_cents: normalRoleFeeCents,
+    discount_percent: discountPercent
+  }
 }
 
 async function resolveStripeCustomerId({
@@ -118,8 +155,10 @@ async function createSubscriptionCheckoutSession({
   embedded = false,
   metadataSource = 'admin_subscription_checkout',
   metadata = {},
+  firstRolePrepay = null,
   enterpriseFees = null,
-  requestContext = null
+  requestContext = null,
+  idempotencyKey = ''
 }) {
   const normalizedClientId = String(clientId || '').trim()
   const normalizedPlanTier = normalizePlanTier(planTier)
@@ -127,6 +166,8 @@ async function createSubscriptionCheckoutSession({
   const normalizedMetadataSource = String(metadataSource || '').trim().toLowerCase()
   const normalizedReturnTab = String(returnTab || '').trim().toLowerCase()
   const embeddedCheckoutRequested = wantsEmbeddedCheckout(embedded)
+  const normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey)
+  const firstRolePrepayCheckout = normalizeFirstRolePrepayCheckout(firstRolePrepay)
 
   if (!normalizedClientId) throw makeError(400, 'client_id_required', 'Client id is required.')
   if (!normalizedPlanTier) throw makeError(400, 'invalid_plan_tier', 'Invalid plan tier.')
@@ -263,18 +304,24 @@ async function createSubscriptionCheckoutSession({
     })
     lineItems.push({ price: enterprisePrice.id, quantity: 1 })
   } else {
-    let priceId = ''
-    if (normalizedPlanTier === 'basic') {
-      priceId = normalizedBillingInterval === 'annual'
-        ? String(process.env.STRIPE_PRICE_BASIC_ANNUAL || '')
-        : String(process.env.STRIPE_PRICE_BASIC_MONTHLY || '')
-    } else if (normalizedPlanTier === 'pro') {
-      priceId = normalizedBillingInterval === 'annual'
-        ? String(process.env.STRIPE_PRICE_PRO_ANNUAL || '')
-        : String(process.env.STRIPE_PRICE_PRO_MONTHLY || '')
-    }
+    const priceId = getAlphaScreenStripePriceId(normalizedPlanTier, normalizedBillingInterval)
     if (!priceId) throw makeError(500, 'stripe_price_not_configured', 'Stripe price is not configured.')
     lineItems.push({ price: priceId, quantity: 1 })
+  }
+  let firstRolePrepayMetadata = null
+  if (firstRolePrepayCheckout) {
+    const firstRolePrepayPriceId = getAlphaScreenFirstRolePrepayStripePriceId(normalizedPlanTier)
+    if (!firstRolePrepayPriceId) {
+      throw makeError(500, 'first_role_prepay_price_not_configured', 'First-role prepay Stripe price is not configured.')
+    }
+    lineItems.push({ price: firstRolePrepayPriceId, quantity: 1 })
+    firstRolePrepayMetadata = {
+      first_role_prepay_selected: 'true',
+      first_role_prepay_credit_type: firstRolePrepayCheckout.credit_type,
+      first_role_prepay_amount_cents: String(firstRolePrepayCheckout.amount_cents),
+      first_role_prepay_normal_role_fee_cents: String(firstRolePrepayCheckout.normal_role_fee_cents),
+      first_role_prepay_discount_percent: String(firstRolePrepayCheckout.discount_percent)
+    }
   }
 
   const forwardedProto = String(requestContext?.forwardedProto || requestContext?.protocol || 'https').split(',')[0].trim()
@@ -300,6 +347,7 @@ async function createSubscriptionCheckoutSession({
     plan_tier: normalizedPlanTier,
     billing_interval: normalizedBillingInterval,
     ...normalizeMetadataObject(enterpriseCheckoutMetadata || {}),
+    ...normalizeMetadataObject(firstRolePrepayMetadata || {}),
     ...normalizeMetadataObject(metadata),
     ...normalizeMetadataObject(replacementMetadata || {})
   }
@@ -318,6 +366,11 @@ async function createSubscriptionCheckoutSession({
   let checkoutClientSecret = null
   let primaryCheckoutSession = null
   let hostedFallbackSession = null
+  const createOptions = (suffix = '') => {
+    if (!normalizedIdempotencyKey) return undefined
+    const key = suffix ? `${normalizedIdempotencyKey}:${suffix}` : normalizedIdempotencyKey
+    return { idempotencyKey: key.slice(0, 255) }
+  }
 
   if (embeddedCheckoutRequested) {
     try {
@@ -325,7 +378,7 @@ async function createSubscriptionCheckoutSession({
         ...checkoutBasePayload,
         ui_mode: 'embedded',
         return_url: checkoutSuccessUrl
-      })
+      }, createOptions('embedded'))
       const resolvedClientSecret = String(primaryCheckoutSession?.client_secret || '').trim()
       if (resolvedClientSecret) {
         checkoutClientSecret = resolvedClientSecret
@@ -342,14 +395,14 @@ async function createSubscriptionCheckoutSession({
       ...checkoutBasePayload,
       success_url: checkoutSuccessUrl,
       cancel_url: normalizedCancelUrl || buildClientDashboardReturnUrl(cancelParams)
-    })
+    }, createOptions())
   } else {
     try {
       hostedFallbackSession = await stripe.checkout.sessions.create({
         ...checkoutBasePayload,
         success_url: checkoutSuccessUrl,
         cancel_url: normalizedCancelUrl || buildClientDashboardReturnUrl(cancelParams)
-      })
+      }, createOptions('hosted'))
     } catch (hostedFallbackErr) {
       console.error('create_subscription_hosted_fallback_checkout_session_failed:', hostedFallbackErr?.message || hostedFallbackErr)
     }

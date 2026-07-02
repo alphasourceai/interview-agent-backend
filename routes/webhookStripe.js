@@ -4,6 +4,9 @@ const Stripe = require('stripe');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { requireParentClient } = require('../src/lib/clientBillingScope');
 const { getRoleInterviewAvailability } = require('../src/lib/roleInterviewAvailability');
+const { buildAlphaScreenPlanSettingsPayload } = require('../src/lib/alphaScreenPackages');
+const { activatePublicPurchaseAgreementCheckout } = require('../src/lib/publicPurchaseActivation');
+const { finalizePendingRolePurchase } = require('../src/lib/rolePurchaseFinalizer');
 const router = express.Router();
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');
@@ -72,20 +75,6 @@ async function syncBillingInvoiceFromStripeEvent(stripeInvoice, request_id) {
 
 const LIVE_SUB_STATUSES = new Set(['active', 'trialing']);
 const MANAGED_SUBSCRIPTION_CHECKOUT_SOURCES = new Set(['admin_subscription_checkout', 'agreement_checkout']);
-const PLAN_SETTINGS_DEFAULTS = {
-  basic: {
-    per_role_fee: 399,
-    included_interviews_per_role: 25,
-    additional_interview_fee: 35,
-    max_interview_minutes: 8
-  },
-  pro: {
-    per_role_fee: 699,
-    included_interviews_per_role: 50,
-    additional_interview_fee: 45,
-    max_interview_minutes: 10
-  }
-};
 
 async function requireParentClientForStripeBilling(clientId, context = {}) {
   const result = await requireParentClient(supabaseAdmin, clientId, context);
@@ -200,18 +189,11 @@ function buildClientPlanSettingsPayloadFromSubscription(subscription, clientId, 
     };
   }
 
-  const defaults = PLAN_SETTINGS_DEFAULTS[planTier];
-  if (!defaults) return null;
-  return {
-    client_id: clientId,
-    plan_tier: planTier,
-    billing_interval: billingInterval,
-    platform_fee: null,
-    per_role_fee: defaults.per_role_fee,
-    included_interviews_per_role: defaults.included_interviews_per_role,
-    additional_interview_fee: defaults.additional_interview_fee,
-    max_interview_minutes: defaults.max_interview_minutes
-  };
+  return buildAlphaScreenPlanSettingsPayload({
+    clientId,
+    planKey: planTier,
+    billingInterval
+  });
 }
 
 async function upsertClientPlanSettingsFromSubscription(subscription, clientId, options = {}) {
@@ -307,41 +289,18 @@ function shouldIgnoreStaleSubscriptionUpdate(client, incomingSubscriptionId, eve
 async function markAgreementCheckoutPaid(agreementId, options = {}) {
   const normalizedAgreementId = String(agreementId || '').trim();
   if (!normalizedAgreementId) return;
-  const paidAt = String(options.paidAt || '').trim() || new Date().toISOString();
-  const checkoutSessionId = String(options.checkoutSessionId || '').trim() || null;
-
-  const { data: agreement, error: agreementErr } = await supabaseAdmin
-    .from('membership_agreements')
-    .select('id,client_id')
-    .eq('id', normalizedAgreementId)
-    .maybeSingle();
-  if (agreementErr) throw new Error(agreementErr.message || 'Agreement lookup failed');
-  if (!agreement) return;
-
-  const agreementClientId = String(agreement.client_id || '').trim();
-  if (!agreementClientId) {
-    const err = new Error('Agreement is not linked to a client.');
-    err.code = 'missing_agreement_client_id';
-    err.agreement_id = normalizedAgreementId;
-    throw err;
-  }
-  await requireParentClientForStripeBilling(agreementClientId, {
-    route: 'stripe_webhook_agreement_checkout_paid',
-    agreement_id: normalizedAgreementId,
-    client_id: agreementClientId
+  return activatePublicPurchaseAgreementCheckout({
+    agreementId: normalizedAgreementId,
+    checkoutSessionId: options.checkoutSessionId || null,
+    paidAt: options.paidAt || null,
+    subscription: options.subscription || null,
+    fallbackCustomerId: options.fallbackCustomerId || null,
+    fallbackSubscriptionId: options.fallbackSubscriptionId || null,
+    fallbackClientId: options.fallbackClientId || null,
+    fallbackPlanTier: options.fallbackPlanTier || null,
+    fallbackBillingInterval: options.fallbackBillingInterval || null,
+    requestId: options.requestId || null
   });
-
-  const payload = {
-    checkout_status: 'paid',
-    checkout_paid_at: paidAt
-  };
-  if (checkoutSessionId) payload.checkout_session_id = checkoutSessionId;
-
-  const { error } = await supabaseAdmin
-    .from('membership_agreements')
-    .update(payload)
-    .eq('id', normalizedAgreementId);
-  if (error) throw new Error(error.message || 'Agreement checkout status update failed');
 }
 
 router.post('/', async (req, res) => {
@@ -609,68 +568,18 @@ router.post('/', async (req, res) => {
             claimedPendingRolePurchase = inProgressPendingRolePurchase || null;
           }
           if (claimedPendingRolePurchase) {
-            const roleTitle = String(claimedPendingRolePurchase.role_title || '').trim();
-            if (!roleTitle) throw new Error('Pending role title missing');
-            const interviewTypeRaw = String(claimedPendingRolePurchase.interview_type || '').trim().toUpperCase();
-            const interviewType = ['BASIC', 'DETAILED', 'TECHNICAL'].includes(interviewTypeRaw) ? interviewTypeRaw : null;
-            const { data: linkedRole, error: linkedRoleErr } = await supabaseAdmin
-              .from('roles')
-              .select('id')
-              .eq('client_id', claimedPendingRolePurchase.client_id)
-              .eq('pending_role_purchase_id', claimedPendingRolePurchase.id)
-              .order('created_at', { ascending: false })
-              .limit(1)
-              .maybeSingle();
-            if (linkedRoleErr) throw new Error(linkedRoleErr.message || 'Role recovery lookup failed');
-            const linkedRoleId = linkedRole?.id || null;
-            let createdRole = linkedRoleId ? { id: linkedRoleId } : null;
-            if (!createdRole) {
-              const { data: insertedRole, error: createdRoleErr } = await supabaseAdmin
-                .from('roles')
-                .insert({
-                  client_id: claimedPendingRolePurchase.client_id,
-                  title: roleTitle,
-                  interview_type: interviewType,
-                  pending_role_purchase_id: claimedPendingRolePurchase.id
-                })
-                .select('id')
-                .single();
-              if (createdRoleErr) throw new Error(createdRoleErr.message || 'Role creation failed');
-              createdRole = insertedRole;
-            }
-
-            const jdStoragePath = String(claimedPendingRolePurchase.jd_storage_path || '').trim();
-            if (jdStoragePath) {
-              const { error: roleJdUpdateErr } = await supabaseAdmin
-                .from('roles')
-                .update({ job_description_url: jdStoragePath })
-                .eq('id', createdRole.id)
-                .eq('client_id', claimedPendingRolePurchase.client_id);
-              if (roleJdUpdateErr) throw new Error(roleJdUpdateErr.message || 'Role JD update failed');
-              const { generateRubricAndKBForRole } = require('../generateRubric');
-              await generateRubricAndKBForRole(createdRole.id);
-            }
-
-            const { data: finalizedPendingRolePurchase, error: finalizeErr } = await supabaseAdmin
-              .from('pending_role_purchases')
-              .update({
-                finalized_role_id: createdRole.id,
-                status: 'finalized',
-                finalized_at: new Date().toISOString()
-              })
-              .eq('id', claimedPendingRolePurchase.id)
-              .is('finalized_role_id', null)
-              .in('status', linkedRoleId ? ['pending', 'paid', 'finalizing'] : ['finalizing'])
-              .select('id')
-              .maybeSingle();
-            if (finalizeErr || !finalizedPendingRolePurchase) throw new Error(finalizeErr?.message || 'Pending role purchase finalize failed');
+            await finalizePendingRolePurchase({
+              db: supabaseAdmin,
+              pendingRolePurchase: claimedPendingRolePurchase
+            });
           }
         }
       } else if (String(eventObject?.mode || '').toLowerCase() === 'subscription') {
         const subscriptionId = pickId(eventObject?.subscription);
+        let targetClientId = null;
+        let checkoutSubscription = null;
 
         if (subscriptionId) {
-          let targetClientId = null;
           if (metadataClientId) {
             const { data: metadataClient, error: metadataClientErr } = await supabaseAdmin
               .from('clients')
@@ -697,8 +606,8 @@ router.post('/', async (req, res) => {
               subscription_id: subscriptionId,
               source: metadataSource || null
             });
-            const subscription = await stripe.subscriptions.retrieve(subscriptionId);
-            const updates = buildClientSubscriptionUpdatesFromStripe(subscription, {
+            checkoutSubscription = await stripe.subscriptions.retrieve(subscriptionId);
+            const updates = buildClientSubscriptionUpdatesFromStripe(checkoutSubscription, {
               fallbackCustomerId: customerId,
               fallbackSubscriptionId: subscriptionId,
               fallbackBillingInterval: metadataBillingInterval,
@@ -713,7 +622,7 @@ router.post('/', async (req, res) => {
 
             if (MANAGED_SUBSCRIPTION_CHECKOUT_SOURCES.has(metadataSource)) {
               const planTierForSettings = String(updates?.plan_tier || metadataPlanTier || '').trim().toLowerCase();
-              const planSettingsUpserted = await upsertClientPlanSettingsFromSubscription(subscription, targetClientId, {
+              const planSettingsUpserted = await upsertClientPlanSettingsFromSubscription(checkoutSubscription, targetClientId, {
                 fallbackSource: metadataSource,
                 fallbackPlanTier: updates?.plan_tier || metadataPlanTier || null,
                 fallbackBillingInterval: updates?.billing_interval || metadataBillingInterval || null,
@@ -741,14 +650,39 @@ router.post('/', async (req, res) => {
         ) {
           await markAgreementCheckoutPaid(metadataAgreementId, {
             checkoutSessionId: pickId(eventObject?.id) || null,
-            paidAt: new Date().toISOString()
+            paidAt: new Date().toISOString(),
+            subscription: checkoutSubscription || (subscriptionId ? await stripe.subscriptions.retrieve(subscriptionId) : null),
+            fallbackCustomerId: customerId,
+            fallbackSubscriptionId: subscriptionId,
+            fallbackClientId: targetClientId || metadataClientId || null,
+            fallbackPlanTier: metadataPlanTier,
+            fallbackBillingInterval: metadataBillingInterval,
+            requestId: request_id
           });
         }
       }
     } else if (event.type === 'invoice.payment_succeeded' || event.type === 'invoice.payment_failed') {
       const customerId = pickId(eventObject?.customer);
       const subscriptionId = pickId(eventObject?.subscription);
-      const metadata = eventObject?.metadata && typeof eventObject.metadata === 'object' ? eventObject.metadata : {};
+      let invoiceSubscription = null;
+      let metadata = eventObject?.metadata && typeof eventObject.metadata === 'object' ? eventObject.metadata : {};
+      if (
+        subscriptionId &&
+        (
+          !String(metadata?.source || '').trim() ||
+          !String(metadata?.agreement_id || '').trim() ||
+          !String(metadata?.client_id || '').trim()
+        )
+      ) {
+        invoiceSubscription = await stripe.subscriptions.retrieve(subscriptionId);
+        const subscriptionMetadata = invoiceSubscription?.metadata && typeof invoiceSubscription.metadata === 'object'
+          ? invoiceSubscription.metadata
+          : {};
+        metadata = {
+          ...subscriptionMetadata,
+          ...metadata
+        };
+      }
       const metadataSource = String(metadata?.source || '').trim().toLowerCase();
       const metadataClientId = String(metadata?.client_id || '').trim();
       const metadataAgreementId = String(metadata?.agreement_id || '').trim();
@@ -806,7 +740,14 @@ router.post('/', async (req, res) => {
         metadataAgreementId
       ) {
         await markAgreementCheckoutPaid(metadataAgreementId, {
-          paidAt: new Date().toISOString()
+          paidAt: new Date().toISOString(),
+          subscription: invoiceSubscription || null,
+          fallbackCustomerId: customerId,
+          fallbackSubscriptionId: subscriptionId,
+          fallbackClientId: metadataClientId,
+          fallbackPlanTier: metadataPlanTier,
+          fallbackBillingInterval: metadataBillingInterval,
+          requestId: request_id
         });
       }
 

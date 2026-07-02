@@ -61,15 +61,13 @@ const frontendBase = firstBase(
 const publicSiteBase = firstBase(
   canonical.PUBLIC_SITE_BASE,
   process.env.ACCOUNT_REDIRECT_BASE,
-  process.env.PUBLIC_SITE_BASE_FALLBACK,
-  'https://www.alphasourceai.com'
+  process.env.PUBLIC_SITE_BASE_FALLBACK
 );
 
 const publicSiteOrFrontendBase = firstBase(
   canonical.PUBLIC_SITE_BASE,
   process.env.ACCOUNT_REDIRECT_BASE,
   process.env.PUBLIC_SITE_BASE_FALLBACK,
-  publicSiteBase,
   process.env.FRONTEND_BASE,
   process.env.FRONTEND_URL,
   frontendUrl
@@ -78,8 +76,7 @@ const publicSiteOrFrontendBase = firstBase(
 const clientAppBase = firstBase(
   canonical.CLIENT_APP_BASE,
   process.env.CLIENT_AUTH_FRONTEND_BASE,
-  process.env.CLIENT_APP_BASE_FALLBACK,
-  'https://app.alphasourceai.com'
+  process.env.CLIENT_APP_BASE_FALLBACK
 );
 
 const clientAppBaseWithFrontendFallback = firstBase(
@@ -88,15 +85,12 @@ const clientAppBaseWithFrontendFallback = firstBase(
   process.env.CLIENT_APP_BASE_FALLBACK,
   process.env.FRONTEND_BASE,
   process.env.FRONTEND_URL,
-  clientAppBase,
   frontendUrl
 );
 
 const adminAppBase = firstBase(
   canonical.ADMIN_APP_BASE,
-  process.env.ADMIN_AUTH_FRONTEND_BASE,
-  process.env.ADMIN_FRONTEND_BASE,
-  'https://admin.alphasourceai.com'
+  publicSiteBase
 );
 
 const interviewAppBase = firstBase(
@@ -112,9 +106,6 @@ const corsDefaultOrigins = Array.from(new Set([
   'https://ia-frontend-prod.onrender.com',
   'https://www.alphasourceai.com',
   'https://alphasourceai.com',
-  'https://app.alphasourceai.com',
-  'https://admin.alphasourceai.com',
-  'https://interviews.alphasourceai.com',
   'https://www-alphasourceai-com.filesusr.com',
   'https://editor.wix.com',
   'https://ia-frontend-qa.onrender.com',
@@ -208,10 +199,6 @@ function buildClientDashboardReturnUrl(query) {
   return appendQuery(`${dashboardBase}/dashboard`, query);
 }
 
-function buildClientDashboardUrl(query) {
-  return buildClientDashboardReturnUrl(query);
-}
-
 function buildAdminDashboardUrl(query) {
   return appendQuery(`${adminAppBase}/admin`, query);
 }
@@ -224,8 +211,17 @@ function buildPublicPwResetUrl(query) {
   return appendQuery(`${publicSiteOrFrontendBase}/pwreset`, query);
 }
 
+function buildPublicCheckoutSuccessUrl(query) {
+  const base = firstBase(
+    publicSiteOrFrontendBase,
+    frontendBase,
+    frontendUrl
+  );
+  return appendQuery(`${base}/checkout/subscription-success`, query);
+}
+
 function buildAcceptInviteUrl(token) {
-  return appendQuery(`${clientAppBase}/accept-invite`, { token: String(token || '') });
+  return appendQuery(`${frontendUrl}/accept-invite`, { token: String(token || '') });
 }
 
 function buildTextInterviewUrl(token) {
@@ -236,11 +232,9 @@ function buildTextInterviewUrl(token) {
 function buildMembershipAgreementSignUrl(token) {
   const safeToken = encodeURIComponent(String(token || '').trim());
   const base = firstBase(
-    clientAppBase,
-    clientAppBaseWithFrontendFallback,
+    publicSiteOrFrontendBase,
     frontendBase,
-    frontendUrl,
-    publicSiteOrFrontendBase
+    frontendUrl
   );
   return `${base}/membership-agreement/sign/${safeToken}`;
 }
@@ -256,10 +250,10 @@ module.exports = {
   isInterviewPrettyLinkHost,
   buildPublicAccountUrl,
   buildClientDashboardReturnUrl,
-  buildClientDashboardUrl,
   buildAdminDashboardUrl,
   buildClientPwResetUrl,
   buildPublicPwResetUrl,
+  buildPublicCheckoutSuccessUrl,
   buildAcceptInviteUrl,
   buildTextInterviewUrl,
   buildMembershipAgreementSignUrl,
@@ -272,7 +266,5 @@ module.exports = {
   clientAppBaseWithFrontendFallback,
   adminAppBase,
   interviewAppBase,
-  CLIENT_AUTH_FRONTEND_BASE: clientAppBase,
-  ADMIN_AUTH_FRONTEND_BASE: adminAppBase,
   publicBackendUrl: canonical.PUBLIC_BACKEND_URL
 };

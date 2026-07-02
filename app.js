@@ -46,6 +46,7 @@ if (SENTRY_ENABLED) {
 const express = require('express')
 const cors = require('cors')
 const crypto = require('crypto')
+const fs = require('fs')
 const multer = require('multer')
 const path = require('path')
 const { supabaseAdmin } = require('./src/lib/supabaseClient')
@@ -56,7 +57,7 @@ const dashboardRouter = require('./routes/dashboard')
 const rolesRouter = require('./routes/roles')
 const automationRouter = require('./routes/automation')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
-const { buildClientScopeContext } = require('./src/lib/clientScope')
+const { buildClientScopeContext, canViewLegalBillingForClient } = require('./src/lib/clientScope')
 const {
   entityFieldsForClientId,
   loadEntityMap,
@@ -69,9 +70,14 @@ const { normalizeCriteriaConfig, stableStringify } = require('./src/lib/candidat
 const { getRoleInterviewAvailability } = require('./src/lib/roleInterviewAvailability')
 const { cleanupNoSubstantiveRecordings } = require('./src/lib/recordingCleanup')
 const { createSubscriptionCheckoutSession } = require('./src/lib/subscriptionCheckout')
+const {
+  finalizePrepaidRoleCredit,
+  findUnusedFirstRolePrepayCredit
+} = require('./src/lib/rolePurchaseFinalizer')
 const { processClientEntityImport } = require('./src/lib/clientEntityImportService')
 const { archiveChildClientEntity, restoreChildClientEntity } = require('./src/lib/clientEntityArchive')
 const { buildAdminMetricsPayload, safeErrorBody } = require('./src/lib/adminMetricsService')
+const { resolvePublicCheckoutReturnState } = require('./src/lib/publicPurchaseActivation')
 const {
   archivePublicLeadCapture,
   buildAdminPublicAnalyticsLeadsCsv,
@@ -80,7 +86,21 @@ const {
   unarchivePublicLeadCapture,
   updatePublicLeadCaptureArchiveBatch,
 } = require('./src/lib/adminPublicAnalyticsService')
-const { sendSubscriptionCheckoutEmail, sendMemberRecoveryEmail } = require('./utils/mailer')
+const {
+  buildAdminPublicPurchasesPayload,
+  resendPublicPurchaseAgreementLink,
+  resendPublicPurchaseCheckoutLink,
+  resendPublicPurchaseSetupEmail,
+  resendPublicPurchaseWelcomeEmail,
+  safePublicPurchaseActionErrorBody,
+  safePublicPurchasesErrorBody,
+} = require('./src/lib/adminPublicPurchasesService')
+const {
+  sendSubscriptionCheckoutEmail,
+  sendMemberRecoveryEmail,
+  sendAlphaScreenWelcomeEmail,
+  sendMembershipAgreementEmail,
+} = require('./utils/mailer')
 const {
   frontendUrl: FRONTEND_URL,
   interviewAppBase: INTERVIEW_APP_BASE,
@@ -92,6 +112,7 @@ const {
   buildAdminDashboardUrl,
   buildClientPwResetUrl,
   buildPublicPwResetUrl,
+  buildPublicCheckoutSuccessUrl,
   buildAcceptInviteUrl
 } = require('./config/urlConfig')
 const ROLE_CHECKOUT_JD_BUCKET = (process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || process.env.SUPABASE_JD_BUCKET || 'job-descriptions').trim()
@@ -156,9 +177,12 @@ app.use((req, res, next) => {
     const cspFrameAncestors = String(
       process.env.CSP_FRAME_ANCESTORS || `'self' ${FRONTEND_URL} https://*.wixsite.com https://*.filesusr.com`
     ).trim();
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader(
       'Content-Security-Policy',
-      `frame-ancestors ${cspFrameAncestors};`
+      `base-uri 'self'; object-src 'none'; frame-ancestors ${cspFrameAncestors};`
     );
     // Ensure we don't send legacy X-Frame-Options that could conflict with CSP
     res.removeHeader && res.removeHeader('X-Frame-Options');
@@ -172,6 +196,25 @@ app.use((req, res, next) => {
       'Permissions-Policy',
       'camera=(self "https://tavus.daily.co" "https://c.daily.co"), microphone=(self "https://tavus.daily.co" "https://c.daily.co"), display-capture=(self "https://tavus.daily.co" "https://c.daily.co"), fullscreen=(self "https://tavus.daily.co" "https://c.daily.co"), autoplay=(self "https://tavus.daily.co" "https://c.daily.co"), clipboard-read=(self), clipboard-write=(self)'
     );
+  } catch (_) {}
+  next();
+});
+
+app.use((req, res, next) => {
+  try {
+    const pathName = String(req.path || '');
+    if (
+      pathName.startsWith('/admin') ||
+      pathName.startsWith('/clients') ||
+      pathName.startsWith('/client-members') ||
+      pathName.startsWith('/dashboard') ||
+      pathName.startsWith('/roles') ||
+      pathName.startsWith('/reports') ||
+      pathName.startsWith('/files') ||
+      pathName.startsWith('/membership-agreements')
+    ) {
+      res.setHeader('Cache-Control', 'private, no-store');
+    }
   } catch (_) {}
   next();
 });
@@ -254,6 +297,8 @@ function normalizeTenantRole(role) {
   return normalized === 'superadmin' ? 'super_admin' : normalized
 }
 
+const TENANT_ENTITY_MANAGER_ROLES = new Set(['manager', 'admin', 'owner', 'super_admin'])
+
 function findEffectiveClientMembership(req, clientId) {
   const targetClientId = String(clientId || '').trim()
   if (!targetClientId) return null
@@ -267,13 +312,13 @@ function findEffectiveClientMembership(req, clientId) {
   return memberships.find(m => String(m?.client_id || '').trim() === targetClientId) || null
 }
 
-function hasTenantSuperAdminAccess(req, parentClientId) {
+function hasTenantEntityManagementAccess(req, parentClientId) {
   const parentId = String(parentClientId || '').trim()
   if (!parentId) return false
   if (req?.isGlobalAdmin === true || req?.isAdmin === true) return true
 
   const parentMembership = findEffectiveClientMembership(req, parentId)
-  if (normalizeTenantRole(parentMembership?.role) === 'super_admin') return true
+  if (TENANT_ENTITY_MANAGER_ROLES.has(normalizeTenantRole(parentMembership?.role))) return true
 
   const memberships = Array.isArray(req?.clientScope?.memberships)
     ? req.clientScope.memberships
@@ -283,7 +328,7 @@ function hasTenantSuperAdminAccess(req, parentClientId) {
         ? req.memberships
         : []
   return memberships.some(m => (
-    normalizeTenantRole(m?.role) === 'super_admin' &&
+    TENANT_ENTITY_MANAGER_ROLES.has(normalizeTenantRole(m?.role)) &&
     m?.inherited === true &&
     String(m?.inherited_from_client_id || '').trim() === parentId
   ))
@@ -327,7 +372,7 @@ async function resolveTenantEntityParent(req, selectedClientId) {
 
   const selectedParentId = String(selected.parent_client_id || '').trim()
   if (!selectedParentId) {
-    if (!hasTenantSuperAdminAccess(req, selected.id)) {
+    if (!hasTenantEntityManagementAccess(req, selected.id)) {
       return { ok: false, status: 403, body: { error: 'forbidden' } }
     }
     return { ok: true, parent: selected, selected }
@@ -349,7 +394,7 @@ async function resolveTenantEntityParent(req, selectedClientId) {
       body: { error: 'invalid_parent_client', detail: 'Client hierarchy could not be resolved safely.' }
     }
   }
-  if (!hasTenantSuperAdminAccess(req, parent.id)) {
+  if (!hasTenantEntityManagementAccess(req, parent.id)) {
     return { ok: false, status: 403, body: { error: 'forbidden' } }
   }
 
@@ -639,7 +684,7 @@ app.patch('/clients/entities/:entityClientId', requireAuth, withClientScope, asy
         request_id
       })
     }
-    if (!hasTenantSuperAdminAccess(req, parent.id)) {
+    if (!hasTenantEntityManagementAccess(req, parent.id)) {
       return res.status(403).json({ error: 'forbidden', request_id })
     }
 
@@ -718,13 +763,26 @@ app.get('/clients/billing/summary', requireAuth, withClientScope, async (req, re
     if (wantedClientId && !ids.includes(wantedClientId)) {
       return res.status(403).json({ error: 'forbidden' })
     }
+    const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true
+
+    let queryIds = ids
+    if (wantedClientId) {
+      if (!isGlobalAdmin && !canViewLegalBillingForClient(req.clientScope, wantedClientId)) {
+        return res.status(403).json({ error: 'forbidden' })
+      }
+      const billingScope = await resolveBillingOwnerForScope(supabaseAdmin, wantedClientId)
+      if (!billingScope.ok) return respondWithBillingScopeError(res, billingScope, 'billing_client_lookup_failed')
+      queryIds = [billingScope.billingClientId || wantedClientId]
+    } else if (!isGlobalAdmin) {
+      queryIds = ids.filter((clientId) => canViewLegalBillingForClient(req.clientScope, clientId))
+      if (queryIds.length === 0) return res.status(403).json({ error: 'forbidden' })
+    }
 
     let q = supabaseAdmin
       .from('clients')
       .select('id,name,plan_tier,billing_status,billing_interval,auto_renew,current_term_end,contract_end_at,subscription_status,cancel_at_term_end,access_override_mode,stripe_customer_id')
-      .in('id', ids)
+      .in('id', Array.from(new Set(queryIds)))
       .order('name', { ascending: true })
-    if (wantedClientId) q = q.eq('id', wantedClientId)
 
     const { data, error } = await q
     if (error) return res.status(500).json({ error: 'list_billing_summary_failed', detail: error.message })
@@ -1103,6 +1161,47 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
       return res.status(400).json({ error: 'invalid_per_role_fee' })
     }
 
+    let prepayAttemptJdStoragePath = ''
+    const unusedFirstRoleCredit = await findUnusedFirstRolePrepayCredit({
+      db: supabaseAdmin,
+      billingClientId
+    })
+    if (unusedFirstRoleCredit?.id) {
+      const prepayUploadObjectKey = `pending/${clientId}/first-role-credit-${crypto.randomUUID()}/${safeFilename}`
+      const prepayJdUpload = await supabaseAdmin.storage
+        .from(ROLE_CHECKOUT_JD_BUCKET)
+        .upload(prepayUploadObjectKey, jdFile.buffer, { contentType, upsert: true })
+      if (prepayJdUpload.error) {
+        return res.status(500).json({ error: 'prepaid_role_jd_upload_failed', detail: prepayJdUpload.error.message })
+      }
+      prepayAttemptJdStoragePath = `${ROLE_CHECKOUT_JD_BUCKET}/${prepayUploadObjectKey}`
+
+      const prepaidFinalization = await finalizePrepaidRoleCredit({
+        db: supabaseAdmin,
+        billingClientId,
+        clientId,
+        roleTitle,
+        interviewType,
+        jdStoragePath: prepayAttemptJdStoragePath,
+        generateRubricAndKBForRole,
+        throwOnEnrichmentError: false,
+        logger: console
+      })
+      if (prepaidFinalization.applied) {
+        return res.json({
+          ok: true,
+          credit_applied: true,
+          role_id: prepaidFinalization.role_id,
+          message: 'First-role prepay credit applied.'
+        })
+      }
+      console.warn('[role-checkout] first_role_prepay_credit_unavailable_after_lookup', {
+        billing_client_id: billingClientId,
+        client_id: clientId,
+        status: prepaidFinalization.status || 'credit_not_available'
+      })
+    }
+
     const Stripe = require('stripe')
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
 
@@ -1168,15 +1267,18 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
       return res.status(500).json({ error: 'create_pending_role_purchase_failed', detail: pendingRolePurchaseErr.message })
     }
 
-    const pendingJdObjectKey = `pending/${clientId}/${pendingRolePurchase.id}/${safeFilename}`
-    const pendingJdUpload = await supabaseAdmin.storage
-      .from(ROLE_CHECKOUT_JD_BUCKET)
-      .upload(pendingJdObjectKey, jdFile.buffer, { contentType, upsert: true })
-    if (pendingJdUpload.error) {
-      return res.status(500).json({ error: 'pending_jd_upload_failed', detail: pendingJdUpload.error.message })
+    let pendingJdStoragePath = prepayAttemptJdStoragePath
+    if (!pendingJdStoragePath) {
+      const pendingJdObjectKey = `pending/${clientId}/${pendingRolePurchase.id}/${safeFilename}`
+      const pendingJdUpload = await supabaseAdmin.storage
+        .from(ROLE_CHECKOUT_JD_BUCKET)
+        .upload(pendingJdObjectKey, jdFile.buffer, { contentType, upsert: true })
+      if (pendingJdUpload.error) {
+        return res.status(500).json({ error: 'pending_jd_upload_failed', detail: pendingJdUpload.error.message })
+      }
+      pendingJdStoragePath = `${ROLE_CHECKOUT_JD_BUCKET}/${pendingJdObjectKey}`
     }
 
-    const pendingJdStoragePath = `${ROLE_CHECKOUT_JD_BUCKET}/${pendingJdObjectKey}`
     const { error: pendingRolePurchaseJdUpdateErr } = await supabaseAdmin
       .from('pending_role_purchases')
       .update({
@@ -1303,6 +1405,7 @@ app.use('/automation', automationRouter)
 app.use('/api/automation', automationRouter)
 app.use('/feedback', require('./routes/feedback'))
 app.use('/api/feedback', require('./routes/feedback'))
+app.use('/api/alphascreen', require('./routes/alphaScreenPackages'))
 app.use('/api/public-analytics', require('./routes/publicAnalytics'))
 app.use('/api/public-leads', require('./routes/publicLeads'))
 
@@ -1541,140 +1644,8 @@ async function requireAdmin(req, res, next) {
   }
 }
 
-
 const adminRouter = express.Router()
-
-// --- Password reset (Admin-triggered) ---
-// Helper: send HTML email via SendGrid
-async function _sendgridSend({ to, subject, html }) {
-  const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || process.env.SENDGRID_KEY;
-  const FROM = process.env.SENDGRID_FROM || process.env.SENDGRID_FROM_EMAIL || 'info@alphasourceai.com';
-  if (!SENDGRID_API_KEY) throw new Error('missing SENDGRID_API_KEY');
-  if (!FROM) throw new Error('missing SENDGRID_FROM');
-
-  const payload = {
-    personalizations: [{ to: [{ email: to }] }],
-    from: { email: FROM, name: 'alphaSource' },
-    subject,
-    content: [{ type: 'text/html', value: html }]
-  };
-
-  await axios.post('https://api.sendgrid.com/v3/mail/send', payload, {
-    headers: {
-      Authorization: `Bearer ${SENDGRID_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    timeout: 10000
-  });
-}
-
-// POST /admin/users/:userId/reset-password
-// Optional body: { email?: string, redirect_to?: string }
-adminRouter.post('/users/:userId/reset-password', requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const userId = (req.params.userId || '').trim();
-    const fallbackEmail = (req.body?.email || '').trim();
-    const redirectTo = (req.body?.redirect_to || 'https://www.alphasourceai.com/account?password_reset=1').trim();
-
-    if (!userId && !fallbackEmail) {
-      return res.status(400).json({ error: 'user_id_or_email_required' });
-    }
-
-    // Look up Supabase user (prefer by id)
-    let email = null;
-    if (userId && supabaseAdmin?.auth?.admin?.getUserById) {
-      try {
-        const { data, error } = await supabaseAdmin.auth.admin.getUserById(userId);
-        if (!error && data?.user?.email) email = data.user.email;
-      } catch (e) {
-        // fall through to fallbackEmail
-      }
-    }
-    if (!email && fallbackEmail) email = fallbackEmail;
-
-    if (!email) {
-      return res.status(404).json({ error: 'user_email_not_found' });
-    }
-
-    // Generate a recovery link
-    const linkResp = await supabaseAdmin.auth.admin.generateLink({
-      type: 'recovery',
-      email,
-      options: { redirectTo }
-    });
-
-    const action_link = linkResp?.data?.action_link || null;
-    if (!action_link) {
-      const detail = linkResp?.error?.message || 'no_action_link';
-      return res.status(500).json({ error: 'generate_link_failed', detail });
-    }
-
-    // Branded minimal HTML (aligns with current brand; can be swapped to a SendGrid template later)
-    const html = `
-      <!doctype html>
-      <html>
-      <head>
-        <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width,initial-scale=1" />
-        <title>Reset your password</title>
-      </head>
-      <body style="margin:0;padding:0;background:#0A1547;color:#ffffff;font-family:Arial,Helvetica,sans-serif;">
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#0A1547;">
-          <tr>
-            <td align="center" style="padding:32px 16px;">
-              <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;background:#0A1547;border-radius:8px;">
-                <tr>
-                  <td style="padding:24px 24px 0 24px;" align="left">
-                    <img src="https://www.alphasourceai.com/alpha-logo.png" alt="alphaSource" style="height:48px;display:block;" />
-                  </td>
-                </tr>
-                <tr>
-                  <td style="padding:24px;" align="left">
-                    <h1 style="margin:0 0 12px 0;font-size:22px;font-weight:700;line-height:1.3;color:#ffffff;">Reset your password</h1>
-                    <p style="margin:0 0 20px 0;font-size:14px;line-height:1.6;color:#e7eaf6;">
-                      Click the button below to reset your alphaSource password. This link will expire shortly for security.
-                    </p>
-                    <p style="margin:0 0 28px 0;">
-                      <a href="${action_link}"
-                         style="background:#C3B4F3;color:#0A1547;text-decoration:none;font-weight:700;font-size:14px;padding:12px 18px;border-radius:6px;display:inline-block;">
-                        Reset password
-                      </a>
-                    </p>
-                    <p style="margin:0 0 10px 0;font-size:12px;color:#bfc6e0;">
-                      Or paste this link into your browser:
-                    </p>
-                    <p style="margin:0 0 24px 0;font-size:12px;color:#93a0c6;word-break:break-all;">${action_link}</p>
-                    <p style="margin:0;font-size:12px;color:#93a0c6;">
-                      If you didn’t request this, you can safely ignore this email.
-                    </p>
-                  </td>
-                </tr>
-                <tr>
-                  <td style="padding:16px 24px 28px 24px;font-size:12px;color:#93a0c6;">
-                    Questions? Email <a href="mailto:info@alphasourceai.com" style="color:#C3B4F3;text-decoration:underline;">info@alphasourceai.com</a>.
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-        </table>
-      </body>
-      </html>
-    `;
-
-    // Send via SendGrid
-    await _sendgridSend({
-      to: email,
-      subject: 'Reset your alphaSource password',
-      html
-    });
-
-    return res.json({ ok: true, email, sent_via: 'sendgrid' });
-  } catch (e) {
-    console.error('reset_password_admin_failed:', e?.message || e);
-    return res.status(500).json({ error: 'reset_password_admin_failed', detail: e?.message || String(e) });
-  }
-});
+const PUBLIC_PURCHASE_PLAYBOOK_PDF_PATH = path.join(__dirname, 'templates', 'pdf', 'alphascreen-public-purchase-support-playbook.pdf')
 
 // Helper: ensure a user exists/invite; return user_id + optional action_link
 async function ensureUserIdAndInvite(email, redirectTo, opts = {}) {
@@ -2492,6 +2463,145 @@ adminRouter.get('/public-analytics', requireAuth, requireAdmin, async (req, res)
     const body = safePublicAnalyticsErrorBody(error, request_id)
     console.error('[admin/public-analytics] failed', {
       request_id,
+      code: body.code,
+      detail: body.detail
+    })
+    return sendAdminError(res, error?.status || 500, body)
+  }
+})
+
+adminRouter.get('/public-purchases', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const payload = await buildAdminPublicPurchasesPayload({
+      db: supabaseAdmin,
+      query: req.query || {},
+      requestId: request_id
+    })
+    return res.json(payload)
+  } catch (error) {
+    const body = safePublicPurchasesErrorBody(error, request_id)
+    console.error('[admin/public-purchases] failed', {
+      request_id,
+      code: body.code,
+      detail: body.detail
+    })
+    return sendAdminError(res, error?.status || 500, body)
+  }
+})
+
+adminRouter.get('/public-purchases/playbook.pdf', requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    if (!fs.existsSync(PUBLIC_PURCHASE_PLAYBOOK_PDF_PATH)) {
+      return res.status(404).json({ error: 'playbook_pdf_not_found' })
+    }
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', 'attachment; filename="alphascreen-public-purchase-support-playbook.pdf"')
+    res.setHeader('Cache-Control', 'private, no-store')
+    return res.sendFile(PUBLIC_PURCHASE_PLAYBOOK_PDF_PATH)
+  } catch (error) {
+    console.error('[admin/public-purchases/playbook.pdf] failed', {
+      request_id: _req.request_id || null,
+      message: error?.message || 'unknown_error'
+    })
+    return res.status(500).json({ error: 'playbook_pdf_failed' })
+  }
+})
+
+adminRouter.post('/public-purchases/:id/resend-setup-email', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const payload = await resendPublicPurchaseSetupEmail({
+      db: supabaseAdmin,
+      authAdmin: supabaseAdmin.auth?.admin,
+      purchaseIntentId: req.params.id,
+      actorEmail: req.user?.email || null,
+      requestId: request_id,
+      sendRecoveryEmail: sendMemberRecoveryEmail,
+      logger: console
+    })
+    return res.json(payload)
+  } catch (error) {
+    const body = safePublicPurchaseActionErrorBody(error, request_id)
+    console.error('[admin/public-purchases/resend-setup-email] failed', {
+      request_id,
+      purchase_intent_id: req.params.id,
+      actor: req.user?.email || null,
+      code: body.code,
+      detail: body.detail
+    })
+    return sendAdminError(res, error?.status || 500, body)
+  }
+})
+
+adminRouter.post('/public-purchases/:id/resend-welcome-email', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const payload = await resendPublicPurchaseWelcomeEmail({
+      db: supabaseAdmin,
+      purchaseIntentId: req.params.id,
+      actorEmail: req.user?.email || null,
+      requestId: request_id,
+      sendWelcomeEmail: sendAlphaScreenWelcomeEmail,
+      logger: console
+    })
+    return res.json(payload)
+  } catch (error) {
+    const body = safePublicPurchaseActionErrorBody(error, request_id)
+    console.error('[admin/public-purchases/resend-welcome-email] failed', {
+      request_id,
+      purchase_intent_id: req.params.id,
+      actor: req.user?.email || null,
+      code: body.code,
+      detail: body.detail
+    })
+    return sendAdminError(res, error?.status || 500, body)
+  }
+})
+
+adminRouter.post('/public-purchases/:id/resend-agreement-link', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const payload = await resendPublicPurchaseAgreementLink({
+      db: supabaseAdmin,
+      purchaseIntentId: req.params.id,
+      actorEmail: req.user?.email || null,
+      requestId: request_id,
+      sendAgreementEmail: sendMembershipAgreementEmail,
+      logger: console
+    })
+    return res.json(payload)
+  } catch (error) {
+    const body = safePublicPurchaseActionErrorBody(error, request_id)
+    console.error('[admin/public-purchases/resend-agreement-link] failed', {
+      request_id,
+      purchase_intent_id: req.params.id,
+      actor: req.user?.email || null,
+      code: body.code,
+      detail: body.detail
+    })
+    return sendAdminError(res, error?.status || 500, body)
+  }
+})
+
+adminRouter.post('/public-purchases/:id/resend-checkout-link', requireAuth, requireAdmin, async (req, res) => {
+  const request_id = req.request_id || null
+  try {
+    const payload = await resendPublicPurchaseCheckoutLink({
+      db: supabaseAdmin,
+      purchaseIntentId: req.params.id,
+      actorEmail: req.user?.email || null,
+      requestId: request_id,
+      sendCheckoutEmail: sendSubscriptionCheckoutEmail,
+      logger: console
+    })
+    return res.json(payload)
+  } catch (error) {
+    const body = safePublicPurchaseActionErrorBody(error, request_id)
+    console.error('[admin/public-purchases/resend-checkout-link] failed', {
+      request_id,
+      purchase_intent_id: req.params.id,
+      actor: req.user?.email || null,
       code: body.code,
       detail: body.detail
     })
@@ -5705,11 +5815,11 @@ adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, 
       request_id,
       email,
       redirectTo,
-      actionLink,
-      actionLink_host: actionLinkHost,
-      actionLink_path: actionLinkPath,
-      actionLink_contains_pwreset: actionLinkContainsPwreset,
-      actionLink_contains_redirect_to: actionLinkContainsRedirectTo
+      action_link_present: Boolean(actionLink),
+      action_link_host: actionLinkHost,
+      action_link_path: actionLinkPath,
+      action_link_contains_pwreset: actionLinkContainsPwreset,
+      action_link_contains_redirect_to: actionLinkContainsRedirectTo
     })
 
     try {
@@ -5725,7 +5835,9 @@ adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, 
         request_id,
         email,
         redirectTo,
-        actionLink,
+        action_link_present: Boolean(actionLink),
+        action_link_host: actionLinkHost,
+        action_link_path: actionLinkPath,
         error: e?.message || e,
         code: e?.code || null,
         status: e?.status || null
@@ -5737,8 +5849,8 @@ adminRouter.post('/send-password-reset', requireAuth, requireAdmin, async (req, 
       request_id,
       email,
       redirectTo,
-      actionLink_host: actionLinkHost,
-      actionLink_path: actionLinkPath
+      action_link_host: actionLinkHost,
+      action_link_path: actionLinkPath
     })
     return res.json({ ok: true, request_id })
   } catch (e) {
@@ -5858,6 +5970,13 @@ app.get('/checkout/subscription-success', async (req, res) => {
     if (tab) params.set('tab', tab)
     return buildClientDashboardReturnUrl(params)
   }
+  const makePublicCheckoutStatusUrl = (status, clientId = '', extra = {}) => {
+    const params = { checkout: 'success', status: status || 'setup_pending' }
+    if (clientId) params.client_id = clientId
+    if (extra.session_id) params.session_id = extra.session_id
+    if (extra.agreement_id) params.agreement_id = extra.agreement_id
+    return buildPublicCheckoutSuccessUrl(params)
+  }
   const request_id = req.request_id || null
   const fallbackClientId = String(req.query?.client_id || '').trim()
   const fallbackTab = String(req.query?.tab || '').trim().toLowerCase()
@@ -5891,6 +6010,10 @@ app.get('/checkout/subscription-success', async (req, res) => {
     const metadataBillingInterval = String(metadata?.billing_interval || '').trim().toLowerCase()
     const clientId = metadataClientId || fallbackClientId
     const successUrl = makeAccountSuccessUrl(clientId, fallbackTab)
+    const agreementStatusUrl = (status) => makePublicCheckoutStatusUrl(status, clientId, {
+      session_id: sessionId,
+      agreement_id: metadataAgreementId
+    })
     const paymentStatus = String(session?.payment_status || '').toLowerCase()
     const subscriptionObj = session?.subscription && typeof session.subscription === 'object' ? session.subscription : null
     const subscriptionMetadata = subscriptionObj?.metadata && typeof subscriptionObj.metadata === 'object' ? subscriptionObj.metadata : {}
@@ -5920,118 +6043,37 @@ app.get('/checkout/subscription-success', async (req, res) => {
     if (String(session?.status || '').toLowerCase() !== 'complete') {
       console.log('subscription_checkout_success_redirect:', {
         branch: 'session_incomplete',
-        target: 'success_url'
+        target: metadataSource === 'agreement_checkout' ? 'public_checkout_status' : 'success_url'
       })
-      return res.redirect(302, successUrl)
+      return res.redirect(302, metadataSource === 'agreement_checkout' ? agreementStatusUrl('payment_pending') : successUrl)
     }
     if (paymentStatus && !['paid', 'no_payment_required'].includes(paymentStatus)) {
       console.log('subscription_checkout_success_redirect:', {
         branch: 'payment_not_paid',
-        target: 'success_url'
+        target: metadataSource === 'agreement_checkout' ? 'public_checkout_status' : 'success_url'
       })
-      return res.redirect(302, successUrl)
+      return res.redirect(302, metadataSource === 'agreement_checkout' ? agreementStatusUrl('payment_pending') : successUrl)
     }
     if (subscriptionStatus && !['active', 'trialing'].includes(subscriptionStatus)) {
       console.log('subscription_checkout_success_redirect:', {
         branch: 'subscription_not_active',
-        target: 'success_url'
+        target: metadataSource === 'agreement_checkout' ? 'public_checkout_status' : 'success_url'
       })
-      return res.redirect(302, successUrl)
+      return res.redirect(302, metadataSource === 'agreement_checkout' ? agreementStatusUrl('activation_pending') : successUrl)
     }
 
-    if (clientId && subscriptionObj && ['active', 'trialing'].includes(subscriptionStatus)) {
-      try {
-        const pickStripeId = (value) => {
-          if (!value) return null
-          if (typeof value === 'string') return value
-          if (typeof value === 'object' && typeof value.id === 'string') return value.id
-          return null
-        }
-        const toIsoFromUnixSeconds = (value) => {
-          const n = Number(value)
-          if (!Number.isFinite(n) || n <= 0) return null
-          return new Date(n * 1000).toISOString()
-        }
-        const normalizeStripeInterval = (value) => {
-          const raw = String(value || '').trim().toLowerCase()
-          if (raw === 'month') return 'monthly'
-          if (raw === 'year') return 'annual'
-          if (raw === 'monthly' || raw === 'annual') return raw
-          return null
-        }
-        const intervalRaw =
-          subscriptionObj?.items?.data?.[0]?.price?.recurring?.interval ||
-          subscriptionObj?.plan?.interval ||
-          ''
-        const cancelAtTermEnd = subscriptionObj?.cancel_at_period_end === true
-        const currentTermEnd = toIsoFromUnixSeconds(
-          subscriptionObj?.current_period_end ??
-          subscriptionObj?.items?.data?.[0]?.current_period_end ??
-          null
-        )
-        let autoRenewForClient = !cancelAtTermEnd
-        if (metadataSource === 'agreement_checkout' && metadataAgreementId) {
-          try {
-            const { data: agreementRenewal, error: agreementRenewalErr } = await supabaseAdmin
-              .from('membership_agreements')
-              .select('auto_renew')
-              .eq('id', metadataAgreementId)
-              .maybeSingle()
-            if (agreementRenewalErr) {
-              console.error('subscription_checkout_success_agreement_auto_renew_lookup_failed:', {
-                request_id,
-                agreement_id: metadataAgreementId,
-                error: agreementRenewalErr.message,
-                code: agreementRenewalErr.code || null,
-                hint: agreementRenewalErr.hint || null
-              })
-            } else if (typeof agreementRenewal?.auto_renew === 'boolean') {
-              autoRenewForClient = agreementRenewal.auto_renew
-            }
-          } catch (agreementRenewalErr) {
-            console.error('subscription_checkout_success_agreement_auto_renew_lookup_failed:', {
-              request_id,
-              agreement_id: metadataAgreementId,
-              error: agreementRenewalErr?.message || agreementRenewalErr
-            })
-          }
-        }
-        const clientBillingUpdates = {
-          stripe_customer_id: pickStripeId(subscriptionObj?.customer) || pickStripeId(session?.customer) || null,
-          stripe_subscription_id: pickStripeId(subscriptionObj?.id) || null,
-          subscription_status: subscriptionStatus,
-          current_term_end: currentTermEnd,
-          cancel_at_term_end: cancelAtTermEnd,
-          billing_interval: normalizeStripeInterval(intervalRaw) || normalizeStripeInterval(metadataBillingInterval),
-          billing_status: 'active',
-          auto_renew: autoRenewForClient,
-          cancel_effective_at: null
-        }
-        if (['basic', 'pro', 'enterprise'].includes(metadataPlanTier)) {
-          clientBillingUpdates.plan_tier = metadataPlanTier
-        }
-        const { error: clientBillingUpdateErr } = await supabaseAdmin
-          .from('clients')
-          .update(clientBillingUpdates)
-          .eq('id', clientId)
-        if (clientBillingUpdateErr) {
-          console.error('subscription_checkout_success_client_billing_update_failed:', {
-            request_id,
-            client_id: clientId,
-            session_id: sessionId,
-            error: clientBillingUpdateErr.message,
-            code: clientBillingUpdateErr.code || null,
-            hint: clientBillingUpdateErr.hint || null
-          })
-        }
-      } catch (clientBillingUpdateErr) {
-        console.error('subscription_checkout_success_client_billing_update_failed:', {
-          request_id,
-          client_id: clientId,
-          session_id: sessionId,
-          error: clientBillingUpdateErr?.message || clientBillingUpdateErr
-        })
-      }
+    if (metadataSource === 'agreement_checkout') {
+      const returnState = await resolvePublicCheckoutReturnState({
+        sessionId,
+        fallbackClientId: clientId,
+        agreementId: metadataAgreementId
+      })
+      console.log('subscription_checkout_success_redirect:', {
+        branch: 'agreement_checkout_webhook_state',
+        status: returnState?.status || 'setup_pending',
+        target: 'public_checkout_status'
+      })
+      return res.redirect(302, agreementStatusUrl(returnState?.status || 'setup_pending'))
     }
 
     if (metadataSource === 'agreement_checkout' && metadataAgreementId) {
@@ -6067,9 +6109,9 @@ app.get('/checkout/subscription-success', async (req, res) => {
     if (!client?.id) {
       console.log('subscription_checkout_success_redirect:', {
         branch: 'client_not_found',
-        target: 'success_url'
+        target: metadataSource === 'agreement_checkout' ? 'public_checkout_status' : 'success_url'
       })
-      return res.redirect(302, successUrl)
+      return res.redirect(302, metadataSource === 'agreement_checkout' ? agreementStatusUrl('setup_pending') : successUrl)
     }
 
     if (subscriptionObj && ['active', 'trialing'].includes(subscriptionStatus)) {
@@ -6212,9 +6254,9 @@ app.get('/checkout/subscription-success', async (req, res) => {
     if (!clientEmail) {
       console.log('subscription_checkout_success_redirect:', {
         branch: 'client_email_missing',
-        target: 'success_url'
+        target: metadataSource === 'agreement_checkout' ? 'public_checkout_status' : 'success_url'
       })
-      return res.redirect(302, successUrl)
+      return res.redirect(302, metadataSource === 'agreement_checkout' ? agreementStatusUrl('setup_pending') : successUrl)
     }
     const clientEmailLower = clientEmail.toLowerCase()
     const membershipName = String(client.client_admin_name || client.name || clientEmail).trim() || clientEmail
@@ -6334,9 +6376,9 @@ app.get('/checkout/subscription-success', async (req, res) => {
     if (existingAuthUser && hasSignedIn) {
       console.log('subscription_checkout_success_redirect:', {
         branch: 'existing_user_signed_in',
-        target: 'success_url'
+        target: metadataSource === 'agreement_checkout' ? 'public_checkout_status' : 'success_url'
       })
-      return res.redirect(302, successUrl)
+      return res.redirect(302, metadataSource === 'agreement_checkout' ? agreementStatusUrl('ready') : successUrl)
     }
 
     const generateRecoveryActionLink = async () => {
@@ -6421,12 +6463,11 @@ app.get('/checkout/subscription-success', async (req, res) => {
     }
 
     if (metadataSource === 'agreement_checkout') {
-      return res.status(500).json({
-        error: 'agreement_checkout_bootstrap_failed',
-        code: 'agreement_checkout_bootstrap_failed',
-        detail: 'Unable to complete onboarding bootstrap.',
-        request_id
+      console.log('subscription_checkout_success_redirect:', {
+        branch: 'agreement_checkout_onboarding_pending_no_recovery_link',
+        target: 'public_checkout_status'
       })
+      return res.redirect(302, agreementStatusUrl('setup_pending'))
     }
 
     const pendingOnboardingUrl = buildPublicPwResetUrl({
@@ -6447,12 +6488,11 @@ app.get('/checkout/subscription-success', async (req, res) => {
   } catch (e) {
     console.error('subscription_checkout_success_handoff_failed:', e?.message || e)
     if (parsedMetadataSource === 'agreement_checkout') {
-      return res.status(500).json({
-        error: 'agreement_checkout_bootstrap_failed',
-        code: 'agreement_checkout_bootstrap_failed',
-        detail: e?.message || 'Unable to complete onboarding bootstrap.',
-        request_id
+      console.log('subscription_checkout_success_redirect:', {
+        branch: 'agreement_checkout_handler_exception',
+        target: 'public_checkout_status'
       })
+      return res.redirect(302, makePublicCheckoutStatusUrl('setup_pending', fallbackClientId))
     }
     console.log('subscription_checkout_success_redirect:', {
       branch: 'handler_exception',

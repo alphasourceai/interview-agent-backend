@@ -3,7 +3,8 @@
 const express = require('express');
 const crypto = require('crypto');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
-const { requireParentClient } = require('../src/lib/clientBillingScope');
+const { requireParentClient, resolveBillingOwnerForScope } = require('../src/lib/clientBillingScope');
+const { canViewLegalBillingForClient } = require('../src/lib/clientScope');
 const { buildMembershipAgreementSignUrl } = require('../config/urlConfig');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 const { htmlToPdf } = require('../utils/pdfRenderer');
@@ -16,6 +17,12 @@ const {
   sendMembershipAgreementCompletedInternalNotification
 } = require('../utils/mailer');
 const { createSubscriptionCheckoutSession } = require('../src/lib/subscriptionCheckout');
+const {
+  normalizeAlphaScreenPlanKey,
+  normalizeBillingInterval,
+  getAlphaScreenPlatformFee,
+  getAlphaScreenFirstRolePrepayConfig
+} = require('../src/lib/alphaScreenPackages');
 
 const router = express.Router();
 
@@ -23,6 +30,34 @@ const AGREEMENTS_BUCKET = process.env.SUPABASE_AGREEMENTS_BUCKET || 'agreements'
 const MEMBERSHIP_INTERNAL_NOTIFY_EMAIL = 'memberships@alphasourceai.com';
 const SIGNED_URL_TTL_SECONDS = Math.max(60, Number(process.env.SIGNED_URL_TTL_SECONDS || 600));
 const EMAIL_SIGNED_URL_TTL_SECONDS = Math.max(300, Number(process.env.AGREEMENT_SIGNED_EMAIL_LINK_TTL_SECONDS || 604800));
+const PUBLIC_TOKEN_RATE_WINDOW_MS = 10 * 60 * 1000;
+const PUBLIC_TOKEN_RATE_MAX = Number(process.env.MEMBERSHIP_AGREEMENT_PUBLIC_TOKEN_RATE_MAX || 60);
+const publicAgreementTokenRateBuckets = new Map();
+
+function getRequestIp(req) {
+  return String((req.headers['x-forwarded-for'] || req.ip || 'unknown')).split(',')[0].trim() || 'unknown';
+}
+
+function publicAgreementTokenRateLimit(req, res, next) {
+  const now = Date.now();
+  const routeKey = `${req.method || 'POST'}:${req.path || req.originalUrl || 'membership-agreement'}`;
+  const subject = `${getRequestIp(req)}:${routeKey}`;
+  const current = publicAgreementTokenRateBuckets.get(subject);
+  const bucket = (!current || current.resetAt <= now)
+    ? { count: 0, resetAt: now + PUBLIC_TOKEN_RATE_WINDOW_MS }
+    : current;
+  bucket.count += 1;
+  publicAgreementTokenRateBuckets.set(subject, bucket);
+  if (bucket.count > PUBLIC_TOKEN_RATE_MAX) {
+    return res.status(429).json({
+      error: 'rate_limited',
+      code: 'RATE_LIMIT_EXCEEDED',
+      detail: 'Too many requests. Please try again later.',
+      request_id: req.request_id || null
+    });
+  }
+  return next();
+}
 
 function extractErrorMessage(text, fallback) {
   const raw = String(text || '').trim();
@@ -33,6 +68,14 @@ function extractErrorMessage(text, fallback) {
     if (typeof detail === 'string' && detail.trim()) return detail.trim();
   } catch (_) {}
   return raw;
+}
+
+function makeCheckoutError(status, code, detail, hint) {
+  const err = new Error(detail || code || 'checkout_failed');
+  err.status = Number(status) || 500;
+  err.code = String(code || 'checkout_failed');
+  err.hint = hint || null;
+  return err;
 }
 
 function readToken(req) {
@@ -65,6 +108,13 @@ function wantsEmbeddedCheckout(value, fallback = false) {
   if (value === true) return true;
   const normalized = String(value).trim().toLowerCase();
   return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'embedded';
+}
+
+function appendQueryParam(url, key, value) {
+  const raw = String(url || '').trim();
+  if (!raw) return raw;
+  const separator = raw.includes('?') ? '&' : '?';
+  return `${raw}${separator}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
 }
 
 function getClientIp(req) {
@@ -172,6 +222,248 @@ async function requireParentAgreementClient(agreement, context) {
   return requireParentClient(supabaseAdmin, agreement?.client_id, context);
 }
 
+function isPublicPurchaseIntentAgreement(agreement) {
+  const snapshot = agreement?.template_snapshot && typeof agreement.template_snapshot === 'object'
+    ? agreement.template_snapshot
+    : null;
+  return String(snapshot?.source || '').trim() === 'public_purchase_intent';
+}
+
+function publicPurchaseIntentIdFromAgreement(agreement) {
+  const snapshot = agreement?.template_snapshot && typeof agreement.template_snapshot === 'object'
+    ? agreement.template_snapshot
+    : null;
+  return String(snapshot?.purchase_intent?.id || '').trim();
+}
+
+function packageSnapshotFromAgreement(agreement) {
+  const snapshot = agreement?.template_snapshot && typeof agreement.template_snapshot === 'object'
+    ? agreement.template_snapshot
+    : null;
+  const packageSnapshot = snapshot?.package_snapshot && typeof snapshot.package_snapshot === 'object'
+    ? snapshot.package_snapshot
+    : null;
+  return packageSnapshot || null;
+}
+
+function packageNumber(snapshot, ...keys) {
+  for (const key of keys) {
+    const n = Number(snapshot?.[key]);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return null;
+}
+
+function firstRolePrepaySnapshot(packageSnapshot) {
+  return packageSnapshot?.first_role_prepay && typeof packageSnapshot.first_role_prepay === 'object'
+    ? packageSnapshot.first_role_prepay
+    : null;
+}
+
+function buildFirstRolePrepayCheckout(packageSnapshot) {
+  const prepay = firstRolePrepaySnapshot(packageSnapshot);
+  if (!prepay?.selected) return null;
+  return {
+    selected: true,
+    credit_type: prepay.credit_type || 'first_role_prepay',
+    amount_cents: Number(prepay.discounted_credit_amount_cents),
+    normal_role_fee_cents: Number(prepay.normal_role_fee_cents),
+    discount_percent: Number(prepay.discount_percent)
+  };
+}
+
+function buildPublicAgreementCheckoutMetadata({ agreement, agreementInput, intent, packageSnapshot }) {
+  const planTier = normalizeAlphaScreenPlanKey(packageSnapshot?.plan_key || agreementInput?.membership_tier);
+  const billingInterval = normalizeBillingInterval(packageSnapshot?.billing_cadence || agreementInput?.billing_option);
+  const firstRolePrepay = buildFirstRolePrepayCheckout(packageSnapshot);
+  const metadata = {
+    agreement_id: agreement.id,
+    purchase_intent_id: intent?.id || undefined,
+    public_purchase_intent_id: intent?.id || undefined,
+    membership_agreement_id: agreement.id,
+    agreement_checkout: 'true',
+    checkout_status: 'pending_payment',
+    package_plan_key: planTier,
+    package_billing_cadence: billingInterval,
+    platform_fee: packageNumber(packageSnapshot, 'platform_fee'),
+    per_role_fee: packageNumber(packageSnapshot, 'per_role_fee'),
+    included_interviews_per_role: packageNumber(packageSnapshot, 'included_interviews_per_role', 'included_interviews'),
+    additional_interview_fee: packageNumber(packageSnapshot, 'additional_interview_fee', 'additional_interview_price', 'overage_price'),
+    max_interview_minutes: packageNumber(packageSnapshot, 'max_interview_minutes', 'interview_duration_minutes')
+  };
+  if (firstRolePrepay?.selected) {
+    metadata.first_role_prepay_selected = 'true';
+    metadata.first_role_prepay_credit_type = firstRolePrepay.credit_type;
+    metadata.first_role_prepay_amount_cents = firstRolePrepay.amount_cents;
+    metadata.first_role_prepay_normal_role_fee_cents = firstRolePrepay.normal_role_fee_cents;
+    metadata.first_role_prepay_discount_percent = firstRolePrepay.discount_percent;
+  }
+  return metadata;
+}
+
+function validatePublicPurchaseIntentForCheckout({ agreement, agreementInput, intent }) {
+  if (!intent) {
+    throw makeCheckoutError(404, 'purchase_intent_not_found', 'Signup request was not found.');
+  }
+
+  const status = String(intent.status || '').trim().toLowerCase();
+  if (!['agreement_pending', 'checkout_pending'].includes(status)) {
+    throw makeCheckoutError(409, 'purchase_intent_not_checkout_eligible', 'Signup request is not eligible for checkout.');
+  }
+
+  const agreementId = String(agreement?.id || '').trim();
+  const intentAgreementId = String(intent.agreement_id || '').trim();
+  if (!intentAgreementId || intentAgreementId !== agreementId) {
+    throw makeCheckoutError(409, 'purchase_intent_agreement_mismatch', 'Signup request is not linked to this agreement.');
+  }
+
+  const packageSnapshot = packageSnapshotFromAgreement(agreement);
+  if (!packageSnapshot) {
+    throw makeCheckoutError(409, 'package_snapshot_missing', 'Agreement package snapshot is missing.');
+  }
+
+  const planTier = normalizeAlphaScreenPlanKey(agreementInput?.membership_tier);
+  const billingInterval = normalizeBillingInterval(agreementInput?.billing_option);
+  const snapshotPlan = normalizeAlphaScreenPlanKey(packageSnapshot.plan_key);
+  const snapshotBilling = normalizeBillingInterval(packageSnapshot.billing_cadence);
+  const intentPlan = normalizeAlphaScreenPlanKey(intent.selected_plan_key);
+  const intentBilling = normalizeBillingInterval(intent.selected_billing_cadence);
+
+  if (!['basic', 'pro'].includes(planTier) || !['basic', 'pro'].includes(snapshotPlan) || !['basic', 'pro'].includes(intentPlan)) {
+    throw makeCheckoutError(409, 'invalid_agreement_plan', 'Agreement plan tier is invalid for checkout.');
+  }
+  if (!billingInterval || !snapshotBilling || !intentBilling) {
+    throw makeCheckoutError(409, 'invalid_agreement_billing_interval', 'Agreement billing interval is invalid for checkout.');
+  }
+  if (planTier !== snapshotPlan || planTier !== intentPlan || billingInterval !== snapshotBilling || billingInterval !== intentBilling) {
+    throw makeCheckoutError(409, 'package_snapshot_mismatch', 'Agreement package selection does not match the signup request.');
+  }
+
+  const configuredPlatformFee = getAlphaScreenPlatformFee(planTier, billingInterval);
+  const snapshotPlatformFee = packageNumber(packageSnapshot, 'platform_fee');
+  const perRoleFee = packageNumber(packageSnapshot, 'per_role_fee');
+  const includedInterviews = packageNumber(packageSnapshot, 'included_interviews_per_role', 'included_interviews');
+  const additionalInterviewFee = packageNumber(packageSnapshot, 'additional_interview_fee', 'additional_interview_price', 'overage_price');
+  const maxInterviewMinutes = packageNumber(packageSnapshot, 'max_interview_minutes', 'interview_duration_minutes');
+  const firstRolePrepay = firstRolePrepaySnapshot(packageSnapshot);
+  const firstRolePrepaySelected = firstRolePrepay?.selected === true;
+  const expectedPrepay = getAlphaScreenFirstRolePrepayConfig(planTier);
+  if (
+    configuredPlatformFee === null ||
+    snapshotPlatformFee === null ||
+    Number(snapshotPlatformFee) !== Number(configuredPlatformFee) ||
+    perRoleFee === null ||
+    includedInterviews === null ||
+    additionalInterviewFee === null ||
+    maxInterviewMinutes === null
+  ) {
+    throw makeCheckoutError(409, 'package_snapshot_invalid', 'Agreement package snapshot is invalid for checkout.');
+  }
+  if (intent.first_role_prepay_selected === true && !firstRolePrepaySelected) {
+    throw makeCheckoutError(409, 'first_role_prepay_snapshot_missing', 'Agreement first-role prepay snapshot is missing.');
+  }
+  if (firstRolePrepaySelected) {
+    if (
+      !expectedPrepay ||
+      firstRolePrepay.credit_type !== expectedPrepay.credit_type ||
+      Number(firstRolePrepay.normal_role_fee_cents) !== Number(expectedPrepay.normal_role_fee_cents) ||
+      Number(firstRolePrepay.discounted_credit_amount_cents) !== Number(expectedPrepay.discounted_credit_amount_cents) ||
+      Number(firstRolePrepay.discount_percent) !== Number(expectedPrepay.discount_percent)
+    ) {
+      throw makeCheckoutError(409, 'first_role_prepay_snapshot_invalid', 'Agreement first-role prepay snapshot is invalid for checkout.');
+    }
+  }
+
+  return {
+    planTier,
+    billingInterval,
+    packageSnapshot
+  };
+}
+
+async function loadPublicPurchaseIntentForAgreement(agreement) {
+  const purchaseIntentId = publicPurchaseIntentIdFromAgreement(agreement);
+  if (!purchaseIntentId) {
+    throw makeCheckoutError(409, 'purchase_intent_missing', 'Agreement is missing its signup request reference.');
+  }
+
+  const { data, error } = await supabaseAdmin
+    .from('public_purchase_intents')
+    .select('id,status,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,company_legal_name,company_dba,buyer_first_name,buyer_last_name,buyer_email,buyer_phone,buyer_title,source_path,agreement_id,stripe_checkout_session_id,client_id,expires_at,created_at')
+    .eq('id', purchaseIntentId)
+    .maybeSingle();
+  if (error) {
+    throw makeCheckoutError(503, error.code || 'purchase_intent_lookup_failed', error.message || 'Signup request lookup failed.', error.hint || null);
+  }
+  return data || null;
+}
+
+async function ensurePublicAgreementCheckoutClient({ agreement, agreementInput, intent, planTier, billingInterval }) {
+  const nowIso = new Date().toISOString();
+  let clientId = String(agreement.client_id || intent?.client_id || '').trim();
+
+  if (!clientId) {
+    const firstName = String(intent?.buyer_first_name || '').trim();
+    const lastName = String(intent?.buyer_last_name || '').trim();
+    const adminName = `${firstName} ${lastName}`.trim() || String(intent?.buyer_email || '').trim();
+    const { data: client, error: clientErr } = await supabaseAdmin
+      .from('clients')
+      .insert({
+        name: String(intent?.company_legal_name || agreementInput.client_legal_name || '').trim(),
+        email: String(intent?.buyer_email || agreementInput.admin_email || '').trim().toLowerCase(),
+        client_admin_name: adminName || null,
+        plan_tier: planTier,
+        billing_interval: billingInterval,
+        billing_status: 'inactive',
+        subscription_status: 'incomplete',
+        auto_renew: false
+      })
+      .select('id,name,email,client_admin_name')
+      .single();
+    if (clientErr || !client?.id) {
+      throw makeCheckoutError(503, clientErr?.code || 'checkout_client_create_failed', clientErr?.message || 'Could not prepare billing account.', clientErr?.hint || null);
+    }
+    clientId = String(client.id || '').trim();
+  }
+
+  if (!clientId) {
+    throw makeCheckoutError(500, 'checkout_client_missing', 'Could not prepare billing account.');
+  }
+
+  if (String(agreement.client_id || '').trim() !== clientId) {
+    const { error: agreementUpdateErr } = await supabaseAdmin
+      .from('membership_agreements')
+      .update({ client_id: clientId, updated_at: nowIso })
+      .eq('id', agreement.id)
+      .eq('status', 'signed')
+      .eq('is_current', true);
+    if (agreementUpdateErr) {
+      throw makeCheckoutError(503, agreementUpdateErr.code || 'agreement_client_link_failed', agreementUpdateErr.message || 'Could not link agreement to billing account.', agreementUpdateErr.hint || null);
+    }
+    agreement.client_id = clientId;
+  }
+
+  if (String(intent?.client_id || '').trim() !== clientId) {
+    const { error: intentClientErr } = await supabaseAdmin
+      .from('public_purchase_intents')
+      .update({ client_id: clientId, updated_at: nowIso })
+      .eq('id', intent.id);
+    if (intentClientErr) {
+      throw makeCheckoutError(503, intentClientErr.code || 'purchase_intent_client_link_failed', intentClientErr.message || 'Could not link signup request to billing account.', intentClientErr.hint || null);
+    }
+    intent.client_id = clientId;
+  }
+
+  return clientId;
+}
+
+async function requireAgreementClientWhenPresent(agreement, context) {
+  if (!String(agreement?.client_id || '').trim() && isPublicPurchaseIntentAgreement(agreement)) {
+    return { ok: true, client: null, clientId: null };
+  }
+  return requireParentAgreementClient(agreement, context);
+}
+
 function respondWithAgreementClientGuard(res, result, request_id) {
   return res.status(result.status || 500).json({
     ...(result.body || {
@@ -212,6 +504,12 @@ function resolveAgreementPublicSessionState(row) {
   }
 
   if (status === 'signed' && row.is_current === true) {
+    if (!String(row.client_id || '').trim() && isPublicPurchaseIntentAgreement(row)) {
+      return {
+        ok: true,
+        state: 'agreement_signed_pending_payment_setup'
+      };
+    }
     if (checkoutStatus === 'paid') {
       return {
         ok: true,
@@ -276,7 +574,7 @@ async function createAgreementSignedUrl(path, expiresInSeconds) {
 async function loadAgreementByTokenHash(tokenHash) {
   const { data, error } = await supabaseAdmin
     .from('membership_agreements')
-    .select('id,client_id,status,is_current,checkout_status,client_legal_name,dba_trade_name,primary_admin_name,admin_email,membership_tier,initial_term_start,initial_renewal_date,billing_option,auto_renew,notice_deadline_days,template_snapshot,draft_pdf_path,executed_pdf_path,signer_token_expires_at,opened_at,sent_at,signed_at,signer_typed_name')
+    .select('id,client_id,status,is_current,checkout_status,checkout_session_id,checkout_created_at,client_legal_name,dba_trade_name,primary_admin_name,admin_email,membership_tier,initial_term_start,initial_renewal_date,billing_option,auto_renew,notice_deadline_days,template_snapshot,draft_pdf_path,executed_pdf_path,signer_token_expires_at,opened_at,sent_at,signed_at,signer_typed_name')
     .eq('signer_token_hash', tokenHash)
     .maybeSingle();
 
@@ -290,7 +588,69 @@ async function loadAgreementByTokenHash(tokenHash) {
   return data || null;
 }
 
-router.post('/session', async (req, res) => {
+async function resolveLegalBillingAgreementClient(req, clientId, requestId) {
+  const requestedClientId = String(clientId || '').trim();
+  if (!requestedClientId || requestedClientId === 'all') {
+    return { ok: true, client_id: null };
+  }
+
+  const scopedIds = Array.isArray(req.client_memberships)
+    ? req.client_memberships
+    : (Array.isArray(req.clientIds) ? req.clientIds : []);
+  const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
+  if (!isGlobalAdmin && !scopedIds.includes(requestedClientId)) {
+    return {
+      ok: false,
+      status: 403,
+      body: {
+        error: 'forbidden',
+        code: 'forbidden',
+        detail: 'Client scope mismatch.',
+        request_id: requestId
+      }
+    };
+  }
+
+  const billingScope = await resolveBillingOwnerForScope(supabaseAdmin, requestedClientId);
+  if (!billingScope.ok) {
+    return {
+      ok: false,
+      status: billingScope.status || 500,
+      body: {
+        error: billingScope.body?.error || billingScope.body?.code || 'billing_client_lookup_failed',
+        code: billingScope.body?.code || billingScope.body?.error || 'billing_client_lookup_failed',
+        detail: billingScope.body?.detail || 'Billing client lookup failed.',
+        hint: billingScope.body?.hint || null,
+        request_id: requestId
+      }
+    };
+  }
+
+  if (
+    !isGlobalAdmin &&
+    !canViewLegalBillingForClient(req.clientScope, billingScope.scopeClientId || requestedClientId) &&
+    !canViewLegalBillingForClient(req.clientScope, billingScope.billingClientId)
+  ) {
+    return {
+      ok: false,
+      status: 403,
+      body: {
+        error: 'forbidden',
+        code: 'forbidden',
+        detail: 'Legal billing access is required.',
+        request_id: requestId
+      }
+    };
+  }
+
+  return {
+    ok: true,
+    client_id: billingScope.billingClientId || requestedClientId,
+    scope_client_id: billingScope.scopeClientId || requestedClientId
+  };
+}
+
+router.post('/session', publicAgreementTokenRateLimit, async (req, res) => {
   const request_id = req.request_id || null;
   try {
     const token = readToken(req);
@@ -314,7 +674,7 @@ router.post('/session', async (req, res) => {
         request_id
       });
     }
-    const parentGuard = await requireParentAgreementClient(agreement, { route: 'membership_agreements_session', agreement_id: agreement.id });
+    const parentGuard = await requireAgreementClientWhenPresent(agreement, { route: 'membership_agreements_session', agreement_id: agreement.id });
     if (!parentGuard.ok) return respondWithAgreementClientGuard(res, parentGuard, request_id);
 
     let openedAt = agreement.opened_at || null;
@@ -381,7 +741,7 @@ router.post('/session', async (req, res) => {
   }
 });
 
-router.post('/sign', async (req, res) => {
+router.post('/sign', publicAgreementTokenRateLimit, async (req, res) => {
   const request_id = req.request_id || null;
   try {
     const token = readToken(req);
@@ -437,7 +797,7 @@ router.post('/sign', async (req, res) => {
         request_id
       });
     }
-    const parentGuard = await requireParentAgreementClient(agreement, { route: 'membership_agreements_sign', agreement_id: agreement.id });
+    const parentGuard = await requireAgreementClientWhenPresent(agreement, { route: 'membership_agreements_sign', agreement_id: agreement.id });
     if (!parentGuard.ok) return respondWithAgreementClientGuard(res, parentGuard, request_id);
 
     const signedAt = new Date().toISOString();
@@ -470,6 +830,7 @@ router.post('/sign', async (req, res) => {
 
     const agreementInput = buildAgreementInputFromRow(agreement);
     const { html } = buildMembershipAgreementHtml(agreementInput, {
+      showPackageTerms: isPublicPurchaseIntentAgreement(agreement),
       execution: {
         accepted: true,
         signer_typed_name: typedName,
@@ -650,11 +1011,10 @@ router.post('/sign', async (req, res) => {
   }
 });
 
-router.post('/checkout-session', async (req, res) => {
+router.post('/checkout-session', publicAgreementTokenRateLimit, async (req, res) => {
   const request_id = req.request_id || null;
   try {
     const token = readToken(req);
-    const embeddedCheckoutRequested = wantsEmbeddedCheckout(req.body?.embedded, true);
     if (!token) {
       return res.status(400).json({
         error: 'token_required',
@@ -675,6 +1035,8 @@ router.post('/checkout-session', async (req, res) => {
       });
     }
 
+    const publicAgreement = isPublicPurchaseIntentAgreement(agreement);
+    const embeddedCheckoutRequested = wantsEmbeddedCheckout(req.body?.embedded, !publicAgreement);
     if (String(agreement.status || '').trim().toLowerCase() !== 'signed' || agreement.is_current !== true) {
       return res.status(409).json({
         error: 'agreement_not_checkout_eligible',
@@ -691,18 +1053,6 @@ router.post('/checkout-session', async (req, res) => {
         request_id
       });
     }
-
-    const clientId = String(agreement.client_id || '').trim();
-    if (!clientId) {
-      return res.status(400).json({
-        error: 'missing_client_id',
-        code: 'missing_client_id',
-        detail: 'Agreement is not linked to a client.',
-        request_id
-      });
-    }
-    const parentGuard = await requireParentAgreementClient(agreement, { route: 'membership_agreements_checkout_session', agreement_id: agreement.id });
-    if (!parentGuard.ok) return respondWithAgreementClientGuard(res, parentGuard, request_id);
 
     const agreementInput = buildAgreementInputFromRow(agreement);
     const planTier = String(agreementInput.membership_tier || '').trim().toLowerCase();
@@ -723,6 +1073,33 @@ router.post('/checkout-session', async (req, res) => {
         request_id
       });
     }
+
+    let purchaseIntent = null;
+    let publicPackageSnapshot = null;
+    let clientId = String(agreement.client_id || '').trim();
+    if (publicAgreement) {
+      purchaseIntent = await loadPublicPurchaseIntentForAgreement(agreement);
+      const publicCheckout = validatePublicPurchaseIntentForCheckout({ agreement, agreementInput, intent: purchaseIntent });
+      publicPackageSnapshot = publicCheckout.packageSnapshot;
+      clientId = await ensurePublicAgreementCheckoutClient({
+        agreement,
+        agreementInput,
+        intent: purchaseIntent,
+        planTier: publicCheckout.planTier,
+        billingInterval: publicCheckout.billingInterval
+      });
+    }
+
+    if (!clientId) {
+      return res.status(400).json({
+        error: 'missing_client_id',
+        code: 'missing_client_id',
+        detail: 'Agreement is not linked to a client.',
+        request_id
+      });
+    }
+    const parentGuard = await requireParentAgreementClient(agreement, { route: 'membership_agreements_checkout_session', agreement_id: agreement.id });
+    if (!parentGuard.ok) return respondWithAgreementClientGuard(res, parentGuard, request_id);
 
     const enterpriseFees = planTier === 'enterprise'
       ? {
@@ -750,6 +1127,26 @@ router.post('/checkout-session', async (req, res) => {
       });
     }
 
+    const checkoutMetadata = publicAgreement
+      ? buildPublicAgreementCheckoutMetadata({
+          agreement,
+          agreementInput,
+          intent: purchaseIntent,
+          packageSnapshot: publicPackageSnapshot
+        })
+      : {
+          agreement_id: agreement.id
+        };
+    const firstRolePrepay = publicAgreement
+      ? buildFirstRolePrepayCheckout(publicPackageSnapshot)
+      : null;
+    const idempotencyKey = publicAgreement
+      ? `agreement_checkout:${agreement.id}:${planTier}:${billingInterval}`
+      : '';
+    const cancelUrl = publicAgreement
+      ? appendQueryParam(buildMembershipAgreementSignUrl(token), 'checkout', 'cancel')
+      : buildMembershipAgreementSignUrl(token);
+
     const {
       session,
       fallbackSession,
@@ -761,12 +1158,12 @@ router.post('/checkout-session', async (req, res) => {
       planTier,
       billingInterval,
       metadataSource: 'agreement_checkout',
-      metadata: {
-        agreement_id: agreement.id
-      },
+      metadata: checkoutMetadata,
+      firstRolePrepay,
       enterpriseFees,
       embedded: embeddedCheckoutRequested,
-      cancelUrl: buildMembershipAgreementSignUrl(token),
+      cancelUrl,
+      idempotencyKey,
       requestContext: {
         forwardedProto: req.headers?.['x-forwarded-proto'],
         forwardedHost: req.headers?.['x-forwarded-host'],
@@ -823,6 +1220,36 @@ router.post('/checkout-session', async (req, res) => {
       });
     }
 
+    if (purchaseIntent?.id) {
+      const { error: intentCheckoutErr } = await supabaseAdmin
+        .from('public_purchase_intents')
+        .update({
+          status: 'checkout_pending',
+          stripe_checkout_session_id: checkoutSessionId,
+          client_id: clientId,
+          updated_at: nowIso
+        })
+        .eq('id', purchaseIntent.id);
+
+      if (intentCheckoutErr) {
+        console.error('[membership-agreements/checkout-session] purchase_intent_checkout_update_failed', {
+          request_id,
+          agreement_id: agreement.id,
+          purchase_intent_id: purchaseIntent.id,
+          error: intentCheckoutErr.message,
+          code: intentCheckoutErr.code,
+          hint: intentCheckoutErr.hint
+        });
+        return res.status(500).json({
+          error: 'purchase_intent_checkout_update_failed',
+          code: intentCheckoutErr.code || 'purchase_intent_checkout_update_failed',
+          detail: intentCheckoutErr.message,
+          hint: intentCheckoutErr.hint,
+          request_id
+        });
+      }
+    }
+
     return res.json({
       ok: true,
       url: checkoutUrl || null,
@@ -849,23 +1276,14 @@ router.get('/latest-signed', requireAuth, withClientScope, async (req, res) => {
       return res.json({ ok: true, agreement: null, request_id });
     }
 
-    const scopedIds = Array.isArray(req.client_memberships)
-      ? req.client_memberships
-      : (Array.isArray(req.clientIds) ? req.clientIds : []);
-    const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
-    if (!isGlobalAdmin && !scopedIds.includes(clientId)) {
-      return res.status(403).json({
-        error: 'forbidden',
-        code: 'forbidden',
-        detail: 'Client scope mismatch.',
-        request_id
-      });
-    }
+    const access = await resolveLegalBillingAgreementClient(req, clientId, request_id);
+    if (!access.ok) return res.status(access.status || 403).json(access.body);
+    const agreementClientId = access.client_id;
 
     const { data: latest, error: latestErr } = await supabaseAdmin
       .from('membership_agreements')
       .select('id,client_id,status,signed_at,signer_typed_name,client_legal_name,executed_pdf_path,created_at,is_current')
-      .eq('client_id', clientId)
+      .eq('client_id', agreementClientId)
       .eq('status', 'signed')
       .eq('is_current', true)
       .maybeSingle();
@@ -873,7 +1291,7 @@ router.get('/latest-signed', requireAuth, withClientScope, async (req, res) => {
     if (latestErr) {
       console.error('[membership-agreements/latest-signed] query_failed', {
         request_id,
-        client_id: clientId,
+        client_id: agreementClientId,
         error: latestErr.message,
         code: latestErr.code,
         hint: latestErr.hint
@@ -925,23 +1343,14 @@ router.get('/latest-signed-url', requireAuth, withClientScope, async (req, res) 
       return res.json({ ok: true, executed_pdf_url: null, request_id });
     }
 
-    const scopedIds = Array.isArray(req.client_memberships)
-      ? req.client_memberships
-      : (Array.isArray(req.clientIds) ? req.clientIds : []);
-    const isGlobalAdmin = req.isGlobalAdmin === true || req.isAdmin === true;
-    if (!isGlobalAdmin && !scopedIds.includes(clientId)) {
-      return res.status(403).json({
-        error: 'forbidden',
-        code: 'forbidden',
-        detail: 'Client scope mismatch.',
-        request_id
-      });
-    }
+    const access = await resolveLegalBillingAgreementClient(req, clientId, request_id);
+    if (!access.ok) return res.status(access.status || 403).json(access.body);
+    const agreementClientId = access.client_id;
 
     const { data: latest, error: latestErr } = await supabaseAdmin
       .from('membership_agreements')
       .select('id,executed_pdf_path,created_at,signed_at,is_current')
-      .eq('client_id', clientId)
+      .eq('client_id', agreementClientId)
       .eq('status', 'signed')
       .eq('is_current', true)
       .maybeSingle();
@@ -949,7 +1358,7 @@ router.get('/latest-signed-url', requireAuth, withClientScope, async (req, res) 
     if (latestErr) {
       console.error('[membership-agreements/latest-signed-url] query_failed', {
         request_id,
-        client_id: clientId,
+        client_id: agreementClientId,
         error: latestErr.message,
         code: latestErr.code,
         hint: latestErr.hint
