@@ -8,6 +8,11 @@ const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
 const { isRoleInactive, buildRoleInactivePayload, logInactiveRoleBlocked } = require('../src/lib/roleLifecycle');
+const {
+  normalizeCandidatePhoneCountry,
+  normalizeCandidatePhone,
+  getCandidatePhoneValidationMessage
+} = require('../src/lib/candidatePhone');
 const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
 const analyzeResume = require('../analyzeResume'); // resume analyzer
 
@@ -64,11 +69,6 @@ function six() {
 // normalize helpers
 function normEmail(v = '') {
   return String(v || '').trim().toLowerCase();
-}
-function normPhone(v = '') {
-  const digits = String(v || '').replace(/\D/g, '');
-  // Keep only last 10 digits (NANP style), chopping country codes/leading 1
-  return digits.length > 10 ? digits.slice(-10) : digits;
 }
 function normName(v = '') {
   return String(v || '').trim().replace(/\s+/g, ' ').toLowerCase();
@@ -128,17 +128,26 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
     const rawName      = (req.body.name || '').trim();
     const emailRaw     = (req.body.email || '').trim();
     const phoneRaw     = (req.body.phone || '').trim();
+    const phoneCountry = normalizeCandidatePhoneCountry(req.body.phone_country || req.body.phoneCountry || '');
     const resume_url_in = req.body.resume_url || null;
 
     const fullName = rawName || [first_name, last_name].filter(Boolean).join(' ').trim();
 
     const email = normEmail(emailRaw);
-    const phone = normPhone(phoneRaw);
+    const phone = normalizeCandidatePhone(phoneRaw, phoneCountry);
     const nameNorm = normName(fullName);
 
     if (!email || !fullName || (!role_token && !role_id_in)) {
       return res.status(400).json({
         error: 'Required: email, (name OR first_name+last_name), and (role_id OR role_token).',
+      });
+    }
+    if (!phone) {
+      return res.status(400).json({
+        error: 'invalid_phone',
+        code: 'INVALID_PHONE',
+        detail: getCandidatePhoneValidationMessage(phoneCountry),
+        request_id
       });
     }
 
@@ -443,7 +452,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
           first_name,
           last_name,
           email,
-          phone, // already normalized to last 10 digits
+          phone, // US: 10 digits; Philippines: 63 + mobile number.
           status: 'Resume Uploaded',
         })
         .select('id')
