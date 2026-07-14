@@ -39,6 +39,51 @@ function safeJSONParse(s) {
   try { return JSON.parse(s) } catch { return null }
 }
 
+const REPLACEMENT_RUBRIC_MIN_QUESTIONS = 3
+const RUBRIC_TARGET_MINIMUMS = Object.freeze({
+  BASIC: 5,
+  DETAILED: 7,
+  TECHNICAL: 7
+})
+
+class RubricQuestionQualityError extends Error {
+  constructor({ minimum, target, validQuestionCount }) {
+    super(`Generated rubric must contain at least ${minimum} valid, distinct questions.`)
+    this.name = 'RubricQuestionQualityError'
+    this.code = 'RUBRIC_QUESTION_QUALITY_FAILED'
+    this.stage = 'rubric_quality'
+    this.status = 502
+    this.detail = { minimum, target, valid_question_count: validQuestionCount, attempts: 2 }
+  }
+}
+
+function normalizeQuestionKey(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ')
+}
+
+function normalizeRubricQuestions(questions) {
+  const seen = new Set()
+  const normalized = []
+
+  for (const question of Array.isArray(questions) ? questions : []) {
+    if (!question || typeof question !== 'object' || Array.isArray(question)) continue
+    const text = String(question.text || '').replace(/\s+/g, ' ').trim()
+    if (!text) continue
+    const key = normalizeQuestionKey(text)
+    if (seen.has(key)) continue
+    seen.add(key)
+    const category = String(question.category || '').replace(/\s+/g, ' ').trim() || 'auto'
+    normalized.push({ ...question, text, category })
+  }
+
+  return normalized
+}
+
+function replacementRubricTargetCount(interviewType) {
+  const normalizedType = String(interviewType || 'BASIC').trim().toUpperCase()
+  return RUBRIC_TARGET_MINIMUMS[normalizedType] || RUBRIC_TARGET_MINIMUMS.BASIC
+}
+
 function makeKBFromRubric(rubricObj) {
   const qs = Array.isArray(rubricObj?.questions) ? rubricObj.questions : []
   // Tavus-facing KB must contain only clean question text, not rubric categories or scoring labels.
@@ -48,30 +93,8 @@ function makeKBFromRubric(rubricObj) {
   return { questions }
 }
 
-async function generateRubricAndKBForRole(roleId) {
-  // 1) Load role
-  const { data: role, error: roleErr } = await supabase
-    .from('roles')
-    .select('id, title, interview_type, manual_questions, job_description_url')
-    .eq('id', roleId)
-    .single()
-  if (roleErr || !role) throw new Error(`role_lookup_failed: ${roleErr?.message || 'not found'}`)
-
-  // 2) Pull + parse JD (if present)
-  let jdText = ''
-  let jdFileName = ''
-  if (role.job_description_url) {
-    const { bucket, key } = splitBucketAndKey(role.job_description_url)
-    if (bucket && key) {
-      jdFileName = key
-      const buf = await downloadAsBuffer(bucket, key)
-      const mime = guessMimeFromExt(key)
-      jdText = await parseBufferToText(buf, mime, key)
-    }
-  }
-
-  // 3) Build LLM prompt
-  const prompt = `
+function buildRubricPrompt(role, jdText) {
+  return `
 You are an AI interview designer. Create a JSON rubric based on the job description and any custom questions.
 
 Return ONLY valid JSON. Shape:
@@ -118,78 +141,187 @@ ${jdText || 'N/A'}
 Manual Questions:
 ${role.manual_questions || 'None'}
 `.trim()
+}
 
-  // 4) Call OpenAI
-  let rubricObj = null
+function buildRubricCorrectionPrompt(role, jdText, validQuestions) {
+  const target = replacementRubricTargetCount(role?.interview_type)
+  const additionalNeeded = Math.max(target - validQuestions.length, REPLACEMENT_RUBRIC_MIN_QUESTIONS - validQuestions.length)
+  return `${buildRubricPrompt(role, jdText)}
+
+QUALITY CORRECTION:
+The prior result contained only ${validQuestions.length} valid, distinct questions. Return a complete replacement JSON rubric with at least ${target} valid, distinct questions. Add at least ${additionalNeeded} new, non-duplicate questions while preserving these usable questions where appropriate:
+${JSON.stringify(validQuestions)}`
+}
+
+async function requestRubric({ prompt, openaiClient = openai, logger = console }) {
   try {
-    const resp = await openai.chat.completions.create({
+    const resp = await openaiClient.chat.completions.create({
       model: process.env.OPENAI_RUBRIC_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini',
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.2
     })
     const raw = resp?.choices?.[0]?.message?.content || ''
-    rubricObj = safeJSONParse(raw)
+    const rubricObj = safeJSONParse(raw)
+    return rubricObj && Array.isArray(rubricObj.questions) ? rubricObj : null
   } catch (e) {
-    // Keep going; we'll fallback to basic KB if needed
-    console.error('openai_rubric_failed:', e?.message || e)
+    logger.error('openai_rubric_failed:', e?.message || e)
+    return null
+  }
+}
+
+function fallbackRubric(role) {
+  const fallbackQuestion = role.title
+    ? `What experience makes you a strong fit for the ${role.title} role?`
+    : 'Tell me about your most relevant experience for this role.'
+  return { questions: [{ text: fallbackQuestion, category: 'auto' }] }
+}
+
+async function generateRubricForRole({ role, jdText, openaiClient = openai, logger = console }) {
+  const rubricObj = await requestRubric({
+    prompt: buildRubricPrompt(role, jdText),
+    openaiClient,
+    logger
+  })
+
+  return rubricObj || fallbackRubric(role)
+}
+
+async function generateReplacementRubric({ role, jdText, openaiClient = openai, logger = console }) {
+  const initialRubric = await generateRubricForRole({ role, jdText, openaiClient, logger })
+  const initialQuestions = normalizeRubricQuestions(initialRubric.questions)
+  if (initialQuestions.length >= REPLACEMENT_RUBRIC_MIN_QUESTIONS) {
+    return { ...initialRubric, questions: initialQuestions }
   }
 
-  // Fallback rubric if parsing failed
-  if (!rubricObj || !Array.isArray(rubricObj.questions)) {
-    const fallbackQ = role.title
-      ? [`What experience makes you a strong fit for the ${role.title} role?`]
-      : [`Tell me about your most relevant experience for this role.`]
-    rubricObj = { questions: fallbackQ.map(t => ({ text: t, category: 'auto' })) }
+  const retryRubric = await requestRubric({
+    prompt: buildRubricCorrectionPrompt(role, jdText, initialQuestions),
+    openaiClient,
+    logger
+  })
+  const mergedQuestions = normalizeRubricQuestions([
+    ...initialQuestions,
+    ...(retryRubric?.questions || [])
+  ])
+  if (mergedQuestions.length < REPLACEMENT_RUBRIC_MIN_QUESTIONS) {
+    throw new RubricQuestionQualityError({
+      minimum: REPLACEMENT_RUBRIC_MIN_QUESTIONS,
+      target: replacementRubricTargetCount(role?.interview_type),
+      validQuestionCount: mergedQuestions.length
+    })
   }
 
-  // 5) Write rubric to roles.rubric + canonical parsed JD text
-  const descriptionExcerpt = jdText ? jdText.replace(/\s+/g, ' ').trim().slice(0, 400) : ''
-  await supabase.from('roles').update({
-    rubric: rubricObj,
-    rubric_questions: Array.isArray(rubricObj?.questions) ? rubricObj.questions : [],
-    ...(jdText ? { job_description_text: jdText, description: descriptionExcerpt || null } : {})
-  }).eq('id', roleId)
+  return { ...(retryRubric || initialRubric), questions: mergedQuestions }
+}
 
-  // 6) Create + upload KB JSON (kbs/<uuid>.json), store <uuid> in roles.kb_document_id
+async function uploadKnowledgeBase({ rubricObj, supabaseClient = supabase, kbId = randomUUID() }) {
   const kbJson = makeKBFromRubric(rubricObj)
-  const kbId = randomUUID()
   const kbKey = `${kbId}.json`
-  const { error: upErr } = await supabase.storage
+  const { error: upErr } = await supabaseClient.storage
     .from('kbs')
     .upload(kbKey, new Blob([JSON.stringify(kbJson, null, 2)], { type: 'application/json' }), {
       contentType: 'application/json',
       upsert: true
     })
   if (upErr) {
-    // If Blob unsupported in your Node env, fallback to Buffer:
-    const { error: upErr2 } = await supabase.storage
+    const { error: upErr2 } = await supabaseClient.storage
       .from('kbs')
       .upload(kbKey, Buffer.from(JSON.stringify(kbJson)), {
         contentType: 'application/json',
         upsert: true
-      })
+    })
     if (upErr2) throw new Error(`kb_upload_failed: ${upErr2.message}`)
   }
+  return kbId
+}
 
+async function generateJdDerivedArtifactsForRole(
+  { role, jdText },
+  { supabaseClient = supabase, openaiClient = openai, logger = console, kbId } = {}
+) {
+  if (!role?.id) throw new Error('role_id_required')
+  const normalizedJdText = String(jdText || '').trim()
+  const rubric = await generateReplacementRubric({
+    role,
+    jdText: normalizedJdText,
+    openaiClient,
+    logger
+  })
+  const kbDocumentId = await uploadKnowledgeBase({
+    rubricObj: rubric,
+    supabaseClient,
+    kbId
+  })
+  const rubricQuestions = Array.isArray(rubric?.questions) ? rubric.questions : []
+  const description = normalizedJdText
+    ? normalizedJdText.replace(/\s+/g, ' ').slice(0, 400)
+    : null
+
+  return {
+    job_description_text: normalizedJdText,
+    description,
+    rubric,
+    rubric_questions: rubricQuestions,
+    kb_document_id: kbDocumentId
+  }
+}
+
+async function generateRubricAndKBForRole(roleId) {
+  const { data: role, error: roleErr } = await supabase
+    .from('roles')
+    .select('id, title, interview_type, manual_questions, job_description_url')
+    .eq('id', roleId)
+    .single()
+  if (roleErr || !role) throw new Error(`role_lookup_failed: ${roleErr?.message || 'not found'}`)
+
+  let jdText = ''
+  if (role.job_description_url) {
+    const { bucket, key } = splitBucketAndKey(role.job_description_url)
+    if (bucket && key) {
+      const buf = await downloadAsBuffer(bucket, key)
+      const mime = guessMimeFromExt(key)
+      jdText = await parseBufferToText(buf, mime, key)
+    }
+  }
+
+  const rubric = await generateRubricForRole({ role, jdText })
+  const rubricQuestions = Array.isArray(rubric?.questions) ? rubric.questions : []
+  const descriptionExcerpt = jdText ? jdText.replace(/\s+/g, ' ').trim().slice(0, 400) : ''
+
+  await supabase.from('roles').update({
+    rubric,
+    rubric_questions: rubricQuestions,
+    ...(jdText ? { job_description_text: jdText, description: descriptionExcerpt || null } : {})
+  }).eq('id', roleId)
+
+  const kbDocumentId = await uploadKnowledgeBase({ rubricObj: rubric })
   const { error: updErr } = await supabase
     .from('roles')
-    .update({ kb_document_id: kbId })
+    .update({ kb_document_id: kbDocumentId })
     .eq('id', roleId)
   if (updErr) throw new Error(`kb_id_update_failed: ${updErr.message}`)
 
   try {
     await ensureTavusDocumentForRole(
-      { id: roleId, title: role.title, kb_document_id: kbId },
-      { supabase, rubric: rubricObj }
+      { id: roleId, title: role.title, kb_document_id: kbDocumentId },
+      { supabase, rubric }
     )
   } catch (tavusErr) {
     console.error(
-      `[generateRubric] tavus_document_creation_failed role=${roleId} kb_document_id=${kbId}:`,
+      `[generateRubric] tavus_document_creation_failed role=${roleId} kb_document_id=${kbDocumentId}:`,
       tavusErr?.message || tavusErr
     )
   }
 
-  return { role_id: roleId, kb_document_id: kbId }
+  return { role_id: roleId, kb_document_id: kbDocumentId }
 }
 
-module.exports = { generateRubricAndKBForRole, makeKBFromRubric }
+module.exports = {
+  REPLACEMENT_RUBRIC_MIN_QUESTIONS,
+  RubricQuestionQualityError,
+  generateRubricAndKBForRole,
+  generateJdDerivedArtifactsForRole,
+  generateRubricForRole,
+  makeKBFromRubric,
+  normalizeRubricQuestions,
+  replacementRubricTargetCount
+}

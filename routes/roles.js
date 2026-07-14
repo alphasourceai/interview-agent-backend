@@ -5,6 +5,7 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
 const { getRoleInterviewAvailability } = require('../src/lib/roleInterviewAvailability');
+const { getRoleJdReplacementEligibility } = require('../src/lib/roleJdReplacement');
 const { loadEntityMap, resolveEntityFilter, uniqueIds, withEntityFields } = require('../src/lib/entityScopeFilter');
 const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
 
@@ -171,6 +172,19 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
     }
 
     const roles = data || [];
+    let replacementEligibilityByRoleId = {};
+    try {
+      replacementEligibilityByRoleId = await getRoleJdReplacementEligibility({ db, roles });
+    } catch (eligibilityError) {
+      console.error('[GET /roles] replacement eligibility lookup failed', eligibilityError);
+      return res.status(500).json({
+        error: 'query failed (role replacement eligibility)',
+        code: 'LIST_ROLE_REPLACEMENT_ELIGIBILITY_FAILED',
+        detail: null,
+        hint: null,
+        request_id
+      });
+    }
     const parseWholeNonNegative = (value) => {
       const n = Number(value);
       if (!Number.isFinite(n)) return null;
@@ -223,7 +237,11 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
         purchased_interviews: availability?.purchased_interviews ?? null,
         used_interviews: availability?.used_interviews ?? null,
         remaining_interviews: availability?.remaining_interviews ?? null,
-        max_interview_minutes: maxInterviewMinutesByClientId[role.client_id] ?? null
+        max_interview_minutes: maxInterviewMinutesByClientId[role.client_id] ?? null,
+        job_description_replacement: replacementEligibilityByRoleId[role.id] || {
+          eligible: false,
+          blockers: ['eligibility_unavailable']
+        }
       }, entityMap, role.client_id);
     });
 

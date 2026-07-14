@@ -6,11 +6,27 @@ const mammoth = require('mammoth');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 
-// Server-side Supabase (service role) – used to download from Storage
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+let supabase = null;
+
+function getSupabase() {
+  if (supabase) return supabase;
+  const url = String(process.env.SUPABASE_URL || '').trim();
+  const serviceRoleKey = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  if (!url || !serviceRoleKey) {
+    throw new Error('parseJD: Supabase storage is not configured');
+  }
+  supabase = createClient(url, serviceRoleKey, {
+    auth: { persistSession: false, autoRefreshToken: false }
+  });
+  return supabase;
+}
+
+function normalizeExtractedText(value) {
+  return String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .trim();
+}
 
 async function parseBufferToText(buffer, mime, filename) {
   const ext = (path.extname(filename || '').toLowerCase() || '').replace('.', '');
@@ -18,12 +34,12 @@ async function parseBufferToText(buffer, mime, filename) {
 
   if (type === 'application/pdf' || ext === 'pdf') {
     const out = await pdfParse(buffer);
-    return (out.text || '').trim();
+    return normalizeExtractedText(out.text);
   }
 
   if (type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || ext === 'docx') {
     const { value } = await mammoth.extractRawText({ buffer });
-    return (value || '').trim();
+    return normalizeExtractedText(value);
   }
 
   throw Object.assign(new Error('Unsupported file type. Please upload PDF or DOCX.'), { status: 415 });
@@ -46,7 +62,7 @@ async function parseJD({ path: storedPath }) {
   const bucket = storedPath.slice(0, firstSlash);
   const key = storedPath.slice(firstSlash + 1);
 
-  const { data: fileData, error } = await supabase
+  const { data: fileData, error } = await getSupabase()
     .storage
     .from(bucket)
     .download(key);
@@ -70,6 +86,7 @@ async function parseJD({ path: storedPath }) {
 }
 
 module.exports = {
+  normalizeExtractedText,
   parseBufferToText,
   parseJD
 };
