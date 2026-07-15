@@ -426,6 +426,46 @@ async function sendMembershipAgreementEmail(to, signingUrl, details = {}) {
   return { statusCode: resp?.statusCode || 0 }
 }
 
+async function sendRetailSignupEmailVerificationCode(to, code, details = {}) {
+  if (!API_KEY) return { skipped: true }
+  const rawCode = String(code || '').trim()
+  const safeCode = escapeHtml(rawCode)
+  const purchaseIntentId = String(details.purchaseIntentId || details.purchase_intent_id || '').trim()
+  const verificationId = String(details.verificationId || details.verification_id || '').trim()
+  const msg = {
+    to,
+    from: FROM,
+    subject: 'Your alphaScreen verification code',
+    text: `Use this one-time code to verify your email and continue your alphaScreen membership signup: ${rawCode}\n\nThis code expires in 10 minutes. If you did not request it, you can ignore this email.`,
+    html: buildBrandedEmailShell({
+      title: 'Verify your alphaScreen email',
+      preheader: 'Use your one-time code to continue your alphaScreen membership signup.',
+      helpEmail: 'memberships@alphasourceai.com',
+      contentHtml: `
+        <p style="margin:0 0 14px;font-size:15px;line-height:1.6;">
+          Use this one-time code to verify your email and continue your alphaScreen membership signup:
+        </p>
+        <p style="margin:0 0 16px;">
+          <span style="display:inline-block;background:#F8F9FD;color:#0A1547;border:1px solid #A380F6;border-radius:8px;padding:10px 16px;font-size:22px;font-weight:800;letter-spacing:0.22em;">
+            ${safeCode}
+          </span>
+        </p>
+        <p style="margin:0 0 16px;font-size:14px;line-height:1.55;">
+          This code expires in 10 minutes. If you did not request it, you can ignore this email.
+        </p>
+      `
+    }),
+    categories: ['retail_signup_email_verification'],
+    customArgs: {
+      email_category: 'retail_signup_email_verification',
+      purchase_intent_id: purchaseIntentId,
+      verification_id: verificationId
+    }
+  }
+  const [resp] = await sg.send(msg)
+  return { statusCode: resp?.statusCode || 0 }
+}
+
 async function sendMembershipAgreementInternalNotification(to, details = {}) {
   if (!API_KEY) return { skipped: true }
 
@@ -753,6 +793,7 @@ module.exports = {
   sendMemberRecoveryEmail,
   sendAlphaScreenWelcomeEmail,
   sendMembershipAgreementEmail,
+  sendRetailSignupEmailVerificationCode,
   sendMembershipAgreementInternalNotification,
   sendMembershipAgreementSignedCopyEmail,
   sendMembershipAgreementCompletedInternalNotification,

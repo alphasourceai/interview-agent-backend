@@ -1,12 +1,17 @@
+const crypto = require('crypto');
 const { supabaseAdmin } = require('./supabaseClient');
 
 function getRequestSubjectKey(req) {
-  const forwarded = String(req?.headers?.['x-forwarded-for'] || '').trim();
-  if (forwarded) {
-    const first = forwarded.split(',')[0].trim();
-    if (first) return first;
-  }
-  return String(req?.ip || 'unknown').trim() || 'unknown';
+  // Express derives req.ip from trusted proxies configured by the application.
+  // Reading x-forwarded-for here would let direct clients choose another subject.
+  return String(req?.ip || req?.socket?.remoteAddress || 'unknown').trim() || 'unknown';
+}
+
+function hashRateLimitSubject(...parts) {
+  const normalized = parts
+    .map((part) => String(part || '').trim().toLowerCase())
+    .join('\u001f');
+  return crypto.createHash('sha256').update(normalized).digest('hex');
 }
 
 async function checkAndIncrementRateLimit({
@@ -42,5 +47,6 @@ async function checkAndIncrementRateLimit({
 
 module.exports = {
   getRequestSubjectKey,
+  hashRateLimitSubject,
   checkAndIncrementRateLimit
 };

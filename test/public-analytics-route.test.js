@@ -133,6 +133,25 @@ test('public analytics route rejects unknown event names without inserting', asy
   assert.equal(db.inserts.length, 0);
 });
 
+test('public analytics route accepts the pricing-page signup back event', async () => {
+  const db = makeDb();
+  const app = buildApp(db);
+  const response = await request(app, {
+    event_name: 'signup_back_clicked',
+    path: '/alphascreen/pricing',
+    properties: {
+      plan: 'basic',
+      step: 'agreement_created',
+    },
+  });
+
+  assert.equal(response.status, 202);
+  assert.deepEqual(db.inserts[0].rows[0].properties, {
+    plan: 'basic',
+    step: 'agreement_created',
+  });
+});
+
 test('public analytics route bounds and sanitizes allowed array properties', async () => {
   const db = makeDb();
   const app = buildApp(db);

@@ -123,6 +123,10 @@ const roleCheckoutUpload = multer({
   limits: { fileSize: 20 * 1024 * 1024 }
 })
 const app = express()
+const configuredTrustProxyHops = Number(process.env.TRUST_PROXY_HOPS || 1)
+app.set('trust proxy', Number.isInteger(configuredTrustProxyHops) && configuredTrustProxyHops >= 0
+  ? configuredTrustProxyHops
+  : 1)
 
 // Sentry request middleware (must be before other app.use and routes)
 if (SENTRY_ENABLED) {

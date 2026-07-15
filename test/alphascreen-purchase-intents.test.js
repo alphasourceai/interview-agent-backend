@@ -8,6 +8,7 @@ const { test } = require('node:test')
 
 const routePath = path.join(__dirname, '..', 'routes', 'alphaScreenPackages.js')
 const supabaseClientPath = path.join(__dirname, '..', 'src', 'lib', 'supabaseClient.js')
+const rateLimitPath = path.join(__dirname, '..', 'src', 'lib', 'rateLimit.js')
 const STALE_ANNUAL_PRICE_PATTERN = new RegExp([
   String(3229 + 0.2).replace('.', '\\.'),
   String(322900 + 20),
@@ -158,12 +159,27 @@ function makeDb(options = {}) {
 function buildApp(db, env = {}) {
   delete require.cache[routePath]
   delete require.cache[supabaseClientPath]
+  delete require.cache[rateLimitPath]
   const previous = {}
   for (const [key, value] of Object.entries(env)) {
     previous[key] = process.env[key]
     process.env[key] = value
   }
   injectModule(supabaseClientPath, { supabaseAdmin: db })
+  const rateLimitCounts = new Map()
+  injectModule(rateLimitPath, {
+    getRequestSubjectKey: () => '198.51.100.20',
+    hashRateLimitSubject: (...parts) => `hash:${parts.join(':')}`,
+    async checkAndIncrementRateLimit({ routeName, subjectKey, maxCount }) {
+      const key = `${routeName}:${subjectKey}`
+      const count = (rateLimitCounts.get(key) || 0) + 1
+      rateLimitCounts.set(key, count)
+      return {
+        allowed: count <= maxCount,
+        retryAfterSeconds: count <= maxCount ? 0 : 60
+      }
+    }
+  })
   const router = require(routePath)
   for (const [key, value] of Object.entries(previous)) {
     if (value === undefined) delete process.env[key]
@@ -583,9 +599,12 @@ test('purchase intent endpoint rate limits repeated requests', async () => {
   const app = buildApp(db, { ALPHASCREEN_PURCHASE_INTENT_RATE_MAX: '1' })
 
   const first = await request(app, validBody({ buyer_email: 'one@company.example' }), { 'x-forwarded-for': '198.51.100.20' })
-  const second = await request(app, validBody({ buyer_email: 'two@company.example' }), { 'x-forwarded-for': '198.51.100.20' })
+  const differentCustomer = await request(app, validBody({ buyer_email: 'two@company.example' }), { 'x-forwarded-for': '198.51.100.20' })
+  const second = await request(app, validBody({ buyer_email: 'one@company.example' }), { 'x-forwarded-for': '198.51.100.20' })
 
   assert.equal(first.status, 201)
+  assert.equal(differentCustomer.status, 201)
   assert.equal(second.status, 429)
-  assert.equal(second.body.code, 'RATE_LIMIT_EXCEEDED')
+  assert.equal(second.body.code, 'RETAIL_SIGNUP_RATE_LIMITED')
+  assert.equal(second.body.retry_after_seconds, 60)
 })
