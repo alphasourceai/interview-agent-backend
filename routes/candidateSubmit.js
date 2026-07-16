@@ -1,6 +1,7 @@
 // routes/candidateSubmit.js
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const Sentry = require('@sentry/node');
 const multer = require('multer');
 const sg = require('@sendgrid/mail');
@@ -13,6 +14,14 @@ const {
   normalizeCandidatePhone,
   getCandidatePhoneValidationMessage
 } = require('../src/lib/candidatePhone');
+const { buildCandidateError, sendCandidateError, getInterviewConflictCode } = require('../src/lib/candidateErrors');
+const { ResumeUploadError, inspectResumeFile, uploadResumeObject } = require('../src/lib/resumeUpload');
+const {
+  CandidateSubmissionKeyError,
+  reserveCandidateSubmission,
+  completeCandidateSubmission,
+  failCandidateSubmission
+} = require('../src/lib/candidateSubmissionIdempotency');
 const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
 const analyzeResume = require('../analyzeResume'); // resume analyzer
 
@@ -41,22 +50,14 @@ async function candidateSubmitRateLimit(req, res, next) {
       maxCount: SUBMIT_RATE_MAX
     });
     if (!result.allowed) {
-      return res.status(429).json({
-        error: 'rate_limited',
-        code: 'RATE_LIMIT_EXCEEDED',
-        detail: 'Too many requests. Please try again later.'
-      });
+      return sendCandidateError(res, 'RATE_LIMITED', { request_id: req.request_id || null });
     }
   } catch (error) {
     console.error('[rate-limit] candidate submit check failed', {
       request_id: req.request_id || null,
       error: error?.message || error
     });
-    return res.status(503).json({
-      error: 'rate_limit_unavailable',
-      code: 'RATE_LIMIT_UNAVAILABLE',
-      detail: 'Request protection is temporarily unavailable. Please try again shortly.'
-    });
+    return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id: req.request_id || null });
   }
   return next();
 }
@@ -72,6 +73,18 @@ function normEmail(v = '') {
 }
 function normName(v = '') {
   return String(v || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function resumeMetadata(inspection) {
+  if (!inspection) return {};
+  return {
+    resume_original_filename: inspection.original_filename,
+    resume_size_bytes: inspection.size_bytes,
+    resume_mime_type: inspection.mime_type,
+    resume_sha256: inspection.sha256,
+    resume_parse_status: inspection.parse_status,
+    resume_parse_note: inspection.parse_note
+  };
 }
 
 function buildOtpEmailHtml(appName, otpCode) {
@@ -106,19 +119,26 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
   let sentryCandidateId = null;
   let sentryRoleId = null;
   let sentryClientId = null;
+  let submissionReservation = null;
   Sentry.setTag('route_name', 'candidate_submit');
   Sentry.setTag('surface', 'backend');
   if (request_id) Sentry.setTag('request_id', String(request_id));
   try {
-    const submissionFailed = (reason, details = {}) => {
-      console.warn('[candidate-submit] submission_failed', { request_id, reason, ...details });
-      const payload = {
-        error: 'submission_failed',
-        code: 'SUBMISSION_FAILED',
-        detail: 'We could not process this request. Please review your information and try again.'
-      };
-      if (request_id) payload.request_id = request_id;
-      return res.status(400).json(payload);
+    const respondFinal = async (status, payload, candidateId = null) => {
+      await completeCandidateSubmission(supabaseAdmin, submissionReservation, {
+        status,
+        body: payload,
+        candidateId
+      });
+      return res.status(status).json(payload);
+    };
+    const respondCandidateError = async (code, overrides = {}, candidateId = null) => {
+      const { status, payload } = buildCandidateError(code, { ...overrides, request_id });
+      return respondFinal(status, payload, candidateId);
+    };
+    const respondRetryableError = async (code, overrides = {}, candidateId = null) => {
+      await failCandidateSubmission(supabaseAdmin, submissionReservation, { code, candidateId });
+      return sendCandidateError(res, code, { ...overrides, request_id });
     };
     // --- normalize inputs ---
     const role_token   = (req.body.role_token || '').trim();
@@ -129,7 +149,11 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
     const emailRaw     = (req.body.email || '').trim();
     const phoneRaw     = (req.body.phone || '').trim();
     const phoneCountry = normalizeCandidatePhoneCountry(req.body.phone_country || req.body.phoneCountry || '');
+    const submissionKey = req.body.submission_key || req.body.submissionKey || '';
     const resume_url_in = req.body.resume_url || null;
+    const resumeFile = (req.files || []).find(file =>
+      ['resume', 'resume_file', 'file', 'resumeFile', 'pdf'].includes(file.fieldname)
+    ) || null;
 
     const fullName = rawName || [first_name, last_name].filter(Boolean).join(' ').trim();
 
@@ -143,12 +167,22 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       });
     }
     if (!phone) {
-      return res.status(400).json({
-        error: 'invalid_phone',
-        code: 'INVALID_PHONE',
+      return sendCandidateError(res, 'INVALID_PHONE_FOR_COUNTRY', {
         detail: getCandidatePhoneValidationMessage(phoneCountry),
         request_id
       });
+    }
+
+    let resumeInspection = null;
+    if (resumeFile) {
+      try {
+        resumeInspection = await inspectResumeFile(resumeFile);
+      } catch (error) {
+        if (error instanceof ResumeUploadError) {
+          return sendCandidateError(res, error.code, { request_id });
+        }
+        throw error;
+      }
     }
 
     // --- role lookup (need client_id + description) ---
@@ -167,10 +201,11 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
         .single());
     }
     if (rErr || !role) {
-      return submissionFailed('role_not_found', {
-        role_id: role_id_in || null,
-        role_token: role_token || null
+      console.warn('[candidate-submit] role_not_found', {
+        request_id,
+        role_id: role_id_in || null
       });
+      return sendCandidateError(res, 'INTERVIEW_LINK_EXPIRED', { request_id });
     }
     const roleId = role.id;
     sentryRoleId = roleId || null;
@@ -255,10 +290,40 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       });
     }
 
+    try {
+      submissionReservation = await reserveCandidateSubmission(supabaseAdmin, {
+        roleId,
+        submissionKey
+      });
+    } catch (error) {
+      if (error instanceof CandidateSubmissionKeyError) {
+        return sendCandidateError(res, 'INVALID_SUBMISSION_KEY', { request_id });
+      }
+      console.error('[candidate-submit] idempotency_reservation_failed', {
+        request_id,
+        role_id: roleId,
+        code: error?.code || null,
+        error: error?.message || error
+      });
+      return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
+    }
+    if (submissionReservation.state === 'replay') {
+      return res
+        .status(Number(submissionReservation.row.response_status) || 200)
+        .json(submissionReservation.row.response_body);
+    }
+    if (submissionReservation.state === 'processing') {
+      return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', {
+        status: 409,
+        detail: 'This submission is still processing. Please wait a moment and try again.',
+        request_id
+      });
+    }
+
     // --- duplicate & enrichment policy ---
     // RULES:
-    // 1) Email match for this role -> BLOCK if verified; recover OTP if unverified.
-    // 2) If email does NOT match, but (name + phone) BOTH match for this role -> BLOCK (409). Enrich phone on the existing record if missing.
+    // 1) Email match resolves to the existing identity. Recover OTP when no interview exists.
+    // 2) If email does not match but name and phone do, require support review.
     // 3) Otherwise, ALLOW (create candidate, upload, send OTP).
 
     // 1) Email match
@@ -278,8 +343,25 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       if (phone && !existingByEmail.phone) {
         await supabase.from('candidates').update({ phone }).eq('id', existingByEmail.id);
       }
-      const alreadyVerified = existingByEmail.verified === true || String(existingByEmail.status || '').toLowerCase() === 'verified';
-      if (!alreadyVerified) {
+      const { data: existingInterview, error: existingInterviewError } = await supabase
+        .from('interviews')
+        .select('id,status')
+        .eq('candidate_id', existingByEmail.id)
+        .eq('role_id', roleId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (existingInterviewError) {
+        return respondRetryableError('TEMPORARY_SERVICE_ERROR', {}, existingByEmail.id);
+      }
+      if (existingInterview) {
+        return respondCandidateError(
+          getInterviewConflictCode(existingInterview.status),
+          {},
+          existingByEmail.id
+        );
+      }
+      {
         const candidate_id = existingByEmail.id;
         sentryCandidateId = candidate_id || null;
         if (sentryCandidateId) Sentry.setTag('candidate_id', String(sentryCandidateId));
@@ -287,8 +369,37 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
           request_id,
           candidate_id,
           role_id: roleId,
-          email
+          recovery: true
         });
+
+        if (!existingByEmail.resume_url && resumeFile && resumeInspection) {
+          const bucket = process.env.SUPABASE_RESUMES_BUCKET || 'resumes';
+          const objectPath = `${candidate_id}.${resumeInspection.extension}`;
+          try {
+            const resumeUrl = await uploadResumeObject({
+              storage: supabase.storage,
+              bucket,
+              objectPath,
+              file: resumeFile,
+              inspection: resumeInspection
+            });
+            const { error: resumeUpdateError } = await supabase
+              .from('candidates')
+              .update({ resume_url: resumeUrl, ...resumeMetadata(resumeInspection) })
+              .eq('id', candidate_id);
+            if (resumeUpdateError) throw resumeUpdateError;
+            existingByEmail.resume_url = resumeUrl;
+          } catch (error) {
+            await supabase.storage.from(bucket).remove([objectPath]).catch(() => {});
+            console.error('[candidate-submit] recovery_resume_upload_failed', {
+              request_id,
+              candidate_id,
+              role_id: roleId,
+              code: error?.code || null
+            });
+            return respondRetryableError('RESUME_UPLOAD_FAILED', {}, candidate_id);
+          }
+        }
 
         const nowIso = new Date().toISOString();
         const { error: invalidateErr } = await supabase
@@ -306,12 +417,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
             error: invalidateErr.message,
             code: invalidateErr.code || null
           });
-          return res.status(500).json({
-            error: 'server_error',
-            code: 'OTP_INVALIDATE_FAILED',
-            detail: 'Unable to continue verification at this time.',
-            ...(request_id ? { request_id } : {})
-          });
+          return respondRetryableError('TEMPORARY_SERVICE_ERROR', {}, candidate_id);
         }
 
         const freshCode = six();
@@ -330,26 +436,23 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
             error: otpErr.message,
             code: otpErr.code || null
           });
-          return res.status(500).json({
-            error: 'server_error',
-            code: 'OTP_CREATE_FAILED',
-            detail: 'Unable to continue verification at this time.',
-            ...(request_id ? { request_id } : {})
-          });
+          return respondRetryableError('TEMPORARY_SERVICE_ERROR', {}, candidate_id);
         }
 
         console.log('[candidate-submit] duplicate_unverified_recovery_success', {
           request_id,
           candidate_id,
           role_id: roleId,
-          email
+          recovery: true
         });
-        res.status(200).json({
+        const responseBody = {
           message: 'If your information is accepted, a verification code will be sent shortly.',
           candidate_id,
           role_id: roleId,
           resume_url: existingByEmail.resume_url || null,
-        });
+          resume_parse_status: resumeInspection?.parse_status || null
+        };
+        await respondFinal(200, responseBody, candidate_id);
 
         setImmediate(async () => {
           console.log('[candidate-submit] duplicate_unverified_recovery_email_start', {
@@ -409,106 +512,128 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
         });
         return;
       }
-      return submissionFailed('duplicate_email', {
-        role_id: roleId,
-        candidate_id: existingByEmail.id || null
-      });
     }
 
-    // 2) Name + phone match (only if we have both a name and a phone)
-    if (fullName && phone) {
+    // 2) Name + phone match with a different email requires recovery review.
+    if (nameNorm && phone) {
       let existingByNamePhone = null;
       const { data, error } = await supabase
         .from('candidates')
         .select('id, phone')
         .eq('role_id', roleId)
         .eq('phone', phone)
-        .ilike('name', fullName) // case-insensitive exact match
+        .ilike('name', fullName)
         .limit(1)
         .maybeSingle();
       if (!error && data) existingByNamePhone = data;
 
       if (existingByNamePhone) {
-        // Enrich phone if the stored record is missing it (defensive; may already be set)
-        if (!existingByNamePhone.phone && phone) {
-          await supabase.from('candidates').update({ phone }).eq('id', existingByNamePhone.id);
-        }
-        return submissionFailed('duplicate_name_phone', {
-          role_id: roleId,
-          candidate_id: existingByNamePhone.id || null
-        });
+        return respondCandidateError('CANDIDATE_ALREADY_EXISTS', {}, existingByNamePhone.id);
       }
     }
 
-    // --- create candidate (denormalize client_id) ---
-    let candidate_id = null;
-    {
-      const { data: inserted, error: cErr } = await supabase
+    if (resumeInspection?.sha256) {
+      const { data: matchingResume } = await supabase
         .from('candidates')
-        .insert({
-          role_id: roleId,
-          client_id: role.client_id || null,
-          name: fullName,
-          first_name,
-          last_name,
-          email,
-          phone, // US: 10 digits; Philippines: 63 + mobile number.
-          status: 'Resume Uploaded',
-        })
         .select('id')
-        .single();
-      if (cErr) return res.status(500).json({ error: cErr.message });
-      candidate_id = inserted.id;
-      sentryCandidateId = candidate_id || null;
-      if (sentryCandidateId) Sentry.setTag('candidate_id', String(sentryCandidateId));
-      Sentry.addBreadcrumb({
-        category: 'candidate_submit',
-        message: 'candidate created',
-        level: 'info',
-        data: { candidate_id, role_id: roleId }
-      });
-
-      // self-reference (candidate_id column)
-      await supabase.from('candidates').update({ candidate_id }).eq('id', candidate_id);
-    }
-
-    // --- resume upload (optional) ---
-    let resume_url = resume_url_in;
-    let fileBuf = null, fileType = '';
-    try {
-      const file = (req.files || []).find(f =>
-        ['resume', 'resume_file', 'file', 'resumeFile', 'pdf'].includes(f.fieldname)
-      );
-      if (file) {
-        fileBuf = file.buffer;
-        fileType = file.mimetype || 'application/pdf';
-        const bucket = process.env.SUPABASE_RESUMES_BUCKET || 'resumes';
-        const ext = /pdf/i.test(fileType) ? 'pdf' : 'docx';
-        const path = `${candidate_id}.${ext}`;
-
-        const up = await supabase.storage.from(bucket).upload(path, file.buffer, {
-          contentType: fileType,
-          upsert: true,
+        .eq('role_id', roleId)
+        .eq('resume_sha256', resumeInspection.sha256)
+        .limit(1)
+        .maybeSingle();
+      if (matchingResume) {
+        console.warn('[candidate-submit] matching_resume_signal', {
+          request_id,
+          role_id: roleId,
+          existing_candidate_id: matchingResume.id
         });
-        if (!up.error) {
-          resume_url = `${bucket}/${path}`;
-        }
       }
-    } catch (e) {
-      console.error('resume upload failed:', e?.message || e);
     }
-    if (resume_url) {
-      await supabase.from('candidates').update({ resume_url }).eq('id', candidate_id);
+
+    // Upload first so a successful candidate row never points at a failed storage write.
+    const candidate_id = crypto.randomUUID();
+    let resume_url = resume_url_in;
+    let uploadedObject = null;
+    const fileBuf = resumeFile?.buffer || null;
+    const fileType = resumeInspection?.mime_type || '';
+    if (resumeFile && resumeInspection) {
+      try {
+        const bucket = process.env.SUPABASE_RESUMES_BUCKET || 'resumes';
+        const objectPath = `${candidate_id}.${resumeInspection.extension}`;
+        resume_url = await uploadResumeObject({
+          storage: supabase.storage,
+          bucket,
+          objectPath,
+          file: resumeFile,
+          inspection: resumeInspection
+        });
+        uploadedObject = { bucket, objectPath };
+      } catch (error) {
+        console.error('[candidate-submit] resume_upload_failed', {
+          request_id,
+          role_id: roleId,
+          code: error?.code || null
+        });
+        return respondRetryableError('RESUME_UPLOAD_FAILED');
+      }
     }
+
+    const { error: cErr } = await supabase
+      .from('candidates')
+      .insert({
+        id: candidate_id,
+        candidate_id,
+        role_id: roleId,
+        client_id: role.client_id || null,
+        name: fullName,
+        first_name,
+        last_name,
+        email,
+        phone, // US: 10 digits; Philippines: 63 + mobile number.
+        status: 'Resume Uploaded',
+        resume_url: resume_url || null,
+        ...resumeMetadata(resumeInspection)
+      });
+    if (cErr) {
+      if (uploadedObject) {
+        await supabase.storage.from(uploadedObject.bucket).remove([uploadedObject.objectPath]).catch(() => {});
+      }
+      console.error('[candidate-submit] candidate_insert_failed', {
+        request_id,
+        role_id: roleId,
+        code: cErr.code || null,
+        error: cErr.message
+      });
+      if (cErr.code === '23505') {
+        return respondCandidateError('CANDIDATE_ALREADY_EXISTS');
+      }
+      return respondRetryableError('TEMPORARY_SERVICE_ERROR');
+    }
+    sentryCandidateId = candidate_id;
+    Sentry.setTag('candidate_id', String(candidate_id));
+    Sentry.addBreadcrumb({
+      category: 'candidate_submit',
+      message: 'candidate created',
+      level: 'info',
+      data: { candidate_id, role_id: roleId }
+    });
 
     // --- OTP hardening: invalidate old + create fresh ---
     const nowIso = new Date().toISOString();
-    await supabase
+    const { error: invalidateErr } = await supabase
       .from('otp_tokens')
       .update({ used: true, used_at: nowIso })
       .eq('candidate_email', email)
       .eq('role_id', roleId)
       .eq('used', false);
+    if (invalidateErr) {
+      console.error('[candidate-submit] otp_invalidate_failed', {
+        request_id,
+        candidate_id,
+        role_id: roleId,
+        code: invalidateErr.code || null
+      });
+      return respondRetryableError('TEMPORARY_SERVICE_ERROR', {}, candidate_id);
+    }
 
     const freshCode = six();
     const { error: otpErr } = await supabase.from('otp_tokens').insert({
@@ -526,21 +651,17 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
         error: otpErr.message,
         code: otpErr.code || null
       });
-      return res.status(500).json({
-        error: 'server_error',
-        code: 'OTP_CREATE_FAILED',
-        detail: 'Unable to continue verification at this time.',
-        ...(request_id ? { request_id } : {})
-      });
+      return respondRetryableError('TEMPORARY_SERVICE_ERROR', {}, candidate_id);
     }
 
     // success
-    res.status(200).json({
+    await respondFinal(200, {
       message: 'If your information is accepted, a verification code will be sent shortly.',
       candidate_id,
       role_id: roleId,
       resume_url: resume_url || null,
-    });
+      resume_parse_status: resumeInspection?.parse_status || null
+    }, candidate_id);
 
     setImmediate(async () => {
       console.log('[candidate-submit] background_otp_email_start', {
@@ -605,7 +726,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       }
     });
 
-    if (fileBuf) {
+    if (fileBuf && resumeInspection?.parse_status === 'parsed') {
       setImmediate(async () => {
         console.log('[candidate-submit] background_resume_analysis_start', {
           request_id,
@@ -673,7 +794,13 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
         client_id: sentryClientId
       }
     });
-    return res.status(500).json({ error: 'Server error.' });
+    try {
+      await failCandidateSubmission(supabaseAdmin, submissionReservation, {
+        code: 'TEMPORARY_SERVICE_ERROR',
+        candidateId: sentryCandidateId
+      });
+    } catch (_) {}
+    return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
   }
 });
 

@@ -1390,6 +1390,10 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
     }
 
     const statusBefore = interview.status || null;
+    const preserveFailureStatus = [
+      'INTERVIEW_PROGRESS_STALLED',
+      'INTERVIEW_DISCONNECTED'
+    ].includes(String(interview.failure_code || '').trim().toUpperCase());
     let statusAfter = null;
     let analysisCompleteSummary = null;
     let perceptionKeysCount = null;
@@ -1453,6 +1457,14 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
               tool_name: toolName,
               status: endResp.status,
               detail: detail || null
+            });
+          } else if (preserveFailureStatus) {
+            statusAfter = interview.status || 'Incomplete';
+            console.log('[webhook] tool_call failure_status_preserved', {
+              request_id: requestId || null,
+              conversation_id: conversationId || null,
+              interview_id: interview.id,
+              failure_code: interview.failure_code
             });
           } else {
             const { error: toolUpdateError } = await supabaseAdmin
@@ -1731,6 +1743,17 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
           payload_keys: Object.keys(body?.payload || {})
         });
       }
+    }
+
+    if (preserveFailureStatus && updates.status) {
+      console.log('[webhook] failure_status_preserved', {
+        request_id: requestId || null,
+        event_type: eventType || null,
+        interview_id: interview.id,
+        failure_code: interview.failure_code,
+        ignored_status: updates.status
+      });
+      delete updates.status;
     }
 
     let updatesApplied = false;

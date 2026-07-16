@@ -8,6 +8,7 @@ const { createTavusInterviewHandler } = require('../handlers/createTavusIntervie
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
 const { isRoleInactive, buildRoleInactivePayload, logInactiveRoleBlocked } = require('../src/lib/roleLifecycle');
+const { sendCandidateError, getInterviewConflictCode } = require('../src/lib/candidateErrors');
 const { resolvePublicBackendBase } = require('../config/urlConfig');
 
 const router = express.Router();
@@ -25,22 +26,14 @@ async function createTavusRateLimit(req, res, next) {
       maxCount: CREATE_TAVUS_RATE_MAX
     });
     if (!result.allowed) {
-      return res.status(429).json({
-        error: 'rate_limited',
-        code: 'RATE_LIMIT_EXCEEDED',
-        detail: 'Too many requests. Please try again later.'
-      });
+      return sendCandidateError(res, 'RATE_LIMITED', { request_id: req.request_id || null });
     }
   } catch (error) {
     console.error('[rate-limit] create tavus interview check failed', {
       request_id: req.request_id || null,
       error: error?.message || error
     });
-    return res.status(503).json({
-      error: 'rate_limit_unavailable',
-      code: 'RATE_LIMIT_UNAVAILABLE',
-      detail: 'Request protection is temporarily unavailable. Please try again shortly.'
-    });
+    return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id: req.request_id || null });
   }
   return next();
 }
@@ -269,7 +262,7 @@ router.post('/', createTavusRateLimit, async (req, res) => {
     // Check for existing interview row
     const { data: existing, error: eErr } = await supabase
       .from('interviews')
-      .select('id, tavus_application_id')
+      .select('id, tavus_application_id, status')
       .eq('candidate_id', candidate_id)
       .eq('role_id', roleId)
       .order('created_at', { ascending: false })
@@ -277,37 +270,60 @@ router.post('/', createTavusRateLimit, async (req, res) => {
       .maybeSingle();
     if (eErr) return res.status(500).json({ error: eErr.message });
 
-    if (!existing) {
-      const availability = await getRoleInterviewAvailability({
-        db: supabaseAdmin,
-        roleId,
-        clientId
+    if (existing) {
+      return sendCandidateError(res, getInterviewConflictCode(existing.status), { request_id });
+    }
+
+    const availability = await getRoleInterviewAvailability({
+      db: supabaseAdmin,
+      roleId,
+      clientId
+    });
+    await syncRoleInterviewLimitNotification({
+      db: supabaseAdmin,
+      roleId,
+      clientId,
+      remainingInterviews: availability.remaining_interviews,
+      roleTitle: role?.title || ''
+    });
+    if (availability.remaining_interviews != null && availability.remaining_interviews <= 0) {
+      Sentry.addBreadcrumb({
+        category: 'create_tavus_interview',
+        message: 'interview limit reached',
+        level: 'info',
+        data: { role_id: roleId, client_id: clientId }
       });
-      await syncRoleInterviewLimitNotification({
-        db: supabaseAdmin,
-        roleId,
-        clientId,
-        remainingInterviews: availability.remaining_interviews,
-        roleTitle: role?.title || ''
+      return res.status(403).json({
+        error: 'forbidden',
+        code: 'interview_limit_reached',
+        detail: 'This role has no interviews remaining under the current plan.',
+        hint: null,
+        request_id
       });
-      if (availability.remaining_interviews != null && availability.remaining_interviews <= 0) {
-        Sentry.addBreadcrumb({
-          category: 'create_tavus_interview',
-          message: 'interview limit reached',
-          level: 'info',
-          data: { role_id: roleId, client_id: clientId }
-        });
-        return res.status(403).json({
-          error: 'forbidden',
-          code: 'interview_limit_reached',
-          detail: 'This role has no interviews remaining under the current plan.',
-          hint: null,
-          request_id
-        });
-      }
     }
 
     const webhookUrl = `${base}/webhook/tavus`;
+    const { data: startingInterview, error: startingInterviewError } = await supabase
+      .from('interviews')
+      .insert({
+        candidate_id,
+        client_id: clientId,
+        role_id: roleId,
+        status: 'Starting',
+        failure_code: null,
+        failure_stage: null,
+        failure_summary: null,
+        failure_at: null,
+        retryable: null
+      })
+      .select('id')
+      .single();
+    if (startingInterviewError || !startingInterview) {
+      if (startingInterviewError?.code === '23505') {
+        return sendCandidateError(res, 'INTERVIEW_IN_PROGRESS', { request_id });
+      }
+      return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
+    }
 
     // Tavus
     Sentry.addBreadcrumb({
@@ -316,15 +332,69 @@ router.post('/', createTavusRateLimit, async (req, res) => {
       level: 'info',
       data: { candidate_id, role_id: roleId, client_id: clientId }
     });
-    const result = await createTavusInterviewHandler(candidate, role, webhookUrl, {
-      maxInterviewMinutes
-    });
+    let result;
+    try {
+      result = await createTavusInterviewHandler(candidate, role, webhookUrl, {
+        maxInterviewMinutes
+      });
+      if (!result?.conversation_id || !result?.conversation_url) {
+        const invalidResultError = new Error('Tavus returned an incomplete conversation response');
+        invalidResultError.code = 'tavus_incomplete_response';
+        throw invalidResultError;
+      }
+    } catch (error) {
+      await supabase
+        .from('interviews')
+        .update({
+          status: 'Failed',
+          failure_code: 'INTERVIEW_VENDOR_START_FAILED',
+          failure_stage: 'vendor_start',
+          failure_summary: 'The interview vendor did not create a usable conversation.',
+          failure_at: new Date().toISOString(),
+          retryable: true,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', startingInterview.id);
+      Sentry.captureException(error, {
+        tags: {
+          route_name: 'create_tavus_interview',
+          surface: 'backend',
+          stage: 'vendor_start',
+          request_id: request_id || undefined,
+          candidate_id: candidate_id || undefined,
+          role_id: roleId || undefined,
+          client_id: clientId || undefined,
+          interview_id: startingInterview.id
+        }
+      });
+      return sendCandidateError(res, 'INTERVIEW_VENDOR_START_FAILED', { request_id });
+    }
     Sentry.addBreadcrumb({
       category: 'create_tavus_interview',
       message: 'tavus launch succeeded',
       level: 'info',
       data: { conversation_id: result?.conversation_id || null }
     });
+
+    const { error: interviewUpdateError } = await supabase
+      .from('interviews')
+      .update({
+        video_url: result.conversation_url || null,
+        tavus_application_id: result.conversation_id || null,
+        status: 'Pending',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', startingInterview.id);
+    if (interviewUpdateError) {
+      console.error('[create-tavus-interview] linkage_update_failed', {
+        request_id,
+        interview_id: startingInterview.id,
+        candidate_id,
+        role_id: roleId,
+        code: interviewUpdateError.code || null
+      });
+      return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
+    }
 
     // Immediately reflect on candidate
     await supabase
@@ -346,50 +416,14 @@ router.post('/', createTavusRateLimit, async (req, res) => {
       })
       .eq('candidate_id', candidate_id);
 
-    if (!existing) {
-      const { error: iErr, data: iData } = await supabase
-        .from('interviews')
-        .insert({
-          candidate_id,
-          client_id: clientId,
-          role_id: roleId,
-          video_url: result.conversation_url || null,
-          tavus_application_id: result.conversation_id || null,
-          status: 'Pending'
-        })
-        .select('id')
-        .single();
-      if (iErr) return res.status(500).json({ error: iErr.message });
-
-      return res.status(200).json({
-        message: 'Interview created',
-        conversation_url: result.conversation_url || null,
-        conversation_id: result.conversation_id || null,
-        interview_id: iData.id,
-        max_interview_minutes: maxInterviewMinutes,
-        candidate_assistance_contact: candidateAssistanceContact || null
-      });
-    } else {
-      const { error: uErr } = await supabase
-        .from('interviews')
-        .update({
-          client_id: clientId,
-          video_url: result.conversation_url || null,
-          tavus_application_id: result.conversation_id || existing.tavus_application_id || null,
-          status: 'Pending'
-        })
-        .eq('id', existing.id);
-      if (uErr) return res.status(500).json({ error: uErr.message });
-
-      return res.status(200).json({
-        message: 'Interview updated',
-        conversation_url: result.conversation_url || null,
-        conversation_id: result.conversation_id || existing.tavus_application_id || null,
-        interview_id: existing.id,
-        max_interview_minutes: maxInterviewMinutes,
-        candidate_assistance_contact: candidateAssistanceContact || null
-      });
-    }
+    return res.status(200).json({
+      message: 'Interview created',
+      conversation_url: result.conversation_url || null,
+      conversation_id: result.conversation_id || null,
+      interview_id: startingInterview.id,
+      max_interview_minutes: maxInterviewMinutes,
+      candidate_assistance_contact: candidateAssistanceContact || null
+    });
   } catch (e) {
     const status = e.status || 500;
     if (status >= 500) {
@@ -410,7 +444,7 @@ router.post('/', createTavusRateLimit, async (req, res) => {
         }
       });
     }
-    return res.status(status).json({ error: e.message });
+    return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
   }
 });
 

@@ -17,6 +17,23 @@ const EARLY_END_TRANSCRIPT_SCORES = {
   ai_aided_risk: 'low',
   ai_aided_risk_reason: 'No substantive interview response was available to assess.'
 };
+const END_REASONS = new Set([
+  'manual',
+  'tool_call',
+  'closing_utterance',
+  'time_limit_warning',
+  'time_limit_graceful_close',
+  'time_limit_force_close',
+  'progress_stalled',
+  'disconnected'
+]);
+
+function normalizeEndReason(value) {
+  const raw = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (!raw) return 'manual';
+  const normalized = raw.replace(/[^a-z0-9_-]+/g, '_').slice(0, 80);
+  return END_REASONS.has(normalized) ? normalized : 'unknown';
+}
 
 function hasNonEmptyText(value) {
   return typeof value === 'string' && value.trim().length > 0;
@@ -40,6 +57,13 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
     const conversation_id = typeof req.body?.conversation_id === 'string' ? req.body.conversation_id.trim() : '';
     const interview_id = typeof req.body?.interview_id === 'string' ? req.body.interview_id.trim() : '';
     const role_token = typeof req.body?.role_token === 'string' ? req.body.role_token.trim() : '';
+    const reason = normalizeEndReason(req.body?.reason);
+    const isTimeLimitEnd = reason.startsWith('time_limit');
+    const isFailureEnd = reason === 'progress_stalled' || reason === 'disconnected';
+    const failureCode = reason === 'progress_stalled' ? 'INTERVIEW_PROGRESS_STALLED' : 'INTERVIEW_DISCONNECTED';
+    const failureSummary = reason === 'progress_stalled'
+      ? 'The live interview stopped progressing after one automatic reconnect attempt.'
+      : 'The live interview disconnected and could not reconnect.';
     if (!conversation_id || !interview_id || !role_token) {
       return res.status(400).json({
         error: 'bad_request',
@@ -144,9 +168,24 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
       console.error('[tavus/end-conversation] tavus_end_failed', {
         request_id,
         conversation_id,
+        reason,
         status: upstreamStatus,
         detail
       });
+      if (isFailureEnd) {
+        await supabaseAdmin
+          .from('interviews')
+          .update({
+            status: 'Incomplete',
+            failure_code: failureCode,
+            failure_stage: 'live_interview',
+            failure_summary: failureSummary,
+            failure_at: new Date().toISOString(),
+            retryable: true,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', interview.id);
+      }
       return res.status(upstreamStatus && upstreamStatus >= 400 && upstreamStatus < 600 ? upstreamStatus : 502).json({
         error: 'upstream_error',
         code: 'TAVUS_END_FAILED',
@@ -156,12 +195,23 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
       });
     }
 
+    const statusUpdate = isFailureEnd
+      ? {
+          status: 'Incomplete',
+          failure_code: failureCode,
+          failure_stage: 'live_interview',
+          failure_summary: failureSummary,
+          failure_at: new Date().toISOString(),
+          retryable: true,
+          updated_at: new Date().toISOString()
+        }
+      : {
+          status: 'ending_requested',
+          updated_at: new Date().toISOString()
+        };
     const { data: updatedInterview, error: updateError } = await supabaseAdmin
       .from('interviews')
-      .update({
-        status: 'ending_requested',
-        updated_at: new Date().toISOString()
-      })
+      .update(statusUpdate)
       .eq('tavus_application_id', conversation_id)
       .select('id, status')
       .maybeSingle();
@@ -170,6 +220,7 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
       console.error('[tavus/end-conversation] status_update_failed', {
         request_id,
         conversation_id,
+        reason,
         code: updateError.code,
         detail: updateError.message
       });
@@ -182,7 +233,7 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
       });
     }
 
-    if (updatedInterview?.id) {
+    if (updatedInterview?.id && !isTimeLimitEnd && !isFailureEnd) {
       const interviewId = updatedInterview.id;
       setTimeout(async () => {
         try {
@@ -196,6 +247,7 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
             console.error('[tavus/end-conversation] early_end_reconcile_read_failed', {
               request_id,
               interview_id: interviewId,
+              reason,
               code: freshError.code,
               detail: freshError.message
             });
@@ -233,6 +285,7 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
             console.error('[tavus/end-conversation] early_end_reconcile_finalize_failed', {
               request_id,
               interview_id: interviewId,
+              reason,
               code: finalizeError.code,
               detail: finalizeError.message
             });
@@ -263,6 +316,7 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
                 interview_id: interviewId,
                 candidate_id: fresh.candidate_id,
                 role_id: fresh.role_id,
+                reason,
                 code: reportCleanupError.code,
                 detail: reportCleanupError.message
               });
@@ -273,10 +327,18 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
           console.error('[tavus/end-conversation] early_end_reconcile_unexpected', {
             request_id,
             interview_id: interviewId,
+            reason,
             error: e?.message || e
           });
         }
       }, EARLY_END_GRACE_MS);
+    } else if (updatedInterview?.id && (isTimeLimitEnd || isFailureEnd)) {
+      console.log('[tavus/end-conversation] early_end_reconcile_skipped', {
+        request_id,
+        interview_id: updatedInterview.id,
+        conversation_id,
+        reason
+      });
     }
 
     return res.json({ ok: true, request_id });

@@ -9,7 +9,14 @@ const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { requireAuth } = require('../src/middleware/auth');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
 const { redactEmail } = require('../src/lib/recoveryHelper');
-const { checkDuplicateCandidate, normalizeEmail, normalizePhone } = require('../src/lib/duplicateCandidate');
+const { normalizeEmail } = require('../src/lib/duplicateCandidate');
+const {
+  normalizeCandidatePhoneCountry,
+  normalizeCandidatePhone,
+  getCandidatePhoneValidationMessage
+} = require('../src/lib/candidatePhone');
+const { sendCandidateError } = require('../src/lib/candidateErrors');
+const { ResumeUploadError, inspectResumeFile, uploadResumeObject } = require('../src/lib/resumeUpload');
 const { isRoleInactive, logInactiveRoleBlocked } = require('../src/lib/roleLifecycle');
 const { buildTextInterviewUrl } = require('../config/urlConfig');
 const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
@@ -129,24 +136,14 @@ async function accommodationRequestRateLimit(req, res, next) {
       maxCount: ACCOMMODATION_REQUEST_RATE_MAX
     });
     if (!result.allowed) {
-      return res.status(429).json({
-        error: 'rate_limited',
-        code: 'RATE_LIMIT_EXCEEDED',
-        detail: 'Too many requests. Please try again later.',
-        request_id: req.request_id || null
-      });
+      return sendCandidateError(res, 'RATE_LIMITED', { request_id: req.request_id || null });
     }
   } catch (error) {
     console.error('[rate-limit] accommodation request check failed', {
       request_id: req.request_id || null,
       error: error?.message || error
     });
-    return res.status(503).json({
-      error: 'rate_limit_unavailable',
-      code: 'RATE_LIMIT_UNAVAILABLE',
-      detail: 'Request protection is temporarily unavailable. Please try again shortly.',
-      request_id: req.request_id || null
-    });
+    return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id: req.request_id || null });
   }
   return next();
 }
@@ -164,15 +161,6 @@ function getAccommodationResumeBucket() {
 
 function sendError(res, status, { error, code, detail, hint, request_id }) {
   return res.status(status).json({ error, code, detail, hint, request_id });
-}
-
-function sendPublicRequestFailed(res, request_id) {
-  return res.status(400).json({
-    error: 'request_failed',
-    code: 'REQUEST_FAILED',
-    detail: 'We could not process this request. Please review your information and try again.',
-    request_id,
-  });
 }
 
 function logSupabaseError(message, request_id, error) {
@@ -225,6 +213,18 @@ async function findOrCreateCandidate({ role, name, email, phone }) {
   await supabaseAdmin.from('candidates').update({ candidate_id: candidateId }).eq('id', candidateId);
 
   return { id: candidateId, resume_url: null, created: true };
+}
+
+function resumeMetadata(inspection) {
+  if (!inspection) return {};
+  return {
+    resume_original_filename: inspection.original_filename,
+    resume_size_bytes: inspection.size_bytes,
+    resume_mime_type: inspection.mime_type,
+    resume_sha256: inspection.sha256,
+    resume_parse_status: inspection.parse_status,
+    resume_parse_note: inspection.parse_note
+  };
 }
 
 function parseBucketPath(v) {
@@ -655,7 +655,8 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
     const candidate_name = safeText(req.body?.candidate_name || req.body?.name);
     const candidate_email = normalizeEmail(req.body?.candidate_email || req.body?.email);
     const candidate_phone_raw = safeText(req.body?.candidate_phone || req.body?.phone);
-    const candidate_phone = normalizePhone(candidate_phone_raw);
+    const phone_country = normalizeCandidatePhoneCountry(req.body?.phone_country || req.body?.phoneCountry || '');
+    const candidate_phone = normalizeCandidatePhone(candidate_phone_raw, phone_country);
     const request_text = safeText(req.body?.accommodation_request_text || req.body?.request_text);
     const role_token = safeText(req.body?.role_token);
     const role_id_in = safeText(req.body?.role_id);
@@ -663,13 +664,23 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
     const role_lookup_is_uuid = isUuid(role_lookup_value);
     const lookupAttempts = role_lookup_value ? (role_lookup_is_uuid ? ['id', 'slug_or_token'] : ['slug_or_token']) : [];
 
-    if (!candidate_name || !candidate_email || !candidate_phone || !request_text || (!role_token && !role_id_in)) {
+    const file = (req.files || []).find(f =>
+      ['resume', 'resume_file', 'file', 'resumeFile', 'pdf'].includes(f.fieldname)
+    ) || null;
+
+    if (!candidate_name || !candidate_email || !candidate_phone_raw || !request_text || (!role_token && !role_id_in)) {
       return sendError(res, 400, {
         error: 'Missing required fields.',
         code: 'missing_fields',
         detail: null,
         hint: null,
         request_id,
+      });
+    }
+    if (!candidate_phone) {
+      return sendCandidateError(res, 'INVALID_PHONE_FOR_COUNTRY', {
+        detail: getCandidatePhoneValidationMessage(phone_country),
+        request_id
       });
     }
     if (!isValidEmail(candidate_email)) {
@@ -680,6 +691,18 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
         hint: null,
         request_id,
       });
+    }
+
+    let resumeInspection = null;
+    if (file) {
+      try {
+        resumeInspection = await inspectResumeFile(file);
+      } catch (error) {
+        if (error instanceof ResumeUploadError) {
+          return sendCandidateError(res, error.code, { request_id });
+        }
+        throw error;
+      }
     }
 
     let role = null;
@@ -726,7 +749,7 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
       }
     }
     if (!role) {
-      return sendPublicRequestFailed(res, request_id);
+      return sendCandidateError(res, 'INTERVIEW_LINK_EXPIRED', { request_id });
     }
     if (isRoleInactive(role)) {
       logInactiveRoleBlocked(console, {
@@ -734,134 +757,111 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
         request_id,
         role_id: role.id || null
       });
-      return sendPublicRequestFailed(res, request_id);
+      return sendCandidateError(res, 'INTERVIEW_LINK_EXPIRED', { request_id });
     }
 
-    const dup = await checkDuplicateCandidate({
-      supabase: supabaseAdmin,
-      roleId: role.id,
-      email: candidate_email,
-      fullName: candidate_name,
-      phone: candidate_phone,
-      allowPhoneEnrich: true,
-    });
-    if (dup.duplicate) {
-      console.warn('[accommodation] duplicate candidate blocked', {
+    const { data: existingByPhone, error: phoneLookupError } = await supabaseAdmin
+      .from('candidates')
+      .select('id,email')
+      .eq('role_id', role.id)
+      .eq('phone', candidate_phone)
+      .limit(1)
+      .maybeSingle();
+    if (phoneLookupError) {
+      return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
+    }
+    if (existingByPhone && normalizeEmail(existingByPhone.email) !== candidate_email) {
+      console.warn('[accommodation] phone_conflict', {
         request_id,
         role_id: role.id,
-        candidate_id: dup.candidateId || null,
-        reason: dup.reason || null,
+        candidate_id: existingByPhone.id
       });
-      return sendPublicRequestFailed(res, request_id);
+      return sendCandidateError(res, 'CANDIDATE_ALREADY_EXISTS', { request_id });
     }
 
-    const { id: candidate_id, resume_url: existingResumeUrl } = await findOrCreateCandidate({
-      role,
-      name: candidate_name,
-      email: candidate_email,
-      phone: candidate_phone || null,
-    });
+    const accommodationRequestId = crypto.randomUUID();
+    let resume_url = null;
+    let candidate_resume_url = null;
+    let resume_received_at = null;
+    let uploadedObject = null;
+    const resumeBuffer = file?.buffer || null;
+    const resumeMime = resumeInspection?.mime_type || null;
+    if (file && resumeInspection) {
+      try {
+        const bucket = getAccommodationResumeBucket();
+        const objectPath = `accommodations/${accommodationRequestId}.${resumeInspection.extension}`;
+        await uploadResumeObject({
+          storage: supabaseAdmin.storage,
+          bucket,
+          objectPath,
+          file,
+          inspection: resumeInspection
+        });
+        uploadedObject = { bucket, objectPath };
+        resume_url = objectPath;
+        candidate_resume_url = `${bucket}/${objectPath}`;
+        resume_received_at = new Date().toISOString();
+      } catch (e) {
+        console.error('[accommodation] resume upload failed', {
+          request_id,
+          error: e?.message || e,
+          code: e?.code || null
+        });
+        return sendCandidateError(res, 'RESUME_UPLOAD_FAILED', { request_id });
+      }
+    }
+
+    let candidate;
+    try {
+      candidate = await findOrCreateCandidate({
+        role,
+        name: candidate_name,
+        email: candidate_email,
+        phone: candidate_phone
+      });
+    } catch (error) {
+      if (uploadedObject) {
+        await supabaseAdmin.storage.from(uploadedObject.bucket).remove([uploadedObject.objectPath]).catch(() => {});
+      }
+      throw error;
+    }
+    const candidate_id = candidate.id;
 
     const { data: reqRow, error: reqErr } = await supabaseAdmin
       .from('accommodation_requests')
       .insert({
+        id: accommodationRequestId,
         role_id: role.id,
         candidate_id,
         candidate_name,
         candidate_email,
-        candidate_phone: candidate_phone || null,
+        candidate_phone,
         request_text,
         status: 'pending',
+        resume_url,
+        resume_received_at,
+        ...resumeMetadata(resumeInspection)
       })
       .select('*')
       .single();
     if (reqErr || !reqRow) {
-      return sendError(res, 500, {
-        error: 'Could not create request.',
-        code: reqErr?.code || 'request_insert_failed',
-        detail: reqErr?.message || null,
-        hint: reqErr?.hint || null,
-        request_id,
-      });
+      if (uploadedObject) {
+        await supabaseAdmin.storage.from(uploadedObject.bucket).remove([uploadedObject.objectPath]).catch(() => {});
+      }
+      return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
     }
 
-    let resume_url = null;
-    let candidate_resume_url = null;
-    let resume_received_at = null;
-    let resumeBuffer = null;
-    let resumeMime = null;
-    const file = (req.files || []).find(f =>
-      ['resume', 'resume_file', 'file', 'resumeFile', 'pdf'].includes(f.fieldname)
-    );
-    if (file) {
-      try {
-        const bucket = getAccommodationResumeBucket();
-        const fileType = file.mimetype || 'application/pdf';
-        resumeBuffer = file.buffer;
-        resumeMime = fileType;
-        const ext = /pdf/i.test(fileType) ? 'pdf' : 'docx';
-        const path = `accommodations/${reqRow.id}.${ext}`;
-        const up = await supabaseAdmin.storage.from(bucket).upload(path, file.buffer, {
-          contentType: fileType,
-          upsert: true,
-        });
-        if (up.error) {
-          logSupabaseError('[accommodation] resume upload failed', reqRow.id, up.error);
-          return sendError(res, 500, {
-            error: 'resume_upload_failed',
-            code: up.error.code || 'resume_upload_failed',
-            detail: up.error.message || null,
-            hint: up.error.hint || null,
-            request_id: reqRow.id,
-          });
-        }
-        resume_url = path;
-        candidate_resume_url = `${bucket}/${path}`;
-        resume_received_at = new Date().toISOString();
-      } catch (e) {
-        console.error('[accommodation] resume upload failed', {
-          request_id: reqRow.id,
-          error: e?.message || e,
-          detail: e?.detail || null,
-          hint: e?.hint || null,
-        });
-        return sendError(res, 500, {
-          error: e?.code || 'resume_upload_failed',
-          code: e?.code || 'resume_upload_failed',
-          detail: e?.detail || e?.message || null,
-          hint: e?.hint || null,
-          request_id: reqRow.id,
-        });
+    if (!candidate.resume_url && candidate_resume_url) {
+      const { error: candUpdateErr } = await supabaseAdmin
+        .from('candidates')
+        .update({ resume_url: candidate_resume_url, ...resumeMetadata(resumeInspection) })
+        .eq('id', candidate_id);
+      if (candUpdateErr) {
+        logSupabaseError('[accommodation] candidate resume update failed', reqRow.id, candUpdateErr);
       }
     }
 
-    if (resume_url) {
-      const { error: updateErr } = await supabaseAdmin
-        .from('accommodation_requests')
-        .update({ resume_url, resume_received_at })
-        .eq('id', reqRow.id);
-      if (updateErr) {
-        logSupabaseError('[accommodation] resume update failed', reqRow.id, updateErr);
-        return sendError(res, 500, {
-          error: 'resume_update_failed',
-          code: updateErr.code || 'resume_update_failed',
-          detail: updateErr.message || null,
-          hint: updateErr.hint || null,
-          request_id: reqRow.id,
-        });
-      }
-      if (!existingResumeUrl && candidate_id && candidate_resume_url) {
-        const { error: candUpdateErr } = await supabaseAdmin
-          .from('candidates')
-          .update({ resume_url: candidate_resume_url })
-          .eq('id', candidate_id);
-        if (candUpdateErr) {
-          logSupabaseError('[accommodation] candidate resume update failed', reqRow.id, candUpdateErr);
-        }
-      }
-    }
-
-    if (resumeBuffer && candidate_id) {
+    if (resumeBuffer && candidate_id && resumeInspection?.parse_status === 'parsed') {
       const roleForResume = {
         ...role,
         description: role.description || role.job_description_text || ''
@@ -922,13 +922,7 @@ router.post('/request', accommodationRequestRateLimit, upload.any(), async (req,
       detail: err?.detail || null,
       hint: err?.hint || null,
     });
-    return sendError(res, 500, {
-      error: 'Server error.',
-      code: err?.code || 'server_error',
-      detail: err?.message || null,
-      hint: err?.hint || null,
-      request_id,
-    });
+    return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
   }
 });
 

@@ -6,6 +6,7 @@ const { supabase, supabaseAdmin } = require("../src/lib/supabaseClient");
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
 const { isRoleInactive, buildRoleInactivePayload, logInactiveRoleBlocked } = require('../src/lib/roleLifecycle');
+const { sendCandidateError } = require('../src/lib/candidateErrors');
 const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
 
 const router = express.Router();
@@ -30,22 +31,14 @@ async function verifyOtpRateLimit(req, res, next) {
       maxCount: VERIFY_OTP_RATE_MAX
     });
     if (!result.allowed) {
-      return res.status(429).json({
-        error: 'rate_limited',
-        code: 'RATE_LIMIT_EXCEEDED',
-        detail: 'Too many requests. Please try again later.'
-      });
+      return sendCandidateError(res, 'RATE_LIMITED', { request_id: req.request_id || null });
     }
   } catch (error) {
     console.error('[rate-limit] verify otp check failed', {
       request_id: req.request_id || null,
       error: error?.message || error
     });
-    return res.status(503).json({
-      error: 'rate_limit_unavailable',
-      code: 'RATE_LIMIT_UNAVAILABLE',
-      detail: 'Request protection is temporarily unavailable. Please try again shortly.'
-    });
+    return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id: req.request_id || null });
   }
   return next();
 }
@@ -59,22 +52,14 @@ async function resendOtpRateLimit(req, res, next) {
       maxCount: RESEND_OTP_RATE_MAX
     });
     if (!result.allowed) {
-      return res.status(429).json({
-        error: 'rate_limited',
-        code: 'RATE_LIMIT_EXCEEDED',
-        detail: 'Too many requests. Please try again later.'
-      });
+      return sendCandidateError(res, 'RATE_LIMITED', { request_id: req.request_id || null });
     }
   } catch (error) {
     console.error('[rate-limit] resend otp check failed', {
       request_id: req.request_id || null,
       error: error?.message || error
     });
-    return res.status(503).json({
-      error: 'rate_limit_unavailable',
-      code: 'RATE_LIMIT_UNAVAILABLE',
-      detail: 'Request protection is temporarily unavailable. Please try again shortly.'
-    });
+    return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id: req.request_id || null });
   }
   return next();
 }
@@ -512,17 +497,21 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
 
     // 3) Validate
     if (token.expires_at && new Date(token.expires_at) <= new Date()) {
-      return verificationFailed('otp_expired', {
+      console.warn('[verify-otp] otp_expired', {
+        request_id,
         candidate_id: cand.id || null,
         role_id: roleId
       });
+      return sendCandidateError(res, 'OTP_EXPIRED', { request_id });
     }
     const isUsed = String(token.used).toLowerCase() === "true"; // supports text/boolean
     if (isUsed) {
-      return verificationFailed('otp_already_used', {
+      console.warn('[verify-otp] otp_used', {
+        request_id,
         candidate_id: cand.id || null,
         role_id: roleId
       });
+      return sendCandidateError(res, 'OTP_USED', { request_id });
     }
     if (String(token.code) !== code) {
       return verificationFailed('otp_invalid_code', {
