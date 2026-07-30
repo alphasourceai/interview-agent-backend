@@ -41,6 +41,11 @@ const ERROR_DEFINITIONS = Object.freeze({
     error: 'otp_used',
     detail: 'This verification code has already been used. Request a new code and try again.'
   },
+  STALE_ACCESS_INVALIDATED: {
+    status: 409,
+    error: 'stale_access_invalidated',
+    detail: 'This access code has been invalidated. Use the latest reset email.'
+  },
   INVALID_PHONE_FOR_COUNTRY: {
     status: 400,
     error: 'invalid_phone_for_country',

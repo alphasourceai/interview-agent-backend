@@ -15,6 +15,10 @@ test('candidate error responses expose stable candidate-safe codes', () => {
   assert.equal(upload.status, 503);
   assert.equal(upload.payload.code, 'RESUME_UPLOAD_FAILED');
   assert.equal(upload.payload.retryable, true);
+
+  const stale = buildCandidateError('STALE_ACCESS_INVALIDATED');
+  assert.equal(stale.status, 409);
+  assert.equal(stale.payload.error, 'stale_access_invalidated');
 });
 
 test('interview conflict codes distinguish completed, active, and reset-required states', () => {

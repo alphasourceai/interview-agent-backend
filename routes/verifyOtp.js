@@ -181,6 +181,7 @@ router.post("/resend", resendOtpRateLimit, async (req, res) => {
     const freshCode = six();
     const { error: otpErr } = await supabase.from("otp_tokens").insert({
       candidate_email: email,
+      candidate_id,
       role_id: roleId,
       code: freshCode,
       expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
@@ -476,7 +477,7 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
     // 2) Newest OTP for (candidate_email, role_id)
     const { data: token, error: tErr } = await supabase
       .from("otp_tokens")
-      .select("id, code, expires_at, used, role_id")
+      .select("id, code, expires_at, used, role_id, invalidated_at")
       .eq("candidate_email", email)
       .eq("role_id", roleId)
       .order("created_at", { ascending: false })
@@ -487,6 +488,9 @@ router.post("/", verifyOtpRateLimit, async (req, res) => {
         candidate_id: cand.id || null,
         role_id: roleId
       });
+    }
+    if (token.invalidated_at) {
+      return sendCandidateError(res, 'STALE_ACCESS_INVALIDATED', { request_id });
     }
     Sentry.addBreadcrumb({
       category: 'verify_otp',

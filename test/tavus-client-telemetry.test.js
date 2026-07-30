@@ -1,0 +1,435 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const { test } = require('node:test');
+process.env.SUPABASE_URL ||= 'http://127.0.0.1:54321';
+process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-service-role-key';
+process.env.SUPABASE_ANON_KEY ||= 'test-anon-key';
+const {
+  METADATA_KEYS,
+  TELEMETRY_EVENTS,
+  decodeTelemetryAuthorization,
+  diagnosticDedupeKey,
+  validateTelemetryPayload,
+} = require('../src/lib/interviewReliabilityDiagnostics');
+const { createClientTelemetryHandler, isIdempotentEndState } = require('../routes/tavus');
+
+const BASE_PAYLOAD = Object.freeze({
+  interview_id: '00000000-0000-4000-8000-000000000001',
+  conversation_id: 'synthetic-provider-binding',
+  role_token: 'synthetic-role-token',
+  event: 'reconnect_started',
+  event_sequence: 1,
+  observed_at: '2026-07-28T02:00:00.000Z',
+  reason: 'watchdog_timeout',
+  metadata: {
+    recovery_attempt: 1,
+    recovery_phase: 'reconnecting_transport',
+    progress_age_ms: 45000,
+    is_recovery_active: true,
+  },
+});
+
+const AUTHORIZATION = `AlphaScreen-Telemetry ${Buffer.from(JSON.stringify([
+  BASE_PAYLOAD.role_token,
+  BASE_PAYLOAD.conversation_id,
+])).toString('base64')}`;
+
+function responseRecorder() {
+  return {
+    statusCode: 200,
+    body: null,
+    status(code) {
+      this.statusCode = code;
+      return this;
+    },
+    json(body) {
+      this.body = body;
+      return this;
+    },
+  };
+}
+
+function createFakeDatabase(options = {}) {
+  const state = {
+    inserts: [],
+    updates: [],
+    role: options.role || { id: 'role-id' },
+    interview: options.interview || {
+      id: BASE_PAYLOAD.interview_id,
+      role_id: 'role-id',
+      client_id: 'client-id',
+      candidate_id: 'candidate-id',
+      attempt_number: 2,
+      tavus_application_id: BASE_PAYLOAD.conversation_id,
+      reconnect_attempt_count: 0,
+    },
+  };
+
+  return {
+    state,
+    from(table) {
+      const query = {
+        action: 'select',
+        payload: null,
+        filters: {},
+        select() {
+          this.action = 'select';
+          return this;
+        },
+        update(payload) {
+          this.action = 'update';
+          this.payload = payload;
+          return this;
+        },
+        eq(key, value) {
+          this.filters[key] = value;
+          if (this.action === 'update') {
+            state.updates.push({ table, payload: this.payload, filters: this.filters });
+            return Promise.resolve({ error: options.updateError || null });
+          }
+          return this;
+        },
+        maybeSingle() {
+          if (table === 'roles') {
+            return Promise.resolve({ data: state.role, error: options.roleError || null });
+          }
+          if (table === 'interviews') {
+            return Promise.resolve({ data: state.interview, error: options.interviewError || null });
+          }
+          return Promise.resolve({ data: null, error: null });
+        },
+        insert(payload) {
+          state.inserts.push({ table, payload });
+          return Promise.resolve({ error: options.insertError || null });
+        },
+      };
+      return query;
+    },
+  };
+}
+
+test('diagnostic contract exposes only the bounded event and metadata allowlists', () => {
+  assert.equal(TELEMETRY_EVENTS.has('reconnect_started'), true);
+  assert.equal(TELEMETRY_EVENTS.has('interview_terminal_requested'), true);
+  assert.equal(TELEMETRY_EVENTS.has('question_lock_entered'), true);
+  assert.equal(TELEMETRY_EVENTS.has('closing_only_entered'), true);
+  assert.equal(TELEMETRY_EVENTS.has('candidate_question_invitation_sent'), true);
+  assert.equal(TELEMETRY_EVENTS.has('candidate_question_received'), true);
+  assert.equal(TELEMETRY_EVENTS.has('candidate_question_response_completed'), true);
+  assert.equal(TELEMETRY_EVENTS.has('closing_farewell_started'), true);
+  assert.equal(TELEMETRY_EVENTS.has('termination_only_entered'), true);
+  assert.equal(TELEMETRY_EVENTS.has('provider_end_requested'), true);
+  assert.equal(TELEMETRY_EVENTS.has('provider_end_confirmed'), true);
+  assert.equal(TELEMETRY_EVENTS.has('post_closing_question_violation'), true);
+  assert.equal(TELEMETRY_EVENTS.has('transcript_received'), false);
+  assert.equal(METADATA_KEYS.has('remote_audio_state'), true);
+  assert.equal(METADATA_KEYS.has('message'), false);
+  assert.equal(METADATA_KEYS.has('conversation_id'), false);
+});
+
+test('provider-end state suppresses repeated terminal requests without masking a different active failure', () => {
+  assert.equal(isIdempotentEndState('ending_requested', 'completed_normally', 'completed_normally'), true);
+  assert.equal(isIdempotentEndState('ReadyForAnalysis', null, 'completed_normally'), true);
+  assert.equal(isIdempotentEndState('Ended', 'candidate_ended', 'completed_normally'), true);
+  assert.equal(isIdempotentEndState('started', null, 'completed_normally'), false);
+  assert.equal(isIdempotentEndState('ending_requested', 'completed_normally', 'reconnect_failed'), false);
+});
+
+test('closing diagnostics accept only bounded state, time, turn, and interruption metadata', () => {
+  const events = [
+    'question_lock_entered',
+    'closing_only_entered',
+    'candidate_question_invitation_sent',
+    'candidate_question_received',
+    'candidate_question_response_completed',
+    'closing_farewell_started',
+    'termination_only_entered',
+    'provider_end_requested',
+    'provider_end_confirmed',
+    'post_closing_question_violation',
+  ];
+  for (const [index, event] of events.entries()) {
+    const result = validateTelemetryPayload({
+      ...BASE_PAYLOAD,
+      event,
+      event_sequence: index + 100,
+      reason: undefined,
+      metadata: {
+        closing_state: event === 'provider_end_confirmed' ? 'ENDED' : 'CLOSING_ONLY',
+        remaining_time_bucket: '11_30',
+        turn_index: index,
+        ...(event === 'post_closing_question_violation' ? { speech_interrupted: true } : {}),
+      },
+    });
+    assert.equal(result.ok, true, event);
+  }
+
+  for (const metadata of [
+    { question_text: 'synthetic' },
+    { transcript: 'synthetic' },
+    { inference_id: 'synthetic' },
+    { provider_url: 'https://example.invalid' },
+    { closing_state: 'closing_only' },
+    { remaining_time_bucket: '29_seconds' },
+    { turn_index: 10_001 },
+  ]) {
+    assert.equal(validateTelemetryPayload({
+      ...BASE_PAYLOAD,
+      event: 'post_closing_question_violation',
+      reason: undefined,
+      metadata,
+    }).ok, false);
+  }
+});
+
+test('valid telemetry is normalized without arbitrary values', () => {
+  const {
+    conversation_id: _conversationId,
+    role_token: _roleToken,
+    ...boundedPayload
+  } = BASE_PAYLOAD;
+  const result = validateTelemetryPayload(boundedPayload);
+  assert.equal(result.ok, true);
+  assert.equal(result.telemetry.event, 'reconnect_started');
+  assert.deepEqual(result.telemetry.metadata, BASE_PAYLOAD.metadata);
+  assert.equal(result.telemetry.conversationId, '');
+  assert.equal(result.telemetry.roleToken, '');
+});
+
+test('candidate-speaking watchdog transitions use only bounded allowlisted enums', () => {
+  const cases = [
+    {
+      event: 'progress_checkpoint_updated',
+      metadata: {
+        progress_source: 'candidate_speaking_started',
+        watchdog_reset_source: 'progress_checkpoint',
+        elapsed_ms: 45000,
+        recovery_attempt: 0,
+        recovery_phase: 'idle',
+        is_recovery_active: false,
+      },
+    },
+    {
+      event: 'progress_checkpoint_updated',
+      metadata: {
+        progress_source: 'candidate_speaking_ended',
+        watchdog_reset_source: 'progress_checkpoint',
+        elapsed_ms: 60000,
+        recovery_attempt: 0,
+        recovery_phase: 'idle',
+        is_recovery_active: false,
+      },
+    },
+    {
+      event: 'watchdog_deadline_evaluated',
+      metadata: {
+        watchdog_evaluation: 'candidate_speaking_active',
+        progress_age_ms: 60000,
+        recovery_attempt: 0,
+        recovery_phase: 'idle',
+        is_recovery_active: false,
+      },
+    },
+    {
+      event: 'watchdog_deadline_evaluated',
+      metadata: {
+        watchdog_evaluation: 'candidate_speaking_protection_expired',
+        progress_age_ms: 120000,
+        recovery_attempt: 0,
+        recovery_phase: 'idle',
+        is_recovery_active: false,
+      },
+    },
+  ];
+
+  for (const [index, telemetry] of cases.entries()) {
+    const result = validateTelemetryPayload({
+      ...BASE_PAYLOAD,
+      event_sequence: index + 10,
+      reason: undefined,
+      ...telemetry,
+    });
+    assert.equal(result.ok, true, `${telemetry.event}:${telemetry.metadata.progress_source || telemetry.metadata.watchdog_evaluation}`);
+    assert.deepEqual(result.telemetry.metadata, telemetry.metadata);
+  }
+});
+
+test('unknown events, fields, metadata, nested values, and invalid bounds fail closed', () => {
+  const cases = [
+    [{ ...BASE_PAYLOAD, event: 'raw_provider_payload' }, 'UNKNOWN_TELEMETRY_EVENT'],
+    [{ ...BASE_PAYLOAD, candidate_id: 'untrusted' }, 'UNKNOWN_TELEMETRY_FIELD'],
+    [{ ...BASE_PAYLOAD, metadata: { message: 'untrusted' } }, 'UNKNOWN_TELEMETRY_METADATA'],
+    [{ ...BASE_PAYLOAD, metadata: { remote_audio_state: { raw: true } } }, 'INVALID_TELEMETRY_METADATA'],
+    [{ ...BASE_PAYLOAD, metadata: { progress_age_ms: -1 } }, 'INVALID_TELEMETRY_METADATA'],
+    [{ ...BASE_PAYLOAD, event_sequence: 0 }, 'INVALID_TELEMETRY_SEQUENCE'],
+  ];
+  for (const [payload, expectedCode] of cases) {
+    assert.deepEqual(validateTelemetryPayload(payload), { ok: false, code: expectedCode });
+  }
+});
+
+test('oversized metadata fails closed', () => {
+  const result = validateTelemetryPayload({
+    ...BASE_PAYLOAD,
+    metadata: { remote_audio_state: `playable${'x'.repeat(3000)}` },
+  });
+  assert.deepEqual(result, { ok: false, code: 'TELEMETRY_METADATA_TOO_LARGE' });
+});
+
+test('handler binds identity server-side and stores no provider binding or role token', async () => {
+  const database = createFakeDatabase();
+  const handler = createClientTelemetryHandler({
+    database,
+    now: () => '2026-07-28T02:00:01.000Z',
+    warn: () => assert.fail('warning not expected'),
+  });
+  const res = responseRecorder();
+  const {
+    conversation_id: _conversationId,
+    role_token: _roleToken,
+    ...boundedPayload
+  } = BASE_PAYLOAD;
+  await handler({
+    body: boundedPayload,
+    headers: { authorization: AUTHORIZATION },
+  }, res);
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body, { ok: true, duplicate: false });
+  assert.equal(database.state.inserts.length, 1);
+  const stored = database.state.inserts[0].payload;
+  assert.equal(stored.interview_id, database.state.interview.id);
+  assert.equal(stored.client_id, database.state.interview.client_id);
+  assert.equal(stored.event_type, 'client.reconnect_started');
+  assert.equal(stored.dedupe_key, diagnosticDedupeKey(1, BASE_PAYLOAD.observed_at));
+  assert.equal(stored.metadata.event_sequence, 1);
+  const serialized = JSON.stringify(stored);
+  assert.equal(serialized.includes(BASE_PAYLOAD.conversation_id), false);
+  assert.equal(serialized.includes(BASE_PAYLOAD.role_token), false);
+  assert.equal(serialized.includes(database.state.interview.candidate_id), false);
+  assert.deepEqual(decodeTelemetryAuthorization(AUTHORIZATION), {
+    roleToken: BASE_PAYLOAD.role_token,
+    conversationId: BASE_PAYLOAD.conversation_id,
+  });
+});
+
+test('received order and bounded client sequence are preserved', async () => {
+  const database = createFakeDatabase();
+  const times = ['2026-07-28T02:00:01.000Z', '2026-07-28T02:00:02.000Z'];
+  const handler = createClientTelemetryHandler({
+    database,
+    now: () => times.shift(),
+    warn: () => assert.fail('warning not expected'),
+  });
+  await handler({ body: BASE_PAYLOAD }, responseRecorder());
+  await handler({
+    body: {
+      ...BASE_PAYLOAD,
+      event: 'reconnect_local_joined',
+      event_sequence: 2,
+      observed_at: '2026-07-28T02:00:00.500Z',
+      reason: undefined,
+      metadata: {
+        recovery_attempt: 1,
+        recovery_phase: 'awaiting_remote_presence',
+        recovery_age_ms: 500,
+        meeting_state: 'joined',
+      },
+    },
+  }, responseRecorder());
+
+  assert.deepEqual(
+    database.state.inserts.map(({ payload }) => [
+      payload.received_at,
+      payload.metadata.event_sequence,
+      payload.event_type,
+    ]),
+    [
+      ['2026-07-28T02:00:01.000Z', 1, 'client.reconnect_started'],
+      ['2026-07-28T02:00:02.000Z', 2, 'client.reconnect_local_joined'],
+    ],
+  );
+});
+
+test('duplicate delivery is idempotent and skips legacy summary updates', async () => {
+  const database = createFakeDatabase({ insertError: { code: '23505', message: 'sensitive database text' } });
+  const handler = createClientTelemetryHandler({
+    database,
+    warn: () => assert.fail('duplicate must not warn'),
+  });
+  const res = responseRecorder();
+  await handler({
+    body: {
+      ...BASE_PAYLOAD,
+      event: 'reconnect_attempted',
+    },
+  }, res);
+  assert.deepEqual(res.body, { ok: true, duplicate: true });
+  assert.equal(database.state.updates.length, 0);
+});
+
+test('a new browser document cannot collide with an earlier sequence', () => {
+  assert.notEqual(
+    diagnosticDedupeKey(1, '2026-07-28T02:00:00.000Z'),
+    diagnosticDedupeKey(1, '2026-07-28T02:05:00.000Z'),
+  );
+});
+
+test('persistence failure is bounded and cannot alter interview state', async () => {
+  const warnings = [];
+  const database = createFakeDatabase({
+    insertError: { code: 'XX000', message: 'raw query URL and secret marker' },
+  });
+  const handler = createClientTelemetryHandler({
+    database,
+    warn: (category) => warnings.push(category),
+  });
+  const res = responseRecorder();
+  await handler({ body: BASE_PAYLOAD }, res);
+
+  assert.equal(res.statusCode, 503);
+  assert.equal(res.body.code, 'CLIENT_TELEMETRY_UNAVAILABLE');
+  assert.deepEqual(warnings, ['lifecycle_persist_failed']);
+  assert.equal(database.state.updates.length, 0);
+  assert.equal(JSON.stringify({ response: res.body, warnings }).includes('secret marker'), false);
+});
+
+test('binding errors fail closed before persistence', async () => {
+  const database = createFakeDatabase({
+    interview: {
+      ...createFakeDatabase().state.interview,
+      tavus_application_id: 'different-binding',
+    },
+  });
+  const handler = createClientTelemetryHandler({ database, warn: () => {} });
+  const res = responseRecorder();
+  await handler({ body: BASE_PAYLOAD }, res);
+  assert.equal(res.statusCode, 403);
+  assert.equal(database.state.inserts.length, 0);
+  assert.equal(database.state.updates.length, 0);
+});
+
+test('legacy reconnect summary is updated only after append-only persistence succeeds', async () => {
+  const database = createFakeDatabase();
+  const handler = createClientTelemetryHandler({
+    database,
+    now: () => '2026-07-28T02:00:01.000Z',
+    warn: () => assert.fail('warning not expected'),
+  });
+  const res = responseRecorder();
+  await handler({
+    body: {
+      ...BASE_PAYLOAD,
+      event: 'reconnect_attempted',
+    },
+  }, res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(database.state.updates.length, 1);
+  assert.deepEqual(database.state.updates[0].payload, {
+    reconnect_attempted: true,
+    reconnect_attempt_count: 1,
+    client_end_reason: 'watchdog_timeout',
+    updated_at: '2026-07-28T02:00:01.000Z',
+  });
+});

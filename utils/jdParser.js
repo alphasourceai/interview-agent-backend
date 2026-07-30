@@ -1,7 +1,7 @@
 // utils/jdParser.js
 'use strict';
 
-const pdfParse = require('pdf-parse');
+const { PDFParse } = require('pdf-parse');
 const mammoth = require('mammoth');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
@@ -33,8 +33,18 @@ async function parseBufferToText(buffer, mime, filename) {
   const type = mime || '';
 
   if (type === 'application/pdf' || ext === 'pdf') {
-    const out = await pdfParse(buffer);
-    return normalizeExtractedText(out.text);
+    const parser = new PDFParse({
+      data: buffer,
+      isEvalSupported: false,
+      useWorkerFetch: false,
+      verbosity: 0
+    });
+    try {
+      const out = await parser.getText({ pageJoiner: '' });
+      return normalizeExtractedText(out.text);
+    } finally {
+      await parser.destroy().catch(() => {});
+    }
   }
 
   if (type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || ext === 'docx') {

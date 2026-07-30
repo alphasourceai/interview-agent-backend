@@ -8,8 +8,14 @@ const { createTavusInterviewHandler } = require('../handlers/createTavusIntervie
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
 const { isRoleInactive, buildRoleInactivePayload, logInactiveRoleBlocked } = require('../src/lib/roleLifecycle');
-const { sendCandidateError, getInterviewConflictCode } = require('../src/lib/candidateErrors');
+const { sendCandidateError } = require('../src/lib/candidateErrors');
+const {
+  claimInterviewAttempt,
+  completeRecoveryStart,
+  recordVendorBindingFailure,
+} = require('../src/lib/interviewAttemptService');
 const { resolvePublicBackendBase } = require('../config/urlConfig');
+const { normalizePrimitiveString, normalizeUuid } = require('../src/lib/strictRequestValidation');
 
 const router = express.Router();
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
@@ -65,15 +71,34 @@ router.post('/', createTavusRateLimit, async (req, res) => {
     const base = resolvePublicBackendBase(computedBase);
 
     const {
-      candidate_id,
-      role_id: roleIdFromBody,
+      candidate_id: candidateIdRaw,
+      role_id: roleIdFromBodyRaw,
       roleToken,
       role_token
     } = req.body || {};
-    sentryCandidateId = candidate_id || null;
-    if (sentryCandidateId) Sentry.setTag('candidate_id', String(sentryCandidateId));
-    const roleTokenFromBody = roleToken || role_token || null;
-    if (!candidate_id) return res.status(400).json({ error: 'candidate_id required' });
+    const candidate_id = normalizeUuid(candidateIdRaw);
+    const roleIdFromBody = normalizeUuid(roleIdFromBodyRaw, { required: false });
+    const roleTokenValue = roleToken !== undefined ? roleToken : role_token;
+    const roleTokenFromBody = normalizePrimitiveString(roleTokenValue, {
+      required: false,
+      maxCodePoints: 200,
+      maxBytes: 200,
+    });
+    if (candidate_id === null) {
+      return res.status(400).json({ error: 'bad_request', code: 'INVALID_CANDIDATE_ID', detail: 'candidate_id must be a UUID.', request_id });
+    }
+    if (roleIdFromBody === null) {
+      return res.status(400).json({ error: 'bad_request', code: 'INVALID_ROLE_ID', detail: 'role_id must be a UUID.', request_id });
+    }
+    if (roleTokenFromBody === null || (roleTokenFromBody && !/^[A-Za-z0-9_-]+$/.test(roleTokenFromBody))) {
+      return res.status(400).json({ error: 'bad_request', code: 'INVALID_ROLE_TOKEN', detail: 'role token is invalid.', request_id });
+    }
+    if (roleToken !== undefined && role_token !== undefined
+      && (typeof roleToken !== 'string' || typeof role_token !== 'string' || roleToken.trim() !== role_token.trim())) {
+      return res.status(400).json({ error: 'bad_request', code: 'INVALID_ROLE_TOKEN', detail: 'role token is invalid.', request_id });
+    }
+    sentryCandidateId = candidate_id;
+    Sentry.setTag('candidate_id', candidate_id);
 
     // candidate
     const { data: candidate, error: cErr } = await supabase
@@ -259,21 +284,6 @@ router.post('/', createTavusRateLimit, async (req, res) => {
       } catch {}
     }
 
-    // Check for existing interview row
-    const { data: existing, error: eErr } = await supabase
-      .from('interviews')
-      .select('id, tavus_application_id, status')
-      .eq('candidate_id', candidate_id)
-      .eq('role_id', roleId)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (eErr) return res.status(500).json({ error: eErr.message });
-
-    if (existing) {
-      return sendCandidateError(res, getInterviewConflictCode(existing.status), { request_id });
-    }
-
     const availability = await getRoleInterviewAvailability({
       db: supabaseAdmin,
       roleId,
@@ -303,26 +313,52 @@ router.post('/', createTavusRateLimit, async (req, res) => {
     }
 
     const webhookUrl = `${base}/webhook/tavus`;
-    const { data: startingInterview, error: startingInterviewError } = await supabase
-      .from('interviews')
-      .insert({
-        candidate_id,
-        client_id: clientId,
-        role_id: roleId,
-        status: 'Starting',
-        failure_code: null,
-        failure_stage: null,
-        failure_summary: null,
-        failure_at: null,
-        retryable: null
-      })
-      .select('id')
-      .single();
-    if (startingInterviewError || !startingInterview) {
-      if (startingInterviewError?.code === '23505') {
-        return sendCandidateError(res, 'INTERVIEW_IN_PROGRESS', { request_id });
+    let startingInterview;
+    try {
+      const claimed = await claimInterviewAttempt(supabaseAdmin, {
+        candidateId: candidate_id,
+        roleId,
+        clientId,
+      });
+      startingInterview = {
+        id: claimed.interview_id,
+        attempt_number: claimed.attempt_number,
+        authorized_replacement: claimed.authorized_replacement === true,
+        authorization_id: claimed.recovery_authorization_id || null,
+        claim_token: claimed.vendor_claim_token || null,
+        external_reference: claimed.vendor_external_reference || null,
+        claim_state: claimed.claim_state || null,
+      };
+      if (claimed.start_claimed === false) {
+        const reconciliationRequired = ['replacement_reconciliation_required', 'replacement_reconciling']
+          .includes(String(claimed.claim_state || ''));
+        const manualReview = String(claimed.claim_state || '') === 'replacement_manual_review';
+        const bindingRecoveryRequired = String(claimed.claim_state || '') === 'replacement_binding_recovery_required';
+        return res.status(reconciliationRequired || manualReview || bindingRecoveryRequired ? 503 : 409).json({
+          error: bindingRecoveryRequired ? 'vendor_binding_recovery_required'
+            : (manualReview ? 'vendor_reconciliation_manual_review'
+              : (reconciliationRequired ? 'vendor_reconciliation_required' : 'replacement_start_in_progress')),
+          code: bindingRecoveryRequired ? 'VENDOR_BINDING_RECOVERY_REQUIRED'
+            : (manualReview ? 'VENDOR_RECONCILIATION_MANUAL_REVIEW'
+              : (reconciliationRequired ? 'VENDOR_RECONCILIATION_REQUIRED' : 'REPLACEMENT_START_IN_PROGRESS')),
+          detail: bindingRecoveryRequired
+            ? 'The interview provider succeeded, but support must finish linking the interview. Please do not retry.'
+            : (manualReview
+            ? 'The interview start requires support review. Please do not retry.'
+            : (reconciliationRequired
+              ? 'The interview start is being verified. Please do not retry yet.'
+              : 'The approved replacement interview is already starting.')),
+          request_id,
+          interview_id: claimed.interview_id,
+        });
       }
-      return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
+    } catch (claimError) {
+      return res.status(claimError.status || 503).json({
+        error: claimError.code || 'temporary_service_error',
+        code: claimError.code || 'TEMPORARY_SERVICE_ERROR',
+        detail: claimError.message,
+        request_id,
+      });
     }
 
     // Tavus
@@ -335,26 +371,47 @@ router.post('/', createTavusRateLimit, async (req, res) => {
     let result;
     try {
       result = await createTavusInterviewHandler(candidate, role, webhookUrl, {
-        maxInterviewMinutes
+        maxInterviewMinutes,
+        interviewId: startingInterview.id,
       });
-      if (!result?.conversation_id || !result?.conversation_url) {
-        const invalidResultError = new Error('Tavus returned an incomplete conversation response');
-        invalidResultError.code = 'tavus_incomplete_response';
-        throw invalidResultError;
-      }
     } catch (error) {
-      await supabase
-        .from('interviews')
-        .update({
-          status: 'Failed',
-          failure_code: 'INTERVIEW_VENDOR_START_FAILED',
-          failure_stage: 'vendor_start',
-          failure_summary: 'The interview vendor did not create a usable conversation.',
-          failure_at: new Date().toISOString(),
-          retryable: true,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', startingInterview.id);
+      const failureCategory = error?.failureCategory === 'definite_pre_acceptance'
+        ? 'definite_pre_acceptance'
+        : 'ambiguous_acceptance';
+      if (startingInterview.authorized_replacement && startingInterview.authorization_id) {
+        try {
+          await completeRecoveryStart(supabaseAdmin, {
+            interviewId: startingInterview.id,
+            authorizationId: startingInterview.authorization_id,
+            success: false,
+            failureCode: String(error?.code || 'INTERVIEW_VENDOR_START_FAILED').slice(0, 100),
+            failureCategory,
+            externalReference: result?.vendor_external_reference || startingInterview.external_reference
+              || `alphascreen-interview-${startingInterview.id}`,
+            claimToken: startingInterview.claim_token,
+            requestId: request_id,
+          });
+        } catch (recoveryError) {
+          console.error('[create-tavus-interview] recovery_start_failure_record_failed', {
+            request_id,
+            interview_id: startingInterview.id,
+            code: recoveryError?.code || null,
+          });
+        }
+      } else {
+        await supabaseAdmin
+          .from('interviews')
+          .update({
+            status: 'Failed',
+            failure_code: 'INTERVIEW_VENDOR_START_FAILED',
+            failure_stage: 'vendor_start',
+            failure_summary: 'The interview vendor did not create a usable conversation.',
+            failure_at: new Date().toISOString(),
+            retryable: true,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', startingInterview.id);
+      }
       Sentry.captureException(error, {
         tags: {
           route_name: 'create_tavus_interview',
@@ -367,6 +424,15 @@ router.post('/', createTavusRateLimit, async (req, res) => {
           interview_id: startingInterview.id
         }
       });
+      if (failureCategory === 'ambiguous_acceptance') {
+        return res.status(503).json({
+          error: 'vendor_reconciliation_required',
+          code: 'VENDOR_RECONCILIATION_REQUIRED',
+          detail: 'The interview start is being verified. Please do not retry yet.',
+          request_id,
+          interview_id: startingInterview.id,
+        });
+      }
       return sendCandidateError(res, 'INTERVIEW_VENDOR_START_FAILED', { request_id });
     }
     Sentry.addBreadcrumb({
@@ -376,15 +442,42 @@ router.post('/', createTavusRateLimit, async (req, res) => {
       data: { conversation_id: result?.conversation_id || null }
     });
 
-    const { error: interviewUpdateError } = await supabase
-      .from('interviews')
-      .update({
-        video_url: result.conversation_url || null,
-        tavus_application_id: result.conversation_id || null,
-        status: 'Pending',
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', startingInterview.id);
+    let interviewUpdateError = null;
+    if (startingInterview.authorized_replacement && startingInterview.authorization_id) {
+      try {
+        await completeRecoveryStart(supabaseAdmin, {
+          interviewId: startingInterview.id,
+          authorizationId: startingInterview.authorization_id,
+          success: true,
+          conversationId: result.conversation_id,
+          conversationUrl: result.conversation_url,
+          effectivePersonaId: result.effective_persona_id,
+          effectiveReplicaId: result.effective_replica_id,
+          effectiveDocumentId: result.effective_tavus_document_id,
+          externalReference: result.vendor_external_reference || startingInterview.external_reference,
+          resolutionSource: 'create_response',
+          claimToken: startingInterview.claim_token,
+          requestId: request_id,
+        });
+      } catch (error) {
+        interviewUpdateError = error;
+      }
+    } else {
+      const updateResult = await supabaseAdmin
+        .from('interviews')
+        .update({
+          video_url: result.conversation_url || null,
+          tavus_application_id: result.conversation_id || null,
+          tavus_conversation_id: result.conversation_id || null,
+          effective_persona_id: result.effective_persona_id || null,
+          effective_replica_id: result.effective_replica_id || null,
+          effective_tavus_document_id: result.effective_tavus_document_id || null,
+          status: 'Pending',
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', startingInterview.id);
+      interviewUpdateError = updateResult.error;
+    }
     if (interviewUpdateError) {
       console.error('[create-tavus-interview] linkage_update_failed', {
         request_id,
@@ -393,11 +486,47 @@ router.post('/', createTavusRateLimit, async (req, res) => {
         role_id: roleId,
         code: interviewUpdateError.code || null
       });
-      return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
+      if (startingInterview.authorized_replacement && startingInterview.authorization_id) {
+        try {
+          const recorded = await recordVendorBindingFailure(supabaseAdmin, {
+            interviewId: startingInterview.id,
+            authorizationId: startingInterview.authorization_id,
+            claimToken: startingInterview.claim_token,
+            externalReference: result.vendor_external_reference || startingInterview.external_reference,
+            conversationId: result.conversation_id,
+            conversationUrl: result.conversation_url,
+            effectivePersonaId: result.effective_persona_id,
+            effectiveReplicaId: result.effective_replica_id,
+            effectiveDocumentId: result.effective_tavus_document_id,
+            failureCode: interviewUpdateError.code || 'database_binding_failed',
+            requestId: request_id,
+          });
+          if (recorded === 'started' || recorded?.status === 'started') {
+            interviewUpdateError = null;
+          }
+        } catch (bindingRecordError) {
+          console.error('[create-tavus-interview] binding_recovery_record_failed', {
+            request_id,
+            interview_id: startingInterview.id,
+            code: bindingRecordError?.code || null,
+          });
+        }
+        if (interviewUpdateError) {
+          return res.status(503).json({
+            error: 'vendor_binding_recovery_required',
+            code: 'VENDOR_BINDING_RECOVERY_REQUIRED',
+            detail: 'The interview provider succeeded, but support must finish linking the interview. Please do not retry.',
+            request_id,
+            interview_id: startingInterview.id,
+          });
+        }
+      } else {
+        return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
+      }
     }
 
     // Immediately reflect on candidate
-    await supabase
+    await supabaseAdmin
       .from('candidates')
       .update({
         interview_status: 'Started',
@@ -405,16 +534,6 @@ router.post('/', createTavusRateLimit, async (req, res) => {
         candidate_external_id: result.conversation_id || null
       })
       .eq('id', candidate_id);
-
-    // Stamp linkage on existing report rows for this candidate (if any)
-    await supabase
-      .from('reports')
-      .update({
-        role_id: role.id,
-        client_id: clientId,
-        candidate_external_id: result.conversation_id || null
-      })
-      .eq('candidate_id', candidate_id);
 
     return res.status(200).json({
       message: 'Interview created',

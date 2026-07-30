@@ -1,98 +1,127 @@
 // routes/reports.js
-// Direct-export Express router
+// Historical report-download router. Authorization and ownership fail closed.
+
+'use strict';
 
 const express = require('express');
 const { supabase } = require('../src/lib/supabaseClient');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
+const { normalizeUuid } = require('../src/lib/strictRequestValidation');
 
 const router = express.Router();
-
 const REPORTS_BUCKET = process.env.SUPABASE_REPORTS_BUCKET || 'reports';
 const URL_TTL_SECONDS = Number(process.env.REPORTS_SIGNED_URL_TTL_SECONDS || 300);
 
-// Helper: collect client IDs from scope (and legacy hints)
 function getScopedClientIds(req) {
-  const idsFromScope = Array.isArray(req?.clientScope?.memberships)
-    ? req.clientScope.memberships.map(m => m.client_id).filter(Boolean)
-    : [];
-  const legacy = req.client?.id ? [req.client.id] : [];
-  return Array.from(new Set([...idsFromScope, ...legacy]));
+  return Array.from(new Set([
+    ...(Array.isArray(req?.clientScope?.memberships) ? req.clientScope.memberships.map((m) => m?.client_id) : []),
+    ...(Array.isArray(req?.clientIds) ? req.clientIds : []),
+    ...(Array.isArray(req?.client_memberships) ? req.client_memberships : []),
+    ...(Array.isArray(req?.memberships) ? req.memberships.map((m) => m?.client_id) : []),
+    req?.client?.id,
+  ].filter((value) => typeof value === 'string' && value)));
+}
+
+function safeStorageKey(value) {
+  if (typeof value !== 'string') return null;
+  const key = value.trim().replace(/^\/+/, '');
+  if (!key || key.length > 1000 || key.includes('\0') || key.split('/').includes('..')) return null;
+  return key;
+}
+
+function keyFromReportUrl(value) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const raw = value.trim();
+  if (!/^https?:\/\//i.test(raw)) return safeStorageKey(raw);
+  try {
+    const url = new URL(raw);
+    for (const marker of [
+      `/storage/v1/object/public/${REPORTS_BUCKET}/`,
+      `/storage/v1/object/sign/${REPORTS_BUCKET}/`,
+    ]) {
+      const index = url.pathname.indexOf(marker);
+      if (index !== -1) return safeStorageKey(decodeURIComponent(url.pathname.slice(index + marker.length)));
+    }
+  } catch (_) {}
+  return null;
+}
+
+function boundedFailure(res, status, code) {
+  return res.status(status).json({ error: code });
 }
 
 /**
  * GET /reports/:id/download
- * Finds the report's storage path (DB or fallback), verifies scope to its client,
- * and redirects to a short-lived signed URL.
+ * Signs only an explicitly stored report object after report, candidate, client,
+ * role, optional interview, and authenticated scope all agree.
  */
 router.get('/:id/download', requireAuth, withClientScope, async (req, res) => {
+  const id = normalizeUuid(req.params.id);
+  if (id === null) return boundedFailure(res, 400, 'invalid_report_id');
+
   try {
-    const id = req.params.id;
-    if (!id) return res.status(400).send('Missing id');
+    const { data: report, error: reportError } = await supabase
+      .from('reports')
+      .select('id,storage_path,path,file_path,report_url,candidate_id,client_id,role_id,interview_id')
+      .eq('id', id)
+      .maybeSingle();
+    if (reportError) return boundedFailure(res, 503, 'report_lookup_unavailable');
+    if (!report) return boundedFailure(res, 404, 'report_not_found');
 
-    // 1) Try DB lookup first (be tolerant if table doesn’t exist)
-    let storagePath = null;
-    let reportClientId = null;
+    const candidateId = normalizeUuid(report.candidate_id);
+    if (candidateId === null) return boundedFailure(res, 403, 'report_access_denied');
+    const { data: candidate, error: candidateError } = await supabase
+      .from('candidates')
+      .select('id,client_id,role_id')
+      .eq('id', candidateId)
+      .maybeSingle();
+    if (candidateError) return boundedFailure(res, 503, 'report_lookup_unavailable');
+    if (!candidate) return boundedFailure(res, 403, 'report_access_denied');
 
-    try {
-      const { data, error } = await supabase
-        .from('reports')
-        .select('storage_path, path, file_path, client_id')
-        .eq('id', id)
-        .maybeSingle(); // don't throw if not found
+    const candidateClientId = normalizeUuid(candidate.client_id);
+    const candidateRoleId = normalizeUuid(candidate.role_id);
+    const reportClientId = report.client_id == null ? undefined : normalizeUuid(report.client_id);
+    const reportRoleId = report.role_id == null ? undefined : normalizeUuid(report.role_id);
+    if (candidateClientId === null || candidateRoleId === null || reportClientId === null || reportRoleId === null) {
+      return boundedFailure(res, 403, 'report_access_denied');
+    }
+    const effectiveClientId = reportClientId || candidateClientId;
+    if (!effectiveClientId || (reportClientId && reportClientId !== candidateClientId)
+      || (reportRoleId && reportRoleId !== candidateRoleId)
+      || !getScopedClientIds(req).includes(effectiveClientId)) {
+      return boundedFailure(res, 403, 'report_access_denied');
+    }
 
-      if (error) {
-        // If this env doesn't have the table, just fall through to fallback path
-        console.warn('[reports] DB lookup error (continuing with fallback):', error.message);
-      } else if (data) {
-        storagePath = data.storage_path || data.path || data.file_path || null;
-        reportClientId = data.client_id || null;
+    if (report.interview_id != null) {
+      const interviewId = normalizeUuid(report.interview_id);
+      if (interviewId === null) return boundedFailure(res, 403, 'report_access_denied');
+      const { data: interview, error: interviewError } = await supabase
+        .from('interviews')
+        .select('id,candidate_id,client_id,role_id')
+        .eq('id', interviewId)
+        .maybeSingle();
+      if (interviewError) return boundedFailure(res, 503, 'report_lookup_unavailable');
+      if (!interview
+        || interview.candidate_id !== candidateId
+        || interview.client_id !== effectiveClientId
+        || interview.role_id !== candidateRoleId) {
+        return boundedFailure(res, 403, 'report_access_denied');
       }
-    } catch (e) {
-      // Keep going with fallback
-      console.warn('[reports] DB lookup exception (continuing with fallback):', e.message);
     }
 
-    // 2) Fallback storage path if needed
-    if (!storagePath) {
-      const hintedClient =
-        reportClientId ||
-        req.query.client_id ||
-        req.clientScope?.defaultClientId ||
-        req.client?.id ||
-        null;
+    const storagePath = safeStorageKey(report.storage_path)
+      || safeStorageKey(report.path)
+      || safeStorageKey(report.file_path)
+      || keyFromReportUrl(report.report_url);
+    if (!storagePath) return boundedFailure(res, 404, 'report_file_not_found');
 
-      storagePath = hintedClient
-        ? `${hintedClient}/reports/${id}.pdf`
-        : `reports/${id}.pdf`;
-    }
-
-    // 3) Enforce scope
-    const scopedIds = getScopedClientIds(req);
-    // Try to infer a client_id from the path if DB didn’t have one
-    const inferredClient = storagePath.includes('/') ? storagePath.split('/')[0] : null;
-    const targetClientId = reportClientId || req.query.client_id || inferredClient;
-
-    const allowed = targetClientId
-      ? scopedIds.includes(targetClientId)
-      : scopedIds.length > 0; // if we truly cannot infer, allow if user has *some* scope (legacy behavior)
-
-    if (!allowed) return res.status(403).send('Forbidden');
-
-    // 4) Create signed URL & redirect
-    const { data: signed, error: signErr } = await supabase
-      .storage
+    const { data: signed, error: signError } = await supabase.storage
       .from(REPORTS_BUCKET)
       .createSignedUrl(storagePath, URL_TTL_SECONDS);
-
-    if (signErr || !signed?.signedUrl) {
-      console.error('[GET /reports/:id/download] storage error', signErr || 'no url');
-      return res.status(404).send('Report not found');
-    }
-
+    if (signError || !signed?.signedUrl) return boundedFailure(res, 404, 'report_file_not_found');
     return res.redirect(302, signed.signedUrl);
-  } catch (e) {
-    console.error('[GET /reports/:id/download] unexpected', e);
-    return res.status(500).send('Server error');
+  } catch (_) {
+    return boundedFailure(res, 503, 'report_lookup_unavailable');
   }
 });
 

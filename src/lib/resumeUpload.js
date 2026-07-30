@@ -3,7 +3,7 @@
 const crypto = require('crypto');
 const path = require('path');
 const mammoth = require('mammoth');
-const pdfParse = require('pdf-parse');
+const { PDFParse, PasswordException } = require('pdf-parse');
 
 const MAX_RESUME_BYTES = 10 * 1024 * 1024;
 const MIN_MEANINGFUL_TEXT_CHARS = 20;
@@ -38,6 +38,30 @@ function assertResumeSize(file) {
   return size;
 }
 
+async function extractPdfText(buffer) {
+  const parser = new PDFParse({
+    data: buffer,
+    isEvalSupported: false,
+    useWorkerFetch: false,
+    verbosity: 0
+  });
+
+  try {
+    const result = await parser.getText({ pageJoiner: '' });
+    return String(result?.text || '');
+  } catch (error) {
+    if (error instanceof PasswordException || error?.name === 'PasswordException') {
+      throw new ResumeUploadError(
+        'RESUME_UNREADABLE',
+        'The PDF is encrypted or password-protected.'
+      );
+    }
+    throw new ResumeUploadError('RESUME_UNREADABLE', 'The PDF could not be read.');
+  } finally {
+    await parser.destroy().catch(() => {});
+  }
+}
+
 async function inspectResumeFile(file) {
   const sizeBytes = assertResumeSize(file);
   const extension = normalizedExtension(file);
@@ -55,15 +79,11 @@ async function inspectResumeFile(file) {
     if (!buffer.subarray(0, 5).equals(Buffer.from('%PDF-'))) {
       throw new ResumeUploadError('RESUME_UNREADABLE', 'The selected file is not a valid PDF.');
     }
-    try {
-      const result = await pdfParse(buffer);
-      extractedTextLength = meaningfulTextLength(result?.text || '');
-      if (extractedTextLength < MIN_MEANINGFUL_TEXT_CHARS) {
-        parseStatus = 'manual_review';
-        parseNote = 'no_extractable_pdf_text';
-      }
-    } catch {
-      throw new ResumeUploadError('RESUME_UNREADABLE', 'The PDF could not be read.');
+    const extractedText = await extractPdfText(buffer);
+    extractedTextLength = meaningfulTextLength(extractedText);
+    if (extractedTextLength < MIN_MEANINGFUL_TEXT_CHARS) {
+      parseStatus = 'manual_review';
+      parseNote = 'no_extractable_pdf_text';
     }
   } else if (extension === '.docx') {
     if (buffer[0] !== 0x50 || buffer[1] !== 0x4b || !buffer.includes(Buffer.from('word/document.xml'))) {

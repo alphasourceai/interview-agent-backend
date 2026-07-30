@@ -3,6 +3,10 @@ const { htmlToPdf } = require('../utils/pdfRenderer');
 const { buildCandidateReportHtml } = require('../utils/renderCandidateReport');
 const { createClient } = require('@supabase/supabase-js');
 const Sentry = require('@sentry/node');
+const {
+  normalizePrimitiveString,
+  normalizeUuid,
+} = require('../src/lib/strictRequestValidation');
 
 // Supabase Admin (for loading report data + uploading PDFs)
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -16,6 +20,58 @@ const supabaseAdmin = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
 const DEFAULT_SIGNED_SECS = 90; // short-lived; FE will open immediately
 const MIN_SIGNED_SECS = 15;
 const MAX_SIGNED_SECS = 600;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isUuid(value) {
+  return normalizeUuid(value) !== null;
+}
+
+function invalidUuidResponse(res, field) {
+  return res.status(400).json({ error: 'bad_request', code: 'invalid_identifier', detail: `${field} must be a UUID.` });
+}
+
+function scopedClientIds(req) {
+  return Array.from(new Set([
+    ...(Array.isArray(req?.clientIds) ? req.clientIds : []),
+    ...(Array.isArray(req?.client_memberships) ? req.client_memberships : []),
+    ...(Array.isArray(req?.memberships) ? req.memberships.map((item) => item?.client_id) : []),
+  ].map((value) => String(value || '').trim()).filter(Boolean)));
+}
+
+const RESUME_SCORE_FIELDS = [
+  'resume_score',
+  'skills_match_percent',
+  'education_match_percent',
+  'experience_match_percent',
+  'overall_resume_match_percent',
+];
+
+function safeResumeScore(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 100) return null;
+  return value;
+}
+
+function sanitizeResumeBreakdown(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const safe = {};
+  for (const field of RESUME_SCORE_FIELDS) {
+    if (!Object.hasOwn(value, field)) continue;
+    const score = safeResumeScore(value[field]);
+    if (score !== null || value[field] === null) safe[field] = score;
+  }
+  if (Object.hasOwn(value, 'summary')) {
+    const summary = normalizePrimitiveString(value.summary, {
+      required: false,
+      allowEmpty: true,
+      maxCodePoints: 4000,
+      maxBytes: 16000,
+    });
+    if (summary !== null && summary !== undefined) safe.summary = summary;
+  }
+  if (!Object.keys(safe).length) return null;
+  return Buffer.byteLength(JSON.stringify(safe), 'utf8') <= 16384 ? safe : null;
+}
 
 // Extract a storage key from a Supabase public/signed URL or return as-is if already a key
 function keyFromUrl(url) {
@@ -98,25 +154,139 @@ async function handleGenerate(req, res) {
       return res.status(500).json({ error: 'Storage not configured (missing SUPABASE_URL/SUPABASE_SERVICE_KEY)' });
     }
 
-    const { candidate_id, report_id, interview_id } = req.body || {};
-    if (!candidate_id && !report_id) {
-      return res.status(400).json({ error: 'candidate_id or report_id is required' });
+    const body = req.body || {};
+    const candidate_id = normalizeUuid(body.candidate_id, { required: false });
+    const report_id = normalizeUuid(body.report_id, { required: false });
+    const interview_id = normalizeUuid(body.interview_id, { required: false });
+    for (const [field, value] of Object.entries({ candidate_id, report_id, interview_id })) {
+      if (value === null) return invalidUuidResponse(res, field);
+    }
+    if (!candidate_id && !report_id && !interview_id) {
+      return res.status(400).json({ error: 'candidate_id, report_id, or interview_id is required' });
     }
 
-    // 1) Load report row
+    // 1) Resolve an exact interview first when the caller supplies one. New
+    // recovery attempts never pair a candidate-wide latest report with a
+    // different interview.
+    let latestInterview = null;
+    let recoveryAttempt = false;
+    if (interview_id) {
+      const { data: ivById, error: ivByIdErr } = await supabaseAdmin
+        .from('interviews')
+        .select('id, created_at, candidate_id, client_id, role_id, attempt_number, attempt_mode, previous_attempt_id, replacement_authorization_id, status, video_url, transcript_url, transcript, analysis_url, analysis, transcript_scores, perception_scores, interview_summary, unanswered_candidate_questions')
+        .eq('id', interview_id)
+        .maybeSingle();
+      if (ivByIdErr) throw ivByIdErr;
+      if (!ivById) return res.status(404).json({ error: 'Interview not found' });
+      if (!scopedClientIds(req).includes(String(ivById.client_id || ''))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (candidate_id && String(ivById.candidate_id) !== String(candidate_id)) {
+        return res.status(409).json({ error: 'interview_candidate_mismatch' });
+      }
+      latestInterview = ivById;
+      recoveryAttempt = !!ivById.replacement_authorization_id || Number(ivById.attempt_number || 0) > 1;
+    }
+
     let reportRow = null;
     if (report_id) {
       const { data, error } = await supabaseAdmin
         .from('reports')
-        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis, unanswered_candidate_questions')
+        .select('id, created_at, candidate_id, client_id, role_id, interview_id, attempt_number, report_kind, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis, unanswered_candidate_questions')
         .eq('id', report_id)
         .maybeSingle();
       if (error) throw error;
       reportRow = data;
+      if (!reportRow) return res.status(404).json({ error: 'No report found for given id' });
+      if (!scopedClientIds(req).includes(String(reportRow.client_id || ''))) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (candidate_id && String(reportRow.candidate_id) !== String(candidate_id)) {
+        return res.status(409).json({ error: 'report_candidate_mismatch' });
+      }
+      if (latestInterview) {
+        const exactReportBinding = reportRow.interview_id
+          && String(reportRow.interview_id) === String(latestInterview.id)
+          && String(reportRow.candidate_id || '') === String(latestInterview.candidate_id || '')
+          && String(reportRow.client_id || '') === String(latestInterview.client_id || '')
+          && String(reportRow.role_id || '') === String(latestInterview.role_id || '')
+          && Number(reportRow.attempt_number) === Number(latestInterview.attempt_number)
+          && (!recoveryAttempt || reportRow.report_kind === 'complete_interview');
+        if (!exactReportBinding) {
+          return res.status(409).json({ error: 'recovery_report_interview_mismatch' });
+        }
+      }
+      // A bound report carries its own attempt identity. Resolve that exact
+      // interview even when an older caller supplies only report_id.
+      if (!latestInterview && reportRow.interview_id) {
+        const { data: boundInterview, error: boundInterviewError } = await supabaseAdmin
+          .from('interviews')
+          .select('id, created_at, candidate_id, client_id, role_id, attempt_number, attempt_mode, previous_attempt_id, replacement_authorization_id, status, video_url, transcript_url, transcript, analysis_url, analysis, transcript_scores, perception_scores, interview_summary, unanswered_candidate_questions')
+          .eq('id', reportRow.interview_id)
+          .maybeSingle();
+        if (boundInterviewError) throw boundInterviewError;
+        if (!boundInterview) return res.status(409).json({ error: 'report_interview_binding_missing' });
+        if (!scopedClientIds(req).includes(String(boundInterview.client_id || ''))
+          || String(boundInterview.client_id || '') !== String(reportRow.client_id || '')
+          || String(boundInterview.candidate_id || '') !== String(reportRow.candidate_id || '')
+          || String(boundInterview.role_id || '') !== String(reportRow.role_id || '')) {
+          return res.status(409).json({ error: 'report_interview_binding_mismatch' });
+        }
+        latestInterview = boundInterview;
+        recoveryAttempt = !!boundInterview.replacement_authorization_id
+          || Number(boundInterview.attempt_number || 0) > 1;
+      }
+    } else if (recoveryAttempt) {
+      const { data, error } = await supabaseAdmin
+        .from('reports')
+        .select('id, created_at, candidate_id, client_id, role_id, interview_id, attempt_number, report_kind, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis, unanswered_candidate_questions')
+        .eq('interview_id', latestInterview.id)
+        .eq('candidate_id', latestInterview.candidate_id)
+        .eq('client_id', latestInterview.client_id)
+        .eq('role_id', latestInterview.role_id)
+        .eq('attempt_number', latestInterview.attempt_number)
+        .eq('report_kind', 'complete_interview')
+        .maybeSingle();
+      if (error) throw error;
+      reportRow = data;
+
+      if (!reportRow) {
+        // Resume-only data is the sole candidate-wide input allowed to seed a
+        // new attempt report. No prior interview analysis is copied.
+        const { data: resumeRows, error: resumeError } = await supabaseAdmin
+          .from('reports')
+          .select('id,created_at,resume_score,resume_breakdown')
+          .eq('candidate_id', latestInterview.candidate_id)
+          .eq('client_id', latestInterview.client_id)
+          .eq('role_id', latestInterview.role_id)
+          .eq('report_kind', 'resume_only')
+          .is('interview_id', null)
+          .order('created_at', { ascending: false })
+          .order('id', { ascending: false })
+          .limit(1);
+        if (resumeError) throw resumeError;
+        const resumeOnly = (resumeRows || [])[0] || null;
+        const { data: inserted, error: insertError } = await supabaseAdmin
+          .from('reports')
+          .insert({
+            candidate_id: latestInterview.candidate_id,
+            client_id: latestInterview.client_id,
+            role_id: latestInterview.role_id,
+            interview_id: latestInterview.id,
+            attempt_number: latestInterview.attempt_number,
+            report_kind: 'complete_interview',
+            resume_score: safeResumeScore(resumeOnly?.resume_score),
+            resume_breakdown: sanitizeResumeBreakdown(resumeOnly?.resume_breakdown),
+          })
+          .select('id, created_at, candidate_id, client_id, role_id, interview_id, attempt_number, report_kind, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis, unanswered_candidate_questions')
+          .single();
+        if (insertError) throw insertError;
+        reportRow = inserted;
+      }
     } else {
       const { data, error } = await supabaseAdmin
         .from('reports')
-        .select('id, created_at, candidate_id, role_id, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis, unanswered_candidate_questions')
+        .select('id, created_at, candidate_id, client_id, role_id, interview_id, attempt_number, report_kind, resume_score, interview_score, overall_score, interview_breakdown, resume_breakdown, analysis, unanswered_candidate_questions')
         .eq('candidate_id', candidate_id)
         .order('created_at', { ascending: false })
         .limit(1);
@@ -127,33 +297,24 @@ async function handleGenerate(req, res) {
     if (!reportRow) {
       return res.status(404).json({ error: 'No report found for given id' });
     }
+    if (!scopedClientIds(req).includes(String(reportRow.client_id || ''))) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
     if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
       Sentry.addBreadcrumb({ category: 'db', level: 'info', message: 'reports:loaded', data: { report_id: reportRow.id, candidate_id: reportRow.candidate_id } });
     }
 
-    // Load interview row used for current dashboard values.
-    // Prefer explicit interview_id from FE; otherwise use latest by candidate.
-    let latestInterview = null;
-    {
-      if (interview_id) {
-        const { data: ivById, error: ivByIdErr } = await supabaseAdmin
-          .from('interviews')
-          .select('id, created_at, candidate_id, video_url, transcript_url, analysis_url, analysis, transcript_scores, perception_scores, interview_summary, unanswered_candidate_questions')
-          .eq('id', interview_id)
-          .maybeSingle();
-        if (ivByIdErr) throw ivByIdErr;
-        latestInterview = ivById || null;
-      }
-      if (!latestInterview) {
+    // Legacy report generation retains its historical latest-interview fallback.
+    // Recovery attempts above are exact-ID-only.
+    if (!latestInterview) {
         const { data: ivs, error: ivErr } = await supabaseAdmin
           .from('interviews')
-          .select('id, created_at, candidate_id, video_url, transcript_url, analysis_url, analysis, transcript_scores, perception_scores, interview_summary, unanswered_candidate_questions')
+          .select('id, created_at, candidate_id, client_id, role_id, attempt_number, attempt_mode, previous_attempt_id, replacement_authorization_id, status, video_url, transcript_url, transcript, analysis_url, analysis, transcript_scores, perception_scores, interview_summary, unanswered_candidate_questions')
           .eq('candidate_id', reportRow.candidate_id)
           .order('created_at', { ascending: false })
           .limit(1);
         if (ivErr) throw ivErr;
         latestInterview = (ivs && ivs[0]) || null;
-      }
     }
     if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
       Sentry.addBreadcrumb({ category: 'db', level: 'info', message: 'interviews:loaded', data: { latest_interview_id: latestInterview ? latestInterview.id : null } });
@@ -546,7 +707,7 @@ async function handleGenerate(req, res) {
         }
       });
     }
-    return res.status(500).json({ error: err.message || 'Failed to generate report' });
+    return res.status(503).json({ error: 'temporary_service_error', detail: 'The report service is temporarily unavailable.' });
   }
 }
 
@@ -569,6 +730,67 @@ router.post('/pdf', async (req, res) => {
 });
 
 /**
+ * GET /api/reports/interviews/:interviewId/url?expires=60
+ * Exact-attempt URL for recovery-aware consumers. Legacy report-id URLs remain
+ * available below.
+ */
+router.get('/interviews/:interviewId/url', async (req, res) => {
+  try {
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: 'Storage not configured (missing SUPABASE_URL/SUPABASE_SERVICE_KEY)' });
+    }
+    const interviewId = normalizeUuid(req.params.interviewId);
+    if (interviewId === null) return invalidUuidResponse(res, 'interview_id');
+    const rawExpires = req.query.expires;
+    if (rawExpires !== undefined && (typeof rawExpires !== 'string' || !/^\d{1,4}$/.test(rawExpires))) {
+      return res.status(400).json({ error: 'bad_request', code: 'invalid_expiry', detail: 'expires must be an integer string.' });
+    }
+    const expiresParam = Number(rawExpires || DEFAULT_SIGNED_SECS);
+    const expiresIn = Math.max(MIN_SIGNED_SECS, Math.min(MAX_SIGNED_SECS, expiresParam));
+
+    const { data: interview, error: interviewError } = await supabaseAdmin
+      .from('interviews')
+      .select('id,candidate_id,client_id,role_id,attempt_number')
+      .eq('id', interviewId)
+      .maybeSingle();
+    if (interviewError) throw interviewError;
+    if (!interview) return res.status(404).json({ error: 'Interview not found' });
+    if (!scopedClientIds(req).includes(String(interview.client_id || ''))) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const { data: report, error } = await supabaseAdmin
+      .from('reports')
+      .select('id,candidate_id,client_id,role_id,report_url,interview_id,attempt_number,report_kind')
+      .eq('interview_id', interviewId)
+      .eq('candidate_id', interview.candidate_id)
+      .eq('client_id', interview.client_id)
+      .eq('role_id', interview.role_id)
+      .eq('attempt_number', interview.attempt_number)
+      .eq('report_kind', 'complete_interview')
+      .maybeSingle();
+    if (error) throw error;
+    if (!report) return res.status(404).json({ error: 'Report not found' });
+    const key = keyFromUrl(report.report_url);
+    if (!key) return res.status(404).json({ error: 'Report file not available' });
+    const { data: signed, error: signErr } = await supabaseAdmin.storage
+      .from(REPORTS_BUCKET)
+      .createSignedUrl(key, expiresIn);
+    if (signErr) throw signErr;
+    return res.json({
+      ok: true,
+      report_id: report.id,
+      interview_id: report.interview_id,
+      attempt_number: report.attempt_number,
+      signed_url: signed?.signedUrl || null,
+      expires_in: expiresIn,
+    });
+  } catch (err) {
+    return res.status(503).json({ error: 'temporary_service_error', detail: 'The report service is temporarily unavailable.' });
+  }
+});
+
+/**
  * GET /api/reports/:id/url?expires=60
  * Returns a short-lived signed URL for an existing report PDF.
  */
@@ -577,18 +799,39 @@ router.get('/:id/url', async (req, res) => {
     if (!supabaseAdmin) {
       return res.status(500).json({ error: 'Storage not configured (missing SUPABASE_URL/SUPABASE_SERVICE_KEY)' });
     }
-    const id = req.params.id;
-    const expiresParam = Number(req.query.expires || DEFAULT_SIGNED_SECS);
+    const id = normalizeUuid(req.params.id);
+    if (id === null) return invalidUuidResponse(res, 'report_id');
+    const rawExpires = req.query.expires;
+    if (rawExpires !== undefined && (typeof rawExpires !== 'string' || !/^\d{1,4}$/.test(rawExpires))) {
+      return res.status(400).json({ error: 'bad_request', code: 'invalid_expiry', detail: 'expires must be an integer string.' });
+    }
+    const expiresParam = Number(rawExpires || DEFAULT_SIGNED_SECS);
     const expiresIn = Math.max(MIN_SIGNED_SECS, Math.min(MAX_SIGNED_SECS, expiresParam));
 
     // Load report row to find where the PDF lives
     const { data: report, error } = await supabaseAdmin
       .from('reports')
-      .select('id, report_url, candidate_id')
+      .select('id, report_url, candidate_id, client_id, role_id')
       .eq('id', id)
       .maybeSingle();
     if (error) throw error;
     if (!report) return res.status(404).json({ error: 'Report not found' });
+
+    const { data: candidate, error: candidateError } = await supabaseAdmin
+      .from('candidates')
+      .select('id,client_id,role_id')
+      .eq('id', report.candidate_id)
+      .maybeSingle();
+    if (candidateError) throw candidateError;
+    if (!candidate) return res.status(404).json({ error: 'Report owner not found' });
+    const effectiveClientId = report.client_id || candidate.client_id;
+    if (!effectiveClientId || !scopedClientIds(req).includes(String(effectiveClientId))) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    if ((report.client_id && String(report.client_id) !== String(candidate.client_id || ''))
+      || (report.role_id && String(report.role_id) !== String(candidate.role_id || ''))) {
+      return res.status(409).json({ error: 'report_owner_binding_mismatch' });
+    }
 
     const key = keyFromUrl(report.report_url);
     if (!key) return res.status(404).json({ error: 'Report file not available' });
@@ -610,9 +853,10 @@ router.get('/:id/url', async (req, res) => {
     if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
       Sentry.captureException(err, { tags: { endpoint: '/reports/:id/url' } });
     }
-    return res.status(500).json({ error: err.message || 'Failed to mint signed URL' });
+    return res.status(503).json({ error: 'temporary_service_error', detail: 'The report service is temporarily unavailable.' });
   }
 });
 
 router._handleGenerate = handleGenerate;
+router._sanitizeResumeBreakdown = sanitizeResumeBreakdown;
 module.exports = router;

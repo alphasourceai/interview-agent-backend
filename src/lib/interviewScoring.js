@@ -3,6 +3,7 @@
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const INSUFFICIENT_SUMMARY = 'Interview ended before any substantive responses were recorded.\nEvidence strength: 0%\nAI-aided interview risk: Low';
+const { classifyTranscriptCandidateEvidence } = require('./interviewUtteranceClassifier');
 
 function clampScore(value) {
   const n = Number(value);
@@ -12,53 +13,12 @@ function clampScore(value) {
 
 function isSubstantiveTranscript(transcriptText) {
   const text = String(transcriptText || '').trim();
-  if (!text) return { ok: false, reason: 'empty_transcript', wordCount: 0 };
-
-  const words = text.split(/\s+/).filter(Boolean);
-  const wordCount = words.length;
-
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  let speakerTurns = 0;
-  let answerTurns = 0;
-  let candidateResponseWords = 0;
-  let meaningfulCandidateTurns = 0;
-  const fillerOnlyRe = /^(?:yes|no|ok(?:ay)?|sure|thanks?|thank you|hello|hi|good\s+(?:morning|afternoon|evening)|sounds good|got it|not sure|i\s+(?:do\s+not|don't)\s+know|maybe|pass|skip|n\/?a|none)(?:[\s.!?]|$)+$/i;
-  for (const line of lines) {
-    if (/^(CANDIDATE|USER)\s*:/i.test(line)) {
-      answerTurns += 1;
-      speakerTurns += 1;
-      const candidateText = line.replace(/^(CANDIDATE|USER)\s*:/i, '').trim();
-      const candidateWords = candidateText ? candidateText.split(/\s+/).filter(Boolean).length : 0;
-      if (candidateWords > 0) {
-        candidateResponseWords += candidateWords;
-        if (candidateWords >= 4 && !fillerOnlyRe.test(candidateText)) {
-          meaningfulCandidateTurns += 1;
-        }
-      }
-      continue;
-    }
-    if (/^(INTERVIEWER|ASSISTANT|AGENT)\s*:/i.test(line)) {
-      speakerTurns += 1;
-    }
-  }
-
-  if (answerTurns === 0 || candidateResponseWords === 0) {
-    return { ok: false, reason: 'no_candidate_response', wordCount };
-  }
-
-  if (meaningfulCandidateTurns < 1) {
-    return { ok: false, reason: 'insufficient_candidate_content', wordCount };
-  }
-
-  if (speakerTurns < 2 && answerTurns < 2) {
-    return { ok: false, reason: 'insufficient_turns', wordCount };
-  }
-
-  return { ok: true, reason: null, wordCount };
+  if (!text) return { ok: false, reason: 'empty_transcript', wordCount: 0, candidateUtteranceCount: 0, substantiveResponseCount: 0, counts: {} };
+  const evidence = classifyTranscriptCandidateEvidence(text);
+  return {
+    ...evidence,
+    wordCount: text.split(/\s+/).filter(Boolean).length,
+  };
 }
 
 function normalizePerceptionScores(input) {

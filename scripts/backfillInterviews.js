@@ -305,6 +305,14 @@ async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
     }
 
     const substantive = isSubstantiveTranscript(transcriptText);
+    if (!substantive.ok) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: substantive.reason || 'no_substantive_candidate_response',
+        request_id: requestId || null,
+      };
+    }
     const jdText = await getRoleJdText(row.role_id);
     const perceptionScores = row.perception_scores && typeof row.perception_scores === 'object'
       ? row.perception_scores
@@ -432,11 +440,11 @@ async function main() {
 
       const substantive = isSubstantiveTranscript(transcriptText);
       if (!substantive.ok) {
-        insufficient += 1;
-        console.log(`[backfill] insufficient ${row.id} ${substantive.reason}`);
-      } else {
-        scored += 1;
+        skipped += 1;
+        console.log(`[backfill] skip ${row.id} ${substantive.reason || 'no_substantive_candidate_response'}`);
+        continue;
       }
+      scored += 1;
       const jdText = await getRoleJdText(row.role_id);
       const perceptionScores = row.perception_scores && typeof row.perception_scores === 'object'
         ? row.perception_scores

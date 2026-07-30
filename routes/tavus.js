@@ -3,6 +3,11 @@
 const express = require('express');
 const axios = require('axios');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
+const {
+  decodeTelemetryAuthorization,
+  diagnosticDedupeKey,
+  validateTelemetryPayload,
+} = require('../src/lib/interviewReliabilityDiagnostics');
 
 const router = express.Router();
 const EARLY_END_GRACE_MS = 15000;
@@ -17,22 +22,50 @@ const EARLY_END_TRANSCRIPT_SCORES = {
   ai_aided_risk: 'low',
   ai_aided_risk_reason: 'No substantive interview response was available to assess.'
 };
-const END_REASONS = new Set([
-  'manual',
-  'tool_call',
-  'closing_utterance',
-  'time_limit_warning',
-  'time_limit_graceful_close',
-  'time_limit_force_close',
-  'progress_stalled',
-  'disconnected'
-]);
+const END_REASON_MAP = Object.freeze({
+  manual: 'candidate_ended',
+  candidate_ended: 'candidate_ended',
+  tool_call: 'vendor_end_event',
+  ended_payload: 'vendor_end_event',
+  vendor_end_event: 'vendor_end_event',
+  closing_utterance: 'completed_normally',
+  completed_normally: 'completed_normally',
+  time_limit_warning: 'completed_normally',
+  time_limit_graceful_close: 'completed_normally',
+  time_limit_force_close: 'completed_normally',
+  progress_stalled: 'watchdog_timeout',
+  watchdog_timeout: 'watchdog_timeout',
+  disconnected: 'reconnect_failed',
+  reconnect_failed: 'reconnect_failed',
+  browser_closed: 'browser_closed_or_navigation',
+  browser_closed_or_navigation: 'browser_closed_or_navigation',
+});
 
 function normalizeEndReason(value) {
   const raw = typeof value === 'string' ? value.trim().toLowerCase() : '';
   if (!raw) return 'manual';
   const normalized = raw.replace(/[^a-z0-9_-]+/g, '_').slice(0, 80);
-  return END_REASONS.has(normalized) ? normalized : 'unknown';
+  return END_REASON_MAP[normalized] || 'vendor_end_event';
+}
+
+function isIdempotentEndState(status, currentEndReason, requestedEndReason) {
+  const currentStatus = String(status || '').trim().toLowerCase();
+  const storedReason = String(currentEndReason || '').trim().toLowerCase();
+  const requestedReason = String(requestedEndReason || '').trim().toLowerCase();
+  if (new Set([
+    'analyzed',
+    'complete',
+    'completed',
+    'ended',
+    'readyforanalysis',
+    'transcribed',
+    'transcriptionreceived',
+  ]).has(currentStatus)) {
+    return true;
+  }
+  return currentStatus === 'ending_requested'
+    && Boolean(storedReason)
+    && storedReason === requestedReason;
 }
 
 function hasNonEmptyText(value) {
@@ -58,10 +91,10 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
     const interview_id = typeof req.body?.interview_id === 'string' ? req.body.interview_id.trim() : '';
     const role_token = typeof req.body?.role_token === 'string' ? req.body.role_token.trim() : '';
     const reason = normalizeEndReason(req.body?.reason);
-    const isTimeLimitEnd = reason.startsWith('time_limit');
-    const isFailureEnd = reason === 'progress_stalled' || reason === 'disconnected';
-    const failureCode = reason === 'progress_stalled' ? 'INTERVIEW_PROGRESS_STALLED' : 'INTERVIEW_DISCONNECTED';
-    const failureSummary = reason === 'progress_stalled'
+    const isTimeLimitEnd = reason === 'completed_normally';
+    const isFailureEnd = reason === 'watchdog_timeout' || reason === 'reconnect_failed';
+    const failureCode = reason === 'watchdog_timeout' ? 'INTERVIEW_PROGRESS_STALLED' : 'INTERVIEW_DISCONNECTED';
+    const failureSummary = reason === 'watchdog_timeout'
       ? 'The live interview stopped progressing after one automatic reconnect attempt.'
       : 'The live interview disconnected and could not reconnect.';
     if (!conversation_id || !interview_id || !role_token) {
@@ -101,7 +134,7 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
 
     const { data: interview, error: interviewError } = await supabaseAdmin
       .from('interviews')
-      .select('id, role_id, tavus_application_id, status')
+      .select('id, role_id, tavus_application_id, status, client_end_reason')
       .eq('id', interview_id)
       .maybeSingle();
 
@@ -135,6 +168,10 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
         hint: null,
         request_id
       });
+    }
+
+    if (isIdempotentEndState(interview.status, interview.client_end_reason, reason)) {
+      return res.json({ ok: true, duplicate: true, request_id });
     }
 
     const apiKey = String(process.env.TAVUS_API_KEY || '').trim();
@@ -182,6 +219,8 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
             failure_summary: failureSummary,
             failure_at: new Date().toISOString(),
             retryable: true,
+            replacement_eligible: true,
+            client_end_reason: reason,
             updated_at: new Date().toISOString()
           })
           .eq('id', interview.id);
@@ -203,10 +242,13 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
           failure_summary: failureSummary,
           failure_at: new Date().toISOString(),
           retryable: true,
+          replacement_eligible: true,
+          client_end_reason: reason,
           updated_at: new Date().toISOString()
         }
       : {
-          status: 'ending_requested',
+        status: 'ending_requested',
+        client_end_reason: reason,
           updated_at: new Date().toISOString()
         };
     const { data: updatedInterview, error: updateError } = await supabaseAdmin
@@ -292,37 +334,6 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
             return;
           }
 
-          if (fresh.candidate_id) {
-            const { error: reportCleanupError } = await supabaseAdmin
-              .from('reports')
-              .update({
-                interview_score: null,
-                overall_score: null,
-                interview_breakdown: {
-                  clarity: null,
-                  confidence: null,
-                  body_language: null,
-                  evidence_strength: null,
-                  total_score: null,
-                  summary: EARLY_END_SUMMARY
-                }
-              })
-              .eq('candidate_id', fresh.candidate_id)
-              .eq('role_id', fresh.role_id);
-
-            if (reportCleanupError) {
-              console.error('[tavus/end-conversation] early_end_reconcile_report_cleanup_failed', {
-                request_id,
-                interview_id: interviewId,
-                candidate_id: fresh.candidate_id,
-                role_id: fresh.role_id,
-                reason,
-                code: reportCleanupError.code,
-                detail: reportCleanupError.message
-              });
-            }
-          }
-
         } catch (e) {
           console.error('[tavus/end-conversation] early_end_reconcile_unexpected', {
             request_id,
@@ -354,4 +365,150 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
   }
 });
 
+function createClientTelemetryHandler({
+  database = supabaseAdmin,
+  now = () => new Date().toISOString(),
+  warn = (category) => console.warn('[tavus/client-telemetry] bounded_failure', { category }),
+} = {}) {
+  return async (req, res) => {
+    const validation = validateTelemetryPayload(req.body);
+    if (!validation.ok) {
+      return res.status(400).json({ error: 'bad_request', code: validation.code });
+    }
+    if (!database) {
+      warn('database_unavailable');
+      return res.status(503).json({ error: 'temporary_service_error', code: 'CLIENT_TELEMETRY_UNAVAILABLE' });
+    }
+
+    const telemetry = validation.telemetry;
+    const headerBinding = decodeTelemetryAuthorization(req.headers?.authorization);
+    const roleToken = headerBinding?.roleToken || telemetry.roleToken;
+    const conversationId = headerBinding?.conversationId || telemetry.conversationId;
+    if (!roleToken || !conversationId) {
+      return res.status(400).json({ error: 'bad_request', code: 'MISSING_TELEMETRY_BINDING' });
+    }
+    if (
+      headerBinding &&
+      (
+        (telemetry.roleToken && telemetry.roleToken !== headerBinding.roleToken) ||
+        (telemetry.conversationId && telemetry.conversationId !== headerBinding.conversationId)
+      )
+    ) {
+      return res.status(403).json({ error: 'forbidden', code: 'INTERVIEW_BINDING_MISMATCH' });
+    }
+    try {
+      const roleLookup = await database
+        .from('roles')
+        .select('id')
+        .eq('slug_or_token', roleToken)
+        .maybeSingle();
+      if (roleLookup.error) {
+        warn('role_lookup_failed');
+        return res.status(503).json({ error: 'temporary_service_error', code: 'CLIENT_TELEMETRY_UNAVAILABLE' });
+      }
+      const role = roleLookup.data;
+
+      const { data: interview, error: interviewError } = await database
+        .from('interviews')
+        .select('id,role_id,client_id,candidate_id,attempt_number,tavus_application_id,reconnect_attempt_count')
+        .eq('id', telemetry.interviewId)
+        .maybeSingle();
+      if (interviewError) {
+        warn('interview_lookup_failed');
+        return res.status(503).json({ error: 'temporary_service_error', code: 'CLIENT_TELEMETRY_UNAVAILABLE' });
+      }
+      if (
+        !role ||
+        !interview ||
+        !interview.client_id ||
+        !interview.candidate_id ||
+        !Number.isInteger(Number(interview.attempt_number)) ||
+        String(interview.role_id) !== String(role.id) ||
+        String(interview.tavus_application_id) !== conversationId
+      ) {
+        return res.status(403).json({ error: 'forbidden', code: 'INTERVIEW_BINDING_MISMATCH' });
+      }
+
+      const receivedAt = now();
+      const { error: insertError } = await database
+        .from('interview_lifecycle_events')
+        .insert({
+          interview_id: interview.id,
+          client_id: interview.client_id,
+          event_type: `client.${telemetry.event}`,
+          vendor_event_id: null,
+          dedupe_key: diagnosticDedupeKey(telemetry.eventSequence, telemetry.observedAt),
+          speaker_role: 'system',
+          utterance_classification: null,
+          observed_at: telemetry.observedAt,
+          received_at: receivedAt,
+          metadata: {
+            ...telemetry.metadata,
+            event_sequence: telemetry.eventSequence,
+          },
+        });
+
+      if (insertError?.code === '23505') {
+        return res.json({ ok: true, duplicate: true });
+      }
+      if (insertError) {
+        warn('lifecycle_persist_failed');
+        return res.status(503).json({ error: 'temporary_service_error', code: 'CLIENT_TELEMETRY_UNAVAILABLE' });
+      }
+
+      // Preserve the pre-existing Phase B summary fields for legacy events.
+      const update = {};
+      if (telemetry.event === 'watchdog_timeout') update.watchdog_no_progress_at = receivedAt;
+      if (telemetry.event === 'reconnect_attempted') {
+        update.reconnect_attempted = true;
+        update.reconnect_attempt_count = Math.min(1, Number(interview.reconnect_attempt_count || 0) + 1);
+      }
+      if (telemetry.event === 'reconnect_succeeded' || telemetry.event === 'reconnect_failed') {
+        update.reconnect_result = telemetry.event;
+      }
+      if (telemetry.event === 'browser_closed_or_navigation') {
+        update.client_end_reason = 'browser_closed_or_navigation';
+      }
+      if (
+        telemetry.reason &&
+        (
+          telemetry.event === 'watchdog_timeout' ||
+          telemetry.event === 'reconnect_attempted' ||
+          telemetry.event === 'reconnect_succeeded' ||
+          telemetry.event === 'reconnect_failed' ||
+          telemetry.event === 'browser_closed_or_navigation'
+        )
+      ) {
+        update.client_end_reason = telemetry.reason;
+      }
+
+      if (Object.keys(update).length > 0) {
+        update.updated_at = receivedAt;
+        const { error: updateError } = await database
+          .from('interviews')
+          .update(update)
+          .eq('id', interview.id);
+        if (updateError) {
+          warn('legacy_summary_update_failed');
+          return res.status(503).json({ error: 'temporary_service_error', code: 'CLIENT_TELEMETRY_UNAVAILABLE' });
+        }
+      }
+
+      return res.json({ ok: true, duplicate: false });
+    } catch {
+      warn('unexpected_failure');
+      return res.status(503).json({ error: 'temporary_service_error', code: 'CLIENT_TELEMETRY_UNAVAILABLE' });
+    }
+  };
+}
+
+// Diagnostic delivery is best effort and separate from interview control.
+router.post(
+  '/tavus/client-telemetry',
+  express.json({ limit: '8kb' }),
+  createClientTelemetryHandler(),
+);
+
 module.exports = router;
+module.exports.createClientTelemetryHandler = createClientTelemetryHandler;
+module.exports.isIdempotentEndState = isIdempotentEndState;

@@ -1,6 +1,6 @@
 // analyzeResume.js
 require('dotenv').config();
-const pdfParse = require('pdf-parse');
+const { PDFParse } = require('pdf-parse');
 const mammoth = require('mammoth');
 const { OpenAI } = require('openai');
 const { createClient } = require('@supabase/supabase-js');
@@ -33,16 +33,26 @@ async function analyzeResume(fileBuffer, mimeType, role, candidateId) {
   let resumeText = '';
   try {
     if (/pdf/i.test(mimeType)) {
-      const data = await pdfParse(fileBuffer);
-      resumeText = (data.text || '').trim();
+      const parser = new PDFParse({
+        data: fileBuffer,
+        isEvalSupported: false,
+        useWorkerFetch: false,
+        verbosity: 0
+      });
+      try {
+        const data = await parser.getText({ pageJoiner: '' });
+        resumeText = (data.text || '').trim();
+      } finally {
+        await parser.destroy().catch(() => {});
+      }
     } else if (/wordprocessingml|officedocument|docx/i.test(mimeType)) {
       const res = await mammoth.extractRawText({ buffer: fileBuffer });
       resumeText = (res.value || '').trim();
     } else {
       resumeText = Buffer.from(fileBuffer).toString('utf8').trim();
     }
-  } catch (e) {
-    console.warn('Resume extraction failed (non-fatal):', e?.message || e);
+  } catch {
+    console.warn('Resume extraction failed (non-fatal): bounded_parse_failure');
   }
   if (resumeText.length > 15000) {
     resumeText = resumeText.slice(0, 15000) + '\n\n[Truncated for analysis]';
