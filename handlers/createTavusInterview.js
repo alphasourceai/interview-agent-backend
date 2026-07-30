@@ -8,6 +8,7 @@ const {
   annotateTavusCreateError,
   deterministicConversationName,
 } = require('../src/lib/tavusVendorReconciliation');
+const { requireConfiguredInterviewDuration } = require('../src/lib/interviewDuration');
 
 /**
  * Create a Tavus v2 conversation for a candidate/role.
@@ -77,11 +78,8 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
     });
   }
 
-  const parsedMaxInterviewMinutes = Number(options?.maxInterviewMinutes);
-  const maxInterviewMinutes = Number.isFinite(parsedMaxInterviewMinutes) && parsedMaxInterviewMinutes > 0
-    ? Math.floor(parsedMaxInterviewMinutes)
-    : null;
-  const maxCallDurationSeconds = maxInterviewMinutes != null ? maxInterviewMinutes * 60 : 3600;
+  const maxInterviewMinutes = requireConfiguredInterviewDuration(options?.maxInterviewMinutes);
+  const maxCallDurationSeconds = maxInterviewMinutes * 60;
 
   const companyNameRaw = (options.companyName || role.company_name || '').trim();
   const companyName = /^the hiring organization$/i.test(companyNameRaw) ? '' : companyNameRaw;

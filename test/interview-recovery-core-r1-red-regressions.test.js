@@ -146,7 +146,7 @@ test('R1 red Tavus regression: transmitted timeout is classified ambiguous and u
       { id: ID.candidate, name: 'Synthetic' },
       { id: ID.role, title: 'Synthetic role', tavus_document_id: 'document-test' },
       'https://example.test/webhook',
-      { interviewId: ID.replacementInterview },
+      { interviewId: ID.replacementInterview, maxInterviewMinutes: 10 },
     ).then(() => null, (caught) => caught);
     assert.equal(error?.failureCategory, 'ambiguous_acceptance');
     assert.equal(error?.retryable, false);

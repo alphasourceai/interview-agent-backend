@@ -16,6 +16,7 @@ const {
 } = require('../src/lib/interviewAttemptService');
 const { resolvePublicBackendBase } = require('../config/urlConfig');
 const { normalizePrimitiveString, normalizeUuid } = require('../src/lib/strictRequestValidation');
+const { validateConfiguredInterviewDuration } = require('../src/lib/interviewDuration');
 
 const router = express.Router();
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
@@ -230,16 +231,37 @@ router.post('/', createTavusRateLimit, async (req, res) => {
     let candidateAssistanceContact = '';
     let maxInterviewMinutes = null;
     try {
-      const { data: planSettings } = await supabaseAdmin
+      const { data: planSettings, error: planSettingsError } = await supabaseAdmin
         .from('client_plan_settings')
         .select('max_interview_minutes')
         .eq('client_id', clientId)
         .maybeSingle();
-      const parsedMaxInterviewMinutes = Number(planSettings?.max_interview_minutes);
-      if (Number.isFinite(parsedMaxInterviewMinutes) && parsedMaxInterviewMinutes > 0) {
-        maxInterviewMinutes = Math.floor(parsedMaxInterviewMinutes);
+      if (planSettingsError) {
+        console.warn('[create-tavus-interview] duration_preflight_blocked', {
+          request_id,
+          reason: 'lookup_failed',
+        });
+        return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
       }
-    } catch (_) {}
+      const duration = validateConfiguredInterviewDuration(planSettings?.max_interview_minutes);
+      if (!duration.ok) {
+        console.warn('[create-tavus-interview] duration_preflight_blocked', {
+          request_id,
+          reason: duration.reason,
+        });
+        return sendCandidateError(res, 'INTERVIEW_DURATION_NOT_CONFIGURED', {
+          request_id,
+          retryable: false,
+        });
+      }
+      maxInterviewMinutes = duration.minutes;
+    } catch (_) {
+      console.warn('[create-tavus-interview] duration_preflight_blocked', {
+        request_id,
+        reason: 'lookup_exception',
+      });
+      return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
+    }
     if (BILLING_ENFORCED) {
       const { data: client, error: clientErr } = await supabase
         .from('clients')

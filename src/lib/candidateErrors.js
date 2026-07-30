@@ -71,6 +71,12 @@ const ERROR_DEFINITIONS = Object.freeze({
     error: 'interview_vendor_start_failed',
     detail: 'The interview room could not be started. Contact support before trying again.'
   },
+  INTERVIEW_DURATION_NOT_CONFIGURED: {
+    status: 503,
+    error: 'interview_duration_not_configured',
+    detail: 'Interview duration is not configured. Please contact the hiring team.',
+    retryable: false
+  },
   INTERVIEW_PROGRESS_STALLED: {
     status: 409,
     error: 'interview_progress_stalled',
@@ -109,7 +115,7 @@ function buildCandidateError(code, overrides = {}) {
     error: overrides.error || definition.error,
     code: ERROR_DEFINITIONS[code] ? code : 'TEMPORARY_SERVICE_ERROR',
     detail: overrides.detail || definition.detail,
-    retryable: overrides.retryable ?? definition.status >= 500
+    retryable: overrides.retryable ?? definition.retryable ?? definition.status >= 500
   };
   if (overrides.hint) payload.hint = overrides.hint;
   if (overrides.request_id) payload.request_id = overrides.request_id;

@@ -6,7 +6,7 @@ const axios = require('axios');
 
 const SYNTHETIC_INTERVIEW_ID = '11111111-1111-4111-8111-111111111111';
 
-async function captureConversationPayload() {
+async function captureConversationPayload(maxInterviewMinutes = 10) {
   const originalPost = axios.post;
   const previousEnv = {
     SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY,
@@ -47,7 +47,7 @@ async function captureConversationPayload() {
       {
         companyName: 'Synthetic Company',
         interviewId: SYNTHETIC_INTERVIEW_ID,
-        maxInterviewMinutes: 10,
+        maxInterviewMinutes,
       },
     );
     return payload;
@@ -107,4 +107,11 @@ test('provider duration remains an independent hard upper bound', async () => {
 
   assert.equal(payload?.properties?.max_call_duration, 600);
   assert.equal(payload?.properties?.participant_left_timeout, 60);
+});
+
+test('provider handler fails closed before Tavus when duration is invalid', async () => {
+  await assert.rejects(
+    () => captureConversationPayload(null),
+    (error) => error?.code === 'INTERVIEW_DURATION_NOT_CONFIGURED',
+  );
 });

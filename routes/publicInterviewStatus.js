@@ -4,6 +4,7 @@ const express = require('express');
 const { supabase } = require('../src/lib/supabaseClient');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
 const { isRoleInactive, buildRoleInactivePayload, logInactiveRoleBlocked } = require('../src/lib/roleLifecycle');
+const { validateConfiguredInterviewDuration } = require('../src/lib/interviewDuration');
 
 const router = express.Router();
 const PUBLIC_STATUS_RATE_WINDOW_MS = 5 * 60 * 1000;
@@ -85,15 +86,31 @@ router.get('/public/interview-status', publicStatusRateLimit, async (req, res) =
 
     let max_interview_minutes = null;
     if (role?.client_id) {
-      const { data: plan } = await supabase
+      const { data: plan, error: planError } = await supabase
         .from('client_plan_settings')
         .select('max_interview_minutes')
         .eq('client_id', role.client_id)
         .maybeSingle();
-      const raw = Number(plan?.max_interview_minutes);
-      if (Number.isFinite(raw) && raw > 0) {
-        max_interview_minutes = Math.floor(raw);
+      if (planError) {
+        return res.status(503).json({
+          error: 'temporary_service_error',
+          code: 'TEMPORARY_SERVICE_ERROR',
+          detail: 'The service is temporarily unavailable. Please try again shortly.',
+          retryable: true,
+          request_id
+        });
       }
+      const duration = validateConfiguredInterviewDuration(plan?.max_interview_minutes);
+      if (!duration.ok) {
+        return res.status(503).json({
+          error: 'interview_duration_not_configured',
+          code: 'INTERVIEW_DURATION_NOT_CONFIGURED',
+          detail: 'Interview duration is not configured. Please contact the hiring team.',
+          retryable: false,
+          request_id
+        });
+      }
+      max_interview_minutes = duration.minutes;
     }
 
     if (!interview_id) {
