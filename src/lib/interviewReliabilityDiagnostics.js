@@ -30,6 +30,10 @@ const TELEMETRY_EVENTS = new Set([
   'provider_end_requested',
   'provider_end_confirmed',
   'post_closing_question_violation',
+  'candidate_inactivity_nudge_armed',
+  'candidate_inactivity_nudge_cancelled',
+  'candidate_inactivity_nudge_sent',
+  'candidate_inactivity_nudge_suppressed',
   // Existing Phase B events retained for deployment compatibility.
   'watchdog_started',
   'watchdog_timeout',
@@ -55,12 +59,20 @@ const INTEGER_FIELDS = Object.freeze({
   recovery_age_ms: [0, 3_600_000],
   participant_count: [0, 16],
   turn_index: [0, 10_000],
+  threshold_ms: [0, 60_000],
+  turn_sequence: [0, 1_000_000_000],
 });
 
 const BOOLEAN_FIELDS = new Set([
   'remote_participant_present',
   'is_recovery_active',
   'speech_interrupted',
+  'candidate_speaking',
+  'reconnect_active',
+  'transport_healthy',
+  'replica_present',
+  'remote_audio_ready',
+  'runtime_owner',
 ]);
 
 const ENUM_FIELDS = Object.freeze({
@@ -114,6 +126,45 @@ const ENUM_FIELDS = Object.freeze({
     '11_30',
     '0_10',
   ]),
+  inactivity_state: new Set([
+    'DISABLED',
+    'DISARMED',
+    'ARMED_AFTER_PAL_TURN',
+    'CANCELLED',
+    'NUDGE_DISPATCHED',
+    'WAITING_FOR_CANDIDATE_AFTER_NUDGE',
+    'SUPPRESSED',
+    'TERMINAL',
+  ]),
+  inactivity_reason: new Set([
+    'candidate_speaking',
+    'candidate_utterance',
+    'pal_speaking',
+    'reconnect',
+    'transport_unhealthy',
+    'candidate_media_unavailable',
+    'replica_absent',
+    'remote_audio_unavailable',
+    'watchdog_recovery',
+    'question_lock',
+    'closing',
+    'termination',
+    'provider_end',
+    'conversation_changed',
+    'unmount',
+    'runtime_ownership_lost',
+    'hidden_document',
+    'interrupted_pal_turn',
+    'duplicate_turn',
+    'stale_sequence',
+    'wrong_conversation',
+    'application_control_turn',
+    'late_timer',
+    'ambiguous_state',
+    'dispatch_failed',
+  ]),
+  timer_lateness_bucket: new Set(['on_time', 'within_2s', 'over_2s']),
+  ownership_mode: new Set(['prompt', 'tavus_patient', 'application_inactivity']),
 });
 
 const METADATA_KEYS = new Set([

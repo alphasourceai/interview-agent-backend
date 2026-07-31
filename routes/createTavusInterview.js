@@ -563,6 +563,9 @@ router.post('/', createTavusRateLimit, async (req, res) => {
       conversation_id: result.conversation_id || null,
       interview_id: startingInterview.id,
       max_interview_minutes: maxInterviewMinutes,
+      silence_engagement_owner: result.silence_engagement_owner,
+      prompt_silence_instruction_included: result.prompt_silence_instruction_included,
+      application_inactivity_control_enabled: result.application_inactivity_control_enabled,
       candidate_assistance_contact: candidateAssistanceContact || null
     });
   } catch (e) {

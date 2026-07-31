@@ -122,10 +122,65 @@ test('diagnostic contract exposes only the bounded event and metadata allowlists
   assert.equal(TELEMETRY_EVENTS.has('provider_end_requested'), true);
   assert.equal(TELEMETRY_EVENTS.has('provider_end_confirmed'), true);
   assert.equal(TELEMETRY_EVENTS.has('post_closing_question_violation'), true);
+  assert.equal(TELEMETRY_EVENTS.has('candidate_inactivity_nudge_armed'), true);
+  assert.equal(TELEMETRY_EVENTS.has('candidate_inactivity_nudge_cancelled'), true);
+  assert.equal(TELEMETRY_EVENTS.has('candidate_inactivity_nudge_sent'), true);
+  assert.equal(TELEMETRY_EVENTS.has('candidate_inactivity_nudge_suppressed'), true);
   assert.equal(TELEMETRY_EVENTS.has('transcript_received'), false);
   assert.equal(METADATA_KEYS.has('remote_audio_state'), true);
   assert.equal(METADATA_KEYS.has('message'), false);
   assert.equal(METADATA_KEYS.has('conversation_id'), false);
+});
+
+test('inactivity diagnostics accept only bounded lifecycle metadata', () => {
+  for (const [index, event] of [
+    'candidate_inactivity_nudge_armed',
+    'candidate_inactivity_nudge_cancelled',
+    'candidate_inactivity_nudge_sent',
+    'candidate_inactivity_nudge_suppressed',
+  ].entries()) {
+    const result = validateTelemetryPayload({
+      ...BASE_PAYLOAD,
+      event,
+      event_sequence: 500 + index,
+      reason: undefined,
+      metadata: {
+        threshold_ms: 10_000,
+        turn_sequence: index + 1,
+        inactivity_state: event.endsWith('_sent')
+          ? 'WAITING_FOR_CANDIDATE_AFTER_NUDGE'
+          : 'ARMED_AFTER_PAL_TURN',
+        inactivity_reason: event.endsWith('_cancelled') ? 'candidate_speaking' : 'ambiguous_state',
+        timer_lateness_bucket: 'on_time',
+        ownership_mode: 'application_inactivity',
+        candidate_speaking: false,
+        reconnect_active: false,
+        transport_healthy: true,
+        replica_present: true,
+        remote_audio_ready: true,
+        runtime_owner: true,
+      },
+    });
+    assert.equal(result.ok, true, event);
+  }
+
+  for (const metadata of [
+    { transcript: 'synthetic' },
+    { utterance: 'synthetic' },
+    { candidate_id: 'synthetic' },
+    { conversation_id: 'synthetic' },
+    { provider_id: 'synthetic' },
+    { ownership_mode: 'request_override' },
+    { timer_lateness_bucket: '2750ms' },
+  ]) {
+    assert.equal(validateTelemetryPayload({
+      ...BASE_PAYLOAD,
+      event: 'candidate_inactivity_nudge_suppressed',
+      event_sequence: 600,
+      reason: undefined,
+      metadata,
+    }).ok, false);
+  }
 });
 
 test('provider-end state suppresses repeated terminal requests without masking a different active failure', () => {
