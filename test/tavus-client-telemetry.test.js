@@ -114,10 +114,19 @@ test('diagnostic contract exposes only the bounded event and metadata allowlists
   assert.equal(TELEMETRY_EVENTS.has('interview_terminal_requested'), true);
   assert.equal(TELEMETRY_EVENTS.has('question_lock_entered'), true);
   assert.equal(TELEMETRY_EVENTS.has('closing_only_entered'), true);
+  assert.equal(TELEMETRY_EVENTS.has('wind_down_entered'), true);
+  assert.equal(TELEMETRY_EVENTS.has('wind_down_forced_interrupt'), true);
+  assert.equal(TELEMETRY_EVENTS.has('closing_forced_interrupt'), true);
   assert.equal(TELEMETRY_EVENTS.has('candidate_question_invitation_sent'), true);
+  assert.equal(TELEMETRY_EVENTS.has('candidate_question_invitation_skipped'), true);
   assert.equal(TELEMETRY_EVENTS.has('candidate_question_received'), true);
   assert.equal(TELEMETRY_EVENTS.has('candidate_question_response_completed'), true);
+  assert.equal(TELEMETRY_EVENTS.has('final_farewell_eligible'), true);
+  assert.equal(TELEMETRY_EVENTS.has('closing_farewell_reserved'), true);
   assert.equal(TELEMETRY_EVENTS.has('closing_farewell_started'), true);
+  assert.equal(TELEMETRY_EVENTS.has('closing_farewell_completed'), true);
+  assert.equal(TELEMETRY_EVENTS.has('closing_farewell_interrupted'), true);
+  assert.equal(TELEMETRY_EVENTS.has('closing_farewell_completion_timeout'), true);
   assert.equal(TELEMETRY_EVENTS.has('termination_only_entered'), true);
   assert.equal(TELEMETRY_EVENTS.has('provider_end_requested'), true);
   assert.equal(TELEMETRY_EVENTS.has('provider_end_confirmed'), true);
@@ -195,10 +204,19 @@ test('closing diagnostics accept only bounded state, time, turn, and interruptio
   const events = [
     'question_lock_entered',
     'closing_only_entered',
+    'wind_down_entered',
+    'wind_down_forced_interrupt',
+    'closing_forced_interrupt',
     'candidate_question_invitation_sent',
+    'candidate_question_invitation_skipped',
     'candidate_question_received',
     'candidate_question_response_completed',
+    'final_farewell_eligible',
+    'closing_farewell_reserved',
     'closing_farewell_started',
+    'closing_farewell_completed',
+    'closing_farewell_interrupted',
+    'closing_farewell_completion_timeout',
     'termination_only_entered',
     'provider_end_requested',
     'provider_end_confirmed',
@@ -211,10 +229,19 @@ test('closing diagnostics accept only bounded state, time, turn, and interruptio
       event_sequence: index + 100,
       reason: undefined,
       metadata: {
-        closing_state: event === 'provider_end_confirmed' ? 'ENDED' : 'CLOSING_ONLY',
+        closing_state: event === 'provider_end_confirmed'
+          ? 'ENDED'
+          : event === 'wind_down_entered'
+            ? 'WIND_DOWN_ONLY'
+            : event === 'wind_down_forced_interrupt'
+              ? 'FORCED_WIND_DOWN'
+              : event === 'final_farewell_eligible'
+                ? 'FINAL_FAREWELL_ELIGIBLE'
+                : 'CLOSING_ONLY',
         remaining_time_bucket: '11_30',
         turn_index: index,
         ...(event === 'post_closing_question_violation' ? { speech_interrupted: true } : {}),
+        ...(event === 'provider_end_requested' ? { hard_deadline: false } : {}),
       },
     });
     assert.equal(result.ok, true, event);
@@ -235,6 +262,24 @@ test('closing diagnostics accept only bounded state, time, turn, and interruptio
       reason: undefined,
       metadata,
     }).ok, false);
+  }
+
+  for (const closing_state of [
+    'WIND_DOWN_ONLY',
+    'FORCED_WIND_DOWN',
+    'FINAL_FAREWELL_ELIGIBLE',
+  ]) {
+    assert.equal(validateTelemetryPayload({
+      ...BASE_PAYLOAD,
+      event: 'post_closing_question_violation',
+      event_sequence: 900,
+      reason: undefined,
+      metadata: {
+        closing_state,
+        remaining_time_bucket: '11_30',
+        turn_index: 1,
+      },
+    }).ok, true, closing_state);
   }
 });
 
