@@ -104,6 +104,20 @@ test('public preflight returns the valid three-minute QA duration', async () => 
   assert.equal(body.max_interview_minutes, 3);
 });
 
+test('public preflight fails closed when provider farewell headroom cannot be reserved', async () => {
+  const harness = await createHarness({
+    planSetting: { client_id: CLIENT_ID, max_interview_minutes: 60 },
+  });
+  servers.add(harness.server);
+
+  const response = await fetch(harness.url);
+  const body = await response.json();
+
+  assert.equal(response.status, 503);
+  assert.equal(body.code, 'INTERVIEW_DURATION_NOT_CONFIGURED');
+  assert.equal(body.retryable, false);
+});
+
 test('public preflight exposes the stable bounded duration configuration error', async () => {
   const harness = await createHarness({ planSetting: null });
   servers.add(harness.server);

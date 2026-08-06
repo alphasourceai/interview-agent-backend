@@ -222,6 +222,7 @@ for (const [label, planSetting] of [
   ['negative duration', { client_id: CLIENT_ID, max_interview_minutes: -3 }],
   ['malformed duration', { client_id: CLIENT_ID, max_interview_minutes: 'not-a-number' }],
   ['non-integer duration', { client_id: CLIENT_ID, max_interview_minutes: 3.5 }],
+  ['duration without provider farewell headroom', { client_id: CLIENT_ID, max_interview_minutes: 60 }],
   ['over-provider-limit duration', { client_id: CLIENT_ID, max_interview_minutes: 61 }],
 ]) {
   test(`invalid ${label} fails closed before interview claim or provider creation`, async () => {
@@ -272,7 +273,7 @@ test('duration lookup failure is retryable and does not masquerade as missing co
 for (const [label, duration] of [
   ['three-minute QA fixture', 3],
   ['active paid client', 10],
-  ['provider maximum', 60],
+  ['provider maximum with farewell headroom', 59],
 ]) {
   test(`valid ${label} preserves configured duration and normal launch`, async () => {
     const harness = await startServer(
