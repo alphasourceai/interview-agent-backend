@@ -194,7 +194,7 @@ test('finalizePendingRolePurchase creates role, updates JD, generates rubric, an
   assert.equal(result.role.id, 'role-1');
   assert.equal(db.roles[0].client_id, 'client-1');
   assert.equal(db.roles[0].title, 'Dental Hygienist');
-  assert.equal(db.roles[0].interview_type, 'DETAILED');
+  assert.equal(db.roles[0].interview_type, 'leadership');
   assert.equal(db.roles[0].pending_role_purchase_id, 'pending-1');
   assert.equal(db.roles[0].job_description_url, 'job-descriptions/pending/client-1/pending-1/jd.pdf');
   assert.deepEqual(generated, ['role-1']);

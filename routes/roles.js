@@ -8,6 +8,8 @@ const { getRoleInterviewAvailability } = require('../src/lib/roleInterviewAvaila
 const { getRoleJdReplacementEligibility } = require('../src/lib/roleJdReplacement');
 const { loadEntityMap, resolveEntityFilter, uniqueIds, withEntityFields } = require('../src/lib/entityScopeFilter');
 const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
+const { resolvePlanCapacity, resolvePlanCapacityForClient } = require('../src/lib/planCapacity');
+const { normalizeInterviewType, normalizeRoleInterviewTypeForRead } = require('../src/lib/interviewTypes');
 
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 
@@ -185,25 +187,41 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
         request_id
       });
     }
-    const parseWholeNonNegative = (value) => {
-      const n = Number(value);
-      if (!Number.isFinite(n)) return null;
-      return Math.max(0, Math.floor(n));
-    };
-
     const planClientIds = uniqueIds(roles.map((role) => role.client_id).concat(scopedClientIds));
-    const maxInterviewMinutesByClientId = {};
+    const planCapacityByClientId = {};
+    const clientsWithDirectPlanSettings = new Set();
     const { data: planSettings, error: planSettingsError } = await db
       .from('client_plan_settings')
-      .select('client_id,max_interview_minutes')
+      .select('client_id,plan_tier,max_interview_minutes')
       .in('client_id', planClientIds.length ? planClientIds : [clientId]);
     if (planSettingsError) {
       console.warn('[GET /roles] plan settings lookup failed', planSettingsError?.message || planSettingsError);
     } else {
       for (const row of planSettings || []) {
         const rowClientId = String(row?.client_id || '').trim();
-        if (rowClientId) maxInterviewMinutesByClientId[rowClientId] = parseWholeNonNegative(row.max_interview_minutes);
+        if (!rowClientId) continue;
+        clientsWithDirectPlanSettings.add(rowClientId);
+        try {
+          planCapacityByClientId[rowClientId] = resolvePlanCapacity({
+            planTier: row.plan_tier,
+            clientId: rowClientId,
+            configuredDurationMinutes: row.max_interview_minutes,
+          });
+        } catch (_) {
+          planCapacityByClientId[rowClientId] = null;
+        }
       }
+      const clientsNeedingBillingFallback = planClientIds.filter((id) => !clientsWithDirectPlanSettings.has(id));
+      await Promise.all(clientsNeedingBillingFallback.map(async (fallbackClientId) => {
+        try {
+          planCapacityByClientId[fallbackClientId] = await resolvePlanCapacityForClient({
+            db,
+            clientId: fallbackClientId,
+          });
+        } catch (_) {
+          planCapacityByClientId[fallbackClientId] = null;
+        }
+      }));
     }
 
     const availabilityByRoleId = {};
@@ -231,18 +249,21 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
 
     const items = roles.map((role) => {
       const availability = availabilityByRoleId[role.id] || null;
-      return withEntityFields({
+      const capacity = planCapacityByClientId[role.client_id] || null;
+      return withEntityFields(normalizeRoleInterviewTypeForRead({
         ...role,
         included_interviews_per_role: availability?.included_interviews_per_role ?? null,
         purchased_interviews: availability?.purchased_interviews ?? null,
         used_interviews: availability?.used_interviews ?? null,
         remaining_interviews: availability?.remaining_interviews ?? null,
-        max_interview_minutes: maxInterviewMinutesByClientId[role.client_id] ?? null,
+        membership_level: capacity?.membership_level ?? null,
+        max_interview_minutes: capacity?.max_interview_minutes ?? null,
+        scored_question_count: capacity?.scored_question_count ?? null,
         job_description_replacement: replacementEligibilityByRoleId[role.id] || {
           eligible: false,
           blockers: ['eligibility_unavailable']
         }
-      }, entityMap, role.client_id);
+      }), entityMap, role.client_id);
     });
 
     return res.json({ items });
@@ -267,10 +288,11 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
 
     if (!clientId) return res.status(400).json({ error: 'client_id required' });
     if (!hasScopedWriteAccess(req, clientId)) return res.status(403).json({ error: 'forbidden' });
-    const interviewTypeRaw = String(req.body.interview_type || '').trim().toUpperCase();
-    const interviewType = ['BASIC', 'DETAILED', 'TECHNICAL'].includes(interviewTypeRaw)
-      ? interviewTypeRaw
-      : 'BASIC';
+    const interviewTypeRaw = String(req.body.interview_type || '').trim();
+    const interviewType = normalizeInterviewType(interviewTypeRaw, {
+      fallback: interviewTypeRaw ? null : 'core'
+    });
+    if (!interviewType) return res.status(400).json({ error: 'invalid_interview_type' });
 
     const payload = {
       client_id: clientId,
@@ -291,7 +313,7 @@ router.post('/', requireAuth, withClientScope, async (req, res) => {
       return res.status(500).json({ error: 'Failed to create role' });
     }
 
-    return res.json({ role: data });
+    return res.json({ role: normalizeRoleInterviewTypeForRead(data) });
   } catch (e) {
     console.error('[POST /roles] unexpected', e);
     return res.status(500).json({ error: 'Server error' });
@@ -335,7 +357,7 @@ router.patch('/:id/status', requireAuth, withClientScope, async (req, res) => {
       return res.status(500).json({ error: 'role_status_update_failed', detail: error.message });
     }
     if (!data) return res.status(404).json({ error: 'not_found' });
-    return res.json({ role: data });
+    return res.json({ role: normalizeRoleInterviewTypeForRead(data) });
   } catch (e) {
     console.error('[PATCH /roles/:id/status] unexpected', e);
     return res.status(500).json({ error: 'server_error' });

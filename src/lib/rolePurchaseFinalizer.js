@@ -1,16 +1,14 @@
 'use strict';
 
 const { randomUUID } = require('crypto');
-
-const VALID_INTERVIEW_TYPES = new Set(['BASIC', 'DETAILED', 'TECHNICAL']);
+const { requireInterviewType: requireCanonicalInterviewType } = require('./interviewTypes');
 
 function cleanText(value) {
   return String(value || '').trim();
 }
 
 function normalizeInterviewType(value) {
-  const raw = cleanText(value).toUpperCase();
-  return VALID_INTERVIEW_TYPES.has(raw) ? raw : null;
+  return requireCanonicalInterviewType(value);
 }
 
 function defaultGenerateRubricAndKBForRole(roleId) {

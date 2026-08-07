@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const { Readable } = require('stream');
 const tmp = require('tmp');
+const { excludeWarmupFromTranscript } = require('../src/lib/warmupExclusion');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegStatic = require('ffmpeg-static');
 const { OpenAI } = require('openai');
@@ -338,7 +339,7 @@ const handleWebhook = async (req, res) => {
     const fullTranscript = transcriptProcessing.cleanedTranscript;
     segments = transcriptProcessing.cleanedSegments;
     const unansweredQuestions = transcriptProcessing.unanswered;
-    const transcriptSnippet = fullTranscript.slice(0, 1800); // keep prompt compact
+    const transcriptSnippet = excludeWarmupFromTranscript(fullTranscript).slice(0, 1800); // keep prompt compact and unscored warm-up excluded
 
     // 4) Prosody features
     const prosody = prosodyFromWhisper(segments);

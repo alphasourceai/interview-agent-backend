@@ -18,6 +18,7 @@ const availabilityPath = path.join(__dirname, '..', 'src', 'lib', 'roleInterview
 const rateLimitPath = path.join(__dirname, '..', 'src', 'lib', 'rateLimit.js');
 const attemptsPath = path.join(__dirname, '..', 'src', 'lib', 'interviewAttemptService.js');
 const previousBillingMode = process.env.BILLING_MODE;
+const previousInternalSyntheticClientIds = process.env.INTERNAL_SYNTHETIC_INTERVIEW_CLIENT_IDS;
 
 const injectedPaths = [
   routePath,
@@ -172,6 +173,8 @@ async function startServer(planSetting, options = {}) {
   });
 
   process.env.BILLING_MODE = 'enforce';
+  if (options.internalSynthetic === true) process.env.INTERNAL_SYNTHETIC_INTERVIEW_CLIENT_IDS = CLIENT_ID;
+  else delete process.env.INTERNAL_SYNTHETIC_INTERVIEW_CLIENT_IDS;
   delete require.cache[routePath];
   const router = require(routePath);
   const app = express();
@@ -213,17 +216,14 @@ afterEach(async () => {
   for (const filename of injectedPaths) delete require.cache[filename];
   if (previousBillingMode === undefined) delete process.env.BILLING_MODE;
   else process.env.BILLING_MODE = previousBillingMode;
+  if (previousInternalSyntheticClientIds === undefined) delete process.env.INTERNAL_SYNTHETIC_INTERVIEW_CLIENT_IDS;
+  else process.env.INTERNAL_SYNTHETIC_INTERVIEW_CLIENT_IDS = previousInternalSyntheticClientIds;
 });
 
 for (const [label, planSetting] of [
   ['missing row', undefined],
-  ['null duration', { client_id: CLIENT_ID, max_interview_minutes: null }],
-  ['zero duration', { client_id: CLIENT_ID, max_interview_minutes: 0 }],
-  ['negative duration', { client_id: CLIENT_ID, max_interview_minutes: -3 }],
-  ['malformed duration', { client_id: CLIENT_ID, max_interview_minutes: 'not-a-number' }],
-  ['non-integer duration', { client_id: CLIENT_ID, max_interview_minutes: 3.5 }],
-  ['duration without provider farewell headroom', { client_id: CLIENT_ID, max_interview_minutes: 60 }],
-  ['over-provider-limit duration', { client_id: CLIENT_ID, max_interview_minutes: 61 }],
+  ['null plan tier', { client_id: CLIENT_ID, plan_tier: null, max_interview_minutes: 10 }],
+  ['unknown plan tier', { client_id: CLIENT_ID, plan_tier: 'unknown', max_interview_minutes: 10 }],
 ]) {
   test(`invalid ${label} fails closed before interview claim or provider creation`, async () => {
     const harness = await startServer(planSetting);
@@ -270,25 +270,28 @@ test('duration lookup failure is retryable and does not masquerade as missing co
   assert.equal(harness.calls.provider, 0);
 });
 
-for (const [label, duration] of [
-  ['three-minute QA fixture', 3],
-  ['active paid client', 10],
-  ['provider maximum with farewell headroom', 59],
+for (const [label, planTier, configuredDuration, expectedDuration, internalSynthetic] of [
+  ['external Basic ignores stale stored duration', 'basic', 3, 10, false],
+  ['external Pro uses the plan contract', 'pro', 3, 12, false],
+  ['external Enterprise uses the plan contract', 'enterprise', 3, 15, false],
+  ['three-minute internal QA fixture', 'basic', 3, 3, true],
+  ['internal provider maximum with farewell headroom', 'enterprise', 59, 59, true],
 ]) {
   test(`valid ${label} preserves configured duration and normal launch`, async () => {
     const harness = await startServer(
       {
         client_id: CLIENT_ID,
-        max_interview_minutes: duration,
+        plan_tier: planTier,
+        max_interview_minutes: configuredDuration,
       },
-      { accessOverrideMode: label === 'active paid client' ? 'inherit' : 'force_active' },
+      { accessOverrideMode: 'force_active', internalSynthetic },
     );
     servers.add(harness.server);
 
     const result = await postStart(harness.url);
 
     assert.equal(result.status, 200);
-    assert.equal(result.body.max_interview_minutes, duration);
+    assert.equal(result.body.max_interview_minutes, expectedDuration);
     assert.equal(harness.calls.claim, 1);
     assert.equal(harness.calls.provider, 1);
   });

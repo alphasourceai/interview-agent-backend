@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const Stripe = require('stripe');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
+const { requirePlanCapacity } = require('../src/lib/planCapacity');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');
 const LIVE_SUB_STATUSES = new Set(['active', 'trialing']);
@@ -10,13 +11,13 @@ const PLAN_SETTINGS_DEFAULTS = {
     per_role_fee: 399,
     included_interviews_per_role: 25,
     additional_interview_fee: 35,
-    max_interview_minutes: 8
+    max_interview_minutes: requirePlanCapacity('basic').max_interview_minutes
   },
   pro: {
     per_role_fee: 699,
     included_interviews_per_role: 50,
     additional_interview_fee: 45,
-    max_interview_minutes: 10
+    max_interview_minutes: requirePlanCapacity('pro').max_interview_minutes
   }
 };
 
@@ -122,7 +123,7 @@ function buildClientPlanSettingsPayloadFromSubscription(subscription, clientId) 
       per_role_fee: perRoleFee,
       included_interviews_per_role: includedInterviewsPerRole,
       additional_interview_fee: additionalInterviewFee,
-      max_interview_minutes: 15
+      max_interview_minutes: requirePlanCapacity('enterprise').max_interview_minutes
     };
   }
 

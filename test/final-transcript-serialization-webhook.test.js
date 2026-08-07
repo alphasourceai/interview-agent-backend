@@ -880,6 +880,20 @@ async function postTranscription(app, overrides = {}) {
   }
 }
 
+async function postWebhookEvent(app, body, fetchImpl = fetch) {
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    return await fetchImpl(`http://127.0.0.1:${server.address().port}/webhook/tavus`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
 async function withScenario(options, callback) {
   const db = makeDb(options);
   const { app, restore } = buildApp(db);
@@ -928,6 +942,39 @@ function assertNoReconciliationSideEffects(db) {
   assert.equal(db.tracker.questionUpdates, 0);
   assert.equal(db.tracker.questionRpcCalls, 0);
 }
+
+if (!IS_REAL_SENTRY_PROBE) test('current Tavus end_call tool ends the provider conversation and requests interview ending', async () => {
+  await withScenario({ failureCode: null }, async (app, db) => {
+    const originalFetch = global.fetch;
+    const previousApiKey = process.env.TAVUS_API_KEY;
+    const providerCalls = [];
+    process.env.TAVUS_API_KEY = 'synthetic-tavus-key';
+    global.fetch = async (url, options) => {
+      if (String(url).startsWith(`https://tavusapi.com/v2/conversations/${ID.conversation}/end`)) {
+        providerCalls.push({ url: String(url), method: options?.method });
+        return { ok: true, status: 200, text: async () => '' };
+      }
+      return originalFetch(url, options);
+    };
+
+    try {
+      const response = await postWebhookEvent(app, {
+        event_type: 'conversation.tool_call',
+        conversation_id: ID.conversation,
+        tool_name: 'end_call',
+        tool_arguments: { reason: 'natural_conclusion' },
+      }, originalFetch);
+      assert.equal(response.status, 200);
+      assert.equal(providerCalls.length, 1);
+      assert.equal(providerCalls[0].method, 'POST');
+      assert.equal(db.interview.status, 'ending_requested');
+    } finally {
+      global.fetch = originalFetch;
+      if (previousApiKey === undefined) delete process.env.TAVUS_API_KEY;
+      else process.env.TAVUS_API_KEY = previousApiKey;
+    }
+  });
+});
 
 function serializedSentry(tracker) {
   return JSON.stringify({

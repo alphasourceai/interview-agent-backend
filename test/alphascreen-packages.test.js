@@ -207,6 +207,7 @@ test('public package endpoint exposes safe package data and no Stripe secrets', 
     assert.equal(basic.first_role_prepay.stripe_price_configured, true)
     assert.equal(basic.included_interviews, 20)
     assert.equal(basic.interview_duration_minutes, 10)
+    assert.equal(basic.scored_question_count, 5)
     assert.equal(basic.overage_price, 30)
     assert.equal(pro.platform_monthly_fee, 599)
     assert.equal(pro.platform_monthly_fee_cents, 59900)
@@ -218,6 +219,7 @@ test('public package endpoint exposes safe package data and no Stripe secrets', 
     assert.equal(pro.first_role_prepay.normal_role_fee_cents, 69900)
     assert.equal(pro.included_interviews, 30)
     assert.equal(pro.interview_duration_minutes, 12)
+    assert.equal(pro.scored_question_count, 6)
     assert.equal(pro.overage_price, 35)
 
     const basicMonthly = basic.billing_cadences.find((item) => item.key === 'monthly')

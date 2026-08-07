@@ -4,6 +4,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const INSUFFICIENT_SUMMARY = 'Interview ended before any substantive responses were recorded.\nEvidence strength: 0%\nAI-aided interview risk: Low';
 const { classifyTranscriptCandidateEvidence } = require('./interviewUtteranceClassifier');
+const { excludeWarmupFromTranscript } = require('./warmupExclusion');
 
 function clampScore(value) {
   const n = Number(value);
@@ -12,7 +13,7 @@ function clampScore(value) {
 }
 
 function isSubstantiveTranscript(transcriptText) {
-  const text = String(transcriptText || '').trim();
+  const text = excludeWarmupFromTranscript(transcriptText);
   if (!text) return { ok: false, reason: 'empty_transcript', wordCount: 0, candidateUtteranceCount: 0, substantiveResponseCount: 0, counts: {} };
   const evidence = classifyTranscriptCandidateEvidence(text);
   return {
@@ -89,7 +90,7 @@ async function scoreInterview({ transcriptText, jdText, perceptionScores, mode, 
 
   const fetchImpl = typeof fetch === 'function' ? fetch : require('node-fetch');
 
-  const transcript = String(transcriptText || '').slice(0, 16000);
+  const transcript = excludeWarmupFromTranscript(transcriptText).slice(0, 16000);
   const jdGrounding = typeof jdText === 'string' && jdText.trim()
     ? jdText.trim().slice(0, 6000)
     : '[JD unavailable; evaluate using transcript and rubric alignment only.]';
@@ -110,6 +111,8 @@ Return ONLY valid JSON with exactly these keys:
 }
 
 Scoring rules:
+- The introductory warm-up and its response are unscored. They have been removed from the transcript and must never be inferred, reconstructed, or used as evidence.
+- Do not use favorite-season preferences or any sensitive/personal information from pre-screening conversation in scores, summaries, risk signals, or comparisons.
 - Base scoring primarily on transcript answer quality, accuracy, and relevance to role requirements.
 - Use perception/non-verbal signals only as secondary supporting evidence.
 - Do not infer protected traits.

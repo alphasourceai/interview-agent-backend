@@ -1,5 +1,7 @@
 'use strict';
 
+const { excludeWarmupFromTranscript } = require('./warmupExclusion');
+
 // Deliberately deterministic.  This is an access-control gate, not a model
 // judgement: only a candidate answer with concrete answer-shaped content can
 // make an attempt eligible for downstream scoring.
@@ -59,7 +61,8 @@ function transcriptCandidateUtterances(transcript) {
 }
 
 function classifyTranscriptCandidateEvidence(transcript) {
-  const utterances = transcriptCandidateUtterances(transcript).map(classifyCandidateUtterance);
+  const evaluativeTranscript = excludeWarmupFromTranscript(transcript);
+  const utterances = transcriptCandidateUtterances(evaluativeTranscript).map(classifyCandidateUtterance);
   const counts = {};
   for (const item of utterances) counts[item.classification] = (counts[item.classification] || 0) + 1;
   const substantive = utterances.filter((item) => item.substantive);

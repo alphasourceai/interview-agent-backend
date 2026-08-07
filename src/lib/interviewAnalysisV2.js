@@ -2,6 +2,7 @@
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_INTERVIEW_ANALYSIS_V2_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const { excludeWarmupFromTranscript } = require('./warmupExclusion');
 
 const SCORE_KEYS = [
   'response_specificity',
@@ -156,6 +157,8 @@ Use exactly this JSON shape:
 }
 
 Rules:
+- The introductory warm-up and its response are unscored. They have been removed from the transcript and must never be inferred, reconstructed, summarized, or used as evidence.
+- Do not use favorite-season preferences or sensitive/personal information from pre-screening conversation in analysis, risk, evidence, or comparisons.
 - Use transcript/content evidence first.
 - Use final Tavus perception only as supporting context.
 - Do not infer honesty, truthfulness, deception, trustworthiness, motivation, likability, personality, or personality judgments.
@@ -173,11 +176,11 @@ Context JSON:
 ${safeJson(payload, {})}
 
 Transcript:
-"""${truncate(input.transcript, 16000)}"""`;
+"""${truncate(excludeWarmupFromTranscript(input.transcript), 16000)}"""`;
 }
 
 async function generateInterviewAnalysisV2(input = {}) {
-  const transcript = String(input.transcript || '').trim();
+  const transcript = excludeWarmupFromTranscript(input.transcript);
   if (!transcript) throw new Error('missing_transcript');
   if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY missing');
 
@@ -215,6 +218,7 @@ async function generateInterviewAnalysisV2(input = {}) {
 }
 
 module.exports = {
+  buildInterviewAnalysisV2Prompt: buildPrompt,
   generateInterviewAnalysisV2,
   normalizeInterviewAnalysisV2Result: normalizeResult
 };

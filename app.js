@@ -75,6 +75,7 @@ const { createAdminInterviewReliabilityRouter } = require('./routes/adminIntervi
 const { normalizeUuid } = require('./src/lib/strictRequestValidation')
 const { isInterviewRecoveryCoreEnabled, isInterviewRecoveryCoreEmailEnabled } = require('./src/lib/interviewAttemptService')
 const { cleanupNoSubstantiveRecordings } = require('./src/lib/recordingCleanup')
+const { normalizeInterviewType, normalizeRoleInterviewTypeForRead } = require('./src/lib/interviewTypes')
 const { createSubscriptionCheckoutSession } = require('./src/lib/subscriptionCheckout')
 const {
   finalizePrepaidRoleCredit,
@@ -1107,14 +1108,14 @@ app.post('/clients/roles/checkout-session', requireAuth, withClientScope, roleCh
     const tab = sanitizeClientDashboardTab(req.body?.tab, 'roles')
     const embeddedCheckoutRequested = wantsEmbeddedCheckout(req.body?.embedded)
     const roleTitle = String(req.body?.role_title || '').trim()
-    const interviewType = String(req.body?.interview_type || '').trim().toUpperCase()
+    const interviewType = normalizeInterviewType(req.body?.interview_type)
     const jdFile = req.file || null
 
     if (!clientId) return res.status(400).json({ error: 'client_id_required' })
     if (!ids.includes(clientId)) return res.status(403).json({ error: 'forbidden' })
     if (!hasClientWriteAccess(req, clientId)) return res.status(403).json({ error: 'forbidden' })
     if (!roleTitle) return res.status(400).json({ error: 'role_title_required' })
-    if (!['BASIC', 'DETAILED', 'TECHNICAL'].includes(interviewType)) {
+    if (!interviewType) {
       return res.status(400).json({ error: 'invalid_interview_type' })
     }
     if (!jdFile) return res.status(400).json({ error: 'file_required' })
@@ -4271,7 +4272,8 @@ adminRouter.get('/roles', requireAuth, requireAdmin, async (req, res) => {
     used_interviews: null,
     remaining_interviews: null
   }
-  const items = await Promise.all(rows.map(async (role) => {
+  const items = await Promise.all(rows.map(async (rawRole) => {
+    const role = normalizeRoleInterviewTypeForRead(rawRole)
     try {
       if (!role?.id || !role?.client_id) {
         return withEntityFields({
@@ -4326,9 +4328,11 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
   if (!client_id || !title || !title.trim()) {
     return res.status(400).json({ error: 'client_id_and_title_required' })
   }
-  const IT = String(interview_type || '').toUpperCase()
-  const VALID = new Set(['BASIC','DETAILED','TECHNICAL'])
-  interview_type = VALID.has(IT) ? IT : null
+  const interviewTypeRaw = String(interview_type || '').trim()
+  interview_type = normalizeInterviewType(interviewTypeRaw, {
+    fallback: interviewTypeRaw ? null : 'core'
+  })
+  if (!interview_type) return res.status(400).json({ error: 'invalid_interview_type' })
 
   const { data: role, error } = await supabaseAdmin
     .from('roles')
@@ -4357,7 +4361,7 @@ adminRouter.post('/roles', requireAuth, requireAdmin, async (req, res) => {
     .eq('id', role.id)
     .single()
 
-  res.json({ item: updated || role })
+  res.json({ item: normalizeRoleInterviewTypeForRead(updated || role) })
 })
 
 adminRouter.patch('/roles/:id/status', requireAuth, requireAdmin, async (req, res) => {
@@ -4407,7 +4411,7 @@ adminRouter.patch('/roles/:id/status', requireAuth, requireAdmin, async (req, re
       .maybeSingle()
     if (error) return res.status(500).json({ error: 'role_status_update_failed', detail: error.message })
     if (!data) return res.status(404).json({ error: 'not_found' })
-    return res.json({ item: data })
+    return res.json({ item: normalizeRoleInterviewTypeForRead(data) })
   } catch (e) {
     console.error('role_status_update_exception:', e?.message || e)
     return res.status(500).json({ error: 'server_error' })

@@ -7,6 +7,7 @@ const { getRoleInterviewAvailability } = require('../src/lib/roleInterviewAvaila
 const { buildAlphaScreenPlanSettingsPayload } = require('../src/lib/alphaScreenPackages');
 const { activatePublicPurchaseAgreementCheckout } = require('../src/lib/publicPurchaseActivation');
 const { finalizePendingRolePurchase } = require('../src/lib/rolePurchaseFinalizer');
+const { requirePlanCapacity } = require('../src/lib/planCapacity');
 const router = express.Router();
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');
@@ -185,7 +186,7 @@ function buildClientPlanSettingsPayloadFromSubscription(subscription, clientId, 
       per_role_fee: perRoleFee,
       included_interviews_per_role: includedInterviewsPerRole,
       additional_interview_fee: additionalInterviewFee,
-      max_interview_minutes: 15
+      max_interview_minutes: requirePlanCapacity('enterprise').max_interview_minutes
     };
   }
 

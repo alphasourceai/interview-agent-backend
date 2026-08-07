@@ -9,6 +9,7 @@ const { afterEach, test } = require('node:test');
 const ROLE_TOKEN = 'synthetic-role-token';
 const CLIENT_ID = '11111111-1111-4111-8111-111111111111';
 const ROLE_ID = '22222222-2222-4222-8222-222222222222';
+const previousInternalSyntheticClientIds = process.env.INTERNAL_SYNTHETIC_INTERVIEW_CLIENT_IDS;
 
 const routePath = path.join(__dirname, '..', 'routes', 'publicInterviewStatus.js');
 const supabaseClientPath = path.join(__dirname, '..', 'src', 'lib', 'supabaseClient.js');
@@ -54,7 +55,7 @@ class FakeQuery {
   }
 }
 
-async function createHarness({ planSetting, planError = false }) {
+async function createHarness({ planSetting, planError = false, internalSynthetic = false }) {
   const db = {
     planSetting,
     planError,
@@ -68,6 +69,8 @@ async function createHarness({ planSetting, planError = false }) {
     checkAndIncrementRateLimit: async () => ({ allowed: true }),
   });
   delete require.cache[routePath];
+  if (internalSynthetic) process.env.INTERNAL_SYNTHETIC_INTERVIEW_CLIENT_IDS = CLIENT_ID;
+  else delete process.env.INTERNAL_SYNTHETIC_INTERVIEW_CLIENT_IDS;
 
   const app = express();
   app.use(require(routePath));
@@ -89,11 +92,14 @@ afterEach(async () => {
   for (const filename of [routePath, supabaseClientPath, rateLimitPath]) {
     delete require.cache[filename];
   }
+  if (previousInternalSyntheticClientIds === undefined) delete process.env.INTERNAL_SYNTHETIC_INTERVIEW_CLIENT_IDS;
+  else process.env.INTERNAL_SYNTHETIC_INTERVIEW_CLIENT_IDS = previousInternalSyntheticClientIds;
 });
 
 test('public preflight returns the valid three-minute QA duration', async () => {
   const harness = await createHarness({
-    planSetting: { client_id: CLIENT_ID, max_interview_minutes: 3 },
+    planSetting: { client_id: CLIENT_ID, plan_tier: 'basic', max_interview_minutes: 3 },
+    internalSynthetic: true,
   });
   servers.add(harness.server);
 
@@ -104,18 +110,17 @@ test('public preflight returns the valid three-minute QA duration', async () => 
   assert.equal(body.max_interview_minutes, 3);
 });
 
-test('public preflight fails closed when provider farewell headroom cannot be reserved', async () => {
+test('public preflight ignores stale external duration and uses authoritative Basic capacity', async () => {
   const harness = await createHarness({
-    planSetting: { client_id: CLIENT_ID, max_interview_minutes: 60 },
+    planSetting: { client_id: CLIENT_ID, plan_tier: 'basic', max_interview_minutes: 60 },
   });
   servers.add(harness.server);
 
   const response = await fetch(harness.url);
   const body = await response.json();
 
-  assert.equal(response.status, 503);
-  assert.equal(body.code, 'INTERVIEW_DURATION_NOT_CONFIGURED');
-  assert.equal(body.retryable, false);
+  assert.equal(response.status, 200);
+  assert.equal(body.max_interview_minutes, 10);
 });
 
 test('public preflight exposes the stable bounded duration configuration error', async () => {

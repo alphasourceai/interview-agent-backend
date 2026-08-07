@@ -12,6 +12,7 @@ const { INSUFFICIENT_SUMMARY, isSubstantiveTranscript, scoreInterview } = requir
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 const { transcriptCompletionTransition } = require('../src/lib/interviewLifecycle');
 const { classifyCandidateUtterance } = require('../src/lib/interviewUtteranceClassifier');
+const { excludeWarmupFromTranscript, excludeWarmupFromTranscriptItems } = require('../src/lib/warmupExclusion');
 const {
   buildEvidenceSnapshot,
   projectReconciliationLog,
@@ -20,6 +21,7 @@ const {
 const {
   extractCandidateQuestions,
 } = require('../src/lib/unansweredCandidateQuestions');
+const { isTerminalInterviewToolName } = require('../src/lib/tavusTerminalTool');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -1367,7 +1369,7 @@ async function getRoleJdText(roleId, requestId, interviewId, conversationId, opt
 }
 
 async function applyTranscriptScoringForInterview({ interview, fresh, transcriptText, requestId, conversationId }) {
-  const transcript = typeof transcriptText === 'string' ? transcriptText.trim() : '';
+  const transcript = excludeWarmupFromTranscript(transcriptText);
   const substantiveCheck = isSubstantiveTranscript(transcript);
   const transcriptWordCount = transcript ? transcript.split(/\s+/).filter(Boolean).length : 0;
   const candidateResponseTurns = (transcript.match(/^(CANDIDATE|USER)\s*:/gim) || []).length;
@@ -1983,7 +1985,7 @@ function queueFinalTranscriptPostProcessing({
 
   let questions;
   try {
-    questions = extractCandidateQuestions(transcriptItems);
+    questions = extractCandidateQuestions(excludeWarmupFromTranscriptItems(transcriptItems));
   } catch {
     console.error('[webhook] final_transcript_post_processing', {
       outcome: 'failed',
@@ -2719,7 +2721,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
     let preserveRecordingState = false;
     let suppressRecordingReadyState = false;
 
-    if (isToolCall && toolName === 'end_interview' && conversationId && interview?.id) {
+    if (isToolCall && isTerminalInterviewToolName(toolName) && conversationId && interview?.id) {
       try {
         const apiKey = String(process.env.TAVUS_API_KEY || '').trim();
         if (!apiKey) {
@@ -2781,7 +2783,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
               });
             } else {
               statusAfter = 'ending_requested';
-              console.log('[webhook] tool_call end_interview processed', {
+              console.log('[webhook] terminal tool_call processed', {
                 request_id: requestId || null,
                 conversation_id: conversationId || null,
                 interview_id: interview.id,
@@ -2792,7 +2794,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
           }
         }
       } catch (err) {
-        console.error('[webhook] tool_call end_interview failed', {
+        console.error('[webhook] terminal tool_call failed', {
           request_id: requestId || null,
           conversation_id: conversationId || null,
           interview_id: interview.id,

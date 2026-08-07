@@ -1,9 +1,13 @@
 'use strict'
 
+const { requirePlanCapacity } = require('./planCapacity')
+
 const PUBLIC_PACKAGE_KEYS = Object.freeze(['basic', 'pro'])
 const BILLING_INTERVALS = Object.freeze(['monthly', 'annual'])
 const ANNUAL_PLATFORM_FEE_NOTE = 'Discounted annual platform fee'
 const FIRST_ROLE_PREPAY_CREDIT_TYPE = 'first_role_prepay'
+const BASIC_CAPACITY = requirePlanCapacity('basic')
+const PRO_CAPACITY = requirePlanCapacity('pro')
 
 function moneyCents(value) {
   return Math.round(Number(value || 0) * 100)
@@ -18,8 +22,9 @@ const ALPHA_SCREEN_PACKAGES = Object.freeze({
     annual_platform_fee_note: ANNUAL_PLATFORM_FEE_NOTE,
     included_interviews: 20,
     included_interviews_per_role: 20,
-    interview_duration_minutes: 10,
-    max_interview_minutes: 10,
+    interview_duration_minutes: BASIC_CAPACITY.interview_duration_minutes,
+    max_interview_minutes: BASIC_CAPACITY.max_interview_minutes,
+    scored_question_count: BASIC_CAPACITY.scored_question_count,
     additional_interview_price: 30,
     additional_interview_fee: 30,
     per_role_fee: 399,
@@ -48,8 +53,9 @@ const ALPHA_SCREEN_PACKAGES = Object.freeze({
     annual_platform_fee_note: ANNUAL_PLATFORM_FEE_NOTE,
     included_interviews: 30,
     included_interviews_per_role: 30,
-    interview_duration_minutes: 12,
-    max_interview_minutes: 12,
+    interview_duration_minutes: PRO_CAPACITY.interview_duration_minutes,
+    max_interview_minutes: PRO_CAPACITY.max_interview_minutes,
+    scored_question_count: PRO_CAPACITY.scored_question_count,
     additional_interview_price: 35,
     additional_interview_fee: 35,
     per_role_fee: 699,
@@ -195,6 +201,7 @@ function buildAlphaScreenPackageSnapshot(planKey, billingInterval, options = {})
     included_interviews_per_role: pkg.included_interviews_per_role,
     interview_duration_minutes: pkg.interview_duration_minutes,
     max_interview_minutes: pkg.max_interview_minutes,
+    scored_question_count: pkg.scored_question_count,
     additional_interview_price: pkg.additional_interview_price,
     additional_interview_fee: pkg.additional_interview_fee,
     overage_price: pkg.additional_interview_price,
@@ -220,6 +227,7 @@ function listPublicAlphaScreenPackages({ env = process.env } = {}) {
       included_interviews_per_role: pkg.included_interviews_per_role,
       interview_duration_minutes: pkg.interview_duration_minutes,
       max_interview_minutes: pkg.max_interview_minutes,
+      scored_question_count: pkg.scored_question_count,
       additional_interview_price: pkg.additional_interview_price,
       additional_interview_fee: pkg.additional_interview_fee,
       overage_price: pkg.additional_interview_price,

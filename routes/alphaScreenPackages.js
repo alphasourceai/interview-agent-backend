@@ -418,6 +418,7 @@ function safePackageSummary(snapshot = {}) {
     included_interviews_per_role: snapshot.included_interviews_per_role ?? null,
     interview_duration_minutes: snapshot.interview_duration_minutes ?? null,
     max_interview_minutes: snapshot.max_interview_minutes ?? null,
+    scored_question_count: snapshot.scored_question_count ?? null,
     additional_interview_price: snapshot.additional_interview_price ?? null,
     additional_interview_fee: snapshot.additional_interview_fee ?? null,
     overage_price: snapshot.overage_price ?? null,

@@ -15,7 +15,7 @@ values (
   gen_random_uuid(),
   :'client_id',
   'Software Engineer',
-  'basic',
+  'core',
   '{}'::jsonb,
   null
 )

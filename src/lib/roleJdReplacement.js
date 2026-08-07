@@ -2,14 +2,13 @@
 
 const path = require('path');
 const { randomUUID } = require('crypto');
+const { getPlanCapacity } = require('./planCapacity');
 
 const JD_MAX_BYTES = 20 * 1024 * 1024;
 const JD_FILE_TYPES = Object.freeze({
   '.pdf': 'application/pdf',
   '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 });
-const REPLACEMENT_RUBRIC_MIN_QUESTIONS = 3;
-
 const ROLE_ACTIVITY_CHECKS = Object.freeze([
   { table: 'candidates', label: 'candidates' },
   { table: 'interviews', label: 'interviews' },
@@ -87,7 +86,7 @@ function normalizeGeneratedRubricQuestions(questions) {
 }
 
 function rubricQuestionQualityError(detail = null) {
-  return new RoleJdReplacementError('Generated rubric did not meet the minimum interview question quality.', {
+  return new RoleJdReplacementError('Generated rubric did not meet the exact plan-owned question contract.', {
     status: 502,
     code: 'RUBRIC_QUESTION_QUALITY_FAILED',
     stage: 'rubric_quality',
@@ -393,10 +392,12 @@ function createRoleJdReplacementService(options = {}) {
         });
       }
       const rubricQuestions = normalizeGeneratedRubricQuestions(artifacts.rubric_questions);
-      if (rubricQuestions.length < REPLACEMENT_RUBRIC_MIN_QUESTIONS) {
+      const artifactCapacity = getPlanCapacity(artifacts.rubric.membership_level);
+      if (!artifactCapacity || rubricQuestions.length !== artifactCapacity.scored_question_count) {
         throw rubricQuestionQualityError({
-          minimum: REPLACEMENT_RUBRIC_MIN_QUESTIONS,
-          valid_question_count: rubricQuestions.length
+          membership_level: artifacts.rubric.membership_level || null,
+          expected_question_count: artifactCapacity?.scored_question_count || null,
+          valid_question_count: rubricQuestions.length,
         });
       }
       artifacts = {
@@ -489,7 +490,6 @@ function createRoleJdReplacementService(options = {}) {
 module.exports = {
   JD_FILE_TYPES,
   JD_MAX_BYTES,
-  REPLACEMENT_RUBRIC_MIN_QUESTIONS,
   ROLE_ACTIVITY_CHECKS,
   RoleJdReplacementError,
   createRoleJdReplacementService,

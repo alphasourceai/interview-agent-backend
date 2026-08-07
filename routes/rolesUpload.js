@@ -7,6 +7,7 @@ const crypto = require('crypto');
 
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { parseBufferToText } = require('../utils/jdParser');
+const { normalizeRoleInterviewTypeForRead } = require('../src/lib/interviewTypes');
 
 // Canonical JD storage bucket; store job_description_url as "<bucket>/<path>".
 const JD_BUCKET = (process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || process.env.SUPABASE_JD_BUCKET || 'job-descriptions').trim();
@@ -128,7 +129,7 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
     // 5) Respond with role + preview
     return res.json({
       ok: true,
-      role: updated,
+      role: normalizeRoleInterviewTypeForRead(updated),
       parsed_text_preview: (parsedText || '').slice(0, 1200)
     });
   } catch (e) {

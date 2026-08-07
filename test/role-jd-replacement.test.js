@@ -16,19 +16,20 @@ const {
   createRoleJdReplacementService
 } = require('../src/lib/roleJdReplacement');
 const { createRoleJdReplacementRouter } = require('../routes/roleJdReplacement');
+const { getPlanCapacity } = require('../src/lib/planCapacity');
 const {
-  REPLACEMENT_RUBRIC_MIN_QUESTIONS,
+  buildFallbackRubric,
   generateJdDerivedArtifactsForRole
 } = require('../generateRubric');
 
 const ROLE_ID = '11111111-1111-4111-8111-111111111111';
 const CLIENT_ID = '22222222-2222-4222-8222-222222222222';
 const REPLACEMENT_ID = '33333333-3333-4333-8333-333333333333';
-const NEW_RUBRIC_QUESTIONS = [
-  { text: 'Tell me about relevant patient-care experience.', category: 'experience' },
-  { text: 'Walk me through how you prioritize a busy schedule.', category: 'judgment' },
-  { text: 'Describe how you communicate with a concerned patient.', category: 'communication' }
-];
+const BASIC_SCORED_QUESTION_COUNT = getPlanCapacity('basic').scored_question_count;
+const NEW_RUBRIC_QUESTIONS = buildFallbackRubric({
+  title: 'Dental Hygienist',
+  interview_type: 'leadership'
+}, 'basic').questions;
 
 function baseRole(overrides = {}) {
   return {
@@ -37,6 +38,7 @@ function baseRole(overrides = {}) {
     title: 'Dental Hygienist',
     description: 'Old JD excerpt',
     interview_type: 'DETAILED',
+    membership_level: 'basic',
     manual_questions: null,
     status: 'active',
     job_description_url: 'job-descriptions/old/jd.pdf',
@@ -219,7 +221,11 @@ function makeService(db, overrides = {}) {
       return {
         job_description_text: jdText,
         description: 'New JD excerpt',
-        rubric: { questions: NEW_RUBRIC_QUESTIONS },
+        rubric: {
+          membership_level: 'basic',
+          interview_type: 'leadership',
+          questions: NEW_RUBRIC_QUESTIONS
+        },
         rubric_questions: NEW_RUBRIC_QUESTIONS,
         kb_document_id: 'kb-new'
       };
@@ -264,9 +270,12 @@ function makeOpenAiResponses(responses) {
             prompts.push(messages?.[0]?.content || '');
             const next = responses[index++];
             if (next instanceof Error) throw next;
+            const payload = next && typeof next === 'object' && Array.isArray(next.questions)
+              ? { membership_level: 'basic', interview_type: 'leadership', ...next }
+              : next;
             return {
               choices: [{
-                message: { content: typeof next === 'string' ? next : JSON.stringify(next) }
+                message: { content: typeof payload === 'string' ? payload : JSON.stringify(payload) }
               }]
             };
           }
@@ -303,7 +312,7 @@ for (const filename of ['replacement.pdf', 'replacement.docx']) {
     assert.equal(result.role.kb_document_id, 'kb-new');
     assert.equal(result.role.tavus_document_id, 'tavus-new');
     assert.equal(result.role.tavus_prompt, null);
-    assert.equal(result.role.rubric_questions.length, REPLACEMENT_RUBRIC_MIN_QUESTIONS);
+    assert.equal(result.role.rubric_questions.length, BASIC_SCORED_QUESTION_COUNT);
     assert.deepEqual(db.state.billing, billingBefore);
 
     const history = db.state.replacements[0];
@@ -317,7 +326,11 @@ for (const filename of ['replacement.pdf', 'replacement.docx']) {
     assert.equal(history.old_tavus_prompt, 'Old JD-specific prompt');
     assert.equal(history.new_tavus_prompt, null);
     assert.deepEqual(history.old_rubric, { questions: [{ text: 'Old question', category: 'old' }] });
-    assert.deepEqual(history.new_rubric, { questions: NEW_RUBRIC_QUESTIONS });
+    assert.deepEqual(history.new_rubric, {
+      membership_level: 'basic',
+      interview_type: 'leadership',
+      questions: NEW_RUBRIC_QUESTIONS
+    });
     assert.equal(db.state.storageDeletes.length, 0);
     assert.equal(tavusCalls.length, 1);
     assert.equal(tavusCalls[0].role.tavus_document_id, null);
@@ -339,7 +352,7 @@ test('replacement artifact generation accepts a valid minimum rubric without ret
 
   assert.equal(prompts.length, 1);
   assert.equal(uploads.length, 1);
-  assert.equal(artifacts.rubric_questions.length, REPLACEMENT_RUBRIC_MIN_QUESTIONS);
+  assert.equal(artifacts.rubric_questions.length, BASIC_SCORED_QUESTION_COUNT);
   assert.deepEqual(artifacts.rubric.questions, NEW_RUBRIC_QUESTIONS);
 });
 
@@ -349,9 +362,9 @@ test('replacement artifact generation retries once and deduplicates valid questi
     { questions: [NEW_RUBRIC_QUESTIONS[0]] },
     {
       questions: [
-        { text: '  tell me about relevant patient-care experience. ', category: 'experience' },
-        NEW_RUBRIC_QUESTIONS[1],
-        NEW_RUBRIC_QUESTIONS[2]
+        NEW_RUBRIC_QUESTIONS[0],
+        { ...NEW_RUBRIC_QUESTIONS[0], text: `  ${NEW_RUBRIC_QUESTIONS[0].text.toLowerCase()}  ` },
+        ...NEW_RUBRIC_QUESTIONS.slice(1)
       ]
     }
   ]);
@@ -364,7 +377,7 @@ test('replacement artifact generation retries once and deduplicates valid questi
   assert.equal(prompts.length, 2);
   assert.match(prompts[1], /QUALITY CORRECTION/);
   assert.equal(uploads.length, 1);
-  assert.equal(artifacts.rubric_questions.length, REPLACEMENT_RUBRIC_MIN_QUESTIONS);
+  assert.equal(artifacts.rubric_questions.length, BASIC_SCORED_QUESTION_COUNT);
   assert.deepEqual(
     artifacts.rubric_questions.map((question) => question.text),
     NEW_RUBRIC_QUESTIONS.map((question) => question.text)
@@ -384,7 +397,7 @@ test('replacement artifact generation fails before KB upload when retry remains 
       { supabaseClient: client, openaiClient, logger: { error() {} }, kbId: 'quality-kb-failed' }
     ),
     (error) => error.code === 'RUBRIC_QUESTION_QUALITY_FAILED'
-      && error.detail.minimum === REPLACEMENT_RUBRIC_MIN_QUESTIONS
+      && error.detail.minimum === BASIC_SCORED_QUESTION_COUNT
       && error.detail.valid_question_count === 1
   );
   assert.equal(prompts.length, 2);
@@ -396,7 +409,7 @@ test('replacement retry success activates the role with deduplicated questions',
   const billingBefore = structuredClone(db.state.billing);
   const { client: openaiClient, prompts } = makeOpenAiResponses([
     { questions: [NEW_RUBRIC_QUESTIONS[0]] },
-    { questions: [NEW_RUBRIC_QUESTIONS[0], NEW_RUBRIC_QUESTIONS[1], NEW_RUBRIC_QUESTIONS[2]] }
+    { questions: NEW_RUBRIC_QUESTIONS }
   ]);
   const { service, tavusCalls } = makeService(db, {
     generateArtifacts: ({ role, jdText }, options) => generateJdDerivedArtifactsForRole(
@@ -409,7 +422,7 @@ test('replacement retry success activates the role with deduplicated questions',
 
   assert.equal(result.ok, true);
   assert.equal(prompts.length, 2);
-  assert.equal(result.role.rubric_questions.length, REPLACEMENT_RUBRIC_MIN_QUESTIONS);
+  assert.equal(result.role.rubric_questions.length, BASIC_SCORED_QUESTION_COUNT);
   assert.equal(db.state.rpcCalls.length, 1);
   assert.equal(tavusCalls.length, 1);
   assert.equal(db.state.storageUploads.filter((item) => item.bucket === 'kbs').length, 1);
@@ -535,7 +548,7 @@ test('rubric quality failure leaves the active role unchanged and records struct
   const qualityError = Object.assign(new Error('not enough valid questions'), {
     code: 'RUBRIC_QUESTION_QUALITY_FAILED',
     stage: 'rubric_quality',
-    detail: { minimum: REPLACEMENT_RUBRIC_MIN_QUESTIONS, valid_question_count: 1, attempts: 2 }
+    detail: { minimum: BASIC_SCORED_QUESTION_COUNT, valid_question_count: 1, attempts: 2 }
   });
   const { service, tavusCalls } = makeService(db, {
     generateArtifacts: async () => { throw qualityError; }
@@ -560,14 +573,17 @@ test('replacement service removes duplicate generated questions before activatio
   const db = makeDb();
   const duplicatedQuestions = [
     NEW_RUBRIC_QUESTIONS[0],
-    { text: ' tell me about relevant patient-care experience. ', category: 'duplicate' },
-    NEW_RUBRIC_QUESTIONS[1],
-    NEW_RUBRIC_QUESTIONS[2]
+    { ...NEW_RUBRIC_QUESTIONS[0], text: ` ${NEW_RUBRIC_QUESTIONS[0].text.toLowerCase()} `, category: 'duplicate' },
+    ...NEW_RUBRIC_QUESTIONS.slice(1)
   ];
   const { service } = makeService(db, {
     generateArtifacts: async () => ({
       description: 'New JD excerpt',
-      rubric: { questions: duplicatedQuestions },
+      rubric: {
+        membership_level: 'basic',
+        interview_type: 'leadership',
+        questions: duplicatedQuestions
+      },
       rubric_questions: duplicatedQuestions,
       kb_document_id: 'kb-new'
     })
@@ -575,11 +591,42 @@ test('replacement service removes duplicate generated questions before activatio
 
   const result = await service.replaceJobDescription(replacementRequest());
   assert.equal(result.ok, true);
-  assert.equal(result.role.rubric_questions.length, REPLACEMENT_RUBRIC_MIN_QUESTIONS);
+  assert.equal(result.role.rubric_questions.length, BASIC_SCORED_QUESTION_COUNT);
   assert.deepEqual(
     result.role.rubric_questions.map((question) => question.text),
     NEW_RUBRIC_QUESTIONS.map((question) => question.text)
   );
+});
+
+test('replacement service rejects too many questions and missing plan metadata before activation', async () => {
+  for (const rubric of [
+    {
+      membership_level: 'basic',
+      interview_type: 'leadership',
+      questions: [
+        ...NEW_RUBRIC_QUESTIONS,
+        { ...NEW_RUBRIC_QUESTIONS[0], text: 'Describe a distinct sixth competency.' }
+      ]
+    },
+    { interview_type: 'leadership', questions: NEW_RUBRIC_QUESTIONS }
+  ]) {
+    const db = makeDb();
+    const { service, tavusCalls } = makeService(db, {
+      generateArtifacts: async () => ({
+        description: 'New JD excerpt',
+        rubric,
+        rubric_questions: rubric.questions,
+        kb_document_id: 'kb-rejected-exact-gate'
+      })
+    });
+
+    await assert.rejects(
+      service.replaceJobDescription(replacementRequest()),
+      (error) => error.code === 'RUBRIC_QUESTION_QUALITY_FAILED'
+    );
+    assert.equal(db.state.rpcCalls.length, 0);
+    assert.equal(tavusCalls.length, 0);
+  }
 });
 
 test('quality rejection preserves a generated KB reference in failed history without Tavus activation', async () => {
@@ -587,7 +634,11 @@ test('quality rejection preserves a generated KB reference in failed history wit
   const { service, tavusCalls } = makeService(db, {
     generateArtifacts: async () => ({
       description: 'New JD excerpt',
-      rubric: { questions: [NEW_RUBRIC_QUESTIONS[0]] },
+      rubric: {
+        membership_level: 'basic',
+        interview_type: 'leadership',
+        questions: [NEW_RUBRIC_QUESTIONS[0]]
+      },
       rubric_questions: [NEW_RUBRIC_QUESTIONS[0]],
       kb_document_id: 'kb-preserved-failed-attempt'
     })

@@ -17,6 +17,7 @@ const {
 const { resolvePublicBackendBase } = require('../config/urlConfig');
 const { normalizePrimitiveString, normalizeUuid } = require('../src/lib/strictRequestValidation');
 const { validateConfiguredInterviewDuration } = require('../src/lib/interviewDuration');
+const { resolvePlanCapacityForClient } = require('../src/lib/planCapacity');
 
 const router = express.Router();
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
@@ -231,19 +232,26 @@ router.post('/', createTavusRateLimit, async (req, res) => {
     let candidateAssistanceContact = '';
     let maxInterviewMinutes = null;
     try {
-      const { data: planSettings, error: planSettingsError } = await supabaseAdmin
-        .from('client_plan_settings')
-        .select('max_interview_minutes')
-        .eq('client_id', clientId)
-        .maybeSingle();
-      if (planSettingsError) {
+      let planCapacity;
+      try {
+        planCapacity = await resolvePlanCapacityForClient({
+          db: supabaseAdmin,
+          clientId,
+        });
+      } catch (capacityError) {
         console.warn('[create-tavus-interview] duration_preflight_blocked', {
           request_id,
-          reason: 'lookup_failed',
+          reason: capacityError?.code || 'invalid_membership_level',
         });
-        return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
+        if (capacityError?.code === 'PLAN_CAPACITY_LOOKUP_FAILED') {
+          return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
+        }
+        return sendCandidateError(res, 'INTERVIEW_DURATION_NOT_CONFIGURED', {
+          request_id,
+          retryable: false,
+        });
       }
-      const duration = validateConfiguredInterviewDuration(planSettings?.max_interview_minutes);
+      const duration = validateConfiguredInterviewDuration(planCapacity.max_interview_minutes);
       if (!duration.ok) {
         console.warn('[create-tavus-interview] duration_preflight_blocked', {
           request_id,
