@@ -22,6 +22,7 @@ const {
   extractCandidateQuestions,
 } = require('../src/lib/unansweredCandidateQuestions');
 const { isTerminalInterviewToolName } = require('../src/lib/tavusTerminalTool');
+const { authenticateTavusWebhookRequest } = require('../src/lib/tavusWebhookAuth');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -2404,7 +2405,11 @@ function sanitizeTranscriptArray(arr) {
 router.get('/_ping', (_req, res) => res.json({ ok: true }));
 
 // Primary webhook entry
-router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
+router.post(
+  '/tavus',
+  authenticateTavusWebhookRequest,
+  express.json({ limit: '10mb' }),
+  async (req, res) => {
   let requestId = null;
   let eventType = null;
   let interviewId = null;
@@ -3447,6 +3452,7 @@ router.post('/tavus', express.json({ limit: '10mb' }), async (req, res) => {
     // Be lenient to avoid provider retries storms
     return res.status(200).json({ ok: true });
   }
-});
+  },
+);
 
 module.exports = router;

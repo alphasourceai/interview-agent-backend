@@ -18,6 +18,7 @@ const { resolvePublicBackendBase } = require('../config/urlConfig');
 const { normalizePrimitiveString, normalizeUuid } = require('../src/lib/strictRequestValidation');
 const { validateConfiguredInterviewDuration } = require('../src/lib/interviewDuration');
 const { resolvePlanCapacityForClient } = require('../src/lib/planCapacity');
+const { buildAuthenticatedTavusWebhookUrl } = require('../src/lib/tavusWebhookAuth');
 
 const router = express.Router();
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
@@ -342,7 +343,7 @@ router.post('/', createTavusRateLimit, async (req, res) => {
       });
     }
 
-    const webhookUrl = `${base}/webhook/tavus`;
+    const webhookUrl = buildAuthenticatedTavusWebhookUrl(`${base}/webhook/tavus`);
     let startingInterview;
     try {
       const claimed = await claimInterviewAttempt(supabaseAdmin, {

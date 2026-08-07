@@ -19,6 +19,8 @@ const rateLimitPath = path.join(__dirname, '..', 'src', 'lib', 'rateLimit.js');
 const attemptsPath = path.join(__dirname, '..', 'src', 'lib', 'interviewAttemptService.js');
 const previousBillingMode = process.env.BILLING_MODE;
 const previousInternalSyntheticClientIds = process.env.INTERNAL_SYNTHETIC_INTERVIEW_CLIENT_IDS;
+const previousTavusWebhookSecret = process.env.TAVUS_WEBHOOK_SECRET;
+const TEST_TAVUS_WEBHOOK_SECRET = Buffer.alloc(32, 17).toString('base64url');
 
 const injectedPaths = [
   routePath,
@@ -134,6 +136,7 @@ function createDatabase(planSetting, options = {}) {
 }
 
 async function startServer(planSetting, options = {}) {
+  process.env.TAVUS_WEBHOOK_SECRET = TEST_TAVUS_WEBHOOK_SECRET;
   const db = createDatabase(planSetting, options);
   const calls = {
     claim: 0,
@@ -218,6 +221,8 @@ afterEach(async () => {
   else process.env.BILLING_MODE = previousBillingMode;
   if (previousInternalSyntheticClientIds === undefined) delete process.env.INTERNAL_SYNTHETIC_INTERVIEW_CLIENT_IDS;
   else process.env.INTERNAL_SYNTHETIC_INTERVIEW_CLIENT_IDS = previousInternalSyntheticClientIds;
+  if (previousTavusWebhookSecret === undefined) delete process.env.TAVUS_WEBHOOK_SECRET;
+  else process.env.TAVUS_WEBHOOK_SECRET = previousTavusWebhookSecret;
 });
 
 for (const [label, planSetting] of [

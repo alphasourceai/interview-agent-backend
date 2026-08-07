@@ -39,6 +39,8 @@ if (IS_REAL_SENTRY_PROBE) {
   });
 }
 const express = require('express');
+const WEBHOOK_SECRET = Buffer.alloc(32, 11).toString('base64url');
+process.env.TAVUS_WEBHOOK_SECRET = WEBHOOK_SECRET;
 
 const ID = {
   candidate: '76000000-0000-4000-8000-000000000001',
@@ -841,9 +843,9 @@ async function postTranscription(app, overrides = {}) {
   const server = http.createServer(app);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   try {
-    const query = overrides.privacyProbe
-      ? `?probe=${encodeURIComponent(PRIVACY_SENTINELS.query)}`
-      : '';
+    const queryParams = new URLSearchParams({ tavus_webhook_token: WEBHOOK_SECRET });
+    if (overrides.privacyProbe) queryParams.set('probe', PRIVACY_SENTINELS.query);
+    const query = `?${queryParams.toString()}`;
     return await fetch(`http://127.0.0.1:${server.address().port}/webhook/tavus${query}`, {
       method: 'POST',
       headers: {
@@ -884,7 +886,8 @@ async function postWebhookEvent(app, body, fetchImpl = fetch) {
   const server = http.createServer(app);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   try {
-    return await fetchImpl(`http://127.0.0.1:${server.address().port}/webhook/tavus`, {
+    const query = new URLSearchParams({ tavus_webhook_token: WEBHOOK_SECRET });
+    return await fetchImpl(`http://127.0.0.1:${server.address().port}/webhook/tavus?${query.toString()}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),

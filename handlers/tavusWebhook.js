@@ -1,16 +1,7 @@
 // handlers/tavusWebhook.js
 require('dotenv').config();
 const { supabase } = require('../src/lib/supabaseClient');
-
-/**
- * Optional signature verification if TAVUS_WEBHOOK_SECRET is set.
- */
-function verifySignature(req) {
-  const secret = process.env.TAVUS_WEBHOOK_SECRET;
-  if (!secret) return true;
-  const provided = req.headers['x-webhook-secret'];
-  return Boolean(provided && provided === secret);
-}
+const { verifyTavusWebhookRequest } = require('../src/lib/tavusWebhookAuth');
 
 async function handleTavusWebhook(req, res) {
   try {
@@ -18,8 +9,11 @@ async function handleTavusWebhook(req, res) {
       return res.status(405).json({ error: 'Method not allowed' });
     }
 
-    if (!verifySignature(req)) {
-      return res.status(401).json({ error: 'Invalid signature' });
+    if (!verifyTavusWebhookRequest(req).ok) {
+      return res.status(401).json({
+        ok: false,
+        error: 'webhook_authentication_failed',
+      });
     }
 
     const body = req.body || {};

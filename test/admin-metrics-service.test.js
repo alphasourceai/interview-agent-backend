@@ -320,7 +320,7 @@ function tavusHealthContext(overrides = {}) {
     now,
     env: {
       TAVUS_API_KEY: 'tavus-secret',
-      TAVUS_WEBHOOK_SECRET: 'webhook-secret',
+      TAVUS_WEBHOOK_SECRET: Buffer.alloc(32, 13).toString('base64url'),
       ...(overrides.env || {}),
     },
     dateRange: {

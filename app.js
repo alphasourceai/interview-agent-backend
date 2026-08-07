@@ -4,6 +4,10 @@ require('dotenv').config()
 // --- Sentry MUST be initialized before requiring Express to instrument it ---
 const Sentry = require('@sentry/node');
 const { nodeProfilingIntegration } = require('@sentry/profiling-node');
+const {
+  getTavusWebhookAuthReadiness,
+  redactTavusWebhookAuth,
+} = require('./src/lib/tavusWebhookAuth');
 const SENTRY_ENABLED = process.env.SENTRY_ENABLED === '1' && !!process.env.SENTRY_DSN;
 if (SENTRY_ENABLED) {
   const integrations = [];
@@ -37,7 +41,13 @@ if (SENTRY_ENABLED) {
           }
         }
       } catch (_) {}
-      return event;
+      return redactTavusWebhookAuth(event);
+    },
+    beforeSendTransaction(event) {
+      return redactTavusWebhookAuth(event);
+    },
+    beforeSendSpan(span) {
+      return redactTavusWebhookAuth(span);
     },
   });
 }
@@ -6694,6 +6704,7 @@ app.get('/healthz', async (req, res) => {
   const anonKey = String(process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_PUBLIC_ANON_KEY || '');
 
   const supabase_auth = { ok: false, latency_ms: 0 };
+  const tavus_webhook_auth = getTavusWebhookAuthReadiness();
   const startedAt = Date.now();
 
   if (!supabaseUrl || !anonKey || typeof fetch !== 'function' || typeof AbortController !== 'function') {
@@ -6713,6 +6724,7 @@ app.get('/healthz', async (req, res) => {
         email_enabled: isInterviewRecoveryCoreEmailEnabled(),
       },
       supabase_auth,
+      tavus_webhook_auth,
     });
   }
 
@@ -6742,8 +6754,8 @@ app.get('/healthz', async (req, res) => {
   }
 
   return res.json({
-    ok: supabase_auth.ok === true,
-    degraded: supabase_auth.ok !== true,
+    ok: supabase_auth.ok === true && tavus_webhook_auth.ok === true,
+    degraded: supabase_auth.ok !== true || tavus_webhook_auth.ok !== true,
     request_id,
     now,
     interview_recovery_core: {
@@ -6751,6 +6763,7 @@ app.get('/healthz', async (req, res) => {
       email_enabled: isInterviewRecoveryCoreEmailEnabled(),
     },
     supabase_auth,
+    tavus_webhook_auth,
   });
 });
 

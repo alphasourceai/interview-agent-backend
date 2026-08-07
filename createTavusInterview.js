@@ -1,6 +1,10 @@
 const fetch = require('node-fetch');
 require('dotenv').config();
 const { resolvePublicBackendBase } = require('./config/urlConfig');
+const {
+  buildAuthenticatedTavusWebhookUrl,
+  omitProviderCallbackUrls,
+} = require('./src/lib/tavusWebhookAuth');
 
 const TAVUS_API_KEY = process.env.TAVUS_API_KEY;
 const TAVUS_PERSONA_ID = process.env.TAVUS_PERSONA_ID;
@@ -24,6 +28,7 @@ async function createTavusInterview(req, res) {
     if (!callbackBase) {
       throw new Error('missing_callback_base_url');
     }
+    const callbackUrl = buildAuthenticatedTavusWebhookUrl(`${callbackBase}/webhook/tavus`);
 
     const response = await fetch('https://api.tavus.io/conversations', {
       method: 'POST',
@@ -33,7 +38,7 @@ async function createTavusInterview(req, res) {
       },
       body: JSON.stringify({
         persona_id: TAVUS_PERSONA_ID,
-        callback_url: `${callbackBase}/tavus-webhook`,
+        callback_url: callbackUrl,
         metadata: {
           candidate_id,
           email,
@@ -47,11 +52,17 @@ async function createTavusInterview(req, res) {
     const data = await response.json();
 
     if (!response.ok) {
-      console.error('Tavus error:', data);
+      console.error('Tavus error:', {
+        status: response.status,
+        provider_code: String(data?.code || data?.error || '').slice(0, 80) || null,
+      });
       return res.status(500).send({ error: 'Failed to create Tavus conversation' });
     }
 
-    return res.status(200).send({ message: 'Conversation created', data });
+    return res.status(200).send({
+      message: 'Conversation created',
+      data: omitProviderCallbackUrls(data),
+    });
   } catch (error) {
     console.error('Error creating Tavus conversation:', error);
     return res.status(500).send({ error: 'Internal server error' });

@@ -1,5 +1,7 @@
 'use strict';
 
+const { isConfiguredTavusWebhookSecret } = require('../tavusWebhookAuth');
+
 const {
   cachedLiveCall,
   costSummary,
@@ -211,7 +213,7 @@ async function fetchTavusConversationPage(context) {
 async function buildTavusHealth(context) {
   const { env, now, signals } = context;
   const configured = envConfigured(env, ['TAVUS_API_KEY']);
-  const webhookConfigured = envConfigured(env, ['TAVUS_WEBHOOK_SECRET']);
+  const webhookConfigured = isConfiguredTavusWebhookSecret(env);
   const canCheckLive = configured && shouldRunLiveCheck(context, 'TAVUS_USAGE_ENABLED');
   let live = null;
   let liveError = null;
