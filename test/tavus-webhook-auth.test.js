@@ -9,6 +9,7 @@ const express = require('express');
 
 process.env.SUPABASE_URL ||= 'https://fixture.supabase.co';
 process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'fixture-service-role-key';
+process.env.SUPABASE_ANON_KEY ||= 'fixture-anon-key';
 const AUTH_SECRET = Buffer.alloc(32, 7).toString('base64url');
 process.env.TAVUS_WEBHOOK_SECRET = AUTH_SECRET;
 

@@ -1,10 +1,8 @@
 const multer = require('multer');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
-const { createClient } = require('@supabase/supabase-js');
 const analyzeResume = require('../analyzeResume');
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const { supabaseAdmin: supabase } = require('../src/lib/supabaseClient');
 
 const storage = multer.memoryStorage();
 const upload = multer({ storage });

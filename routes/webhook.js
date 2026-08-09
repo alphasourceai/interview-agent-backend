@@ -5,7 +5,7 @@ const express = require('express');
 const Sentry = require('@sentry/node');
 const crypto = require('node:crypto');
 const router = express.Router();
-const { createClient } = require('@supabase/supabase-js');
+const { supabaseAdmin: defaultSupabaseAdmin } = require('../src/lib/supabaseClient');
 const { analyzeInterviewTranscriptById } = require('../scripts/backfillInterviews.js');
 const { generateInterviewAnalysisV2 } = require('../src/lib/interviewAnalysisV2');
 const { INSUFFICIENT_SUMMARY, isSubstantiveTranscript, scoreInterview } = require('../src/lib/interviewScoring');
@@ -32,11 +32,6 @@ const {
 
 let activeTavusHttpClient = defaultTavusHttpClient;
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const defaultSupabaseAdmin = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
-  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-  : null;
 let supabaseAdmin = defaultSupabaseAdmin;
 
 const TRANSCRIPTS_BUCKET = process.env.SUPABASE_TRANSCRIPTS_BUCKET || 'transcripts';

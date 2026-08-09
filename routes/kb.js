@@ -5,6 +5,10 @@ const express = require('express');
 const axios = require('axios');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
+const {
+  ServiceRoleAuthorizationError,
+  requireRoleAccess,
+} = require('../src/lib/serviceRoleAuthorization');
 
 const router = express.Router();
 
@@ -37,25 +41,21 @@ router.post('/upload', requireAuth, withClientScope, async (req, res) => {
 
     if (!role_id) return res.status(400).json({ error: 'role_id required' });
 
-    // Ensure caller has scope over this role's client
-    const { data: roleRow, error: roleErr } = await supabaseAdmin
-      .from('roles')
-      .select('id, client_id')
-      .eq('id', role_id)
-      .single();
-    if (roleErr || !roleRow) return res.status(404).json({ error: 'Role not found' });
-
-    const scopedIds = getScopedClientIds(req);
-    if (!scopedIds.includes(roleRow.client_id)) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
+    const { role: roleRow } = await requireRoleAccess({
+      db: supabaseAdmin,
+      req,
+      roleId: role_id,
+      manage: true,
+      columns: 'id,client_id',
+    });
 
     // If caller passed a pre-existing doc id, just attach it
     if (kb_document_id) {
       const { error: uErr } = await supabaseAdmin
         .from('roles')
         .update({ kb_document_id })
-        .eq('id', role_id);
+        .eq('id', roleRow.id)
+        .eq('client_id', roleRow.client_id);
 
       if (uErr) return res.status(500).json({ error: uErr.message });
       return res.status(200).json({ kb_document_id });
@@ -84,11 +84,15 @@ router.post('/upload', requireAuth, withClientScope, async (req, res) => {
     const { error: uErr } = await supabaseAdmin
       .from('roles')
       .update({ kb_document_id: docId })
-      .eq('id', role_id);
+      .eq('id', roleRow.id)
+      .eq('client_id', roleRow.client_id);
     if (uErr) return res.status(500).json({ error: uErr.message });
 
     return res.status(200).json({ kb_document_id: docId, document_url: docUrl });
   } catch (e) {
+    if (e instanceof ServiceRoleAuthorizationError) {
+      return res.status(e.status).json({ error: e.status === 404 ? 'Role not found' : 'Forbidden' });
+    }
     const status = e.response?.status || 500;
     const details = e.response?.data || e.message;
     return res.status(status).json({ error: details });

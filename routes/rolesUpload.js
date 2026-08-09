@@ -8,6 +8,10 @@ const crypto = require('crypto');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { parseBufferToText } = require('../utils/jdParser');
 const { normalizeRoleInterviewTypeForRead } = require('../src/lib/interviewTypes');
+const {
+  ServiceRoleAuthorizationError,
+  requireRoleAccess,
+} = require('../src/lib/serviceRoleAuthorization');
 
 // Canonical JD storage bucket; store job_description_url as "<bucket>/<path>".
 const JD_BUCKET = (process.env.SUPABASE_JOB_DESCRIPTIONS_BUCKET || process.env.SUPABASE_JD_BUCKET || 'job-descriptions').trim();
@@ -51,9 +55,14 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
     if (!client_id) return res.status(400).json({ error: 'Missing client_id' });
     if (!role_id) return res.status(400).json({ error: 'Missing role_id' });
 
-    // Scope check: withClientScope added by app.js sets req.client_memberships
-    const scopedIds = Array.isArray(req.client_memberships) ? req.client_memberships : [];
-    if (!scopedIds.includes(client_id)) return res.status(403).json({ error: 'Forbidden' });
+    const { role: authorizedRole } = await requireRoleAccess({
+      db: supabaseAdmin,
+      req,
+      roleId: role_id,
+      clientId: client_id,
+      manage: true,
+      columns: 'id,client_id',
+    });
 
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
@@ -93,7 +102,8 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
     let { data: updated, error: updErr } = await supabaseAdmin
       .from('roles')
       .update(updates)
-      .eq('id', role_id)
+      .eq('id', authorizedRole.id)
+      .eq('client_id', authorizedRole.client_id)
       .select('id,title,client_id,slug_or_token,interview_type,job_description_url,job_description_text,description,rubric,kb_document_id,tavus_document_id,created_at')
       .single();
 
@@ -133,6 +143,9 @@ router.post('/upload-jd', upload.single('file'), async (req, res) => {
       parsed_text_preview: (parsedText || '').slice(0, 1200)
     });
   } catch (e) {
+    if (e instanceof ServiceRoleAuthorizationError) {
+      return res.status(e.status).json({ error: e.status === 404 ? 'Not found' : 'Forbidden' });
+    }
     console.error('[upload-jd] unexpected:', e?.message || e);
     return res.status(500).json({ error: 'Server error' });
   }

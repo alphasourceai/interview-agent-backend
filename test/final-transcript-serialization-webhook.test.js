@@ -763,7 +763,9 @@ function buildApp(db, buildOptions = {}) {
     }
   }
   Module._load = function patchedLoad(request, parent, isMain) {
-    if (request === '@supabase/supabase-js') return { createClient: () => db };
+    if (request === '../src/lib/supabaseClient' && /routes\/webhook\.js$/.test(parent?.filename || '')) {
+      return { supabaseAdmin: db, supabase: db };
+    }
     if (request === '@sentry/node' && buildOptions.realSentry !== true) {
       return {
         NodeClient: MockSentryNodeClient,

@@ -82,7 +82,7 @@ class Query {
   then(resolve, reject) { return Promise.resolve(this.db.resolve(this, false)).then(resolve, reject); }
 }
 
-function createDb({ interviews = [exactInterview()], reports = [] } = {}) {
+function createDb({ interviews = [exactInterview()], reports = [], candidates = null, roles = null } = {}) {
   const db = {
     interviews,
     reports,
@@ -100,11 +100,11 @@ function createDb({ interviews = [exactInterview()], reports = [] } = {}) {
       let rows;
       if (query.table === 'interviews') rows = db.interviews;
       else if (query.table === 'reports') rows = db.reports;
-      else if (query.table === 'candidates') rows = [
+      else if (query.table === 'candidates') rows = candidates || [
         { id: ID.candidate, client_id: ID.client, role_id: ID.role, name: 'Synthetic Candidate', email: 'synthetic@example.test', analysis_summary: {} },
         { id: ID.otherCandidate, client_id: ID.otherClient, role_id: ID.otherRole, name: 'Other Candidate', email: 'other@example.test', analysis_summary: {} },
       ];
-      else if (query.table === 'roles') rows = [
+      else if (query.table === 'roles') rows = roles || [
         { id: ID.role, client_id: ID.client, title: 'Synthetic Role' },
         { id: ID.otherRole, client_id: ID.otherClient, title: 'Other Role' },
       ];
@@ -142,7 +142,9 @@ async function withRouter(db, callback) {
   const capture = { payloads: [] };
   const originalLoad = Module._load;
   Module._load = function patchedLoad(request, parent, isMain) {
-    if (request === '@supabase/supabase-js') return { createClient: () => db };
+    if (request === '../src/lib/supabaseClient' && /routes\/reportsPdf\.js$/.test(parent?.filename || '')) {
+      return { supabaseAdmin: db, supabase: db };
+    }
     if (request === '../utils/pdfRenderer' && /routes\/reportsPdf\.js$/.test(parent?.filename || '')) return { htmlToPdf: async (html) => Buffer.from(html) };
     if (request === '../utils/renderCandidateReport' && /routes\/reportsPdf\.js$/.test(parent?.filename || '')) {
       return { buildCandidateReportHtml: (payload) => { capture.payloads.push(payload); return JSON.stringify(payload); } };
@@ -337,6 +339,44 @@ test('Report isolation 12. generated replacement payload contains no attempt-one
   await withRouter(db, async (router, capture) => {
     assert.equal((await generate(router, { interview_id: ID.replacement })).statusCode, 200);
     assert.doesNotMatch(JSON.stringify(capture.payloads[0]), /ATTEMPT_ONE_SENTINEL/);
+  });
+});
+
+test('Finding #2 red: legacy generation rejects report-to-candidate client mismatch before render', async () => {
+  const db = createDb({
+    reports: [report({ interview_id: null, attempt_number: null, report_kind: null })],
+    candidates: [{
+      id: ID.candidate,
+      client_id: ID.otherClient,
+      role_id: ID.role,
+      name: 'Foreign Candidate',
+      email: 'foreign@example.test',
+      analysis_summary: {},
+    }],
+  });
+  await withRouter(db, async (router, capture) => {
+    const res = await generate(router, { candidate_id: ID.candidate }, [ID.client]);
+    assert.equal(res.statusCode, 409);
+    assert.equal(capture.payloads.length, 0);
+    assert.equal(db.uploaded, 0);
+  });
+});
+
+test('Finding #2 red: legacy generation rejects latest-interview client mismatch before render', async () => {
+  const db = createDb({
+    reports: [report({ interview_id: null, attempt_number: null, report_kind: null })],
+    interviews: [{
+      ...exactInterview(),
+      client_id: ID.otherClient,
+      interview_summary: 'FOREIGN_INTERVIEW_SENTINEL',
+      analysis: { summary: 'FOREIGN_INTERVIEW_SENTINEL' },
+    }],
+  });
+  await withRouter(db, async (router, capture) => {
+    const res = await generate(router, { candidate_id: ID.candidate }, [ID.client]);
+    assert.equal(res.statusCode, 409);
+    assert.equal(capture.payloads.length, 0);
+    assert.equal(db.uploaded, 0);
   });
 });
 

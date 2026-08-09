@@ -1,7 +1,6 @@
 // generateRubric.js
 'use strict'
 
-const { createClient } = require('@supabase/supabase-js')
 const OpenAI = require('openai')
 const { randomUUID } = require('crypto')
 const path = require('path')
@@ -10,9 +9,7 @@ const { ensureTavusDocumentForRole } = require('./lib/tavusDocuments')
 const { getPlanCapacity, normalizeMembershipLevel, requirePlanCapacity, resolvePlanCapacityForClient } = require('./src/lib/planCapacity')
 const { getInterviewTypeConfig, normalizeInterviewType, requireInterviewType } = require('./src/lib/interviewTypes')
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false, autoRefreshToken: false }
-})
+const { supabaseAdmin: supabase } = require('./src/lib/supabaseClient')
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
 const REQUIRED_QUESTION_FIELDS = Object.freeze([

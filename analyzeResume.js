@@ -3,9 +3,7 @@ require('dotenv').config();
 const { PDFParse } = require('pdf-parse');
 const mammoth = require('mammoth');
 const { OpenAI } = require('openai');
-const { createClient } = require('@supabase/supabase-js');
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const { supabaseAdmin: supabase } = require('./src/lib/supabaseClient');
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 function readPath(obj, path) {

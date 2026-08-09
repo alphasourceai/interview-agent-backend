@@ -1,20 +1,18 @@
 const router = require('express').Router();
 const { htmlToPdf } = require('../utils/pdfRenderer');
 const { buildCandidateReportHtml } = require('../utils/renderCandidateReport');
-const { createClient } = require('@supabase/supabase-js');
 const Sentry = require('@sentry/node');
+const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const {
   normalizePrimitiveString,
   normalizeUuid,
 } = require('../src/lib/strictRequestValidation');
+const {
+  ServiceRoleAuthorizationError,
+  assertReportBindings,
+} = require('../src/lib/serviceRoleAuthorization');
 
-// Supabase Admin (for loading report data + uploading PDFs)
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
 const REPORTS_BUCKET = process.env.REPORTS_BUCKET || 'reports';
-const supabaseAdmin = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
-  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, { auth: { persistSession: false } })
-  : null;
 
 // Signed URL defaults
 const DEFAULT_SIGNED_SECS = 90; // short-lived; FE will open immediately
@@ -151,7 +149,7 @@ async function handleGenerate(req, res) {
       Sentry.addBreadcrumb({ category: 'reports', level: 'info', message: 'generate:start' });
     }
     if (!supabaseAdmin) {
-      return res.status(500).json({ error: 'Storage not configured (missing SUPABASE_URL/SUPABASE_SERVICE_KEY)' });
+      return res.status(500).json({ error: 'Storage admin client is not configured' });
     }
 
     const body = req.body || {};
@@ -322,11 +320,25 @@ async function handleGenerate(req, res) {
 
     // 2) Load candidate + role
     const [{ data: cand, error: candErr }, { data: role, error: roleErr }] = await Promise.all([
-      supabaseAdmin.from('candidates').select('id,name,email,client_id,analysis_summary').eq('id', reportRow.candidate_id).maybeSingle(),
-      supabaseAdmin.from('roles').select('id,title').eq('id', reportRow.role_id).maybeSingle(),
+      supabaseAdmin.from('candidates').select('id,name,email,client_id,role_id,analysis_summary').eq('id', reportRow.candidate_id).maybeSingle(),
+      supabaseAdmin.from('roles').select('id,title,client_id').eq('id', reportRow.role_id).maybeSingle(),
     ]);
     if (candErr) throw candErr;
     if (roleErr) throw roleErr;
+    try {
+      assertReportBindings({
+        report: reportRow,
+        candidate: cand,
+        role,
+        interview: latestInterview,
+        allowUnboundInterview: true,
+      });
+    } catch (bindingError) {
+      if (bindingError instanceof ServiceRoleAuthorizationError) {
+        return res.status(409).json({ error: 'report_resource_binding_mismatch' });
+      }
+      throw bindingError;
+    }
     if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
       Sentry.addBreadcrumb({ category: 'db', level: 'info', message: 'candidate:loaded', data: { candidate_id: cand ? cand.id : null } });
       Sentry.addBreadcrumb({ category: 'db', level: 'info', message: 'role:loaded', data: { role_id: role ? role.id : null } });
@@ -737,7 +749,7 @@ router.post('/pdf', async (req, res) => {
 router.get('/interviews/:interviewId/url', async (req, res) => {
   try {
     if (!supabaseAdmin) {
-      return res.status(500).json({ error: 'Storage not configured (missing SUPABASE_URL/SUPABASE_SERVICE_KEY)' });
+      return res.status(500).json({ error: 'Storage admin client is not configured' });
     }
     const interviewId = normalizeUuid(req.params.interviewId);
     if (interviewId === null) return invalidUuidResponse(res, 'interview_id');
@@ -797,7 +809,7 @@ router.get('/interviews/:interviewId/url', async (req, res) => {
 router.get('/:id/url', async (req, res) => {
   try {
     if (!supabaseAdmin) {
-      return res.status(500).json({ error: 'Storage not configured (missing SUPABASE_URL/SUPABASE_SERVICE_KEY)' });
+      return res.status(500).json({ error: 'Storage admin client is not configured' });
     }
     const id = normalizeUuid(req.params.id);
     if (id === null) return invalidUuidResponse(res, 'report_id');

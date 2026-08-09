@@ -62,8 +62,8 @@ function createReportDb() {
           resume_breakdown: {},
         }, error: null };
       }
-      if (table === 'candidates') return { data: { id: ID.candidate, client_id: ID.client, name: 'Synthetic', email: 'synthetic@example.test' }, error: null };
-      if (table === 'roles') return { data: { id: ID.role, title: 'Synthetic role' }, error: null };
+      if (table === 'candidates') return { data: { id: ID.candidate, client_id: ID.client, role_id: ID.role, name: 'Synthetic', email: 'synthetic@example.test' }, error: null };
+      if (table === 'roles') return { data: { id: ID.role, client_id: ID.client, title: 'Synthetic role' }, error: null };
       if (table === 'clients') return { data: { id: ID.client, name: 'Synthetic client' }, error: null };
       if (table === 'reports' && db.updates.length) return { data: null, error: null };
       return { data: null, error: null };
@@ -94,7 +94,9 @@ test('R1 red report regression: an unbound attempt-one report is rejected for ex
   let renderedPayload = null;
   const originalLoad = Module._load;
   Module._load = function patchedLoad(request, parent, isMain) {
-    if (request === '@supabase/supabase-js') return { createClient: () => db };
+    if (request === '../src/lib/supabaseClient' && /routes\/reportsPdf\.js$/.test(parent?.filename || '')) {
+      return { supabaseAdmin: db, supabase: db };
+    }
     if (request === '../utils/pdfRenderer' && /routes\/reportsPdf\.js$/.test(parent?.filename || '')) {
       return { htmlToPdf: async (html) => Buffer.from(html) };
     }

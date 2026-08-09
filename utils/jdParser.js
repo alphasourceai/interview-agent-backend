@@ -4,20 +4,13 @@
 const { PDFParse } = require('pdf-parse');
 const mammoth = require('mammoth');
 const path = require('path');
-const { createClient } = require('@supabase/supabase-js');
 
 let supabase = null;
 
 function getSupabase() {
   if (supabase) return supabase;
-  const url = String(process.env.SUPABASE_URL || '').trim();
-  const serviceRoleKey = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
-  if (!url || !serviceRoleKey) {
-    throw new Error('parseJD: Supabase storage is not configured');
-  }
-  supabase = createClient(url, serviceRoleKey, {
-    auth: { persistSession: false, autoRefreshToken: false }
-  });
+  supabase = require('../src/lib/supabaseClient').supabaseAdmin;
+  if (!supabase) throw new Error('parseJD: Supabase storage is not configured');
   return supabase;
 }
 

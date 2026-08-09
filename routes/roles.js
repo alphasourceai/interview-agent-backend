@@ -10,6 +10,7 @@ const { loadEntityMap, resolveEntityFilter, uniqueIds, withEntityFields } = requ
 const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
 const { resolvePlanCapacity, resolvePlanCapacityForClient } = require('../src/lib/planCapacity');
 const { normalizeInterviewType, normalizeRoleInterviewTypeForRead } = require('../src/lib/interviewTypes');
+const { hasClientAccess, hasClientManagerAccess } = require('../src/lib/serviceRoleAuthorization');
 
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 
@@ -81,19 +82,11 @@ function getScopedMembershipRole(req, clientId) {
 }
 
 function hasScopedReadAccess(req, clientId) {
-  if (req?.isGlobalAdmin === true || req?.isAdmin === true) return true;
-  const targetClientId = String(clientId || '').trim();
-  if (!targetClientId) return false;
-  const memberships = Array.isArray(req?.clientScope?.memberships) ? req.clientScope.memberships : [];
-  if (memberships.some((item) => String(item?.client_id || '').trim() === targetClientId)) return true;
-  const clientIds = Array.isArray(req?.clientIds) ? req.clientIds : [];
-  return clientIds.some((id) => String(id || '').trim() === targetClientId);
+  return hasClientAccess(req, clientId);
 }
 
 function hasScopedWriteAccess(req, clientId) {
-  if (req?.isGlobalAdmin === true || req?.isAdmin === true) return true;
-  const role = getScopedMembershipRole(req, clientId);
-  return role === 'manager' || role === 'admin' || role === 'owner' || role === 'super_admin';
+  return hasClientManagerAccess(req, clientId);
 }
 
 const ROLE_STATUS_VALUES = new Set(['active', 'inactive', 'all']);
