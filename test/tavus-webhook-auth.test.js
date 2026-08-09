@@ -45,6 +45,20 @@ async function postWebhook({ query = '', body = {}, rawBody = null } = {}) {
   }
 }
 
+async function captureConsole(callback) {
+  const captured = [];
+  const original = { log: console.log, warn: console.warn, error: console.error };
+  for (const method of Object.keys(original)) {
+    console[method] = (...args) => captured.push([method, ...args]);
+  }
+  try {
+    await callback();
+  } finally {
+    Object.assign(console, original);
+  }
+  return captured;
+}
+
 test('active Tavus route rejects a missing callback secret before handler logic', async () => {
   const response = await postWebhook({
     body: {
@@ -103,6 +117,18 @@ test('authentication runs before JSON parsing and therefore before product mutat
   });
 });
 
+test('authenticated malformed JSON receives a bounded validation response', async () => {
+  const response = await postWebhook({
+    query: `?${TAVUS_WEBHOOK_AUTH_QUERY_PARAM}=${encodeURIComponent(AUTH_SECRET)}`,
+    rawBody: '{not-json',
+  });
+  assert.equal(response.status, 400);
+  assert.deepEqual(response.body, {
+    ok: false,
+    error: 'invalid_webhook_payload',
+  });
+});
+
 test('correct callback secret enters the existing handler behavior', async () => {
   const response = await postWebhook({
     query: `?${TAVUS_WEBHOOK_AUTH_QUERY_PARAM}=${encodeURIComponent(AUTH_SECRET)}`,
@@ -113,6 +139,183 @@ test('correct callback secret enters the existing handler behavior', async () =>
   });
   assert.equal(response.status, 200);
   assert.deepEqual(response.body, { ok: true, ignored: true });
+});
+
+test('authenticated empty payload is rejected before callback processing', async () => {
+  const response = await postWebhook({
+    query: `?${TAVUS_WEBHOOK_AUTH_QUERY_PARAM}=${encodeURIComponent(AUTH_SECRET)}`,
+    body: {},
+  });
+  assert.equal(response.status, 400);
+  assert.deepEqual(response.body, {
+    ok: false,
+    error: 'invalid_webhook_payload',
+  });
+});
+
+test('authenticated conflicting conversation identifiers are rejected', async () => {
+  const response = await postWebhook({
+    query: `?${TAVUS_WEBHOOK_AUTH_QUERY_PARAM}=${encodeURIComponent(AUTH_SECRET)}`,
+    body: {
+      event_type: 'synthetic.unknown',
+      conversation_id: 'synthetic-conversation-a',
+      properties: { conversation_id: 'synthetic-conversation-b' },
+    },
+  });
+  assert.equal(response.status, 400);
+  assert.deepEqual(response.body, {
+    ok: false,
+    error: 'invalid_webhook_payload',
+  });
+});
+
+test('authenticated root primitives and missing envelope fields are rejected generically', async () => {
+  for (const body of [null, [], 'payload', 7, { conversation_id: 'synthetic-conversation' }]) {
+    const response = await postWebhook({
+      query: `?${TAVUS_WEBHOOK_AUTH_QUERY_PARAM}=${encodeURIComponent(AUTH_SECRET)}`,
+      body,
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(response.body, {
+      ok: false,
+      error: 'invalid_webhook_payload',
+    });
+  }
+});
+
+test('authenticated missing and wrong-type conversation identifiers are rejected', async () => {
+  for (const body of [
+    { event_type: 'synthetic.unknown' },
+    { event_type: 'synthetic.unknown', conversation_id: 7 },
+    { event_type: 'synthetic.unknown', conversation_id: [] },
+    { event_type: 'synthetic.unknown', conversation_id: {} },
+  ]) {
+    const response = await postWebhook({
+      query: `?${TAVUS_WEBHOOK_AUTH_QUERY_PARAM}=${encodeURIComponent(AUTH_SECRET)}`,
+      body,
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(response.body, {
+      ok: false,
+      error: 'invalid_webhook_payload',
+    });
+  }
+});
+
+test('validation rejection logs are bounded and exclude raw callback contents', async () => {
+  const sentinels = [
+    'candidate@example.test',
+    'synthetic transcript never log',
+    'https://example.invalid/recording?signature=never-log',
+    AUTH_SECRET,
+    'synthetic-tavus-api-key-never-log',
+  ];
+  const logs = await captureConsole(async () => {
+    const response = await postWebhook({
+      query: `?${TAVUS_WEBHOOK_AUTH_QUERY_PARAM}=${encodeURIComponent(AUTH_SECRET)}`,
+      body: {
+        event_type: 'application.recording_ready',
+        conversation_id: 'conversation-a',
+        properties: {
+          conversation_id: 'conversation-b',
+          transcript: sentinels[1],
+          recording_url: sentinels[2],
+          candidate_email: sentinels[0],
+          webhook_secret: AUTH_SECRET,
+          api_key: sentinels[4],
+        },
+      },
+    });
+    assert.equal(response.status, 400);
+  });
+  const serialized = JSON.stringify(logs);
+  for (const sentinel of sentinels) assert.equal(serialized.includes(sentinel), false);
+  assert.match(serialized, /conflicting_conversation_ids/);
+  assert.match(serialized, /identifier_conflict/);
+});
+
+test('every rejected envelope returns before any database or provider operation', async () => {
+  let databaseCalls = 0;
+  router._setSupabaseAdminForTest({
+    from() {
+      databaseCalls += 1;
+      throw new Error('database must not be reached');
+    },
+    rpc() {
+      databaseCalls += 1;
+      throw new Error('database must not be reached');
+    },
+  });
+  try {
+    const invalidPayloads = [
+      {},
+      { event_type: 'system.shutdown' },
+      { event_type: 'system.shutdown', conversation_id: 7 },
+      {
+        event_type: 'system.shutdown',
+        conversation_id: 'conversation-a',
+        properties: { conversation_id: 'conversation-b' },
+      },
+      {
+        event_type: 'application.transcription_ready',
+        conversation_id: 'conversation-a',
+        properties: { transcript: 'invalid' },
+      },
+    ];
+    for (const body of invalidPayloads) {
+      const response = await postWebhook({
+        query: `?${TAVUS_WEBHOOK_AUTH_QUERY_PARAM}=${encodeURIComponent(AUTH_SECRET)}`,
+        body,
+      });
+      assert.equal(response.status, 400);
+    }
+    assert.equal(databaseCalls, 0);
+  } finally {
+    router._setSupabaseAdminForTest(undefined);
+  }
+});
+
+test('known valid event for an unbound conversation performs reads only and is safely ignored', async () => {
+  const tracker = { reads: 0, mutations: 0 };
+  const query = {
+    select() { return this; },
+    eq() { return this; },
+    async maybeSingle() {
+      tracker.reads += 1;
+      return { data: null, error: null };
+    },
+    update() {
+      tracker.mutations += 1;
+      return this;
+    },
+    insert() {
+      tracker.mutations += 1;
+      return this;
+    },
+  };
+  router._setSupabaseAdminForTest({
+    from() { return query; },
+    rpc() {
+      tracker.mutations += 1;
+      throw new Error('mutation must not be reached');
+    },
+  });
+  try {
+    const response = await postWebhook({
+      query: `?${TAVUS_WEBHOOK_AUTH_QUERY_PARAM}=${encodeURIComponent(AUTH_SECRET)}`,
+      body: {
+        event_type: 'system.replica_joined',
+        conversation_id: 'synthetic-nonexistent-conversation',
+        properties: { face_id: 'synthetic-face' },
+      },
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, { ok: true, ignored: true });
+    assert.equal(tracker.reads, 2);
+    assert.equal(tracker.mutations, 0);
+  } finally {
+    router._setSupabaseAdminForTest(undefined);
+  }
 });
 
 test('missing server configuration fails closed and readiness is bounded', async () => {
@@ -212,9 +415,17 @@ test('all conversation-create paths use the canonical authenticated callback bui
   assert.doesNotMatch(legacyInternal, /callback_url:\s*`\$\{callbackBase\}/);
   assert.match(
     activeWebhook,
-    /router\.post\(\s*['"]\/tavus['"],\s*authenticateTavusWebhookRequest,\s*express\.json/,
+    /router\.post\(\s*['"]\/tavus['"],\s*authenticateTavusWebhookRequest,\s*parseTavusWebhookJson,\s*handleTavusWebhookJsonError/,
   );
+  assert.ok(
+    activeWebhook.indexOf('authenticateTavusWebhookRequest,\n  parseTavusWebhookJson')
+      < activeWebhook.indexOf('validateTavusWebhookPayload(body)'),
+    'sender authentication and bounded JSON parsing must precede payload validation',
+  );
+  assert.match(activeWebhook, /express\.json\(\{ limit: '10mb' \}\)/);
+  assert.match(activeWebhook, /error: 'invalid_webhook_payload'/);
   assert.match(legacyWebhook, /verifyTavusWebhookRequest/);
+  assert.match(legacyWebhook, /validateTavusWebhookPayload/);
   assert.doesNotMatch(legacyWebhook, /if\s*\(!secret\)\s*return true/);
 
   assert.ok(

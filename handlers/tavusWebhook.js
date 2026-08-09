@@ -2,6 +2,18 @@
 require('dotenv').config();
 const { supabase } = require('../src/lib/supabaseClient');
 const { verifyTavusWebhookRequest } = require('../src/lib/tavusWebhookAuth');
+const {
+  getOwnPath,
+  validateTavusWebhookPayload,
+} = require('../src/lib/tavusWebhookPayload');
+
+function firstOwnValue(body, paths) {
+  for (const path of paths) {
+    const candidate = getOwnPath(body, path);
+    if (candidate.found) return candidate.value;
+  }
+  return undefined;
+}
 
 async function handleTavusWebhook(req, res) {
   try {
@@ -16,12 +28,30 @@ async function handleTavusWebhook(req, res) {
       });
     }
 
-    const body = req.body || {};
-    const conversation_id = body.conversation_id || body.id || null;
-    const video_url = body.video_url || body.url || null;
+    const body = req.body;
+    const validation = validateTavusWebhookPayload(body);
+    if (!validation.ok) {
+      return res.status(400).json({
+        ok: false,
+        error: 'invalid_webhook_payload',
+      });
+    }
+    if (!validation.supported || validation.eventType !== 'application.recording_ready') {
+      return res.status(200).json({ ok: true, ignored: true });
+    }
 
-    if (!conversation_id) {
-      return res.status(400).json({ error: 'Missing conversation_id' });
+    const conversation_id = validation.conversationId;
+    const video_url = firstOwnValue(body, [
+      'properties.recording_url',
+      'properties.video_url',
+      'recording_url',
+      'video_url',
+      'payload.recording_url',
+      'payload.video_url',
+      'output.video_url',
+    ]);
+    if (typeof video_url !== 'string' || !video_url.trim()) {
+      return res.status(200).json({ ok: true, ignored: true });
     }
 
     const { data: interview, error: iErr } = await supabase

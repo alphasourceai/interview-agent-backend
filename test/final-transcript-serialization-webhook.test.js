@@ -1409,18 +1409,17 @@ test('contradictory interview and conversation binding fails closed without touc
   });
 });
 
-test('interview-id-only callback fails closed before claim, scoring, storage, or finalize', async () => {
+test('interview-id-only callback is rejected by the common envelope before any reconciliation mutation', async () => {
   await withScenario({}, async (app, db) => {
     const before = structuredClone(db.interview);
     const response = await postTranscription(app, {
       interviewId: ID.interview,
       omitConversationId: true,
     });
-    assert.equal(response.status, 409);
+    assert.equal(response.status, 400);
     assert.deepEqual(await response.json(), {
       ok: false,
-      outcome: 'binding_not_found',
-      retryable: false,
+      error: 'invalid_webhook_payload',
     });
     assert.deepEqual(db.interview, before);
     assert.equal(db.tracker.claimCalls, 0);

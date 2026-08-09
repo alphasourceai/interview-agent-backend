@@ -24,14 +24,20 @@ const {
 const { isTerminalInterviewToolName } = require('../src/lib/tavusTerminalTool');
 const { authenticateTavusWebhookRequest } = require('../src/lib/tavusWebhookAuth');
 const { tavusHttpClient: defaultTavusHttpClient } = require('../src/lib/tavusHttpClient');
+const {
+  buildTavusWebhookValidationTelemetry,
+  getOwnPath,
+  validateTavusWebhookPayload,
+} = require('../src/lib/tavusWebhookPayload');
 
 let activeTavusHttpClient = defaultTavusHttpClient;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const supabaseAdmin = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+const defaultSupabaseAdmin = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
   : null;
+let supabaseAdmin = defaultSupabaseAdmin;
 
 const TRANSCRIPTS_BUCKET = process.env.SUPABASE_TRANSCRIPTS_BUCKET || 'transcripts';
 
@@ -50,12 +56,8 @@ function pickFirst(...vals) {
 
 function fromAny(obj, ...paths) {
   for (const p of paths) {
-    try {
-      const parts = p.split('.');
-      let cur = obj;
-      for (const key of parts) cur = cur?.[key];
-      if (cur !== undefined) return cur;
-    } catch {}
+    const result = getOwnPath(obj, p);
+    if (result.found) return result.value;
   }
   return undefined;
 }
@@ -131,32 +133,6 @@ function isDownloadableRecordingUrl(url) {
   if (!/^https?:\/\//i.test(String(url))) return false;
   if (isDailyRoomUrl(url)) return false;
   return true;
-}
-
-function summarizeUrlValue(value) {
-  const raw = typeof value === 'string' ? value.trim() : '';
-  if (!raw) return { has_url: false, host: null, path: null };
-  try {
-    const parsed = new URL(raw);
-    return {
-      has_url: true,
-      host: parsed.host || null,
-      path: parsed.pathname || null
-    };
-  } catch {
-    return { has_url: true, host: null, path: null };
-  }
-}
-
-function summarizeUrlValues(values) {
-  const list = (values || []).filter((value) => typeof value === 'string' && value.trim());
-  const first = summarizeUrlValue(list[0]);
-  return {
-    count: list.length,
-    has_url: list.length > 0,
-    host: first.host,
-    path: first.path
-  };
 }
 
 function isMissingColumnError(error) {
@@ -2407,11 +2383,28 @@ function sanitizeTranscriptArray(arr) {
 
 router.get('/_ping', (_req, res) => res.json({ ok: true }));
 
+const parseTavusWebhookJson = express.json({ limit: '10mb' });
+
+function handleTavusWebhookJsonError(error, _req, res, next) {
+  if (!error) return next();
+  console.warn('[webhook] tavus_webhook_payload_rejected', {
+    validation_category: 'invalid_root',
+    identifier_present: false,
+    identifier_conflict: false,
+    event_type: null,
+  });
+  return res.status(400).json({
+    ok: false,
+    error: 'invalid_webhook_payload',
+  });
+}
+
 // Primary webhook entry
 router.post(
   '/tavus',
   authenticateTavusWebhookRequest,
-  express.json({ limit: '10mb' }),
+  parseTavusWebhookJson,
+  handleTavusWebhookJsonError,
   async (req, res) => {
   let requestId = null;
   let eventType = null;
@@ -2422,25 +2415,26 @@ router.post(
   let sentryClientId = null;
   let isFinalTranscriptEvent = false;
   try {
-    const body = req.body || {};
+    const body = req.body;
+    const validation = validateTavusWebhookPayload(body);
+    if (!validation.ok) {
+      console.warn(
+        '[webhook] tavus_webhook_payload_rejected',
+        buildTavusWebhookValidationTelemetry(validation),
+      );
+      return res.status(400).json({
+        ok: false,
+        error: 'invalid_webhook_payload',
+      });
+    }
+
     requestId = getRequestId(req, body);
     Sentry.setTag('route_name', 'tavus_webhook');
     Sentry.setTag('surface', 'backend');
     const eventReceivedAt = new Date();
     const eventReceivedAtIso = eventReceivedAt.toISOString();
 
-    const eventTypeRaw = pickFirst(
-      fromAny(body, 'event_type'),
-      fromAny(body, 'eventType'),
-      fromAny(body, 'type'),
-      fromAny(body, 'payload.event_type'),
-      fromAny(body, 'payload.eventType'),
-      fromAny(body, 'payload.type'),
-      fromAny(body, 'event'),
-      fromAny(body, 'status')
-    );
-
-    eventType = String(eventTypeRaw || '').toLowerCase();
+    eventType = validation.eventType;
     const isTranscriptionReady = eventType === 'application.transcription_ready';
     isFinalTranscriptEvent = isTranscriptionReady;
     if (!isTranscriptionReady && requestId) {
@@ -2473,22 +2467,7 @@ router.post(
       fromAny(body, 'payload.metadata.interview_id')
     );
 
-    conversationId = pickFirst(
-      fromAny(body, 'conversation_id'),
-      fromAny(body, 'properties.conversation_id'),
-      fromAny(body, 'properties.conversationId'),
-      fromAny(body, 'metadata.conversation_id'),
-      fromAny(body, 'payload.conversation_id'),
-      fromAny(body, 'payload.properties.conversation_id'),
-      fromAny(body, 'conversation.id'),
-      fromAny(body, 'payload.conversation.id'),
-      fromAny(body, 'application_id'),
-      fromAny(body, 'properties.application_id'),
-      fromAny(body, 'payload.application_id'),
-      fromAny(body, 'payload.properties.application_id'),
-      fromAny(body, 'application.id'),
-      fromAny(body, 'payload.application.id')
-    );
+    conversationId = validation.conversationId;
     Sentry.addBreadcrumb({
       category: 'webhook',
       message: 'tavus webhook event received',
@@ -2516,9 +2495,6 @@ router.post(
       'payload.video_url',
       'output.video_url'
     );
-    const recordingUrlSummary = summarizeUrlValues(recordingUrls);
-    const videoUrlSummary = summarizeUrlValues(videoUrls);
-
     console.log('[webhook] received', isTranscriptionReady ? {
       event_type: 'application.transcription_ready',
       has_binding_ids: !!(interviewId || conversationId),
@@ -2530,44 +2506,22 @@ router.post(
     } : {
       request_id: requestId || null,
       received_at: eventReceivedAtIso,
-      event_type_raw: eventTypeRaw ?? null,
       event_type: eventType || null,
       interview_id: interviewId || null,
       conversation_id: conversationId || null,
-      has_recording_url: recordingUrlSummary.has_url,
-      recording_url_host: recordingUrlSummary.host,
-      recording_url_path: recordingUrlSummary.path,
-      recording_url_count: recordingUrlSummary.count,
-      has_video_url: videoUrlSummary.has_url,
-      video_url_host: videoUrlSummary.host,
-      video_url_path: videoUrlSummary.path,
-      video_url_count: videoUrlSummary.count
+      has_recording_url: recordingUrls.length > 0,
+      recording_url_count: recordingUrls.length,
+      has_video_url: videoUrls.length > 0,
+      video_url_count: videoUrls.length
     });
 
     if (!isKnownEvent) {
       console.log('[webhook] unknown_event_ignored', {
         request_id: requestId || null,
         event_type: eventType || null,
-        conversation_id: conversationId || null,
-        has_interview_id: !!interviewId
+        identifier_present: true,
       });
       return res.status(200).json({ ok: true, ignored: true });
-    }
-
-    if (!interviewId && !conversationId) {
-      console.warn('[webhook] unsafe_event_ignored', isTranscriptionReady ? {
-        event_type: 'application.transcription_ready',
-        reason: 'missing_binding_ids',
-      } : {
-        request_id: requestId || null,
-        event_type: eventType || null,
-        reason: 'missing_binding_ids',
-        conversation_id: null,
-        has_interview_id: false
-      });
-      return isTranscriptionReady
-        ? res.status(400).json({ ok: false, outcome: 'missing_binding_ids', retryable: false })
-        : res.status(200).json({ ok: true, ignored: true });
     }
 
     if (!supabaseAdmin) {
@@ -2628,9 +2582,7 @@ router.post(
         conversation_id: conversationId || null,
         ignored: true,
         has_interview_id: !!interviewId,
-        has_conversation_id: !!conversationId,
-        top_keys: Object.keys(body || {}),
-        payload_keys: Object.keys(body?.payload || {})
+        has_conversation_id: !!conversationId
       });
       return isTranscriptionReady
         ? res.status(404).json({ ok: false, outcome: 'binding_not_found', retryable: false })
@@ -2791,7 +2743,7 @@ router.post(
                 conversation_id: conversationId || null,
                 interview_id: interview.id,
                 tool_name: toolName,
-                tool_arguments: toolArgs ?? null
+                has_tool_arguments: toolArgs !== undefined && toolArgs !== null
               });
             }
           }
@@ -2810,7 +2762,11 @@ router.post(
     if (isShutdown) {
       updates.status = 'Ended';
       updates.vendor_end_reason = String(pickFirst(
-        fromAny(body, 'reason'), fromAny(body, 'properties.reason'), fromAny(body, 'payload.reason'), fromAny(body, 'status')
+        fromAny(body, 'properties.shutdown_reason'),
+        fromAny(body, 'reason'),
+        fromAny(body, 'properties.reason'),
+        fromAny(body, 'payload.reason'),
+        fromAny(body, 'status')
       ) || 'vendor_end_event').slice(0, 120);
       console.log('[webhook] interview ended', {
         request_id: requestId || null,
@@ -2892,25 +2848,19 @@ router.post(
         fromAny(body, 'payload.video_url'),
         fromAny(body, 'output.video_url')
       );
-      const recordingUrlLog = summarizeUrlValue(recordingUrlForLog);
-      const videoUrlLog = summarizeUrlValue(videoUrlForLog);
       const recordingFieldSnapshot = {
-        has_recording_url: recordingUrlLog.has_url,
-        recording_url_host: recordingUrlLog.host,
-        recording_url_path: recordingUrlLog.path,
-        has_video_url: videoUrlLog.has_url,
-        video_url_host: videoUrlLog.host,
-        video_url_path: videoUrlLog.path,
-        bucket_name: fromAny(body, 'bucket_name'),
+        has_recording_url: typeof recordingUrlForLog === 'string' && !!recordingUrlForLog.trim(),
+        has_video_url: typeof videoUrlForLog === 'string' && !!videoUrlForLog.trim(),
+        has_bucket_name: !!fromAny(body, 'bucket_name'),
         has_s3_key: !!fromAny(body, 's3_key'),
         duration: fromAny(body, 'duration'),
-        properties_bucket_name: fromAny(body, 'properties.bucket_name'),
+        properties_has_bucket_name: !!fromAny(body, 'properties.bucket_name'),
         properties_has_s3_key: !!fromAny(body, 'properties.s3_key'),
         properties_duration: fromAny(body, 'properties.duration'),
-        payload_bucket_name: fromAny(body, 'payload.bucket_name'),
+        payload_has_bucket_name: !!fromAny(body, 'payload.bucket_name'),
         payload_has_s3_key: !!fromAny(body, 'payload.s3_key'),
         payload_duration: fromAny(body, 'payload.duration'),
-        output_bucket_name: fromAny(body, 'output.bucket_name'),
+        output_has_bucket_name: !!fromAny(body, 'output.bucket_name'),
         output_has_s3_key: !!fromAny(body, 'output.s3_key'),
         output_duration: fromAny(body, 'output.duration')
       };
@@ -3456,4 +3406,7 @@ router.post(
 module.exports = router;
 router._setTavusHttpClientForTest = (client) => {
   activeTavusHttpClient = client || defaultTavusHttpClient;
+};
+router._setSupabaseAdminForTest = (client) => {
+  supabaseAdmin = client === undefined ? defaultSupabaseAdmin : client;
 };
