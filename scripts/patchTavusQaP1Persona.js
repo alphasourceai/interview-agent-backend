@@ -1,6 +1,8 @@
 // Manual QA-only script. Do not run against production persona.
 'use strict';
 
+const { createTavusHttpClient } = require('../src/lib/tavusHttpClient');
+
 try {
   require('dotenv').config();
 } catch (error) {
@@ -10,7 +12,7 @@ try {
 
 const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
 const PERSONA_ID = String(process.env.TAVUS_PERSONA_ID || '').trim();
-const API_BASE = String(process.env.TAVUS_API_BASE_URL || 'https://tavusapi.com/v2').trim().replace(/\/+$/, '');
+const API_BASE = String(process.env.TAVUS_API_BASE_URL || '').trim().replace(/\/+$/, '') || undefined;
 const APPLY = process.argv.includes('--apply');
 
 const systemPrompt = `You are the alphaScreen structured interview persona.
@@ -140,9 +142,8 @@ async function main() {
   requireEnv('TAVUS_API_KEY', API_KEY);
   requireEnv('TAVUS_PERSONA_ID', PERSONA_ID);
 
-  const url = `${API_BASE}/personas/${encodeURIComponent(PERSONA_ID)}`;
   console.log('Target Tavus persona id:', PERSONA_ID);
-  console.log('Tavus API base:', API_BASE);
+  console.log('Tavus API base:', API_BASE || 'shared-client-default');
   console.warn('WARNING: This script should only be run against the QA persona.');
 
   if (!APPLY) {
@@ -151,36 +152,25 @@ async function main() {
     return;
   }
 
-  if (typeof fetch !== 'function') {
-    throw new Error('This script requires a Node runtime with built-in fetch.');
-  }
-
-  const response = await fetch(url, {
-    method: 'PATCH',
-    headers: {
-      'x-api-key': API_KEY,
-      'Content-Type': 'application/json-patch+json'
-    },
-    body: JSON.stringify(patch)
-  });
-
-  const text = await response.text();
-  let body = text;
+  const client = createTavusHttpClient({ apiKey: API_KEY, baseUrl: API_BASE });
+  let body;
   try {
-    body = text ? JSON.parse(text) : null;
-  } catch {}
-
-  if (!response.ok) {
+    body = await client.patchPersona(PERSONA_ID, patch, {
+      contentType: 'application/json-patch+json',
+    });
+  } catch (error) {
     console.error('Tavus persona patch failed:', {
-      status: response.status,
-      statusText: response.statusText,
-      response: body
+      status: error?.status || null,
+      providerCode: error?.providerCode || null,
+      category: error?.category || 'provider_error',
+      attemptCount: Number.isInteger(error?.attemptCount) ? error.attemptCount : 1,
+      timeout: error?.timeout === true,
     });
     process.exit(1);
   }
 
   console.log('Tavus persona patch succeeded:', {
-    status: response.status,
+    status: 200,
     persona_id: body?.persona_id || body?.id || PERSONA_ID,
     updated_at: body?.updated_at || null
   });

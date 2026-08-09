@@ -826,6 +826,7 @@ function buildApp(db, buildOptions = {}) {
     app.use('/webhook', router);
     return {
       app,
+      router,
       restore() {
         Module._load = originalLoad;
         for (const filename of [routePath, scoringPath, roleAvailabilityPath, backfillPath, analysisV2Path]) {
@@ -899,9 +900,9 @@ async function postWebhookEvent(app, body, fetchImpl = fetch) {
 
 async function withScenario(options, callback) {
   const db = makeDb(options);
-  const { app, restore } = buildApp(db);
+  const { app, router, restore } = buildApp(db);
   try {
-    await callback(app, db);
+    await callback(app, db, router);
   } finally {
     await drainDeferred();
     restore();
@@ -947,18 +948,16 @@ function assertNoReconciliationSideEffects(db) {
 }
 
 if (!IS_REAL_SENTRY_PROBE) test('current Tavus end_call tool ends the provider conversation and requests interview ending', async () => {
-  await withScenario({ failureCode: null }, async (app, db) => {
-    const originalFetch = global.fetch;
+  await withScenario({ failureCode: null }, async (app, db, router) => {
     const previousApiKey = process.env.TAVUS_API_KEY;
     const providerCalls = [];
     process.env.TAVUS_API_KEY = 'synthetic-tavus-key';
-    global.fetch = async (url, options) => {
-      if (String(url).startsWith(`https://tavusapi.com/v2/conversations/${ID.conversation}/end`)) {
-        providerCalls.push({ url: String(url), method: options?.method });
-        return { ok: true, status: 200, text: async () => '' };
-      }
-      return originalFetch(url, options);
-    };
+    router._setTavusHttpClientForTest({
+      async endConversation(conversationId) {
+        providerCalls.push({ conversationId, method: 'POST' });
+        return null;
+      },
+    });
 
     try {
       const response = await postWebhookEvent(app, {
@@ -966,13 +965,14 @@ if (!IS_REAL_SENTRY_PROBE) test('current Tavus end_call tool ends the provider c
         conversation_id: ID.conversation,
         tool_name: 'end_call',
         tool_arguments: { reason: 'natural_conclusion' },
-      }, originalFetch);
+      });
       assert.equal(response.status, 200);
       assert.equal(providerCalls.length, 1);
+      assert.equal(providerCalls[0].conversationId, ID.conversation);
       assert.equal(providerCalls[0].method, 'POST');
       assert.equal(db.interview.status, 'ending_requested');
     } finally {
-      global.fetch = originalFetch;
+      router._setTavusHttpClientForTest(null);
       if (previousApiKey === undefined) delete process.env.TAVUS_API_KEY;
       else process.env.TAVUS_API_KEY = previousApiKey;
     }

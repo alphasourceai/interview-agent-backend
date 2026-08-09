@@ -2,8 +2,8 @@
 'use strict';
 
 require('dotenv').config();
-const axios = require('axios');
 const { ensureTavusDocumentForRole, missingTavusKbError } = require('../lib/tavusDocuments');
+const { tavusHttpClient: defaultTavusHttpClient } = require('../src/lib/tavusHttpClient');
 const {
   annotateTavusCreateError,
   deterministicConversationName,
@@ -51,6 +51,7 @@ function resolveSilenceEngagementOwner(env = process.env) {
  * @param {Object} [options] - { companyName, maxInterviewMinutes }
  */
 async function createTavusInterviewHandler(candidate, role, webhookUrl, options = {}) {
+  const tavusHttpClient = options.tavusHttpClient || defaultTavusHttpClient;
   const API_KEY = String(process.env.TAVUS_API_KEY || '').trim();
   const REPLICA_ID = String(process.env.TAVUS_REPLICA_ID || '').trim();
   const PERSONA_ID = String(process.env.TAVUS_PERSONA_ID || '').trim();
@@ -184,14 +185,7 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
   }
 
   try {
-    const resp = await axios.post('https://tavusapi.com/v2/conversations', payload, {
-      headers: {
-        'x-api-key': API_KEY,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    const data = resp?.data || {};
+    const data = await tavusHttpClient.createConversation(payload) || {};
     if (!data.conversation_id || !(data.conversation_url || data.url || data.link)) {
       const incomplete = new Error('Tavus returned an incomplete conversation response');
       incomplete.code = 'tavus_incomplete_response';
@@ -213,16 +207,15 @@ async function createTavusInterviewHandler(candidate, role, webhookUrl, options 
         silenceEngagementOwner === SILENCE_ENGAGEMENT_OWNER_APPLICATION_INACTIVITY,
     };
   } catch (e) {
-    const status = e.response?.status || 500;
-    const details = e.response?.data || null;
-    const providerCode = typeof details === 'object' && details
-      ? String(details.code || details.error || '').slice(0, 80)
-      : null;
+    const status = Number.isInteger(e?.status) ? e.status : 500;
+    const providerCode = typeof e?.providerCode === 'string' ? e.providerCode : null;
     console.error('[tavus-interview-error] tavus_request_failed', {
       role_id: role?.id || null,
-      candidate_id: candidate?.id || candidate?.candidate_id || null,
       httpStatus: status,
       providerCode: providerCode || null,
+      category: e?.category || 'provider_error',
+      attemptCount: Number.isInteger(e?.attemptCount) ? e.attemptCount : 1,
+      timeout: e?.timeout === true,
     });
     if (status === 400 && (payload?.document_ids || []).length) {
       console.error(

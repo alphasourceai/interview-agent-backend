@@ -1,6 +1,6 @@
 'use strict';
 
-const axios = require('axios');
+const { createTavusHttpClient } = require('./tavusHttpClient');
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const LIST_PAGE_SIZE = 100;
@@ -176,25 +176,33 @@ function validatePaginationMetadata(body) {
   return { malformed: false, hasAdditionalPage: hasMoreSignal };
 }
 
-function createTavusReadOnlyProvider({ apiKey = process.env.TAVUS_API_KEY, httpClient = axios } = {}) {
+function createTavusReadOnlyProvider({
+  apiKey = process.env.TAVUS_API_KEY,
+  tavusHttpClient = null,
+  httpClient = null,
+} = {}) {
   const key = typeof apiKey === 'string' ? apiKey.trim() : '';
+  const client = tavusHttpClient || (httpClient
+    ? {
+        async listConversations(query) {
+          const response = await httpClient.get('/conversations', { params: query });
+          return response?.data;
+        },
+      }
+    : createTavusHttpClient({ apiKey: key }));
   return {
     async findExactConversations(externalReference) {
       if (!key) return boundedScanResult('unavailable');
       const exactName = typeof externalReference === 'string' ? externalReference.trim() : '';
       if (!exactName || exactName.length > 100) return boundedScanResult('incomplete_malformed_page');
 
-      let response;
+      let body;
       try {
-        response = await httpClient.get('https://tavusapi.com/v2/conversations', {
-          headers: { 'x-api-key': key },
-          params: { limit: LIST_PAGE_SIZE, page: 1 },
-        });
+        body = await client.listConversations({ limit: LIST_PAGE_SIZE, page: 1 });
       } catch (_) {
         return boundedScanResult('unavailable', { pagesRequested: 1 });
       }
 
-      const body = response?.data;
       const rows = body?.data;
       const totalCount = body?.total_count;
       if (!Array.isArray(rows)) {

@@ -1,8 +1,8 @@
 'use strict';
 
 const express = require('express');
-const axios = require('axios');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
+const { tavusHttpClient: defaultTavusHttpClient } = require('../src/lib/tavusHttpClient');
 const {
   decodeTelemetryAuthorization,
   diagnosticDedupeKey,
@@ -10,6 +10,7 @@ const {
 } = require('../src/lib/interviewReliabilityDiagnostics');
 
 const router = express.Router();
+let activeTavusHttpClient = defaultTavusHttpClient;
 const EARLY_END_GRACE_MS = 15000;
 const EARLY_END_WINDOW_MS = 20 * 60 * 1000;
 const EARLY_END_SUMMARY = 'Interview ended before substantive responses were captured.';
@@ -186,28 +187,18 @@ router.post('/tavus/end-conversation', express.json({ limit: '1mb' }), async (re
     }
 
     try {
-      await axios.post(
-        `https://tavusapi.com/v2/conversations/${encodeURIComponent(conversation_id)}/end`,
-        {},
-        {
-          headers: {
-            'x-api-key': apiKey,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
+      await activeTavusHttpClient.endConversation(conversation_id);
     } catch (e) {
-      const upstreamStatus = e?.response?.status;
-      const upstreamData = e?.response?.data;
-      const detail = typeof upstreamData === 'string'
-        ? upstreamData
-        : (upstreamData ? JSON.stringify(upstreamData) : (e?.message || 'Failed to end Tavus conversation'));
+      const upstreamStatus = e?.status;
+      const detail = 'Tavus could not end the conversation.';
       console.error('[tavus/end-conversation] tavus_end_failed', {
         request_id,
-        conversation_id,
         reason,
         status: upstreamStatus,
-        detail
+        providerCode: e?.providerCode || null,
+        category: e?.category || 'provider_error',
+        attemptCount: Number.isInteger(e?.attemptCount) ? e.attemptCount : 1,
+        timeout: e?.timeout === true,
       });
       if (isFailureEnd) {
         await supabaseAdmin
@@ -510,5 +501,8 @@ router.post(
 );
 
 module.exports = router;
+router._setTavusHttpClientForTest = (client) => {
+  activeTavusHttpClient = client || defaultTavusHttpClient;
+};
 module.exports.createClientTelemetryHandler = createClientTelemetryHandler;
 module.exports.isIdempotentEndState = isIdempotentEndState;

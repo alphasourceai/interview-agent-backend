@@ -130,28 +130,25 @@ test('R1 red Tavus regression: transmitted timeout is classified ambiguous and u
   process.env.SUPABASE_URL ||= 'http://127.0.0.1:54321';
   process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-service-role-key';
   process.env.SUPABASE_ANON_KEY ||= 'test-anon-key';
-  const axios = require('axios');
-  const originalPost = axios.post;
   let sentPayload = null;
-  axios.post = async (_url, payload) => {
-    sentPayload = payload;
-    const error = new Error('socket hang up after request transmission');
-    error.code = 'ECONNRESET';
-    error.request = {};
-    throw error;
+  const tavusHttpClient = {
+    async createConversation(payload) {
+      sentPayload = payload;
+      const error = new Error('socket hang up after request transmission');
+      error.code = 'ECONNRESET';
+      error.category = 'network';
+      error.attemptCount = 1;
+      throw error;
+    },
   };
-  try {
-    const { createTavusInterviewHandler } = require('../handlers/createTavusInterview');
-    const error = await createTavusInterviewHandler(
-      { id: ID.candidate, name: 'Synthetic' },
-      { id: ID.role, title: 'Synthetic role', tavus_document_id: 'document-test' },
-      'https://example.test/webhook',
-      { interviewId: ID.replacementInterview, maxInterviewMinutes: 10 },
-    ).then(() => null, (caught) => caught);
-    assert.equal(error?.failureCategory, 'ambiguous_acceptance');
-    assert.equal(error?.retryable, false);
-    assert.equal(sentPayload?.conversation_name, `alphascreen-interview-${ID.replacementInterview}`);
-  } finally {
-    axios.post = originalPost;
-  }
+  const { createTavusInterviewHandler } = require('../handlers/createTavusInterview');
+  const error = await createTavusInterviewHandler(
+    { id: ID.candidate, name: 'Synthetic' },
+    { id: ID.role, title: 'Synthetic role', tavus_document_id: 'document-test' },
+    'https://example.test/webhook',
+    { interviewId: ID.replacementInterview, maxInterviewMinutes: 10, tavusHttpClient },
+  ).then(() => null, (caught) => caught);
+  assert.equal(error?.failureCategory, 'ambiguous_acceptance');
+  assert.equal(error?.retryable, false);
+  assert.equal(sentPayload?.conversation_name, `alphascreen-interview-${ID.replacementInterview}`);
 });

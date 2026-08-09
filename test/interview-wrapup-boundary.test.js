@@ -2,7 +2,6 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const axios = require('axios');
 const {
   MAX_INTERVIEW_MINUTES,
   PROVIDER_CLOSING_GRACE_SECONDS,
@@ -13,7 +12,6 @@ const {
 const SYNTHETIC_INTERVIEW_ID = '11111111-1111-4111-8111-111111111111';
 
 async function captureConversationPayload(maxInterviewMinutes = 10) {
-  const originalPost = axios.post;
   const previousEnv = {
     SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY,
     SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY,
@@ -29,14 +27,14 @@ async function captureConversationPayload(maxInterviewMinutes = 10) {
   process.env.TAVUS_API_KEY = 'synthetic-test-key';
   process.env.TAVUS_PERSONA_ID = 'synthetic-test-persona';
   process.env.TAVUS_REPLICA_ID = 'synthetic-test-replica';
-  axios.post = async (_url, body) => {
-    payload = body;
-    return {
-      data: {
+  const tavusHttpClient = {
+    async createConversation(body) {
+      payload = body;
+      return {
         conversation_id: 'synthetic-conversation',
         conversation_url: 'https://example.invalid/synthetic-conversation',
-      },
-    };
+      };
+    },
   };
 
   try {
@@ -54,11 +52,11 @@ async function captureConversationPayload(maxInterviewMinutes = 10) {
         companyName: 'Synthetic Company',
         interviewId: SYNTHETIC_INTERVIEW_ID,
         maxInterviewMinutes,
+        tavusHttpClient,
       },
     );
     return payload;
   } finally {
-    axios.post = originalPost;
     for (const [key, value] of Object.entries(previousEnv)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;

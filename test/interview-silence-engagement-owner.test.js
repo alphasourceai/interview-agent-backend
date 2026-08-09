@@ -4,7 +4,6 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const { readFileSync } = require('node:fs');
 const { join } = require('node:path');
-const axios = require('axios');
 
 process.env.SUPABASE_URL ||= 'http://127.0.0.1:54321';
 process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'synthetic-service-role-key';
@@ -48,7 +47,6 @@ function contextFor(owner) {
 }
 
 async function captureConversation(owner, options = {}) {
-  const originalPost = axios.post;
   const originalInfo = console.info;
   const previousEnv = Object.fromEntries(ENV_KEYS.map((key) => [key, process.env[key]]));
   const infoEvents = [];
@@ -64,14 +62,14 @@ async function captureConversation(owner, options = {}) {
   else process.env.INTERVIEW_SILENCE_ENGAGEMENT_OWNER = owner;
 
   console.info = (...args) => infoEvents.push(args);
-  axios.post = async (_url, body) => {
-    payload = body;
-    return {
-      data: {
+  const tavusHttpClient = {
+    async createConversation(body) {
+      payload = body;
+      return {
         conversation_id: 'synthetic-conversation',
         conversation_url: 'https://example.invalid/synthetic-conversation',
-      },
-    };
+      };
+    },
   };
 
   try {
@@ -88,12 +86,12 @@ async function captureConversation(owner, options = {}) {
         companyName: 'Synthetic Company',
         interviewId: INTERVIEW_ID,
         maxInterviewMinutes: 10,
+        tavusHttpClient,
         ...options,
       },
     );
     return { infoEvents, payload, result };
   } finally {
-    axios.post = originalPost;
     console.info = originalInfo;
     for (const [key, value] of Object.entries(previousEnv)) {
       if (value === undefined) delete process.env[key];

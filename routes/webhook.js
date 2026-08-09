@@ -23,6 +23,9 @@ const {
 } = require('../src/lib/unansweredCandidateQuestions');
 const { isTerminalInterviewToolName } = require('../src/lib/tavusTerminalTool');
 const { authenticateTavusWebhookRequest } = require('../src/lib/tavusWebhookAuth');
+const { tavusHttpClient: defaultTavusHttpClient } = require('../src/lib/tavusHttpClient');
+
+let activeTavusHttpClient = defaultTavusHttpClient;
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -2737,29 +2740,24 @@ router.post(
             tool_name: toolName
           });
         } else {
-          const endResp = await fetch(
-            `https://tavusapi.com/v2/conversations/${encodeURIComponent(conversationId)}/end`,
-            {
-              method: 'POST',
-              headers: {
-                'x-api-key': apiKey,
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify({})
-            }
-          );
-
-          if (!endResp.ok) {
-            const detail = await endResp.text().catch(() => '');
+          let tavusEndSucceeded = false;
+          try {
+            await activeTavusHttpClient.endConversation(conversationId);
+            tavusEndSucceeded = true;
+          } catch (endError) {
             console.error('[webhook] tool_call tavus end failed', {
               request_id: requestId || null,
-              conversation_id: conversationId || null,
               interview_id: interview.id,
               tool_name: toolName,
-              status: endResp.status,
-              detail: detail || null
+              status: endError?.status || null,
+              providerCode: endError?.providerCode || null,
+              category: endError?.category || 'provider_error',
+              attemptCount: Number.isInteger(endError?.attemptCount) ? endError.attemptCount : 1,
+              timeout: endError?.timeout === true,
             });
-          } else if (preserveFailureStatus) {
+          }
+
+          if (tavusEndSucceeded && preserveFailureStatus) {
             statusAfter = interview.status || 'Incomplete';
             console.log('[webhook] tool_call failure_status_preserved', {
               request_id: requestId || null,
@@ -2767,7 +2765,7 @@ router.post(
               interview_id: interview.id,
               failure_code: interview.failure_code
             });
-          } else {
+          } else if (tavusEndSucceeded) {
             const { error: toolUpdateError } = await supabaseAdmin
               .from('interviews')
               .update({
@@ -3456,3 +3454,6 @@ router.post(
 );
 
 module.exports = router;
+router._setTavusHttpClientForTest = (client) => {
+  activeTavusHttpClient = client || defaultTavusHttpClient;
+};

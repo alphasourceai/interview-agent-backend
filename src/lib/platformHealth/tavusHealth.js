@@ -1,13 +1,13 @@
 'use strict';
 
 const { isConfiguredTavusWebhookSecret } = require('../tavusWebhookAuth');
+const { createTavusHttpClient } = require('../tavusHttpClient');
 
 const {
   cachedLiveCall,
   costSummary,
   envConfigured,
   envValue,
-  fetchJson,
   metric,
   readiness,
   safeErrorMessage,
@@ -28,16 +28,8 @@ const DEFAULT_TAVUS_RATE_CARD = {
 };
 
 function tavusApiBase(env) {
-  return (envValue(env, ['TAVUS_API_BASE', 'TAVUS_API_BASE_URL']) || 'https://tavusapi.com/v2').replace(/\/+$/, '');
-}
-
-function tavusHeaders(env) {
-  const value = envValue(env, ['TAVUS_API_KEY']);
-  return {
-    'x-api-key': value,
-    Authorization: `Bearer ${value}`,
-    'Content-Type': 'application/json',
-  };
+  const configured = envValue(env, ['TAVUS_API_BASE', 'TAVUS_API_BASE_URL']);
+  return configured ? configured.replace(/\/+$/, '') : null;
 }
 
 function numberFromEnv(env, name, fallback) {
@@ -190,9 +182,22 @@ function buildTavusCostEstimate({ env, estimatedMinutes }) {
 }
 
 async function fetchTavusConversationPage(context) {
-  const url = new URL(`${tavusApiBase(context.env)}/conversations`);
-  url.searchParams.set('limit', '100');
-  const data = await fetchJson(context, url.toString(), { headers: tavusHeaders(context.env) });
+  const transport = typeof context.fetchImpl === 'function'
+    ? async (url, options) => {
+        const response = await context.fetchImpl(url, options);
+        return {
+          statusCode: response.status,
+          headers: response.headers,
+          body: { text: () => response.text() },
+        };
+      }
+    : undefined;
+  const client = context.tavusHttpClient || createTavusHttpClient({
+    apiKey: envValue(context.env, ['TAVUS_API_KEY']),
+    baseUrl: tavusApiBase(context.env),
+    transport,
+  });
+  const data = await client.listConversations({ limit: 100 }, { health: true });
   const rows = Array.isArray(data?.data)
     ? data.data
     : Array.isArray(data?.conversations)
@@ -222,7 +227,7 @@ async function buildTavusHealth(context) {
     try {
       live = await cachedLiveCall(
         context,
-        `tavus:${context.dateRange.date_from}:${context.dateRange.date_to}:${tavusApiBase(env)}`,
+        `tavus:${context.dateRange.date_from}:${context.dateRange.date_to}:${tavusApiBase(env) || 'default'}`,
         () => fetchTavusConversationPage(context)
       );
     } catch (error) {
