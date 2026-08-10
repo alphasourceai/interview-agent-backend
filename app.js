@@ -6003,22 +6003,54 @@ app.post('/internal/otp/cleanup', async (req, res) => {
 
   try {
     const nowIso = new Date().toISOString()
-    const { data, error } = await supabaseAdmin
-      .from('otp_tokens')
-      .delete()
-      // Durable cutover rows retain non-sensitive history for role-JD and
-      // recovery diagnostics until a later explicit retirement migration.
-      .neq('code', '[removed]')
-      .or(`used.eq.true,expires_at.lt.${nowIso}`)
-      .select('id')
+    // Production PostgREST rejects a DELETE `.or(...)` predicate that mixes
+    // the legacy `used` flag with `expires_at`, even though both columns exist.
+    // Resolve the two legacy cleanup predicates first, then delete their union
+    // in one request. This avoids partial cleanup if either predicate lookup
+    // fails and remains bounded because durable issuance no longer writes here.
+    const [usedResult, expiredResult] = await Promise.all([
+      supabaseAdmin
+        .from('otp_tokens')
+        .select('id')
+        .neq('code', '[removed]')
+        .eq('used', true)
+        .limit(1000),
+      supabaseAdmin
+        .from('otp_tokens')
+        .select('id')
+        .neq('code', '[removed]')
+        .lt('expires_at', nowIso)
+        .limit(1000),
+    ])
 
-    if (error) {
-      return res.status(500).json({ error: 'otp_cleanup_failed', detail: error.message })
+    const lookupError = usedResult.error || expiredResult.error
+    if (lookupError) {
+      return res.status(500).json({ error: 'otp_cleanup_failed', detail: lookupError.message })
+    }
+
+    const cleanupIds = [...new Set([
+      ...(usedResult.data || []).map((row) => row.id),
+      ...(expiredResult.data || []).map((row) => row.id),
+    ].filter(Boolean))]
+    let deletedRows = []
+    if (cleanupIds.length > 0) {
+      const { data, error } = await supabaseAdmin
+        .from('otp_tokens')
+        .delete()
+        // Durable cutover rows retain non-sensitive history for role-JD and
+        // recovery diagnostics until a later explicit retirement migration.
+        .in('id', cleanupIds)
+        .neq('code', '[removed]')
+        .select('id')
+      if (error) {
+        return res.status(500).json({ error: 'otp_cleanup_failed', detail: error.message })
+      }
+      deletedRows = data || []
     }
 
     return res.json({
       ok: true,
-      deleted_count: Array.isArray(data) ? data.length : 0
+      deleted_count: deletedRows.length
     })
   } catch (e) {
     return res.status(500).json({

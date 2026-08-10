@@ -28,7 +28,7 @@ The secret is environment-only. It must not be committed, logged, included in Se
 
 ## Legacy cutover
 
-The migration first preserves the legacy table and audit row count, then replaces every retained `public.otp_tokens.code` value with `[removed]`, marks the rows used/invalidated, and adds a constraint preventing six-digit material from returning. New routes do not read or write the legacy table. The pre-existing internal legacy cleanup route explicitly excludes `[removed]` rows so it cannot erase the retained neutralized ledger after cutover. The table can be removed in a later isolated migration only after role-JD and historical recovery dependencies are reconstructed and production rollback requirements are satisfied.
+The migration first preserves the legacy table and audit row count, then replaces every retained `public.otp_tokens.code` value with `[removed]`, marks the rows used/invalidated, and adds a constraint preventing six-digit material from returning. New routes do not read or write the legacy table. The pre-existing internal legacy cleanup route explicitly excludes `[removed]` rows so it cannot erase the retained neutralized ledger after cutover. Production resolves bounded `used` and `expires_at` ID sets separately and deletes their union once because its PostgREST path rejects the former mixed DELETE `.or(...)` predicate; this preserves the same legacy cleanup set without partial deletion when a lookup fails. The table can be removed in a later isolated migration only after role-JD and historical recovery dependencies are reconstructed and production rollback requirements are satisfied.
 
 ## Privacy and observability
 

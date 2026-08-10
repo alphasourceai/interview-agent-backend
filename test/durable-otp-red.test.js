@@ -35,4 +35,7 @@ test('legacy cleanup preserves neutralized OTP history after durable cutover', (
     source.indexOf("app.post('/internal/recordings/cleanup'"),
   );
   assert.match(cleanup, /\.from\(['"]otp_tokens['"]\)[\s\S]*?\.delete\(\)[\s\S]*?\.neq\(['"]code['"],\s*['"]\[removed\]['"]\)/);
+  assert.match(cleanup, /\.neq\(['"]code['"],\s*['"]\[removed\]['"]\)[\s\S]*?\.eq\(['"]used['"],\s*true\)/);
+  assert.match(cleanup, /\.neq\(['"]code['"],\s*['"]\[removed\]['"]\)[\s\S]*?\.lt\(['"]expires_at['"],\s*nowIso\)/);
+  assert.doesNotMatch(cleanup, /\.or\(\s*`used\.eq\.true,expires_at\.lt\./);
 });
