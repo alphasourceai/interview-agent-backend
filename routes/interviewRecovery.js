@@ -24,6 +24,11 @@ const {
   normalizePrimitiveString,
   normalizeUuid,
 } = require('../src/lib/strictRequestValidation');
+const {
+  issueOtpChallenge,
+  markOtpChallengeDelivery,
+  supersedeOtpChallenges,
+} = require('../src/lib/otpChallenge');
 
 const AUTHORIZATION_SUCCESS = 'One replacement video interview has been authorized.';
 const COMPLETED_BLOCKED = 'This candidate has completed the interview and cannot be authorized for another attempt.';
@@ -57,11 +62,12 @@ function blockerDetail(code) {
   return publicErrorDetail(code);
 }
 
-function resetLink(role, candidate) {
+function resetLink(role, candidate, challengeId = null) {
   const token = String(role?.slug_or_token || '').trim();
   const base = String(INTERVIEW_APP_BASE || '').replace(/\/+$/, '');
   if (!base || !token) return null;
   const query = new URLSearchParams({ candidate_id: String(candidate.id), email: String(candidate.email || '') });
+  if (challengeId) query.set('challenge_id', String(challengeId));
   return `${base}/interview/${encodeURIComponent(token)}?${query.toString()}`;
 }
 
@@ -228,14 +234,26 @@ function createInterviewRecoveryRouter({
     }
 
     let emailStatus = authorization?.email_status || (resetMode === 'reset_only' ? 'not_requested' : 'pending');
+    try {
+      await supersedeOtpChallenges(db, {
+        candidateId,
+        roleId,
+        reason: 'recovery_authorized',
+      });
+    } catch (error) {
+      return res.status(503).json({
+        error: 'temporary_service_error',
+        code: 'temporary_service_error',
+        detail: 'Interview access was reset, but verification cleanup is still reconciling. Please retry this action.',
+      });
+    }
     if (resetMode === 'reset_and_send' && authorization?.replayed !== true) {
       const { data: claimData, error: claimError } = await db.rpc('claim_interview_recovery_email_core', {
         p_authorization_id: authorization.authorization_id,
       });
       const claim = Array.isArray(claimData) ? claimData[0] : claimData;
       if (!claimError && claim?.claimed && claim?.claim_token) {
-        const code = String(crypto.randomInt(100000, 1000000));
-        let otpCreated = false;
+        let otpChallenge = null;
         try {
           const [{ data: candidate, error: candidateError }, { data: role, error: roleError }] = await Promise.all([
             db.from('candidates').select('id,name,email,client_id,role_id').eq('id', candidateId).eq('client_id', clientId).eq('role_id', roleId).single(),
@@ -244,31 +262,23 @@ function createInterviewRecoveryRouter({
           if (candidateError || !candidate) throw candidateError || new Error('reset_candidate_not_found');
           if (roleError || !role) throw roleError || new Error('reset_role_not_found');
 
-          const { error: invalidateError } = await db.from('otp_tokens').update({
-            invalidated_at: new Date().toISOString(),
-            invalidation_reason: 'stale_access_invalidated',
-          }).eq('candidate_id', candidateId).eq('role_id', roleId).eq('used', false).is('invalidated_at', null);
-          if (invalidateError) throw invalidateError;
-
-          const { error: tokenError } = await db.from('otp_tokens').insert({
-            candidate_email: String(candidate.email || '').trim().toLowerCase(),
-            candidate_id: candidateId,
-            interview_id: null,
-            role_id: roleId,
-            code,
-            expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
-            used: false,
+          otpChallenge = await issueOtpChallenge(db, {
+            email: candidate.email,
+            candidateId,
+            clientId,
+            roleId,
+            interviewAttemptId: priorInterviewId,
+            recoveryAuthorizationId: authorization.authorization_id,
           });
-          if (tokenError) throw tokenError;
-          otpCreated = true;
 
-          const link = resetLink(role, candidate);
+          const link = resetLink(role, candidate, otpChallenge.challengeId);
           await sendEmail({
             to: candidate.email,
             subject: 'Your interview access has been reset',
-            text: `One replacement interview has been approved. Your verification code is ${code}. ${link || ''}`,
-            html: resetEmailHtml(candidate.name, role.title, code, link),
+            text: `One replacement interview has been approved. Your verification code is ${otpChallenge.code}. ${link || ''}`,
+            html: resetEmailHtml(candidate.name, role.title, otpChallenge.code, link),
           });
+          await markOtpChallengeDelivery(db, otpChallenge.challengeId, 'sent');
           const { data: completedStatus, error: completeError } = await db.rpc('complete_interview_recovery_email_core', {
             p_authorization_id: authorization.authorization_id,
             p_claim_token: claim.claim_token,
@@ -278,11 +288,13 @@ function createInterviewRecoveryRouter({
           if (completeError) throw completeError;
           emailStatus = completedStatus || 'sent';
         } catch (error) {
-          if (otpCreated) {
-            await db.from('otp_tokens').update({
-              invalidated_at: new Date().toISOString(),
-              invalidation_reason: 'recovery_email_failed',
-            }).eq('candidate_id', candidateId).eq('role_id', roleId).eq('code', code).eq('used', false);
+          if (otpChallenge) {
+            await markOtpChallengeDelivery(db, otpChallenge.challengeId, 'failed').catch(() => {});
+            await supersedeOtpChallenges(db, {
+              candidateId,
+              roleId,
+              reason: 'recovery_email_failed',
+            }).catch(() => {});
           }
           const { data: completedStatus } = await db.rpc('complete_interview_recovery_email_core', {
             p_authorization_id: authorization.authorization_id,

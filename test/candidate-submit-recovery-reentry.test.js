@@ -159,6 +159,7 @@ function buildContext(currentScenario) {
     emails: 0,
     providerCalls: 0,
     rpcs: [],
+    challenges: [],
   };
   const context = {
     scenario: currentScenario,
@@ -172,6 +173,11 @@ function buildContext(currentScenario) {
         }
         return { data: currentScenario.eligibility, error: null };
       }
+      if (name === 'service_issue_otp_challenge') {
+        tracker.challenges.push(args);
+        return { data: [{ challenge_id: args.p_challenge_id, expires_at: '2026-08-10T18:00:00Z' }], error: null };
+      }
+      if (name === 'service_mark_otp_challenge_delivery') return { data: true, error: null };
       return { data: null, error: { message: `unexpected_rpc:${name}` } };
     },
     storage: {
@@ -283,7 +289,7 @@ test('authorized reset-only candidate re-entry reaches the normal OTP boundary w
   const response = await submit(context);
   assert.equal(response.status, 200);
   assert.equal(response.body.candidate_id, ID.candidate);
-  assert.equal(context.tracker.inserts.filter((entry) => entry.table === 'otp_tokens').length, 1);
+  assert.equal(context.tracker.challenges.length, 1);
   assert.equal(context.tracker.ledger.length, 1);
   assert.equal(context.tracker.emails, 1);
   assert.equal(context.tracker.inserts.filter((entry) => entry.table === 'reports').length, 0);
@@ -410,7 +416,7 @@ for (const [name, currentScenario] of [
     const response = await submit(context);
     assert.equal(response.status, 409);
     assert.equal(response.body.code, 'RETAKE_AUTHORIZATION_REQUIRED');
-    assert.equal(context.tracker.inserts.filter((entry) => entry.table === 'otp_tokens').length, 0);
+    assert.equal(context.tracker.challenges.length, 0);
     assert.equal(context.tracker.emails, 0);
     assert.equal(context.scenario.interviews.length, 1);
   });
@@ -432,7 +438,7 @@ test('an existing attempt two prevents another verification flow', async () => {
   const context = buildContext(currentScenario);
   const response = await submit(context);
   assert.equal(response.status, 409);
-  assert.equal(context.tracker.inserts.filter((entry) => entry.table === 'otp_tokens').length, 0);
+  assert.equal(context.tracker.challenges.length, 0);
   assert.equal(context.scenario.interviews.length, 2);
 });
 
@@ -443,7 +449,7 @@ test('Recovery Core disabled preserves the ordinary conflict without authorizati
   assert.equal(response.status, 409);
   assert.equal(response.body.code, 'RETAKE_AUTHORIZATION_REQUIRED');
   assert.equal(context.tracker.rpcs.length, 0);
-  assert.equal(context.tracker.inserts.filter((entry) => entry.table === 'otp_tokens').length, 0);
+  assert.equal(context.tracker.challenges.length, 0);
   process.env.INTERVIEW_RECOVERY_CORE_ENABLED = 'true';
 });
 
@@ -455,7 +461,7 @@ test('an expired authorization fails closed', async () => {
   const response = await submit(context);
   assert.equal(response.status, 409);
   assert.equal(response.body.code, 'RETAKE_AUTHORIZATION_REQUIRED');
-  assert.equal(context.tracker.inserts.filter((entry) => entry.table === 'otp_tokens').length, 0);
+  assert.equal(context.tracker.challenges.length, 0);
 });
 
 test('an authorization lookup failure is retryable and creates no OTP', async () => {
@@ -464,7 +470,7 @@ test('an authorization lookup failure is retryable and creates no OTP', async ()
   const response = await submit(context);
   assert.equal(response.status, 503);
   assert.equal(response.body.code, 'TEMPORARY_SERVICE_ERROR');
-  assert.equal(context.tracker.inserts.filter((entry) => entry.table === 'otp_tokens').length, 0);
+  assert.equal(context.tracker.challenges.length, 0);
   assert.equal(context.tracker.emails, 0);
 });
 
@@ -486,7 +492,7 @@ test('a completed interview without a usable authorization remains blocked', asy
   const response = await submit(context);
   assert.equal(response.status, 409);
   assert.equal(response.body.code, 'INTERVIEW_ALREADY_COMPLETED');
-  assert.equal(context.tracker.inserts.filter((entry) => entry.table === 'otp_tokens').length, 0);
+  assert.equal(context.tracker.challenges.length, 0);
 });
 
 test('replaying the same successful submission key does not duplicate OTP, email, candidate, or ledger work', async () => {
@@ -497,7 +503,7 @@ test('replaying the same successful submission key does not duplicate OTP, email
   assert.equal(first.status, 200);
   assert.equal(second.status, 200);
   assert.deepEqual(second.body, first.body);
-  assert.equal(context.tracker.inserts.filter((entry) => entry.table === 'otp_tokens').length, 1);
+  assert.equal(context.tracker.challenges.length, 1);
   assert.equal(context.tracker.inserts.filter((entry) => entry.table === 'candidates').length, 0);
   assert.equal(context.tracker.emails, 1);
   assert.equal(context.tracker.ledger.length, 1);
@@ -515,7 +521,7 @@ test('ordinary first-time application still creates one candidate and one OTP', 
   const response = await submit(context);
   assert.equal(response.status, 200);
   assert.equal(context.tracker.inserts.filter((entry) => entry.table === 'candidates').length, 1);
-  assert.equal(context.tracker.inserts.filter((entry) => entry.table === 'otp_tokens').length, 1);
+  assert.equal(context.tracker.challenges.length, 1);
   assert.equal(context.tracker.ledger.length, 1);
   assert.equal(context.tracker.emails, 1);
 });

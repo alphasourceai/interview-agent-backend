@@ -44,7 +44,7 @@ class FakeQuery {
 }
 
 function createFakeDb({ wrongClient = false } = {}) {
-  const tracker = { rpc: [], inserts: [], updates: [], authorizationCalls: 0 };
+  const tracker = { rpc: [], inserts: [], updates: [], authorizationCalls: 0, challenges: [] };
   const candidate = { id: ID.candidate, name: 'Synthetic Candidate', email: 'candidate@example.test', client_id: ID.client, role_id: ID.role };
   const role = { id: ID.role, title: 'Synthetic Role', slug_or_token: 'synthetic-role', client_id: ID.client };
   const eligibility = {
@@ -95,6 +95,12 @@ function createFakeDb({ wrongClient = false } = {}) {
       if (name === 'complete_interview_recovery_email_core') {
         return { data: args.p_success ? 'sent' : 'failed', error: null };
       }
+      if (name === 'service_supersede_otp_challenges') return { data: 0, error: null };
+      if (name === 'service_issue_otp_challenge') {
+        tracker.challenges.push(args);
+        return { data: [{ challenge_id: args.p_challenge_id, expires_at: '2026-08-10T18:00:00Z' }], error: null };
+      }
+      if (name === 'service_mark_otp_challenge_delivery') return { data: true, error: null };
       return { data: null, error: { message: `unexpected_rpc:${name}` } };
     },
   };
@@ -240,7 +246,7 @@ test('Recovery Core route 5. reset-only creates no OTP and invokes no email send
     assert.equal(body.email_status, 'not_requested');
   });
   assert.equal(emailCount, 0);
-  assert.equal(db.tracker.inserts.filter((entry) => entry.table === 'otp_tokens').length, 0);
+  assert.equal(db.tracker.challenges.length, 0);
 });
 
 test('Recovery Core route 6. reset-and-send is disabled by default before authorization, OTP, or email', async () => {
@@ -256,7 +262,7 @@ test('Recovery Core route 6. reset-and-send is disabled by default before author
   assert.equal(isInterviewRecoveryCoreEmailEnabled({}), false);
   assert.equal(db.tracker.authorizationCalls, 0);
   assert.equal(emailCount, 0);
-  assert.equal(db.tracker.inserts.filter((entry) => entry.table === 'otp_tokens').length, 0);
+  assert.equal(db.tracker.challenges.length, 0);
 });
 
 test('Recovery Core route 7. explicitly enabled reset-and-send replay does not duplicate OTP or email', async () => {
@@ -280,7 +286,7 @@ test('Recovery Core route 7. explicitly enabled reset-and-send replay does not d
     assert.equal((await second.json()).replayed, true);
   });
   assert.equal(emailCount, 1);
-  assert.equal(db.tracker.inserts.filter((entry) => entry.table === 'otp_tokens').length, 1);
+  assert.equal(db.tracker.challenges.length, 1);
   assert.equal(db.tracker.rpc.filter((entry) => entry.name === 'claim_interview_recovery_email_core').length, 1);
 });
 

@@ -35,6 +35,9 @@ if (SENTRY_ENABLED) {
                 .replace(/(Authorization|Bearer)\s+[A-Za-z0-9\-\._~\+\/]+=*/gi, '$1 REDACTED')
             : s;
         if (event.request?.url) event.request.url = scrub(event.request.url);
+        if (/\/api\/candidate\/(?:submit|verify-otp)(?:\/|$)/.test(String(event.request?.url || ''))) {
+          delete event.request.data;
+        }
         if (event.extra) {
           for (const k of Object.keys(event.extra)) {
             if (typeof event.extra[k] === 'string') event.extra[k] = scrub(event.extra[k]);
@@ -6003,6 +6006,9 @@ app.post('/internal/otp/cleanup', async (req, res) => {
     const { data, error } = await supabaseAdmin
       .from('otp_tokens')
       .delete()
+      // Durable cutover rows retain non-sensitive history for role-JD and
+      // recovery diagnostics until a later explicit retirement migration.
+      .neq('code', '[removed]')
       .or(`used.eq.true,expires_at.lt.${nowIso}`)
       .select('id')
 

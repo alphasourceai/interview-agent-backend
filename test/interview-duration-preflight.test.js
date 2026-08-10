@@ -21,6 +21,12 @@ const previousBillingMode = process.env.BILLING_MODE;
 const previousInternalSyntheticClientIds = process.env.INTERNAL_SYNTHETIC_INTERVIEW_CLIENT_IDS;
 const previousTavusWebhookSecret = process.env.TAVUS_WEBHOOK_SECRET;
 const TEST_TAVUS_WEBHOOK_SECRET = Buffer.alloc(32, 17).toString('base64url');
+process.env.OTP_HMAC_SECRET_VERSION = '1';
+process.env.OTP_HMAC_SECRET_V1 = Buffer.alloc(32, 23).toString('base64');
+const {
+  COOKIE_NAME: OTP_COOKIE_NAME,
+  createOtpLaunchCapability,
+} = require('../src/middleware/otpLaunchCapability');
 
 const injectedPaths = [
   routePath,
@@ -195,9 +201,18 @@ async function startServer(planSetting, options = {}) {
 }
 
 async function postStart(url) {
+  const launchCapability = createOtpLaunchCapability({
+    challenge_id: '55555555-5555-4555-8555-555555555555',
+    candidate_id: CANDIDATE_ID,
+    client_id: CLIENT_ID,
+    role_id: ROLE_ID,
+  });
   const response = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      cookie: `${OTP_COOKIE_NAME}=${encodeURIComponent(launchCapability)}`,
+    },
     body: JSON.stringify({
       candidate_id: CANDIDATE_ID,
       role_id: ROLE_ID,

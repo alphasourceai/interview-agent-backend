@@ -19,6 +19,10 @@ const { normalizePrimitiveString, normalizeUuid } = require('../src/lib/strictRe
 const { validateConfiguredInterviewDuration } = require('../src/lib/interviewDuration');
 const { resolvePlanCapacityForClient } = require('../src/lib/planCapacity');
 const { buildAuthenticatedTavusWebhookUrl } = require('../src/lib/tavusWebhookAuth');
+const {
+  clearOtpLaunchCapability,
+  requireOtpLaunchCapability,
+} = require('../src/middleware/otpLaunchCapability');
 
 const router = express.Router();
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
@@ -47,7 +51,7 @@ async function createTavusRateLimit(req, res, next) {
   return next();
 }
 
-router.post('/', createTavusRateLimit, async (req, res) => {
+router.post('/', requireOtpLaunchCapability, createTavusRateLimit, async (req, res) => {
   const request_id = req.request_id || null;
   let sentryCandidateId = null;
   let sentryRoleId = null;
@@ -125,6 +129,10 @@ router.post('/', createTavusRateLimit, async (req, res) => {
 
     const candidateRoleId = String(candidate?.role_id || '').trim();
     const candidateClientId = String(candidate?.client_id || '').trim();
+    if (String(req.otp_launch_capability?.client_id || '') !== candidateClientId) {
+      clearOtpLaunchCapability(res);
+      return launchFailed('otp_launch_client_mismatch', { candidate_id });
+    }
     let role = null;
     let roleId = String(roleIdFromBody || '').trim();
 
@@ -566,6 +574,7 @@ router.post('/', createTavusRateLimit, async (req, res) => {
       })
       .eq('id', candidate_id);
 
+    clearOtpLaunchCapability(res);
     return res.status(200).json({
       message: 'Interview created',
       conversation_url: result.conversation_url || null,

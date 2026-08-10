@@ -4,7 +4,6 @@ const router = express.Router();
 const crypto = require('crypto');
 const Sentry = require('@sentry/node');
 const multer = require('multer');
-const sg = require('@sendgrid/mail');
 const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
 const { getRoleInterviewAvailability, syncRoleInterviewLimitNotification } = require('../src/lib/roleInterviewAvailability');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib/rateLimit');
@@ -26,7 +25,8 @@ const {
   getAuthorizedRecoveryReentry,
   isInterviewRecoveryCoreEnabled
 } = require('../src/lib/interviewAttemptService');
-const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
+const { issueOtpChallenge } = require('../src/lib/otpChallenge');
+const { createEmailOtpDelivery } = require('../src/lib/otpDelivery');
 const analyzeResume = require('../analyzeResume'); // resume analyzer
 
 // uploads: keep in memory; 10MB limit
@@ -35,15 +35,11 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 });
 
-// email config
-const FROM_EMAIL = process.env.SENDGRID_FROM;
-const SENDGRID_KEY = process.env.SENDGRID_API_KEY;
-const APP_NAME = process.env.APP_NAME || 'Interview Agent';
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
 const BILLING_ENFORCED = BILLING_MODE === 'enforce';
-if (SENDGRID_KEY) sg.setApiKey(SENDGRID_KEY);
 const SUBMIT_RATE_WINDOW_MS = 60 * 60 * 1000;
 const SUBMIT_RATE_MAX = 10;
+const deliverEmailOtp = createEmailOtpDelivery();
 
 async function candidateSubmitRateLimit(req, res, next) {
   try {
@@ -66,11 +62,6 @@ async function candidateSubmitRateLimit(req, res, next) {
   return next();
 }
 
-// 6-digit OTP
-function six() {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
-
 // normalize helpers
 function normEmail(v = '') {
   return String(v || '').trim().toLowerCase();
@@ -91,25 +82,43 @@ function resumeMetadata(inspection) {
   };
 }
 
-function buildOtpEmailHtml(appName, otpCode) {
-  const safeAppName = escapeHtml(appName || 'Interview Agent');
-  const safeOtpCode = escapeHtml(otpCode || '');
-  return buildBrandedEmailShell({
-    title: 'Your verification code',
-    preheader: `Your verification code is ${safeOtpCode}. It expires in 10 minutes.`,
-    contentHtml: `
-      <p style="margin:0 0 14px;color:#C9D3FF;font-size:15px;line-height:1.6;">
-        Use this one-time code to continue your ${safeAppName} verification.
-      </p>
-      <p style="margin:0 0 16px;">
-        <span style="display:inline-block;background:#A78BFA;color:#0A1547;border:1px solid #CFCBFF;border-radius:10px;padding:10px 16px;font-size:22px;font-weight:800;letter-spacing:0.22em;">
-          ${safeOtpCode}
-        </span>
-      </p>
-      <p style="margin:0 0 16px;color:#C9D3FF;font-size:14px;line-height:1.55;">
-        This code expires in 10 minutes.
-      </p>
-    `
+function queueOtpEmail({ challengeId, code, email, candidateId, roleId, requestId }) {
+  setImmediate(async () => {
+    console.log('[candidate-submit] otp_delivery_started', {
+      request_id: requestId,
+      candidate_id: candidateId,
+      role_id: roleId,
+      channel: 'email'
+    });
+    try {
+      await deliverEmailOtp({ db: supabaseAdmin, challengeId, destination: email, code });
+      console.log('[candidate-submit] otp_delivery_succeeded', {
+        request_id: requestId,
+        candidate_id: candidateId,
+        role_id: roleId,
+        channel: 'email'
+      });
+    } catch (error) {
+      console.warn('[candidate-submit] otp_delivery_failed', {
+        request_id: requestId,
+        candidate_id: candidateId,
+        role_id: roleId,
+        channel: 'email',
+        status: error?.response?.status || error?.code || null
+      });
+      Sentry.captureException(error, {
+        tags: {
+          route_name: 'candidate_submit',
+          surface: 'backend',
+          task: 'background_otp_email',
+          request_id: requestId || undefined,
+          candidate_id: candidateId || undefined,
+          role_id: roleId || undefined,
+          otp_channel: 'email'
+        },
+        extra: { request_id: requestId, candidate_id: candidateId, role_id: roleId }
+      });
+    }
   });
 }
 
@@ -327,7 +336,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
     // --- duplicate & enrichment policy ---
     // RULES:
     // 1) Email match resolves to the existing identity. Recover OTP when no interview exists.
-    // 2) If email does not match but name and phone do, require support review.
+    // 2) If email does not match but phone does, require support review.
     // 3) Otherwise, ALLOW (create candidate, upload, send OTP).
 
     // 1) Email match
@@ -358,8 +367,8 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       if (existingInterviewError) {
         return respondRetryableError('TEMPORARY_SERVICE_ERROR', {}, existingByEmail.id);
       }
+      let authorizedRecoveryReentry = null;
       if (existingInterview) {
-        let authorizedRecoveryReentry = null;
         if (isInterviewRecoveryCoreEnabled()) {
           try {
             authorizedRecoveryReentry = await getAuthorizedRecoveryReentry(supabaseAdmin, {
@@ -425,41 +434,24 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
           }
         }
 
-        const nowIso = new Date().toISOString();
-        const { error: invalidateErr } = await supabase
-          .from('otp_tokens')
-          .update({ used: true, used_at: nowIso })
-          .eq('candidate_email', email)
-          .eq('role_id', roleId)
-          .eq('used', false);
-        if (invalidateErr) {
-          console.error('[candidate-submit] duplicate_unverified_recovery_invalidate_failed', {
-            request_id,
-            candidate_id,
-            role_id: roleId,
+        let otpChallenge;
+        try {
+          otpChallenge = await issueOtpChallenge(supabaseAdmin, {
             email,
-            error: invalidateErr.message,
-            code: invalidateErr.code || null
+            candidateId: candidate_id,
+            clientId: role.client_id,
+            roleId,
+            submissionId: submissionReservation?.row?.id || null,
+            interviewAttemptId: existingInterview?.id || null,
+            recoveryAuthorizationId: authorizedRecoveryReentry?.id || null,
           });
-          return respondRetryableError('TEMPORARY_SERVICE_ERROR', {}, candidate_id);
-        }
-
-        const freshCode = six();
-        const { error: otpErr } = await supabase.from('otp_tokens').insert({
-          candidate_email: email,
-          candidate_id,
-          role_id: roleId,
-          code: freshCode,
-          expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
-          used: false,
-        });
-        if (otpErr) {
-          console.error('otp create failed', {
+        } catch (error) {
+          console.error('[candidate-submit] durable_challenge_create_failed', {
             request_id,
             candidate_id,
             role_id: roleId,
-            error: otpErr.message,
-            code: otpErr.code || null
+            code: error?.code || null,
+            error_name: error?.name || null
           });
           return respondRetryableError('TEMPORARY_SERVICE_ERROR', {}, candidate_id);
         }
@@ -474,66 +466,18 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
           message: 'If your information is accepted, a verification code will be sent shortly.',
           candidate_id,
           role_id: roleId,
+          challenge_id: otpChallenge.challengeId,
           resume_url: existingByEmail.resume_url || null,
           resume_parse_status: resumeInspection?.parse_status || null
         };
         await respondFinal(200, responseBody, candidate_id);
-
-        setImmediate(async () => {
-          console.log('[candidate-submit] duplicate_unverified_recovery_email_start', {
-            request_id,
-            candidate_id,
-            role_id: roleId,
-            email
-          });
-          try {
-            if (!SENDGRID_KEY || !FROM_EMAIL) throw new Error('SENDGRID_API_KEY or SENDGRID_FROM not configured');
-            const [resp] = await sg.send({
-              to: email,
-              from: { email: FROM_EMAIL, name: APP_NAME },
-              subject: `Your ${APP_NAME} verification code`,
-              text: `Your verification code is ${freshCode}. It expires in 10 minutes.`,
-              html: buildOtpEmailHtml(APP_NAME, freshCode),
-            });
-            console.log('[candidate-submit] duplicate_unverified_recovery_email_success', {
-              request_id,
-              candidate_id,
-              role_id: roleId,
-              email,
-              status: resp?.statusCode || null
-            });
-          } catch (e) {
-            const status = e?.response?.status || e?.code || null;
-            const message = e?.message || 'send_failed';
-            console.warn('[candidate-submit] duplicate_unverified_recovery_email_failure', {
-              request_id,
-              candidate_id,
-              role_id: roleId,
-              email,
-              status,
-              message
-            });
-            Sentry.captureException(e, {
-              tags: {
-                route_name: 'candidate_submit',
-                surface: 'backend',
-                task: 'duplicate_unverified_recovery_email',
-                request_id: request_id || undefined,
-                candidate_id: candidate_id || undefined,
-                role_id: roleId || undefined,
-                client_id: role?.client_id || undefined
-              },
-              extra: {
-                request_id,
-                candidate_id,
-                role_id: roleId,
-                client_id: role?.client_id || null,
-                email,
-                status,
-                message
-              }
-            });
-          }
+        queueOtpEmail({
+          challengeId: otpChallenge.challengeId,
+          code: otpChallenge.code,
+          email,
+          candidateId: candidate_id,
+          roleId,
+          requestId: request_id,
         });
         return;
       }
@@ -642,40 +586,21 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       data: { candidate_id, role_id: roleId }
     });
 
-    // --- OTP hardening: invalidate old + create fresh ---
-    const nowIso = new Date().toISOString();
-    const { error: invalidateErr } = await supabase
-      .from('otp_tokens')
-      .update({ used: true, used_at: nowIso })
-      .eq('candidate_email', email)
-      .eq('role_id', roleId)
-      .eq('used', false);
-    if (invalidateErr) {
-      console.error('[candidate-submit] otp_invalidate_failed', {
-        request_id,
-        candidate_id,
-        role_id: roleId,
-        code: invalidateErr.code || null
+    let otpChallenge;
+    try {
+      otpChallenge = await issueOtpChallenge(supabaseAdmin, {
+        email,
+        candidateId: candidate_id,
+        clientId: role.client_id,
+        roleId,
+        submissionId: submissionReservation?.row?.id || null,
       });
-      return respondRetryableError('TEMPORARY_SERVICE_ERROR', {}, candidate_id);
-    }
-
-    const freshCode = six();
-    const { error: otpErr } = await supabase.from('otp_tokens').insert({
-      candidate_email: email,
-      candidate_id,
-      role_id: roleId,
-      code: freshCode,
-      expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
-      used: false,
-    });
-    if (otpErr) {
-      console.error('otp create failed', {
+    } catch (error) {
+      console.error('[candidate-submit] durable_challenge_create_failed', {
         request_id,
         candidate_id,
         role_id: roleId,
-        error: otpErr.message,
-        code: otpErr.code || null
+        code: error?.code || null
       });
       return respondRetryableError('TEMPORARY_SERVICE_ERROR', {}, candidate_id);
     }
@@ -685,71 +610,17 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       message: 'If your information is accepted, a verification code will be sent shortly.',
       candidate_id,
       role_id: roleId,
+      challenge_id: otpChallenge.challengeId,
       resume_url: resume_url || null,
       resume_parse_status: resumeInspection?.parse_status || null
     }, candidate_id);
-
-    setImmediate(async () => {
-      console.log('[candidate-submit] background_otp_email_start', {
-        request_id,
-        candidate_id,
-        role_id: roleId,
-        email
-      });
-      try {
-        if (!SENDGRID_KEY || !FROM_EMAIL) throw new Error('SENDGRID_API_KEY or SENDGRID_FROM not configured');
-        const [resp] = await sg.send({
-          to: email,
-          from: { email: FROM_EMAIL, name: APP_NAME },
-          subject: `Your ${APP_NAME} verification code`,
-          text: `Your verification code is ${freshCode}. It expires in 10 minutes.`,
-          html: buildOtpEmailHtml(APP_NAME, freshCode),
-        });
-        console.log('[candidate-submit] background_otp_email_success', {
-          request_id,
-          candidate_id,
-          role_id: roleId,
-          email,
-          status: resp?.statusCode || null
-        });
-      } catch (e) {
-        const status = e?.response?.status || e?.code || null;
-        const message = e?.message || 'send_failed';
-        console.warn('[candidate-submit] background_otp_email_failed', {
-          request_id,
-          candidate_id,
-          role_id: roleId,
-          email,
-          status,
-          message
-        });
-        Sentry.addBreadcrumb({
-          category: 'candidate_submit',
-          message: 'otp send failed',
-          level: 'warning',
-          data: { request_id, status, message, candidate_id, role_id: roleId }
-        });
-        Sentry.captureException(e, {
-          tags: {
-            route_name: 'candidate_submit',
-            surface: 'backend',
-            task: 'background_otp_email',
-            request_id: request_id || undefined,
-            candidate_id: candidate_id || undefined,
-            role_id: roleId || undefined,
-            client_id: role?.client_id || undefined
-          },
-          extra: {
-            request_id,
-            candidate_id,
-            role_id: roleId,
-            client_id: role?.client_id || null,
-            email,
-            status,
-            message
-          }
-        });
-      }
+    queueOtpEmail({
+      challengeId: otpChallenge.challengeId,
+      code: otpChallenge.code,
+      email,
+      candidateId: candidate_id,
+      roleId,
+      requestId: request_id,
     });
 
     if (fileBuf && resumeInspection?.parse_status === 'parsed') {
@@ -757,8 +628,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
         console.log('[candidate-submit] background_resume_analysis_start', {
           request_id,
           candidate_id,
-          role_id: roleId,
-          email
+          role_id: roleId
         });
         try {
           const summary = await analyzeResume(fileBuf, fileType, {
@@ -769,15 +639,13 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
           console.log('[candidate-submit] background_resume_analysis_success', {
             request_id,
             candidate_id,
-            role_id: roleId,
-            email
+            role_id: roleId
           });
         } catch (e) {
           console.warn('[candidate-submit] background_resume_analysis_failed', {
             request_id,
             candidate_id,
             role_id: roleId,
-            email,
             error: e?.message || e
           });
           Sentry.captureException(e, {
@@ -794,8 +662,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
               request_id,
               candidate_id,
               role_id: roleId,
-              client_id: role?.client_id || null,
-              email
+              client_id: role?.client_id || null
             }
           });
         }
