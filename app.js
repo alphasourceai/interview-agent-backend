@@ -71,6 +71,7 @@ const rolesRouter = require('./routes/roles')
 const { createRoleJdReplacementRouter } = require('./routes/roleJdReplacement')
 const automationRouter = require('./routes/automation')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
+const { createSupportVoiceGateway } = require('./src/lib/supportVoiceGateway')
 const { buildClientScopeContext, canViewLegalBillingForClient } = require('./src/lib/clientScope')
 const {
   entityFieldsForClientId,
@@ -154,6 +155,14 @@ if (SENTRY_ENABLED) {
     app.use(Sentry.Handlers.requestHandler()); // v7
   }
 }
+
+// Dashboard browser voice has its own strict Origin/CORS/body contract and
+// must mount before the application's broader CORS and JSON middleware.
+const supportVoiceGateway = createSupportVoiceGateway({
+  requireAuth,
+  serviceDb: supabaseAdmin,
+})
+app.use('/api/support/voice', supportVoiceGateway.router)
 
 // ---------- CORS ----------
 const DEFAULT_ORIGINS = corsDefaultOrigins
@@ -6743,6 +6752,7 @@ app.get('/healthz', async (req, res) => {
 
   const supabase_auth = { ok: false, latency_ms: 0 };
   const tavus_webhook_auth = getTavusWebhookAuthReadiness();
+  const support_voice = supportVoiceGateway.publicHealth();
   const startedAt = Date.now();
 
   if (!supabaseUrl || !anonKey || typeof fetch !== 'function' || typeof AbortController !== 'function') {
@@ -6763,6 +6773,7 @@ app.get('/healthz', async (req, res) => {
       },
       supabase_auth,
       tavus_webhook_auth,
+      support_voice,
     });
   }
 
@@ -6792,8 +6803,8 @@ app.get('/healthz', async (req, res) => {
   }
 
   return res.json({
-    ok: supabase_auth.ok === true && tavus_webhook_auth.ok === true,
-    degraded: supabase_auth.ok !== true || tavus_webhook_auth.ok !== true,
+    ok: supabase_auth.ok === true && tavus_webhook_auth.ok === true && (support_voice.enabled !== true || support_voice.configured === true),
+    degraded: supabase_auth.ok !== true || tavus_webhook_auth.ok !== true || (support_voice.enabled === true && support_voice.configured !== true),
     request_id,
     now,
     interview_recovery_core: {
@@ -6802,6 +6813,7 @@ app.get('/healthz', async (req, res) => {
     },
     supabase_auth,
     tavus_webhook_auth,
+    support_voice,
   });
 });
 
@@ -6828,8 +6840,15 @@ app.use(function (err, req, res, next) {
 
 // ---------- Start ----------
 const PORT = process.env.PORT || 3000
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`)
 })
+// Some isolated route tests replace Express' listen method with a minimal
+// close-only stub. Real Express servers always expose EventEmitter.on().
+if (server && typeof server.on === 'function') {
+  supportVoiceGateway.attach(server)
+}
 
+app.supportVoiceGateway = supportVoiceGateway
+app.supportVoiceServer = server
 module.exports = app

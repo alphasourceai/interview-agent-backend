@@ -50,7 +50,8 @@
     "tmp": "^0.2.5",
     "twilio": "^5.8.0",
     "undici": "6.28.0",
-    "uuid": "^11.1.0"
+    "uuid": "^11.1.0",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"
