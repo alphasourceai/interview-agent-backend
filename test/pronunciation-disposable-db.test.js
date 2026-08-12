@@ -12,11 +12,11 @@ const USER = process.env.PRONUNCIATION_PG_USER || process.env.USER || 'postgres'
 const DATABASE = `alphascreen_pronunciation_${process.pid}`;
 const ROOT = path.resolve(__dirname, '..');
 const BOOTSTRAP = path.join(__dirname, 'fixtures', 'durable-otp-bootstrap.sql');
-const MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260812201729_pronunciation_registry_foundation_prod.sql');
-const CORRECTION = path.join(ROOT, 'supabase', 'migrations', '20260812201731_pronunciation_ipa_correction_prod.sql');
-const TARGETED_CORRECTION = path.join(ROOT, 'supabase', 'migrations', '20260812201737_pronunciation_targeted_phoneme_correction_prod.sql');
-const GINGIVA_STRESS_CORRECTION = path.join(ROOT, 'supabase', 'migrations', '20260812201742_pronunciation_gingiva_stress_correction_prod.sql');
-const GINGIVA_ALIAS_CORRECTION = path.join(ROOT, 'supabase', 'migrations', '20260812201745_pronunciation_gingiva_continuous_alias_prod.sql');
+const MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260812203858_pronunciation_registry_foundation_prod.sql');
+const CORRECTION = path.join(ROOT, 'supabase', 'migrations', '20260812203904_pronunciation_ipa_correction_prod.sql');
+const TARGETED_CORRECTION = path.join(ROOT, 'supabase', 'migrations', '20260812203909_pronunciation_targeted_phoneme_correction_prod.sql');
+const GINGIVA_STRESS_CORRECTION = path.join(ROOT, 'supabase', 'migrations', '20260812203914_pronunciation_gingiva_stress_correction_prod.sql');
+const GINGIVA_ALIAS_CORRECTION = path.join(ROOT, 'supabase', 'migrations', '20260812203918_pronunciation_gingiva_continuous_alias_prod.sql');
 
 function command(name, args) {
   return spawnSync(name, args, { encoding: 'utf8' });

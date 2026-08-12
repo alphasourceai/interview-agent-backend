@@ -5,11 +5,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { test } = require('node:test');
 
-const migration = fs.readFileSync(path.resolve(__dirname, '../supabase/migrations/20260812201729_pronunciation_registry_foundation_prod.sql'), 'utf8');
-const correction = fs.readFileSync(path.resolve(__dirname, '../supabase/migrations/20260812201731_pronunciation_ipa_correction_prod.sql'), 'utf8');
-const targetedCorrection = fs.readFileSync(path.resolve(__dirname, '../supabase/migrations/20260812201737_pronunciation_targeted_phoneme_correction_prod.sql'), 'utf8');
-const gingivaStressCorrection = fs.readFileSync(path.resolve(__dirname, '../supabase/migrations/20260812201742_pronunciation_gingiva_stress_correction_prod.sql'), 'utf8');
-const gingivaAliasCorrection = fs.readFileSync(path.resolve(__dirname, '../supabase/migrations/20260812201745_pronunciation_gingiva_continuous_alias_prod.sql'), 'utf8');
+const migration = fs.readFileSync(path.resolve(__dirname, '../supabase/migrations/20260812203858_pronunciation_registry_foundation_prod.sql'), 'utf8');
+const correction = fs.readFileSync(path.resolve(__dirname, '../supabase/migrations/20260812203904_pronunciation_ipa_correction_prod.sql'), 'utf8');
+const targetedCorrection = fs.readFileSync(path.resolve(__dirname, '../supabase/migrations/20260812203909_pronunciation_targeted_phoneme_correction_prod.sql'), 'utf8');
+const gingivaStressCorrection = fs.readFileSync(path.resolve(__dirname, '../supabase/migrations/20260812203914_pronunciation_gingiva_stress_correction_prod.sql'), 'utf8');
+const gingivaAliasCorrection = fs.readFileSync(path.resolve(__dirname, '../supabase/migrations/20260812203918_pronunciation_gingiva_continuous_alias_prod.sql'), 'utf8');
 
 test('migration creates provider-neutral registry and sync binding', () => {
   assert.match(migration, /create table if not exists public\.pronunciation_terms/i);
