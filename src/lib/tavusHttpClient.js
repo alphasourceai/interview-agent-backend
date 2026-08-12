@@ -69,6 +69,13 @@ const OPERATION_CONFIG = Object.freeze({
   create_persona: Object.freeze({ method: 'POST', path: '/personas', timeout: 'mutation', retrySafety: RETRY_SAFETY.NOT_SAFE_TO_RETRY, maxAttempts: 1 }),
   get_persona: Object.freeze({ method: 'GET', path: '/personas/:personaId', timeout: 'read', retrySafety: RETRY_SAFETY.SAFE_TO_RETRY, maxAttempts: 3 }),
   patch_persona: Object.freeze({ method: 'PATCH', path: '/personas/:personaId', timeout: 'mutation', retrySafety: RETRY_SAFETY.NOT_SAFE_TO_RETRY, maxAttempts: 1 }),
+  get_pal: Object.freeze({ method: 'GET', path: '/pals/:palId', timeout: 'read', retrySafety: RETRY_SAFETY.SAFE_TO_RETRY, maxAttempts: 3 }),
+  patch_pal: Object.freeze({ method: 'PATCH', path: '/pals/:palId', timeout: 'mutation', retrySafety: RETRY_SAFETY.NOT_SAFE_TO_RETRY, maxAttempts: 1 }),
+  publish_pal: Object.freeze({ method: 'POST', path: '/pals/:palId/publish', timeout: 'mutation', retrySafety: RETRY_SAFETY.NOT_SAFE_TO_RETRY, maxAttempts: 1 }),
+  list_pronunciation_dictionaries: Object.freeze({ method: 'GET', path: '/pronunciation-dictionaries', timeout: 'read', retrySafety: RETRY_SAFETY.SAFE_TO_RETRY, maxAttempts: 3 }),
+  get_pronunciation_dictionary: Object.freeze({ method: 'GET', path: '/pronunciation-dictionaries/:dictionaryId', timeout: 'read', retrySafety: RETRY_SAFETY.SAFE_TO_RETRY, maxAttempts: 3 }),
+  create_pronunciation_dictionary: Object.freeze({ method: 'POST', path: '/pronunciation-dictionaries', timeout: 'mutation', retrySafety: RETRY_SAFETY.NOT_SAFE_TO_RETRY, maxAttempts: 1 }),
+  update_pronunciation_dictionary: Object.freeze({ method: 'PATCH', path: '/pronunciation-dictionaries/:dictionaryId', timeout: 'mutation', retrySafety: RETRY_SAFETY.NOT_SAFE_TO_RETRY, maxAttempts: 1 }),
 });
 
 const dispatcherCache = new Map();
@@ -567,8 +574,48 @@ function createTavusHttpClient(options = {}) {
         body,
       });
     },
+    getPal(palId, query = {}, requestOptions = {}) {
+      return execute('get_pal', {
+        ...requestOptions,
+        path: replacePathParameter(OPERATION_CONFIG.get_pal.path, 'palId', palId),
+        query,
+      });
+    },
+    patchPal(palId, body, query = {}, requestOptions = {}) {
+      return execute('patch_pal', {
+        ...requestOptions,
+        path: replacePathParameter(OPERATION_CONFIG.patch_pal.path, 'palId', palId),
+        query,
+        body,
+      });
+    },
+    publishPal(palId, requestOptions = {}) {
+      return execute('publish_pal', {
+        ...requestOptions,
+        path: replacePathParameter(OPERATION_CONFIG.publish_pal.path, 'palId', palId),
+      });
+    },
+    listPronunciationDictionaries(query = {}, requestOptions = {}) {
+      return execute('list_pronunciation_dictionaries', { ...requestOptions, query });
+    },
+    getPronunciationDictionary(dictionaryId, requestOptions = {}) {
+      return execute('get_pronunciation_dictionary', {
+        ...requestOptions,
+        path: replacePathParameter(OPERATION_CONFIG.get_pronunciation_dictionary.path, 'dictionaryId', dictionaryId),
+      });
+    },
+    createPronunciationDictionary(body, requestOptions = {}) {
+      return execute('create_pronunciation_dictionary', { ...requestOptions, body });
+    },
+    updatePronunciationDictionary(dictionaryId, body, requestOptions = {}) {
+      return execute('update_pronunciation_dictionary', {
+        ...requestOptions,
+        path: replacePathParameter(OPERATION_CONFIG.update_pronunciation_dictionary.path, 'dictionaryId', dictionaryId),
+        body,
+      });
+    },
     createReadRequestForTest(operation, path, requestOptions = {}) {
-      if (!['get_conversation', 'list_conversations', 'get_persona'].includes(operation)) {
+      if (!['get_conversation', 'list_conversations', 'get_persona', 'get_pal', 'list_pronunciation_dictionaries', 'get_pronunciation_dictionary'].includes(operation)) {
         throw new Error('test_read_operation_required');
       }
       return execute(operation, { ...requestOptions, path });
