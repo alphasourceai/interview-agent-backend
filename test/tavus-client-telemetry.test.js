@@ -110,6 +110,32 @@ function createFakeDatabase(options = {}) {
 }
 
 test('diagnostic contract exposes only the bounded event and metadata allowlists', () => {
+  for (const event of [
+    'closing_terminal_reserved',
+    'closing_candidate_audio_unpublish_requested',
+    'closing_foreign_pal_audio_muted',
+    'closing_interrupt_dispatched',
+    'closing_farewell_dispatched',
+    'closing_farewell_dispatch_failed',
+    'closing_farewell_started',
+    'closing_farewell_completed',
+    'closing_foreign_inference_suppressed',
+    'closing_farewell_interrupted',
+    'closing_farewell_start_timed_out',
+    'closing_farewell_completion_timed_out',
+  ]) {
+    assert.equal(TELEMETRY_EVENTS.has(event), true, event);
+  }
+  assert.equal(TELEMETRY_EVENTS.has('local_closing_reserved'), true);
+  assert.equal(TELEMETRY_EVENTS.has('remote_pal_audio_muted'), true);
+  assert.equal(TELEMETRY_EVENTS.has('candidate_audio_unpublish_requested'), true);
+  assert.equal(TELEMETRY_EVENTS.has('local_closing_audio_primed'), true);
+  assert.equal(TELEMETRY_EVENTS.has('local_closing_audio_prime_failed'), true);
+  assert.equal(TELEMETRY_EVENTS.has('local_closing_audio_play_requested'), true);
+  assert.equal(TELEMETRY_EVENTS.has('local_closing_audio_started'), true);
+  assert.equal(TELEMETRY_EVENTS.has('local_closing_audio_completed'), true);
+  assert.equal(TELEMETRY_EVENTS.has('local_closing_audio_play_failed'), true);
+  assert.equal(TELEMETRY_EVENTS.has('local_closing_navigation_fallback'), true);
   assert.equal(TELEMETRY_EVENTS.has('reconnect_started'), true);
   assert.equal(TELEMETRY_EVENTS.has('interview_terminal_requested'), true);
   assert.equal(TELEMETRY_EVENTS.has('question_lock_entered'), true);
@@ -127,6 +153,13 @@ test('diagnostic contract exposes only the bounded event and metadata allowlists
   assert.equal(TELEMETRY_EVENTS.has('closing_farewell_completed'), true);
   assert.equal(TELEMETRY_EVENTS.has('closing_farewell_interrupted'), true);
   assert.equal(TELEMETRY_EVENTS.has('closing_farewell_completion_timeout'), true);
+  assert.equal(TELEMETRY_EVENTS.has('closing_candidate_audio_lock_requested'), true);
+  assert.equal(TELEMETRY_EVENTS.has('closing_candidate_audio_lock_waiting'), true);
+  assert.equal(TELEMETRY_EVENTS.has('closing_candidate_audio_locked'), true);
+  assert.equal(TELEMETRY_EVENTS.has('closing_candidate_audio_lock_failed'), true);
+  assert.equal(TELEMETRY_EVENTS.has('closing_candidate_audio_lock_timed_out'), true);
+  assert.equal(TELEMETRY_EVENTS.has('closing_candidate_audio_lock_cancelled'), true);
+  assert.equal(TELEMETRY_EVENTS.has('closing_candidate_activity_suppressed'), true);
   assert.equal(TELEMETRY_EVENTS.has('termination_only_entered'), true);
   assert.equal(TELEMETRY_EVENTS.has('provider_end_requested'), true);
   assert.equal(TELEMETRY_EVENTS.has('provider_end_confirmed'), true);
@@ -139,6 +172,340 @@ test('diagnostic contract exposes only the bounded event and metadata allowlists
   assert.equal(METADATA_KEYS.has('remote_audio_state'), true);
   assert.equal(METADATA_KEYS.has('message'), false);
   assert.equal(METADATA_KEYS.has('conversation_id'), false);
+});
+
+test('startup-readiness and remote-media telemetry accepts only the bounded canonical contract', () => {
+  for (const event of [
+    'daily_remote_participant_snapshot',
+    'daily_remote_track_state_changed',
+    'daily_receive_settings_snapshot',
+    'remote_video_attachment_result',
+    'reconnect_media_binding_snapshot',
+    'startup_readiness_changed',
+  ]) assert.equal(TELEMETRY_EVENTS.has(event), true, event);
+
+  const snapshot = validateTelemetryPayload({
+    ...BASE_PAYLOAD,
+    event: 'daily_remote_participant_snapshot',
+    metadata: {
+      remote_participant_count_bucket: 'one',
+      local_remote_classification: 'all_non_local_as_replica',
+      audio_track_state: 'playable',
+      video_track_state: 'loading',
+      audio_persistent_track_present: true,
+      video_persistent_track_present: true,
+      audio_subscription_state: 'subscribed',
+      video_subscription_state: 'staged',
+      startup_readiness_state: 'remote_video_loading',
+      reconnect_phase: 'idle',
+      snapshot_reason: 'participant_updated',
+    },
+  });
+  assert.equal(snapshot.ok, true);
+
+  const attachment = validateTelemetryPayload({
+    ...BASE_PAYLOAD,
+    event_sequence: 2,
+    event: 'remote_video_attachment_result',
+    metadata: {
+      video_attachment_result: 'play_rejected_policy',
+      video_track_state: 'playable',
+      element_ready_state_bucket: 'metadata',
+      element_visible: true,
+      element_size_bucket: 'nonzero',
+      reconnect_active: false,
+      elapsed_since_join_bucket: 'under_15_seconds',
+      startup_readiness_state: 'remote_video_playable',
+    },
+  });
+  assert.equal(attachment.ok, true);
+
+  const raw = validateTelemetryPayload({
+    ...BASE_PAYLOAD,
+    event_sequence: 3,
+    event: 'daily_remote_track_state_changed',
+    metadata: { track_id: 'forbidden' },
+  });
+  assert.deepEqual(raw, { ok: false, code: 'UNKNOWN_TELEMETRY_METADATA' });
+});
+
+test('zero-deadline local closing diagnostics accept only bounded metadata', () => {
+  const cases = [
+    ['local_closing_reserved', { closing_state: 'LOCAL_CLOSING', remaining_time_bucket: '0_10' }],
+    ['remote_pal_audio_muted', {
+      closing_state: 'LOCAL_CLOSING',
+      remaining_time_bucket: '0_10',
+      mute_result_category: 'muted_detached',
+    }],
+    ['candidate_audio_unpublish_requested', {
+      closing_state: 'LOCAL_CLOSING',
+      remaining_time_bucket: '0_10',
+      candidate_unpublish_result_category: 'requested',
+    }],
+    ['local_closing_audio_primed', {
+      closing_state: 'INTERVIEWING',
+      playback_result_category: 'primed',
+      audio_duration_bucket: '4_5_seconds',
+    }],
+    ['local_closing_audio_prime_failed', {
+      closing_state: 'INTERVIEWING',
+      playback_result_category: 'prime_failed',
+      audio_duration_bucket: '4_5_seconds',
+    }],
+    ['local_closing_audio_play_requested', {
+      closing_state: 'LOCAL_CLOSING',
+      remaining_time_bucket: '0_10',
+      playback_result_category: 'requested',
+      audio_duration_bucket: '4_5_seconds',
+    }],
+    ['local_closing_audio_started', {
+      closing_state: 'LOCAL_CLOSING',
+      remaining_time_bucket: '0_10',
+      playback_result_category: 'started',
+      audio_duration_bucket: '4_5_seconds',
+    }],
+    ['local_closing_audio_completed', {
+      closing_state: 'LOCAL_CLOSING',
+      remaining_time_bucket: '0_10',
+      playback_result_category: 'completed',
+      audio_duration_bucket: '4_5_seconds',
+    }],
+    ['local_closing_audio_play_failed', {
+      closing_state: 'LOCAL_CLOSING',
+      remaining_time_bucket: '0_10',
+      playback_result_category: 'play_failed',
+      audio_duration_bucket: '4_5_seconds',
+    }],
+    ['local_closing_navigation_fallback', {
+      closing_state: 'COMPLETE',
+      remaining_time_bucket: '0_10',
+      fallback_reason: 'playback_stalled',
+    }],
+    ['provider_end_requested', {
+      closing_state: 'LOCAL_CLOSING',
+      remaining_time_bucket: '0_10',
+      hard_deadline: true,
+      provider_end_result_category: 'requested',
+    }],
+    ['provider_end_confirmed', {
+      closing_state: 'LOCAL_CLOSING',
+      remaining_time_bucket: '0_10',
+      hard_deadline: true,
+      provider_end_result_category: 'confirmed',
+    }],
+  ];
+  for (const [index, [event, metadata]] of cases.entries()) {
+    const result = validateTelemetryPayload({
+      ...BASE_PAYLOAD,
+      event,
+      event_sequence: 800 + index,
+      reason: undefined,
+      metadata,
+    });
+    assert.equal(result.ok, true, event);
+  }
+
+  for (const metadata of [
+    { closing_text: 'synthetic' },
+    { transcript: 'synthetic' },
+    { provider_conversation_id: 'synthetic' },
+    { participant_id: 'synthetic' },
+    { room_url: 'https://example.invalid' },
+    { file_path: '/synthetic/path' },
+    { playback_result_category: 'raw_exception' },
+    { fallback_reason: 'raw_media_failure' },
+  ]) {
+    assert.equal(validateTelemetryPayload({
+      ...BASE_PAYLOAD,
+      event: 'local_closing_audio_play_failed',
+      event_sequence: 850,
+      reason: undefined,
+      metadata,
+    }).ok, false);
+  }
+});
+
+test('terminal closing diagnostics accept the canonical bounded contract and reject content', () => {
+  const cases = [
+    ['closing_terminal_reserved', {
+      closing_state: 'CLOSING_RESERVED',
+      duplicate_suppression_category: 'none',
+      remaining_time_bucket: '0_10',
+    }],
+    ['closing_candidate_audio_unpublish_requested', {
+      closing_state: 'CLOSING_RESERVED',
+      candidate_unpublish_result_category: 'requested',
+      remaining_time_bucket: '0_10',
+    }],
+    ['closing_foreign_pal_audio_muted', {
+      closing_state: 'FOREIGN_PAL_AUDIO_MUTED',
+      mute_result_category: 'muted_detached',
+      remaining_time_bucket: '0_10',
+    }],
+    ['closing_interrupt_dispatched', {
+      closing_state: 'FOREIGN_PAL_AUDIO_MUTED',
+      dispatch_result_category: 'sent',
+      remaining_time_bucket: '0_10',
+    }],
+    ['closing_farewell_dispatched', {
+      closing_state: 'FAREWELL_DISPATCHED',
+      dispatch_result_category: 'sent',
+      remaining_time_bucket: '0_10',
+    }],
+    ['closing_farewell_dispatch_failed', {
+      closing_state: 'FOREIGN_PAL_AUDIO_MUTED',
+      dispatch_result_category: 'failed',
+      remaining_time_bucket: '0_10',
+    }],
+    ['closing_farewell_started', {
+      closing_state: 'FAREWELL_AUDIBLE',
+      inference_match: true,
+      speech_result_category: 'started',
+      remote_audio_state_category: 'audible',
+      remaining_time_bucket: '0_10',
+    }],
+    ['closing_foreign_inference_suppressed', {
+      closing_state: 'FAREWELL_AUDIBLE',
+      inference_match: false,
+      remote_audio_state_category: 'remuted',
+      provider_end_reason: 'foreign_inference_conflict',
+      remaining_time_bucket: '0_10',
+    }],
+    ['closing_farewell_start_timed_out', {
+      closing_state: 'FAREWELL_DISPATCHED',
+      timeout_category: 'farewell_start',
+      remaining_time_bucket: '0_10',
+    }],
+    ['closing_farewell_completion_timed_out', {
+      closing_state: 'FAREWELL_AUDIBLE',
+      timeout_category: 'farewell_completion',
+      remaining_time_bucket: '0_10',
+    }],
+    ['closing_farewell_completed', {
+      closing_state: 'FAREWELL_AUDIBLE',
+      inference_match: true,
+      speech_interrupted: false,
+      speech_result_category: 'completed',
+      remaining_time_bucket: '0_10',
+    }],
+    ['closing_farewell_interrupted', {
+      closing_state: 'FAREWELL_AUDIBLE',
+      inference_match: true,
+      speech_interrupted: true,
+      remote_audio_state_category: 'remuted',
+      remaining_time_bucket: '0_10',
+    }],
+    ['provider_end_requested', {
+      closing_state: 'PROVIDER_END_REQUESTED',
+      provider_end_result_category: 'requested',
+      provider_end_reason: 'farewell_completed',
+      remaining_time_bucket: '0_10',
+    }],
+    ['provider_end_confirmed', {
+      closing_state: 'PROVIDER_END_REQUESTED',
+      provider_end_result_category: 'unconfirmed',
+      provider_end_reason: 'observer_reload',
+      remaining_time_bucket: '0_10',
+    }],
+  ];
+  for (const [index, [event, metadata]] of cases.entries()) {
+    const result = validateTelemetryPayload({
+      ...BASE_PAYLOAD,
+      event,
+      event_sequence: 900 + index,
+      reason: undefined,
+      metadata,
+    });
+    assert.equal(result.ok, true, `${event}:${result.code || 'ok'}`);
+  }
+
+  for (const metadata of [
+    { inference_id: 'synthetic' },
+    { farewell_text: 'synthetic' },
+    { provider_conversation_id: 'synthetic' },
+    { participant_id: 'synthetic' },
+    { room_url: 'https://example.invalid' },
+    { raw_event: 'synthetic' },
+  ]) {
+    assert.equal(validateTelemetryPayload({
+      ...BASE_PAYLOAD,
+      event: 'closing_farewell_started',
+      event_sequence: 950,
+      reason: undefined,
+      metadata,
+    }).ok, false);
+  }
+});
+
+test('final-closing audio lock diagnostics accept only bounded publication metadata', () => {
+  for (const [index, [event, lock_result_category]] of [
+    ['closing_candidate_audio_lock_requested', 'requested'],
+    ['closing_candidate_audio_lock_waiting', 'requested'],
+    ['closing_candidate_audio_locked', 'confirmed_disabled'],
+    ['closing_candidate_audio_lock_failed', 'definite_failure'],
+    ['closing_candidate_audio_lock_timed_out', 'timed_out'],
+    ['closing_candidate_audio_lock_cancelled', 'cancelled_terminal'],
+  ].entries()) {
+    const result = validateTelemetryPayload({
+      ...BASE_PAYLOAD,
+      event,
+      event_sequence: 700 + index,
+      reason: undefined,
+      metadata: {
+        closing_state: 'FINAL_FAREWELL_ELIGIBLE',
+        remaining_time_bucket: '11_30',
+        lock_result_category,
+        audio_publication_enabled: event === 'closing_candidate_audio_lock_failed',
+        attempt_count: Math.min(2, index),
+        confirmation_source: event === 'closing_candidate_audio_locked'
+          ? 'participant_updated'
+          : 'none',
+        publication_state: event === 'closing_candidate_audio_locked'
+          ? 'off'
+          : event === 'closing_candidate_audio_lock_failed'
+            ? 'enabled'
+            : 'unknown',
+        elapsed_time_bucket: 'under_250',
+        ...(event === 'closing_candidate_audio_lock_timed_out'
+          ? { timeout_category: 'bounded_timeout' }
+          : {}),
+        reconnect_active: false,
+      },
+    });
+    assert.equal(result.ok, true, event);
+  }
+  assert.equal(validateTelemetryPayload({
+    ...BASE_PAYLOAD,
+    event: 'closing_candidate_activity_suppressed',
+    event_sequence: 710,
+    reason: undefined,
+    metadata: {
+      closing_state: 'FINAL_FAREWELL_ELIGIBLE',
+      remaining_time_bucket: '11_30',
+      suppression_reason: 'final_closing_audio_lock',
+    },
+  }).ok, true);
+
+  for (const metadata of [
+    { utterance: 'synthetic' },
+    { participant_id: 'synthetic' },
+    { provider_conversation_id: 'synthetic' },
+    { lock_result_category: 'raw_daily_failure' },
+    { attempt_count: 3 },
+    { suppression_reason: 'synthetic-sensitive-reason' },
+    { confirmation_source: 'raw_daily_event' },
+    { publication_state: 'SECRET_TRACK_STATE' },
+    { elapsed_time_bucket: '1800_exact' },
+    { timeout_category: 'raw_timeout_reason' },
+  ]) {
+    assert.equal(validateTelemetryPayload({
+      ...BASE_PAYLOAD,
+      event: 'closing_candidate_audio_lock_failed',
+      event_sequence: 720,
+      reason: undefined,
+      metadata,
+    }).ok, false);
+  }
 });
 
 test('inactivity diagnostics accept only bounded lifecycle metadata', () => {

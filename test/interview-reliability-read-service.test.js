@@ -285,7 +285,11 @@ test('classification and processing rules are deterministic at the one-hour exis
 test('metadata projection allowlists bounded technical fields and strips arbitrary metadata', () => {
   const source = lifecycleEvents()[1];
   const sanitized = sanitizeLifecycleEvent(source, '2026-07-28T16:00:00.000Z');
-  assert.deepEqual(sanitized.technical_details, { track_kind: 'audio', track_state: 'playable' });
+  assert.deepEqual(sanitized.technical_details, {
+    track_kind: 'audio',
+    track_state: 'playable',
+    webhook_latency_bucket: 'under_1_second',
+  });
   assert.equal(Object.keys(sanitized.technical_details).every((key) => TECHNICAL_METADATA_FIELDS.includes(key)), true);
   assertNoSensitiveContent(sanitized);
 
@@ -299,8 +303,67 @@ test('metadata projection allowlists bounded technical fields and strips arbitra
       terminal_reason: { secret: 'SECRET_NESTED_MARKER' },
     },
   }, '2026-07-28T16:00:00.000Z');
-  assert.deepEqual(invalidValues.technical_details, {});
+  assert.deepEqual(invalidValues.technical_details, { webhook_latency_bucket: 'under_1_second' });
   assert.equal(JSON.stringify(invalidValues).includes('SECRET_'), false);
+});
+
+test('provider occurrence and receipt timing derives bounded webhook latency without conflating late occurrence', () => {
+  const underOne = sanitizeLifecycleEvent({
+    event_type: 'system.replica_joined',
+    observed_at: '2026-08-05T12:01:20.000Z',
+    received_at: '2026-08-05T12:01:20.411Z',
+    created_at: '2026-08-05T12:01:20.500Z',
+    metadata: {},
+  }, '2026-08-05T12:00:00.000Z');
+  assert.equal(underOne.technical_details.webhook_latency_bucket, 'under_1_second');
+  assert.equal(underOne.elapsed_ms, 80000);
+  assert.equal(underOne.persistence_timestamp, '2026-08-05T12:01:20.500Z');
+
+  for (const [received_at, expected] of [
+    ['2026-08-05T12:00:04.000Z', '1_5_seconds'],
+    ['2026-08-05T12:00:12.000Z', '5_15_seconds'],
+    ['2026-08-05T12:00:20.000Z', 'over_15_seconds'],
+  ]) {
+    const result = sanitizeLifecycleEvent({
+      event_type: 'system.replica_joined',
+      observed_at: '2026-08-05T12:00:00.000Z',
+      received_at,
+      metadata: {},
+    }, '2026-08-05T12:00:00.000Z');
+    assert.equal(result.technical_details.webhook_latency_bucket, expected);
+  }
+
+  const unavailable = sanitizeLifecycleEvent({
+    event_type: 'system.replica_joined',
+    received_at: '2026-08-05T12:00:01.000Z',
+    metadata: {},
+  }, '2026-08-05T12:00:00.000Z');
+  assert.equal('webhook_latency_bucket' in unavailable.technical_details, false);
+});
+
+test('new startup and media events render bounded labels and identity-free metadata', () => {
+  const sanitized = sanitizeLifecycleEvent({
+    event_type: 'client.daily_remote_participant_snapshot',
+    observed_at: '2026-08-05T12:00:00.000Z',
+    received_at: '2026-08-05T12:00:00.100Z',
+    metadata: {
+      remote_participant_count_bucket: 'one',
+      audio_track_state: 'playable',
+      video_track_state: 'loading',
+      startup_readiness_state: 'remote_video_loading',
+      participant_id: 'SECRET_PARTICIPANT_MARKER',
+      track_id: 'SECRET_TRACK_MARKER',
+    },
+  }, '2026-08-05T12:00:00.000Z');
+  assert.equal(sanitized.event, 'Remote participant snapshot');
+  assert.deepEqual(sanitized.technical_details, {
+    audio_track_state: 'playable',
+    video_track_state: 'loading',
+    remote_participant_count_bucket: 'one',
+    startup_readiness_state: 'remote_video_loading',
+    webhook_latency_bucket: 'under_1_second',
+  });
+  assert.equal(JSON.stringify(sanitized).includes('SECRET_'), false);
 });
 
 test('closing lifecycle diagnostics render bounded labels without raw payload data', () => {
@@ -330,6 +393,37 @@ test('closing lifecycle diagnostics render bounded labels without raw payload da
     speech_interrupted: true,
   });
   assert.equal(JSON.stringify(sanitized).includes('SECRET_'), false);
+});
+
+test('terminal-closing lifecycle diagnostics render canonical bounded labels', () => {
+  const events = [
+    ['client.closing_terminal_reserved', 'Terminal closing reserved'],
+    ['client.closing_foreign_pal_audio_muted', 'Ordinary PAL audio muted'],
+    ['client.closing_interrupt_dispatched', 'Closing interrupt dispatched'],
+    ['client.closing_farewell_dispatched', 'Closing farewell dispatched'],
+    ['client.closing_farewell_dispatch_failed', 'Closing farewell dispatch failed'],
+    ['client.closing_farewell_started', 'Closing farewell started'],
+    ['client.closing_farewell_completed', 'Closing farewell completed'],
+    ['client.closing_farewell_interrupted', 'Closing farewell interrupted'],
+    ['client.closing_foreign_inference_suppressed', 'Foreign closing inference suppressed'],
+    ['client.closing_farewell_start_timed_out', 'Closing farewell start timed out'],
+    ['client.closing_farewell_completion_timed_out', 'Closing farewell completion timed out'],
+  ];
+  for (const [event_type, expectedLabel] of events) {
+    const sanitized = sanitizeLifecycleEvent({
+      id: event_type,
+      event_type,
+      observed_at: '2026-08-04T12:00:00.000Z',
+      received_at: '2026-08-04T12:00:00.100Z',
+      metadata: {
+        closing_state: 'FAREWELL_DISPATCHED',
+        remaining_time_bucket: '0_10',
+        raw_payload: 'SECRET_CLOSING_MARKER',
+      },
+    }, '2026-08-04T12:00:00.000Z');
+    assert.equal(sanitized.event, expectedLabel);
+    assert.equal(JSON.stringify(sanitized).includes('SECRET_CLOSING_MARKER'), false);
+  }
 });
 
 test('single 20-second closing interrupt renders bounded evidence only', () => {
@@ -387,6 +481,115 @@ test('single-flight farewell diagnostics expose bounded completion and deadline 
     remaining_time_bucket: '0_10',
     turn_index: 5,
     hard_deadline: false,
+  });
+  assert.equal(JSON.stringify(sanitized).includes('SECRET_'), false);
+});
+
+test('final-closing audio lock evidence exposes bounded publication state only', () => {
+  const sanitized = sanitizeLifecycleEvent({
+    id: 'audio-lock-event',
+    interview_id: INTERVIEW_A,
+    event_type: 'client.closing_candidate_audio_locked',
+    source: 'browser',
+    occurred_at: '2026-07-28T16:00:00.000Z',
+    received_at: '2026-07-28T16:00:00.100Z',
+    metadata: {
+      closing_state: 'FINAL_FAREWELL_ELIGIBLE',
+      remaining_time_bucket: '11_30',
+      lock_result_category: 'confirmed_disabled',
+      audio_publication_enabled: false,
+      attempt_count: 1,
+      confirmation_source: 'participant_updated',
+      publication_state: 'off',
+      elapsed_time_bucket: '250_749',
+      reconnect_active: false,
+      participant_id: 'SECRET_PARTICIPANT_MARKER',
+      provider_payload: 'SECRET_PROVIDER_MARKER',
+    },
+  }, '2026-07-28T16:00:01.000Z');
+
+  assert.equal(sanitized.event_code, 'client.closing_candidate_audio_locked');
+  assert.equal(sanitized.event, 'Candidate audio publication locked');
+  assert.deepEqual(sanitized.technical_details, {
+    closing_state: 'FINAL_FAREWELL_ELIGIBLE',
+    remaining_time_bucket: '11_30',
+    lock_result_category: 'confirmed_disabled',
+    audio_publication_enabled: false,
+    attempt_count: 1,
+    confirmation_source: 'participant_updated',
+    publication_state: 'off',
+    elapsed_time_bucket: '250_749',
+    reconnect_active: false,
+  });
+  assert.equal(JSON.stringify(sanitized).includes('SECRET_'), false);
+});
+
+test('asynchronous audio-lock timeout diagnostics remain bounded and content-free', () => {
+  const sanitized = sanitizeLifecycleEvent({
+    id: 'audio-lock-timeout-event',
+    interview_id: INTERVIEW_A,
+    event_type: 'client.closing_candidate_audio_lock_timed_out',
+    source: 'browser',
+    occurred_at: '2026-07-28T16:00:00.000Z',
+    received_at: '2026-07-28T16:00:00.100Z',
+    metadata: {
+      closing_state: 'FINAL_FAREWELL_ELIGIBLE',
+      remaining_time_bucket: '11_30',
+      lock_result_category: 'timed_out',
+      confirmation_source: 'none',
+      publication_state: 'loading',
+      elapsed_time_bucket: '1500_1999',
+      timeout_category: 'bounded_timeout',
+      attempt_count: 1,
+      reconnect_active: false,
+      participant_id: 'SECRET_PARTICIPANT_MARKER',
+      raw_daily_payload: 'SECRET_DAILY_MARKER',
+    },
+  }, '2026-07-28T16:00:02.000Z');
+
+  assert.equal(sanitized.event_code, 'client.closing_candidate_audio_lock_timed_out');
+  assert.equal(sanitized.event, 'Candidate audio lock confirmation timed out');
+  assert.deepEqual(sanitized.technical_details, {
+    closing_state: 'FINAL_FAREWELL_ELIGIBLE',
+    remaining_time_bucket: '11_30',
+    lock_result_category: 'timed_out',
+    confirmation_source: 'none',
+    publication_state: 'loading',
+    elapsed_time_bucket: '1500_1999',
+    timeout_category: 'bounded_timeout',
+    attempt_count: 1,
+    reconnect_active: false,
+  });
+  assert.equal(JSON.stringify(sanitized).includes('SECRET_'), false);
+});
+
+test('zero-deadline local closing diagnostics render bounded labels without content', () => {
+  const sanitized = sanitizeLifecycleEvent({
+    id: 'local-closing-event',
+    interview_id: INTERVIEW_A,
+    event_type: 'client.local_closing_audio_completed',
+    source: 'browser',
+    occurred_at: '2026-07-28T16:00:00.000Z',
+    received_at: '2026-07-28T16:00:00.100Z',
+    metadata: {
+      closing_state: 'LOCAL_CLOSING',
+      remaining_time_bucket: '0_10',
+      playback_result_category: 'completed',
+      audio_duration_bucket: '4_5_seconds',
+      transcript_text: 'SECRET_TRANSCRIPT_MARKER',
+      closing_text: 'SECRET_CLOSING_MARKER',
+      provider_conversation_id: 'SECRET_PROVIDER_MARKER',
+      file_path: 'SECRET_PATH_MARKER',
+    },
+  }, '2026-07-28T16:00:01.000Z');
+
+  assert.equal(sanitized.event_code, 'client.local_closing_audio_completed');
+  assert.equal(sanitized.event, 'Local closing audio completed');
+  assert.deepEqual(sanitized.technical_details, {
+    closing_state: 'LOCAL_CLOSING',
+    remaining_time_bucket: '0_10',
+    playback_result_category: 'completed',
+    audio_duration_bucket: '4_5_seconds',
   });
   assert.equal(JSON.stringify(sanitized).includes('SECRET_'), false);
 });
