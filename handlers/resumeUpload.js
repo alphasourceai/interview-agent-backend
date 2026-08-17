@@ -3,9 +3,16 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const analyzeResume = require('../analyzeResume');
 const { supabaseAdmin: supabase } = require('../src/lib/supabaseClient');
+const { ResumeUploadError, inspectResumeFile } = require('../src/lib/resumeUpload');
 
 const storage = multer.memoryStorage();
-const upload = multer({ storage });
+const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
+
+function nullableScore(value) {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
+  const score = Number(value);
+  return Number.isFinite(score) ? Math.max(0, Math.min(100, score)) : null;
+}
 
 const handleResumeUpload = [
   upload.single('resume'),
@@ -14,6 +21,29 @@ const handleResumeUpload = [
     try {
       const { name, email, role_id } = req.body;
       const resumeFile = req.file;
+      if (!resumeFile) {
+        return res.status(400).json({
+          error: 'resume_required',
+          code: 'resume_required',
+          detail: 'Choose a resume file and try again.',
+          hint: null,
+          request_id
+        });
+      }
+      try {
+        await inspectResumeFile(resumeFile);
+      } catch (error) {
+        if (error instanceof ResumeUploadError) {
+          return res.status(400).json({
+            error: String(error.code || 'resume_unreadable').toLowerCase(),
+            code: error.code,
+            detail: error.detail,
+            hint: null,
+            request_id
+          });
+        }
+        throw error;
+      }
       const fileExt = path.extname(resumeFile.originalname);
       const candidate_id = `cand-${uuidv4()}`;
       const storagePath = `${candidate_id}${fileExt}`;
@@ -47,16 +77,19 @@ const handleResumeUpload = [
 
 
       const analysisSummary = {
-        resume_score: Number(analysis.resume_score) || 0,
-        skills_match_percent: Number(analysis.skills_match_percent) || 0,
-        experience_match_percent: Number(analysis.experience_match_percent) || 0,
-        education_match_percent: Number(analysis.education_match_percent) || 0,
-        overall_resume_match_percent: Number(analysis.overall_resume_match_percent) || 0,
+        resume_score: nullableScore(analysis.resume_score),
+        skills_match_percent: nullableScore(analysis.skills_match_percent),
+        experience_match_percent: nullableScore(analysis.experience_match_percent),
+        education_match_percent: nullableScore(analysis.education_match_percent),
+        overall_resume_match_percent: nullableScore(analysis.overall_resume_match_percent),
         resume_summary: analysis.summary || '',
+        evidence: Array.isArray(analysis.evidence) ? analysis.evidence : [],
+        analysis_status: analysis.analysis_status || 'unavailable',
+        resume_integrity: analysis.resume_integrity || null,
         resume_analysis: {
-          experience_match_percent: Number(analysis.experience_match_percent) || 0,
-          skills_match_percent: Number(analysis.skills_match_percent) || 0,
-          education_match_percent: Number(analysis.education_match_percent) || 0,
+          experience_match_percent: nullableScore(analysis.experience_match_percent),
+          skills_match_percent: nullableScore(analysis.skills_match_percent),
+          education_match_percent: nullableScore(analysis.education_match_percent),
           summary: analysis.summary || ''
         }
       };

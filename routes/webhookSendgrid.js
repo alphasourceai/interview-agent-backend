@@ -4,6 +4,7 @@ const express = require('express');
 const sg = require('@sendgrid/mail');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const { buildBrandedEmailShell, escapeHtml } = require('../utils/mailer');
+const { authenticateSendgridWebhook } = require('../src/lib/sendgridWebhookAuth');
 
 const router = express.Router();
 
@@ -195,10 +196,14 @@ async function sendAlert(payload) {
 }
 
 router.post('/', async (req, res) => {
-  const configuredSecret = cleanText(process.env.SENDGRID_EVENT_WEBHOOK_SECRET);
-  if (configuredSecret) {
-    const providedSecret = cleanText(req.get('x-sendgrid-webhook-secret')) || cleanText(req.query?.secret);
-    if (providedSecret !== configuredSecret) return res.status(401).json({ error: 'unauthorized' });
+  const authentication = authenticateSendgridWebhook({
+    env: process.env,
+    getHeader: (name) => req.get(name),
+    rawBody: req.raw_body,
+    querySecret: req.query?.secret,
+  });
+  if (!authentication.ok) {
+    return res.status(authentication.status).json({ error: authentication.code });
   }
 
   if (!Array.isArray(req.body)) {

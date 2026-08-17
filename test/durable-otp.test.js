@@ -77,6 +77,15 @@ test('destination fingerprint is deterministic and does not reveal the email', (
   assert.doesNotMatch(fingerprint, /candidate|example/i);
 });
 
+test('SMS destination fingerprint requires canonical E.164 and is channel-separated', () => {
+  const sms = otp.destinationFingerprint('+15551234567', 1, ENV, 'sms');
+  assert.match(sms, /^[0-9a-f]{64}$/);
+  assert.notEqual(sms, otp.destinationFingerprint('+15551234567', 1, ENV, 'email'));
+  assert.throws(() => otp.destinationFingerprint('(555) 123-4567', 1, ENV, 'sms'), {
+    code: 'INVALID_OTP_DESTINATION',
+  });
+});
+
 test('verifier is deterministic for the same challenge and binding', () => {
   const args = { challengeId: ID.challenge, code: '012345', binding: binding(), env: ENV };
   assert.equal(otp.verifierHmac(args), otp.verifierHmac(args));
@@ -95,6 +104,15 @@ test('verifier changes when the challenge ID changes', () => {
 test('verifier changes when a bound resource changes', () => {
   const common = { challengeId: ID.challenge, code: '012345', env: ENV };
   assert.notEqual(otp.verifierHmac({ ...common, binding: binding() }), otp.verifierHmac({ ...common, binding: binding({ interview_attempt_id: null }) }));
+});
+
+test('channel remains HMAC-bound for verifier and binding fingerprints', () => {
+  const common = { challengeId: ID.challenge, code: '012345', binding: binding(), env: ENV };
+  assert.notEqual(
+    otp.verifierHmac({ ...common, channel: 'email' }),
+    otp.verifierHmac({ ...common, channel: 'sms' }),
+  );
+  assert.notEqual(otp.bindingFingerprint(binding(), 'email'), otp.bindingFingerprint(binding(), 'sms'));
 });
 
 test('verifier rejects non-six-digit input', () => {
@@ -120,6 +138,34 @@ test('issue RPC receives only HMAC/fingerprints and never plaintext code or emai
   assert.match(call.args.p_verifier_hmac_hex, /^[0-9a-f]{64}$/);
   assert.equal(JSON.stringify(call.args).includes(result.code), false);
   assert.equal(JSON.stringify(call.args).includes('candidate@example.test'), false);
+});
+
+test('synthetic SMS issuance uses the consent-bound service boundary without exposing phone or code', async () => {
+  let call;
+  const db = { rpc: async (name, args) => {
+    call = { name, args };
+    return { data: [{ challenge_id: args.p_challenge_id, expires_at: new Date().toISOString() }], error: null };
+  } };
+  const result = await otp.issueOtpChallenge(db, {
+    channel: 'sms', phoneE164: '+15551234567', candidateId: ID.candidate,
+    clientId: ID.client, roleId: ID.role, submissionId: ID.submission,
+    smsSelectionAt: '2026-08-12T00:00:00.000Z', consentCopyVersion: 'sms-qa-v1', env: ENV,
+  });
+  assert.equal(call.name, 'service_issue_sms_otp_challenge');
+  assert.equal(call.args.p_sms_selection_at, '2026-08-12T00:00:00.000Z');
+  assert.equal(call.args.p_consent_copy_version, 'sms-qa-v1');
+  assert.equal(JSON.stringify(call.args).includes(result.code), false);
+  assert.equal(JSON.stringify(call.args).includes('+15551234567'), false);
+});
+
+test('synthetic SMS issuance fails before RPC without explicit consent evidence', async () => {
+  let called = false;
+  const db = { rpc: async () => { called = true; return { data: null, error: null }; } };
+  await assert.rejects(otp.issueOtpChallenge(db, {
+    channel: 'sms', phoneE164: '+15551234567', candidateId: ID.candidate,
+    clientId: ID.client, roleId: ID.role, env: ENV,
+  }), { code: 'SMS_CONSENT_EVIDENCE_REQUIRED' });
+  assert.equal(called, false);
 });
 
 test('consume uses constant-time result and sends only a boolean to the atomic RPC', async () => {

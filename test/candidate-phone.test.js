@@ -5,6 +5,8 @@ const { test } = require('node:test');
 const {
   normalizeCandidatePhoneCountry,
   normalizeCandidatePhone,
+  normalizeCandidatePhoneIdentity,
+  normalizeCandidatePhoneE164,
   isValidCandidatePhone,
   getCandidatePhoneValidationMessage
 } = require('../src/lib/candidatePhone');
@@ -51,4 +53,26 @@ test('candidate phone country defaults to United States when missing or unsuppor
   assert.equal(normalizeCandidatePhoneCountry(), 'US');
   assert.equal(normalizeCandidatePhoneCountry('CA'), 'US');
   assert.equal(normalizeCandidatePhone('555-123-4567'), '5551234567');
+});
+
+test('candidate phone identity preserves legacy storage while adding canonical US E.164 and country provenance', () => {
+  assert.deepEqual(normalizeCandidatePhoneIdentity('(555) 123-4567', 'US'), {
+    phone: '5551234567',
+    phone_e164: '+15551234567',
+    phone_country_code: 'US',
+  });
+  assert.equal(normalizeCandidatePhoneE164('+1 555 123 4567', 'US'), '+15551234567');
+});
+
+test('candidate phone identity canonicalizes accepted Philippine input without making it SMS eligible', () => {
+  assert.deepEqual(normalizeCandidatePhoneIdentity('0917 123 4567', 'PH'), {
+    phone: '639171234567',
+    phone_e164: '+639171234567',
+    phone_country_code: 'PH',
+  });
+});
+
+test('candidate phone identity rejects malformed values rather than manufacturing E.164', () => {
+  assert.equal(normalizeCandidatePhoneIdentity('555-12', 'US'), null);
+  assert.equal(normalizeCandidatePhoneIdentity('abc123', 'PH'), null);
 });

@@ -51,6 +51,12 @@ const ERROR_DEFINITIONS = Object.freeze({
     error: 'invalid_phone_for_country',
     detail: 'Enter a valid phone number for the selected country.'
   },
+  SMS_CHANNEL_UNAVAILABLE: {
+    status: 503,
+    error: 'sms_channel_unavailable',
+    detail: 'Text message verification is not available. Choose Email to continue.',
+    retryable: false
+  },
   RESUME_EMPTY: {
     status: 400,
     error: 'resume_empty',

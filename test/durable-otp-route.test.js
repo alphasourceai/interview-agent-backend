@@ -217,3 +217,24 @@ test('unknown resend remains enumeration-safe and creates no challenge', async (
   assert.equal(result.body.challenge_id, undefined);
   assert.equal(db.challenges.size, before);
 });
+
+test('SMS resend remains fail-closed when candidate SMS flags are disabled', async () => {
+  const seedId = '83000000-0000-4000-8000-000000000088';
+  db.challenges.set(seedId, {
+    ...db.challenges.get(ID.challenge), challenge_id: seedId, consumed_at: null, superseded_at: null,
+  });
+  const before = db.challenges.size;
+  const sentBefore = sentCodes.length;
+  const result = await post('/resend', {
+    challenge_id: seedId,
+    channel: 'sms',
+    consent_copy_version: 'sms-consent-v1',
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.challenge_id, undefined);
+  assert.equal(result.body.delivery_channel, 'sms');
+  assert.equal(result.body.delivery_outcome, 'misconfigured');
+  assert.equal(result.body.email_fallback_available, true);
+  assert.equal(db.challenges.size, before);
+  assert.equal(sentCodes.length, sentBefore);
+});

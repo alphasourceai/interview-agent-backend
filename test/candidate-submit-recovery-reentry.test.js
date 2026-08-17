@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { test } = require('node:test');
 const express = require('express');
+const { destinationFingerprint } = require('../src/lib/otpChallenge');
 
 process.env.SUPABASE_URL ||= 'http://127.0.0.1:54321';
 process.env.SUPABASE_SERVICE_ROLE_KEY ||= 'test-service-role-key';
@@ -13,6 +14,8 @@ process.env.SENDGRID_API_KEY = 'test-sendgrid-key';
 process.env.SENDGRID_FROM = 'qa@example.test';
 process.env.INTERVIEW_RECOVERY_CORE_ENABLED = 'true';
 process.env.INTERVIEW_RECOVERY_CORE_EMAIL_ENABLED = 'false';
+process.env.OTP_HMAC_SECRET_VERSION = '1';
+process.env.OTP_HMAC_SECRET_V1 = '11'.repeat(32);
 
 const ID = {
   candidate: '76000000-0000-4000-8000-000000000001',
@@ -110,6 +113,8 @@ function scenario(overrides = {}) {
       name: 'Synthetic Recovery Candidate',
       email: 'recovery@example.test',
       phone: '3039008821',
+      phone_e164: '+13039008821',
+      phone_country_code: 'US',
       verified: true,
       status: 'Verified',
       interview_status: null,
@@ -156,6 +161,7 @@ function buildContext(currentScenario) {
     updates: [],
     ledger: [],
     reservations: new Map(),
+    failures: [],
     emails: 0,
     providerCalls: 0,
     rpcs: [],
@@ -177,6 +183,25 @@ function buildContext(currentScenario) {
         tracker.challenges.push(args);
         return { data: [{ challenge_id: args.p_challenge_id, expires_at: '2026-08-10T18:00:00Z' }], error: null };
       }
+      if (name === 'service_is_sms_destination_suppressed') {
+        return { data: currentScenario.smsSuppressed === true, error: null };
+      }
+      if (name === 'service_issue_sms_otp_challenge') {
+        tracker.challenges.push(args);
+        return { data: [{ challenge_id: args.p_challenge_id, expires_at: '2027-08-10T18:00:00Z' }], error: null };
+      }
+      if (name === 'service_record_otp_sms_delivery_metadata') {
+        return {
+          data: [{
+            challenge_id: args.p_challenge_id,
+            provider: args.p_provider,
+            provider_message_id: args.p_provider_message_id,
+            delivery_status: args.p_delivery_status,
+            failure_category: args.p_failure_category,
+          }],
+          error: null,
+        };
+      }
       if (name === 'service_mark_otp_challenge_delivery') return { data: true, error: null };
       return { data: null, error: { message: `unexpected_rpc:${name}` } };
     },
@@ -197,7 +222,8 @@ function loadRouter(context) {
     CandidateSubmissionKeyError: class CandidateSubmissionKeyError extends Error {},
     async reserveCandidateSubmission(_db, { submissionKey }) {
       const existing = context.tracker.reservations.get(submissionKey);
-      if (existing) return { state: 'replay', row: existing };
+      if (existing?.status === 'completed') return { state: 'replay', row: existing };
+      if (existing?.status === 'failed') return { state: 'acquired', row: { id: submissionKey } };
       return { state: 'acquired', row: { id: submissionKey } };
     },
     async completeCandidateSubmission(_db, reservation, result) {
@@ -210,7 +236,16 @@ function loadRouter(context) {
       context.tracker.reservations.set(reservation.row.id, row);
       context.tracker.ledger.push(row);
     },
-    async failCandidateSubmission() {},
+    async failCandidateSubmission(_db, reservation, result) {
+      const row = {
+        id: reservation.row.id,
+        status: 'failed',
+        candidate_id: result.candidateId,
+        last_error_code: result.code,
+      };
+      context.tracker.reservations.set(reservation.row.id, row);
+      context.tracker.failures.push(row);
+    },
   };
   installModule('../src/lib/supabaseClient', { supabase: context, supabaseAdmin: context });
   installModule('../src/lib/rateLimit', {
@@ -253,7 +288,7 @@ async function withServer(router, callback) {
   }
 }
 
-function submissionForm(submissionKey = ID.submission) {
+function submissionForm(submissionKey = ID.submission, channel = 'email') {
   const form = new FormData();
   form.append('first_name', 'Synthetic Recovery');
   form.append('last_name', 'Candidate');
@@ -262,6 +297,8 @@ function submissionForm(submissionKey = ID.submission) {
   form.append('phone', '3039008821');
   form.append('role_id', ID.role);
   form.append('submission_key', submissionKey);
+  form.append('otp_channel', channel);
+  if (channel === 'sms') form.append('consent_copy_version', 'sms-consent-v1');
   const pdfPath = process.env.RECOVERY_REENTRY_PDF_PATH
     || path.join(__dirname, 'fixtures', 'jd-parser-repeated-letters.pdf');
   const pdf = fs.readFileSync(pdfPath);
@@ -269,12 +306,12 @@ function submissionForm(submissionKey = ID.submission) {
   return form;
 }
 
-async function submit(context, submissionKey = ID.submission) {
+async function submit(context, submissionKey = ID.submission, channel = 'email') {
   let result;
   await withServer(loadRouter(context), async (base) => {
     const response = await fetch(`${base}/api/candidate/submit`, {
       method: 'POST',
-      body: submissionForm(submissionKey),
+      body: submissionForm(submissionKey, channel),
     });
     result = { status: response.status, body: await response.json() };
   });
@@ -297,6 +334,141 @@ test('authorized reset-only candidate re-entry reaches the normal OTP boundary w
   assert.deepEqual(context.scenario.interviews[0], priorBefore);
   assert.deepEqual(context.scenario.authorizations[0], authorizationBefore);
   assert.equal(context.tracker.providerCalls, 0);
+});
+
+test('authorized QA SMS selection uses the fake provider, records consent, and sends no email', async () => {
+  const previous = {
+    NODE_ENV: process.env.NODE_ENV,
+    SMS_CANDIDATE_UI_ENABLED: process.env.SMS_CANDIDATE_UI_ENABLED,
+    SMS_ENABLED: process.env.SMS_ENABLED,
+    SMS_ENVIRONMENT: process.env.SMS_ENVIRONMENT,
+    SMS_PROVIDER: process.env.SMS_PROVIDER,
+    SMS_CONSENT_COPY_VERSION: process.env.SMS_CONSENT_COPY_VERSION,
+  };
+  Object.assign(process.env, {
+    NODE_ENV: 'test',
+    SMS_CANDIDATE_UI_ENABLED: 'true',
+    SMS_ENABLED: 'true',
+    SMS_ENVIRONMENT: 'local',
+    SMS_PROVIDER: 'fake',
+    SMS_CONSENT_COPY_VERSION: 'sms-consent-v1',
+  });
+  try {
+    const context = buildContext(scenario());
+    const response = await submit(context, '76000000-0000-4000-8000-000000000077', 'sms');
+    assert.equal(response.status, 200);
+    assert.equal(response.body.delivery_channel, 'sms');
+    assert.equal(response.body.delivery_outcome, 'accepted');
+    assert.equal(response.body.email_fallback_available, false);
+    assert.match(response.body.challenge_id, /^[0-9a-f-]{36}$/);
+    assert.equal(context.tracker.emails, 0);
+    const issued = context.tracker.rpcs.find((call) => call.name === 'service_issue_sms_otp_challenge');
+    assert.ok(issued);
+    assert.equal(issued.args.p_consent_copy_version, 'sms-consent-v1');
+    assert.match(issued.args.p_sms_selection_at, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(JSON.stringify(response.body).includes('+13039008821'), false);
+    assert.equal(JSON.stringify(response.body).includes('fake_'), false);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('pre-challenge SMS suppression leaves idempotency retryable and the same key can issue email', async () => {
+  const previous = {
+    NODE_ENV: process.env.NODE_ENV,
+    SMS_CANDIDATE_UI_ENABLED: process.env.SMS_CANDIDATE_UI_ENABLED,
+    SMS_ENABLED: process.env.SMS_ENABLED,
+    SMS_ENVIRONMENT: process.env.SMS_ENVIRONMENT,
+    SMS_PROVIDER: process.env.SMS_PROVIDER,
+    SMS_CONSENT_COPY_VERSION: process.env.SMS_CONSENT_COPY_VERSION,
+  };
+  Object.assign(process.env, {
+    NODE_ENV: 'test',
+    SMS_CANDIDATE_UI_ENABLED: 'true',
+    SMS_ENABLED: 'true',
+    SMS_ENVIRONMENT: 'local',
+    SMS_PROVIDER: 'fake',
+    SMS_CONSENT_COPY_VERSION: 'sms-consent-v1',
+  });
+  try {
+    const context = buildContext(scenario({ smsSuppressed: true }));
+    const submissionKey = '76000000-0000-4000-8000-000000000088';
+    const smsResponse = await submit(context, submissionKey, 'sms');
+    assert.equal(smsResponse.status, 200);
+    assert.equal(smsResponse.body.challenge_id, null);
+    assert.equal(smsResponse.body.delivery_outcome, 'blocked_destination');
+    assert.equal(smsResponse.body.email_fallback_available, true);
+    assert.equal(context.tracker.reservations.get(submissionKey).status, 'failed');
+    assert.equal(context.tracker.failures.length, 1);
+    assert.equal(context.tracker.emails, 0);
+
+    const emailResponse = await submit(context, submissionKey, 'email');
+    assert.equal(emailResponse.status, 200);
+    assert.match(emailResponse.body.challenge_id, /^[0-9a-f-]{36}$/);
+    assert.equal(emailResponse.body.delivery_channel, 'email');
+    assert.equal(context.tracker.reservations.get(submissionKey).status, 'completed');
+    assert.equal(context.tracker.emails, 1);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('existing candidate SMS reconciles stale canonical fields and binds the request-normalized E.164', async () => {
+  const previous = {
+    NODE_ENV: process.env.NODE_ENV,
+    SMS_CANDIDATE_UI_ENABLED: process.env.SMS_CANDIDATE_UI_ENABLED,
+    SMS_ENABLED: process.env.SMS_ENABLED,
+    SMS_ENVIRONMENT: process.env.SMS_ENVIRONMENT,
+    SMS_PROVIDER: process.env.SMS_PROVIDER,
+    SMS_CONSENT_COPY_VERSION: process.env.SMS_CONSENT_COPY_VERSION,
+  };
+  Object.assign(process.env, {
+    NODE_ENV: 'test',
+    SMS_CANDIDATE_UI_ENABLED: 'true',
+    SMS_ENABLED: 'true',
+    SMS_ENVIRONMENT: 'local',
+    SMS_PROVIDER: 'fake',
+    SMS_CONSENT_COPY_VERSION: 'sms-consent-v1',
+  });
+  try {
+    const context = buildContext(scenario({
+      candidate: {
+        ...scenario().candidate,
+        phone_e164: '+13035550199',
+        phone_country_code: 'US',
+      },
+    }));
+    const response = await submit(context, '76000000-0000-4000-8000-000000000099', 'sms');
+    assert.equal(response.status, 200);
+    assert.equal(response.body.delivery_outcome, 'accepted');
+    assert.ok(context.tracker.updates.some((entry) => (
+      entry.table === 'candidates'
+      && entry.value.phone_e164 === '+13039008821'
+      && entry.value.phone_country_code === 'US'
+    )));
+    const issued = context.tracker.rpcs.find((call) => call.name === 'service_issue_sms_otp_challenge');
+    assert.ok(issued);
+    assert.equal(
+      issued.args.p_destination_fingerprint,
+      destinationFingerprint('+13039008821', undefined, process.env, 'sms')
+    );
+    assert.notEqual(
+      issued.args.p_destination_fingerprint,
+      destinationFingerprint('+13035550199', undefined, process.env, 'sms')
+    );
+    assert.equal(JSON.stringify(response.body).includes('+13035550199'), false);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 for (const [name, currentScenario] of [
@@ -520,7 +692,11 @@ test('ordinary first-time application still creates one candidate and one OTP', 
   }));
   const response = await submit(context);
   assert.equal(response.status, 200);
-  assert.equal(context.tracker.inserts.filter((entry) => entry.table === 'candidates').length, 1);
+  const candidateInserts = context.tracker.inserts.filter((entry) => entry.table === 'candidates');
+  assert.equal(candidateInserts.length, 1);
+  assert.equal(candidateInserts[0].value.phone, '3039008821');
+  assert.equal(candidateInserts[0].value.phone_e164, '+13039008821');
+  assert.equal(candidateInserts[0].value.phone_country_code, 'US');
   assert.equal(context.tracker.challenges.length, 1);
   assert.equal(context.tracker.ledger.length, 1);
   assert.equal(context.tracker.emails, 1);

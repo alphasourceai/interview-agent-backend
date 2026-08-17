@@ -13,6 +13,11 @@ const {
   issueOtpChallenge,
 } = require('../src/lib/otpChallenge');
 const { createEmailOtpDelivery } = require('../src/lib/otpDelivery');
+const {
+  deliverCandidateSmsOtp,
+  normalizeConsentCopyVersion,
+  readCandidateSmsConfiguration,
+} = require('../src/lib/candidateSmsDelivery');
 const { setOtpLaunchCapability } = require('../src/middleware/otpLaunchCapability');
 
 const router = express.Router();
@@ -62,7 +67,7 @@ function verificationFailed(res, requestId, category) {
 
 async function loadBoundCandidateAndRole(context) {
   const [{ data: candidate, error: candidateError }, { data: role, error: roleError }] = await Promise.all([
-    supabase.from('candidates').select('id,role_id,client_id,email').eq('id', context.candidate_id).maybeSingle(),
+    supabase.from('candidates').select('id,role_id,client_id,email,phone_e164,phone_country_code').eq('id', context.candidate_id).maybeSingle(),
     supabase.from('roles').select('id,client_id,status').eq('id', context.role_id).maybeSingle(),
   ]);
   if (candidateError || roleError) throw candidateError || roleError;
@@ -159,9 +164,10 @@ router.post('/resend', resendOtpRateLimit, async (req, res) => {
   Sentry.setTag('route_name', 'resend_otp');
   Sentry.setTag('surface', 'backend');
   if (requestId) Sentry.setTag('request_id', String(requestId));
-  const generic = (challengeId = null) => res.status(200).json({
+  const generic = (challengeId = null, extra = {}) => res.status(200).json({
     message: RESEND_OTP_MESSAGE,
     ...(challengeId ? { challenge_id: challengeId } : {}),
+    ...extra,
   });
 
   try {
@@ -173,6 +179,35 @@ router.post('/resend', resendOtpRateLimit, async (req, res) => {
     if (!bound) return generic();
     if (!(await enforceCurrentInterviewEligibility({ role: bound.role, requestId, res, routeName: 'resend_otp' }))) return;
 
+    const requestedChannel = String(req.body?.channel || 'email').trim().toLowerCase();
+    if (!['email', 'sms'].includes(requestedChannel)) return generic();
+
+    if (requestedChannel === 'sms') {
+      const consentCopyVersion = normalizeConsentCopyVersion(req.body?.consent_copy_version);
+      if (!readCandidateSmsConfiguration(process.env).valid || !consentCopyVersion) {
+        return generic(null, {
+          delivery_channel: 'sms',
+          delivery_outcome: 'misconfigured',
+          email_fallback_available: true,
+        });
+      }
+      const smsDelivery = await deliverCandidateSmsOtp({
+        db: supabaseAdmin,
+        candidate: bound.candidate,
+        clientId: context.client_id,
+        roleId: context.role_id,
+        submissionId: context.submission_id,
+        interviewAttemptId: context.interview_attempt_id,
+        recoveryAuthorizationId: context.recovery_authorization_id,
+        consentCopyVersion,
+      });
+      return generic(smsDelivery.challengeId, {
+        delivery_channel: 'sms',
+        delivery_outcome: smsDelivery.outcome,
+        email_fallback_available: smsDelivery.emailFallbackAvailable,
+      });
+    }
+
     const challenge = await issueOtpChallenge(supabaseAdmin, {
       email: bound.candidate.email,
       candidateId: context.candidate_id,
@@ -182,7 +217,11 @@ router.post('/resend', resendOtpRateLimit, async (req, res) => {
       interviewAttemptId: context.interview_attempt_id,
       recoveryAuthorizationId: context.recovery_authorization_id,
     });
-    generic(challenge.challengeId);
+    generic(challenge.challengeId, {
+      delivery_channel: 'email',
+      delivery_outcome: 'accepted',
+      email_fallback_available: false,
+    });
     queueResendDelivery({
       challengeId: challenge.challengeId,
       code: challenge.code,
@@ -242,7 +281,7 @@ router.post('/', verifyOtpRateLimit, async (req, res) => {
       request_id: requestId,
       candidate_id: result.candidate_id,
       role_id: result.role_id,
-      channel: 'email',
+      channel: context.channel || 'email',
     });
     return res.status(200).json({
       message: 'Verified',
@@ -250,6 +289,7 @@ router.post('/', verifyOtpRateLimit, async (req, res) => {
       candidate_id: result.candidate_id,
       role_id: result.role_id,
       email: bound.candidate.email,
+      channel: context.channel || 'email',
     });
   } catch (error) {
     console.error('[verify-otp] request_failed', { request_id: requestId, code: error?.code || null });

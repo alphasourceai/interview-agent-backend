@@ -42,6 +42,21 @@ function normalizeCandidatePhone(value = '', countryInput = 'US') {
   return national.length === 10 ? national : null;
 }
 
+function normalizeCandidatePhoneIdentity(value = '', countryInput = 'US') {
+  const country = normalizeCandidatePhoneCountry(countryInput);
+  const phone = normalizeCandidatePhone(value, country);
+  if (!phone) return null;
+  return Object.freeze({
+    phone,
+    phone_e164: country === 'PH' ? `+${phone}` : `+1${phone}`,
+    phone_country_code: country,
+  });
+}
+
+function normalizeCandidatePhoneE164(value = '', countryInput = 'US') {
+  return normalizeCandidatePhoneIdentity(value, countryInput)?.phone_e164 || null;
+}
+
 function isValidCandidatePhone(value = '', countryInput = 'US') {
   return normalizeCandidatePhone(value, countryInput) !== null;
 }
@@ -55,6 +70,8 @@ function getCandidatePhoneValidationMessage(countryInput = 'US') {
 module.exports = {
   normalizeCandidatePhoneCountry,
   normalizeCandidatePhone,
+  normalizeCandidatePhoneIdentity,
+  normalizeCandidatePhoneE164,
   isValidCandidatePhone,
   getCandidatePhoneValidationMessage
 };

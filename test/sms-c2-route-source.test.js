@@ -1,0 +1,37 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { test } = require('node:test');
+
+function read(relative) {
+  return fs.readFileSync(path.join(__dirname, '..', relative), 'utf8');
+}
+
+test('candidate routes keep SMS owner-gated, consent-bound, and explicitly fallback-safe', () => {
+  const submit = read('routes/candidateSubmit.js');
+  const resend = read('routes/verifyOtp.js');
+  const delivery = read('src/lib/candidateSmsDelivery.js');
+  for (const required of [
+    'SMS_CANDIDATE_UI_ENABLED',
+    'SMS_ENABLED',
+    "environment === 'qa'",
+    "provider === 'telnyx'",
+    'SMS_CONSENT_COPY_VERSION',
+  ]) assert.match(delivery, new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.doesNotMatch(delivery, /SMS_QA_DESTINATION_FINGERPRINT_ALLOWLIST/);
+  assert.match(submit, /requestedOtpChannel === 'sms'/);
+  assert.match(submit, /email_fallback_available/);
+  assert.match(resend, /requestedChannel === 'sms'/);
+  assert.match(resend, /requestedChannel.*email/s);
+  assert.doesNotMatch(`${submit}\n${resend}`, /twilio_message_sid|telnyx_message_id|provider_message_id/);
+});
+
+test('production and fake-provider safeguards cannot be enabled by the candidate request', () => {
+  const delivery = read('src/lib/candidateSmsDelivery.js');
+  assert.match(delivery, /provider === 'fake'.*environment === 'local'.*NODE_ENV/s);
+  assert.doesNotMatch(delivery, /environment === 'production'/);
+  assert.match(delivery, /configuredAdapter\.network === 'https' && config\.environment === 'qa'/);
+  assert.doesNotMatch(delivery, /req\.|request\.|body\./);
+});

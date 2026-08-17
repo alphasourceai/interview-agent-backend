@@ -10,7 +10,7 @@ const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib
 const { isRoleInactive, buildRoleInactivePayload, logInactiveRoleBlocked } = require('../src/lib/roleLifecycle');
 const {
   normalizeCandidatePhoneCountry,
-  normalizeCandidatePhone,
+  normalizeCandidatePhoneIdentity,
   getCandidatePhoneValidationMessage
 } = require('../src/lib/candidatePhone');
 const { buildCandidateError, sendCandidateError, getInterviewConflictCode } = require('../src/lib/candidateErrors');
@@ -27,13 +27,25 @@ const {
 } = require('../src/lib/interviewAttemptService');
 const { issueOtpChallenge } = require('../src/lib/otpChallenge');
 const { createEmailOtpDelivery } = require('../src/lib/otpDelivery');
+const {
+  deliverCandidateSmsOtp,
+  normalizeConsentCopyVersion,
+  readCandidateSmsConfiguration,
+} = require('../src/lib/candidateSmsDelivery');
 const analyzeResume = require('../analyzeResume'); // resume analyzer
+const {
+  createCandidateSubmitLifecycle,
+  createCandidateUploadMiddleware,
+  markCandidateSubmitStage,
+} = require('../src/lib/candidateSubmitLifecycle');
 
 // uploads: keep in memory; 10MB limit
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
 });
+const candidateSubmitLifecycle = createCandidateSubmitLifecycle();
+const candidateUpload = createCandidateUploadMiddleware(upload.any());
 
 const BILLING_MODE = String(process.env.BILLING_MODE || 'off').toLowerCase();
 const BILLING_ENFORCED = BILLING_MODE === 'enforce';
@@ -50,8 +62,10 @@ async function candidateSubmitRateLimit(req, res, next) {
       maxCount: SUBMIT_RATE_MAX
     });
     if (!result.allowed) {
+      markCandidateSubmitStage(req, 'rate_limit_denied');
       return sendCandidateError(res, 'RATE_LIMITED', { request_id: req.request_id || null });
     }
+    markCandidateSubmitStage(req, 'rate_limit_allowed');
   } catch (error) {
     console.error('[rate-limit] candidate submit check failed', {
       request_id: req.request_id || null,
@@ -127,7 +141,7 @@ function queueOtpEmail({ challengeId, code, email, candidateId, roleId, requestI
  * Accepts multipart form (resume) or JSON (resume_url).
  * Required: email + (name OR first/last) + (role_id OR role_token)
  */
-router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
+router.post('/', candidateSubmitLifecycle, candidateSubmitRateLimit, candidateUpload, async (req, res) => {
   const request_id = req.request_id || null;
   let sentryCandidateId = null;
   let sentryRoleId = null;
@@ -143,6 +157,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
         body: payload,
         candidateId
       });
+      markCandidateSubmitStage(req, 'response_committed');
       return res.status(status).json(payload);
     };
     const respondCandidateError = async (code, overrides = {}, candidateId = null) => {
@@ -153,6 +168,14 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       await failCandidateSubmission(supabaseAdmin, submissionReservation, { code, candidateId });
       return sendCandidateError(res, code, { ...overrides, request_id });
     };
+    const respondSmsPreChallengeFailure = async (payload, candidateId = null) => {
+      await failCandidateSubmission(supabaseAdmin, submissionReservation, {
+        code: 'SMS_PRECHALLENGE_DELIVERY_UNAVAILABLE',
+        candidateId,
+      });
+      markCandidateSubmitStage(req, 'response_committed');
+      return res.status(200).json(payload);
+    };
     // --- normalize inputs ---
     const role_token   = (req.body.role_token || '').trim();
     const role_id_in   = (req.body.role_id || '').trim();
@@ -162,6 +185,10 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
     const emailRaw     = (req.body.email || '').trim();
     const phoneRaw     = (req.body.phone || '').trim();
     const phoneCountry = normalizeCandidatePhoneCountry(req.body.phone_country || req.body.phoneCountry || '');
+    const requestedOtpChannel = String(req.body.otp_channel || req.body.otpChannel || 'email').trim().toLowerCase();
+    const consentCopyVersion = normalizeConsentCopyVersion(
+      req.body.consent_copy_version || req.body.consentCopyVersion || ''
+    );
     const submissionKey = req.body.submission_key || req.body.submissionKey || '';
     const resume_url_in = req.body.resume_url || null;
     const resumeFile = (req.files || []).find(file =>
@@ -171,7 +198,8 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
     const fullName = rawName || [first_name, last_name].filter(Boolean).join(' ').trim();
 
     const email = normEmail(emailRaw);
-    const phone = normalizeCandidatePhone(phoneRaw, phoneCountry);
+    const phoneIdentity = normalizeCandidatePhoneIdentity(phoneRaw, phoneCountry);
+    const phone = phoneIdentity?.phone || null;
     const nameNorm = normName(fullName);
 
     if (!email || !fullName || (!role_token && !role_id_in)) {
@@ -185,6 +213,17 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
         request_id
       });
     }
+    if (!['email', 'sms'].includes(requestedOtpChannel)) {
+      return sendCandidateError(res, 'SMS_CHANNEL_UNAVAILABLE', { request_id });
+    }
+    if (requestedOtpChannel === 'sms' && (
+      !readCandidateSmsConfiguration(process.env).valid
+      || !consentCopyVersion
+      || phoneIdentity.phone_country_code !== 'US'
+    )) {
+      return sendCandidateError(res, 'SMS_CHANNEL_UNAVAILABLE', { request_id });
+    }
+    markCandidateSubmitStage(req, 'input_validated', { channel: requestedOtpChannel });
 
     let resumeInspection = null;
     if (resumeFile) {
@@ -197,6 +236,10 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
         throw error;
       }
     }
+    markCandidateSubmitStage(req, 'resume_inspected', {
+      resume_present: Boolean(resumeFile),
+      resume_parse_status: resumeInspection?.parse_status || null,
+    });
 
     // --- role lookup (need client_id + description) ---
     let role = null, rErr = null;
@@ -221,6 +264,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       return sendCandidateError(res, 'INTERVIEW_LINK_EXPIRED', { request_id });
     }
     const roleId = role.id;
+    markCandidateSubmitStage(req, 'role_loaded');
     sentryRoleId = roleId || null;
     sentryClientId = role.client_id || null;
     if (isRoleInactive(role)) {
@@ -280,6 +324,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       roleId,
       clientId: role.client_id || null
     });
+    markCandidateSubmitStage(req, 'availability_checked');
     await syncRoleInterviewLimitNotification({
       db: supabaseAdmin,
       roleId,
@@ -321,17 +366,20 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', { request_id });
     }
     if (submissionReservation.state === 'replay') {
+      markCandidateSubmitStage(req, 'reservation_replay');
       return res
         .status(Number(submissionReservation.row.response_status) || 200)
         .json(submissionReservation.row.response_body);
     }
     if (submissionReservation.state === 'processing') {
+      markCandidateSubmitStage(req, 'reservation_processing');
       return sendCandidateError(res, 'TEMPORARY_SERVICE_ERROR', {
         status: 409,
         detail: 'This submission is still processing. Please wait a moment and try again.',
         request_id
       });
     }
+    markCandidateSubmitStage(req, 'reservation_acquired');
 
     // --- duplicate & enrichment policy ---
     // RULES:
@@ -344,7 +392,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
     {
       const { data, error } = await supabase
         .from('candidates')
-        .select('id, name, email, phone, verified, status, resume_url')
+        .select('id, name, email, phone, phone_e164, phone_country_code, verified, status, resume_url')
         .eq('role_id', roleId)
         .eq('email', email)
         .limit(1)
@@ -354,7 +402,37 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
     if (existingByEmail) {
       // Enrich phone if missing
       if (phone && !existingByEmail.phone) {
-        await supabase.from('candidates').update({ phone }).eq('id', existingByEmail.id);
+        const { error: phoneUpdateError } = await supabase.from('candidates').update({
+          phone,
+          phone_e164: phoneIdentity.phone_e164,
+          phone_country_code: phoneIdentity.phone_country_code,
+        }).eq('id', existingByEmail.id);
+        if (phoneUpdateError) {
+          return respondRetryableError('TEMPORARY_SERVICE_ERROR', {}, existingByEmail.id);
+        }
+        existingByEmail.phone = phone;
+        existingByEmail.phone_e164 = phoneIdentity.phone_e164;
+        existingByEmail.phone_country_code = phoneIdentity.phone_country_code;
+      } else if (
+        phone
+        && existingByEmail.phone === phone
+        && (
+          existingByEmail.phone_e164 !== phoneIdentity.phone_e164
+          || existingByEmail.phone_country_code !== phoneIdentity.phone_country_code
+        )
+      ) {
+        const { error: phoneUpdateError } = await supabase.from('candidates').update({
+          phone_e164: phoneIdentity.phone_e164,
+          phone_country_code: phoneIdentity.phone_country_code,
+        }).eq('id', existingByEmail.id);
+        if (phoneUpdateError) {
+          return respondRetryableError('TEMPORARY_SERVICE_ERROR', {}, existingByEmail.id);
+        }
+        existingByEmail.phone_e164 = phoneIdentity.phone_e164;
+        existingByEmail.phone_country_code = phoneIdentity.phone_country_code;
+      }
+      if (requestedOtpChannel === 'sms' && existingByEmail.phone !== phone) {
+        return respondCandidateError('CANDIDATE_ALREADY_EXISTS', {}, existingByEmail.id);
       }
       const { data: existingInterview, error: existingInterviewError } = await supabase
         .from('interviews')
@@ -422,6 +500,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
               .eq('id', candidate_id);
             if (resumeUpdateError) throw resumeUpdateError;
             existingByEmail.resume_url = resumeUrl;
+            markCandidateSubmitStage(req, 'storage_uploaded');
           } catch (error) {
             await supabase.storage.from(bucket).remove([objectPath]).catch(() => {});
             console.error('[candidate-submit] recovery_resume_upload_failed', {
@@ -435,16 +514,34 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
         }
 
         let otpChallenge;
+        let smsDelivery = null;
         try {
-          otpChallenge = await issueOtpChallenge(supabaseAdmin, {
-            email,
-            candidateId: candidate_id,
-            clientId: role.client_id,
-            roleId,
-            submissionId: submissionReservation?.row?.id || null,
-            interviewAttemptId: existingInterview?.id || null,
-            recoveryAuthorizationId: authorizedRecoveryReentry?.id || null,
-          });
+          if (requestedOtpChannel === 'sms') {
+            smsDelivery = await deliverCandidateSmsOtp({
+              db: supabaseAdmin,
+              candidate: {
+                id: candidate_id,
+                phone_e164: phoneIdentity.phone_e164,
+                phone_country_code: phoneIdentity.phone_country_code,
+              },
+              clientId: role.client_id,
+              roleId,
+              submissionId: submissionReservation?.row?.id || null,
+              interviewAttemptId: existingInterview?.id || null,
+              recoveryAuthorizationId: authorizedRecoveryReentry?.id || null,
+              consentCopyVersion,
+            });
+          } else {
+            otpChallenge = await issueOtpChallenge(supabaseAdmin, {
+              email,
+              candidateId: candidate_id,
+              clientId: role.client_id,
+              roleId,
+              submissionId: submissionReservation?.row?.id || null,
+              interviewAttemptId: existingInterview?.id || null,
+              recoveryAuthorizationId: authorizedRecoveryReentry?.id || null,
+            });
+          }
         } catch (error) {
           console.error('[candidate-submit] durable_challenge_create_failed', {
             request_id,
@@ -462,23 +559,35 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
           role_id: roleId,
           recovery: true
         });
+        markCandidateSubmitStage(req, 'challenge_created', { channel: requestedOtpChannel });
         const responseBody = {
           message: 'If your information is accepted, a verification code will be sent shortly.',
           candidate_id,
           role_id: roleId,
-          challenge_id: otpChallenge.challengeId,
+          challenge_id: requestedOtpChannel === 'sms' ? smsDelivery?.challengeId : otpChallenge.challengeId,
+          delivery_channel: requestedOtpChannel,
+          delivery_outcome: requestedOtpChannel === 'sms' ? smsDelivery?.outcome : 'accepted',
+          email_fallback_available: requestedOtpChannel === 'sms' && smsDelivery?.emailFallbackAvailable === true,
           resume_url: existingByEmail.resume_url || null,
           resume_parse_status: resumeInspection?.parse_status || null
         };
+        if (requestedOtpChannel === 'sms' && (
+          smsDelivery?.challengeCreated !== true
+          || !smsDelivery?.challengeId
+        )) {
+          return respondSmsPreChallengeFailure(responseBody, candidate_id);
+        }
         await respondFinal(200, responseBody, candidate_id);
-        queueOtpEmail({
-          challengeId: otpChallenge.challengeId,
-          code: otpChallenge.code,
-          email,
-          candidateId: candidate_id,
-          roleId,
-          requestId: request_id,
-        });
+        if (requestedOtpChannel === 'email') {
+          queueOtpEmail({
+            challengeId: otpChallenge.challengeId,
+            code: otpChallenge.code,
+            email,
+            candidateId: candidate_id,
+            roleId,
+            requestId: request_id,
+          });
+        }
         return;
       }
     }
@@ -536,6 +645,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
           inspection: resumeInspection
         });
         uploadedObject = { bucket, objectPath };
+        markCandidateSubmitStage(req, 'storage_uploaded');
       } catch (error) {
         console.error('[candidate-submit] resume_upload_failed', {
           request_id,
@@ -558,6 +668,8 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
         last_name,
         email,
         phone, // US: 10 digits; Philippines: 63 + mobile number.
+        phone_e164: phoneIdentity.phone_e164,
+        phone_country_code: phoneIdentity.phone_country_code,
         status: 'Resume Uploaded',
         resume_url: resume_url || null,
         ...resumeMetadata(resumeInspection)
@@ -578,6 +690,7 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       return respondRetryableError('TEMPORARY_SERVICE_ERROR');
     }
     sentryCandidateId = candidate_id;
+    markCandidateSubmitStage(req, 'candidate_persisted');
     Sentry.setTag('candidate_id', String(candidate_id));
     Sentry.addBreadcrumb({
       category: 'candidate_submit',
@@ -587,14 +700,30 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
     });
 
     let otpChallenge;
+    let smsDelivery = null;
     try {
-      otpChallenge = await issueOtpChallenge(supabaseAdmin, {
-        email,
-        candidateId: candidate_id,
-        clientId: role.client_id,
-        roleId,
-        submissionId: submissionReservation?.row?.id || null,
-      });
+      if (requestedOtpChannel === 'sms') {
+        smsDelivery = await deliverCandidateSmsOtp({
+          db: supabaseAdmin,
+          candidate: {
+            id: candidate_id,
+            phone_e164: phoneIdentity.phone_e164,
+            phone_country_code: phoneIdentity.phone_country_code,
+          },
+          clientId: role.client_id,
+          roleId,
+          submissionId: submissionReservation?.row?.id || null,
+          consentCopyVersion,
+        });
+      } else {
+        otpChallenge = await issueOtpChallenge(supabaseAdmin, {
+          email,
+          candidateId: candidate_id,
+          clientId: role.client_id,
+          roleId,
+          submissionId: submissionReservation?.row?.id || null,
+        });
+      }
     } catch (error) {
       console.error('[candidate-submit] durable_challenge_create_failed', {
         request_id,
@@ -604,24 +733,39 @@ router.post('/', candidateSubmitRateLimit, upload.any(), async (req, res) => {
       });
       return respondRetryableError('TEMPORARY_SERVICE_ERROR', {}, candidate_id);
     }
+    markCandidateSubmitStage(req, 'challenge_created', { channel: requestedOtpChannel });
 
     // success
-    await respondFinal(200, {
+    const responseBody = {
       message: 'If your information is accepted, a verification code will be sent shortly.',
       candidate_id,
       role_id: roleId,
-      challenge_id: otpChallenge.challengeId,
+      challenge_id: requestedOtpChannel === 'sms' ? smsDelivery?.challengeId : otpChallenge.challengeId,
+      delivery_channel: requestedOtpChannel,
+      delivery_outcome: requestedOtpChannel === 'sms' ? smsDelivery?.outcome : 'accepted',
+      email_fallback_available: requestedOtpChannel === 'sms' && smsDelivery?.emailFallbackAvailable === true,
       resume_url: resume_url || null,
       resume_parse_status: resumeInspection?.parse_status || null
-    }, candidate_id);
-    queueOtpEmail({
-      challengeId: otpChallenge.challengeId,
-      code: otpChallenge.code,
-      email,
-      candidateId: candidate_id,
-      roleId,
-      requestId: request_id,
-    });
+    };
+    const smsFailedBeforeChallenge = requestedOtpChannel === 'sms' && (
+      smsDelivery?.challengeCreated !== true
+      || !smsDelivery?.challengeId
+    );
+    if (smsFailedBeforeChallenge) {
+      await respondSmsPreChallengeFailure(responseBody, candidate_id);
+    } else {
+      await respondFinal(200, responseBody, candidate_id);
+    }
+    if (!smsFailedBeforeChallenge && requestedOtpChannel === 'email') {
+      queueOtpEmail({
+        challengeId: otpChallenge.challengeId,
+        code: otpChallenge.code,
+        email,
+        candidateId: candidate_id,
+        roleId,
+        requestId: request_id,
+      });
+    }
 
     if (fileBuf && resumeInspection?.parse_status === 'parsed') {
       setImmediate(async () => {

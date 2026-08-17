@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const { normalizeStoredResumeIntegrity } = require('./resumeIntegrity');
 
 function automationError(code, detail, status = 400, hint = null) {
   const err = new Error(detail || code);
@@ -123,6 +124,26 @@ function getResumeAnalysisScore(candidate) {
   );
 }
 
+function getResumeIntegrity(latestReport, candidate) {
+  const reportBreakdown = parseJsonObject(latestReport?.resume_breakdown) || {};
+  const candidateAnalysis = parseJsonObject(candidate?.analysis_summary) || {};
+  return normalizeStoredResumeIntegrity(
+    reportBreakdown.resume_integrity || candidateAnalysis.resume_integrity || null
+  );
+}
+
+function automationIntegritySnapshot(integrity) {
+  return {
+    version: integrity.version,
+    mode: integrity.mode,
+    status: integrity.status,
+    manual_review_required: integrity.manual_review_required,
+    automation_eligible: integrity.automation_eligible,
+    format_assessment: integrity.format_assessment,
+    reason_codes: integrity.reason_codes
+  };
+}
+
 function clampScore(value) {
   if (!Number.isFinite(Number(value))) return null;
   const n = Number(value);
@@ -203,7 +224,7 @@ async function loadEvaluationInputs({ db, clientId, roleId, candidateId }) {
 
   const { data: reports, error: reportErr } = await db
     .from('reports')
-    .select('id,created_at,client_id,candidate_id,role_id,resume_score,interview_score,overall_score')
+    .select('id,created_at,client_id,candidate_id,role_id,resume_score,interview_score,overall_score,resume_breakdown')
     .eq('client_id', clientId)
     .eq('candidate_id', candidateId)
     .eq('role_id', roleId)
@@ -273,7 +294,8 @@ function buildScoreSnapshotHash(snapshot) {
     resume_score: snapshot.resume_score,
     interview_score: snapshot.interview_score,
     interview_status: snapshot.interview_status,
-    content_sufficiency: snapshot.content_sufficiency
+    content_sufficiency: snapshot.content_sufficiency,
+    resume_integrity: snapshot.resume_integrity
   }));
 }
 
@@ -301,17 +323,22 @@ async function evaluateCandidateAutomation(input = {}) {
   });
 
   const contentSufficiency = getContentSufficiency(latestInterview);
+  const resumeIntegrity = getResumeIntegrity(latestReport, candidate);
+  const resumeIntegritySnapshot = automationIntegritySnapshot(resumeIntegrity);
   const reportResumeScore = toScoreOrNull(latestReport?.resume_score);
   const reportInterviewScore = toScoreOrNull(latestReport?.interview_score);
   const reportOverallScore = toScoreOrNull(latestReport?.overall_score);
-  const resumeScore = reportResumeScore !== null ? reportResumeScore : getResumeAnalysisScore(candidate);
+  const rawResumeScore = reportResumeScore !== null ? reportResumeScore : getResumeAnalysisScore(candidate);
+  const resumeScore = resumeIntegrity.automation_eligible ? rawResumeScore : null;
   const transcriptOverall = contentSufficiency.insufficient_content ? null : getTranscriptOverall(latestInterview);
   const interviewScore = reportInterviewScore !== null ? reportInterviewScore : transcriptOverall;
   const calculatedOverallScore =
     Number.isFinite(resumeScore) && Number.isFinite(interviewScore)
       ? Math.round((clampScore(resumeScore) + clampScore(interviewScore)) / 2)
       : null;
-  const overallScore = reportOverallScore !== null ? reportOverallScore : calculatedOverallScore;
+  const overallScore = resumeIntegrity.automation_eligible
+    ? (reportOverallScore !== null ? reportOverallScore : calculatedOverallScore)
+    : null;
 
   const normalizedCandidateSnapshot = {
     candidate_id: candidate.id,
@@ -326,7 +353,8 @@ async function evaluateCandidateAutomation(input = {}) {
     interview_status: String(candidate.interview_status || '').trim() || null,
     report_id: latestReport?.id || null,
     interview_id: latestInterview?.id || null,
-    content_sufficiency: contentSufficiency
+    content_sufficiency: contentSufficiency,
+    resume_integrity: resumeIntegritySnapshot
   };
 
   const matchReasons = [];
@@ -341,6 +369,17 @@ async function evaluateCandidateAutomation(input = {}) {
     nonMatchReasons.push({
       code: 'no_score_thresholds_configured',
       detail: 'At least one score threshold is required for Phase 1 matching.'
+    });
+  }
+
+  if (!resumeIntegrity.automation_eligible) {
+    nonMatchReasons.push({
+      code: resumeIntegrity.status === 'suspicious'
+        ? 'resume_integrity_manual_review_required'
+        : 'resume_integrity_unassessed',
+      detail: 'Resume-derived scores cannot drive automation until document integrity review is complete.',
+      integrity_status: resumeIntegrity.status,
+      integrity_version: resumeIntegrity.version
     });
   }
 
