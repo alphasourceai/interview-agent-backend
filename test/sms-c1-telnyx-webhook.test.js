@@ -22,6 +22,24 @@ function payload({ type = 'message.finalized', status = 'delivered', eventId = '
   }));
 }
 
+function controlPayload({ autoresponseType = 'STOP', text = 'stop', eventId = 'control-1', from = '+15555550100' } = {}) {
+  return Buffer.from(JSON.stringify({
+    data: {
+      record_type: 'event', id: eventId, event_type: 'message.received', occurred_at: '2026-08-12T12:00:00.000Z',
+      payload: { from: { phone_number: from }, text, autoresponse_type: autoresponseType },
+    },
+  }));
+}
+
+function spendLimitPayload() {
+  return Buffer.from(JSON.stringify({
+    data: {
+      record_type: 'event', id: 'spend-event-1', event_type: 'messaging-profile.spend-limit-reached',
+      occurred_at: '2026-08-12T12:00:00.000Z', payload: {},
+    },
+  }));
+}
+
 function signedHeaders(body, timestamp = TIMESTAMP) {
   return {
     'content-type': 'application/json',
@@ -30,10 +48,20 @@ function signedHeaders(body, timestamp = TIMESTAMP) {
   };
 }
 
-async function serveAndPost({ body, headers = {}, recordDeliveryEvent, env = { TELNYX_WEBHOOK_PUBLIC_KEY: PUBLIC_KEY }, logger } = {}) {
+async function serveAndPost({
+  body,
+  headers = {},
+  recordDeliveryEvent,
+  recordControlEvent,
+  activateProviderBreaker,
+  fingerprintDestination,
+  env = { TELNYX_WEBHOOK_PUBLIC_KEY: PUBLIC_KEY },
+  logger,
+} = {}) {
   const app = express();
   app.use('/webhook/telnyx/sms', express.raw({ type: 'application/json', limit: '256kb' }), createTelnyxSmsWebhookRouter({
-    db: {}, env, now: () => NOW_MS, recordDeliveryEvent, logger,
+    db: {}, env, now: () => NOW_MS, recordDeliveryEvent, recordControlEvent,
+    activateProviderBreaker, fingerprintDestination, logger,
   }));
   const server = app.listen(0, '127.0.0.1');
   await new Promise((resolve, reject) => {
@@ -99,6 +127,47 @@ test('known Telnyx statuses map to provider-neutral telemetry and invalid shapes
   for (const [native, normalized] of cases) assert.equal(parseTelnyxWebhook(payload({ status: native })).status, normalized);
   assert.equal(parseTelnyxWebhook(payload({ status: 'unknown' })).ignored, true);
   assert.throws(() => parseTelnyxWebhook(Buffer.from(JSON.stringify({ data: { record_type: 'event', id: 'x', event_type: 'message.finalized', occurred_at: 'bad', payload: {} } }))));
+});
+
+test('signed STOP, START, and HELP events use fingerprint-only control storage', async () => {
+  const actions = [];
+  const fingerprintInputs = [];
+  for (const action of ['STOP', 'START', 'HELP']) {
+    const body = controlPayload({ autoresponseType: action, text: action.toLowerCase(), eventId: `control-${action}` });
+    const response = await serveAndPost({
+      body,
+      headers: signedHeaders(body),
+      fingerprintDestination: (value) => {
+        fingerprintInputs.push(value);
+        return 'b'.repeat(64);
+      },
+      recordControlEvent: async (_db, value) => {
+        actions.push(value);
+        return { applied: true, replayed: false, suppressed: value.action === 'stop', released: value.action === 'start' };
+      },
+    });
+    assert.equal(response.status, 200);
+  }
+  assert.deepEqual(actions.map((value) => value.action), ['stop', 'start', 'help']);
+  assert.deepEqual(actions.map((value) => value.destinationFingerprint), Array(3).fill('b'.repeat(64)));
+  assert.deepEqual(fingerprintInputs, Array(3).fill('+15555550100'));
+  assert.equal(JSON.stringify(actions).includes('+15555550100'), false);
+});
+
+test('signed provider spend-limit event activates the global provider breaker', async () => {
+  const body = spendLimitPayload();
+  let breaker = null;
+  const response = await serveAndPost({
+    body,
+    headers: signedHeaders(body),
+    activateProviderBreaker: async (_db, value) => { breaker = value; return true; },
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(breaker, {
+    provider: 'telnyx',
+    providerEventId: 'spend-event-1',
+    providerEventAt: '2026-08-12T12:00:00.000Z',
+  });
 });
 
 test('unknown message, duplicate, and out-of-order results remain bounded acknowledgements', async () => {

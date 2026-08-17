@@ -25,6 +25,43 @@ async function isSmsDestinationSuppressed(db, destinationFingerprint, scope = 'a
   return data === true;
 }
 
+async function recordSmsInboundControlEvent(db, {
+  provider,
+  providerEventId,
+  providerEventAt,
+  destinationFingerprint,
+  action,
+} = {}) {
+  if (!db || typeof db.rpc !== 'function') throw new Error('SMS_CONTROL_STORE_UNAVAILABLE');
+  const { data, error } = await db.rpc('service_record_sms_inbound_control_event', {
+    p_provider: provider,
+    p_provider_event_id: providerEventId,
+    p_provider_event_at: providerEventAt,
+    p_destination_fingerprint: destinationFingerprint,
+    p_action: action,
+  });
+  if (error) throw error;
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row || typeof row !== 'object') throw new Error('SMS_CONTROL_STORE_EMPTY');
+  return Object.freeze({
+    applied: row.applied === true,
+    replayed: row.replayed === true,
+    suppressed: row.suppressed === true,
+    released: row.released === true,
+  });
+}
+
+async function activateSmsProviderBreaker(db, { provider, providerEventId, providerEventAt } = {}) {
+  if (!db || typeof db.rpc !== 'function') throw new Error('SMS_BREAKER_STORE_UNAVAILABLE');
+  const { error } = await db.rpc('service_activate_sms_provider_breaker', {
+    p_provider: provider,
+    p_source_event_id: providerEventId,
+    p_activated_at: providerEventAt,
+  });
+  if (error) throw error;
+  return true;
+}
+
 function getSmsOtpEligibility(candidate, {
   bindingValid = true,
   architectureAvailable = true,
@@ -57,8 +94,10 @@ function getSmsOtpEligibility(candidate, {
 module.exports = {
   SMS_ALLOWED_COUNTRIES,
   SMS_LINE_TYPES,
+  activateSmsProviderBreaker,
   getSmsOtpEligibility,
   isSmsDestinationSuppressed,
   lineTypeAllowsSms,
   normalizeSmsLineType,
+  recordSmsInboundControlEvent,
 };

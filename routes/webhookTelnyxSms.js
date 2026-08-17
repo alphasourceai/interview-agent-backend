@@ -1,7 +1,11 @@
 'use strict';
 
 const express = require('express');
-const { recordOtpSmsDeliveryEvent } = require('../src/lib/otpChallenge');
+const { destinationFingerprint, recordOtpSmsDeliveryEvent } = require('../src/lib/otpChallenge');
+const {
+  activateSmsProviderBreaker,
+  recordSmsInboundControlEvent,
+} = require('../src/lib/smsOtpFoundation');
 const {
   TelnyxWebhookError,
   parseTelnyxWebhook,
@@ -13,6 +17,9 @@ function createTelnyxSmsWebhookRouter({
   env = process.env,
   now = () => Date.now(),
   recordDeliveryEvent = recordOtpSmsDeliveryEvent,
+  recordControlEvent = recordSmsInboundControlEvent,
+  activateProviderBreaker = activateSmsProviderBreaker,
+  fingerprintDestination = destinationFingerprint,
   logger = null,
 } = {}) {
   const router = express.Router();
@@ -30,18 +37,39 @@ function createTelnyxSmsWebhookRouter({
       const event = parseTelnyxWebhook(req.body);
       if (event.ignored) return res.status(200).json({ ok: true });
       const selectedDb = db || require('../src/lib/supabaseClient').supabaseAdmin;
-      const result = await recordDeliveryEvent(selectedDb, {
-        provider: event.provider,
-        providerMessageId: event.messageId,
-        providerEventId: event.eventId,
-        providerEventAt: event.occurredAt,
-        deliveryStatus: event.status,
-      });
+      let result;
+      if (event.kind === 'control') {
+        const fingerprint = fingerprintDestination(event.fromE164, undefined, env, 'sms');
+        result = await recordControlEvent(selectedDb, {
+          provider: event.provider,
+          providerEventId: event.eventId,
+          providerEventAt: event.occurredAt,
+          destinationFingerprint: fingerprint,
+          action: event.action,
+        });
+      } else if (event.kind === 'provider_breaker') {
+        await activateProviderBreaker(selectedDb, {
+          provider: event.provider,
+          providerEventId: event.eventId,
+          providerEventAt: event.occurredAt,
+        });
+        result = { applied: true, replayed: false };
+      } else {
+        result = await recordDeliveryEvent(selectedDb, {
+          provider: event.provider,
+          providerMessageId: event.messageId,
+          providerEventId: event.eventId,
+          providerEventAt: event.occurredAt,
+          deliveryStatus: event.status,
+        });
+      }
       if (logger && typeof logger.info === 'function') {
-        logger.info('sms_delivery_callback', {
+        logger.info('sms_provider_callback', {
           provider: 'telnyx',
+          event_kind: event.kind,
           event_type: event.eventType,
-          status: event.status,
+          status: event.status || null,
+          control_action: event.action || null,
           found: result.found === true,
           applied: result.applied === true,
           replayed: result.replayed === true,

@@ -17,6 +17,7 @@ const {
   normalizeDeliveryCallbackFixture,
 } = require('../src/lib/smsDeliveryCallbackContract');
 const {
+  networkDestinationAllowed,
   orchestrateOtpSmsDelivery,
   qaDestinationAllowed,
   validateCommittedChallenge,
@@ -86,6 +87,17 @@ test('a send-request metadata failure prevents adapter invocation', async () => 
   assert.equal(harness.adapter.getCallCount(), 0);
 });
 
+test('send-request failure releases a production spend reservation before surfacing', async () => {
+  const harness = harnessOptions({ recordMetadata: async () => { throw new Error('bounded database failure'); } });
+  const releases = [];
+  harness.options.environment = 'production';
+  harness.options.spendGate = async () => ({ allowed: true });
+  harness.options.releaseSpend = async (outcome) => { releases.push(outcome); return true; };
+  await assert.rejects(() => orchestrateOtpSmsDelivery(harness.options), /bounded database failure/);
+  assert.deepEqual(releases, ['misconfigured']);
+  assert.equal(harness.adapter.getCallCount(), 0);
+});
+
 test('all fake-provider modes are deterministic, bounded, and called exactly once', async () => {
   const expectations = {
     accepted: 'accepted',
@@ -136,6 +148,23 @@ test('accepted-provider metadata failure is fail-closed as ambiguous and never r
   assert.equal(records, 2);
 });
 
+test('spend settlement failure cannot turn an accepted provider response into a client retry', async () => {
+  const harness = harnessOptions();
+  harness.options.environment = 'production';
+  harness.options.adapter = {
+    name: 'fake',
+    network: 'none',
+    async sendOtpSms() {
+      return { provider: 'fake', messageId: 'production-fixture', status: 'queued', outcome: 'accepted', failureCategory: null };
+    },
+  };
+  harness.options.spendGate = async () => ({ allowed: true });
+  harness.options.finalizeSpend = async () => { throw new Error('database unavailable'); };
+  const result = await orchestrateOtpSmsDelivery(harness.options);
+  assert.equal(result.outcome, 'accepted');
+  assert.equal(result.adapterCalled, true);
+});
+
 test('suppressed and ineligible destinations stop before challenge creation or adapter invocation', async () => {
   const suppressed = harnessOptions({ suppressed: true });
   const suppressedResult = await orchestrateOtpSmsDelivery(suppressed.options);
@@ -162,24 +191,82 @@ test('authorization and rate gates fail closed before issuance', async () => {
   assert.equal(rate.adapter.getCallCount(), 0);
 });
 
-test('SMS-C0 rejects production and all network adapters by default', async () => {
+test('production controls run rates, lookup, and spend before challenge commit', async () => {
+  const harness = harnessOptions();
+  const order = harness.order;
+  harness.options.environment = 'production';
+  harness.options.adapter = {
+    name: 'fake',
+    network: 'none',
+    async sendOtpSms() {
+      order.push('adapter');
+      return { provider: 'fake', messageId: 'production-fixture', status: 'queued', outcome: 'accepted', failureCategory: null };
+    },
+  };
+  harness.options.rateLimitGates = [async () => { order.push('production-rate'); return { allowed: true }; }];
+  harness.options.lookupLineType = async () => { order.push('lookup'); return { ok: true, lineType: 'mobile' }; };
+  harness.options.spendGate = async () => { order.push('spend'); return { allowed: true }; };
+  harness.options.finalizeSpend = async (outcome) => { order.push(`spend-${outcome}`); return true; };
+  const result = await orchestrateOtpSmsDelivery(harness.options);
+  assert.equal(result.outcome, 'accepted');
+  assert.deepEqual(order, [
+    'authorize', 'suppression', 'production-rate', 'lookup', 'spend',
+    'commit', 'send_requested', 'adapter', 'provider_accepted', 'spend-accepted',
+  ]);
+});
+
+test('line lookup and spend breaker fail closed before challenge creation', async () => {
+  for (const lookup of [
+    { ok: true, lineType: 'landline' },
+    { ok: true, lineType: 'voip' },
+    { ok: true, lineType: 'unknown' },
+    { ok: false, lineType: 'unknown' },
+  ]) {
+    const harness = harnessOptions();
+    harness.options.environment = 'production';
+    harness.options.lookupLineType = async () => lookup;
+    const result = await orchestrateOtpSmsDelivery(harness.options);
+    assert.equal(result.outcome, 'invalid_destination');
+    assert.equal(result.challengeCreated, false);
+    assert.equal(harness.order.includes('commit'), false);
+  }
+
+  const spend = harnessOptions();
+  spend.options.environment = 'production';
+  spend.options.lookupLineType = async () => ({ ok: true, lineType: 'mobile' });
+  spend.options.spendGate = async () => ({ allowed: false });
+  const result = await orchestrateOtpSmsDelivery(spend.options);
+  assert.equal(result.outcome, 'blocked_destination');
+  assert.equal(result.challengeCreated, false);
+  assert.equal(spend.order.includes('commit'), false);
+});
+
+test('network delivery remains explicit while production is a valid orchestration environment', async () => {
   assert.throws(() => createFakeSmsProvider(), /disabled/);
   assert.throws(() => createFakeSmsProvider({ environment: 'production' }), /disabled/);
   const harness = harnessOptions();
   harness.options.environment = undefined;
-  await assert.rejects(() => orchestrateOtpSmsDelivery(harness.options), /disabled/);
+  await assert.rejects(() => orchestrateOtpSmsDelivery(harness.options), /environment is invalid/);
   harness.options.environment = 'production';
-  await assert.rejects(() => orchestrateOtpSmsDelivery(harness.options), /disabled/);
+  harness.options.adapter = {
+    name: 'fake',
+    network: 'none',
+    async sendOtpSms() {
+      return { provider: 'fake', messageId: 'production-fixture', status: 'queued', outcome: 'accepted', failureCategory: null };
+    },
+  };
+  assert.equal((await orchestrateOtpSmsDelivery(harness.options)).outcome, 'accepted');
   harness.options.environment = 'qa';
   harness.options.adapter = { name: 'provider_a', network: 'https', sendOtpSms: async () => ({}) };
   await assert.rejects(() => orchestrateOtpSmsDelivery(harness.options), /network SMS adapters are disabled/);
 });
 
-test('QA live transport accepts every eligible fingerprint without a destination allowlist', () => {
+test('QA and production transport accept every eligible fingerprint without a destination allowlist', () => {
   assert.equal(qaDestinationAllowed({ environment: 'qa', destinationFingerprint: FINGERPRINT, adapterNetwork: 'none' }), true);
   assert.equal(qaDestinationAllowed({ environment: 'qa', destinationFingerprint: FINGERPRINT, adapterNetwork: 'https' }), true);
   assert.equal(qaDestinationAllowed({ environment: 'qa', destinationFingerprint: 'not-a-fingerprint', adapterNetwork: 'https' }), false);
-  assert.equal(qaDestinationAllowed({ environment: 'production', destinationFingerprint: FINGERPRINT, adapterNetwork: 'https' }), false);
+  assert.equal(networkDestinationAllowed({ environment: 'production', destinationFingerprint: FINGERPRINT, adapterNetwork: 'https' }), true);
+  assert.equal(networkDestinationAllowed({ environment: 'local', destinationFingerprint: FINGERPRINT, adapterNetwork: 'https' }), false);
 });
 
 test('idempotency identity is stable, challenge-specific, and independent of phone/code fields', () => {

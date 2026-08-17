@@ -7,11 +7,13 @@ const {
   safeSmsTelemetry,
 } = require('./smsProviderContract');
 
-function qaDestinationAllowed({ environment, destinationFingerprint, adapterNetwork }) {
+function networkDestinationAllowed({ environment, destinationFingerprint, adapterNetwork }) {
   if (adapterNetwork === 'none') return true;
-  return environment === 'qa'
+  return ['qa', 'production'].includes(environment)
     && /^[0-9a-f]{64}$/.test(String(destinationFingerprint || ''));
 }
+
+const qaDestinationAllowed = networkDestinationAllowed;
 
 function validateCommittedChallenge(challenge) {
   if (!challenge || challenge.committed !== true || challenge.channel !== 'sms'
@@ -31,44 +33,83 @@ async function orchestrateOtpSmsDelivery({
   authorizeAndBind,
   checkSuppressed,
   rateLimitGates = [],
+  lookupLineType = null,
+  spendGate = null,
+  releaseSpend = null,
+  finalizeSpend = null,
   issueChallenge,
   adapter,
   allowNetwork = false,
   recordMetadata = recordOtpSmsDeliveryMetadata,
   logger = null,
 } = {}) {
-  if (!['local', 'qa'].includes(environment)) throw new Error('SMS-C0 orchestration is disabled outside local and QA');
+  if (!['local', 'qa', 'production'].includes(environment)) throw new Error('SMS orchestration environment is invalid');
   if (!adapter || typeof adapter.sendOtpSms !== 'function') throw new TypeError('one SMS adapter is required');
   if (adapter.network !== 'none' && !allowNetwork) throw new Error('network SMS adapters are disabled in SMS-C0');
 
   const authorization = await authorizeAndBind();
   if (!authorization || authorization.valid !== true) return Object.freeze({ outcome: 'misconfigured', challengeCreated: false, adapterCalled: false });
   const suppressed = await checkSuppressed(destinationFingerprint);
-  const eligibility = getSmsOtpEligibility(candidate, { bindingValid: true, architectureAvailable: true, suppressed });
-  if (!eligibility.eligible) {
+  const preliminaryEligibility = getSmsOtpEligibility(candidate, { bindingValid: true, architectureAvailable: true, suppressed });
+  if (!preliminaryEligibility.eligible) {
     return Object.freeze({
       outcome: suppressed ? 'blocked_destination' : 'invalid_destination',
       challengeCreated: false,
       adapterCalled: false,
     });
   }
-  if (!qaDestinationAllowed({
+  if (!networkDestinationAllowed({
     environment,
     destinationFingerprint,
     adapterNetwork: adapter.network,
   })) return Object.freeze({ outcome: 'blocked_destination', challengeCreated: false, adapterCalled: false });
 
   for (const gate of rateLimitGates) {
-    const result = await gate({ destinationFingerprint, candidateId: candidate.id || null, country: eligibility.country });
+    const result = await gate({ destinationFingerprint, candidateId: candidate.id || null, country: preliminaryEligibility.country });
     if (!result || result.allowed !== true) return Object.freeze({ outcome: 'blocked_destination', challengeCreated: false, adapterCalled: false });
   }
 
-  const challenge = validateCommittedChallenge(await issueChallenge());
-  await recordMetadata(db, {
-    challengeId: challenge.challengeId,
-    event: 'send_requested',
-    provider: adapter.name,
+  let lineType = null;
+  let lookupFailed = false;
+  if (typeof lookupLineType === 'function') {
+    const lookup = await lookupLineType();
+    lineType = lookup?.lineType || 'unknown';
+    lookupFailed = lookup?.ok !== true;
+  }
+  const eligibility = getSmsOtpEligibility(candidate, {
+    bindingValid: true,
+    architectureAvailable: true,
+    suppressed,
+    lineType,
+    lookupEnabled: typeof lookupLineType === 'function',
+    lookupFailed,
   });
+  if (!eligibility.eligible) {
+    return Object.freeze({ outcome: 'invalid_destination', challengeCreated: false, adapterCalled: false });
+  }
+
+  let spendReservation = null;
+  if (typeof spendGate === 'function') {
+    spendReservation = await spendGate();
+    if (!spendReservation || spendReservation.allowed !== true) {
+      return Object.freeze({ outcome: 'blocked_destination', challengeCreated: false, adapterCalled: false });
+    }
+  }
+
+  let challenge;
+  try {
+    challenge = validateCommittedChallenge(await issueChallenge());
+    await recordMetadata(db, {
+      challengeId: challenge.challengeId,
+      event: 'send_requested',
+      provider: adapter.name,
+    });
+  } catch (error) {
+    if (spendReservation && typeof releaseSpend === 'function') {
+      try { await releaseSpend('misconfigured'); } catch { /* conservative reservation remains */ }
+    }
+    throw error;
+  }
 
   let result;
   try {
@@ -128,6 +169,20 @@ async function orchestrateOtpSmsDelivery({
     }
   }
 
+  if (spendReservation) {
+    try {
+      if (['accepted', 'ambiguous_outcome'].includes(result.outcome)) {
+        if (typeof finalizeSpend === 'function') await finalizeSpend(result.outcome);
+      } else if (typeof releaseSpend === 'function') {
+        await releaseSpend(result.failureCategory || result.outcome);
+      }
+    } catch {
+      if (logger && typeof logger.info === 'function') {
+        logger.info('sms_spend_settlement_failed', safeSmsTelemetry({ ...result, country: eligibility.country }));
+      }
+    }
+  }
+
   if (logger && typeof logger.info === 'function') {
     logger.info('sms_delivery_outcome', safeSmsTelemetry({ ...result, country: eligibility.country }));
   }
@@ -135,6 +190,7 @@ async function orchestrateOtpSmsDelivery({
 }
 
 module.exports = {
+  networkDestinationAllowed,
   orchestrateOtpSmsDelivery,
   qaDestinationAllowed,
   validateCommittedChallenge,

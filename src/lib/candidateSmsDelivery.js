@@ -7,6 +7,8 @@ const {
 const { orchestrateOtpSmsDelivery } = require('./smsDeliveryOrchestrator');
 const { isSmsDestinationSuppressed } = require('./smsOtpFoundation');
 const { createFakeSmsProvider } = require('./smsFakeProvider');
+const { createSmsProductionControls, readSmsProductionControlConfig } = require('./smsProductionControls');
+const { readTelnyxLookupConfig } = require('./telnyxNumberLookup');
 const { createTelnyxSmsProvider } = require('./telnyxSmsProvider');
 
 const SMS_CONSENT_COPY_VERSION = 'sms-consent-v1';
@@ -30,12 +32,14 @@ function readCandidateSmsConfiguration(env = process.env) {
   const consentCopyVersion = String(env.SMS_CONSENT_COPY_VERSION || '').trim();
   const uiEnabled = enabled(env.SMS_CANDIDATE_UI_ENABLED);
   const deliveryEnabled = enabled(env.SMS_ENABLED);
-  const providerAllowed = provider === 'telnyx' && environment === 'qa'
+  const providerAllowed = provider === 'telnyx' && ['qa', 'production'].includes(environment)
     || provider === 'fake' && environment === 'local'
       && ['test', 'development'].includes(String(env.NODE_ENV || '').trim().toLowerCase());
+  const productionControlsValid = environment !== 'production'
+    || (readSmsProductionControlConfig(env).valid && readTelnyxLookupConfig(env).valid);
   return Object.freeze({
     valid: uiEnabled && deliveryEnabled && providerAllowed
-      && consentCopyVersion === SMS_CONSENT_COPY_VERSION,
+      && consentCopyVersion === SMS_CONSENT_COPY_VERSION && productionControlsValid,
     environment,
     provider,
     consentCopyVersion,
@@ -70,6 +74,7 @@ async function deliverCandidateSmsOtp({
   submissionId = null,
   interviewAttemptId = null,
   recoveryAuthorizationId = null,
+  requestIp = null,
   consentCopyVersion,
   env = process.env,
   now = () => new Date(),
@@ -110,6 +115,25 @@ async function deliverCandidateSmsOtp({
   }
 
   const fingerprint = destinationFingerprint(candidate?.phone_e164, undefined, env, 'sms');
+  const productionControls = config.environment === 'production'
+    ? createSmsProductionControls({
+      db,
+      env,
+      candidate,
+      clientId,
+      roleId,
+      destinationFingerprint: fingerprint,
+      requestIp,
+    })
+    : null;
+  if (config.environment === 'production' && !productionControls) {
+    return Object.freeze({
+      outcome: 'misconfigured',
+      challengeCreated: false,
+      challengeId: null,
+      emailFallbackAvailable: true,
+    });
+  }
   const smsSelectionAt = now().toISOString();
   let issued = null;
   const result = await orchestrateOtpSmsDelivery({
@@ -121,6 +145,7 @@ async function deliverCandidateSmsOtp({
       valid: Boolean(candidate?.id && clientId && roleId),
     }),
     checkSuppressed: (value) => checkSuppressed(db, value, 'authentication'),
+    ...(productionControls || {}),
     issueChallenge: async () => {
       issued = await issueChallenge(db, {
         phoneE164: candidate.phone_e164,
@@ -139,7 +164,7 @@ async function deliverCandidateSmsOtp({
       return Object.freeze({ ...issued, committed: true });
     },
     adapter: configuredAdapter,
-    allowNetwork: configuredAdapter.network === 'https' && config.environment === 'qa',
+    allowNetwork: configuredAdapter.network === 'https' && ['qa', 'production'].includes(config.environment),
     ...(recordMetadata ? { recordMetadata } : {}),
     logger: {
       info(event, safe) {

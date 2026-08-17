@@ -3,7 +3,15 @@
 const crypto = require('node:crypto');
 
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
-const TELNYX_EVENT_TYPES = new Set(['message.sent', 'message.finalized']);
+const TELNYX_EVENT_TYPES = new Set([
+  'message.sent',
+  'message.finalized',
+  'message.received',
+  'messaging-profile.spend-limit-reached',
+]);
+const STOP_KEYWORDS = new Set(['STOP', 'STOPALL', 'STOP ALL', 'UNSUBSCRIBE', 'CANCEL', 'END', 'QUIT']);
+const START_KEYWORDS = new Set(['START', 'UNSTOP']);
+const HELP_KEYWORDS = new Set(['HELP', 'INFO']);
 
 class TelnyxWebhookError extends Error {
   constructor(code) {
@@ -80,6 +88,16 @@ function normalizeTelnyxDeliveryStatus(value) {
   }
 }
 
+function normalizeTelnyxControlAction(payload) {
+  const automatic = String(payload?.autoresponse_type || '').trim().toUpperCase();
+  const text = String(payload?.text || '').trim().replace(/\s+/g, ' ').toUpperCase();
+  const value = automatic || text;
+  if (STOP_KEYWORDS.has(value)) return 'stop';
+  if (START_KEYWORDS.has(value)) return 'start';
+  if (HELP_KEYWORDS.has(value)) return 'help';
+  return null;
+}
+
 function parseTelnyxWebhook(rawBody) {
   let body;
   try {
@@ -97,6 +115,35 @@ function parseTelnyxWebhook(rawBody) {
   }
   if (!TELNYX_EVENT_TYPES.has(eventType)) return Object.freeze({ ignored: true, eventType });
   const payload = data.payload;
+
+  if (eventType === 'message.received') {
+    const action = normalizeTelnyxControlAction(payload);
+    const fromE164 = String(payload?.from?.phone_number || '').trim();
+    if (!action) return Object.freeze({ ignored: true, eventType });
+    if (!/^\+[1-9]\d{7,14}$/.test(fromE164)) throw new TelnyxWebhookError('invalid_event');
+    return Object.freeze({
+      ignored: false,
+      kind: 'control',
+      provider: 'telnyx',
+      eventId,
+      occurredAt: occurredAt.toISOString(),
+      eventType,
+      action,
+      fromE164,
+    });
+  }
+
+  if (eventType === 'messaging-profile.spend-limit-reached') {
+    return Object.freeze({
+      ignored: false,
+      kind: 'provider_breaker',
+      provider: 'telnyx',
+      eventId,
+      occurredAt: occurredAt.toISOString(),
+      eventType,
+    });
+  }
+
   const messageId = boundedOpaque(payload && payload.id);
   const recipients = payload && payload.to;
   if (!messageId || !Array.isArray(recipients) || recipients.length !== 1 || !recipients[0] || typeof recipients[0] !== 'object') {
@@ -106,6 +153,7 @@ function parseTelnyxWebhook(rawBody) {
   if (!status) return Object.freeze({ ignored: true, eventType });
   return Object.freeze({
     ignored: false,
+    kind: 'delivery',
     provider: 'telnyx',
     messageId,
     eventId,
@@ -118,6 +166,7 @@ function parseTelnyxWebhook(rawBody) {
 module.exports = {
   TelnyxWebhookError,
   createTelnyxPublicKey,
+  normalizeTelnyxControlAction,
   normalizeTelnyxDeliveryStatus,
   parseTelnyxWebhook,
   verifyTelnyxWebhook,

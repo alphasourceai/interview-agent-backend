@@ -200,6 +200,7 @@ router.post('/resend', resendOtpRateLimit, async (req, res) => {
         interviewAttemptId: context.interview_attempt_id,
         recoveryAuthorizationId: context.recovery_authorization_id,
         consentCopyVersion,
+        requestIp: getRequestSubjectKey(req),
       });
       return generic(smsDelivery.challengeId, {
         delivery_channel: 'sms',

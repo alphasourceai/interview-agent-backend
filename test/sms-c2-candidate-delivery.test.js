@@ -87,6 +87,31 @@ test('candidate SMS delivery is disabled unless every independent gate is enable
   assert.equal(normalizeConsentCopyVersion('other-copy'), null);
 });
 
+test('production candidate delivery requires lookup, spend, abuse, and Telnyx configuration', () => {
+  const production = env({
+    NODE_ENV: 'production',
+    SMS_ENVIRONMENT: 'production',
+    SMS_PROVIDER: 'telnyx',
+    SMS_LOOKUP_ENABLED: 'true',
+    SMS_LOOKUP_PROVIDER: 'telnyx',
+    SMS_DAILY_SPEND_CAP_CENTS: '100',
+    SMS_MESSAGE_RESERVE_CENTS: '2',
+    SMS_ABUSE_HMAC_SECRET: Buffer.alloc(32, 42).toString('base64'),
+    TELNYX_API_KEY: 'test-only-api-key',
+    TELNYX_MESSAGING_PROFILE_ID: 'test-profile',
+    TELNYX_SENDER_E164: '+15555550199',
+  });
+  assert.equal(readCandidateSmsConfiguration(production).valid, true);
+  for (const key of [
+    'SMS_LOOKUP_ENABLED',
+    'SMS_DAILY_SPEND_CAP_CENTS',
+    'SMS_MESSAGE_RESERVE_CENTS',
+    'SMS_ABUSE_HMAC_SECRET',
+  ]) {
+    assert.equal(readCandidateSmsConfiguration({ ...production, [key]: '' }).valid, false, key);
+  }
+});
+
 test('accepted fake delivery commits consent-bound challenge before one adapter call', async () => {
   const current = harness();
   const result = await deliverCandidateSmsOtp(current.options);

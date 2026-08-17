@@ -26,21 +26,21 @@ const ENV = Object.freeze({
   TELNYX_TIMEOUT_MS: '5000',
 });
 
-function request() {
+function request(environment = 'qa') {
   return {
     toE164: '+15555550100',
     code: '123456',
     challengeId: CHALLENGE_ID,
     expiresAt: EXPIRES_AT,
-    environment: 'qa',
+    environment,
   };
 }
 
-function providerFor(responseOrError) {
+function providerFor(responseOrError, providerEnv = ENV) {
   let calls = 0;
   let invocation = null;
   const provider = createTelnyxSmsProvider({
-    env: ENV,
+    env: providerEnv,
     now: () => NOW,
     transport: async (value) => {
       calls += 1;
@@ -81,6 +81,7 @@ test('Telnyx HTTP failures map only to bounded provider-neutral outcomes', async
     [401, '10000', 'misconfigured'],
     [403, '40305', 'misconfigured'],
     [429, '10011', 'transient_preacceptance'],
+    [429, '40333', 'rejected'],
     [503, '10001', 'transient_preacceptance'],
   ];
   for (const [statusCode, code, outcome] of cases) {
@@ -152,7 +153,6 @@ test('finite transport distinguishes dispatch state for connection and timeout f
 test('misconfiguration fails closed without reaching the network', async () => {
   for (const env of [
     { ...ENV, SMS_ENABLED: 'false' },
-    { ...ENV, SMS_ENVIRONMENT: 'production' },
     { ...ENV, SMS_PROVIDER: 'other' },
     { ...ENV, TELNYX_API_KEY: '' },
     { ...ENV, TELNYX_MESSAGING_PROFILE_ID: '' },
@@ -164,6 +164,18 @@ test('misconfiguration fails closed without reaching the network', async () => {
     assert.equal(called, false);
   }
   assert.equal(readTelnyxConfig(ENV).valid, true);
+});
+
+test('production transport is valid only when provider and request environments match', async () => {
+  const productionEnv = { ...ENV, SMS_ENVIRONMENT: 'production' };
+  const accepted = providerFor({
+    statusCode: 200,
+    body: JSON.stringify({ data: { id: 'opaque-message-production', to: [{ status: 'queued' }] } }),
+  }, productionEnv);
+  assert.equal(readTelnyxConfig(productionEnv).valid, true);
+  assert.equal((await accepted.provider.sendOtpSms(request('production'))).outcome, 'accepted');
+  assert.equal((await accepted.provider.sendOtpSms(request('qa'))).outcome, 'misconfigured');
+  assert.equal(accepted.calls(), 1);
 });
 
 test('C1 uses C0 ordering: commit and send_requested precede exactly one Telnyx call and acceptance metadata', async () => {

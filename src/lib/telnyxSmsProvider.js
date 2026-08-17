@@ -52,6 +52,7 @@ function failureResult(outcome) {
 
 function classifyTelnyxHttpFailure(statusCode, payload) {
   const code = boundedErrorCode(payload);
+  if (code === '40333') return failureResult('rejected');
   if (code === '40300') return failureResult('blocked_destination');
   if (INVALID_DESTINATION_CODES.has(code)) return failureResult('invalid_destination');
   if ([401, 402].includes(statusCode)) return failureResult('misconfigured');
@@ -130,10 +131,10 @@ function readTelnyxConfig(env) {
   const profileId = boundedOpaque(env.TELNYX_MESSAGING_PROFILE_ID);
   const senderE164 = String(env.TELNYX_SENDER_E164 || '').trim();
   const timeoutMs = Number(env.TELNYX_TIMEOUT_MS || 5000);
-  const valid = enabled && environment === 'qa' && provider === 'telnyx'
+  const valid = enabled && ['qa', 'production'].includes(environment) && provider === 'telnyx'
     && apiKey && profileId && /^\+1\d{10}$/.test(senderE164)
     && Number.isInteger(timeoutMs) && timeoutMs >= 1000 && timeoutMs <= 10_000;
-  return Object.freeze({ valid: !!valid, apiKey, profileId, senderE164, timeoutMs });
+  return Object.freeze({ valid: !!valid, environment, apiKey, profileId, senderE164, timeoutMs });
 }
 
 function createTelnyxSmsProvider({ env = process.env, transport = requestTelnyxMessage, now = () => new Date() } = {}) {
@@ -146,7 +147,7 @@ function createTelnyxSmsProvider({ env = process.env, transport = requestTelnyxM
       calls += 1;
       assertSmsProviderRequest(request);
       const config = readTelnyxConfig(env);
-      if (!config.valid || request.environment !== 'qa') return failureResult('misconfigured');
+      if (!config.valid || request.environment !== config.environment) return failureResult('misconfigured');
       let message;
       try {
         message = buildOtpSmsMessage({

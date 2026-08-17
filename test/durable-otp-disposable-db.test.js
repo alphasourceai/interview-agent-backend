@@ -17,6 +17,7 @@ const SINGLE_ACTIVE_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260
 const SMS_B_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260817201934_sms_b_e164_cross_channel_foundation_prod.sql');
 const SMS_C0_RPC_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260817201935_sms_c0_provider_delivery_recording_rpc_prod.sql');
 const SMS_C1_CALLBACK_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260817201937_sms_c1_provider_delivery_callback_rpc_prod.sql');
+const SMS_PRODUCTION_SAFETY_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260817212357_sms_production_safety_controls.sql');
 let preFixCrossChannelActiveCount = null;
 
 const FIXTURE = {
@@ -96,6 +97,7 @@ before(() => {
   apply(SMS_B_MIGRATION);
   apply(SMS_C0_RPC_MIGRATION);
   apply(SMS_C1_CALLBACK_MIGRATION);
+  apply(SMS_PRODUCTION_SAFETY_MIGRATION);
 });
 
 after(() => {
@@ -349,6 +351,54 @@ test('suppression ledger is fingerprint-only and release has bounded semantics',
   assert.equal(sql("select count(*) from information_schema.columns where table_schema='private_auth' and table_name='sms_destination_suppressions' and column_name in ('phone','phone_e164','to_e164');").stdout, '0');
 });
 
+test('production safety tables remain private and service RPCs expose named arguments only to service_role', { skip: !ENABLED }, () => {
+  for (const table of ['sms_line_type_cache', 'sms_spend_reservations', 'sms_inbound_control_events', 'sms_provider_breakers']) {
+    for (const role of ['anon', 'authenticated', 'service_role']) {
+      assert.notEqual(sql(`set role ${role}; select count(*) from private_auth.${table};`, { allowFailure: true }).status, 0);
+    }
+  }
+  for (const signature of [
+    'public.service_get_sms_line_type_cache(text,text)',
+    'public.service_put_sms_line_type_cache(text,text,text,timestamptz,integer)',
+    'public.service_reserve_sms_spend(uuid,integer,integer,text,text,text,uuid,text)',
+    'public.service_release_sms_spend(uuid,text)',
+    'public.service_finalize_sms_spend(uuid,text)',
+    'public.service_record_sms_inbound_control_event(text,text,timestamptz,text,text)',
+    'public.service_activate_sms_provider_breaker(text,text,timestamptz)',
+  ]) {
+    assert.equal(sql(`select has_function_privilege('anon','${signature}','EXECUTE'),has_function_privilege('authenticated','${signature}','EXECUTE'),has_function_privilege('service_role','${signature}','EXECUTE');`).stdout, 'f|f|t', signature);
+  }
+  assert.equal(sql("select array_to_string(proargnames[1:8],',') from pg_proc where oid='public.service_reserve_sms_spend(uuid,integer,integer,text,text,text,uuid,text)'::regprocedure;").stdout,
+    'p_reservation_id,p_reserved_cents,p_daily_cap_cents,p_provider,p_country,p_destination_fingerprint,p_candidate_id,p_resource_fingerprint');
+});
+
+test('line-type cache is fingerprint-only and service mediated', { skip: !ENABLED }, () => {
+  sql("set role service_role; select public.service_put_sms_line_type_cache(repeat('e',64),'telnyx','mobile',statement_timestamp(),3600);");
+  assert.equal(sql("set role service_role; select line_type from public.service_get_sms_line_type_cache(repeat('e',64),'telnyx');").stdout, 'mobile');
+  assert.equal(sql("select count(*) from information_schema.columns where table_schema='private_auth' and table_name='sms_line_type_cache' and column_name in ('phone','phone_e164','to_e164');").stdout, '0');
+});
+
+test('global spend reservations are atomic, releasable for definite failures, and provider-breaker aware', { skip: !ENABLED }, () => {
+  const reserve = (id) => `set role service_role; select allowed||'|'||reserved_total_cents from public.service_reserve_sms_spend('${id}',2,3,'telnyx','US',repeat('f',64),'${FIXTURE.candidate}',repeat('e',64));`;
+  assert.equal(sql(reserve('82000000-0000-4000-8000-000000000121')).stdout, 'true|2');
+  assert.equal(sql(reserve('82000000-0000-4000-8000-000000000122')).stdout, 'false|2');
+  assert.equal(sql("set role service_role; select public.service_release_sms_spend('82000000-0000-4000-8000-000000000121','provider_rejected');").stdout, 't');
+  assert.equal(sql(reserve('82000000-0000-4000-8000-000000000122')).stdout, 'true|2');
+  sql("set role service_role; select public.service_activate_sms_provider_breaker('telnyx','provider-spend-event','2026-08-17T12:00:00Z');");
+  assert.equal(sql(reserve('82000000-0000-4000-8000-000000000123')).stdout, 'false|0');
+});
+
+test('STOP suppresses, START releases opted-out only, HELP is non-mutating, and events deduplicate', { skip: !ENABLED }, () => {
+  const control = (eventId, fingerprint, action) => `set role service_role; select applied||'|'||replayed||'|'||suppressed||'|'||released from public.service_record_sms_inbound_control_event('telnyx','${eventId}','2026-08-17T12:00:00Z',repeat('${fingerprint}',64),'${action}');`;
+  assert.equal(sql(control('stop-event', '7', 'stop')).stdout, 'true|false|true|false');
+  assert.equal(sql(control('stop-event', '7', 'stop')).stdout, 'false|true|true|false');
+  assert.equal(sql(control('help-event', '8', 'help')).stdout, 'true|false|false|false');
+  assert.equal(sql(control('start-event', '7', 'start')).stdout, 'true|false|false|true');
+  sql("insert into private_auth.sms_destination_suppressions(destination_fingerprint,status,reason,source) values(repeat('9',64),'admin_blocked','synthetic','admin');");
+  assert.equal(sql(control('admin-start-event', '9', 'start')).stdout, 'true|false|true|false');
+  assert.equal(sql("select count(*) from information_schema.columns where table_schema='private_auth' and table_name='sms_inbound_control_events' and column_name in ('phone','phone_e164','to_e164','message_body');").stdout, '0');
+});
+
 test('OTP table and boundary functions have explicit postgres ownership, SECURITY DEFINER, and an empty safe search_path', { skip: !ENABLED }, () => {
   assert.equal(sql("select pg_get_userbyid(c.relowner) from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='private_auth' and c.relname='otp_challenges';").stdout, 'postgres');
   assert.equal(sql("select bool_and(pg_get_userbyid(p.proowner)='postgres' and p.prosecdef and p.proconfig @> array['search_path=\"\"']) from pg_proc p join pg_namespace n on n.oid=p.pronamespace where (n.nspname='private_auth' or (n.nspname='public' and p.proname like 'service%otp%')); ").stdout, 't');
@@ -424,6 +474,7 @@ test('migration replay is catalog-safe and does not duplicate policies or indexe
   apply(SMS_B_MIGRATION);
   apply(SMS_C0_RPC_MIGRATION);
   apply(SMS_C1_CALLBACK_MIGRATION);
+  apply(SMS_PRODUCTION_SAFETY_MIGRATION);
   assert.equal(sql("select count(*) from pg_indexes where schemaname='private_auth' and tablename='otp_challenges';").stdout, '6');
   assert.equal(sql("select count(*) from pg_policies where schemaname='private_auth' and tablename='otp_challenges';").stdout, '0');
 });
