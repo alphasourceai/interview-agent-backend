@@ -18,6 +18,7 @@ const SMS_B_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '2026081720193
 const SMS_C0_RPC_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260817201935_sms_c0_provider_delivery_recording_rpc_prod.sql');
 const SMS_C1_CALLBACK_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260817201937_sms_c1_provider_delivery_callback_rpc_prod.sql');
 const SMS_PRODUCTION_SAFETY_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260817212357_sms_production_safety_controls.sql');
+const SMS_MONITORING_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260818145611_sms_monitoring_admin_snapshot.sql');
 let preFixCrossChannelActiveCount = null;
 
 const FIXTURE = {
@@ -98,6 +99,7 @@ before(() => {
   apply(SMS_C0_RPC_MIGRATION);
   apply(SMS_C1_CALLBACK_MIGRATION);
   apply(SMS_PRODUCTION_SAFETY_MIGRATION);
+  apply(SMS_MONITORING_MIGRATION);
 });
 
 after(() => {
@@ -343,6 +345,24 @@ test('SMS consent is explicit while email consent fields remain null', { skip: !
   assert.equal(sql("select bool_and(sms_selection_at is null and consent_copy_version is null) from private_auth.otp_challenges where channel='email';").stdout, 't');
 });
 
+test('SMS monitoring snapshot is aggregate, service-only, and capability-aware', { skip: !ENABLED }, () => {
+  const privileges = sql(`select
+    has_function_privilege('service_role','public.service_get_sms_monitoring_snapshot(timestamptz,uuid)','execute')||'|'||
+    has_function_privilege('authenticated','public.service_get_sms_monitoring_snapshot(timestamptz,uuid)','execute')||'|'||
+    has_function_privilege('anon','public.service_get_sms_monitoring_snapshot(timestamptz,uuid)','execute');`).stdout;
+  assert.equal(privileges, 'true|false|false');
+  const snapshot = JSON.parse(sql(`set role service_role;
+    select public.service_get_sms_monitoring_snapshot(statement_timestamp()-interval '30 days', '${FIXTURE.client}');`).stdout);
+  assert.equal(snapshot.scope, 'client');
+  assert.equal(typeof snapshot.delivery.requested, 'number');
+  assert.equal(Array.isArray(snapshot.incidents), true);
+  assert.equal(snapshot.capabilities.spend_monitoring, false);
+  const serialized = JSON.stringify(snapshot);
+  for (const forbidden of ['phone_e164', 'destination_fingerprint', 'provider_message_id', 'verifier_hmac_hex']) {
+    assert.equal(serialized.includes(forbidden), false);
+  }
+});
+
 test('suppression ledger is fingerprint-only and release has bounded semantics', { skip: !ENABLED }, () => {
   sql("insert into private_auth.sms_destination_suppressions(destination_fingerprint,status,reason,source) values(repeat('a',64),'opted_out','synthetic','qa_test');");
   assert.equal(sql("set role service_role; select public.service_is_sms_destination_suppressed(repeat('a',64),'authentication');").stdout, 't');
@@ -475,6 +495,7 @@ test('migration replay is catalog-safe and does not duplicate policies or indexe
   apply(SMS_C0_RPC_MIGRATION);
   apply(SMS_C1_CALLBACK_MIGRATION);
   apply(SMS_PRODUCTION_SAFETY_MIGRATION);
+  apply(SMS_MONITORING_MIGRATION);
   assert.equal(sql("select count(*) from pg_indexes where schemaname='private_auth' and tablename='otp_challenges';").stdout, '6');
   assert.equal(sql("select count(*) from pg_policies where schemaname='private_auth' and tablename='otp_challenges';").stdout, '0');
 });

@@ -100,6 +100,7 @@ const {
 const { processClientEntityImport } = require('./src/lib/clientEntityImportService')
 const { archiveChildClientEntity, restoreChildClientEntity } = require('./src/lib/clientEntityArchive')
 const { buildAdminMetricsPayload, safeErrorBody } = require('./src/lib/adminMetricsService')
+const { createAdminSmsMonitoringRouter } = require('./routes/adminSmsMonitoring')
 const { resolvePublicCheckoutReturnState } = require('./src/lib/publicPurchaseActivation')
 const {
   archivePublicLeadCapture,
@@ -1694,6 +1695,7 @@ const adminRouter = express.Router()
 // writes an immutable reset event through the Phase B RPC.
 adminRouter.use('/interview-recovery', requireAuth, requireAdmin, createInterviewRecoveryRouter())
 adminRouter.use('/interview-reliability', requireAuth, requireAdmin, createAdminInterviewReliabilityRouter())
+adminRouter.use('/sms-monitoring', requireAuth, requireAdmin, createAdminSmsMonitoringRouter())
 const PUBLIC_PURCHASE_PLAYBOOK_PDF_PATH = path.join(__dirname, 'templates', 'pdf', 'alphascreen-public-purchase-support-playbook.pdf')
 
 // Helper: ensure a user exists/invite; return user_id + optional action_link
