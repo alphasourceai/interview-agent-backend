@@ -58,7 +58,6 @@ test('snapshot calls only aggregate service RPCs and adds safe runtime posture',
     TELNYX_SENDER_E164: '+18335550123',
     TELNYX_API_KEY: 'secret-api-value',
     TELNYX_WEBHOOK_PUBLIC_KEY: 'secret-public-key-value',
-    TELNYX_INBOUND_WEBHOOK_SECRET: 'secret-inbound-value',
     SMS_LOOKUP_ENABLED: 'true',
     SMS_LOOKUP_PROVIDER: 'telnyx',
     SMS_DAILY_SPEND_CAP_CENTS: '2500',
@@ -82,13 +81,14 @@ test('snapshot calls only aggregate service RPCs and adds safe runtime posture',
   assert.equal(result.retention.scheduled, true);
   assert.equal(result.runtime.outbound_credentials_configured, true);
   assert.equal(result.runtime.delivery_webhook_signing_configured, true);
+  assert.equal(result.runtime.inbound_webhook_signing_configured, true);
+  assert.equal(result.runtime.inbound_webhook_secret_configured, true);
   assert.equal(result.runtime.compliance_review.legal_review_required, true);
   assert.deepEqual(result.runtime.allowed_countries, ['US', 'PH']);
   const serialized = JSON.stringify(result);
   for (const secret of [
     'secret-api-value',
     'secret-public-key-value',
-    'secret-inbound-value',
     'secret-abuse-value',
     '+18335550123',
   ]) {

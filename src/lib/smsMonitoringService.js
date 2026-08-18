@@ -55,6 +55,7 @@ function runtimePosture(env = process.env) {
     .filter((value) => /^[A-Z]{2}$/.test(value))
     .slice(0, 10);
   const dailyCap = Number(env.SMS_DAILY_SPEND_CAP_CENTS);
+  const telnyxWebhookSigningConfigured = configured(env.TELNYX_WEBHOOK_PUBLIC_KEY);
   return Object.freeze({
     delivery_enabled: enabled(env.SMS_ENABLED),
     candidate_ui_enabled: enabled(env.SMS_CANDIDATE_UI_ENABLED),
@@ -62,8 +63,11 @@ function runtimePosture(env = process.env) {
     provider: boundedToken(env.SMS_PROVIDER),
     sender_configured: configured(env.TELNYX_SENDER_E164),
     outbound_credentials_configured: configured(env.TELNYX_API_KEY),
-    delivery_webhook_signing_configured: configured(env.TELNYX_WEBHOOK_PUBLIC_KEY),
-    inbound_webhook_secret_configured: configured(env.TELNYX_INBOUND_WEBHOOK_SECRET),
+    delivery_webhook_signing_configured: telnyxWebhookSigningConfigured,
+    // Telnyx signs both delivery and inbound message events with the same
+    // Ed25519 public key; no second shared secret is required or accepted.
+    inbound_webhook_signing_configured: telnyxWebhookSigningConfigured,
+    inbound_webhook_secret_configured: telnyxWebhookSigningConfigured,
     lookup_enabled: enabled(env.SMS_LOOKUP_ENABLED),
     lookup_provider: boundedToken(env.SMS_LOOKUP_PROVIDER),
     spend_cap_cents: Number.isInteger(dailyCap) && dailyCap > 0 ? dailyCap : null,
