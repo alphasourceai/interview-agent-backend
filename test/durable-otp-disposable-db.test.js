@@ -18,6 +18,7 @@ const SMS_B_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '2026081720193
 const SMS_C0_RPC_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260817201935_sms_c0_provider_delivery_recording_rpc_prod.sql');
 const SMS_C1_CALLBACK_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260817201937_sms_c1_provider_delivery_callback_rpc_prod.sql');
 const SMS_PRODUCTION_SAFETY_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260817212357_sms_production_safety_controls.sql');
+const SMS_SPEND_CANDIDATE_INDEX_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260818155900_sms_spend_reservation_candidate_index.sql');
 const SMS_MONITORING_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20260818145611_sms_monitoring_admin_snapshot.sql');
 let preFixCrossChannelActiveCount = null;
 
@@ -99,6 +100,7 @@ before(() => {
   apply(SMS_C0_RPC_MIGRATION);
   apply(SMS_C1_CALLBACK_MIGRATION);
   apply(SMS_PRODUCTION_SAFETY_MIGRATION);
+  apply(SMS_SPEND_CANDIDATE_INDEX_MIGRATION);
   apply(SMS_MONITORING_MIGRATION);
 });
 
@@ -495,7 +497,9 @@ test('migration replay is catalog-safe and does not duplicate policies or indexe
   apply(SMS_C0_RPC_MIGRATION);
   apply(SMS_C1_CALLBACK_MIGRATION);
   apply(SMS_PRODUCTION_SAFETY_MIGRATION);
+  apply(SMS_SPEND_CANDIDATE_INDEX_MIGRATION);
   apply(SMS_MONITORING_MIGRATION);
   assert.equal(sql("select count(*) from pg_indexes where schemaname='private_auth' and tablename='otp_challenges';").stdout, '6');
   assert.equal(sql("select count(*) from pg_policies where schemaname='private_auth' and tablename='otp_challenges';").stdout, '0');
+  assert.equal(sql("select count(*) from pg_indexes where schemaname='private_auth' and tablename='sms_spend_reservations' and indexname='sms_spend_reservations_candidate_idx';").stdout, '1');
 });
