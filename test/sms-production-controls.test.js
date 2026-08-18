@@ -48,6 +48,8 @@ test('production control and lookup configuration fail closed', () => {
     ['SMS_ABUSE_HMAC_SECRET', 'short'],
   ]) assert.equal(readSmsProductionControlConfig(productionEnv({ [key]: value })).valid, false, key);
   assert.equal(readTelnyxLookupConfig(productionEnv({ SMS_LOOKUP_ENABLED: 'false' })).valid, false);
+  assert.equal(readTelnyxLookupConfig(productionEnv({ SMS_LOOKUP_CACHE_SECONDS: '2592000' })).valid, true);
+  assert.equal(readTelnyxLookupConfig(productionEnv({ SMS_LOOKUP_CACHE_SECONDS: '2592001' })).valid, false);
 });
 
 test('abuse subjects are keyed, scoped, deterministic, and contain no raw IP or identifiers', async () => {

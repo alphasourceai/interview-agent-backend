@@ -20,11 +20,25 @@ test('range and client scope validation are bounded', () => {
   assert.throws(() => normalizeClientId('not-a-client'), (error) => error.code === 'invalid_sms_monitoring_scope');
 });
 
-test('snapshot calls only the aggregate service RPC and adds safe runtime posture', async () => {
+test('snapshot calls only aggregate service RPCs and adds safe runtime posture', async () => {
   const calls = [];
   const db = {
     async rpc(name, args) {
       calls.push([name, args]);
+      if (name === 'service_get_sms_retention_snapshot') {
+        return {
+          data: {
+            available: true,
+            scheduled: true,
+            schedule_utc: '25 3 * * *',
+            last_completed_at: '2026-08-18T11:30:00.000Z',
+            last_run_succeeded: true,
+            last_scheduler_status: 'succeeded',
+            last_counts: {},
+          },
+          error: null,
+        };
+      }
       return {
         data: {
           generated_at: '2026-08-18T12:00:00.000Z',
@@ -58,10 +72,14 @@ test('snapshot calls only the aggregate service RPC and adds safe runtime postur
   const service = createSmsMonitoringService({ db, env, now });
   const result = await service.snapshot({ range: '24h', client_id: CLIENT_ID });
 
-  assert.deepEqual(calls, [[
-    'service_get_sms_monitoring_snapshot',
-    { p_since: '2026-08-17T12:00:00.000Z', p_client_id: CLIENT_ID },
-  ]]);
+  assert.deepEqual(calls, [
+    [
+      'service_get_sms_monitoring_snapshot',
+      { p_since: '2026-08-17T12:00:00.000Z', p_client_id: CLIENT_ID },
+    ],
+    ['service_get_sms_retention_snapshot', undefined],
+  ]);
+  assert.equal(result.retention.scheduled, true);
   assert.equal(result.runtime.outbound_credentials_configured, true);
   assert.equal(result.runtime.delivery_webhook_signing_configured, true);
   assert.equal(result.runtime.compliance_review.legal_review_required, true);
@@ -90,12 +108,36 @@ test('database failures and malformed snapshots map to a bounded service error',
     { data: null, error: null },
   ]) {
     const service = createSmsMonitoringService({
-      db: { rpc: async () => response },
+      db: {
+        rpc: async (name) => name === 'service_get_sms_retention_snapshot'
+          ? { data: { available: true }, error: null }
+          : response,
+      },
       now: () => new Date('2026-08-18T12:00:00.000Z'),
     });
     await assert.rejects(
       service.snapshot({}),
       (error) => error.code === 'sms_monitoring_unavailable' && !error.message.includes('raw database detail'),
+    );
+  }
+});
+
+test('retention snapshot failures and malformed data fail closed', async () => {
+  for (const response of [
+    { data: null, error: { message: 'raw retention detail' } },
+    { data: null, error: null },
+  ]) {
+    const service = createSmsMonitoringService({
+      db: {
+        rpc: async (name) => name === 'service_get_sms_retention_snapshot'
+          ? response
+          : { data: { delivery: {}, incidents: [] }, error: null },
+      },
+      now: () => new Date('2026-08-18T12:00:00.000Z'),
+    });
+    await assert.rejects(
+      service.snapshot({}),
+      (error) => error.code === 'sms_monitoring_unavailable' && !error.message.includes('raw retention detail'),
     );
   }
 });

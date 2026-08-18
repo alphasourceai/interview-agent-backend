@@ -21,7 +21,7 @@ function readTelnyxLookupConfig(env = process.env) {
   const cacheTtlSeconds = Number(env.SMS_LOOKUP_CACHE_SECONDS || 2592000);
   const valid = enabled && ['qa', 'production'].includes(environment) && provider === 'telnyx'
     && apiKey && Number.isInteger(timeoutMs) && timeoutMs >= 1000 && timeoutMs <= 10000
-    && Number.isInteger(cacheTtlSeconds) && cacheTtlSeconds >= 3600 && cacheTtlSeconds <= 2678400;
+    && Number.isInteger(cacheTtlSeconds) && cacheTtlSeconds >= 3600 && cacheTtlSeconds <= 2592000;
   return Object.freeze({ valid: Boolean(valid), enabled, environment, provider, apiKey, timeoutMs, cacheTtlSeconds });
 }
 

@@ -92,14 +92,18 @@ function createSmsMonitoringService({ db, env = process.env, now = () => new Dat
       const range = normalizeRange(query.range);
       const clientId = normalizeClientId(query.client_id);
       const since = new Date(now().getTime() - RANGE_HOURS[range] * 60 * 60 * 1000).toISOString();
-      const { data, error } = await db.rpc('service_get_sms_monitoring_snapshot', {
-        p_since: since,
-        p_client_id: clientId,
-      });
-      if (error) {
+      const [monitoringResponse, retentionResponse] = await Promise.all([
+        db.rpc('service_get_sms_monitoring_snapshot', {
+          p_since: since,
+          p_client_id: clientId,
+        }),
+        db.rpc('service_get_sms_retention_snapshot'),
+      ]);
+      const { data, error } = monitoringResponse;
+      if (error || retentionResponse.error) {
         const serviceError = new Error('SMS monitoring data is temporarily unavailable.');
         serviceError.code = 'sms_monitoring_unavailable';
-        serviceError.cause = error;
+        serviceError.cause = error || retentionResponse.error;
         throw serviceError;
       }
       if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -107,8 +111,15 @@ function createSmsMonitoringService({ db, env = process.env, now = () => new Dat
         serviceError.code = 'sms_monitoring_unavailable';
         throw serviceError;
       }
+      const retention = retentionResponse.data;
+      if (!retention || typeof retention !== 'object' || Array.isArray(retention)) {
+        const serviceError = new Error('SMS monitoring response was incomplete.');
+        serviceError.code = 'sms_monitoring_unavailable';
+        throw serviceError;
+      }
       return Object.freeze({
         ...data,
+        retention,
         range,
         client_id: clientId,
         runtime: runtimePosture(env),
