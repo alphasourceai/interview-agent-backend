@@ -10,10 +10,13 @@ const review = fs.readFileSync(
   'utf8',
 );
 
-test('SMS compliance review is source-backed and cannot be mistaken for legal approval', () => {
-  assert.match(review, /PENDING FORMAL LEGAL\/COMPLIANCE APPROVAL/);
+test('SMS compliance review is source-backed and records the owner-approved QA status', () => {
+  assert.match(review, /OWNER APPROVED FOR QA IMPLEMENTATION/);
   assert.match(review, /not legal advice/i);
-  assert.match(review, /LEGAL_REVIEW_REQUIRED/g);
+  assert.match(review, /sms-consent-v2/);
+  assert.match(review, /owner approval packet/);
+  assert.doesNotMatch(review, /PENDING FORMAL LEGAL\/COMPLIANCE APPROVAL/);
+  assert.doesNotMatch(review, /LEGAL_REVIEW_REQUIRED/);
   for (const source of ['developers.telnyx.com', 'support.telnyx.com', 'docs.fcc.gov', 'ctia.org']) {
     assert.match(review, new RegExp(source.replaceAll('.', '\\.')));
   }

@@ -2,9 +2,9 @@
 
 Date: 2026-08-18
 Scope: transactional interview-access OTP over the dedicated alphaScreen toll-free sender
-Status: **PENDING FORMAL LEGAL/COMPLIANCE APPROVAL**
+Status: **OWNER APPROVED FOR QA IMPLEMENTATION**
 
-This is an engineering and product-controls review, not legal advice. It does not record legal approval and must not be used to set `SMS_COMPLIANCE_REVIEW_STATUS=approved` without an authorized reviewer.
+This is an engineering and product-controls review, not legal advice. The owner approval recorded in `sms-compliance-owner-approval-packet-2026-08-18.md` authorizes the reviewed QA implementation and the approved runtime status.
 
 ## Official guidance reviewed
 
@@ -31,7 +31,7 @@ This is an engineering and product-controls review, not legal advice. It does no
 | Abuse and spend | Candidate/resource/destination/IP controls and an atomic daily spend reservation/breaker exist in the production safety architecture. |
 | Privacy | Operational telemetry is aggregate; raw phone, OTP, provider message ID, destination fingerprint, and candidate identity are excluded from the admin monitoring response. |
 
-## Required pre-approval evidence
+## Ongoing release evidence
 
 - Preserve a screenshot or stable rendered capture of the exact branded opt-in path and its disclosure version.
 - Confirm the currently assigned toll-free sender remains verified for the declared 2FA use case before each production release that changes sender or program details.
@@ -42,13 +42,13 @@ This is an engineering and product-controls review, not legal advice. It does no
 - Confirm HELP supplies a monitored support method without repurposing or changing the AI Customer Support number.
 - Define and approve a retention schedule for consent evidence, inbound control events, delivery telemetry, line-type cache, and spend reservations.
 
-## Open policy/legal items
+## Resolved policy items
 
-1. **LEGAL_REVIEW_REQUIRED:** Approve the OTP disclosure and determine whether explicit “message frequency varies” language is required in addition to the more specific one-time-code statement and user-initiated resend behavior.
-2. **LEGAL_REVIEW_REQUIRED:** Approve explicit Terms language for the transactional SMS program, optional selection, STOP/HELP, carrier charges, and email alternative.
-3. **LEGAL_REVIEW_REQUIRED:** Approve explicit Privacy language that mobile information is not sold or shared with third parties for promotional or marketing purposes, while allowing restricted transport-provider processing needed to deliver the chosen OTP.
-4. **LEGAL_REVIEW_REQUIRED:** Approve retention periods and deletion/release semantics for compliance and suppression evidence.
-5. **OWNER/OPERATIONS:** Record the authoritative reviewer, review version, and approval timestamp before changing runtime status from `pending` or `not_recorded` to `approved`.
+1. The owner approved disclosure version `sms-consent-v2`, including the message-frequency language and explicit Email alternative.
+2. The owner approved the transactional SMS addition to the public and candidate Terms.
+3. The owner approved the provider-neutral mobile-information addition to the Privacy Policy.
+4. The owner approved the retention periods and the rule preserving active suppressions until valid release.
+5. The authoritative reviewer, review version, and approval timestamp are recorded in the owner approval packet.
 
 ## Monitoring contract
 
@@ -60,4 +60,4 @@ Runtime fields:
 - `SMS_COMPLIANCE_REVIEW_VERSION`: stable bounded review identifier
 - `SMS_COMPLIANCE_REVIEWED_AT`: ISO timestamp of the authorized decision
 
-Until the open items above are approved, the correct status is `pending` or `not_recorded`.
+The approved QA runtime values are recorded in the owner approval packet.

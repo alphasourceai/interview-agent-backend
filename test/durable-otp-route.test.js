@@ -228,7 +228,7 @@ test('SMS resend remains fail-closed when candidate SMS flags are disabled', asy
   const result = await post('/resend', {
     challenge_id: seedId,
     channel: 'sms',
-    consent_copy_version: 'sms-consent-v1',
+    consent_copy_version: 'sms-consent-v2',
   });
   assert.equal(result.status, 200);
   assert.equal(result.body.challenge_id, undefined);

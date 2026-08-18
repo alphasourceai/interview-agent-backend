@@ -49,7 +49,7 @@ test('snapshot calls only the aggregate service RPC and adds safe runtime postur
     SMS_LOOKUP_PROVIDER: 'telnyx',
     SMS_DAILY_SPEND_CAP_CENTS: '2500',
     SMS_ABUSE_HMAC_SECRET: 'secret-abuse-value',
-    SMS_CONSENT_COPY_VERSION: 'sms-consent-v1',
+    SMS_CONSENT_COPY_VERSION: 'sms-consent-v2',
     SMS_COMPLIANCE_REVIEW_STATUS: 'pending',
     SMS_COMPLIANCE_REVIEW_VERSION: 'review-2026-08',
     SMS_COMPLIANCE_REVIEWED_AT: '2026-08-18T11:00:00.000Z',

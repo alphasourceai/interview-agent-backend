@@ -3,44 +3,44 @@
 Date: 2026-08-18  
 Program: optional transactional interview-access verification codes  
 Sender: dedicated verified alphaScreen toll-free sender  
-Status: **DRAFT — LEGAL/COMPLIANCE REVIEW REQUIRED**
+Status: **APPROVED FOR QA IMPLEMENTATION**
 
-This packet records proposed product and operational language. It is not legal advice and does not itself constitute approval. Do not set `SMS_COMPLIANCE_REVIEW_STATUS=approved` until an authorized reviewer approves the final language, retention schedule, and provider configuration.
+This packet records the product and operational language approved by the alphaSource Network, LLC owner on 2026-08-18. It is not legal advice. The approval authorizes QA implementation of the language, retention schedule, and provider-neutral controls described below.
 
 ## 1. Candidate selection disclosure
 
-Proposed version: `sms-consent-v2`
+Approved version: `sms-consent-v2`
 
 > By selecting Text Message, you agree to receive transactional verification-code text messages you request from alphaScreen at the number shown above. Message frequency varies based on your verification requests and resends. Message and data rates may apply. Reply STOP to opt out or HELP for help. Text message consent is optional; you may choose Email instead. Review our Terms & Conditions and Privacy Policy.
 
-Approval questions:
+Approval record:
 
-- Is “message frequency varies based on your verification requests and resends” acceptable for this user-initiated OTP flow?
-- Should the copy also state that SMS consent is not a condition of employment consideration, or is the explicit Email alternative sufficient?
-- Approve the stable copy version `sms-consent-v2`.
+- The message-frequency language is approved for this user-initiated OTP flow.
+- The explicit Email alternative is approved; no additional employment-consideration sentence is required in this disclosure.
+- Stable copy version `sms-consent-v2` is approved.
 
-## 2. Proposed Terms & Conditions addition
+## 2. Approved Terms & Conditions addition
 
 > **Optional transactional text messages.** When a candidate expressly selects Text Message, alphaScreen may send transactional interview-access verification codes requested by that candidate to the mobile number provided. Message frequency varies based on verification requests and resends. Message and data rates may apply. Reply STOP to opt out or HELP for help. Text message consent is optional and is not required to use the Email verification alternative. Opting out affects text-message delivery; Email verification remains available. Delivery may depend on mobile carriers and alphaScreen's contracted messaging provider.
 
-Approval questions:
+Approval record:
 
-- Approve this as a new SMS section in the public Terms & Conditions.
-- Confirm whether candidate-specific Terms should repeat or link to this language.
+- Add this as a new SMS section in the public Terms & Conditions.
+- Candidate-specific Terms repeat the core optional-SMS terms and link to the public Terms and Privacy Policy.
 
-## 3. Proposed Privacy Policy addition
+## 3. Approved Privacy Policy addition
 
 > **Mobile information and transactional verification messages.** If you select Text Message for interview-access verification, alphaScreen processes the mobile number and country you provide, the time and version of your selection, a keyed destination fingerprint, delivery and opt-out status, line-type classification, and limited provider delivery metadata. We use this information only to deliver and secure the requested verification flow, prevent abuse and excess spend, honor STOP and related control requests, investigate bounded delivery failures, and maintain compliance evidence. We may disclose the minimum necessary mobile information to contracted messaging, carrier, security, and infrastructure providers that process it for these purposes. We do not sell mobile information or share it with third parties for their own promotional or marketing purposes. Email verification remains available.
 
-Approval questions:
+Approval record:
 
-- Approve the “not sold or shared for promotional or marketing purposes” statement.
-- Approve naming Telnyx in the policy or retaining the provider-neutral “contracted messaging provider” language.
-- Confirm that this description matches the business's intended use of mobile information.
+- The “not sold or shared for promotional or marketing purposes” statement is approved.
+- Retain provider-neutral “contracted messaging provider” language.
+- The description is approved as the business's intended use of mobile information.
 
 ## 4. STOP, START, and HELP operating copy
 
-Proposed policy:
+Approved policy:
 
 - `STOP`: immediately create provider-independent local suppression and rely on the verified toll-free carrier/provider confirmation response. Do not send a second alphaScreen confirmation unless compliance review specifically requires one.
 - `START` or `UNSTOP`: release only an `opted_out` suppression after a valid signed provider event. Never release admin, provider, or abuse blocks automatically.
@@ -48,17 +48,17 @@ Proposed policy:
 
 > alphaScreen: Help with interview access: info@alphasourceai.com. Message and data rates may apply. Reply STOP to opt out.
 
-Approval questions:
+Approval record:
 
-- Confirm `info@alphasourceai.com` is the monitored HELP channel.
-- Confirm the Telnyx messaging profile's automatic STOP/START/HELP responses match this policy and do not create conflicting duplicate replies.
-- Confirm that the separate AI Customer Support number remains unchanged and is not used as the authentication sender.
+- `info@alphasourceai.com` is the approved HELP channel.
+- The Telnyx messaging profile must use this policy without conflicting duplicate replies.
+- The separate AI Customer Support number remains unchanged and is not used as the authentication sender.
 
-## 5. Proposed data-retention schedule
+## 5. Approved data-retention schedule
 
-The durations below are proposed operational policy, not a statement of legally mandated periods. Authorized legal/compliance review is required.
+The durations below are approved operational policy, not a statement of legally mandated periods.
 
-| Data | Proposed retention | Notes |
+| Data | Approved retention | Notes |
 | --- | --- | --- |
 | Active destination suppression | While active | Required to continue honoring opt-out/block state; fingerprint only. |
 | Released suppression history | 4 years after release | Supports evidence of state transitions without plaintext phone storage. |
@@ -69,11 +69,11 @@ The durations below are proposed operational policy, not a statement of legally 
 | Spend reservations and breaker events | 13 months | Cost-control evidence; no raw phone or IP. |
 | OTP challenge verifier data | Existing durable OTP retention policy | No plaintext OTP; this packet does not change the accepted OTP policy. |
 
-Approval questions:
+Approval record:
 
-- Approve, shorten, or extend each proposed duration.
-- Confirm deletion must preserve an active suppression until it is validly released.
-- Identify the role authorized to approve retention-policy changes.
+- Each listed duration is approved as drafted.
+- Deletion must preserve an active suppression until it is validly released.
+- The owner of alphaSource Network, LLC authorizes retention-policy changes.
 
 ## 6. Release evidence to retain
 
@@ -87,19 +87,16 @@ Approval questions:
 
 ## 7. Owner decision record
 
-Do not complete this section until the final language has been reviewed.
+- Decision: `APPROVED`
+- Reviewer: Jason Gardner
+- Reviewer role/authority: Owner, alphaSource Network, LLC
+- Approved version: `sms-operational-review-2026-08-18` with candidate disclosure `sms-consent-v2`
+- Approved at: `2026-08-18T16:19:00Z`
+- Required revisions: None
 
-- Decision: `PENDING`
-- Reviewer: `PENDING`
-- Reviewer role/authority: `PENDING`
-- Approved version: `PENDING`
-- Approved at: `PENDING`
-- Required revisions: `PENDING`
-
-After approval, runtime may be set to:
+Approved runtime values:
 
 - `SMS_COMPLIANCE_REVIEW_STATUS=approved`
-- `SMS_COMPLIANCE_REVIEW_VERSION=<approved stable version>`
-- `SMS_COMPLIANCE_REVIEWED_AT=<ISO timestamp>`
-
-Until then, runtime must remain `pending` or `not_recorded`.
+- `SMS_COMPLIANCE_REVIEW_VERSION=sms-operational-review-2026-08-18`
+- `SMS_COMPLIANCE_REVIEWED_AT=2026-08-18T16:19:00Z`
+- `SMS_CONSENT_COPY_VERSION=sms-consent-v2`

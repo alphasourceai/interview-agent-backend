@@ -298,7 +298,7 @@ function submissionForm(submissionKey = ID.submission, channel = 'email') {
   form.append('role_id', ID.role);
   form.append('submission_key', submissionKey);
   form.append('otp_channel', channel);
-  if (channel === 'sms') form.append('consent_copy_version', 'sms-consent-v1');
+  if (channel === 'sms') form.append('consent_copy_version', 'sms-consent-v2');
   const pdfPath = process.env.RECOVERY_REENTRY_PDF_PATH
     || path.join(__dirname, 'fixtures', 'jd-parser-repeated-letters.pdf');
   const pdf = fs.readFileSync(pdfPath);
@@ -351,7 +351,7 @@ test('authorized QA SMS selection uses the fake provider, records consent, and s
     SMS_ENABLED: 'true',
     SMS_ENVIRONMENT: 'local',
     SMS_PROVIDER: 'fake',
-    SMS_CONSENT_COPY_VERSION: 'sms-consent-v1',
+    SMS_CONSENT_COPY_VERSION: 'sms-consent-v2',
   });
   try {
     const context = buildContext(scenario());
@@ -364,7 +364,7 @@ test('authorized QA SMS selection uses the fake provider, records consent, and s
     assert.equal(context.tracker.emails, 0);
     const issued = context.tracker.rpcs.find((call) => call.name === 'service_issue_sms_otp_challenge');
     assert.ok(issued);
-    assert.equal(issued.args.p_consent_copy_version, 'sms-consent-v1');
+    assert.equal(issued.args.p_consent_copy_version, 'sms-consent-v2');
     assert.match(issued.args.p_sms_selection_at, /^\d{4}-\d{2}-\d{2}T/);
     assert.equal(JSON.stringify(response.body).includes('+13039008821'), false);
     assert.equal(JSON.stringify(response.body).includes('fake_'), false);
@@ -391,7 +391,7 @@ test('pre-challenge SMS suppression leaves idempotency retryable and the same ke
     SMS_ENABLED: 'true',
     SMS_ENVIRONMENT: 'local',
     SMS_PROVIDER: 'fake',
-    SMS_CONSENT_COPY_VERSION: 'sms-consent-v1',
+    SMS_CONSENT_COPY_VERSION: 'sms-consent-v2',
   });
   try {
     const context = buildContext(scenario({ smsSuppressed: true }));
@@ -434,7 +434,7 @@ test('existing candidate SMS reconciles stale canonical fields and binds the req
     SMS_ENABLED: 'true',
     SMS_ENVIRONMENT: 'local',
     SMS_PROVIDER: 'fake',
-    SMS_CONSENT_COPY_VERSION: 'sms-consent-v1',
+    SMS_CONSENT_COPY_VERSION: 'sms-consent-v2',
   });
   try {
     const context = buildContext(scenario({

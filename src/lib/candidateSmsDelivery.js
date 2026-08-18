@@ -11,7 +11,7 @@ const { createSmsProductionControls, readSmsProductionControlConfig } = require(
 const { readTelnyxLookupConfig } = require('./telnyxNumberLookup');
 const { createTelnyxSmsProvider } = require('./telnyxSmsProvider');
 
-const SMS_CONSENT_COPY_VERSION = 'sms-consent-v1';
+const SMS_CONSENT_COPY_VERSION = 'sms-consent-v2';
 const SAFE_SMS_OUTCOMES = Object.freeze([
   'accepted',
   'rejected',
