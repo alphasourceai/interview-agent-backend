@@ -34,6 +34,14 @@
       margin: 0 0 12px;
     }
 
+    .patent-notice {
+      margin: -6px 0 12px;
+      color: #626978;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
     .header p {
       margin: 4px 0;
       font-size: 14px;
@@ -129,6 +137,7 @@
     <div class="header">
       {{#if logo_src}}<img src="{{logo_src}}" alt="AlphaSource Logo" />{{/if}}
       <h2>Candidate Report</h2>
+      <p class="patent-notice">alphaScreen technology — Patent Pending</p>
       <p><strong>Name:</strong> {{name}}</p>
       <p><strong>Email:</strong> {{email}}</p>
       <p><strong>Company:</strong> {{company_name}}</p>
