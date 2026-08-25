@@ -73,6 +73,7 @@ const rolesRouter = require('./routes/roles')
 const { createRoleJdReplacementRouter } = require('./routes/roleJdReplacement')
 const automationRouter = require('./routes/automation')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
+const { createProfileRouter } = require('./routes/profile')
 const { createSupportVoiceGateway } = require('./src/lib/supportVoiceGateway')
 const { buildClientScopeContext, canViewLegalBillingForClient } = require('./src/lib/clientScope')
 const {
@@ -480,6 +481,8 @@ app.get('/auth/me', requireAuth, withClientScope, async (req, res) => {
     }
   })
 })
+
+app.use('/auth/profile', requireAuth, withClientScope, createProfileRouter({ db: supabaseAdmin }))
 
 // ---------- Clients: my ----------
 app.get('/clients/my', requireAuth, withClientScope, async (req, res) => {
