@@ -17,12 +17,13 @@ function createProfileRouter({ db }) {
 
     const userId = String(req.user?.id || '').trim();
     const verifiedEmail = String(req.user?.email || '').trim().toLowerCase();
-    const fullName = normalizeFullName(req.body?.full_name);
+    const hasFullName = Object.prototype.hasOwnProperty.call(req.body || {}, 'full_name');
+    const fullName = hasFullName ? normalizeFullName(req.body.full_name) : null;
 
     if (!USER_ID_RE.test(userId) || !EMAIL_RE.test(verifiedEmail)) {
       return res.status(401).json({ error: 'invalid_authenticated_profile' });
     }
-    if (!fullName || fullName.length > 120) {
+    if (hasFullName && (!fullName || fullName.length > 120)) {
       return res.status(400).json({
         error: 'invalid_full_name',
         detail: 'Name must be between 1 and 120 characters.',
@@ -33,9 +34,11 @@ function createProfileRouter({ db }) {
     }
 
     try {
+      const updatePayload = { email: verifiedEmail };
+      if (hasFullName) updatePayload.name = fullName;
       const { data, error } = await db
         .from('client_members')
-        .update({ name: fullName, email: verifiedEmail })
+        .update(updatePayload)
         .or(`user_id.eq.${userId},user_id_uuid.eq.${userId}`)
         .select('client_id');
 
@@ -50,6 +53,7 @@ function createProfileRouter({ db }) {
         item: {
           full_name: fullName,
           email: verifiedEmail,
+          name_updated: hasFullName,
           memberships_updated: Array.isArray(data) ? data.length : 0,
         },
       });

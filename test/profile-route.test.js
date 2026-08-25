@@ -79,6 +79,7 @@ test('authenticated profile sync updates only rows tied to the verified user id'
     assert.deepEqual(body.item, {
       full_name: 'Jason Gardner',
       email: 'jason@example.com',
+      name_updated: true,
       memberships_updated: 2,
     });
   });
@@ -86,6 +87,30 @@ test('authenticated profile sync updates only rows tied to the verified user id'
   assert.deepEqual(db.calls, [{
     table: 'client_members',
     payload: { name: 'Jason Gardner', email: 'jason@example.com' },
+    filter: `user_id.eq.${USER_ID},user_id_uuid.eq.${USER_ID}`,
+    select: 'client_id',
+  }]);
+});
+
+test('email-only profile sync cannot overwrite an existing member name', async () => {
+  const db = makeDb();
+  await withServer({
+    db,
+    user: { id: USER_ID, email: 'Confirmed@Example.com' },
+    body: {},
+  }, async (response, body) => {
+    assert.equal(response.status, 200);
+    assert.deepEqual(body.item, {
+      full_name: null,
+      email: 'confirmed@example.com',
+      name_updated: false,
+      memberships_updated: 2,
+    });
+  });
+
+  assert.deepEqual(db.calls, [{
+    table: 'client_members',
+    payload: { email: 'confirmed@example.com' },
     filter: `user_id.eq.${USER_ID},user_id_uuid.eq.${USER_ID}`,
     select: 'client_id',
   }]);
