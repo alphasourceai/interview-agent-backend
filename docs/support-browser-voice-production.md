@@ -4,10 +4,10 @@ The production dashboard voice surface is a separate, informational-only support
 
 ## Knowledge contract
 
-- Version: `2026-08-10.1`
+- Version: `2026-08-26.1`
 - Source snapshot: `src/content/support-voice-knowledge.json`
 - Integrity file: `src/content/support-voice-knowledge.sha256`
-- Enumerated sources: dashboard Help Center FAQ, rubric FAQ, public FAQ, public support topics, and public support questions.
+- Enumerated sources: dashboard Help Center FAQ, rubric FAQ, dashboard and public product updates, public FAQ, public support topics, and public support questions.
 - The backend validates the snapshot hash and prompt size before issuing a voice-session credential.
 
 The agent has no tools, no customer/tenant context, and no product-data access. It must not request candidate data, credentials, payment data, interview content, transcripts, or other sensitive information. Account-specific and action requests are redirected to the Help Center or normal support process.
