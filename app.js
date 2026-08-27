@@ -165,6 +165,17 @@ if (SENTRY_ENABLED) {
 const supportVoiceGateway = createSupportVoiceGateway({
   requireAuth,
   serviceDb: supabaseAdmin,
+  captureProviderAlert(metadata) {
+    Sentry.captureMessage('support_voice_provider_contract_failed', {
+      level: 'error',
+      tags: {
+        feature: 'support_voice',
+        failure_category: metadata.failure_category,
+        field: metadata.field || 'none',
+      },
+      extra: { consecutive_failures: metadata.consecutive_failures },
+    });
+  },
 })
 app.use('/api/support/voice', supportVoiceGateway.router)
 
@@ -6817,7 +6828,7 @@ app.get('/healthz', async (req, res) => {
 
   return res.json({
     ok: supabase_auth.ok === true && tavus_webhook_auth.ok === true && (support_voice.enabled !== true || support_voice.configured === true),
-    degraded: supabase_auth.ok !== true || tavus_webhook_auth.ok !== true || (support_voice.enabled === true && support_voice.configured !== true),
+    degraded: supabase_auth.ok !== true || tavus_webhook_auth.ok !== true || (support_voice.enabled === true && support_voice.available !== true),
     request_id,
     now,
     interview_recovery_core: {

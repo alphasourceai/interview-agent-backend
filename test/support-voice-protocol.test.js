@@ -52,6 +52,14 @@ test('closed session.updated attestation accepts the sanitized live provider sha
   assert.equal(validateSessionUpdated(acceptedSession(), { prompt, voice: 'carina' }), true);
 });
 
+test('provider-managed noise suppression echo accepts either bounded boolean and nothing else', () => {
+  const providerNormalized = acceptedSession();
+  providerNormalized.session.enable_noise_suppression = false;
+  assert.equal(validateSessionUpdated(providerNormalized, { prompt, voice: 'carina' }), true);
+  providerNormalized.session.enable_noise_suppression = 'false';
+  assert.equal(validateSessionUpdated(providerNormalized, { prompt, voice: 'carina' }), false);
+});
+
 test('closed session.updated attestation accepts current bounded provider envelope metadata', () => {
   const event = acceptedSession();
   event.event_id = '00000000-0000-4000-8000-000000000000';

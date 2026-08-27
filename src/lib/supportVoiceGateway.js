@@ -6,17 +6,18 @@ const { WebSocketServer } = WebSocket;
 const { hasAnyActiveClientMembership } = require('./supportVoiceMembership');
 const { createSupportVoiceSessionStore } = require('./supportVoiceSessionStore');
 const { buildSupportVoicePrompt, getSupportVoiceKnowledgeReadiness, SUPPORT_GREETING } = require('./supportVoiceKnowledge');
+const { createSupportVoiceProviderCanary } = require('./supportVoiceProviderCanary');
 const {
   BROWSER_MAX_PAYLOAD,
   DEFAULT_VOICE,
   UPSTREAM_MAX_PAYLOAD,
   UPSTREAM_URL,
+  attestSessionUpdated,
   buildAuthoritativeSessionUpdate,
   classifyProviderEvent,
   exactKeys,
   validateBrowserEvent,
   validatePreAttestationProviderEvent,
-  validateSessionUpdated,
 } = require('./supportVoiceProtocol');
 
 const PROTOCOL = 'alphascreen-support-v1';
@@ -205,7 +206,27 @@ function createSupportVoiceGateway(options = {}) {
   if (typeof requireAuth !== 'function') throw new Error('SUPPORT_VOICE_REQUIRE_AUTH_REQUIRED');
   const rateLimit = options.rateLimit || require('./rateLimit').checkAndIncrementRateLimit;
   const WebSocketClient = options.WebSocketClient || WebSocket;
+  const captureProviderAlert = typeof options.captureProviderAlert === 'function' ? options.captureProviderAlert : () => {};
   const sessionStore = options.sessionStore || createSupportVoiceSessionStore({ serviceDb });
+  const providerCanary = options.providerCanary || (env.NODE_ENV === 'test'
+    ? {
+        ready: () => true,
+        snapshot: () => ({
+          provider_contract_ok: true,
+          provider_last_attempt_at: null,
+          provider_last_success_at: null,
+          provider_last_failure_category: null,
+          provider_consecutive_failures: 0,
+        }),
+        start() {},
+        stop() {},
+      }
+    : createSupportVoiceProviderCanary({
+        env,
+        logger,
+        WebSocketClient,
+        alert: captureProviderAlert,
+      }));
   const testDuration = (name, fallback) => env.NODE_ENV === 'test' && Number.isInteger(options[name]) && options[name] > 0 ? options[name] : fallback;
   const idleMs = testDuration('idleMs', IDLE_MS);
   const maxSessionMs = testDuration('maxSessionMs', MAX_SESSION_MS);
@@ -222,19 +243,27 @@ function createSupportVoiceGateway(options = {}) {
   function configuration() {
     const knowledge = getSupportVoiceKnowledgeReadiness();
     const sessionStoreHealthy = sessionStore.isHealthy();
-    return { knowledge, ready: isConfigurationReady(env, knowledge, sessionStoreHealthy), sessionStoreHealthy };
+    const configured = isConfigurationReady(env, knowledge, sessionStoreHealthy);
+    return {
+      knowledge,
+      configured,
+      ready: configured && providerCanary.ready(),
+      sessionStoreHealthy,
+    };
   }
 
   function publicHealth() {
     const config = configuration();
     return {
       enabled: env.SUPPORT_VOICE_ENABLED === 'true',
-      configured: config.ready,
+      configured: config.configured,
+      available: config.ready,
       knowledge_ok: config.knowledge.ok === true,
       version: config.knowledge.version || null,
       sha256: config.knowledge.sha256 || null,
       xff_mode: ['strict', 'best_effort'].includes(env.SUPPORT_VOICE_XFF_MODE) ? env.SUPPORT_VOICE_XFF_MODE : null,
       session_store_ok: config.sessionStoreHealthy,
+      ...providerCanary.snapshot(),
     };
   }
 
@@ -281,6 +310,8 @@ function createSupportVoiceGateway(options = {}) {
       suppressedSpeechEvent: false,
       playbackEndsAt: 0,
       lastProviderEvent: null,
+      providerFailureCategory: null,
+      providerFailureField: null,
       browserToUpstream: { frames: 0, bytes: 0 },
       upstreamToBrowser: { frames: 0, bytes: 0 },
     };
@@ -293,11 +324,14 @@ function createSupportVoiceGateway(options = {}) {
     const lastProviderEvent = DIAGNOSTIC_PROVIDER_EVENTS.has(entry.lastProviderEvent) ? entry.lastProviderEvent : null;
     entry.phase = 'terminal';
     if (safeReason === 'support_voice_unavailable' || safeReason === 'protocol_error') {
-      logger.warn?.('[support-voice] session_finalized', {
+      const metadata = {
         reason: safeReason,
         phase,
         last_provider_event: lastProviderEvent,
-      });
+      };
+      if (typeof entry.providerFailureCategory === 'string') metadata.failure_category = entry.providerFailureCategory;
+      if (typeof entry.providerFailureField === 'string') metadata.field = entry.providerFailureField;
+      logger.warn?.('[support-voice] session_finalized', metadata);
     }
     for (const timer of entry.timers) clearTimeout(timer);
     entry.timers.clear();
@@ -568,7 +602,12 @@ function createSupportVoiceGateway(options = {}) {
         return finalize(entry, 'support_voice_unavailable');
       }
       if (event.type === 'session.updated') {
-        if (entry.phase !== 'session_update_sent' || !validateSessionUpdated(event, { prompt: built.prompt, voice: DEFAULT_VOICE })) return finalize(entry, 'support_voice_unavailable');
+        const attestation = attestSessionUpdated(event, { prompt: built.prompt, voice: DEFAULT_VOICE });
+        if (entry.phase !== 'session_update_sent' || !attestation.ok) {
+          entry.providerFailureCategory = entry.phase === 'session_update_sent' ? 'provider_attestation' : 'unexpected_phase';
+          entry.providerFailureField = attestation.ok ? null : attestation.field;
+          return finalize(entry, 'support_voice_unavailable');
+        }
         clearTimeout(entry.ackTimer);
         entry.timers.delete(entry.ackTimer);
         entry.phase = 'greeting_sent';
@@ -727,6 +766,7 @@ function createSupportVoiceGateway(options = {}) {
     if (attachedServer) throw new Error('SUPPORT_VOICE_ALREADY_ATTACHED');
     attachedServer = server;
     sessionStore.start();
+    providerCanary.start();
     server.on('upgrade', (req, socket, head) => {
       let path;
       try { path = new URL(req.url, 'http://localhost').pathname; } catch { return socket.destroy(); }
@@ -741,6 +781,7 @@ function createSupportVoiceGateway(options = {}) {
     attach,
     finalizeAll: () => {
       finalizeAll('shutdown');
+      providerCanary.stop();
       sessionStore.stop();
     },
     health: configuration,
@@ -750,7 +791,7 @@ function createSupportVoiceGateway(options = {}) {
       if (env.NODE_ENV !== 'test' || typeof sessionStore?._state?.setHealthyForTest !== 'function') throw new Error('SUPPORT_VOICE_TEST_ONLY');
       sessionStore._state.setHealthyForTest(value);
     },
-    _state: { durableClosures, sessions, sessionStore, wss },
+    _state: { durableClosures, providerCanary, sessions, sessionStore, wss },
   };
 }
 

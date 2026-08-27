@@ -81,12 +81,18 @@ function validatePreAttestationProviderEvent(event) {
   return false;
 }
 
-function validateSessionUpdated(event, { prompt, voice = DEFAULT_VOICE }) {
-  if (!event || typeof event !== 'object' || Array.isArray(event) || event.type !== 'session.updated' || !own(event, 'session')) return false;
+function sessionAttestationFailure(failureCategory, field) {
+  return { ok: false, failure_category: failureCategory, field };
+}
+
+function attestSessionUpdated(event, { prompt, voice = DEFAULT_VOICE }) {
+  if (!event || typeof event !== 'object' || Array.isArray(event) || event.type !== 'session.updated' || !own(event, 'session')) {
+    return sessionAttestationFailure('invalid_envelope', 'event');
+  }
   const eventKeys = Object.keys(event);
-  if (eventKeys.some((key) => !['type', 'session', 'event_id', 'previous_item_id'].includes(key))) return false;
-  if (own(event, 'event_id') && !boundedProviderIdentifier(event.event_id)) return false;
-  if (own(event, 'previous_item_id') && !boundedProviderIdentifier(event.previous_item_id, { nullable: true })) return false;
+  if (eventKeys.some((key) => !['type', 'session', 'event_id', 'previous_item_id'].includes(key))) return sessionAttestationFailure('unexpected_field', 'event');
+  if (own(event, 'event_id') && !boundedProviderIdentifier(event.event_id)) return sessionAttestationFailure('invalid_identifier', 'event_id');
+  if (own(event, 'previous_item_id') && !boundedProviderIdentifier(event.previous_item_id, { nullable: true })) return sessionAttestationFailure('invalid_identifier', 'previous_item_id');
   const session = event.session;
   const required = [
     'audio', 'enable_noise_suppression', 'enable_phonetic_spelling', 'input_audio_format',
@@ -94,26 +100,40 @@ function validateSessionUpdated(event, { prompt, voice = DEFAULT_VOICE }) {
     'modalities', 'model', 'output_audio_format', 'temperature', 'tool_choice', 'turn_detection',
   ];
   const optional = ['resumption'];
-  if (!session || typeof session !== 'object' || Array.isArray(session)) return false;
+  if (!session || typeof session !== 'object' || Array.isArray(session)) return sessionAttestationFailure('invalid_session', 'session');
   const keys = Object.keys(session);
-  if (keys.some((key) => !required.includes(key) && !optional.includes(key)) || required.some((key) => !own(session, key))) return false;
-  if (own(session, 'tools')) return false;
-  if (session.instructions !== prompt || session.model !== MODEL) return false;
-  if (!Array.isArray(session.modalities) || session.modalities.length !== 1 || session.modalities[0] !== 'audio') return false;
-  if (session.input_audio_transcription !== null || session.keep_context !== false) return false;
-  if (session.enable_noise_suppression !== true || session.enable_phonetic_spelling !== false) return false;
-  if (session.input_audio_format !== 'not specified' || session.output_audio_format !== 'not specified') return false;
-  if (session.max_response_output_tokens !== 'inf' || session.temperature !== -1 || session.tool_choice !== 'auto') return false;
-  if (!exactKeys(session.audio, ['input', 'output']) || !validateAudioEndpoint(session.audio.input) || !validateAudioEndpoint(session.audio.output)) return false;
-  if (own(session.audio.input, 'transcription')) return false;
+  if (keys.some((key) => !required.includes(key) && !optional.includes(key))) return sessionAttestationFailure('unexpected_field', 'session');
+  if (required.some((key) => !own(session, key))) return sessionAttestationFailure('missing_field', 'session');
+  if (own(session, 'tools')) return sessionAttestationFailure('capability_drift', 'tools');
+  if (session.instructions !== prompt) return sessionAttestationFailure('authority_drift', 'instructions');
+  if (session.model !== MODEL) return sessionAttestationFailure('model_drift', 'model');
+  if (!Array.isArray(session.modalities) || session.modalities.length !== 1 || session.modalities[0] !== 'audio') return sessionAttestationFailure('capability_drift', 'modalities');
+  if (session.input_audio_transcription !== null) return sessionAttestationFailure('capability_drift', 'input_audio_transcription');
+  if (session.keep_context !== false) return sessionAttestationFailure('retention_drift', 'keep_context');
+  // xAI currently echoes this provider-managed compatibility preference as false
+  // even when true is requested. It is not an authorization or data-retention
+  // boundary, so accept either bounded boolean while retaining all critical checks.
+  if (typeof session.enable_noise_suppression !== 'boolean') return sessionAttestationFailure('invalid_value', 'enable_noise_suppression');
+  if (session.enable_phonetic_spelling !== false) return sessionAttestationFailure('capability_drift', 'enable_phonetic_spelling');
+  if (session.input_audio_format !== 'not specified') return sessionAttestationFailure('transport_drift', 'input_audio_format');
+  if (session.output_audio_format !== 'not specified') return sessionAttestationFailure('transport_drift', 'output_audio_format');
+  if (session.max_response_output_tokens !== 'inf') return sessionAttestationFailure('limit_drift', 'max_response_output_tokens');
+  if (session.temperature !== -1) return sessionAttestationFailure('generation_drift', 'temperature');
+  if (session.tool_choice !== 'auto') return sessionAttestationFailure('capability_drift', 'tool_choice');
+  if (!exactKeys(session.audio, ['input', 'output']) || !validateAudioEndpoint(session.audio.input) || !validateAudioEndpoint(session.audio.output)) return sessionAttestationFailure('transport_drift', 'audio');
+  if (own(session.audio.input, 'transcription')) return sessionAttestationFailure('capability_drift', 'audio.input.transcription');
   const turn = session.turn_detection;
-  if (!turn || typeof turn !== 'object' || Array.isArray(turn)) return false;
+  if (!turn || typeof turn !== 'object' || Array.isArray(turn)) return sessionAttestationFailure('invalid_value', 'turn_detection');
   const turnKeys = Object.keys(turn);
-  if (turnKeys.some((key) => !['type', 'threshold', 'silence_duration_ms', 'prefix_padding_ms', 'idle_timeout_ms'].includes(key))) return false;
-  if (turn.type !== 'server_vad' || turn.threshold !== 0.85 || turn.silence_duration_ms !== 800 || turn.prefix_padding_ms !== 300) return false;
-  if (own(turn, 'idle_timeout_ms') && turn.idle_timeout_ms !== null) return false;
-  if (own(session, 'resumption') && (!exactKeys(session.resumption, ['enabled']) || session.resumption.enabled !== false)) return false;
-  return true;
+  if (turnKeys.some((key) => !['type', 'threshold', 'silence_duration_ms', 'prefix_padding_ms', 'idle_timeout_ms'].includes(key))) return sessionAttestationFailure('unexpected_field', 'turn_detection');
+  if (turn.type !== 'server_vad' || turn.threshold !== 0.85 || turn.silence_duration_ms !== 800 || turn.prefix_padding_ms !== 300) return sessionAttestationFailure('vad_drift', 'turn_detection');
+  if (own(turn, 'idle_timeout_ms') && turn.idle_timeout_ms !== null) return sessionAttestationFailure('vad_drift', 'turn_detection.idle_timeout_ms');
+  if (own(session, 'resumption') && (!exactKeys(session.resumption, ['enabled']) || session.resumption.enabled !== false)) return sessionAttestationFailure('retention_drift', 'resumption');
+  return { ok: true, failure_category: null, field: null };
+}
+
+function validateSessionUpdated(event, options) {
+  return attestSessionUpdated(event, options).ok;
 }
 
 function decodeCanonicalAudio(value, maxBytes = MAX_AUDIO_BYTES) {
@@ -168,6 +188,7 @@ module.exports = {
   MODEL,
   UPSTREAM_MAX_PAYLOAD,
   UPSTREAM_URL,
+  attestSessionUpdated,
   buildAuthoritativeSessionUpdate,
   boundedProviderIdentifier,
   classifyProviderEvent,

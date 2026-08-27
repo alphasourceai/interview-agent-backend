@@ -37,7 +37,7 @@ function serviceDb(count = 1) {
   };
 }
 
-async function harness({ memberCount = 1, enabled = true, globalAdmin = false, rateLimitImpl, pendingTtlMs, rateTimeoutMs, reserveFailureAfterCommit = false } = {}) {
+async function harness({ memberCount = 1, enabled = true, globalAdmin = false, rateLimitImpl, pendingTtlMs, rateTimeoutMs, reserveFailureAfterCommit = false, providerCanary } = {}) {
   let authCalls = 0;
   const rateCalls = [];
   const app = express();
@@ -69,6 +69,7 @@ async function harness({ memberCount = 1, enabled = true, globalAdmin = false, r
       return rateLimitImpl ? rateLimitImpl(input) : { allowed: true, count: 1, remaining: 4, retryAfterSeconds: 0 };
     },
     rateTimeoutMs,
+    providerCanary,
   });
   app.use('/api/support/voice', gateway.router);
   const server = http.createServer(app);
@@ -244,6 +245,35 @@ test('pending credentials expire and release the per-user slot', async () => {
 test('disabled feature fails closed before limiter or reservation', async () => {
   const h = await harness({ enabled: false });
   try {
+    const response = await fetch(`${h.base}/sessions`, { method: 'POST', headers: headers() });
+    assert.equal(response.status, 503);
+    assert.equal(h.rateCalls.length, 0);
+    assert.equal(h.backing.sessions.size, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test('failed provider contract canary blocks reservation before microphone-backed session creation', async () => {
+  const providerCanary = {
+    ready: () => false,
+    snapshot: () => ({
+      provider_contract_ok: false,
+      provider_last_attempt_at: '2026-08-27T12:00:00.000Z',
+      provider_last_success_at: null,
+      provider_last_failure_category: 'provider_attestation',
+      provider_consecutive_failures: 2,
+    }),
+    start() {},
+    stop() {},
+  };
+  const h = await harness({ providerCanary });
+  try {
+    const health = h.gateway.publicHealth();
+    assert.equal(health.configured, true);
+    assert.equal(health.available, false);
+    assert.equal(health.provider_contract_ok, false);
+    assert.equal(health.provider_last_failure_category, 'provider_attestation');
     const response = await fetch(`${h.base}/sessions`, { method: 'POST', headers: headers() });
     assert.equal(response.status, 503);
     assert.equal(h.rateCalls.length, 0);
