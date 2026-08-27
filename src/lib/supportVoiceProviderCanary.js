@@ -77,25 +77,29 @@ function createSupportVoiceProviderCanary(options = {}) {
     state.lastFailureCategory = null;
     state.lastFailureField = null;
     state.consecutiveFailures = 0;
-    logger.info?.('[support-voice] provider_contract_probe_ok');
+    try { logger.info?.('[support-voice] provider_contract_probe_ok'); } catch {}
   }
 
   function recordFailure(category, field = null) {
     state.lastFailureCategory = boundedFailureCategory(category);
     state.lastFailureField = typeof field === 'string' && field.length <= 64 ? field : null;
     state.consecutiveFailures += 1;
-    logger.warn?.('[support-voice] provider_contract_probe_failed', {
-      failure_category: state.lastFailureCategory,
-      field: state.lastFailureField,
-      consecutive_failures: Math.min(state.consecutiveFailures, 1_000_000),
-      alert: state.consecutiveFailures >= 2,
-    });
-    if (state.consecutiveFailures === 2) {
-      alert({
+    try {
+      logger.warn?.('[support-voice] provider_contract_probe_failed', {
         failure_category: state.lastFailureCategory,
         field: state.lastFailureField,
-        consecutive_failures: state.consecutiveFailures,
+        consecutive_failures: Math.min(state.consecutiveFailures, 1_000_000),
+        alert: state.consecutiveFailures >= 2,
       });
+    } catch {}
+    if (state.consecutiveFailures === 2) {
+      try {
+        alert({
+          failure_category: state.lastFailureCategory,
+          field: state.lastFailureField,
+          consecutive_failures: state.consecutiveFailures,
+        });
+      } catch {}
     }
   }
 

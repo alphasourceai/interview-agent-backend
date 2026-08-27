@@ -3,6 +3,7 @@ const test = require('node:test');
 const {
   BROWSER_MAX_PAYLOAD,
   UPSTREAM_MAX_PAYLOAD,
+  attestSessionUpdated,
   buildAuthoritativeSessionUpdate,
   classifyProviderEvent,
   decodeCanonicalAudio,
@@ -58,6 +59,16 @@ test('provider-managed noise suppression echo accepts either bounded boolean and
   assert.equal(validateSessionUpdated(providerNormalized, { prompt, voice: 'carina' }), true);
   providerNormalized.session.enable_noise_suppression = 'false';
   assert.equal(validateSessionUpdated(providerNormalized, { prompt, voice: 'carina' }), false);
+});
+
+test('missing required provider fields retain a bounded field-specific diagnostic', () => {
+  const event = acceptedSession();
+  delete event.session.input_audio_transcription;
+  assert.deepEqual(attestSessionUpdated(event, { prompt, voice: 'carina' }), {
+    ok: false,
+    failure_category: 'missing_field',
+    field: 'input_audio_transcription',
+  });
 });
 
 test('closed session.updated attestation accepts current bounded provider envelope metadata', () => {

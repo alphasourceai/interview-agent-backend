@@ -166,15 +166,18 @@ const supportVoiceGateway = createSupportVoiceGateway({
   requireAuth,
   serviceDb: supabaseAdmin,
   captureProviderAlert(metadata) {
-    Sentry.captureMessage('support_voice_provider_contract_failed', {
-      level: 'error',
-      tags: {
-        feature: 'support_voice',
-        failure_category: metadata.failure_category,
-        field: metadata.field || 'none',
-      },
-      extra: { consecutive_failures: metadata.consecutive_failures },
-    });
+    if (!SENTRY_ENABLED) return;
+    try {
+      Sentry.captureMessage('support_voice_provider_contract_failed', {
+        level: 'error',
+        tags: {
+          feature: 'support_voice',
+          failure_category: metadata.failure_category,
+          field: metadata.field || 'none',
+        },
+        extra: { consecutive_failures: metadata.consecutive_failures },
+      });
+    } catch {}
   },
 })
 app.use('/api/support/voice', supportVoiceGateway.router)

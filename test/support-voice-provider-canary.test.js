@@ -86,6 +86,32 @@ test('provider canary fails closed with field-only diagnostics after critical dr
   assert.equal(alerts.length, 1);
 });
 
+test('throwing diagnostic and alert sinks cannot stall or disable later probes', async () => {
+  let alertCalls = 0;
+  const canary = createSupportVoiceProviderCanary({
+    env: { SUPPORT_VOICE_ENABLED: 'true', XAI_API_KEY: 'xai-test-key-not-a-real-secret' },
+    logger: {
+      info() { throw new Error('diagnostic_sink_failed'); },
+      warn() { throw new Error('diagnostic_sink_failed'); },
+    },
+    WebSocketClient: socketClass((event) => ({ ...event, session: { ...event.session, modalities: ['audio', 'text'] } })),
+    alert: () => {
+      alertCalls += 1;
+      throw new Error('alert_sink_failed');
+    },
+    timeoutMs: 100,
+  });
+  assert.equal(await canary.probe(), false);
+  assert.equal(await canary.probe(), false);
+  assert.equal(canary._state.running, false);
+  assert.equal(canary.snapshot().provider_consecutive_failures, 2);
+  assert.equal(alertCalls, 1);
+  assert.equal(await canary.probe(), false);
+  assert.equal(canary._state.running, false);
+  assert.equal(canary.snapshot().provider_consecutive_failures, 3);
+  assert.equal(alertCalls, 1);
+});
+
 test('provider readiness becomes stale without creating a false success', async () => {
   let clock = Date.parse('2026-08-27T12:00:00.000Z');
   const canary = createSupportVoiceProviderCanary({

@@ -103,7 +103,8 @@ function attestSessionUpdated(event, { prompt, voice = DEFAULT_VOICE }) {
   if (!session || typeof session !== 'object' || Array.isArray(session)) return sessionAttestationFailure('invalid_session', 'session');
   const keys = Object.keys(session);
   if (keys.some((key) => !required.includes(key) && !optional.includes(key))) return sessionAttestationFailure('unexpected_field', 'session');
-  if (required.some((key) => !own(session, key))) return sessionAttestationFailure('missing_field', 'session');
+  const missingRequiredKey = required.find((key) => !own(session, key));
+  if (missingRequiredKey) return sessionAttestationFailure('missing_field', missingRequiredKey);
   if (own(session, 'tools')) return sessionAttestationFailure('capability_drift', 'tools');
   if (session.instructions !== prompt) return sessionAttestationFailure('authority_drift', 'instructions');
   if (session.model !== MODEL) return sessionAttestationFailure('model_drift', 'model');
