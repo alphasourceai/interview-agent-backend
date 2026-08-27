@@ -50,7 +50,7 @@ The database owns all security constants and transitions:
 
 The backend probes the content-free health RPC every two seconds. Readiness is valid for at most five seconds after a successful probe. Health, reserve, and consume failures fail closed; only a later successful probe restores readiness. Terminal WebSocket cleanup retries the idempotent close RPC with bounded exponential backoff until success or the database-owned session expiry. A process crash cannot keep authority live beyond that expiry.
 
-`SUPPORT_VOICE_ALLOWED_ORIGIN` is mandatory and exact. Production-mode backends accept only an HTTPS origin. Localhost is available only in non-production with the explicit local-development flag. The former external scale monitor, monitor token, internal monitor routes, hard-coded QA origin, and single-instance confirmation flag are not part of this architecture.
+At least one exact support-voice origin is mandatory. `SUPPORT_VOICE_ALLOWED_ORIGIN` remains the single-origin compatibility setting; `SUPPORT_VOICE_ALLOWED_ORIGINS` accepts a comma-separated bounded list when more than one legitimate dashboard hostname is active. Production-mode backends accept only HTTPS origins, and every configured entry must be a complete exact origin. Localhost is available only in non-production with the explicit local-development flag. The former external scale monitor, monitor token, internal monitor routes, hard-coded QA origin, and single-instance confirmation flag are not part of this architecture.
 
 ## Release order
 

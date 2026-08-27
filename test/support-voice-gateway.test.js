@@ -37,14 +37,15 @@ function serviceDb(count = 1) {
   };
 }
 
-async function harness({ memberCount = 1, enabled = true, globalAdmin = false, rateLimitImpl, pendingTtlMs, rateTimeoutMs, reserveFailureAfterCommit = false, providerCanary } = {}) {
+async function harness({ memberCount = 1, enabled = true, globalAdmin = false, rateLimitImpl, pendingTtlMs, rateTimeoutMs, reserveFailureAfterCommit = false, providerCanary, allowedOrigin = ORIGIN, allowedOrigins } = {}) {
   let authCalls = 0;
   const rateCalls = [];
   const app = express();
   const env = {
     NODE_ENV: 'test',
     SUPPORT_VOICE_ENABLED: enabled ? 'true' : 'false',
-    SUPPORT_VOICE_ALLOWED_ORIGIN: ORIGIN,
+    SUPPORT_VOICE_ALLOWED_ORIGIN: allowedOrigin,
+    SUPPORT_VOICE_ALLOWED_ORIGINS: allowedOrigins,
     SUPPORT_VOICE_XFF_MODE: 'best_effort',
     XAI_API_KEY: 'xai-test-key-not-a-real-secret',
   };
@@ -139,6 +140,25 @@ test('missing or wrong Origin rejects before authentication, membership, rate li
     assert.equal(h.db.calls.length, 0);
     assert.equal(h.rateCalls.length, 0);
     assert.equal(h.backing.sessions.size, 0);
+  } finally {
+    await h.close();
+  }
+});
+
+test('an explicit bounded origin list authorizes both production dashboard hostnames and rejects lookalikes', async () => {
+  const origins = ['https://www.alphasourceai.com', 'https://app.alphasourceai.com'];
+  const h = await harness({ allowedOrigin: '', allowedOrigins: origins.join(',') });
+  try {
+    for (const origin of origins) {
+      const response = await fetch(`${h.base}/health`, { headers: { Origin: origin } });
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('access-control-allow-origin'), origin);
+    }
+    for (const origin of ['https://alphasourceai.com.evil.example', 'https://www.alphasourceai.com:444']) {
+      const response = await fetch(`${h.base}/health`, { headers: { Origin: origin } });
+      assert.equal(response.status, 403);
+      assert.equal(response.headers.get('access-control-allow-origin'), null);
+    }
   } finally {
     await h.close();
   }
@@ -345,12 +365,18 @@ test('voice readiness requires exact XFF mode, provider key, knowledge, durable 
     XAI_API_KEY: 'xai-test-key-not-a-real-secret',
   };
   assert.equal(isConfigurationReady(base, { ok: true }, true), true);
+  assert.equal(isConfigurationReady({
+    ...base,
+    SUPPORT_VOICE_ALLOWED_ORIGIN: '',
+    SUPPORT_VOICE_ALLOWED_ORIGINS: 'https://www.alphasourceai.com, https://app.alphasourceai.com',
+  }, { ok: true }, true), true);
   for (const mode of [undefined, '', 'strict ', 'STRICT', 'garbage']) {
     assert.equal(isConfigurationReady({ ...base, SUPPORT_VOICE_XFF_MODE: mode }, { ok: true }, true), false);
   }
   assert.equal(isConfigurationReady({ ...base, SUPPORT_VOICE_ALLOW_LOCAL_DEV: 'true' }, { ok: true }, true), false);
   assert.equal(isConfigurationReady({ ...base, SUPPORT_VOICE_ALLOWED_ORIGIN: 'http://example.test' }, { ok: true }, true), false);
   assert.equal(isConfigurationReady({ ...base, SUPPORT_VOICE_ALLOWED_ORIGIN: '' }, { ok: true }, true), false);
+  assert.equal(isConfigurationReady({ ...base, SUPPORT_VOICE_ALLOWED_ORIGINS: 'http://example.test' }, { ok: true }, true), false);
   assert.equal(isConfigurationReady({ ...base, XAI_API_KEY: '' }, { ok: true }, true), false);
   assert.equal(isConfigurationReady(base, { ok: false }, true), false);
   assert.equal(isConfigurationReady(base, { ok: true }, false), false);

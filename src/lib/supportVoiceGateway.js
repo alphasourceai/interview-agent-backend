@@ -110,12 +110,32 @@ function noStore(res) {
   res.setHeader('Expires', '0');
 }
 
+function configuredAllowedOrigins(env = process.env) {
+  return [...new Set([
+    String(env.SUPPORT_VOICE_ALLOWED_ORIGIN || '').trim(),
+    ...String(env.SUPPORT_VOICE_ALLOWED_ORIGINS || '')
+      .split(',')
+      .map((value) => value.trim()),
+  ].filter(Boolean))];
+}
+
+function validExactOrigin(origin, env = process.env) {
+  try {
+    const parsed = new URL(origin);
+    if (parsed.origin !== origin || parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) return false;
+    if (env.NODE_ENV === 'production') return parsed.protocol === 'https:';
+    if (parsed.protocol === 'https:') return true;
+    return env.SUPPORT_VOICE_ALLOW_LOCAL_DEV === 'true' &&
+      (origin === 'http://localhost:5173' || origin === 'http://127.0.0.1:5173');
+  } catch {
+    return false;
+  }
+}
+
 function exactOrigin(req, env = process.env) {
   const origin = req.headers.origin;
   if (Array.isArray(origin) || typeof origin !== 'string' || !origin) return false;
-  const allowed = new Set();
-  const configured = String(env.SUPPORT_VOICE_ALLOWED_ORIGIN || '').trim();
-  if (configured) allowed.add(configured);
+  const allowed = new Set(configuredAllowedOrigins(env));
   if (env.NODE_ENV !== 'production' && env.SUPPORT_VOICE_ALLOW_LOCAL_DEV === 'true') {
     allowed.add('http://localhost:5173');
     allowed.add('http://127.0.0.1:5173');
@@ -129,17 +149,8 @@ function exactOrigin(req, env = process.env) {
 }
 
 function validAllowedOrigin(env = process.env) {
-  const configured = String(env.SUPPORT_VOICE_ALLOWED_ORIGIN || '').trim();
-  try {
-    const parsed = new URL(configured);
-    if (parsed.origin !== configured || parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) return false;
-    if (env.NODE_ENV === 'production') return parsed.protocol === 'https:';
-    if (parsed.protocol === 'https:') return true;
-    return env.SUPPORT_VOICE_ALLOW_LOCAL_DEV === 'true' &&
-      (configured === 'http://localhost:5173' || configured === 'http://127.0.0.1:5173');
-  } catch {
-    return false;
-  }
+  const configured = configuredAllowedOrigins(env);
+  return configured.length > 0 && configured.every((origin) => validExactOrigin(origin, env));
 }
 
 function setCors(req, res) {
@@ -813,6 +824,7 @@ module.exports = {
   RATE_ACTIONS,
   SESSION_PATH,
   consumeToken,
+  configuredAllowedOrigins,
   createTokenBucket,
   createSupportVoiceGateway,
   exactOrigin,
