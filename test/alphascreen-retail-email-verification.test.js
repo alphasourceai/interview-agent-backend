@@ -105,10 +105,15 @@ function intent(overrides = {}) {
     selected_plan_key: 'basic',
     selected_billing_cadence: 'monthly',
     buyer_email: 'Alex@AcmeDental.example',
+    buyer_phone: '+1 (555) 555-0184',
     email_verified_at: null,
     email_verified_address: null,
     email_verification_method: null,
     email_verification_version: null,
+    phone_verified_at: null,
+    phone_verified_destination_fingerprint: null,
+    phone_verification_method: null,
+    phone_verification_version: null,
     expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
     ...overrides
   }
@@ -118,6 +123,7 @@ function makeDb(options = {}) {
   const db = {
     purchaseIntents: options.purchaseIntents || [intent()],
     verifications: options.verifications || [],
+    smsVerification: null,
     rpcCalls: [],
     from(table) {
       return new FakeQuery(db, table)
@@ -168,6 +174,56 @@ function makeDb(options = {}) {
           currentIntent.email_verification_version = 1
         }
         return { data: [{ status }], error: null }
+      }
+      if (name === 'service_invalidate_retail_signup_sms_verifications') {
+        if (db.smsVerification && !db.smsVerification.consumed) db.smsVerification.invalidated = true
+        return { data: 0, error: null }
+      }
+      if (name === 'service_get_retail_signup_sms_verification') {
+        if (!db.smsVerification) return { data: [], error: null }
+        return {
+          data: [{
+            verification_id: db.smsVerification.verificationId,
+            verifier_hmac_hex: db.smsVerification.verifierHmacHex,
+            verified: db.smsVerification.consumed === true,
+            status: db.smsVerification.consumed ? 'verified' : db.smsVerification.invalidated ? 'unverified' : 'code_sent',
+            expires_at: db.smsVerification.expiresAt,
+            sent_at: db.smsVerification.sentAt,
+            resend_after_seconds: 60
+          }],
+          error: null
+        }
+      }
+      if (name === 'service_issue_retail_signup_sms_verification') {
+        db.smsVerification = {
+          verificationId: args.p_verification_id,
+          verifierHmacHex: args.p_verifier_hmac_hex,
+          expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+          sentAt: new Date().toISOString(),
+          invalidated: false,
+          consumed: false
+        }
+        return {
+          data: [{
+            status: 'issued',
+            verification_id: db.smsVerification.verificationId,
+            expires_at: db.smsVerification.expiresAt,
+            resend_after_seconds: 60
+          }],
+          error: null
+        }
+      }
+      if (name === 'service_record_retail_signup_sms_delivery_metadata') return { data: true, error: null }
+      if (name === 'service_is_sms_destination_suppressed') return { data: false, error: null }
+      if (name === 'service_consume_retail_signup_sms_verification') {
+        const verified = args.p_verification_id === db.smsVerification?.verificationId && args.p_verifier_matches === true
+        if (verified) {
+          db.smsVerification.consumed = true
+          const currentIntent = db.purchaseIntents.find((row) => row.id === INTENT_ID)
+          currentIntent.phone_verified_at = new Date().toISOString()
+          currentIntent.phone_verification_method = 'retail_signup_sms_otp_v1'
+        }
+        return { data: [{ status: verified ? 'verified' : 'invalid' }], error: null }
       }
       throw new Error(`Unexpected RPC ${name}`)
     }
@@ -223,6 +279,30 @@ async function request(app, pathname, options = {}) {
   }
 }
 
+async function withRetailSmsEnv(callback) {
+  const values = {
+    NODE_ENV: 'test',
+    SMS_ENVIRONMENT: 'local',
+    SMS_PROVIDER: 'fake',
+    SMS_ENABLED: 'true',
+    SMS_RETAIL_UI_ENABLED: 'true',
+    SMS_CONSENT_COPY_VERSION: 'sms-consent-v2',
+    SMS_FAKE_MODE: 'accepted',
+    OTP_HMAC_SECRET_VERSION: '1',
+    OTP_HMAC_SECRET_V1: 'retail-route-test-secret-that-is-at-least-thirty-two-bytes'
+  }
+  const previous = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]))
+  Object.assign(process.env, values)
+  try {
+    return await callback()
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
 test('retail email verification sends a six-digit code while persisting only a hash bound to the normalized intent email', async () => {
   const db = makeDb()
   const { app, emails } = buildApp(db)
@@ -238,7 +318,10 @@ test('retail email verification sends a six-digit code while persisting only a h
   assert.notEqual(db.verifications[0].code_hash, emails[0].code)
   assert.equal(db.verifications[0].code_hash.length, 64)
   assert.equal(db.verifications[0].code_salt.length, 64)
-  assert.equal(db.rpcCalls[0].args.p_code_hash, db.verifications[0].code_hash)
+  assert.equal(
+    db.rpcCalls.find((call) => call.name === 'issue_retail_signup_email_verification').args.p_code_hash,
+    db.verifications[0].code_hash
+  )
   assert.doesNotMatch(JSON.stringify(response.body), new RegExp(emails[0].code))
 })
 
@@ -408,6 +491,64 @@ test('email delivery failure invalidates the issued verification and never marks
   assert.equal(response.body.code, 'RETAIL_EMAIL_VERIFICATION_SEND_FAILED')
   assert.equal(db.purchaseIntents[0].email_verified_at, null)
   assert.equal(db.verifications[0].invalidation_reason, 'delivery_failed')
+})
+
+test('retail SMS routes require consent, keep codes private, and verify through a timing-safe boolean boundary', async () => {
+  await withRetailSmsEnv(async () => {
+    const db = makeDb()
+    const { app } = buildApp(db)
+    const missingConsent = await request(app, `/api/alphascreen/purchase-intents/${INTENT_ID}/sms-verification/send`, {
+      method: 'POST',
+      body: {}
+    })
+    assert.equal(missingConsent.status, 400)
+    assert.equal(missingConsent.body.code, 'RETAIL_SMS_CONSENT_REQUIRED')
+
+    const crypto = require('node:crypto')
+    const originalRandomInt = crypto.randomInt
+    crypto.randomInt = () => 123456
+    let sent
+    try {
+      sent = await request(app, `/api/alphascreen/purchase-intents/${INTENT_ID}/sms-verification/send`, {
+        method: 'POST',
+        body: { consent_copy_version: 'sms-consent-v2' }
+      })
+    } finally {
+      crypto.randomInt = originalRandomInt
+    }
+
+    assert.equal(sent.status, 202)
+    assert.equal(sent.body.sms_verification.status, 'code_sent')
+    assert.doesNotMatch(JSON.stringify(sent.body), /verifier|destination_fingerprint|123456/i)
+    const issueCall = db.rpcCalls.find((call) => call.name === 'service_issue_retail_signup_sms_verification')
+    assert.ok(issueCall)
+    assert.equal(issueCall.args.p_consent_copy_version, 'sms-consent-v2')
+    assert.match(issueCall.args.p_verifier_hmac_hex, /^[0-9a-f]{64}$/)
+    assert.equal(Object.values(issueCall.args).includes('123456'), false)
+    assert.equal(Object.values(issueCall.args).some((value) => String(value).includes('5555550184')), false)
+
+    const status = await request(app, `/api/alphascreen/purchase-intents/${INTENT_ID}/sms-verification/status`)
+    assert.equal(status.status, 200)
+    assert.equal(status.body.sms_verification.code_active, true)
+    assert.doesNotMatch(JSON.stringify(status.body), /verifier_hmac|destination_fingerprint/i)
+
+    const wrong = await request(app, `/api/alphascreen/purchase-intents/${INTENT_ID}/sms-verification/verify`, {
+      method: 'POST',
+      body: { code: '000000' }
+    })
+    const correct = await request(app, `/api/alphascreen/purchase-intents/${INTENT_ID}/sms-verification/verify`, {
+      method: 'POST',
+      body: { code: '123456' }
+    })
+    assert.equal(wrong.status, 400)
+    assert.equal(wrong.body.code, 'RETAIL_SMS_VERIFICATION_INVALID_CODE')
+    assert.equal(correct.status, 200)
+    assert.equal(correct.body.sms_verification.verified, true)
+    assert.deepEqual(
+      db.rpcCalls.filter((call) => call.name === 'service_consume_retail_signup_sms_verification').map((call) => call.args.p_verifier_matches),
+      [false, true]
+    )
+  })
 })
 
 test('retail verification migration isolates OTP records and enforces expiry, attempts, RLS, and transactional consume semantics', () => {

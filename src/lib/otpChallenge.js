@@ -440,5 +440,6 @@ module.exports = {
   normalizeEmail,
   supersedeOtpChallenges,
   timingSafeHexEqual,
+  validateSmsDeliveryMetadataInput,
   verifierHmac,
 };

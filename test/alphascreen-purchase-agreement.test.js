@@ -520,7 +520,7 @@ test('purchase intent agreement endpoint rejects missing, expired, ineligible, a
   }
 })
 
-test('purchase intent agreement endpoint requires a matching retail email verification', async () => {
+test('purchase intent agreement endpoint requires matching retail email or text verification', async () => {
   const db = makeDb({
     purchaseIntents: [intent({
       email_verified_at: null,
@@ -532,7 +532,7 @@ test('purchase intent agreement endpoint requires a matching retail email verifi
   const response = await postAgreement(buildApp(db), BASIC_INTENT_ID)
 
   assert.equal(response.status, 409)
-  assert.equal(response.body.code, 'RETAIL_EMAIL_VERIFICATION_REQUIRED')
+  assert.equal(response.body.code, 'RETAIL_CONTACT_VERIFICATION_REQUIRED')
   assert.equal(db.inserts.length, 0)
   assert.deepEqual(Array.from(new Set(db.touchedTables)).sort(), ['public_purchase_intents'])
 
@@ -545,7 +545,7 @@ test('purchase intent agreement endpoint requires a matching retail email verifi
   const changedEmailResponse = await postAgreement(buildApp(changedEmailDb), BASIC_INTENT_ID)
 
   assert.equal(changedEmailResponse.status, 409)
-  assert.equal(changedEmailResponse.body.code, 'RETAIL_EMAIL_VERIFICATION_REQUIRED')
+  assert.equal(changedEmailResponse.body.code, 'RETAIL_CONTACT_VERIFICATION_REQUIRED')
   assert.equal(changedEmailDb.inserts.length, 0)
 })
 

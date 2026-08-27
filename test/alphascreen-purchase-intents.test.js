@@ -42,6 +42,7 @@ class FakeQuery {
     this.orderBy = null
     this.limitCount = null
     this.insertPayload = null
+    this.updatePayload = null
   }
 
   select(columns) {
@@ -76,6 +77,11 @@ class FakeQuery {
 
   insert(payload) {
     this.insertPayload = payload
+    return this
+  }
+
+  update(payload) {
+    this.updatePayload = payload
     return this
   }
 
@@ -122,6 +128,10 @@ class FakeQuery {
   async maybeSingle() {
     if (this.db.lookupError) return { data: null, error: this.db.lookupError }
     const existing = this.runSelect()[0] || null
+    if (existing && this.updatePayload) {
+      Object.assign(existing, this.updatePayload)
+      this.db.updates.push({ table: this.table, row: existing, payload: this.updatePayload })
+    }
     return { data: existing, error: null }
   }
 
@@ -147,6 +157,7 @@ function makeDb(options = {}) {
     lookupError: options.lookupError || null,
     insertError: options.insertError || null,
     inserts: [],
+    updates: [],
     touchedTables: [],
     from(table) {
       db.touchedTables.push(table)
@@ -484,6 +495,7 @@ test('duplicate pending intent returns existing safe response without inserting'
       selected_billing_cadence: 'monthly',
       buyer_email: 'alex@acmedental.example',
       company_legal_name: 'Acme Dental Group',
+      buyer_phone: '+1 (555) 000-0001',
       first_role_prepay_selected: false,
       created_at: new Date().toISOString(),
       package_snapshot: {
@@ -515,6 +527,9 @@ test('duplicate pending intent returns existing safe response without inserting'
   assert.equal(response.body.purchase_intent_id, 'existing-intent')
   assert.equal(response.body.duplicate, true)
   assert.equal(db.inserts.length, 0)
+  assert.equal(db.updates.length, 1)
+  assert.equal(db.updates[0].payload.buyer_phone, '+1 (555) 123-4567')
+  assert.equal(db.existingIntent.buyer_phone, '+1 (555) 123-4567')
 })
 
 test('active client member email is blocked from creating a new retail signup', async () => {

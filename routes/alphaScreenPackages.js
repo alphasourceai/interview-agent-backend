@@ -16,6 +16,16 @@ const { buildMembershipAgreementHtml } = require('../utils/renderMembershipAgree
 const { resolvePublicCheckoutReturnState } = require('../src/lib/publicPurchaseActivation')
 const { getRequestSubjectKey, hashRateLimitSubject, checkAndIncrementRateLimit } = require('../src/lib/rateLimit')
 const { sendRetailSignupEmailVerificationCode } = require('../utils/mailer')
+const {
+  RETAIL_SMS_CONSENT_COPY_VERSION,
+  RetailSmsVerificationError,
+  consumeRetailSignupSmsOtp,
+  deliverRetailSignupSmsOtp,
+  invalidateRetailSmsVerification,
+  loadRetailSmsVerificationState,
+  normalizeRetailPhone,
+  readRetailSmsConfiguration
+} = require('../src/lib/retailSmsVerification')
 
 const router = express.Router()
 const AGREEMENTS_BUCKET = process.env.SUPABASE_AGREEMENTS_BUCKET || 'agreements'
@@ -36,6 +46,11 @@ const RETAIL_EMAIL_VERIFICATION_SEND_RATE_MAX = 10
 const RETAIL_EMAIL_VERIFICATION_VERIFY_RATE_MAX = 20
 const RETAIL_EMAIL_VERIFICATION_STATUS_RATE_MAX = 120
 const RETAIL_EMAIL_VERIFICATION_METHOD = 'retail_signup_email_otp_v1'
+const RETAIL_SMS_VERIFICATION_TTL_SECONDS = 10 * 60
+const RETAIL_SMS_VERIFICATION_RESEND_COOLDOWN_SECONDS = 60
+const RETAIL_SMS_VERIFICATION_SEND_RATE_MAX = 10
+const RETAIL_SMS_VERIFICATION_VERIFY_RATE_MAX = 20
+const RETAIL_SMS_VERIFICATION_STATUS_RATE_MAX = 120
 const BLOCKING_PURCHASE_INTENT_STATUSES = ['pending', 'agreement_pending', 'checkout_pending', 'completed']
 const BLOCKING_AGREEMENT_STATUSES = ['sent', 'signed']
 const SIGNUP_ALREADY_EXISTS_MESSAGE = 'This email is already associated with an alphaScreen account or signup. Sign in, check your email, or contact support for help.'
@@ -46,10 +61,15 @@ const RETAIL_VERIFICATION_INTENT_SELECT = [
   'selected_plan_key',
   'selected_billing_cadence',
   'buyer_email',
+  'buyer_phone',
   'email_verified_at',
   'email_verified_address',
   'email_verification_method',
   'email_verification_version',
+  'phone_verified_at',
+  'phone_verified_destination_fingerprint',
+  'phone_verification_method',
+  'phone_verification_version',
   'expires_at',
   'agreement_id'
 ].join(',')
@@ -301,6 +321,48 @@ function validatePurchaseIntentForEmailVerification(intent) {
   return { ok: true }
 }
 
+function validatePurchaseIntentForSmsVerification(intent) {
+  if (!intent) {
+    return { ok: false, status: 404, code: 'purchase_intent_not_found', detail: 'Signup request was not found.' }
+  }
+  if (intent.expires_at) {
+    const expiresAt = Date.parse(String(intent.expires_at))
+    if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) {
+      return { ok: false, status: 410, code: 'purchase_intent_expired', detail: 'Signup request has expired.' }
+    }
+  }
+  if (String(intent.status || '').trim().toLowerCase() !== 'pending') {
+    return { ok: false, status: 409, code: 'purchase_intent_not_eligible', detail: 'Signup request is not eligible for text verification.' }
+  }
+  if (!normalizeRetailPhone(intent.buyer_phone)) {
+    return { ok: false, status: 409, code: 'RETAIL_SMS_VERIFICATION_INVALID_DESTINATION', detail: 'Text verification requires a valid U.S. mobile number. Choose email instead.' }
+  }
+  return { ok: true }
+}
+
+function publicSmsVerificationState(state = {}) {
+  return {
+    available: state.available === true,
+    verified: state.verified === true,
+    status: state.status || 'unverified',
+    code_active: state.codeActive === true,
+    expires_in_seconds: Number(state.expiresInSeconds || 0),
+    resend_cooldown_seconds: Number(state.resendCooldownSeconds || 0)
+  }
+}
+
+function sendSmsVerificationResponse(res, req, status, options = {}) {
+  const retryAfter = Math.max(0, Math.ceil(Number(options.retryAfterSeconds || 0)))
+  if (status === 429 && retryAfter > 0) res.set('Retry-After', String(retryAfter))
+  return res.status(status).json({
+    error: options.error || 'sms_verification_failed',
+    code: options.code || 'RETAIL_SMS_VERIFICATION_FAILED',
+    detail: options.detail || 'Text verification could not be completed. Choose email or try again.',
+    retry_after_seconds: retryAfter,
+    request_id: req.request_id || null
+  })
+}
+
 function sendVerificationResponse(res, req, status, options = {}) {
   const retryAfter = Math.max(0, Math.ceil(Number(options.retryAfterSeconds || 0)))
   if (status === 429 && retryAfter > 0) res.set('Retry-After', String(retryAfter))
@@ -468,6 +530,14 @@ function buildPurchaseIntentResponse(row, { duplicate = false } = {}) {
     duplicate,
     selected_package: safePackageSummary(snapshot),
     email_verification: publicEmailVerificationState(row),
+    sms_verification: {
+      available: readRetailSmsConfiguration(process.env).valid && Boolean(normalizeRetailPhone(row?.buyer_phone)),
+      verified: false,
+      status: 'unverified',
+      code_active: false,
+      expires_in_seconds: 0,
+      resend_cooldown_seconds: 0
+    },
     next_step_message: duplicate
       ? 'A signup request already exists for this company and package. The next step is membership agreement preparation.'
       : 'Signup request received. The next step is membership agreement preparation.',
@@ -799,7 +869,7 @@ router.post('/purchase-intents', async (req, res) => {
     const duplicateCutoff = new Date(Date.now() - DUPLICATE_WINDOW_MS).toISOString()
     const { data: existingIntent, error: duplicateErr } = await supabaseAdmin
       .from('public_purchase_intents')
-      .select('id,status,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,email_verified_at,email_verified_address,email_verification_method,email_verification_version,created_at')
+      .select('id,status,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,buyer_phone,email_verified_at,email_verified_address,email_verification_method,email_verification_version,phone_verified_at,phone_verified_destination_fingerprint,phone_verification_method,phone_verification_version,created_at')
       .eq('buyer_email', input.buyer_email)
       .eq('company_legal_name', input.company_legal_name)
       .eq('selected_plan_key', input.selected_plan_key)
@@ -821,7 +891,32 @@ router.post('/purchase-intents', async (req, res) => {
     }
 
     if (existingIntent?.id) {
-      const body = buildPurchaseIntentResponse(existingIntent, { duplicate: true })
+      let reusableIntent = existingIntent
+      if (trimText(existingIntent.buyer_phone, 40) !== input.buyer_phone) {
+        const { data: updatedIntent, error: updateErr } = await supabaseAdmin
+          .from('public_purchase_intents')
+          .update({
+            buyer_phone: input.buyer_phone,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', existingIntent.id)
+          .eq('status', 'pending')
+          .select('id,status,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,buyer_phone,email_verified_at,email_verified_address,email_verification_method,email_verification_version,phone_verified_at,phone_verified_destination_fingerprint,phone_verification_method,phone_verification_version,created_at')
+          .maybeSingle()
+
+        if (updateErr || !updatedIntent?.id) {
+          console.error('[alphascreen/purchase-intents] duplicate_phone_sync_failed:', updateErr?.message || 'intent_not_pending')
+          return res.status(409).json({
+            error: 'purchase_intent_not_reusable',
+            code: 'PURCHASE_INTENT_NOT_REUSABLE',
+            detail: 'This signup request changed while it was being updated. Start again to continue safely.',
+            request_id
+          })
+        }
+        reusableIntent = updatedIntent
+      }
+
+      const body = buildPurchaseIntentResponse(reusableIntent, { duplicate: true })
       body.request_id = request_id
       return res.status(200).json(body)
     }
@@ -866,7 +961,7 @@ router.post('/purchase-intents', async (req, res) => {
     const { data: inserted, error: insertErr } = await supabaseAdmin
       .from('public_purchase_intents')
       .insert(insertPayload)
-      .select('id,status,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,email_verified_at,email_verified_address,email_verification_method,email_verification_version,created_at')
+      .select('id,status,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,buyer_phone,email_verified_at,email_verified_address,email_verification_method,email_verification_version,phone_verified_at,phone_verified_destination_fingerprint,phone_verification_method,phone_verification_version,created_at')
       .single()
 
     if (insertErr) {
@@ -1000,6 +1095,13 @@ router.post('/purchase-intents/:id/email-verification/send', async (req, res) =>
         email_verification: publicEmailVerificationState(intent, latestVerification),
         request_id
       })
+    }
+
+    try {
+      await invalidateRetailSmsVerification(supabaseAdmin, intent.id, 'channel_changed_to_email')
+    } catch (error) {
+      console.error('[alphascreen/email-verification] sms_supersede_failed:', error?.code || 'unknown')
+      return sendVerificationResponse(res, req, 503, { code: 'RETAIL_EMAIL_VERIFICATION_UNAVAILABLE' })
     }
 
     const verificationCode = generateRetailVerificationCode()
@@ -1188,6 +1290,251 @@ router.post('/purchase-intents/:id/email-verification/verify', async (req, res) 
   }
 })
 
+router.get('/purchase-intents/:id/sms-verification/status', async (req, res) => {
+  const request_id = req.request_id || null
+  const intentId = trimText(req.params?.id, 80)
+  if (!UUID_RE.test(intentId)) {
+    return sendSmsVerificationResponse(res, req, 400, {
+      code: 'purchase_intent_id_required',
+      detail: 'A valid signup reference is required.'
+    })
+  }
+
+  try {
+    const { data: intent, error } = await supabaseAdmin
+      .from('public_purchase_intents')
+      .select(RETAIL_VERIFICATION_INTENT_SELECT)
+      .eq('id', intentId)
+      .maybeSingle()
+    if (error) {
+      console.error('[alphascreen/sms-verification] status_lookup_failed:', error?.code || 'unknown')
+      return sendSmsVerificationResponse(res, req, 503, { code: 'RETAIL_SMS_VERIFICATION_UNAVAILABLE' })
+    }
+
+    const validation = validatePurchaseIntentForSmsVerification(intent)
+    if (!validation.ok) {
+      return sendSmsVerificationResponse(res, req, validation.status, {
+        code: validation.code,
+        detail: validation.detail
+      })
+    }
+
+    const allowed = await enforceRetailRateLimit(req, res, {
+      routeName: 'retail_sms_verification_status',
+      subjectParts: ['sms_verification_status', intent.id, getRequestSubjectKey(req)],
+      maxCount: RETAIL_SMS_VERIFICATION_STATUS_RATE_MAX
+    })
+    if (!allowed) return
+
+    const config = readRetailSmsConfiguration(process.env)
+    if (!config.valid) {
+      return res.json({
+        ok: true,
+        sms_verification: publicSmsVerificationState({ available: false }),
+        request_id
+      })
+    }
+    const state = await loadRetailSmsVerificationState(supabaseAdmin, intent, process.env)
+    return res.json({ ok: true, sms_verification: publicSmsVerificationState(state), request_id })
+  } catch (error) {
+    console.error('[alphascreen/sms-verification] status_failed:', error?.code || 'unknown')
+    return sendSmsVerificationResponse(res, req, 503, { code: 'RETAIL_SMS_VERIFICATION_UNAVAILABLE' })
+  }
+})
+
+router.post('/purchase-intents/:id/sms-verification/send', async (req, res) => {
+  const request_id = req.request_id || null
+  const intentId = trimText(req.params?.id, 80)
+  const consentCopyVersion = trimText(req.body?.consent_copy_version, 80)
+  if (!UUID_RE.test(intentId)) {
+    return sendSmsVerificationResponse(res, req, 400, {
+      code: 'purchase_intent_id_required',
+      detail: 'A valid signup reference is required.'
+    })
+  }
+  if (consentCopyVersion !== RETAIL_SMS_CONSENT_COPY_VERSION) {
+    return sendSmsVerificationResponse(res, req, 400, {
+      code: 'RETAIL_SMS_CONSENT_REQUIRED',
+      detail: 'Select Text Message and review the text-message disclosure before requesting a code.'
+    })
+  }
+
+  try {
+    const { data: intent, error } = await supabaseAdmin
+      .from('public_purchase_intents')
+      .select(RETAIL_VERIFICATION_INTENT_SELECT)
+      .eq('id', intentId)
+      .maybeSingle()
+    if (error) {
+      console.error('[alphascreen/sms-verification] send_lookup_failed:', error?.code || 'unknown')
+      return sendSmsVerificationResponse(res, req, 503, { code: 'RETAIL_SMS_VERIFICATION_UNAVAILABLE' })
+    }
+
+    const validation = validatePurchaseIntentForSmsVerification(intent)
+    if (!validation.ok) {
+      return sendSmsVerificationResponse(res, req, validation.status, {
+        code: validation.code,
+        detail: validation.detail
+      })
+    }
+
+    const allowed = await enforceRetailRateLimit(req, res, {
+      routeName: 'retail_sms_verification_send',
+      subjectParts: ['sms_verification_send', intent.id],
+      maxCount: RETAIL_SMS_VERIFICATION_SEND_RATE_MAX
+    })
+    if (!allowed) return
+
+    const current = await loadRetailSmsVerificationState(supabaseAdmin, intent, process.env)
+    if (current.verified) {
+      return res.json({ ok: true, sms_verification: publicSmsVerificationState(current), request_id })
+    }
+
+    const result = await deliverRetailSignupSmsOtp({
+      db: supabaseAdmin,
+      intent,
+      requestIp: getRequestSubjectKey(req),
+      consentCopyVersion,
+      env: process.env
+    })
+    if (result.outcome !== 'accepted') {
+      if (result.outcome === 'invalid_destination') {
+        return sendSmsVerificationResponse(res, req, 409, {
+          code: 'RETAIL_SMS_VERIFICATION_INVALID_DESTINATION',
+          detail: 'Text verification requires a valid U.S. mobile number. Choose email instead.'
+        })
+      }
+      if (result.outcome === 'blocked_destination') {
+        return sendSmsVerificationResponse(res, req, 409, {
+          code: 'RETAIL_SMS_VERIFICATION_BLOCKED',
+          detail: 'Text verification is unavailable for this number. Choose email instead.'
+        })
+      }
+      return sendSmsVerificationResponse(res, req, 503, {
+        code: result.outcome === 'ambiguous_outcome'
+          ? 'RETAIL_SMS_VERIFICATION_SEND_UNCERTAIN'
+          : 'RETAIL_SMS_VERIFICATION_SEND_FAILED',
+        detail: 'We could not confirm text delivery. Choose email or try again.'
+      })
+    }
+
+    return res.status(202).json({
+      ok: true,
+      sms_verification: {
+        available: true,
+        verified: false,
+        status: 'code_sent',
+        code_active: true,
+        expires_in_seconds: RETAIL_SMS_VERIFICATION_TTL_SECONDS,
+        resend_cooldown_seconds: Number(result.retryAfterSeconds || RETAIL_SMS_VERIFICATION_RESEND_COOLDOWN_SECONDS)
+      },
+      request_id
+    })
+  } catch (error) {
+    if (error instanceof RetailSmsVerificationError) {
+      if (error.code === 'RETAIL_SMS_VERIFICATION_COOLDOWN') {
+        return sendSmsVerificationResponse(res, req, 429, {
+          code: error.code,
+          detail: 'Please wait before requesting another code.',
+          retryAfterSeconds: error.retryAfterSeconds
+        })
+      }
+      if (error.code === 'RETAIL_SMS_VERIFICATION_SEND_LIMIT') {
+        return sendSmsVerificationResponse(res, req, 429, {
+          code: error.code,
+          detail: 'Too many verification codes were requested. Choose email or try again later.',
+          retryAfterSeconds: error.retryAfterSeconds
+        })
+      }
+    }
+    console.error('[alphascreen/sms-verification] send_failed:', error?.code || 'unknown')
+    return sendSmsVerificationResponse(res, req, 503, { code: 'RETAIL_SMS_VERIFICATION_UNAVAILABLE' })
+  }
+})
+
+router.post('/purchase-intents/:id/sms-verification/verify', async (req, res) => {
+  const request_id = req.request_id || null
+  const intentId = trimText(req.params?.id, 80)
+  const code = trimText(req.body?.code, 12)
+  if (!UUID_RE.test(intentId)) {
+    return sendSmsVerificationResponse(res, req, 400, {
+      code: 'purchase_intent_id_required',
+      detail: 'A valid signup reference is required.'
+    })
+  }
+  if (!/^\d{6}$/.test(code)) {
+    return sendSmsVerificationResponse(res, req, 400, {
+      code: 'RETAIL_SMS_VERIFICATION_INVALID_CODE',
+      detail: 'That code is not valid. Check the code and try again.'
+    })
+  }
+
+  try {
+    const { data: intent, error } = await supabaseAdmin
+      .from('public_purchase_intents')
+      .select(RETAIL_VERIFICATION_INTENT_SELECT)
+      .eq('id', intentId)
+      .maybeSingle()
+    if (error) {
+      console.error('[alphascreen/sms-verification] verify_lookup_failed:', error?.code || 'unknown')
+      return sendSmsVerificationResponse(res, req, 503, { code: 'RETAIL_SMS_VERIFICATION_UNAVAILABLE' })
+    }
+
+    const validation = validatePurchaseIntentForSmsVerification(intent)
+    if (!validation.ok) {
+      return sendSmsVerificationResponse(res, req, validation.status, {
+        code: validation.code,
+        detail: validation.detail
+      })
+    }
+    const allowed = await enforceRetailRateLimit(req, res, {
+      routeName: 'retail_sms_verification_verify',
+      subjectParts: ['sms_verification_verify', intent.id],
+      maxCount: RETAIL_SMS_VERIFICATION_VERIFY_RATE_MAX
+    })
+    if (!allowed) return
+
+    const current = await loadRetailSmsVerificationState(supabaseAdmin, intent, process.env)
+    if (current.verified) {
+      return res.json({ ok: true, sms_verification: publicSmsVerificationState(current), request_id })
+    }
+    const consumed = await consumeRetailSignupSmsOtp({ db: supabaseAdmin, intent, code, env: process.env })
+    if (consumed.status === 'verified') {
+      return res.json({
+        ok: true,
+        sms_verification: {
+          available: true,
+          verified: true,
+          status: 'verified',
+          code_active: false,
+          expires_in_seconds: 0,
+          resend_cooldown_seconds: 0
+        },
+        request_id
+      })
+    }
+    if (consumed.status === 'expired') {
+      return sendSmsVerificationResponse(res, req, 400, {
+        code: 'RETAIL_SMS_VERIFICATION_EXPIRED',
+        detail: 'That code has expired. Request a new code.'
+      })
+    }
+    if (consumed.status === 'attempt_limit') {
+      return sendSmsVerificationResponse(res, req, 429, {
+        code: 'RETAIL_SMS_VERIFICATION_ATTEMPTS_EXCEEDED',
+        detail: 'Too many unsuccessful attempts. Request a new code.'
+      })
+    }
+    return sendSmsVerificationResponse(res, req, 400, {
+      code: 'RETAIL_SMS_VERIFICATION_INVALID_CODE',
+      detail: 'That code is not valid. Check the code and try again.'
+    })
+  } catch (error) {
+    console.error('[alphascreen/sms-verification] verify_failed:', error?.code || 'unknown')
+    return sendSmsVerificationResponse(res, req, 503, { code: 'RETAIL_SMS_VERIFICATION_UNAVAILABLE' })
+  }
+})
+
 router.post('/purchase-intents/:id/agreement', async (req, res) => {
   const request_id = req.request_id || null
   const intentId = trimText(req.params?.id, 80)
@@ -1210,7 +1557,7 @@ router.post('/purchase-intents/:id/agreement', async (req, res) => {
   try {
     const { data: intent, error: intentErr } = await supabaseAdmin
       .from('public_purchase_intents')
-      .select('id,status,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,company_legal_name,company_dba,buyer_first_name,buyer_last_name,buyer_email,buyer_phone,buyer_title,source_path,agreement_id,stripe_checkout_session_id,client_id,email_verified_at,email_verified_address,email_verification_method,email_verification_version,expires_at,created_at')
+      .select('id,status,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,company_legal_name,company_dba,buyer_first_name,buyer_last_name,buyer_email,buyer_phone,buyer_title,source_path,agreement_id,stripe_checkout_session_id,client_id,email_verified_at,email_verified_address,email_verification_method,email_verification_version,phone_verified_at,phone_verified_destination_fingerprint,phone_verification_method,phone_verification_version,expires_at,created_at')
       .eq('id', intentId)
       .maybeSingle()
 
@@ -1253,7 +1600,17 @@ router.post('/purchase-intents/:id/agreement', async (req, res) => {
       existingAgreement = data
     }
 
-    if (!hasValidRetailEmailVerification(intent)) {
+    let contactVerified = hasValidRetailEmailVerification(intent)
+    if (!contactVerified) {
+      try {
+        const smsState = await loadRetailSmsVerificationState(supabaseAdmin, intent, process.env)
+        contactVerified = smsState.verified === true
+      } catch (error) {
+        console.error('[alphascreen/purchase-intents/agreement] sms_verification_lookup_failed:', error?.code || 'unknown')
+      }
+    }
+
+    if (!contactVerified) {
       if (existingAgreement && String(existingAgreement.status || '').trim().toLowerCase() === 'signed') {
         return res.status(409).json({
           error: 'agreement_not_signable',
@@ -1263,9 +1620,9 @@ router.post('/purchase-intents/:id/agreement', async (req, res) => {
         })
       }
       return res.status(409).json({
-        error: 'retail_email_verification_required',
-        code: 'RETAIL_EMAIL_VERIFICATION_REQUIRED',
-        detail: 'Verify the buyer email before continuing to the membership agreement.',
+        error: 'retail_contact_verification_required',
+        code: 'RETAIL_CONTACT_VERIFICATION_REQUIRED',
+        detail: 'Verify the buyer by email or text message before continuing to the membership agreement.',
         request_id
       })
     }

@@ -1,7 +1,8 @@
 'use strict';
 
 const express = require('express');
-const { destinationFingerprint, recordOtpSmsDeliveryEvent } = require('../src/lib/otpChallenge');
+const { destinationFingerprint } = require('../src/lib/otpChallenge');
+const { recordAnyOtpSmsDeliveryEvent } = require('../src/lib/retailSmsVerification');
 const {
   activateSmsProviderBreaker,
   recordSmsInboundControlEvent,
@@ -16,7 +17,7 @@ function createTelnyxSmsWebhookRouter({
   db = null,
   env = process.env,
   now = () => Date.now(),
-  recordDeliveryEvent = recordOtpSmsDeliveryEvent,
+  recordDeliveryEvent = recordAnyOtpSmsDeliveryEvent,
   recordControlEvent = recordSmsInboundControlEvent,
   activateProviderBreaker = activateSmsProviderBreaker,
   fingerprintDestination = destinationFingerprint,
