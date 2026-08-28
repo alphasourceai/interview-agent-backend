@@ -309,9 +309,11 @@ async function deliverRetailSignupSmsOtp({
   }
   return Object.freeze({
     outcome,
+    provider: result.provider || configuredAdapter.name,
+    status: result.status || null,
     challengeCreated: result.challengeCreated === true,
     expiresAt: issued?.expires_at || expiresAt,
-    retryAfterSeconds: Number(issued?.resend_after_seconds || 60),
+    retryAfterSeconds: Number(issued?.resend_after_seconds || 120),
     emailFallbackAvailable: outcome !== 'accepted',
   });
 }

@@ -19,6 +19,7 @@ const {
 const INTENT_ID = '870f3ec7-5f4c-4aa6-8ed7-0bc3fd00a184'
 const OTP_SECRET = 'retail-sms-test-secret-that-is-at-least-thirty-two-bytes'
 const MIGRATION_PATH = path.join(__dirname, '..', 'supabase', 'migrations', '20260827123000_retail_signup_sms_verification.sql')
+const RESEND_COOLDOWN_MIGRATION_PATH = path.join(__dirname, '..', 'supabase', 'migrations', '20260828163111_extend_retail_sms_resend_cooldown.sql')
 
 function localEnv(overrides = {}) {
   return {
@@ -64,7 +65,7 @@ function makeDb() {
             status: 'issued',
             verification_id: args.p_verification_id,
             expires_at: state.issued.expires_at,
-            resend_after_seconds: 60,
+            resend_after_seconds: 120,
           }],
           error: null,
         }
@@ -87,7 +88,7 @@ function makeDb() {
             status: state.consumed ? 'verified' : 'code_sent',
             expires_at: state.issued.expires_at,
             sent_at: new Date().toISOString(),
-            resend_after_seconds: 60,
+            resend_after_seconds: 120,
           }],
           error: null,
         }
@@ -147,6 +148,8 @@ test('retail SMS delivery commits a private challenge before one adapter call an
   })
 
   assert.equal(result.outcome, 'accepted')
+  assert.equal(result.provider, 'fake')
+  assert.equal(result.status, 'queued')
   assert.equal(result.challengeCreated, true)
   assert.equal(adapter.getCallCount(), 1)
   assert.match(db.state.issued.p_verifier_hmac_hex, /^[0-9a-f]{64}$/)
@@ -197,5 +200,14 @@ test('retail SMS migration keeps challenges private, enforces consent, cross-cha
   assert.match(migration, /revoke all on function private_auth\.consume_retail_signup_sms_verification\(uuid,boolean\) from public, anon, authenticated, service_role/)
   assert.match(migration, /service_consume_retail_signup_sms_verification\(uuid,boolean\)/)
   assert.doesNotMatch(migration, /service_consume_retail_signup_sms_verification\(uuid,text,text\)/)
+  assert.doesNotMatch(migration, /\b(phone_e164|to_e164|otp_code|raw_code)\s+text\b/i)
+})
+
+test('retail SMS resend migration enforces the 120-second delay without changing private function signatures', () => {
+  const migration = fs.readFileSync(RESEND_COOLDOWN_MIGRATION_PATH, 'utf8')
+  assert.match(migration, /private_auth\.issue_retail_signup_sms_verification\([\s\S]*interval '120 seconds'/)
+  assert.match(migration, /private_auth\.get_retail_signup_sms_verification\([\s\S]*interval '120 seconds'/)
+  assert.match(migration, /return query select 'issued'::text, p_verification_id, v_expires_at, 120/)
+  assert.doesNotMatch(migration, /interval '60 seconds'/)
   assert.doesNotMatch(migration, /\b(phone_e164|to_e164|otp_code|raw_code)\s+text\b/i)
 })

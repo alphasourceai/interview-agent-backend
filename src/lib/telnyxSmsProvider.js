@@ -9,8 +9,13 @@ const { buildOtpSmsMessage } = require('./smsMessage');
 
 const TELNYX_API_HOST = 'api.telnyx.com';
 const TELNYX_MESSAGE_PATH = '/v2/messages';
+const TELNYX_WEBHOOK_PATH = '/webhook/telnyx/sms';
 const RESPONSE_LIMIT_BYTES = 256 * 1024;
 const INVALID_DESTINATION_CODES = new Set(['10002', '40001', '40012', '40310', '42201']);
+const TELNYX_WEBHOOK_HOSTS = Object.freeze({
+  qa: new Set(['ia-backend-qa.onrender.com']),
+  production: new Set(['api.alphasourceai.com', 'ia-backend-prod.onrender.com']),
+});
 
 class TelnyxTransportError extends Error {
   constructor(kind, dispatched) {
@@ -36,6 +41,27 @@ function boundedErrorCode(payload) {
 function safeJson(value) {
   try {
     return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeTelnyxWebhookUrl(value, environment) {
+  const normalized = String(value || '').trim();
+  if (!normalized || normalized.length > 500) return null;
+  try {
+    const parsed = new URL(normalized);
+    const allowedHosts = TELNYX_WEBHOOK_HOSTS[environment];
+    if (parsed.protocol !== 'https:'
+      || !allowedHosts
+      || !allowedHosts.has(parsed.hostname)
+      || parsed.pathname !== TELNYX_WEBHOOK_PATH
+      || parsed.username
+      || parsed.password
+      || parsed.search
+      || parsed.hash
+    ) return null;
+    return parsed.toString();
   } catch {
     return null;
   }
@@ -130,11 +156,12 @@ function readTelnyxConfig(env) {
   const apiKey = boundedOpaque(env.TELNYX_API_KEY, 512);
   const profileId = boundedOpaque(env.TELNYX_MESSAGING_PROFILE_ID);
   const senderE164 = String(env.TELNYX_SENDER_E164 || '').trim();
+  const webhookUrl = normalizeTelnyxWebhookUrl(env.TELNYX_MESSAGING_WEBHOOK_URL, environment);
   const timeoutMs = Number(env.TELNYX_TIMEOUT_MS || 5000);
   const valid = enabled && ['qa', 'production'].includes(environment) && provider === 'telnyx'
-    && apiKey && profileId && /^\+1\d{10}$/.test(senderE164)
+    && apiKey && profileId && webhookUrl && /^\+1\d{10}$/.test(senderE164)
     && Number.isInteger(timeoutMs) && timeoutMs >= 1000 && timeoutMs <= 10_000;
-  return Object.freeze({ valid: !!valid, environment, apiKey, profileId, senderE164, timeoutMs });
+  return Object.freeze({ valid: !!valid, environment, apiKey, profileId, senderE164, webhookUrl, timeoutMs });
 }
 
 function createTelnyxSmsProvider({ env = process.env, transport = requestTelnyxMessage, now = () => new Date() } = {}) {
@@ -165,7 +192,7 @@ function createTelnyxSmsProvider({ env = process.env, transport = requestTelnyxM
         text: message.body,
         type: 'SMS',
         encoding: 'gsm7',
-        use_profile_webhooks: true,
+        webhook_url: config.webhookUrl,
       };
       try {
         const response = await transport({
@@ -191,10 +218,12 @@ function createTelnyxSmsProvider({ env = process.env, transport = requestTelnyxM
 module.exports = {
   TELNYX_API_HOST,
   TELNYX_MESSAGE_PATH,
+  TELNYX_WEBHOOK_PATH,
   TelnyxTransportError,
   classifyTelnyxHttpFailure,
   createTelnyxSmsProvider,
   normalizeTelnyxAcceptedResponse,
+  normalizeTelnyxWebhookUrl,
   readTelnyxConfig,
   requestTelnyxMessage,
 };

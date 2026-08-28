@@ -28,12 +28,13 @@ function createTelnyxSmsWebhookRouter({
     const publicKey = String(env.TELNYX_WEBHOOK_PUBLIC_KEY || '').trim();
     if (!publicKey) return res.status(503).json({ ok: false });
     try {
+      const receivedAtMs = now();
       verifyTelnyxWebhook({
         rawBody: req.body,
         signature: req.get('telnyx-signature-ed25519'),
         timestamp: req.get('telnyx-timestamp'),
         publicKey,
-        now: now(),
+        now: receivedAtMs,
       });
       const event = parseTelnyxWebhook(req.body);
       if (event.ignored) return res.status(200).json({ ok: true });
@@ -65,6 +66,7 @@ function createTelnyxSmsWebhookRouter({
         });
       }
       if (logger && typeof logger.info === 'function') {
+        const providerEventAtMs = Date.parse(String(event.occurredAt || ''));
         logger.info('sms_provider_callback', {
           provider: 'telnyx',
           event_kind: event.kind,
@@ -74,6 +76,9 @@ function createTelnyxSmsWebhookRouter({
           found: result.found === true,
           applied: result.applied === true,
           replayed: result.replayed === true,
+          provider_event_age_ms: Number.isFinite(providerEventAtMs)
+            ? Math.max(0, receivedAtMs - providerEventAtMs)
+            : null,
         });
       }
       return res.status(200).json({ ok: true });
@@ -88,6 +93,6 @@ function createTelnyxSmsWebhookRouter({
   return router;
 }
 
-const router = createTelnyxSmsWebhookRouter();
+const router = createTelnyxSmsWebhookRouter({ logger: console });
 module.exports = router;
 module.exports.createTelnyxSmsWebhookRouter = createTelnyxSmsWebhookRouter;

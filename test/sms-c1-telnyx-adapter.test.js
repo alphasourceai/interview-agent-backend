@@ -23,6 +23,7 @@ const ENV = Object.freeze({
   TELNYX_API_KEY: 'test-only-api-key',
   TELNYX_MESSAGING_PROFILE_ID: 'test-profile',
   TELNYX_SENDER_E164: '+15555550199',
+  TELNYX_MESSAGING_WEBHOOK_URL: 'https://ia-backend-qa.onrender.com/webhook/telnyx/sms',
   TELNYX_TIMEOUT_MS: '5000',
 });
 
@@ -58,10 +59,11 @@ test('accepted response returns one opaque Telnyx message binding and sends only
     provider: 'telnyx', messageId: 'opaque-message-1', status: 'queued', outcome: 'accepted', failureCategory: null,
   });
   assert.equal(harness.calls(), 1);
-  assert.deepEqual(Object.keys(harness.invocation().body).sort(), ['encoding', 'from', 'text', 'to', 'type', 'use_profile_webhooks']);
+  assert.deepEqual(Object.keys(harness.invocation().body).sort(), ['encoding', 'from', 'text', 'to', 'type', 'webhook_url']);
   assert.equal(harness.invocation().body.from, ENV.TELNYX_SENDER_E164);
   assert.equal(harness.invocation().body.to, request().toE164);
   assert.match(harness.invocation().body.text, /123456.*10 minutes/);
+  assert.equal(harness.invocation().body.webhook_url, ENV.TELNYX_MESSAGING_WEBHOOK_URL);
   const encoded = JSON.stringify(harness.invocation().body);
   for (const forbidden of [CHALLENGE_ID, 'candidate', 'client', 'role', 'submission']) assert.equal(encoded.includes(forbidden), false);
 });
@@ -157,6 +159,9 @@ test('misconfiguration fails closed without reaching the network', async () => {
     { ...ENV, TELNYX_API_KEY: '' },
     { ...ENV, TELNYX_MESSAGING_PROFILE_ID: '' },
     { ...ENV, TELNYX_SENDER_E164: '+639171234567' },
+    { ...ENV, TELNYX_MESSAGING_WEBHOOK_URL: '' },
+    { ...ENV, TELNYX_MESSAGING_WEBHOOK_URL: 'http://ia-backend-qa.onrender.com/webhook/telnyx/sms' },
+    { ...ENV, TELNYX_MESSAGING_WEBHOOK_URL: 'https://api.alphasourceai.com/webhook/telnyx/sms' },
   ]) {
     let called = false;
     const provider = createTelnyxSmsProvider({ env, transport: async () => { called = true; } });
@@ -167,7 +172,11 @@ test('misconfiguration fails closed without reaching the network', async () => {
 });
 
 test('production transport is valid only when provider and request environments match', async () => {
-  const productionEnv = { ...ENV, SMS_ENVIRONMENT: 'production' };
+  const productionEnv = {
+    ...ENV,
+    SMS_ENVIRONMENT: 'production',
+    TELNYX_MESSAGING_WEBHOOK_URL: 'https://api.alphasourceai.com/webhook/telnyx/sms',
+  };
   const accepted = providerFor({
     statusCode: 200,
     body: JSON.stringify({ data: { id: 'opaque-message-production', to: [{ status: 'queued' }] } }),

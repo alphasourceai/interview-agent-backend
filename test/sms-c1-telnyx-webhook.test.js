@@ -192,6 +192,7 @@ test('callback logs contain only bounded metadata, never body, OTP, phone, key, 
     recordDeliveryEvent: async () => ({ found: true, applied: true, replayed: false }),
   });
   assert.equal(response.status, 200);
+  assert.equal(logs[0][1].provider_event_age_ms, 0);
   const encoded = JSON.stringify(logs);
   for (const forbidden of ['+15555550100', '123456', PUBLIC_KEY, body.toString('utf8'), 'message-1']) assert.equal(encoded.includes(forbidden), false);
 });

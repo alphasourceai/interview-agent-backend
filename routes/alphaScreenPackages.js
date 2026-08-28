@@ -47,7 +47,7 @@ const RETAIL_EMAIL_VERIFICATION_VERIFY_RATE_MAX = 20
 const RETAIL_EMAIL_VERIFICATION_STATUS_RATE_MAX = 120
 const RETAIL_EMAIL_VERIFICATION_METHOD = 'retail_signup_email_otp_v1'
 const RETAIL_SMS_VERIFICATION_TTL_SECONDS = 10 * 60
-const RETAIL_SMS_VERIFICATION_RESEND_COOLDOWN_SECONDS = 60
+const RETAIL_SMS_VERIFICATION_RESEND_COOLDOWN_SECONDS = 120
 const RETAIL_SMS_VERIFICATION_SEND_RATE_MAX = 10
 const RETAIL_SMS_VERIFICATION_VERIFY_RATE_MAX = 20
 const RETAIL_SMS_VERIFICATION_STATUS_RATE_MAX = 120
@@ -1346,6 +1346,7 @@ router.post('/purchase-intents/:id/sms-verification/send', async (req, res) => {
   const request_id = req.request_id || null
   const intentId = trimText(req.params?.id, 80)
   const consentCopyVersion = trimText(req.body?.consent_copy_version, 80)
+  let providerSendStartedAtMs = null
   if (!UUID_RE.test(intentId)) {
     return sendSmsVerificationResponse(res, req, 400, {
       code: 'purchase_intent_id_required',
@@ -1390,12 +1391,20 @@ router.post('/purchase-intents/:id/sms-verification/send', async (req, res) => {
       return res.json({ ok: true, sms_verification: publicSmsVerificationState(current), request_id })
     }
 
+    providerSendStartedAtMs = Date.now()
     const result = await deliverRetailSignupSmsOtp({
       db: supabaseAdmin,
       intent,
       requestIp: getRequestSubjectKey(req),
       consentCopyVersion,
       env: process.env
+    })
+    console.info('[alphascreen/sms-verification] send_outcome', {
+      outcome: result.outcome || 'unknown',
+      provider_status: result.status || null,
+      request_duration_ms: Math.max(0, Date.now() - providerSendStartedAtMs),
+      retry_attempted: result.retryAttempted === true,
+      failover_attempted: result.failoverAttempted === true
     })
     if (result.outcome !== 'accepted') {
       if (result.outcome === 'invalid_destination') {
@@ -1447,7 +1456,10 @@ router.post('/purchase-intents/:id/sms-verification/send', async (req, res) => {
         })
       }
     }
-    console.error('[alphascreen/sms-verification] send_failed:', error?.code || 'unknown')
+    console.error('[alphascreen/sms-verification] send_failed:', {
+      code: error?.code || 'unknown',
+      request_duration_ms: providerSendStartedAtMs === null ? null : Math.max(0, Date.now() - providerSendStartedAtMs)
+    })
     return sendSmsVerificationResponse(res, req, 503, { code: 'RETAIL_SMS_VERIFICATION_UNAVAILABLE' })
   }
 })
