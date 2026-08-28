@@ -19,7 +19,7 @@ const {
 const INTENT_ID = '870f3ec7-5f4c-4aa6-8ed7-0bc3fd00a184'
 const OTP_SECRET = 'retail-sms-test-secret-that-is-at-least-thirty-two-bytes'
 const MIGRATION_PATH = path.join(__dirname, '..', 'supabase', 'migrations', '20260827123000_retail_signup_sms_verification.sql')
-const RESEND_COOLDOWN_MIGRATION_PATH = path.join(__dirname, '..', 'supabase', 'migrations', '20260828163111_extend_retail_sms_resend_cooldown.sql')
+const RESEND_COOLDOWN_MIGRATION_PATH = path.join(__dirname, '..', 'supabase', 'migrations', '20260828163805_extend_retail_sms_resend_cooldown.sql')
 
 function localEnv(overrides = {}) {
   return {
