@@ -110,7 +110,7 @@ test('public preflight returns the valid three-minute QA duration', async () => 
   assert.equal(body.max_interview_minutes, 3);
 });
 
-test('public preflight ignores stale external duration and uses authoritative Basic capacity', async () => {
+test('public preflight ignores stale external duration and uses authoritative Essential capacity', async () => {
   const harness = await createHarness({
     planSetting: { client_id: CLIENT_ID, plan_tier: 'basic', max_interview_minutes: 60 },
   });

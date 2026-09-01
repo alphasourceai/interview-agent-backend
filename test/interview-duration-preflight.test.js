@@ -291,7 +291,7 @@ test('duration lookup failure is retryable and does not masquerade as missing co
 });
 
 for (const [label, planTier, configuredDuration, expectedDuration, internalSynthetic] of [
-  ['external Basic ignores stale stored duration', 'basic', 3, 10, false],
+  ['external Essential ignores stale stored duration', 'basic', 3, 10, false],
   ['external Pro uses the plan contract', 'pro', 3, 12, false],
   ['external Enterprise uses the plan contract', 'enterprise', 3, 15, false],
   ['three-minute internal QA fixture', 'basic', 3, 3, true],

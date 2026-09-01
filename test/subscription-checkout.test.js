@@ -162,7 +162,7 @@ test('subscription checkout adds configured one-time first-role prepay line item
     const { createSubscriptionCheckoutSession } = loadCheckout({ stripeCalls })
     const result = await createSubscriptionCheckoutSession({
       clientId: 'client-1',
-      planTier: 'basic',
+      planTier: 'Essential',
       billingInterval: 'monthly',
       metadataSource: 'agreement_checkout',
       metadata: {
@@ -191,6 +191,7 @@ test('subscription checkout adds configured one-time first-role prepay line item
       { price: 'price_basic_first_role_prepay', quantity: 1 }
     ])
     assert.equal(payload.metadata.first_role_prepay_selected, 'true')
+    assert.equal(payload.metadata.plan_tier, 'basic')
     assert.equal(payload.metadata.first_role_prepay_credit_type, 'first_role_prepay')
     assert.equal(payload.metadata.first_role_prepay_amount_cents, '35900')
     assert.equal(payload.metadata.first_role_prepay_normal_role_fee_cents, '39900')

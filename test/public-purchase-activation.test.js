@@ -310,7 +310,7 @@ function injectModule(filename, exports) {
   }
 }
 
-test('public purchase webhook activation provisions Basic and Pro monthly/annual buyers', async () => {
+test('public purchase webhook activation provisions Essential and Pro monthly/annual buyers', async () => {
   const cases = [
     ['basic', 'monthly', 299, 399, 20, 10, 30],
     ['basic', 'annual', 3299, 399, 20, 10, 30],

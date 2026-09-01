@@ -250,7 +250,7 @@ function intent(overrides = {}) {
     selected_billing_cadence: 'monthly',
     package_snapshot: {
       plan_key: 'basic',
-      display_name: 'Basic',
+      display_name: 'Essential',
       billing_cadence: 'monthly',
       platform_fee: 299,
       platform_fee_cents: 29900,
@@ -290,7 +290,7 @@ function intent(overrides = {}) {
   }
 }
 
-test('valid pending Basic purchase intent creates a sent agreement from purchase snapshot values', async () => {
+test('valid pending Essential purchase intent creates a sent agreement from purchase snapshot values', async () => {
   const db = makeDb({ purchaseIntents: [intent()] })
   const response = await postAgreement(buildApp(db), BASIC_INTENT_ID)
 

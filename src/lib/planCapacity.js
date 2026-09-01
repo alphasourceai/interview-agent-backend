@@ -5,7 +5,7 @@ const INTERNAL_SYNTHETIC_CLIENT_IDS_ENV = 'INTERNAL_SYNTHETIC_INTERVIEW_CLIENT_I
 const PLAN_CAPACITY = Object.freeze({
   basic: Object.freeze({
     membership_level: 'basic',
-    display_name: 'Basic',
+    display_name: 'Essential',
     interview_duration_minutes: 10,
     max_interview_minutes: 10,
     scored_question_count: 5,
@@ -37,7 +37,8 @@ class PlanCapacityError extends Error {
 
 function normalizeMembershipLevel(value) {
   const normalized = String(value || '').trim().toLowerCase();
-  return Object.prototype.hasOwnProperty.call(PLAN_CAPACITY, normalized) ? normalized : '';
+  const canonical = normalized === 'essential' ? 'basic' : normalized;
+  return Object.prototype.hasOwnProperty.call(PLAN_CAPACITY, canonical) ? canonical : '';
 }
 
 function getPlanCapacity(value) {
@@ -48,7 +49,7 @@ function getPlanCapacity(value) {
 function requirePlanCapacity(value) {
   const capacity = getPlanCapacity(value);
   if (!capacity) {
-    throw new PlanCapacityError('Membership level must be Basic, Pro, or Enterprise.');
+    throw new PlanCapacityError('Membership level must be Essential, Pro, or Enterprise.');
   }
   return capacity;
 }

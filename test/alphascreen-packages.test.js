@@ -15,7 +15,8 @@ const {
   getAlphaScreenFirstRolePrepayStripePriceId,
   getAlphaScreenStripePriceEnvName,
   getAlphaScreenStripePriceId,
-  listPublicAlphaScreenPackages
+  listPublicAlphaScreenPackages,
+  normalizeAlphaScreenPlanKey
 } = require('../src/lib/alphaScreenPackages')
 
 const routePath = path.join(__dirname, '..', 'routes', 'alphaScreenPackages.js')
@@ -77,7 +78,9 @@ function buildApp() {
   return app
 }
 
-test('central package config returns canonical Basic and Pro values', () => {
+test('central package config returns canonical Essential and Pro values', () => {
+  assert.equal(normalizeAlphaScreenPlanKey('essential'), 'basic')
+  assert.equal(normalizeAlphaScreenPlanKey('Basic'), 'basic')
   assert.deepEqual(getAlphaScreenPlanSettingsDefaults('basic'), {
     per_role_fee: 399,
     included_interviews_per_role: 20,
@@ -100,7 +103,7 @@ test('central package config returns canonical Basic and Pro values', () => {
   assert.equal(buildAlphaScreenPackageSnapshot('pro', 'monthly').first_role_prepay.normal_role_fee_cents, 69900)
 })
 
-test('webhook Basic provisioning payload uses 20 interviews, 10 minutes, and $30 overage', () => {
+test('webhook Essential provisioning payload uses 20 interviews, 10 minutes, and $30 overage', () => {
   const payload = buildAlphaScreenPlanSettingsPayload({
     clientId: 'client-basic',
     planKey: 'basic',

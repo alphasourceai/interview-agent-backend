@@ -132,7 +132,7 @@ function makeSnapshot(plan, cadence, firstRolePrepaySelected = false) {
   const annual = cadence === 'annual'
   return {
     plan_key: plan,
-    display_name: basic ? 'Basic' : 'Pro',
+    display_name: basic ? 'Essential' : 'Pro',
     billing_cadence: cadence,
     platform_fee: basic ? (annual ? 3299 : 299) : (annual ? 6499 : 599),
     platform_fee_billing_cadence: cadence,
@@ -357,7 +357,7 @@ async function postCheckout(app) {
   }
 }
 
-test('signed public purchase agreements create hosted checkout for Basic/Pro monthly and annual packages', async () => {
+test('signed public purchase agreements create hosted checkout for Essential/Pro monthly and annual packages', async () => {
   const cases = [
     ['basic', 'monthly', 299, 399, 20, 10, 30],
     ['basic', 'annual', 3299, 399, 20, 10, 30],

@@ -16,7 +16,7 @@ function moneyCents(value) {
 const ALPHA_SCREEN_PACKAGES = Object.freeze({
   basic: Object.freeze({
     plan_key: 'basic',
-    display_name: 'Basic',
+    display_name: 'Essential',
     platform_monthly_fee: 299,
     platform_annual_fee: 3299,
     annual_platform_fee_note: ANNUAL_PLATFORM_FEE_NOTE,
@@ -79,7 +79,8 @@ const ALPHA_SCREEN_PACKAGES = Object.freeze({
 })
 
 function normalizeAlphaScreenPlanKey(value) {
-  const key = String(value || '').trim().toLowerCase()
+  const normalized = String(value || '').trim().toLowerCase()
+  const key = normalized === 'essential' ? 'basic' : normalized
   return Object.prototype.hasOwnProperty.call(ALPHA_SCREEN_PACKAGES, key) ? key : ''
 }
 

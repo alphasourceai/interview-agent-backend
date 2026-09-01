@@ -18,7 +18,8 @@ function makeError(status, code, detail) {
 
 function normalizePlanTier(value) {
   const normalized = String(value || '').trim().toLowerCase()
-  return ['basic', 'pro', 'enterprise'].includes(normalized) ? normalized : ''
+  const canonical = normalized === 'essential' ? 'basic' : normalized
+  return ['basic', 'pro', 'enterprise'].includes(canonical) ? canonical : ''
 }
 
 function normalizeBillingInterval(value) {

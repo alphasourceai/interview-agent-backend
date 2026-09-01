@@ -255,7 +255,7 @@ function assertSignupAlreadyExistsResponse(response, expectedNextStep = 'check_e
   assert.equal(response.body.next_step, expectedNextStep)
 }
 
-test('valid Basic monthly intent creates pending intent with central package snapshot', async () => {
+test('valid Essential monthly intent creates pending intent with central package snapshot', async () => {
   const db = makeDb({ nextId: 'intent-basic' })
   const response = await request(buildApp(db), validBody())
 
@@ -332,7 +332,7 @@ test('valid Pro annual intent creates pending intent when annual cadence is supp
   assertNoStaleAnnualPricingPayload(db.inserts[0].row.package_snapshot)
 })
 
-test('purchase intent with selected first-role prepay snapshots immutable Basic credit values', async () => {
+test('purchase intent with selected first-role prepay snapshots immutable Essential credit values', async () => {
   const db = makeDb({ nextId: 'intent-basic-prepay' })
   const response = await request(buildApp(db), validBody({
     first_role_prepay_selected: true
@@ -500,7 +500,7 @@ test('duplicate pending intent returns existing safe response without inserting'
       created_at: new Date().toISOString(),
       package_snapshot: {
         plan_key: 'basic',
-        display_name: 'Basic',
+        display_name: 'Essential',
         billing_cadence: 'monthly',
         platform_fee: 299,
         platform_fee_cents: 29900,

@@ -13,6 +13,7 @@ process.env.OPENAI_API_KEY ||= 'rubric-redesign-openai-key';
 const {
   INTERNAL_SYNTHETIC_CLIENT_IDS_ENV,
   getPlanCapacity,
+  normalizeMembershipLevel,
   resolvePlanCapacity,
 } = require('../src/lib/planCapacity');
 const {
@@ -82,11 +83,14 @@ function transcriptWithWarmup(scoredAnswer = 'I led a migration and used SQL val
   ].join('\n');
 }
 
-test('plan capacity is exact, membership-owned, type-independent, and preserves Basic membership', () => {
+test('plan capacity is exact, membership-owned, type-independent, and preserves Essential membership', () => {
+  assert.equal(normalizeMembershipLevel('essential'), 'basic');
+  assert.equal(normalizeMembershipLevel('Basic'), 'basic');
+
   for (const [membershipLevel, expected] of Object.entries(PLAN_EXPECTATIONS)) {
     const capacity = getPlanCapacity(membershipLevel);
     assert.equal(capacity.membership_level, membershipLevel);
-    assert.equal(capacity.display_name, membershipLevel === 'basic' ? 'Basic' : membershipLevel === 'pro' ? 'Pro' : 'Enterprise');
+    assert.equal(capacity.display_name, membershipLevel === 'basic' ? 'Essential' : membershipLevel === 'pro' ? 'Pro' : 'Enterprise');
     assert.equal(capacity.interview_duration_minutes, expected.minutes);
     assert.equal(capacity.max_interview_minutes, expected.minutes);
     assert.equal(capacity.scored_question_count, expected.questions);

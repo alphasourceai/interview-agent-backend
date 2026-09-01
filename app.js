@@ -3971,7 +3971,8 @@ adminRouter.post('/clients/:id/billing/checkout-session', requireAuth, requireAd
 
 adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin, async (req, res) => {
   const clientId = req.params?.id
-  const planTier = String(req.body?.plan_tier || '').trim().toLowerCase()
+  const requestedPlanTier = String(req.body?.plan_tier || '').trim().toLowerCase()
+  const planTier = requestedPlanTier === 'essential' ? 'basic' : requestedPlanTier
   const billingInterval = String(req.body?.billing_interval || '').trim().toLowerCase()
   const returnTab = String(req.body?.tab || '').trim().toLowerCase()
 
@@ -4037,7 +4038,8 @@ adminRouter.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin
 
 adminRouter.post('/clients/:id/subscription-invoice', requireAuth, requireAdmin, async (req, res) => {
   const clientId = req.params?.id
-  const planTier = String(req.body?.plan_tier || '').trim().toLowerCase()
+  const requestedPlanTier = String(req.body?.plan_tier || '').trim().toLowerCase()
+  const planTier = requestedPlanTier === 'essential' ? 'basic' : requestedPlanTier
   const billingInterval = String(req.body?.billing_interval || '').trim().toLowerCase()
 
   if (!['basic', 'pro', 'enterprise'].includes(planTier)) {
@@ -4139,7 +4141,7 @@ adminRouter.post('/clients/:id/subscription-invoice', requireAuth, requireAdmin,
       if (!Number.isFinite(unitAmount) || unitAmount <= 0) {
         return res.status(500).json({ error: 'invalid_price_configuration' })
       }
-      const planLabel = planTier === 'basic' ? 'Basic' : 'Pro'
+      const planLabel = planTier === 'basic' ? 'Essential' : 'Pro'
       const intervalLabel = billingInterval === 'annual' ? 'annual' : 'monthly'
       invoiceTitle = `${planLabel} membership (${intervalLabel})`
       lineItems.push({

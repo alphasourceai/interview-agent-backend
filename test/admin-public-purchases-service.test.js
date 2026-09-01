@@ -175,7 +175,7 @@ function packageSnapshot(plan = 'basic', cadence = 'monthly', firstRolePrepaySel
   const isAnnual = cadence === 'annual';
   return {
     plan_key: plan,
-    display_name: isPro ? 'Pro' : 'Basic',
+    display_name: isPro ? 'Pro' : 'Essential',
     billing_cadence: cadence,
     billing_cadence_display_name: isAnnual ? 'Annual' : 'Monthly',
     platform_fee: isPro ? (isAnnual ? 6499 : 599) : (isAnnual ? 3299 : 299),
