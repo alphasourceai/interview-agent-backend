@@ -5,6 +5,9 @@ const { buildClientDashboardReturnUrl } = require('../../config/urlConfig');
 const { resolveBillingOwnerForScope } = require('./clientBillingScope');
 const EARLY_ENDED_SENTINEL_SUMMARY = 'Interview ended before substantive responses were captured.';
 const INSUFFICIENT_TRANSCRIPT_EARLY_END_SUMMARY_PREFIX = 'Interview ended before any substantive responses were recorded.';
+const NO_SUBSTANTIVE_CANDIDATE_RESPONSE_SUMMARY = 'Interview ended before a substantive candidate response was recorded.';
+const NO_SUBSTANTIVE_CANDIDATE_RESPONSE_FAILURE_CODE = 'NO_SUBSTANTIVE_CANDIDATE_RESPONSE';
+const NO_SUBSTANTIVE_CANDIDATE_RESPONSE_PROGRESS_STATE = 'NoSubstantiveCandidateResponse';
 
 function parseWholeNonNegative(value) {
   const n = Number(value);
@@ -30,27 +33,29 @@ function isUsedInterviewRow(row) {
   const transcriptOverallRaw = transcriptScores && typeof transcriptScores === 'object'
     ? transcriptScores.overall
     : undefined;
-  const transcriptOverall = transcriptScores && typeof transcriptScores === 'object'
-    ? Number(transcriptOverallRaw)
-    : NaN;
   const hasNumericTranscriptOverall = (
     transcriptOverallRaw != null &&
     !(typeof transcriptOverallRaw === 'string' && transcriptOverallRaw.trim() === '') &&
     Number.isFinite(Number(transcriptOverallRaw))
   );
-  const isEarlyEndedSentinel =
-    normalizedStatus === 'ended' &&
-    summary === EARLY_ENDED_SENTINEL_SUMMARY &&
-    !hasNumericTranscriptOverall;
-  const isInsufficientTranscriptEarlyEndSummary =
-    summary.startsWith(INSUFFICIENT_TRANSCRIPT_EARLY_END_SUMMARY_PREFIX) &&
-    !hasNumericTranscriptOverall;
-  if (isEarlyEndedSentinel || isInsufficientTranscriptEarlyEndSummary) return false;
+  const hasCurrentSubstantiveEvidence = row?.has_substantive_response === true;
+  const hasExplicitNoSubstantiveState = (
+    row?.has_substantive_response === false ||
+    String(row?.failure_code || '').trim().toUpperCase() === NO_SUBSTANTIVE_CANDIDATE_RESPONSE_FAILURE_CODE ||
+    String(row?.conversation_progress_state || '').trim() === NO_SUBSTANTIVE_CANDIDATE_RESPONSE_PROGRESS_STATE ||
+    summary === NO_SUBSTANTIVE_CANDIDATE_RESPONSE_SUMMARY ||
+    summary === EARLY_ENDED_SENTINEL_SUMMARY ||
+    summary.startsWith(INSUFFICIENT_TRANSCRIPT_EARLY_END_SUMMARY_PREFIX)
+  );
+
+  // A reconciled current-attempt substantive marker wins over stale legacy
+  // failure fields. Otherwise, any explicit no-response state is non-billable.
+  if (!hasCurrentSubstantiveEvidence && hasExplicitNoSubstantiveState) return false;
   return (
     normalizedStatus === 'completed' ||
     normalizedStatus === 'analyzed' ||
     !!summary ||
-    Number.isFinite(transcriptOverall)
+    hasNumericTranscriptOverall
   );
 }
 
@@ -122,7 +127,7 @@ async function getRoleInterviewAvailability({ db, roleId, clientId }) {
 
   const { data: interviewRows, error: interviewsError } = await db
     .from('interviews')
-    .select('status,transcript_scores,interview_summary')
+    .select('status,transcript_scores,interview_summary,has_substantive_response,failure_code,conversation_progress_state')
     .eq('client_id', clientId)
     .eq('role_id', roleId);
   if (interviewsError) {

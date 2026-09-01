@@ -661,8 +661,35 @@ function hasNoSubstantiveInterviewSummary(summary) {
   return (
     lower.includes('before any substantive responses were recorded') ||
     lower.includes('before substantive responses were captured') ||
+    lower.includes('before a substantive candidate response was recorded') ||
     lower.includes('insufficient data')
   );
+}
+
+function analysisV2Eligibility(row) {
+  const evaluativeTranscript = excludeWarmupFromTranscript(row?.transcript);
+  if (!evaluativeTranscript) {
+    return { eligible: false, reason: 'missing_evaluative_transcript' };
+  }
+
+  const hasCurrentSubstantiveEvidence = row?.has_substantive_response === true;
+  const explicitlyNonSubstantive =
+    row?.has_substantive_response === false ||
+    String(row?.conversation_progress_state || '').trim() === 'NoSubstantiveCandidateResponse' ||
+    (
+      !hasCurrentSubstantiveEvidence &&
+      String(row?.failure_code || '').trim().toUpperCase() === 'NO_SUBSTANTIVE_CANDIDATE_RESPONSE'
+    ) ||
+    hasNoSubstantiveInterviewSummary(row?.interview_summary);
+  if (explicitlyNonSubstantive) {
+    return { eligible: false, reason: 'no_substantive_responses' };
+  }
+
+  const evidence = isSubstantiveTranscript(evaluativeTranscript);
+  if (!evidence?.ok) {
+    return { eligible: false, reason: 'no_substantive_responses' };
+  }
+  return { eligible: true, reason: null };
 }
 
 function hasExistingPerceptionScores(scores) {
@@ -930,17 +957,19 @@ async function releaseInterviewAnalysisV2Claim({
   analysisClaimVersion,
   failureCategory,
 }) {
-  if (!analysisClaimToken || !Number.isInteger(Number(analysisClaimVersion))) return;
+  if (!analysisClaimToken || !Number.isInteger(Number(analysisClaimVersion))) return true;
   try {
-    await supabaseAdmin.rpc('release_interview_analysis_v2_claim', {
+    const { error } = await supabaseAdmin.rpc('release_interview_analysis_v2_claim', {
       p_interview_id: interviewId,
       p_analysis_claim_token: analysisClaimToken,
       p_analysis_claim_version: Number(analysisClaimVersion),
       p_failure_category: failureCategory,
     });
+    return !error;
   } catch {
     // The bounded analysis lease is the fallback. Never log ownership,
     // transcript identity, database diagnostics, or generated analysis.
+    return false;
   }
 }
 
@@ -1046,7 +1075,7 @@ async function maybeGenerateInterviewAnalysisV2({
   try {
     const { data: row, error } = await supabaseAdmin
       .from('interviews')
-      .select('id,candidate_id,role_id,transcript,transcript_scores,perception_scores,perception_analysis_text,unanswered_candidate_questions,interview_summary,interview_analysis_v2')
+      .select('id,candidate_id,role_id,status,failure_code,conversation_progress_state,has_substantive_response,substantive_response_count,candidate_utterance_count,transcript,transcript_scores,perception_scores,perception_analysis_text,unanswered_candidate_questions,interview_summary,interview_analysis_v2')
       .eq('id', interview.id)
       .maybeSingle();
     if (error || !row) {
@@ -1104,19 +1133,35 @@ async function maybeGenerateInterviewAnalysisV2({
       logInterviewAnalysisV2('info', 'skip', { ...logBase, reason: 'missing_perception_context' });
       return;
     }
-    if (!String(row.transcript || '').trim()) {
-      if (boundedTelemetry) throw new Error('analysis_input_missing');
-      logInterviewAnalysisV2('info', 'skip', { ...logBase, reason: 'missing_transcript' });
-      return;
+
+    const eligibility = analysisV2Eligibility(row);
+    if (!eligibility.eligible) {
+      if (boundedTelemetry && analysisOwnership) {
+        const released = await releaseInterviewAnalysisV2Claim({
+          interviewId: interview.id,
+          analysisClaimToken: analysisOwnership.token,
+          analysisClaimVersion: analysisOwnership.version,
+          failureCategory: 'analysis_superseded',
+        });
+        if (!released) {
+          logInterviewAnalysisV2('error', 'failure', {
+            ...logBase,
+            reason: 'analysis_claim_release_failed',
+          });
+          captureSanitizedFinalTranscriptFailure('analysis_claim_release_failed', {
+            stage: 'downstream_analysis',
+            retryable: true,
+            httpClass: '2xx',
+          });
+          return { skipped: false, reason: 'analysis_claim_release_failed' };
+        }
+      }
+      logInterviewAnalysisV2('info', 'skip', { ...logBase, reason: eligibility.reason });
+      return { skipped: true, reason: eligibility.reason };
     }
     if (!row.transcript_scores || typeof row.transcript_scores !== 'object' || Array.isArray(row.transcript_scores) || !Object.keys(row.transcript_scores).length) {
       if (boundedTelemetry) throw new Error('analysis_input_missing');
       logInterviewAnalysisV2('info', 'skip', { ...logBase, reason: 'missing_transcript_scores' });
-      return;
-    }
-    if (hasNoSubstantiveInterviewSummary(row.interview_summary)) {
-      if (boundedTelemetry) throw new Error('analysis_input_missing');
-      logInterviewAnalysisV2('info', 'skip', { ...logBase, reason: 'no_substantive_responses' });
       return;
     }
 
@@ -1227,6 +1272,20 @@ async function maybeGenerateInterviewAnalysisV2({
 }
 
 function queueInterviewAnalysisV2(input) {
+  if (input?.substantiveEvidence === false) {
+    logInterviewAnalysisV2('info', 'skip', input?.boundedTelemetry ? {
+      source: 'final_transcript_reconciliation',
+      reason: input?.skipReason || 'no_substantive_responses',
+    } : {
+      request_id: input?.requestId || null,
+      interview_id: input?.interview?.id || null,
+      conversation_id: input?.conversationId || null,
+      candidate_id: input?.interview?.candidate_id || null,
+      role_id: input?.interview?.role_id || null,
+      reason: input?.skipReason || 'no_substantive_responses',
+    });
+    return false;
+  }
   setImmediate(() => {
     maybeGenerateInterviewAnalysisV2(input).catch((err) => {
       logInterviewAnalysisV2('error', 'failure', input?.boundedTelemetry ? {
@@ -1242,6 +1301,7 @@ function queueInterviewAnalysisV2(input) {
       });
     });
   });
+  return true;
 }
 
 function extractAnswerScoresFromAnalysis(analysis) {
@@ -1827,6 +1887,7 @@ const FINAL_TRANSCRIPT_FAILURE_CATEGORIES = new Set([
   'finalize_failed',
   'post_processing_failed',
   'analysis_claim_failed',
+  'analysis_claim_release_failed',
   'analysis_generation_failed',
   'analysis_finalize_failed',
   'unexpected_failure',
@@ -2995,7 +3056,15 @@ router.post(
       }
       const perceptionResult = await updatePerceptionAnalysis(interview, analysisText, requestId, perceptionScoreSources);
       if (ENABLE_INTERVIEW_ANALYSIS_V2 && eventType === 'application.perception_analysis' && perceptionResult?.stored) {
-        queueInterviewAnalysisV2({ interview, requestId, conversationId, refreshOnMissingPerception: true });
+        const eligibility = analysisV2Eligibility(interview);
+        queueInterviewAnalysisV2({
+          interview,
+          requestId,
+          conversationId,
+          refreshOnMissingPerception: true,
+          substantiveEvidence: eligibility.eligible,
+          skipReason: eligibility.reason,
+        });
       }
       const extractedKeys = Object.keys(perceptionResult?.perception_scores || {});
       if (eventType === 'application.perception_analysis' && !extractedKeys.length) {
@@ -3261,14 +3330,20 @@ router.post(
             if (!freshErr && fresh) {
           analysisComplete = isTranscriptAnalysisCompleteForRow(fresh);
           statusFrom = fresh.status || null;
-          await applyTranscriptScoringForInterview({
+          const scoringResult = await applyTranscriptScoringForInterview({
             interview,
             fresh,
             transcriptText: typeof fresh.transcript === 'string' ? fresh.transcript : '',
             requestId,
             conversationId
           });
-          queueInterviewAnalysisV2({ interview, requestId, conversationId });
+          queueInterviewAnalysisV2({
+            interview,
+            requestId,
+            conversationId,
+            substantiveEvidence: scoringResult?.substantive === true,
+            skipReason: scoringResult?.reason || 'no_substantive_responses',
+          });
 
               const allowed = [
                 'ReadyForAnalysis',
@@ -3405,3 +3480,8 @@ router._setTavusHttpClientForTest = (client) => {
 router._setSupabaseAdminForTest = (client) => {
   supabaseAdmin = client === undefined ? defaultSupabaseAdmin : client;
 };
+router._test = Object.freeze({
+  analysisV2Eligibility,
+  maybeGenerateInterviewAnalysisV2,
+  queueInterviewAnalysisV2,
+});
