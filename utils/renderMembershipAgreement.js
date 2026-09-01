@@ -133,6 +133,11 @@ function titleCase(value) {
   return normalized.charAt(0).toUpperCase() + normalized.slice(1);
 }
 
+function formatMembershipTier(value) {
+  const normalized = normalizeTier(value);
+  return normalized === 'basic' ? 'Essential' : titleCase(normalized);
+}
+
 function formatUsd(value) {
   const raw = normalizeText(value);
   if (!raw) return '—';
@@ -261,7 +266,7 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
     dba_trade_name: normalized.dba_trade_name || '______________________________',
     primary_admin_name: normalized.primary_admin_name || '______________________________',
     admin_email: normalized.admin_email || '______________________________',
-    membership_tier: titleCase(normalized.membership_tier),
+    membership_tier: formatMembershipTier(normalized.membership_tier),
     is_enterprise: normalized.membership_tier === 'enterprise',
     show_package_terms: showPackageTerms,
     package_platform_fee: formatUsd(normalized.platform_fee),

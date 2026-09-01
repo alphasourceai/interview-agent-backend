@@ -18,6 +18,15 @@ const baseAgreement = {
   notice_deadline_days: 30
 }
 
+test('Essential is the display label while basic remains the canonical agreement key', () => {
+  const { html, normalized } = buildMembershipAgreementHtml(baseAgreement)
+
+  assert.equal(normalized.membership_tier, 'basic')
+  assert.match(html, /Membership Tier/)
+  assert.match(html, />Essential</)
+  assert.doesNotMatch(html, />Basic</)
+})
+
 test('admin-created agreement rendering does not show public purchase package fields by default', () => {
   const { html } = buildMembershipAgreementHtml(baseAgreement)
 
