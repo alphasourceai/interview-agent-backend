@@ -8,7 +8,8 @@
     "dev": "nodemon app.js",
     "test": "node --test test/*.test.js",
     "build:render": "echo \"no build step required\"",
-    "rescore:role": "node scripts/rescoreRoleInterviews.js"
+    "rescore:role": "node scripts/rescoreRoleInterviews.js",
+    "import:qa-role-scores": "node scripts/importQaRoleScores.js"
   },
   "keywords": [],
   "author": "",
