@@ -34,17 +34,26 @@ function safeTimestamp() {
   return new Date().toISOString().replace(/[:.]/g, '-');
 }
 
-async function restorePreviousValues(supabase, backupRows, updatedIds) {
+async function restorePreviousValues(supabase, role, backupRows, updatedVersions) {
   for (const row of backupRows) {
-    if (!updatedIds.has(row.id)) continue;
-    const { error } = await supabase
+    const updatedAt = updatedVersions.get(row.id);
+    if (!updatedAt) continue;
+    const { data: restored, error } = await supabase
       .from('interviews')
       .update({
         transcript_scores: row.transcript_scores,
         interview_summary: row.interview_summary,
+        updated_at: row.updated_at,
       })
-      .eq('id', row.id);
+      .eq('id', row.id)
+      .eq('role_id', role.id)
+      .eq('client_id', role.client_id)
+      .eq('updated_at', updatedAt)
+      .select('id');
     if (error) throw error;
+    if (!Array.isArray(restored) || restored.length !== 1) {
+      throw new Error(`role_rescore_rollback_concurrent_update:${row.id}`);
+    }
   }
 }
 
@@ -106,7 +115,7 @@ async function main() {
       return_payload: true,
       request_id: `role-rescore-${crypto.randomUUID()}`,
     });
-    if (!result.ok || result.skipped || !result.update_payload) {
+    if (!result.ok || result.skipped || !result.update_payload || !Number.isFinite(result.rescored_overall)) {
       throw new Error(`role_rescore_preparation_failed:${result.error || result.reason || 'unknown'}`);
     }
     results.push({
@@ -138,20 +147,21 @@ async function main() {
     });
   if (backupError) throw new Error(`role_rescore_backup_failed:${backupError.message}`);
 
-  const updatedIds = new Set();
+  const updatedVersions = new Map();
   try {
     for (const result of results) {
+      const mutationTimestamp = new Date().toISOString();
       const { data: updated, error: updateError } = await supabase
         .from('interviews')
-        .update(result.update_payload)
+        .update({ ...result.update_payload, updated_at: mutationTimestamp })
         .eq('id', result.id)
         .eq('role_id', role.id)
         .eq('client_id', role.client_id)
         .eq('updated_at', result.prior_updated_at)
-        .select('id');
+        .select('id,updated_at');
       if (updateError) throw updateError;
       if (!Array.isArray(updated) || updated.length !== 1) throw new Error('role_rescore_concurrent_update_detected');
-      updatedIds.add(result.id);
+      updatedVersions.set(result.id, updated[0].updated_at || mutationTimestamp);
     }
 
     const { data: verified, error: verifyError } = await supabase
@@ -160,11 +170,21 @@ async function main() {
       .in('id', results.map((row) => row.id));
     if (verifyError) throw verifyError;
     if (!Array.isArray(verified) || verified.length !== EXPECTED_COUNT) throw new Error('role_rescore_verify_count_mismatch');
-    if (verified.some((row) => !Number.isFinite(row?.transcript_scores?.overall) || !String(row?.interview_summary || '').trim())) {
+    const expectedById = new Map(results.map((row) => [row.id, row.update_payload]));
+    if (verified.some((row) => {
+      const expected = expectedById.get(row.id);
+      return !expected ||
+        Number(row?.transcript_scores?.overall) !== Number(expected?.transcript_scores?.overall) ||
+        String(row?.interview_summary || '') !== String(expected?.interview_summary || '');
+    })) {
       throw new Error('role_rescore_verify_content_invalid');
     }
   } catch (error) {
-    await restorePreviousValues(supabase, backup.interviews, updatedIds);
+    try {
+      await restorePreviousValues(supabase, role, backup.interviews, updatedVersions);
+    } catch (rollbackError) {
+      throw new Error(`role_rescore_rollback_failed:${error?.message || error}:${rollbackError?.message || rollbackError}`);
+    }
     throw new Error(`role_rescore_rolled_back:${error?.message || error}`);
   }
 
