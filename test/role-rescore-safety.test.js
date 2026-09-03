@@ -118,3 +118,29 @@ test('role rescore normalizes transcript hashes and fingerprints the exact body'
     require('node:crypto').createHash('sha256').update('exact transcript').digest('hex')
   );
 });
+
+test('role rescore parses ordered expected output scores', () => {
+  delete require.cache[require.resolve('../scripts/rescoreRoleInterviews')];
+  const { parseExpectedScores } = require('../scripts/rescoreRoleInterviews');
+  assert.deepEqual(parseExpectedScores('63, 58,62,56,54,68'), [63, 58, 62, 56, 54, 68]);
+});
+
+test('non-dry-run role rescore requires a complete bounded expected score sequence', () => {
+  withEnvironment({
+    ALLOW_ROLE_RESCORE: 'true',
+    ROLE_RESCORE_TITLE: 'High-Velocity Sales Closer',
+    ROLE_RESCORE_EXPECTED_PROJECT_REF: 'expected-project',
+    ROLE_RESCORE_EXPECTED_COUNT: '2',
+    ROLE_RESCORE_MAX_CREATED_AT: '2026-09-03T04:00:00Z',
+    ROLE_RESCORE_EXPECTED_TRANSCRIPT_HASHES: `${'a'.repeat(64)},${'b'.repeat(64)}`,
+    ROLE_RESCORE_DRY_RUN: 'false',
+    ROLE_RESCORE_EXPECTED_OUTPUT_SCORES: undefined,
+    SUPABASE_URL: 'https://expected-project.supabase.co',
+    SUPABASE_SERVICE_ROLE_KEY: 'test-service-role-key',
+    OPENAI_API_KEY: 'test-openai-key',
+  }, () => {
+    delete require.cache[require.resolve('../scripts/rescoreRoleInterviews')];
+    const { assertRoleRescoreSafety } = require('../scripts/rescoreRoleInterviews');
+    assert.throws(() => assertRoleRescoreSafety(), /role_rescore_expected_output_scores_invalid/);
+  });
+});

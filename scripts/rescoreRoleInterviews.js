@@ -10,6 +10,7 @@ const EXPECTED_COUNT = Number(process.env.ROLE_RESCORE_EXPECTED_COUNT || 0);
 const MAX_CREATED_AT = String(process.env.ROLE_RESCORE_MAX_CREATED_AT || '').trim();
 const EXPECTED_TRANSCRIPT_HASHES = parseTranscriptHashes(process.env.ROLE_RESCORE_EXPECTED_TRANSCRIPT_HASHES);
 const DRY_RUN = String(process.env.ROLE_RESCORE_DRY_RUN || 'true').toLowerCase() !== 'false';
+const EXPECTED_OUTPUT_SCORES = parseExpectedScores(process.env.ROLE_RESCORE_EXPECTED_OUTPUT_SCORES);
 const BACKUP_BUCKET = String(process.env.SUPABASE_TRANSCRIPTS_BUCKET || 'transcripts').trim();
 
 function parseTranscriptHashes(value) {
@@ -24,6 +25,14 @@ function transcriptDigest(value) {
   return crypto.createHash('sha256').update(body).digest('hex');
 }
 
+function parseExpectedScores(value) {
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .map(Number);
+}
+
 function assertRoleRescoreSafety() {
   if (process.env.ALLOW_ROLE_RESCORE !== 'true') throw new Error('role_rescore_explicit_opt_in_required');
   if (!ROLE_TITLE) throw new Error('role_rescore_title_required');
@@ -34,6 +43,10 @@ function assertRoleRescoreSafety() {
       new Set(EXPECTED_TRANSCRIPT_HASHES).size !== EXPECTED_COUNT ||
       EXPECTED_TRANSCRIPT_HASHES.some((value) => !/^[a-f0-9]{64}$/.test(value))) {
     throw new Error('role_rescore_expected_transcript_hashes_invalid');
+  }
+  if (!DRY_RUN && (EXPECTED_OUTPUT_SCORES.length !== EXPECTED_COUNT ||
+      EXPECTED_OUTPUT_SCORES.some((value) => !Number.isInteger(value) || value < 0 || value > 100))) {
+    throw new Error('role_rescore_expected_output_scores_invalid');
   }
   if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) throw new Error('role_rescore_supabase_credentials_required');
   if (!process.env.OPENAI_API_KEY) throw new Error('role_rescore_openai_key_required');
@@ -153,6 +166,11 @@ async function main() {
     });
   }
 
+  const rescoredScores = results.map((row) => row.rescored_overall);
+  if (!DRY_RUN && rescoredScores.some((value, index) => value !== EXPECTED_OUTPUT_SCORES[index])) {
+    throw new Error('role_rescore_output_scores_mismatch');
+  }
+
   if (DRY_RUN) {
     console.log(JSON.stringify({
       outcome: 'dry_run_complete',
@@ -160,6 +178,7 @@ async function main() {
       interviews: results.length,
       prior_average: average(results.map((row) => row.prior_overall)),
       rescored_average: average(results.map((row) => row.rescored_overall)),
+      rescored_scores: rescoredScores,
       mutations: 0,
     }));
     return;
@@ -220,6 +239,7 @@ async function main() {
     interviews: results.length,
     prior_average: average(results.map((row) => row.prior_overall)),
     rescored_average: average(results.map((row) => row.rescored_overall)),
+    rescored_scores: rescoredScores,
     backup_bucket: BACKUP_BUCKET,
     backup_path: backupPath,
     backup_sha256: backupDigest,
@@ -233,4 +253,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { assertRoleRescoreSafety, average, parseTranscriptHashes, transcriptDigest };
+module.exports = { assertRoleRescoreSafety, average, parseTranscriptHashes, transcriptDigest, parseExpectedScores };

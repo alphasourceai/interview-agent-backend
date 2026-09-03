@@ -220,7 +220,7 @@ function buildInsufficientResult() {
   };
 }
 
-async function scoreInterview({ transcriptText, jdText, roleContext, perceptionScores, mode, request_id } = {}) {
+async function scoreInterview({ transcriptText, jdText, roleContext, perceptionScores } = {}) {
   const substantive = isSubstantiveTranscript(transcriptText);
   if (!substantive.ok) {
     return buildInsufficientResult();
@@ -336,7 +336,7 @@ END UNTRUSTED TRANSCRIPT DATA`;
       messages: [
         {
           role: 'system',
-          content: `Return only strict JSON. mode=${String(mode || 'default')} request_id=${String(request_id || '')}`
+          content: 'Return only strict JSON for an alphaScreen interview evaluation.'
         },
         { role: 'user', content: prompt }
       ],

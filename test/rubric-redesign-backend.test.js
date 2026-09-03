@@ -409,6 +409,8 @@ test('role scoring uses the saved role rubric, the full anchored scale, and a de
       roleContext,
     });
     const prompt = scoringRequest.messages[1].content;
+    assert.equal(scoringRequest.messages[0].content, 'Return only strict JSON for an alphaScreen interview evaluation.');
+    assert.doesNotMatch(scoringRequest.messages[0].content, /mode=|request_id=/i);
     assert.match(prompt, /High-Velocity Sales Closer/);
     assert.match(prompt, /weak 0-39, adequate 40-59, strong 60-79, exceptional 80-100/);
     assert.match(prompt, /misinterpreted a request to repeat/);
