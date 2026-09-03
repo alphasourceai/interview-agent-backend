@@ -7,14 +7,34 @@ const { createClient } = require('@supabase/supabase-js');
 const ROLE_TITLE = String(process.env.ROLE_RESCORE_TITLE || '').trim();
 const EXPECTED_PROJECT_REF = String(process.env.ROLE_RESCORE_EXPECTED_PROJECT_REF || '').trim();
 const EXPECTED_COUNT = Number(process.env.ROLE_RESCORE_EXPECTED_COUNT || 0);
+const MAX_CREATED_AT = String(process.env.ROLE_RESCORE_MAX_CREATED_AT || '').trim();
+const EXPECTED_TRANSCRIPT_HASHES = parseTranscriptHashes(process.env.ROLE_RESCORE_EXPECTED_TRANSCRIPT_HASHES);
 const DRY_RUN = String(process.env.ROLE_RESCORE_DRY_RUN || 'true').toLowerCase() !== 'false';
 const BACKUP_BUCKET = String(process.env.SUPABASE_TRANSCRIPTS_BUCKET || 'transcripts').trim();
+
+function parseTranscriptHashes(value) {
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function transcriptDigest(value) {
+  const body = typeof value === 'string' ? value : JSON.stringify(value ?? '');
+  return crypto.createHash('sha256').update(body).digest('hex');
+}
 
 function assertRoleRescoreSafety() {
   if (process.env.ALLOW_ROLE_RESCORE !== 'true') throw new Error('role_rescore_explicit_opt_in_required');
   if (!ROLE_TITLE) throw new Error('role_rescore_title_required');
   if (!EXPECTED_PROJECT_REF) throw new Error('role_rescore_expected_project_ref_required');
   if (!Number.isInteger(EXPECTED_COUNT) || EXPECTED_COUNT < 1) throw new Error('role_rescore_expected_count_required');
+  if (!MAX_CREATED_AT || !Number.isFinite(Date.parse(MAX_CREATED_AT))) throw new Error('role_rescore_max_created_at_required');
+  if (EXPECTED_TRANSCRIPT_HASHES.length !== EXPECTED_COUNT ||
+      new Set(EXPECTED_TRANSCRIPT_HASHES).size !== EXPECTED_COUNT ||
+      EXPECTED_TRANSCRIPT_HASHES.some((value) => !/^[a-f0-9]{64}$/.test(value))) {
+    throw new Error('role_rescore_expected_transcript_hashes_invalid');
+  }
   if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) throw new Error('role_rescore_supabase_credentials_required');
   if (!process.env.OPENAI_API_KEY) throw new Error('role_rescore_openai_key_required');
 
@@ -78,14 +98,20 @@ async function main() {
   const role = roles[0];
   const { data: interviews, error: interviewError } = await supabase
     .from('interviews')
-    .select('id,role_id,client_id,transcript_scores,interview_summary,updated_at')
+    .select('id,role_id,client_id,transcript,transcript_scores,interview_summary,updated_at')
     .eq('role_id', role.id)
+    .lt('created_at', MAX_CREATED_AT)
     .order('created_at', { ascending: true });
   if (interviewError) throw interviewError;
 
   const scoredInterviews = (interviews || []).filter((row) => Number.isFinite(row?.transcript_scores?.overall));
   if (scoredInterviews.length !== EXPECTED_COUNT) {
     throw new Error(`role_rescore_count_mismatch:expected_${EXPECTED_COUNT}:found_${scoredInterviews.length}`);
+  }
+  const actualTranscriptHashes = scoredInterviews.map((row) => transcriptDigest(row.transcript)).sort();
+  const expectedTranscriptHashes = [...EXPECTED_TRANSCRIPT_HASHES].sort();
+  if (actualTranscriptHashes.some((value, index) => value !== expectedTranscriptHashes[index])) {
+    throw new Error('role_rescore_transcript_set_mismatch');
   }
   if (scoredInterviews.some((row) => row.client_id !== role.client_id || row.role_id !== role.id)) {
     throw new Error('role_rescore_scope_mismatch');
@@ -207,4 +233,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { assertRoleRescoreSafety, average };
+module.exports = { assertRoleRescoreSafety, average, parseTranscriptHashes, transcriptDigest };
