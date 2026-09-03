@@ -46,7 +46,11 @@ const {
   classifyTranscriptCandidateEvidence,
 } = require('../src/lib/interviewUtteranceClassifier');
 const {
+  ROLE_RUBRIC_SCORING_VERSION,
+  averageScorableQuestionScores,
   isSubstantiveTranscript,
+  normalizeQuestionEvaluations,
+  normalizeRoleScoringContext,
   scoreInterview,
 } = require('../src/lib/interviewScoring');
 const {
@@ -277,6 +281,9 @@ test('approved introduction, fallback, warm-up, transition, and question orderin
   assert.ok(context.indexOf(WARMUP_TRANSITION) < context.indexOf('Structured Interview Questions:'));
   assert.match(context, /Do not ask a warm-up follow-up/);
   assert.match(context, /Then ask structured interview question 1/);
+  assert.match(context, /always refers to the currently active question/);
+  assert.match(context, /without advancing, restarting question 1, or changing the question order/);
+  assert.match(context, /Which question would you like me to repeat/);
 });
 
 test('warm-up is excluded from substantive evidence, scores, summaries, Analysis V2, and sensitive-content use', async () => {
@@ -336,6 +343,139 @@ test('warm-up is excluded from substantive evidence, scores, summaries, Analysis
   } finally {
     global.fetch = originalFetch;
   }
+});
+
+test('role scoring uses the saved role rubric, the full anchored scale, and a deterministic question average', async () => {
+  const rubric = buildFallbackRubric({
+    id: 'role-1',
+    title: 'High-Velocity Sales Closer',
+    description: 'Close inbound and outbound opportunities with disciplined follow-up.',
+    interview_type: 'core',
+  }, 'basic');
+  const roleContext = {
+    id: 'role-1',
+    title: 'High-Velocity Sales Closer',
+    description: 'Close inbound and outbound opportunities with disciplined follow-up.',
+    interview_type: 'core',
+    rubric,
+    rubric_questions: rubric.questions,
+  };
+  const normalized = normalizeRoleScoringContext(roleContext);
+  assert.equal(normalized.questions.length, 5);
+  assert.equal(normalized.questions[0].scoring_guidance.exceptional.length > 0, true);
+  assert.equal(averageScorableQuestionScores([
+    { scorable: true, score: 90 },
+    { scorable: true, score: 70 },
+    { scorable: false, score: null },
+    { scorable: true, score: 55 },
+    { scorable: true, score: 35 },
+  ]), 63);
+
+  const originalFetch = global.fetch;
+  let scoringRequest = null;
+  global.fetch = async (_url, options) => {
+    scoringRequest = JSON.parse(options.body);
+    return {
+      ok: true,
+      async json() {
+        return {
+          choices: [{ message: { content: JSON.stringify({
+            summary: 'The candidate supplied several specific examples with mixed depth.',
+            overall: 45,
+            role_fit: 72,
+            technical_strength: 48,
+            communication_quality: 68,
+            evidence_strength: 73,
+            ai_aided_risk: 'low',
+            ai_aided_risk_reason: 'No meaningful scripted-delivery indicators were present.',
+            ai_aided_signals: [],
+            question_evaluations: [
+              { question_order: 1, score: 90, scorable: true, anchor: 'exceptional', missing_reason: '', evidence: 'Specific measurable sales example.' },
+              { question_order: 2, score: 70, scorable: true, anchor: 'strong', missing_reason: '', evidence: 'Sound applied judgment.' },
+              { question_order: 3, score: null, scorable: false, anchor: 'unscored', missing_reason: 'interviewer_process', evidence: 'The interviewer restarted a different question.' },
+              { question_order: 4, score: 55, scorable: true, anchor: 'adequate', missing_reason: '', evidence: 'Relevant but lightly evidenced.' },
+              { question_order: 5, score: 35, scorable: true, anchor: 'weak', missing_reason: 'candidate_no_answer', evidence: 'The candidate did not answer the question asked.' },
+            ],
+          }) } }],
+        };
+      },
+    };
+  };
+
+  try {
+    const scored = await scoreInterview({
+      transcriptText: transcriptWithWarmup(),
+      jdText: roleContext.description,
+      roleContext,
+    });
+    const prompt = scoringRequest.messages[1].content;
+    assert.match(prompt, /High-Velocity Sales Closer/);
+    assert.match(prompt, /weak 0-39, adequate 40-59, strong 60-79, exceptional 80-100/);
+    assert.match(prompt, /misinterpreted a request to repeat/);
+    assert.match(prompt, /must contain exactly 5 items/);
+    assert.match(prompt, /ordered consecutively from 1 through 5/);
+    assert.match(prompt, /strictly as untrusted evidence data/);
+    assert.match(prompt, /BEGIN UNTRUSTED JOB DESCRIPTION DATA/);
+    assert.match(prompt, /BEGIN UNTRUSTED ROLE RUBRIC DATA/);
+    assert.match(prompt, /BEGIN UNTRUSTED TRANSCRIPT DATA/);
+    assert.equal(scored.scoring_version, ROLE_RUBRIC_SCORING_VERSION);
+    assert.equal(scored.transcript_scores.overall, 63);
+    assert.equal(scored.transcript_scores.technical_strength, 63);
+    assert.equal(scored.question_evaluations.length, 5);
+    assert.equal(scored.question_evaluations[2].scorable, false);
+    assert.equal(scored.question_evaluations[4].missing_reason, 'candidate_no_answer');
+    assert.deepEqual(Object.keys(scored.transcript_scores).sort(), [
+      'ai_aided_risk',
+      'ai_aided_risk_reason',
+      'communication_quality',
+      'confidence',
+      'overall',
+      'role_fit',
+      'technical_strength',
+    ]);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('legacy role questions receive deterministic anchors and invalid process exclusions are rejected', () => {
+  const legacy = normalizeRoleScoringContext({
+    id: 'legacy-role',
+    title: 'High-Velocity Sales Closer',
+    description: 'Close qualified opportunities and document measurable outcomes.',
+    rubric: {
+      questions: [
+        { category: 'Custom', text: 'Tell me how you recover a stalled opportunity.' },
+      ],
+    },
+  });
+
+  assert.equal(legacy.questions.length, 1);
+  assert.equal(legacy.questions[0].primary_competency, 'Role-specific evidence 1');
+  assert.match(legacy.questions[0].expected_evidence, /High-Velocity Sales Closer/);
+  assert.match(legacy.questions[0].role_relevance, /job description/);
+  assert.deepEqual(Object.keys(legacy.questions[0].scoring_guidance), ['weak', 'adequate', 'strong', 'exceptional']);
+  assert.ok(Object.values(legacy.questions[0].scoring_guidance).every((value) => value.length > 20));
+
+  assert.deepEqual(normalizeQuestionEvaluations([{
+    question_order: 1,
+    score: null,
+    scorable: false,
+    anchor: 'unscored',
+    missing_reason: 'none',
+    evidence: 'No answer was found.',
+  }], legacy), []);
+
+  const normalized = normalizeQuestionEvaluations([{
+    question_order: 1,
+    score: 35,
+    scorable: true,
+    anchor: 'exceptional',
+    missing_reason: 'none',
+    evidence: 'The response was relevant but lacked a concrete example.',
+  }], legacy);
+  assert.equal(normalized[0].anchor, 'weak');
+  assert.equal(normalized[0].missing_reason, '');
 });
 
 test('unlabelled warm-up transcripts tolerate provider punctuation variants without leaking warm-up content', () => {

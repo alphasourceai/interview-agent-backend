@@ -8,6 +8,7 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { supabase } = require('../src/lib/supabaseClient');
 const { requireAuth, withClientScope } = require('../src/middleware/auth');
 const { entityFieldsForClientId, loadEntityMap, resolveEntityFilter } = require('../src/lib/entityScopeFilter');
+const { classifyInterviewDisplayState } = require('../src/lib/interviewDisplayState');
 
 
 const router = express.Router();
@@ -406,7 +407,15 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         'interview_summary',
         'recording_status',
         'recording_ready_at',
-        'unanswered_candidate_questions'
+        'unanswered_candidate_questions',
+        'status',
+        'failure_code',
+        'failure_stage',
+        'retryable',
+        'replacement_eligible',
+        'client_end_reason',
+        'conversation_progress_state',
+        'has_substantive_response'
       ];
       if (EXPOSE_INTERVIEW_ANALYSIS_V2) interviewSelect.push('interview_analysis_v2');
 
@@ -432,26 +441,6 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         });
         console.error('[dashboard/rows] interviews error', iErr);
       } else {
-        const ivsById = Object.fromEntries((ivs || []).map(iv => [iv.id, iv]));
-        const ivIds = Object.keys(ivsById);
-        if (ivIds.length) {
-          const { data: questionTextRows, error: questionTextErr } = await supabase
-            .from('interviews')
-            .select('id, unanswered_candidate_questions_text')
-            .in('id', ivIds);
-          if (questionTextErr) {
-            console.warn('[dashboard/rows] unanswered_candidate_questions_text fallback skipped', {
-              code: questionTextErr.code,
-              message: questionTextErr.message
-            });
-          } else {
-            for (const row of questionTextRows || []) {
-              if (row?.id && ivsById[row.id]) {
-                ivsById[row.id].unanswered_candidate_questions_text = row.unanswered_candidate_questions_text;
-              }
-            }
-          }
-        }
         for (const iv of ivs || []) {
           const k = iv.candidate_id;
           if (!latestInterviewByCand[k]) latestInterviewByCand[k] = iv;
@@ -556,7 +545,10 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const perception = getPerceptionShape(iv);
       const interviewSummary = typeof iv?.interview_summary === 'string' ? iv.interview_summary : '';
       const transcriptOverall = getTranscriptOverall(iv);
-      const insufficientInterview = hasInsufficientInterviewSummary(interviewSummary);
+      const insufficientInterview =
+        hasInsufficientInterviewSummary(interviewSummary) ||
+        iv?.has_substantive_response === false ||
+        String(iv?.failure_code || '').trim().toUpperCase() === 'NO_SUBSTANTIVE_CANDIDATE_RESPONSE';
       const interview_analysis = {
         clarity: insufficientInterview ? null : perception.clarity,
         confidence: insufficientInterview ? null : perception.confidence,
@@ -569,6 +561,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
       const safeVideoUrl = iv?.video_url && !isDailyRoomUrl(iv.video_url) ? iv.video_url : null;
       const hasTranscript = !!iv?.transcript;
       const interviewScore = insufficientInterview ? null : (Number.isFinite(transcriptOverall) ? transcriptOverall : null);
+      const interviewDisplayState = classifyInterviewDisplayState(iv, { hasScore: Number.isFinite(interviewScore) });
       const overall_score =
         Number.isFinite(resume_score) && Number.isFinite(interviewScore)
           ? Math.max(0, Math.min(100, Math.round((resume_score + interviewScore) / 2)))
@@ -603,7 +596,7 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         transcript_scores: exposedTranscriptScores,
         perception_scores: exposedPerceptionScores,
         interview_summary: interviewSummary || '',
-        unanswered_candidate_questions: normalizeUnansweredQuestions(iv?.unanswered_candidate_questions, iv?.unanswered_candidate_questions_text),
+        unanswered_candidate_questions: normalizeUnansweredQuestions(iv?.unanswered_candidate_questions),
         transcript: typeof iv?.transcript === 'string' ? iv.transcript : '',
         has_video: !!safeVideoUrl,
         has_transcript: hasTranscript,
@@ -612,6 +605,8 @@ router.get('/rows', requireAuth, withClientScope, async (req, res) => {
         // report-driven bits
         resume_score,
         interview_score: interviewScore,
+        interview_state: interviewDisplayState.state,
+        interview_state_label: interviewDisplayState.label,
         overall_score,
         resume_analysis,
         interview_analysis,

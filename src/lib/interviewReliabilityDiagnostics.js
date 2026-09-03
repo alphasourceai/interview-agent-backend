@@ -75,6 +75,11 @@ const TELEMETRY_EVENTS = new Set([
   'candidate_inactivity_nudge_cancelled',
   'candidate_inactivity_nudge_sent',
   'candidate_inactivity_nudge_suppressed',
+  'local_media_preflight_result',
+  'local_audio_level_state_changed',
+  'local_audio_recovery_requested',
+  'local_audio_recovery_succeeded',
+  'local_audio_recovery_failed',
   // Existing Phase B events retained for deployment compatibility.
   'watchdog_started',
   'watchdog_timeout',
@@ -127,6 +132,11 @@ const BOOLEAN_FIELDS = new Set([
   'audio_attached',
   'video_attached',
   'element_visible',
+  'local_audio_track_live',
+  'local_video_track_live',
+  'input_level_detected',
+  'preflight_override',
+  'audio_processing_requested',
 ]);
 
 const ENUM_FIELDS = Object.freeze({
@@ -406,6 +416,10 @@ const ENUM_FIELDS = Object.freeze({
     'over_75_seconds',
     'unavailable',
   ]),
+  local_audio_level_state: new Set(['unavailable', 'silent', 'low', 'ready']),
+  local_media_permission_state: new Set(['granted', 'denied', 'unavailable', 'unknown']),
+  audio_processing_result: new Set(['default', 'applied', 'unsupported', 'failed']),
+  local_audio_recovery_result: new Set(['requested', 'succeeded', 'failed', 'unsupported']),
 });
 
 const METADATA_KEYS = new Set([

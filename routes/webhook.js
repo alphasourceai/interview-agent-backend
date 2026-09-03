@@ -41,7 +41,7 @@ const ANALYSIS_TRIGGER_TTL_MS = 2 * 60 * 1000;
 const ENABLE_TAVUS_PERCEPTION_EVENTS = process.env.ENABLE_TAVUS_PERCEPTION_EVENTS === 'true';
 const ENABLE_INTERVIEW_ANALYSIS_V2 = process.env.ENABLE_INTERVIEW_ANALYSIS_V2 === 'true';
 const analysisTriggerGuard = new Map();
-const roleJdCache = new Map();
+const roleScoringContextCache = new Map();
 
 // --- utilities ---
 function pickFirst(...vals) {
@@ -839,7 +839,7 @@ async function getRoleContextForInterviewAnalysisV2(
   if (!roleId) return null;
   const { data, error } = await supabaseAdmin
     .from('roles')
-    .select('id,title,description,job_description_text,job_description_url,rubric,rubric_questions,manual_questions')
+    .select('id,title,description,interview_type,job_description_text,job_description_url,rubric,rubric_questions,manual_questions')
     .eq('id', roleId)
     .maybeSingle();
   if (error) {
@@ -1369,14 +1369,14 @@ function shouldTriggerAnalysis(interviewId, requestId) {
   return true;
 }
 
-async function getRoleJdText(roleId, requestId, interviewId, conversationId, options = {}) {
-  if (!roleId) return '';
+async function getRoleScoringContext(roleId, requestId, interviewId, conversationId, options = {}) {
+  if (!roleId) return null;
   const cacheKey = String(roleId);
-  if (roleJdCache.has(cacheKey)) return roleJdCache.get(cacheKey);
+  if (roleScoringContextCache.has(cacheKey)) return roleScoringContextCache.get(cacheKey);
 
   const { data, error } = await supabaseAdmin
     .from('roles')
-    .select('id, job_description_text, job_description_url')
+    .select('id,title,description,interview_type,job_description_text,job_description_url,rubric,rubric_questions,manual_questions')
     .eq('id', roleId)
     .maybeSingle();
 
@@ -1392,15 +1392,19 @@ async function getRoleJdText(roleId, requestId, interviewId, conversationId, opt
       details: error.details || null,
       hint: error.hint || null
     });
-    roleJdCache.set(cacheKey, '');
-    return '';
+    roleScoringContextCache.set(cacheKey, null);
+    return null;
   }
 
-  const jdText = typeof data?.job_description_text === 'string' && data.job_description_text.trim()
-    ? data.job_description_text.trim()
-    : (typeof data?.job_description_url === 'string' ? data.job_description_url.trim() : '');
-  roleJdCache.set(cacheKey, jdText || '');
-  return jdText || '';
+  const context = data || null;
+  roleScoringContextCache.set(cacheKey, context);
+  return context;
+}
+
+function getJdTextFromRoleContext(roleContext) {
+  return typeof roleContext?.job_description_text === 'string' && roleContext.job_description_text.trim()
+    ? roleContext.job_description_text.trim()
+    : (typeof roleContext?.job_description_url === 'string' ? roleContext.job_description_url.trim() : '');
 }
 
 async function applyTranscriptScoringForInterview({ interview, fresh, transcriptText, requestId, conversationId }) {
@@ -1470,7 +1474,8 @@ async function applyTranscriptScoringForInterview({ interview, fresh, transcript
   }
 
   const roleId = fresh?.role_id || interview?.role_id || null;
-  const jdText = await getRoleJdText(roleId, requestId, interview?.id, conversationId);
+  const roleContext = await getRoleScoringContext(roleId, requestId, interview?.id, conversationId);
+  const jdText = getJdTextFromRoleContext(roleContext);
   const perceptionScores =
     fresh?.perception_scores && typeof fresh.perception_scores === 'object'
       ? fresh.perception_scores
@@ -1483,6 +1488,7 @@ async function applyTranscriptScoringForInterview({ interview, fresh, transcript
   const scored = await scoreInterview({
       transcriptText: transcript,
       jdText,
+      roleContext,
       perceptionScores,
       mode: 'webhook',
       request_id: requestId || null
@@ -2217,10 +2223,12 @@ async function reconcileFinalTranscript({ body, interview, requestId, conversati
   try {
     scoringPerformed = true;
     if (evidence.ok) {
-      const jdText = await getRoleJdText(interview.role_id, null, null, null, { sanitized: true });
+      const roleContext = await getRoleScoringContext(interview.role_id, null, null, null, { sanitized: true });
+      const jdText = getJdTextFromRoleContext(roleContext);
       const scored = await scoreInterview({
         transcriptText,
         jdText,
+        roleContext,
         perceptionScores: interview.perception_scores || {},
         mode: 'webhook',
         request_id: null,

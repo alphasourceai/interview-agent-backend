@@ -168,10 +168,77 @@ test('diagnostic contract exposes only the bounded event and metadata allowlists
   assert.equal(TELEMETRY_EVENTS.has('candidate_inactivity_nudge_cancelled'), true);
   assert.equal(TELEMETRY_EVENTS.has('candidate_inactivity_nudge_sent'), true);
   assert.equal(TELEMETRY_EVENTS.has('candidate_inactivity_nudge_suppressed'), true);
+  assert.equal(TELEMETRY_EVENTS.has('local_media_preflight_result'), true);
+  assert.equal(TELEMETRY_EVENTS.has('local_audio_level_state_changed'), true);
+  assert.equal(TELEMETRY_EVENTS.has('local_audio_recovery_requested'), true);
+  assert.equal(TELEMETRY_EVENTS.has('local_audio_recovery_succeeded'), true);
+  assert.equal(TELEMETRY_EVENTS.has('local_audio_recovery_failed'), true);
   assert.equal(TELEMETRY_EVENTS.has('transcript_received'), false);
   assert.equal(METADATA_KEYS.has('remote_audio_state'), true);
   assert.equal(METADATA_KEYS.has('message'), false);
   assert.equal(METADATA_KEYS.has('conversation_id'), false);
+});
+
+test('local media diagnostics accept coarse states and reject device or audio content', () => {
+  const cases = [
+    ['local_media_preflight_result', {
+      local_media_permission_state: 'granted',
+      local_audio_level_state: 'ready',
+      local_audio_track_live: true,
+      local_video_track_live: true,
+      input_level_detected: true,
+      preflight_override: false,
+      audio_processing_requested: true,
+    }],
+    ['local_audio_level_state_changed', {
+      local_audio_level_state: 'low',
+      local_audio_track_live: true,
+      input_level_detected: false,
+    }],
+    ['local_audio_recovery_requested', {
+      local_audio_level_state: 'silent',
+      local_audio_recovery_result: 'requested',
+      audio_processing_requested: true,
+    }],
+    ['local_audio_recovery_succeeded', {
+      local_audio_level_state: 'ready',
+      local_audio_recovery_result: 'succeeded',
+      audio_processing_result: 'applied',
+      local_audio_track_live: true,
+    }],
+    ['local_audio_recovery_failed', {
+      local_audio_level_state: 'unavailable',
+      local_audio_recovery_result: 'failed',
+      audio_processing_result: 'failed',
+      local_audio_track_live: false,
+    }],
+  ];
+
+  for (const [index, [event, metadata]] of cases.entries()) {
+    const result = validateTelemetryPayload({
+      ...BASE_PAYLOAD,
+      event,
+      event_sequence: 975 + index,
+      reason: undefined,
+      metadata,
+    });
+    assert.equal(result.ok, true, `${event}:${result.code || 'ok'}`);
+  }
+
+  for (const metadata of [
+    { device_id: 'sensitive-device-id' },
+    { device_label: 'Jason microphone' },
+    { exact_audio_level: 0.012345 },
+    { transcript: 'synthetic voice content' },
+  ]) {
+    assert.equal(validateTelemetryPayload({
+      ...BASE_PAYLOAD,
+      event: 'local_audio_level_state_changed',
+      event_sequence: 990,
+      reason: undefined,
+      metadata,
+    }).ok, false);
+  }
 });
 
 test('startup-readiness and remote-media telemetry accepts only the bounded canonical contract', () => {

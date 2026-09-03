@@ -220,25 +220,29 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-const roleJdCache = new Map();
-async function getRoleJdText(roleId) {
-  if (!roleId) return '';
+const roleScoringContextCache = new Map();
+async function getRoleScoringContext(roleId) {
+  if (!roleId) return null;
   const cacheKey = String(roleId);
-  if (roleJdCache.has(cacheKey)) return roleJdCache.get(cacheKey);
+  if (roleScoringContextCache.has(cacheKey)) return roleScoringContextCache.get(cacheKey);
   const { data, error } = await supabase
     .from('roles')
-    .select('id, job_description_text, job_description_url')
+    .select('id,title,description,interview_type,job_description_text,job_description_url,rubric,rubric_questions,manual_questions')
     .eq('id', roleId)
     .maybeSingle();
   if (error) {
-    roleJdCache.set(cacheKey, '');
-    return '';
+    roleScoringContextCache.set(cacheKey, null);
+    return null;
   }
-  const text = typeof data?.job_description_text === 'string' && data.job_description_text.trim()
-    ? data.job_description_text.trim()
-    : (typeof data?.job_description_url === 'string' ? data.job_description_url.trim() : '');
-  roleJdCache.set(cacheKey, text || '');
-  return text || '';
+  const context = data || null;
+  roleScoringContextCache.set(cacheKey, context);
+  return context;
+}
+
+function getJdTextFromRoleContext(roleContext) {
+  return typeof roleContext?.job_description_text === 'string' && roleContext.job_description_text.trim()
+    ? roleContext.job_description_text.trim()
+    : (typeof roleContext?.job_description_url === 'string' ? roleContext.job_description_url.trim() : '');
 }
 
 async function scoreWithRetry(input, maxAttempts = 3) {
@@ -313,13 +317,15 @@ async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
         request_id: requestId || null,
       };
     }
-    const jdText = await getRoleJdText(row.role_id);
+    const roleContext = await getRoleScoringContext(row.role_id);
+    const jdText = getJdTextFromRoleContext(roleContext);
     const perceptionScores = row.perception_scores && typeof row.perception_scores === 'object'
       ? row.perception_scores
       : {};
     const { summary, transcript_scores } = await scoreWithRetry({
       transcriptText,
       jdText,
+      roleContext,
       perceptionScores,
       mode: 'backfill',
       request_id: requestId || null
@@ -445,13 +451,15 @@ async function main() {
         continue;
       }
       scored += 1;
-      const jdText = await getRoleJdText(row.role_id);
+      const roleContext = await getRoleScoringContext(row.role_id);
+      const jdText = getJdTextFromRoleContext(roleContext);
       const perceptionScores = row.perception_scores && typeof row.perception_scores === 'object'
         ? row.perception_scores
         : {};
       const { summary, transcript_scores } = await scoreWithRetry({
         transcriptText,
         jdText,
+        roleContext,
         perceptionScores,
         mode: 'backfill',
         request_id: null
