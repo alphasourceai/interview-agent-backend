@@ -276,6 +276,8 @@ function normalizeAnalysis(analysis) {
 async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
   const requestId = opts?.request_id || null;
   const dryRun = opts?.dry_run === true;
+  const forceRescore = opts?.force_rescore === true;
+  const returnPayload = opts?.return_payload === true;
 
   try {
     if (!interviewId) {
@@ -299,7 +301,7 @@ async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
     const existingSummary = typeof row.interview_summary === 'string' ? row.interview_summary.trim() : '';
     const alreadyMarkedInsufficient = Number(existingConfidence) === 0 &&
       (existingSummary === INSUFFICIENT_SUMMARY || existingSummary.includes('Interview ended before any substantive responses were recorded.'));
-    if ((Number.isFinite(existingOverall) && existingSummary) || alreadyMarkedInsufficient) {
+    if (!forceRescore && ((Number.isFinite(existingOverall) && existingSummary) || alreadyMarkedInsufficient)) {
       return { ok: true, skipped: true, reason: 'already_analyzed', request_id: requestId || null };
     }
 
@@ -340,7 +342,15 @@ async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
     }
 
     if (dryRun) {
-      return { ok: true, updated: false, dry_run: true, request_id: requestId || null };
+      return {
+        ok: true,
+        updated: false,
+        dry_run: true,
+        prior_overall: Number.isFinite(existingOverall) ? Number(existingOverall) : null,
+        rescored_overall: Number.isFinite(transcript_scores?.overall) ? Number(transcript_scores.overall) : null,
+        ...(returnPayload ? { update_payload: updatePayload } : {}),
+        request_id: requestId || null,
+      };
     }
 
     const { error: upErr } = await supabase
@@ -355,7 +365,13 @@ async function analyzeInterviewTranscriptById(interviewId, opts = {}) {
       return { ok: true, updated: true, skipped: true, reason: `insufficient_${substantive.reason}`, request_id: requestId || null };
     }
 
-    return { ok: true, updated: true, request_id: requestId || null };
+    return {
+      ok: true,
+      updated: true,
+      prior_overall: Number.isFinite(existingOverall) ? Number(existingOverall) : null,
+      rescored_overall: Number.isFinite(transcript_scores?.overall) ? Number(transcript_scores.overall) : null,
+      request_id: requestId || null,
+    };
   } catch (err) {
     return { ok: false, error: err?.message || String(err), request_id: requestId || null };
   }

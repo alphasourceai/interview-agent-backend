@@ -8,7 +8,8 @@
     "dev": "nodemon app.js",
     "test": "node --test test/*.test.js",
     "build:render": "echo \"no build step required\"",
-    "qa:calibrate-scoring": "node scripts/runQaScoringCalibration.js"
+    "qa:calibrate-scoring": "node scripts/runQaScoringCalibration.js",
+    "rescore:role": "node scripts/rescoreRoleInterviews.js"
   },
   "keywords": [],
   "author": "",
