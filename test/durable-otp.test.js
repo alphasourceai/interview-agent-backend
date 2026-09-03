@@ -212,7 +212,8 @@ test('launch capability rejects expiry', () => {
 
 test('launch cookie satisfies the browser-enforced __Host- contract', () => {
   const headers = [];
-  launch.setOtpLaunchCapability({ append: (_name, value) => headers.push(value) }, { challenge_id: ID.challenge, ...binding() }, { now: 100_000, env: ENV });
+  const token = launch.setOtpLaunchCapability({ append: (_name, value) => headers.push(value) }, { challenge_id: ID.challenge, ...binding() }, { now: 100_000, env: ENV });
+  assert.equal(launch.verifyOtpLaunchCapability(token, { now: 100_001, env: ENV }).candidate_id, ID.candidate);
   assert.match(headers[0], /^__Host-alphascreen_otp_launch=/);
   assert.match(headers[0], /HttpOnly/);
   assert.match(headers[0], /Secure/);
@@ -227,6 +228,80 @@ test('launch middleware rejects a missing cookie before provider work', () => {
   const res = { append() {}, status(value) { status = value; return this; }, json(value) { return value; } };
   launch.requireOtpLaunchCapability(req, res, () => assert.fail('next must not run'));
   assert.equal(status, 401);
+});
+
+test('launch middleware accepts the dedicated header without a cookie', () => {
+  const origin = 'https://candidate.example.test';
+  const token = launch.createOtpLaunchCapability({ challenge_id: ID.challenge, ...binding(), request_origin: origin }, { env: ENV });
+  const req = {
+    headers: { [launch.HEADER_NAME]: token, origin },
+    body: { candidate_id: ID.candidate, role_id: ID.role },
+  };
+  const res = { append() {}, status() { return this; }, json(value) { return value; } };
+  let nextCalled = false;
+  launch.requireOtpLaunchCapability(req, res, () => { nextCalled = true; });
+  assert.equal(nextCalled, true);
+  assert.equal(req.otp_launch_capability.client_id, ID.client);
+});
+
+test('launch middleware rejects a dedicated header from a different browser origin', () => {
+  const token = launch.createOtpLaunchCapability({
+    challenge_id: ID.challenge,
+    ...binding(),
+    request_origin: 'https://candidate.example.test',
+  }, { env: ENV });
+  const req = {
+    headers: { [launch.HEADER_NAME]: token, origin: 'https://attacker.example.test' },
+    body: { candidate_id: ID.candidate, role_id: ID.role },
+  };
+  const res = { append() {}, status(value) { this.statusCode = value; return this; }, json(value) { return value; } };
+  launch.requireOtpLaunchCapability(req, res, () => assert.fail('next must not run'));
+  assert.equal(res.statusCode, 401);
+});
+
+test('a malformed dedicated header does not fall back to a valid cookie', () => {
+  const token = launch.createOtpLaunchCapability({ challenge_id: ID.challenge, ...binding() }, { env: ENV });
+  const req = {
+    headers: {
+      [launch.HEADER_NAME]: `${token},${token}`,
+      cookie: `${launch.COOKIE_NAME}=${encodeURIComponent(token)}`,
+    },
+    body: { candidate_id: ID.candidate, role_id: ID.role },
+  };
+  const res = { append() {}, status(value) { this.statusCode = value; return this; }, json(value) { return value; } };
+  launch.requireOtpLaunchCapability(req, res, () => assert.fail('next must not run'));
+  assert.equal(res.statusCode, 401);
+});
+
+test('conflicting valid header and cookie capabilities are rejected', () => {
+  const headerToken = launch.createOtpLaunchCapability({ challenge_id: ID.challenge, ...binding() }, { env: ENV });
+  const cookieToken = launch.createOtpLaunchCapability({ challenge_id: cryptoRandomUuid(), ...binding() }, { env: ENV });
+  const req = {
+    headers: {
+      [launch.HEADER_NAME]: headerToken,
+      cookie: `${launch.COOKIE_NAME}=${encodeURIComponent(cookieToken)}`,
+    },
+    body: { candidate_id: ID.candidate, role_id: ID.role },
+  };
+  const res = { append() {}, status(value) { this.statusCode = value; return this; }, json(value) { return value; } };
+  launch.requireOtpLaunchCapability(req, res, () => assert.fail('next must not run'));
+  assert.equal(res.statusCode, 401);
+});
+
+test('oversized and expired header capabilities are rejected', () => {
+  const expired = launch.createOtpLaunchCapability(
+    { challenge_id: ID.challenge, ...binding() },
+    { now: Date.now() - ((launch.TTL_SECONDS + 1) * 1000), env: ENV },
+  );
+  for (const token of ['x'.repeat(4097), expired]) {
+    const req = {
+      headers: { [launch.HEADER_NAME]: token },
+      body: { candidate_id: ID.candidate, role_id: ID.role },
+    };
+    const res = { append() {}, status(value) { this.statusCode = value; return this; }, json(value) { return value; } };
+    launch.requireOtpLaunchCapability(req, res, () => assert.fail('next must not run'));
+    assert.equal(res.statusCode, 401);
+  }
 });
 
 test('launch middleware rejects a cross-candidate body binding', () => {

@@ -53,6 +53,8 @@ function buildDb() {
   const initialVerifier = otp.verifierHmac({ challengeId: ID.challenge, code: '123456', binding });
   const challenges = new Map([[ID.challenge, {
     challenge_id: ID.challenge,
+    purpose: 'interview_access',
+    channel: 'email',
     pepper_version: 1,
     verifier_hmac_hex: initialVerifier,
     expires_at: new Date(Date.now() + 600_000).toISOString(),
@@ -85,10 +87,33 @@ function buildDb() {
         row.consumed_at = new Date().toISOString();
         return { data: [{ status: 'verified', ...binding, challenge_id: row.challenge_id }], error: null };
       }
+      if (name === 'service_claim_consumed_otp_recovery') {
+        const row = this.challenges.get(args.p_challenge_id);
+        const now = Date.now();
+        const consumedAt = Date.parse(String(row?.consumed_at || ''));
+        const recentResourceClaim = [...this.challenges.values()].some((candidate) => (
+          candidate !== row
+          && candidate.candidate_id === row?.candidate_id
+          && candidate.client_id === row?.client_id
+          && candidate.role_id === row?.role_id
+          && Number.isFinite(Date.parse(String(candidate.recovery_reissued_at || '')))
+          && now - Date.parse(candidate.recovery_reissued_at) < 60_000
+        ));
+        if (!row || row.superseded_at || row.recovery_reissued_at
+          || !Number.isFinite(consumedAt) || now - consumedAt > 30 * 60 * 1000
+          || recentResourceClaim || this.challenges.has(args.p_replacement_challenge_id)) {
+          return { data: [{ status: 'not_claimed' }], error: null };
+        }
+        row.recovery_reissued_at = new Date(now).toISOString();
+        row.recovery_replacement_challenge_id = args.p_replacement_challenge_id;
+        return { data: [{ status: 'claimed' }], error: null };
+      }
       if (name === 'service_issue_otp_challenge') {
         for (const row of this.challenges.values()) if (!row.consumed_at && !row.superseded_at) row.superseded_at = new Date().toISOString();
         this.challenges.set(args.p_challenge_id, {
           challenge_id: args.p_challenge_id,
+          purpose: 'interview_access',
+          channel: 'email',
           pepper_version: args.p_pepper_version,
           verifier_hmac_hex: args.p_verifier_hmac_hex,
           expires_at: new Date(Date.now() + 600_000).toISOString(),
@@ -156,7 +181,12 @@ async function post(path, body) {
   const response = await fetch(`${base}${path}`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
   });
-  return { status: response.status, body: await response.json(), cookie: response.headers.get('set-cookie') || '' };
+  return {
+    status: response.status,
+    body: await response.json(),
+    cacheControl: response.headers.get('cache-control') || '',
+    cookie: response.headers.get('set-cookie') || '',
+  };
 }
 
 test('verification requires an opaque challenge ID and six-digit code', async () => {
@@ -175,6 +205,9 @@ test('correct challenge code sets a short-lived Secure HttpOnly launch capabilit
   const result = await post('', { challenge_id: ID.challenge, code: '123456' });
   assert.equal(result.status, 200);
   assert.equal(result.body.verified, true);
+  assert.equal(typeof result.body.launch_capability, 'string');
+  assert.equal(result.body.launch_capability_expires_in_seconds, 5 * 60);
+  assert.equal(result.cacheControl, 'private, no-store');
   assert.match(result.cookie, /__Host-alphascreen_otp_launch=/);
   assert.match(result.cookie, /HttpOnly/);
   assert.match(result.cookie, /Secure/);
@@ -216,6 +249,91 @@ test('unknown resend remains enumeration-safe and creates no challenge', async (
   assert.equal(result.status, 200);
   assert.equal(result.body.challenge_id, undefined);
   assert.equal(db.challenges.size, before);
+});
+
+test('a recently consumed challenge can issue one fresh recovery code', async () => {
+  const seedId = '83000000-0000-4000-8000-000000000077';
+  db.challenges.set(seedId, {
+    ...db.challenges.get(ID.challenge),
+    challenge_id: seedId,
+    consumed_at: new Date().toISOString(),
+    superseded_at: null,
+  });
+  const sentBefore = sentCodes.length;
+  const result = await post('/resend', { challenge_id: seedId, channel: 'email' });
+  assert.equal(result.status, 200);
+  assert.match(result.body.challenge_id, /^[0-9a-f-]{36}$/);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sentCodes.length, sentBefore + 1);
+  const replay = await post('/resend', { challenge_id: seedId, channel: 'email' });
+  assert.equal(replay.status, 200);
+  assert.equal(replay.body.challenge_id, undefined);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sentCodes.length, sentBefore + 1);
+  assert.match(db.challenges.get(seedId).recovery_replacement_challenge_id, /^[0-9a-f-]{36}$/);
+});
+
+test('concurrent recovery requests atomically issue only one replacement code', async () => {
+  for (const row of db.challenges.values()) {
+    row.recovery_reissued_at = null;
+    row.recovery_replacement_challenge_id = null;
+  }
+  const seedId = '83000000-0000-4000-8000-000000000079';
+  db.challenges.set(seedId, {
+    ...db.challenges.get(ID.challenge),
+    challenge_id: seedId,
+    consumed_at: new Date().toISOString(),
+    superseded_at: null,
+  });
+  const sentBefore = sentCodes.length;
+  const results = await Promise.all([
+    post('/resend', { challenge_id: seedId, channel: 'email' }),
+    post('/resend', { challenge_id: seedId, channel: 'email' }),
+  ]);
+  assert.equal(results.filter((result) => result.body.challenge_id).length, 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sentCodes.length, sentBefore + 1);
+});
+
+test('resource cooldown prevents another consumed seed from invalidating the fresh recovery code', async () => {
+  for (const row of db.challenges.values()) {
+    row.recovery_reissued_at = null;
+    row.recovery_replacement_challenge_id = null;
+  }
+  const firstSeed = '83000000-0000-4000-8000-000000000081';
+  const secondSeed = '83000000-0000-4000-8000-000000000082';
+  for (const seedId of [firstSeed, secondSeed]) {
+    db.challenges.set(seedId, {
+      ...db.challenges.get(ID.challenge),
+      challenge_id: seedId,
+      consumed_at: new Date().toISOString(),
+      superseded_at: null,
+    });
+  }
+  const sentBefore = sentCodes.length;
+  const first = await post('/resend', { challenge_id: firstSeed, channel: 'email' });
+  const second = await post('/resend', { challenge_id: secondSeed, channel: 'email' });
+  assert.match(first.body.challenge_id, /^[0-9a-f-]{36}$/);
+  assert.equal(second.body.challenge_id, undefined);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sentCodes.length, sentBefore + 1);
+});
+
+test('an old consumed challenge stays enumeration-safe and cannot issue a code', async () => {
+  const seedId = '83000000-0000-4000-8000-000000000078';
+  db.challenges.set(seedId, {
+    ...db.challenges.get(ID.challenge),
+    challenge_id: seedId,
+    consumed_at: new Date(Date.now() - (31 * 60 * 1000)).toISOString(),
+    superseded_at: null,
+  });
+  const before = db.challenges.size;
+  const sentBefore = sentCodes.length;
+  const result = await post('/resend', { challenge_id: seedId, channel: 'email' });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.challenge_id, undefined);
+  assert.equal(db.challenges.size, before);
+  assert.equal(sentCodes.length, sentBefore);
 });
 
 test('SMS resend remains fail-closed when candidate SMS flags are disabled', async () => {

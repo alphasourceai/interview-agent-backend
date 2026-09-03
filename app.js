@@ -8,6 +8,7 @@ const {
   getTavusWebhookAuthReadiness,
   redactTavusWebhookAuth,
 } = require('./src/lib/tavusWebhookAuth');
+const { redactOtpLaunchTelemetry } = require('./src/lib/otpLaunchTelemetry');
 const SENTRY_ENABLED = process.env.SENTRY_ENABLED === '1' && !!process.env.SENTRY_DSN;
 if (SENTRY_ENABLED) {
   const integrations = [];
@@ -46,12 +47,14 @@ if (SENTRY_ENABLED) {
           }
         }
       } catch (_) {}
-      return redactTavusWebhookAuth(event);
+      return redactTavusWebhookAuth(redactOtpLaunchTelemetry(event));
     },
     beforeSendTransaction(event) {
+      redactOtpLaunchTelemetry(event);
       return redactTavusWebhookAuth(event);
     },
     beforeSendSpan(span) {
+      redactOtpLaunchTelemetry(span);
       return redactTavusWebhookAuth(span);
     },
   });
@@ -206,6 +209,7 @@ app.use(cors({
   allowedHeaders: [
     'Authorization',
     'Content-Type',
+    'X-AlphaScreen-OTP-Launch',
     'X-Requested-With',
     'apikey',
     'x-client-info',

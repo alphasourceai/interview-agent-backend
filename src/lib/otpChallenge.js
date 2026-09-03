@@ -153,6 +153,7 @@ function rpcRow(data) {
 }
 
 async function issueOtpChallenge(db, {
+  challengeId: requestedChallengeId = null,
   email,
   phoneE164,
   channel: channelInput = OTP_CHANNEL_EMAIL,
@@ -168,7 +169,10 @@ async function issueOtpChallenge(db, {
   env = process.env,
 }) {
   const channel = canonicalChannel(channelInput);
-  const challengeId = crypto.randomUUID();
+  const challengeId = requestedChallengeId == null
+    ? crypto.randomUUID()
+    : String(requestedChallengeId).trim().toLowerCase();
+  if (!UUID_RE.test(challengeId)) throw new OtpChallengeError('INVALID_CHALLENGE_ID');
   const code = generateOtpCode();
   const binding = canonicalBinding({
     candidate_id: candidateId,
@@ -220,6 +224,22 @@ async function issueOtpChallenge(db, {
     throw new OtpChallengeError('OTP_CHALLENGE_CREATE_FAILED', 'challenge creation was not confirmed');
   }
   return { challengeId, code, expiresAt: created.expires_at || null, binding, channel };
+}
+
+async function claimConsumedOtpRecovery(db, { challengeId, replacementChallengeId }) {
+  const normalizedChallengeId = String(challengeId || '').trim().toLowerCase();
+  const normalizedReplacementId = String(replacementChallengeId || '').trim().toLowerCase();
+  if (!UUID_RE.test(normalizedChallengeId)
+    || !UUID_RE.test(normalizedReplacementId)
+    || normalizedChallengeId === normalizedReplacementId) {
+    throw new OtpChallengeError('INVALID_CHALLENGE_ID');
+  }
+  const { data, error } = await db.rpc('service_claim_consumed_otp_recovery', {
+    p_challenge_id: normalizedChallengeId,
+    p_replacement_challenge_id: normalizedReplacementId,
+  });
+  if (error) throw new OtpChallengeError('OTP_RECOVERY_CLAIM_FAILED', error.message);
+  return rpcRow(data)?.status === 'claimed';
 }
 
 async function getOtpChallengeContext(db, challengeId) {
@@ -428,6 +448,7 @@ module.exports = {
   bindingFingerprint,
   canonicalChannel,
   canonicalBinding,
+  claimConsumedOtpRecovery,
   consumeOtpChallenge,
   destinationFingerprint,
   generateOtpCode,

@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const express = require('express');
 const Sentry = require('@sentry/node');
 const { supabase, supabaseAdmin } = require('../src/lib/supabaseClient');
@@ -8,6 +9,7 @@ const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../src/lib
 const { isRoleInactive, buildRoleInactivePayload, logInactiveRoleBlocked } = require('../src/lib/roleLifecycle');
 const { sendCandidateError } = require('../src/lib/candidateErrors');
 const {
+  claimConsumedOtpRecovery,
   consumeOtpChallenge,
   getOtpChallengeContext,
   issueOtpChallenge,
@@ -18,7 +20,10 @@ const {
   normalizeConsentCopyVersion,
   readCandidateSmsConfiguration,
 } = require('../src/lib/candidateSmsDelivery');
-const { setOtpLaunchCapability } = require('../src/middleware/otpLaunchCapability');
+const {
+  TTL_SECONDS: OTP_LAUNCH_CAPABILITY_TTL_SECONDS,
+  setOtpLaunchCapability,
+} = require('../src/middleware/otpLaunchCapability');
 
 const router = express.Router();
 const BILLING_ENFORCED = String(process.env.BILLING_MODE || 'off').toLowerCase() === 'enforce';
@@ -27,6 +32,7 @@ const VERIFY_OTP_RATE_MAX = 20;
 const RESEND_OTP_RATE_WINDOW_MS = 60 * 60 * 1000;
 const RESEND_OTP_RATE_MAX = 5;
 const RESEND_OTP_MESSAGE = 'If your information is accepted, a new verification code will be sent shortly.';
+const CONSUMED_CHALLENGE_RECOVERY_WINDOW_MS = 30 * 60 * 1000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const deliverEmailOtp = createEmailOtpDelivery();
 
@@ -63,6 +69,14 @@ function verificationFailed(res, requestId, category) {
     detail: 'Verification failed. Please check your code and try again.',
     ...(requestId ? { request_id: requestId } : {}),
   });
+}
+
+function isConsumedChallengeInRecoveryWindow(context, now = Date.now()) {
+  if (!context?.consumed_at || context.superseded_at) return false;
+  const consumedAt = Date.parse(String(context.consumed_at));
+  return Number.isFinite(consumedAt)
+    && consumedAt <= now
+    && now - consumedAt <= CONSUMED_CHALLENGE_RECOVERY_WINDOW_MS;
 }
 
 async function loadBoundCandidateAndRole(context) {
@@ -174,7 +188,9 @@ router.post('/resend', resendOtpRateLimit, async (req, res) => {
     const challengeId = String(req.body?.challenge_id || '').trim().toLowerCase();
     if (!UUID_RE.test(challengeId)) return generic();
     const context = await getOtpChallengeContext(supabaseAdmin, challengeId);
-    if (!context || context.consumed_at || context.superseded_at) return generic();
+    if (!context || context.superseded_at) return generic();
+    const replacingConsumedChallenge = Boolean(context.consumed_at);
+    if (replacingConsumedChallenge && !isConsumedChallengeInRecoveryWindow(context)) return generic();
     const bound = await loadBoundCandidateAndRole(context);
     if (!bound) return generic();
     if (!(await enforceCurrentInterviewEligibility({ role: bound.role, requestId, res, routeName: 'resend_otp' }))) return;
@@ -182,8 +198,9 @@ router.post('/resend', resendOtpRateLimit, async (req, res) => {
     const requestedChannel = String(req.body?.channel || 'email').trim().toLowerCase();
     if (!['email', 'sms'].includes(requestedChannel)) return generic();
 
+    let consentCopyVersion = null;
     if (requestedChannel === 'sms') {
-      const consentCopyVersion = normalizeConsentCopyVersion(req.body?.consent_copy_version);
+      consentCopyVersion = normalizeConsentCopyVersion(req.body?.consent_copy_version);
       if (!readCandidateSmsConfiguration(process.env).valid || !consentCopyVersion) {
         return generic(null, {
           delivery_channel: 'sms',
@@ -191,8 +208,21 @@ router.post('/resend', resendOtpRateLimit, async (req, res) => {
           email_fallback_available: true,
         });
       }
+    }
+
+    const replacementChallengeId = replacingConsumedChallenge ? crypto.randomUUID() : null;
+    if (replacingConsumedChallenge) {
+      const claimed = await claimConsumedOtpRecovery(supabaseAdmin, {
+        challengeId,
+        replacementChallengeId,
+      });
+      if (!claimed) return generic();
+    }
+
+    if (requestedChannel === 'sms') {
       const smsDelivery = await deliverCandidateSmsOtp({
         db: supabaseAdmin,
+        challengeId: replacementChallengeId,
         candidate: bound.candidate,
         clientId: context.client_id,
         roleId: context.role_id,
@@ -210,6 +240,7 @@ router.post('/resend', resendOtpRateLimit, async (req, res) => {
     }
 
     const challenge = await issueOtpChallenge(supabaseAdmin, {
+      challengeId: replacementChallengeId,
       email: bound.candidate.email,
       candidateId: context.candidate_id,
       clientId: context.client_id,
@@ -270,13 +301,14 @@ router.post('/', verifyOtpRateLimit, async (req, res) => {
     if (result.status === 'superseded') return sendCandidateError(res, 'STALE_ACCESS_INVALIDATED', { request_id: requestId });
     if (result.status !== 'verified') return verificationFailed(res, requestId, result.status || 'invalid');
 
-    setOtpLaunchCapability(res, {
+    const launchCapability = setOtpLaunchCapability(res, {
       challenge_id: result.challenge_id,
       candidate_id: result.candidate_id,
       client_id: result.client_id,
       role_id: result.role_id,
       submission_id: result.submission_id,
       interview_attempt_id: result.interview_attempt_id,
+      request_origin: req.headers.origin,
     });
     console.log('[verify-otp] verification_succeeded', {
       request_id: requestId,
@@ -284,9 +316,12 @@ router.post('/', verifyOtpRateLimit, async (req, res) => {
       role_id: result.role_id,
       channel: context.channel || 'email',
     });
+    res.set('Cache-Control', 'private, no-store');
     return res.status(200).json({
       message: 'Verified',
       verified: true,
+      launch_capability: launchCapability,
+      launch_capability_expires_in_seconds: OTP_LAUNCH_CAPABILITY_TTL_SECONDS,
       candidate_id: result.candidate_id,
       role_id: result.role_id,
       email: bound.candidate.email,

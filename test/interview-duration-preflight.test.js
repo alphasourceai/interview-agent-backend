@@ -25,6 +25,7 @@ process.env.OTP_HMAC_SECRET_VERSION = '1';
 process.env.OTP_HMAC_SECRET_V1 = Buffer.alloc(32, 23).toString('base64');
 const {
   COOKIE_NAME: OTP_COOKIE_NAME,
+  HEADER_NAME: OTP_HEADER_NAME,
   createOtpLaunchCapability,
 } = require('../src/middleware/otpLaunchCapability');
 
@@ -200,19 +201,25 @@ async function startServer(planSetting, options = {}) {
   };
 }
 
-async function postStart(url) {
+async function postStart(url, options = {}) {
+  const origin = options.origin || '';
   const launchCapability = createOtpLaunchCapability({
     challenge_id: '55555555-5555-4555-8555-555555555555',
     candidate_id: CANDIDATE_ID,
-    client_id: CLIENT_ID,
+    client_id: options.capabilityClientId || CLIENT_ID,
     role_id: ROLE_ID,
+    request_origin: options.transport === 'header' ? origin : null,
   });
+  const headers = { 'content-type': 'application/json' };
+  if (options.transport === 'header') {
+    headers[OTP_HEADER_NAME] = launchCapability;
+    headers.origin = origin;
+  } else {
+    headers.cookie = `${OTP_COOKIE_NAME}=${encodeURIComponent(launchCapability)}`;
+  }
   const response = await fetch(url, {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      cookie: `${OTP_COOKIE_NAME}=${encodeURIComponent(launchCapability)}`,
-    },
+    headers,
     body: JSON.stringify({
       candidate_id: CANDIDATE_ID,
       role_id: ROLE_ID,
@@ -286,6 +293,41 @@ test('duration lookup failure is retryable and does not masquerade as missing co
   assert.equal(result.body.code, 'TEMPORARY_SERVICE_ERROR');
   assert.equal(result.body.retryable, true);
   assert.doesNotMatch(JSON.stringify(result.body), /synthetic raw database error/i);
+  assert.equal(harness.calls.claim, 0);
+  assert.equal(harness.calls.provider, 0);
+});
+
+test('a cross-site browser launch succeeds with only the origin-bound header capability', async () => {
+  const harness = await startServer(
+    { client_id: CLIENT_ID, plan_tier: 'pro', max_interview_minutes: 12 },
+    { accessOverrideMode: 'force_active' },
+  );
+  servers.add(harness.server);
+
+  const result = await postStart(harness.url, {
+    transport: 'header',
+    origin: 'https://candidate.example.test',
+  });
+
+  assert.equal(result.status, 200);
+  assert.equal(harness.calls.claim, 1);
+  assert.equal(harness.calls.provider, 1);
+});
+
+test('a header capability bound to another client fails before claim and provider work', async () => {
+  const harness = await startServer(
+    { client_id: CLIENT_ID, plan_tier: 'pro', max_interview_minutes: 12 },
+    { accessOverrideMode: 'force_active' },
+  );
+  servers.add(harness.server);
+
+  const result = await postStart(harness.url, {
+    transport: 'header',
+    origin: 'https://candidate.example.test',
+    capabilityClientId: '66666666-6666-4666-8666-666666666666',
+  });
+
+  assert.equal(result.status, 400);
   assert.equal(harness.calls.claim, 0);
   assert.equal(harness.calls.provider, 0);
 });

@@ -4,8 +4,10 @@ const crypto = require('crypto');
 const { getOtpSecret } = require('../lib/otpChallenge');
 
 const COOKIE_NAME = '__Host-alphascreen_otp_launch';
+const HEADER_NAME = 'x-alphascreen-otp-launch';
 const PURPOSE = 'interview_launch';
 const TTL_SECONDS = 5 * 60;
+const MAX_TOKEN_LENGTH = 4096;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function encode(value) {
@@ -19,6 +21,18 @@ function sign(encodedPayload, env = process.env) {
     .digest('base64url');
 }
 
+function normalizeOrigin(value) {
+  const raw = String(value || '').trim();
+  if (!raw || raw.length > 512) return null;
+  try {
+    const parsed = new URL(raw);
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.origin !== raw) return null;
+    return parsed.origin;
+  } catch (_) {
+    return null;
+  }
+}
+
 function createOtpLaunchCapability(binding, { now = Date.now(), env = process.env } = {}) {
   const payload = {
     v: 1,
@@ -29,6 +43,7 @@ function createOtpLaunchCapability(binding, { now = Date.now(), env = process.en
     role_id: String(binding.role_id || '').trim().toLowerCase(),
     submission_id: binding.submission_id ? String(binding.submission_id).trim().toLowerCase() : null,
     interview_attempt_id: binding.interview_attempt_id ? String(binding.interview_attempt_id).trim().toLowerCase() : null,
+    request_origin: normalizeOrigin(binding.request_origin),
     iat: Math.floor(now / 1000),
     exp: Math.floor(now / 1000) + TTL_SECONDS,
   };
@@ -59,6 +74,7 @@ function verifyOtpLaunchCapability(token, { now = Date.now(), env = process.env 
   for (const key of ['challenge_id', 'candidate_id', 'client_id', 'role_id']) {
     if (!UUID_RE.test(String(payload?.[key] || ''))) return null;
   }
+  if (payload.request_origin !== null && normalizeOrigin(payload.request_origin) !== payload.request_origin) return null;
   return payload;
 }
 
@@ -80,16 +96,35 @@ function cookieAttributes(maxAge) {
 function setOtpLaunchCapability(res, binding, options = {}) {
   const token = createOtpLaunchCapability(binding, options);
   res.append('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(token)}; ${cookieAttributes(TTL_SECONDS)}`);
+  return token;
 }
 
 function clearOtpLaunchCapability(res) {
   res.append('Set-Cookie', `${COOKIE_NAME}=; ${cookieAttributes(0)}`);
 }
 
+function readHeaderCapability(req) {
+  const raw = req.headers?.[HEADER_NAME];
+  if (raw === undefined) return { present: false, token: '' };
+  if (typeof raw !== 'string') return { present: true, token: '' };
+  const token = raw.trim();
+  if (!token || token.length > MAX_TOKEN_LENGTH || /[\r\n,]/.test(token)) {
+    return { present: true, token: '' };
+  }
+  return { present: true, token };
+}
+
 function requireOtpLaunchCapability(req, res, next) {
   let capability;
   try {
-    capability = verifyOtpLaunchCapability(parseCookie(req, COOKIE_NAME));
+    const header = readHeaderCapability(req);
+    const cookieToken = parseCookie(req, COOKIE_NAME);
+    if (header.present && cookieToken && header.token !== cookieToken) throw new Error('conflicting launch capability transports');
+    const token = header.present ? header.token : cookieToken;
+    capability = verifyOtpLaunchCapability(token);
+    if (header.present && capability?.request_origin !== normalizeOrigin(req.headers?.origin)) {
+      capability = null;
+    }
   } catch (_) {
     capability = null;
   }
@@ -110,9 +145,11 @@ function requireOtpLaunchCapability(req, res, next) {
 
 module.exports = {
   COOKIE_NAME,
+  HEADER_NAME,
   TTL_SECONDS,
   clearOtpLaunchCapability,
   createOtpLaunchCapability,
+  normalizeOrigin,
   requireOtpLaunchCapability,
   setOtpLaunchCapability,
   verifyOtpLaunchCapability,
