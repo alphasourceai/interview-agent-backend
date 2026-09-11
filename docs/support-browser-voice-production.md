@@ -1,6 +1,14 @@
 # Production dashboard browser voice support
 
-The production dashboard voice surface is a separate, informational-only support channel. It does not replace or modify the public alphaSource Support phone agent.
+## September 11 support email update
+
+The caller-approved support email action is documented in [support-agent-email-escalation.md](./support-agent-email-escalation.md). When enabled, it adds exactly one attested function to the dashboard voice session. The browser still cannot inspect accounts or transfer calls and does not store recordings or transcripts. The separately configured public phone agent uses the production phone-handoff endpoint.
+
+## Historical informational-only baseline
+
+The following no-tool description records the disabled-mode baseline; the email action and consent policy above supersede the older capability descriptions when enabled.
+
+The production dashboard voice surface is separate from the public alphaSource Support phone agent.
 
 ## Knowledge contract
 

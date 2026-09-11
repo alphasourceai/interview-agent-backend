@@ -184,6 +184,7 @@ const supportVoiceGateway = createSupportVoiceGateway({
   },
 })
 app.use('/api/support/voice', supportVoiceGateway.router)
+app.use('/api/support/phone-handoff', require('./src/lib/supportHandoff').createPhoneHandoffRouter())
 
 // ---------- CORS ----------
 const DEFAULT_ORIGINS = corsDefaultOrigins
