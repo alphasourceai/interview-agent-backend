@@ -257,6 +257,7 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
   const normalized = normalizeMembershipAgreementInput(payload);
   const execution = normalizeExecutionInput(options.execution || payload.execution || {});
   const showPackageTerms = shouldShowPackageTerms(payload, options);
+  const salesAssistedTerms = options.salesAssistedTerms === true;
   const now = options.generatedAt ? new Date(options.generatedAt) : new Date();
   const displayTimeZone = normalizeText(options.timeZone || options.time_zone) || undefined;
   const generatedAtIso = now.toISOString();
@@ -278,7 +279,7 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
     logo_src: readLogoAsDataUri(),
     generated_at: generatedAtIso,
     generated_at_label: generatedAtLabel,
-    agreement_expires_at_label: agreementExpiresAtLabel,
+    agreement_expires_at_label: salesAssistedTerms ? agreementExpiresAtLabel : '',
     client_legal_name: normalized.client_legal_name || '______________________________',
     dba_trade_name: normalized.dba_trade_name || '______________________________',
     primary_admin_name: normalized.primary_admin_name || '______________________________',
@@ -299,7 +300,8 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
     first_role_prepay_discount_percent: normalized.first_role_prepay.discount_percent || '10',
     initial_term_start_display: formatDateShort(normalized.initial_term_start),
     initial_renewal_date_display: formatDateShort(normalized.initial_renewal_date),
-    term_starts_on_payment: normalized.term_start_basis === 'successful_payment',
+    term_starts_on_payment: salesAssistedTerms && normalized.term_start_basis === 'successful_payment',
+    sales_assisted_terms: salesAssistedTerms,
     billing_option: normalized.billing_option === 'annual' ? 'Annual' : 'Monthly',
     auto_renew: normalized.auto_renew ? 'Yes' : 'No',
     notice_deadline_days: `${normalized.notice_deadline_days} Days`,

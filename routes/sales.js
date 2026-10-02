@@ -285,7 +285,7 @@ function createSalesRouter(options = {}) {
       promotion_code: intent.promotion_code
     }))
     const agreementInput = agreementInputFromDraft(draft, intent.package_snapshot, schedule)
-    const { html, normalized } = renderAgreement(agreementInput, { showPackageTerms: true, generatedAt: nowIso(), timeZone: 'America/Denver' })
+    const { html, normalized } = renderAgreement(agreementInput, { showPackageTerms: true, salesAssistedTerms: true, generatedAt: nowIso(), timeZone: 'America/Denver' })
     const pdf = await renderPdf(html, {
       format: 'Letter',
       margin: { top: '0.75in', right: '0.75in', bottom: '0.75in', left: '0.75in' }
@@ -565,7 +565,7 @@ function createSalesRouter(options = {}) {
       const { package_snapshot: packageSnapshot, pricing } = calculatePricing(draft, promotion)
       const schedule = agreementSchedule()
       const agreementInput = agreementInputFromDraft(draft, packageSnapshot, schedule)
-      const { html } = renderAgreement(agreementInput, { showPackageTerms: true, generatedAt: nowIso(), timeZone: 'America/Denver' })
+      const { html } = renderAgreement(agreementInput, { showPackageTerms: true, salesAssistedTerms: true, generatedAt: nowIso(), timeZone: 'America/Denver' })
       const pdf = await renderPdf(html, {
         format: 'Letter',
         margin: { top: '0.75in', right: '0.75in', bottom: '0.75in', left: '0.75in' }
@@ -771,7 +771,7 @@ function createSalesRouter(options = {}) {
         expires_at: preview.agreement_expires_at
       }
       const agreementInput = agreementInputFromDraft(draft, preview.package_snapshot, agreementScheduleSnapshot)
-      const { html, normalized } = renderAgreement(agreementInput, { showPackageTerms: true, generatedAt: now, timeZone: 'America/Denver' })
+      const { html, normalized } = renderAgreement(agreementInput, { showPackageTerms: true, salesAssistedTerms: true, generatedAt: now, timeZone: 'America/Denver' })
       const pdf = await renderPdf(html, {
         format: 'Letter',
         margin: { top: '0.75in', right: '0.75in', bottom: '0.75in', left: '0.75in' }

@@ -351,7 +351,22 @@ grant execute on function public.list_missing_ghl_sales_won_intents(integer)
 -- exchanges the caller number for a short-lived, single-use routing reference.
 
 alter table public.sales_phone_numbers
-  add column if not exists shared_voice_entrypoint boolean not null default false;
+  add column if not exists shared_voice_entrypoint boolean not null default false,
+  add column if not exists handoff_token_sha256 text;
+
+do $$ begin
+  if not exists (select 1 from pg_constraint
+                 where conrelid = 'public.sales_phone_numbers'::regclass
+                   and conname = 'sales_phone_numbers_handoff_token_check') then
+    alter table public.sales_phone_numbers
+      add constraint sales_phone_numbers_handoff_token_check
+      check (handoff_token_sha256 is null or handoff_token_sha256 ~ '^[a-f0-9]{64}$');
+  end if;
+end $$;
+
+create unique index if not exists sales_phone_numbers_handoff_token_uidx
+  on public.sales_phone_numbers (handoff_token_sha256)
+  where handoff_token_sha256 is not null;
 
 create unique index if not exists sales_phone_numbers_single_shared_voice_entrypoint_uidx
   on public.sales_phone_numbers (shared_voice_entrypoint)

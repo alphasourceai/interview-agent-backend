@@ -581,6 +581,7 @@ function buildExecutedMembershipAgreementHtml(agreement, execution) {
   };
   return buildMembershipAgreementHtml(agreementInput, {
     showPackageTerms: isPublicPurchaseIntentAgreement(agreement),
+    salesAssistedTerms: String(agreement?.template_snapshot?.source || '').trim().toLowerCase() === 'sales_assisted',
     timeZone: SALES_AGREEMENT_TIME_ZONE,
     ...(generatedAt ? { generatedAt } : {}),
     execution

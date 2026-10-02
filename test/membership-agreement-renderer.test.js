@@ -30,11 +30,21 @@ test('Essential is the display label while basic remains the canonical agreement
 test('admin-created agreement rendering does not show public purchase package fields by default', () => {
   const { html } = buildMembershipAgreementHtml(baseAgreement)
 
+  assert.match(html, /Each Membership term begins on June 24, 2026 and continues for an initial term of twelve \(12\) months\./)
+  assert.doesNotMatch(html, /The initial Membership term begins on/)
   assert.doesNotMatch(html, /Platform Fee/)
   assert.doesNotMatch(html, /Per-Role Fee/)
   assert.doesNotMatch(html, /Included Interviews/)
   assert.doesNotMatch(html, /Interview Duration Cap/)
   assert.doesNotMatch(html, /Additional Interview Fee/)
+})
+
+test('sales-assisted payment-start wording does not change agreement-date contracts', () => {
+  const { html } = buildMembershipAgreementHtml({ ...baseAgreement, term_start_basis: 'successful_payment' }, { salesAssistedTerms: true })
+  assert.match(html, /The Membership term begins on the date alphaSource successfully receives the initial payment/)
+  const { html: ordinaryHtml } = buildMembershipAgreementHtml({ ...baseAgreement, term_start_basis: 'successful_payment' })
+  assert.match(ordinaryHtml, /Each Membership term begins on June 24, 2026 and continues for an initial term/)
+  assert.doesNotMatch(ordinaryHtml, /successful payment date controls|Signature and initial payment deadline/i)
 })
 
 test('public purchase agreement rendering includes package fields when explicitly enabled', () => {

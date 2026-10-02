@@ -205,10 +205,27 @@ async function lineForAuthorizationDb(authorization, db) {
   const lineResult = await db.from('sales_phone_numbers')
     .select('id,e164,active,shared_voice_entrypoint')
     .eq('handoff_token_sha256', digest)
-    .eq('active', true)
     .maybeSingle();
   if (lineResult.error) throw new Error('Sales voice line lookup failed');
-  return lineResult.data ? Object.freeze({ ...lineResult.data, tokenHash: digest }) : null;
+  if (lineResult.data) {
+    if (lineResult.data.active !== true) throw new Error('Sales voice line is inactive');
+    return Object.freeze({ ...lineResult.data, tokenHash: digest });
+  }
+  const assignmentResult = await db.from('sales_phone_assignments')
+    .select('id,phone_number_id,status')
+    .eq('handoff_token_sha256', digest)
+    .maybeSingle();
+  if (assignmentResult.error) throw new Error('Sales voice assignment lookup failed');
+  if (!assignmentResult.data) return null;
+  if (assignmentResult.data.status !== 'active') throw new Error('Sales voice assignment is inactive');
+  const assignedLineResult = await db.from('sales_phone_numbers')
+    .select('id,e164,active,shared_voice_entrypoint')
+    .eq('id', assignmentResult.data.phone_number_id)
+    .maybeSingle();
+  if (assignedLineResult.error || !assignedLineResult.data || assignedLineResult.data.active !== true) {
+    throw new Error('Sales voice line is unavailable');
+  }
+  return Object.freeze({ ...assignedLineResult.data, assignmentId: assignmentResult.data.id, tokenHash: digest });
 }
 
 async function routeForAssignmentDb(assignmentId, db, env = process.env, tokenHash = '') {
@@ -273,37 +290,16 @@ async function routeForAssignmentDb(assignmentId, db, env = process.env, tokenHa
 
 async function routeForAuthorizationDb(authorization, db, env = process.env) {
   if (!db) return null;
-  const digest = bearerDigest(authorization);
-  if (!digest) return null;
-  let phone = null;
-  let assignment = null;
-  const lineResult = await db.from('sales_phone_numbers')
-    .select('id,e164,active,shared_voice_entrypoint')
-    .eq('handoff_token_sha256', digest)
-    .eq('active', true)
+  const line = await lineForAuthorizationDb(authorization, db);
+  if (!line) return null;
+  if (line.assignmentId) return routeForAssignmentDb(line.assignmentId, db, env, line.tokenHash);
+  const assignmentResult = await db.from('sales_phone_assignments')
+    .select('id')
+    .eq('phone_number_id', line.id)
+    .eq('status', 'active')
     .maybeSingle();
-  if (lineResult.error) throw new Error('Sales voice line lookup failed');
-  if (lineResult.data) {
-    phone = lineResult.data;
-    const activeResult = await db.from('sales_phone_assignments')
-      .select('id,team_member_id,phone_number_id,status,transfer_enabled,backup_transfer_phone_e164')
-      .eq('phone_number_id', phone.id)
-      .eq('status', 'active')
-      .maybeSingle();
-    if (activeResult.error || !activeResult.data) throw new Error('Sales voice line is not assigned');
-    assignment = activeResult.data;
-  }
-  if (!assignment) {
-    const assignmentResult = await db.from('sales_phone_assignments')
-      .select('id,team_member_id,phone_number_id,status,transfer_enabled,backup_transfer_phone_e164')
-      .eq('handoff_token_sha256', digest)
-      .eq('status', 'active')
-      .maybeSingle();
-    if (assignmentResult.error) throw new Error('Sales voice assignment lookup failed');
-    if (!assignmentResult.data) return null;
-    assignment = assignmentResult.data;
-  }
-  return routeForAssignmentDb(assignment.id, db, env, digest);
+  if (assignmentResult.error || !assignmentResult.data) throw new Error('Sales voice line is not assigned');
+  return routeForAssignmentDb(assignmentResult.data.id, db, env, line.tokenHash);
 }
 
 function voiceContext(route, routingReference = '') {

@@ -71,6 +71,7 @@ test('sales agreements use concrete Denver dates and clamp leap-day renewal', ()
   assert.equal(schedule.expires_at, '2028-03-01T07:00:00.000Z')
   const rendered = buildMembershipAgreementHtml(agreement, {
     showPackageTerms: true,
+    salesAssistedTerms: true,
     generatedAt: '2028-02-29T19:00:00.000Z',
     timeZone: 'America/Denver'
   }).html
