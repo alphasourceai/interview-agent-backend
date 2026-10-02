@@ -32,6 +32,7 @@ function buildSalesProductionOverview(data, env = process.env) {
   const assignments = new Map();
   for (const row of data.assignments) {
     if (!LINE_IDS.includes(row.phone_number_id)) continue;
+    if (row.status === 'inactive') continue;
     const prior = assignments.get(row.phone_number_id);
     if (!prior || (row.status === 'active' && prior.status !== 'active')) assignments.set(row.phone_number_id, row);
   }

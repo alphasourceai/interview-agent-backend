@@ -37,6 +37,16 @@ test('admin sales overview shows fixed line readiness without secrets or custome
   assert.equal(JSON.stringify(payload).includes('contact_email'), false);
 });
 
+test('inactive historical assignment does not appear as a current line owner', () => {
+  const data = fixture();
+  data.assignments[0].status = 'inactive';
+  data.members[0].status = 'inactive';
+  const payload = buildSalesProductionOverview(data);
+  assert.equal(payload.lines[0].assignment_status, 'unassigned');
+  assert.equal(payload.lines[0].representative, null);
+  assert.equal(payload.lines[0].voice_configuration, null);
+});
+
 test('admin sales route returns generic error if production database is unavailable', async () => {
   const router = createAdminSalesProductionRouter({ db: { from() { return { select() { return { order() { return { range: async () => ({ data: null, error: { code: '42501' } }) }; } }; } }; } } });
   const route = router.stack.find((layer) => layer.route?.path === '/');
