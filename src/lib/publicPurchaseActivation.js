@@ -10,6 +10,8 @@ const {
 const { ensureUserAndSendRecovery, redactEmail } = require('./recoveryHelper');
 const { sendMemberRecoveryEmail, sendAlphaScreenWelcomeEmail } = require('../../utils/mailer');
 const { buildClientPwResetUrl } = require('../../config/urlConfig');
+const { enqueueSalesWonDelivery } = require('./salesIntegrations');
+const { salesProductionWritesEnabled } = require('./salesProductionGate');
 
 const LIVE_SUBSCRIPTION_STATUSES = new Set(['active', 'trialing']);
 const PRIVILEGED_MEMBER_ROLES = new Set(['manager', 'admin', 'owner', 'super_admin']);
@@ -98,7 +100,7 @@ function isPublicPurchaseAgreement(agreement, intent) {
   return Boolean(
     intent?.id ||
     publicPurchaseIntentIdFromAgreement(agreement) ||
-    cleanText(snapshot?.source).toLowerCase() === 'public_purchase_intent'
+    ['public_purchase_intent', 'sales_assisted'].includes(cleanText(snapshot?.source).toLowerCase())
   );
 }
 
@@ -359,7 +361,7 @@ async function loadPublicPurchaseIntent(db, agreement) {
   if (snapshotIntentId) {
     const { data, error } = await db
       .from('public_purchase_intents')
-      .select('id,status,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,company_legal_name,company_dba,buyer_first_name,buyer_last_name,buyer_email,buyer_phone,buyer_title,source_path,agreement_id,stripe_checkout_session_id,client_id,expires_at,created_at,updated_at')
+      .select('id,status,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,company_legal_name,company_dba,buyer_first_name,buyer_last_name,buyer_email,buyer_phone,buyer_title,source_path,agreement_id,stripe_checkout_session_id,client_id,channel,expires_at,created_at,updated_at')
       .eq('id', snapshotIntentId)
       .maybeSingle();
     if (error) throw new Error(error.message || 'Public purchase intent lookup failed');
@@ -369,7 +371,7 @@ async function loadPublicPurchaseIntent(db, agreement) {
   if (!agreementId) return null;
   const { data, error } = await db
     .from('public_purchase_intents')
-    .select('id,status,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,company_legal_name,company_dba,buyer_first_name,buyer_last_name,buyer_email,buyer_phone,buyer_title,source_path,agreement_id,stripe_checkout_session_id,client_id,expires_at,created_at,updated_at')
+    .select('id,status,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,company_legal_name,company_dba,buyer_first_name,buyer_last_name,buyer_email,buyer_phone,buyer_title,source_path,agreement_id,stripe_checkout_session_id,client_id,channel,expires_at,created_at,updated_at')
     .eq('agreement_id', agreementId)
     .maybeSingle();
   if (error) throw new Error(error.message || 'Public purchase intent lookup failed');
@@ -908,6 +910,25 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     welcomeEmailStatus = buyerEmail ? 'not_sent_not_public_purchase' : 'not_sent_missing_buyer_email';
   }
 
+  let salesWonDeliveryStatus = 'not_applicable';
+  if (cleanText(intent?.channel).toLowerCase() === 'sales_assisted' && intent?.id) {
+    if (!salesProductionWritesEnabled()) {
+      salesWonDeliveryStatus = 'disabled';
+    } else {
+      try {
+        const delivery = await enqueueSalesWonDelivery(intent.id, { db });
+        salesWonDeliveryStatus = delivery.status;
+      } catch (error) {
+        salesWonDeliveryStatus = 'enqueue_failed';
+        logger.error?.('[public-purchase-activation] sales_won_enqueue_failed', {
+          purchase_intent_id: intent.id,
+          agreement_id: agreementId,
+          error: error?.message || error
+        });
+      }
+    }
+  }
+
   return {
     ok: true,
     agreement_id: agreementId,
@@ -921,6 +942,7 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     auth_status: setup.auth_status,
     setup_email_status: setup.setup_email_status,
     welcome_email_status: welcomeEmailStatus,
+    sales_won_delivery_status: salesWonDeliveryStatus,
     first_role_credit_status: firstRoleCreditStatus
   };
 }

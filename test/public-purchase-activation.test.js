@@ -913,3 +913,20 @@ test('checkout return state reports ready for an existing signed-in user', async
 
   assert.equal(readyStatus.status, 'ready')
 })
+
+test('sales-assisted activation cannot enqueue notifications while the production write guard is off', async () => {
+  const prior = process.env.SALES_PRODUCTION_WRITES_ENABLED
+  delete process.env.SALES_PRODUCTION_WRITES_ENABLED
+  try {
+    const db = makeDb('basic', 'monthly')
+    db.purchaseIntents[0].channel = 'sales_assisted'
+    db.membershipAgreements[0].template_snapshot.source = 'sales_assisted'
+    const { result } = await activateCase('basic', 'monthly', { db })
+    assert.equal(result.ok, true)
+    assert.equal(result.sales_won_delivery_status, 'disabled')
+    assert.equal(db.inserts.some(({ table }) => table === 'sales_integration_deliveries'), false)
+  } finally {
+    if (prior === undefined) delete process.env.SALES_PRODUCTION_WRITES_ENABLED
+    else process.env.SALES_PRODUCTION_WRITES_ENABLED = prior
+  }
+})

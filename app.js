@@ -27,6 +27,8 @@ if (SENTRY_ENABLED) {
         if (event.request?.headers) {
           delete event.request.headers['authorization'];
           delete event.request.headers['cookie'];
+          delete event.request.headers['x-alphasource-ghl-secret'];
+          delete event.request.headers['x-ghl-signature'];
           delete event.request.headers['telnyx-signature-ed25519'];
           delete event.request.headers['telnyx-timestamp'];
         }
@@ -38,7 +40,7 @@ if (SENTRY_ENABLED) {
                 .replace(/(Authorization|Bearer)\s+[A-Za-z0-9\-\._~\+\/]+=*/gi, '$1 REDACTED')
             : s;
         if (event.request?.url) event.request.url = scrub(event.request.url);
-        if (/\/api\/candidate\/(?:submit|verify-otp)(?:\/|$)|\/webhook\/telnyx\/sms(?:\/|$)/.test(String(event.request?.url || ''))) {
+        if (/\/api\/candidate\/(?:submit|verify-otp)(?:\/|$)|\/webhook\/telnyx\/sms(?:\/|$)|\/webhooks\/ghl\/(?:sales-ready)(?:\/|$)/.test(String(event.request?.url || ''))) {
           delete event.request.data;
         }
         if (event.extra) {
@@ -76,6 +78,11 @@ const rolesRouter = require('./routes/roles')
 const { createRoleJdReplacementRouter } = require('./routes/roleJdReplacement')
 const automationRouter = require('./routes/automation')
 const { requireAuth, withClientScope } = require('./src/middleware/auth')
+const { createRequireSalesRep } = require('./src/middleware/salesAuth')
+const { createSalesRouter } = require('./routes/sales')
+const { createInternalSalesIntegrationsRouter } = require('./routes/internalSalesIntegrations')
+const { createGhlSalesWebhookRouter } = require('./routes/ghlSalesWebhook')
+const { requireSalesProductionMutation, requireSalesProductionWrites } = require('./src/lib/salesProductionGate')
 const { createProfileRouter } = require('./routes/profile')
 const { createSupportVoiceGateway } = require('./src/lib/supportVoiceGateway')
 const { buildClientScopeContext, canViewLegalBillingForClient } = require('./src/lib/clientScope')
@@ -185,6 +192,8 @@ const supportVoiceGateway = createSupportVoiceGateway({
 })
 app.use('/api/support/voice', supportVoiceGateway.router)
 app.use('/api/support/phone-handoff', require('./src/lib/supportHandoff').createPhoneHandoffRouter())
+app.use('/api/sales/voice-handoff', requireSalesProductionWrites(), require('./src/lib/salesVoiceHandoff').createSalesVoiceHandoffRouter({ db: supabaseAdmin }))
+app.use('/webhooks/ghl', requireSalesProductionWrites(), createGhlSalesWebhookRouter({ db: supabaseAdmin, env: process.env, logger: console }))
 
 // ---------- CORS ----------
 const DEFAULT_ORIGINS = corsDefaultOrigins
@@ -216,7 +225,8 @@ app.use(cors({
     'x-client-info',
     'Prefer',
     'Range',
-    'Accept'
+    'Accept',
+    'Idempotency-Key'
   ],
   exposedHeaders: ['Content-Range', 'Range-Unit']
 }))
@@ -273,7 +283,8 @@ app.use((req, res, next) => {
       pathName.startsWith('/roles') ||
       pathName.startsWith('/reports') ||
       pathName.startsWith('/files') ||
-      pathName.startsWith('/membership-agreements')
+      pathName.startsWith('/membership-agreements') ||
+      pathName.startsWith('/sales')
     ) {
       res.setHeader('Cache-Control', 'private, no-store');
     }
@@ -293,6 +304,12 @@ app.use((req, _res, next) => {
   } catch (_) {}
   next();
 });
+
+app.use('/internal/sales/integrations', requireSalesProductionWrites(), createInternalSalesIntegrationsRouter({
+  db: supabaseAdmin,
+  env: process.env,
+  logger: console
+}))
 
 // ---------- auth middlewares ----------
 // NOTE: Auth + client scoping are centralized in src/middleware/auth
@@ -1475,6 +1492,7 @@ app.use('/api/feedback', require('./routes/feedback'))
 app.use('/api/alphascreen', require('./routes/alphaScreenPackages'))
 app.use('/api/public-analytics', require('./routes/publicAnalytics'))
 app.use('/api/public-leads', require('./routes/publicLeads'))
+app.use('/sales', requireAuth, createRequireSalesRep(), requireSalesProductionMutation(), createSalesRouter())
 
 // ---------- Dashboard: scoped rows ----------
 async function buildDashboardRows(req, res) {
