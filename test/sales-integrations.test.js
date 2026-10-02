@@ -57,17 +57,17 @@ test('sales-won Slack message is celebratory, minimal, and safe for an internal 
     company_dba: 'Acme <!channel> & Dental',
     selected_plan_key: 'basic',
     selected_billing_cadence: 'annual',
-    created_by_email: 'rep@alphasourceai.com',
+    created_by_email: 'rep@example.invalid',
     platform_fee_cents: 329900,
     promotion_discount_cents: 32990,
     initial_payment_cents: 362810,
     activated_at: '2026-09-18T21:30:00.000Z'
-  }, { display_name: 'Michael Afesi' });
+  }, { display_name: 'Sales QA Rep' });
   const message = buildSlackSalesWonMessage(payload);
   const serialized = JSON.stringify(message);
   assert.match(message.text, /completed checkout and is now active/);
   assert.match(serialized, /Essential/);
-  assert.match(serialized, /Michael Afesi/);
+  assert.match(serialized, /Sales QA Rep/);
   assert.doesNotMatch(serialized, /\$|3,628|discount|deal/i);
   assert.doesNotMatch(serialized, /<!channel>/);
   assert.match(serialized, /&lt;!channel&gt; &amp; Dental/);
@@ -80,7 +80,7 @@ test('sales representative DM uses the stored Slack member destination and human
     company_name: 'Acme Dental',
     membership: 'Pro',
     billing_cadence: 'Annual',
-    sales_representative: 'Michael Afesi',
+    sales_representative: 'Sales QA Rep',
     slack_user_id: 'U123456789'
   };
   assert.match(buildSlackSalesRepMessage(payload).text, /Acme Dental completed checkout and is now active\. Great work!/);
@@ -99,10 +99,10 @@ test('missing sales representative metadata does not fall back to an email addre
   const payload = buildSalesWonPayload({
     id: DELIVERY_ID,
     company_dba: 'Acme Dental',
-    created_by_email: 'rep@alphasourceai.com'
+    created_by_email: 'rep@example.invalid'
   });
   assert.equal(payload.sales_representative, 'alphaSource sales team');
-  assert.doesNotMatch(JSON.stringify(payload), /rep@alphasourceai\.com/);
+  assert.doesNotMatch(JSON.stringify(payload), /rep@example\.invalid/);
 });
 
 test('Slack delivery uses a bot token, fixed channel ID, and stable client message ID', async () => {
@@ -114,7 +114,7 @@ test('Slack delivery uses a bot token, fixed channel ID, and stable client messa
       company_name: 'Acme Dental',
       membership: 'Pro',
       billing_cadence: 'Annual',
-      sales_representative: 'Michael Afesi',
+      sales_representative: 'Sales QA Rep',
       platform_fee_cents: 649900,
       discount_cents: 0,
       initial_payment_cents: 656190,

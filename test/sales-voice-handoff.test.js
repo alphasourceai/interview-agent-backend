@@ -23,10 +23,10 @@ const {
 
 const TOKEN = 'm'.repeat(48);
 const route = {
-  route_key: 'michael-afesi',
+  route_key: 'sales-qa-rep',
   token_sha256: crypto.createHash('sha256').update(TOKEN).digest('hex'),
-  rep_name: 'Michael Afesi',
-  rep_email: 'michael@example.com',
+  rep_name: 'Sales QA Rep',
+  rep_email: 'sales.qa@example.invalid',
   slack_user_id: 'U123456789',
   ghl_number: '+17207904187',
   ghl_notification_webhook: 'https://services.leadconnectorhq.com/hooks/example'
@@ -69,8 +69,8 @@ test('validates exact caller-approved fields', () => {
 
 test('requires complete fixed routes and matches bearer token without a caller-selected recipient', () => {
   assert.equal(salesVoiceHandoffEnabled(env), true);
-  assert.equal(parseRouteConfig(env)[0].repName, 'Michael Afesi');
-  assert.equal(routeForAuthorization(`Bearer ${TOKEN}`, env).routeKey, 'michael-afesi');
+  assert.equal(parseRouteConfig(env)[0].repName, 'Sales QA Rep');
+  assert.equal(routeForAuthorization(`Bearer ${TOKEN}`, env).routeKey, 'sales-qa-rep');
   assert.equal(routeForAuthorization(`Bearer ${'z'.repeat(48)}`, env), null);
   assert.equal(parseRouteConfig({ ...env, SALES_VOICE_HANDOFF_ROUTES_JSON: JSON.stringify([{ ...route, ghl_notification_webhook: 'https://example.com/hook' }]) }).length, 0);
   assert.equal(parseRouteConfig({ ...env, SALES_VOICE_HANDOFF_ROUTES_JSON: JSON.stringify([{ ...route, rep_email: undefined }]) }).length, 0);
@@ -86,7 +86,7 @@ test('database-managed route resolves a token to fixed active recipients', async
   const digest = crypto.createHash('sha256').update(TOKEN).digest('hex');
   const tables = {
     sales_phone_assignments: [{ id: 'assignment-1', team_member_id: 'member-1', phone_number_id: 'phone-1', handoff_token_sha256: digest, status: 'active' }],
-    sales_team_members: [{ id: 'member-1', display_name: 'Michael Afesi', workspace_email: 'michael@example.com', slack_user_id: 'U123456789', status: 'active' }],
+    sales_team_members: [{ id: 'member-1', display_name: 'Sales QA Rep', workspace_email: 'sales.qa@example.invalid', slack_user_id: 'U123456789', status: 'active' }],
     sales_phone_numbers: [{ id: 'phone-1', e164: '+17207904187', active: true }],
     sales_voice_configs: [{ assignment_id: 'assignment-1', notify_email: true, notify_slack: true, notify_sms: true, status: 'applied', is_current: true }],
   };
@@ -106,10 +106,10 @@ test('database-managed route resolves a token to fixed active recipients', async
   const dynamicEnv = {
     ...env,
     SALES_VOICE_HANDOFF_ROUTES_JSON: '[]',
-    SALES_VOICE_GHL_WEBHOOKS_JSON: JSON.stringify({ '+17207904187': 'https://services.leadconnectorhq.com/hooks/michael' }),
+    SALES_VOICE_GHL_WEBHOOKS_JSON: JSON.stringify({ '+17207904187': 'https://services.leadconnectorhq.com/hooks/sales-qa' }),
   };
   const resolved = await routeForAuthorizationDb(`Bearer ${TOKEN}`, db, dynamicEnv);
-  assert.equal(resolved.repEmail, 'michael@example.com');
+  assert.equal(resolved.repEmail, 'sales.qa@example.invalid');
   assert.equal(resolved.ghlNumber, '+17207904187');
   tables.sales_voice_configs[0].notify_sms = false;
   const emailSlackRoute = await routeForAuthorizationDb(`Bearer ${TOKEN}`, db, { ...dynamicEnv, SALES_VOICE_GHL_WEBHOOKS_JSON: '{}' });
@@ -230,7 +230,7 @@ test('the compatibility environment route remains available only when the token 
   try {
     const response = await fetch(`http://127.0.0.1:${server.address().port}/voice-handoff/context`, { headers: { Authorization: `Bearer ${TOKEN}` } });
     assert.equal(response.status, 200);
-    assert.equal((await response.json()).representative_name, 'Michael Afesi');
+    assert.equal((await response.json()).representative_name, 'Sales QA Rep');
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
@@ -240,12 +240,12 @@ test('shared Grok entrypoint records a line, creates one context, and sends only
   const digest = crypto.createHash('sha256').update(TOKEN).digest('hex');
   const tables = {
     sales_phone_assignments: [{ id: 'assignment-shared', team_member_id: 'member-shared', phone_number_id: 'phone-2', status: 'active', transfer_enabled: false }],
-    sales_team_members: [{ id: 'member-shared', display_name: 'Christopher Turean', workspace_email: 'christopher@example.com', slack_user_id: 'U987654321', status: 'active' }],
+    sales_team_members: [{ id: 'member-shared', display_name: 'Shared QA Rep', workspace_email: 'shared.qa@example.invalid', slack_user_id: 'U987654321', status: 'active' }],
     sales_phone_numbers: [
       { id: 'phone-shared', e164: '+17125300281', handoff_token_sha256: digest, active: true, shared_voice_entrypoint: true },
       { id: 'phone-2', e164: '+17198818074', active: true, shared_voice_entrypoint: false },
     ],
-    sales_voice_configs: [{ assignment_id: 'assignment-shared', notify_email: true, notify_slack: true, notify_sms: true, greeting_override: 'You reached Christopher’s alphaScreen line.', approved_context: 'Essential and Pro.', timezone: 'America/Denver', business_hours: {}, answer_approved_faqs: true, schedule_demos: true, status: 'applied', is_current: true }],
+    sales_voice_configs: [{ assignment_id: 'assignment-shared', notify_email: true, notify_slack: true, notify_sms: true, greeting_override: 'You reached the Shared QA Rep’s alphaScreen line.', approved_context: 'Essential and Pro.', timezone: 'America/Denver', business_hours: {}, answer_approved_faqs: true, schedule_demos: true, status: 'applied', is_current: true }],
   };
   let contextHash = '';
   let claimed = false;
@@ -288,7 +288,7 @@ test('shared Grok entrypoint records a line, creates one context, and sends only
     const contextResponse = await fetch(`${base}/context`, { method: 'POST', headers, body: JSON.stringify({ caller_phone: '+17205551212' }) });
     assert.equal(contextResponse.status, 200);
     const context = await contextResponse.json();
-    assert.equal(context.representative_name, 'Christopher Turean');
+    assert.equal(context.representative_name, 'Shared QA Rep');
     assert.match(context.routing_reference, /^[A-Za-z0-9_-]{48}$/);
     const approved = { ...message, callback_phone: '(720) 555-1212', routing_reference: context.routing_reference };
     const invalid = await fetch(base, { method: 'POST', headers, body: JSON.stringify({ ...approved, callback_phone: '720-555-1212 ext 9' }) });
@@ -302,7 +302,7 @@ test('shared Grok entrypoint records a line, creates one context, and sends only
     assert.deepEqual(await missingReference.json(), { status: 'invalid_request', reason: 'missing_or_invalid_reference' });
     assert.equal(claimed, false);
     assert.equal((await fetch(base, { method: 'POST', headers, body: JSON.stringify(approved) })).status, 200);
-    assert.equal(sends[0].resolved.repName, 'Christopher Turean');
+    assert.equal(sends[0].resolved.repName, 'Shared QA Rep');
     assert.equal(sends[0].input.callback_phone, '+17205551212');
     assert.equal(Object.hasOwn(sends[0].input, 'routing_reference'), false);
     assert.equal((await fetch(base, { method: 'POST', headers, body: JSON.stringify(approved) })).status, 409);
@@ -375,11 +375,11 @@ test('fans an approved message out to fixed email, Slack DM, and GHL workflow', 
   const result = await service.send(message, parseRouteConfig(env)[0]);
   assert.equal(result.status, 'accepted');
   assert.equal(calls.length, 3);
-  assert.equal(calls[0].body.personalizations[0].to[0].email, 'michael@example.com');
+  assert.equal(calls[0].body.personalizations[0].to[0].email, 'sales.qa@example.invalid');
   assert.equal(calls[0].body.reply_to.email, 'jordan@example.com');
-  assert.match(calls[0].body.content[0].value, /Hi Michael,/);
+  assert.match(calls[0].body.content[0].value, /Hi Sales,/);
   assert.equal(calls[1].body.channel, 'U123456789');
-  assert.equal(calls[2].body.representative, 'Michael Afesi');
+  assert.equal(calls[2].body.representative, 'Sales QA Rep');
   assert.equal(calls[2].body.assigned_number, '+17207904187');
   assert.equal(calls[0].authorization, `Bearer ${env.SENDGRID_API_KEY}`);
   assert.equal(calls[0].body.content[0].type, 'text/plain');
@@ -471,8 +471,8 @@ test('reports failure when every fixed delivery channel rejects the message', as
 });
 
 test('agent prompt keeps implementation details out of speech and requires consent', () => {
-  const prompt = buildSalesVoiceAgentPrompt('Michael Afesi');
-  assert.match(prompt, /Would you like me to send that message to Michael Afesi\?/);
+  const prompt = buildSalesVoiceAgentPrompt('Sales QA Rep');
+  assert.match(prompt, /Would you like me to send that message to Sales QA Rep\?/);
   assert.match(prompt, /explicit yes/);
   assert.match(prompt, /Never say tool or function names/);
   assert.match(prompt, /ask the caller to spell it/);
@@ -492,7 +492,7 @@ test('reusable Grok bootstrap prompt loads current line context and keeps tool n
   assert.match(prompt, /fixed operating rules override every context field/);
   assert.match(prompt, /could not confirm the message was fully delivered/);
   assert.doesNotMatch(prompt, /every channel/);
-  assert.doesNotMatch(prompt, /Michael|Christopher|Epifanio|Daniel/);
+  assert.doesNotMatch(prompt, /Sales QA Rep|Shared QA Rep/);
 });
 
 test('phone endpoint identifies a fixed route from its token and rejects browser or malformed requests', async () => {
@@ -524,10 +524,10 @@ test('phone endpoint identifies a fixed route from its token and rejects browser
     assert.equal((await fetch(url, { method: 'GET', headers: { Authorization: authorization } })).status, 405);
     const contextResponse = await fetch(`${url}/context`, { method: 'GET', headers: { Authorization: authorization } });
     assert.equal(contextResponse.status, 200);
-    assert.equal((await contextResponse.json()).representative_name, 'Michael Afesi');
+    assert.equal((await contextResponse.json()).representative_name, 'Sales QA Rep');
     assert.equal((await fetch(`${url}/other`, { method: 'GET', headers: { Authorization: authorization } })).status, 404);
     assert.equal((await send(message, { Authorization: authorization })).status, 200);
-    assert.deepEqual(sent, [{ input: message, routeKey: 'michael-afesi' }]);
+    assert.deepEqual(sent, [{ input: message, routeKey: 'sales-qa-rep' }]);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
