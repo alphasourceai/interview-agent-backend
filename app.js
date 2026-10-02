@@ -112,6 +112,7 @@ const { processClientEntityImport } = require('./src/lib/clientEntityImportServi
 const { archiveChildClientEntity, restoreChildClientEntity } = require('./src/lib/clientEntityArchive')
 const { buildAdminMetricsPayload, safeErrorBody } = require('./src/lib/adminMetricsService')
 const { createAdminSmsMonitoringRouter } = require('./routes/adminSmsMonitoring')
+const { createAdminSalesProductionRouter } = require('./routes/adminSalesProduction')
 const { resolvePublicCheckoutReturnState } = require('./src/lib/publicPurchaseActivation')
 const {
   archivePublicLeadCapture,
@@ -1736,6 +1737,7 @@ const adminRouter = express.Router()
 adminRouter.use('/interview-recovery', requireAuth, requireAdmin, createInterviewRecoveryRouter())
 adminRouter.use('/interview-reliability', requireAuth, requireAdmin, createAdminInterviewReliabilityRouter())
 adminRouter.use('/sms-monitoring', requireAuth, requireAdmin, createAdminSmsMonitoringRouter())
+adminRouter.use('/sales-team', requireAuth, requireAdmin, createAdminSalesProductionRouter({ db: supabaseAdmin }))
 const PUBLIC_PURCHASE_PLAYBOOK_PDF_PATH = path.join(__dirname, 'templates', 'pdf', 'alphascreen-public-purchase-support-playbook.pdf')
 
 // Helper: ensure a user exists/invite; return user_id + optional action_link
