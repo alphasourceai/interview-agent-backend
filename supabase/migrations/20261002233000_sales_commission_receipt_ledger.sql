@@ -36,8 +36,10 @@ create table if not exists public.sales_commission_receipts (
   unique (provider, provider_payment_id),
   check (gross_membership_cents > discount_cents + provider_fee_cents),
   check (funds_received_at >= payment_success_at),
-  check (qualification_closed_at >= payment_success_at),
-  check (first_term_end_at > first_term_start_at)
+  -- Later installments follow the original qualifying close; they do not re-close the sale.
+  check (first_term_end_at > first_term_start_at),
+  check (qualification_closed_at >= first_term_start_at and qualification_closed_at < first_term_end_at),
+  check (payment_success_at < first_term_end_at)
 );
 create index if not exists sales_commission_receipts_rep_week_idx
   on public.sales_commission_receipts (rep_user_id, statement_week_start, reviewed_at);

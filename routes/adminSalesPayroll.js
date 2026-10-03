@@ -95,12 +95,14 @@ function createAdminSalesPayrollRouter({ db } = {}) {
         list(db, 'sales_commission_statement_locks', 'rep_user_id,week_start,snapshot_sha256,locked_at', 'locked_at'),
       ]);
       const approvedIntents = intents.filter((row) => row.status === 'activated' && row.created_by_user_id);
-      const reviewedIntentIds = new Set(receipts.map((row) => row.purchase_intent_id));
-      const pendingEvidence = approvedIntents.filter((row) => !reviewedIntentIds.has(row.id));
+      const receiptCountByIntent = new Map();
+      for (const row of receipts) receiptCountByIntent.set(row.purchase_intent_id, (receiptCountByIntent.get(row.purchase_intent_id) || 0) + 1);
+      const reviewCandidates = approvedIntents.map((row) => ({ ...row, reviewed_receipt_count: receiptCountByIntent.get(row.id) || 0 }));
+      const pendingEvidence = reviewCandidates.filter((row) => row.reviewed_receipt_count === 0);
       return res.json({
         policy: { rate: 0.5, basis: 'each reviewed net first-term platform payment', timezone: 'America/Denver', annual_paid_monthly: 'each funded monthly receipt', automation_enabled: false },
         automation: { enabled: false, can_enable: false, reason: 'Worker, reconciliation, and payout controls require a separate reviewed release.' },
-        representatives: reps, pending_evidence: pendingEvidence,
+        representatives: reps, pending_evidence: pendingEvidence, review_candidates: reviewCandidates,
         receipts, adjustments, payouts, departures, locked_statements: locks,
         truncated: [reps, intents, receipts, adjustments, payouts].some((rows) => rows.length === MAX_ROWS),
       });
@@ -123,8 +125,15 @@ function createAdminSalesPayrollRouter({ db } = {}) {
       const fundsAt = timestamp(body.funds_received_at, 'funds_received_at');
       if (new Date(paymentAt) > new Date()) throw failure('future_payment_not_allowed');
       if (new Date(fundsAt) > new Date()) throw failure('future_funds_not_allowed');
-      const intent = await one(db, 'public_purchase_intents', 'id,status,created_by_user_id,agreement_id,activated_at,selected_billing_cadence', 'id', intentId);
+      const intent = await one(db, 'public_purchase_intents', 'id,status,created_by_user_id,agreement_id,activated_at,selected_billing_cadence,platform_fee_cents', 'id', intentId);
       if (!intent || intent.status !== 'activated' || !intent.created_by_user_id || !intent.agreement_id || !intent.activated_at) throw failure('unverified_qualifying_sale');
+      const cadence = String(intent.selected_billing_cadence || '').toLowerCase();
+      if (!((cadence === 'monthly' && paymentKind === 'monthly') ||
+        (cadence === 'annual' && (paymentKind === 'paid_in_full' || paymentKind === 'financed_checkout')))) {
+        throw failure('payment_kind_billing_cadence_mismatch');
+      }
+      const platformFee = Number(intent.platform_fee_cents);
+      if (!Number.isSafeInteger(platformFee) || platformFee <= 0 || gross > platformFee) throw failure('gross_exceeds_contract_platform_fee');
       const agreement = await one(db, 'membership_agreements', 'id,status,checkout_status,signed_at,checkout_paid_at,initial_term_start,initial_renewal_date', 'id', intent.agreement_id);
       if (!agreement || agreement.status !== 'signed' || agreement.checkout_status !== 'paid' || !agreement.signed_at || !agreement.checkout_paid_at) throw failure('unverified_qualifying_sale');
       if (new Date(paymentAt) < new Date(agreement.signed_at)) throw failure('payment_precedes_signed_agreement');

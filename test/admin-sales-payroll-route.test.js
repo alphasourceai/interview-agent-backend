@@ -35,7 +35,7 @@ test('reviewing one monthly receipt stores one net payment, not twelve annualize
   const repId = '44444444-4444-4444-8444-444444444444';
   const records = {
     public_purchase_intents: { id: saleId, status: 'activated', created_by_user_id: repId,
-      agreement_id: agreementId, activated_at: '2026-07-08T19:00:00Z', selected_billing_cadence: 'monthly' },
+      agreement_id: agreementId, activated_at: '2026-07-08T19:00:00Z', selected_billing_cadence: 'monthly', platform_fee_cents: 29900 },
     membership_agreements: { id: agreementId, status: 'signed', checkout_status: 'paid',
       signed_at: '2026-07-08T18:00:00Z', checkout_paid_at: '2026-07-08T18:30:00Z',
       initial_term_start: '2026-07-08', initial_renewal_date: '2027-07-08' },
@@ -63,6 +63,22 @@ test('reviewing one monthly receipt stores one net payment, not twelve annualize
     assert.equal(inserted.provider_fee_cents, 897);
     assert.equal(inserted.payment_kind, 'monthly');
     assert.equal(inserted.qualification_closed_at, '2026-07-08T19:00:00.000Z');
+    const wrongCadence = await fetch(`${base}/admin/sales-payroll/receipts`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ purchase_intent_id: saleId, provider: 'stripe', provider_payment_id: 'pi_local_wrong_cadence',
+        payment_kind: 'paid_in_full', payment_success_at: '2026-09-08T18:00:00Z', funds_received_at: '2026-09-10T18:00:00Z',
+        gross_membership_cents: 29900, discount_cents: 0, provider_fee_cents: 897, evidence_reference: 'receipt local' }),
+    });
+    assert.equal(wrongCadence.status, 422);
+    assert.deepEqual(await wrongCadence.json(), { error: 'payment_kind_billing_cadence_mismatch' });
+    const tooLarge = await fetch(`${base}/admin/sales-payroll/receipts`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ purchase_intent_id: saleId, provider: 'stripe', provider_payment_id: 'pi_local_too_large',
+        payment_kind: 'monthly', payment_success_at: '2026-09-08T18:00:00Z', funds_received_at: '2026-09-10T18:00:00Z',
+        gross_membership_cents: 358800, discount_cents: 0, provider_fee_cents: 897, evidence_reference: 'receipt local' }),
+    });
+    assert.equal(tooLarge.status, 422);
+    assert.deepEqual(await tooLarge.json(), { error: 'gross_exceeds_contract_platform_fee' });
   }, db);
 });
 
