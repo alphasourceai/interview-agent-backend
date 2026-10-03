@@ -53,6 +53,18 @@ test('closed session.updated attestation accepts the sanitized live provider sha
   assert.equal(validateSessionUpdated(acceptedSession(), { prompt, voice: 'carina' }), true);
 });
 
+test('provider omission of documented default VAD threshold is accepted, but drift remains closed', () => {
+  const event = acceptedSession();
+  delete event.session.turn_detection.threshold;
+  assert.equal(validateSessionUpdated(event, { prompt, voice: 'carina' }), true);
+  event.session.turn_detection.threshold = 0.5;
+  assert.deepEqual(attestSessionUpdated(event, { prompt, voice: 'carina' }), {
+    ok: false,
+    failure_category: 'vad_drift',
+    field: 'turn_detection',
+  });
+});
+
 test('provider-managed noise suppression echo accepts either bounded boolean and nothing else', () => {
   const providerNormalized = acceptedSession();
   providerNormalized.session.enable_noise_suppression = false;
