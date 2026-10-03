@@ -74,6 +74,22 @@ test('sales-won Slack message is celebratory, minimal, and safe for an internal 
   assert.doesNotMatch(serialized, /buyer_email|buyer_phone/i);
 });
 
+test('sales-won channel leads with the salesperson name and keeps sale details below it', () => {
+  const message = buildSlackSalesWonMessage({
+    company_name: 'Harbor Dental',
+    membership: 'Essential',
+    billing_cadence: 'Monthly',
+    sales_representative: 'Michael Afesi',
+    activated_at: '2026-10-03T10:00:00.000Z'
+  });
+  assert.equal(message.blocks[0].type, 'header');
+  assert.equal(message.blocks[0].text.text, 'Congratulations, Michael!! 🎉');
+  assert.match(message.text, /^Congratulations, Michael!! 🎉/);
+  assert.match(JSON.stringify(message.blocks[1]), /Harbor Dental/);
+  assert.match(JSON.stringify(message.blocks[1]), /Essential · Monthly/);
+  assert.match(JSON.stringify(message.blocks[1]), /Michael Afesi/);
+});
+
 test('sales representative DM uses the stored Slack member destination and human copy', async () => {
   let captured = null;
   const payload = {

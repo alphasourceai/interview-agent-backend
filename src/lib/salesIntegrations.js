@@ -69,7 +69,8 @@ function buildSalesWonPayload(intent, rep = null) {
 
 function buildSlackSalesWonMessage(payload) {
   const membership = `${escapeSlackText(payload?.membership, 40)} · ${escapeSlackText(payload?.billing_cadence, 40)}`;
-  const text = `🎉 ${escapeSlackText(payload?.company_name, 160)} completed checkout and is now active!`;
+  const firstName = cleanText(payload?.sales_representative, 120).split(/\s+/)[0] || 'sales team';
+  const text = `Congratulations, ${escapeSlackText(firstName, 40)}!! 🎉 ${escapeSlackText(payload?.company_name, 160)} completed checkout and is now active!`;
   const fields = [
     { type: 'mrkdwn', text: `*Company*\n${escapeSlackText(payload?.company_name, 160)}` },
     { type: 'mrkdwn', text: `*Membership*\n${membership}` },
@@ -78,13 +79,13 @@ function buildSlackSalesWonMessage(payload) {
   return {
     text,
     blocks: [
-      { type: 'header', text: { type: 'plain_text', text: '🎉 New alphaScreen client!', emoji: true } },
+      { type: 'header', text: { type: 'plain_text', text: `Congratulations, ${firstName.slice(0, 40)}!! 🎉`, emoji: true } },
       { type: 'section', fields },
       {
         type: 'context',
         elements: [{
           type: 'mrkdwn',
-          text: `Activated ${toSlackDate(payload?.activated_at)} · Great work, ${escapeSlackText(payload?.sales_representative, 120)}!`
+          text: `Activated ${toSlackDate(payload?.activated_at)}`
         }]
       }
     ]
