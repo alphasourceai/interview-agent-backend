@@ -46,6 +46,25 @@ create index if not exists sales_commission_receipts_rep_week_idx
 create index if not exists sales_commission_receipts_intent_idx
   on public.sales_commission_receipts (purchase_intent_id);
 
+-- Filter in PostgreSQL before the API page limit. A stored completed intent is
+-- only reviewable when its signed/paid agreement and client activation agree.
+create or replace view public.sales_commission_review_candidates
+with (security_invoker = true) as
+select i.id, i.company_legal_name, i.buyer_email, i.selected_plan_key,
+       i.selected_billing_cadence, i.created_by_user_id, i.activated_at
+from public.public_purchase_intents i
+join public.membership_agreements a on a.id = i.agreement_id and a.client_id = i.client_id
+join public.clients c on c.id = i.client_id
+where i.status = 'completed'
+  and i.activated_at is not null
+  and i.created_by_user_id is not null
+  and a.status = 'signed' and a.checkout_status = 'paid'
+  and a.signed_at is not null and a.checkout_paid_at is not null
+  and c.billing_status = 'active'
+  and coalesce(nullif(lower(btrim(c.subscription_status)), ''), 'active') in ('active', 'trialing');
+revoke all on public.sales_commission_review_candidates from public, anon, authenticated;
+grant select on public.sales_commission_review_candidates to service_role;
+
 create table if not exists public.sales_commission_adjustments (
   id uuid primary key default gen_random_uuid(),
   receipt_id uuid not null references public.sales_commission_receipts(id) on delete restrict,

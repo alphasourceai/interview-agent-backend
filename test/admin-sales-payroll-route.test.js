@@ -32,11 +32,13 @@ test('payroll automation stays off even if an admin requests ON', async () => {
 test('reviewing one monthly receipt stores one net payment, not twelve annualized payments', async () => {
   const saleId = '22222222-2222-4222-8222-222222222222';
   const agreementId = '33333333-3333-4333-8333-333333333333';
+  const clientId = '55555555-5555-4555-8555-555555555555';
   const repId = '44444444-4444-4444-8444-444444444444';
   const records = {
-    public_purchase_intents: { id: saleId, status: 'activated', created_by_user_id: repId,
-      agreement_id: agreementId, activated_at: '2026-07-08T19:00:00Z', selected_billing_cadence: 'monthly', platform_fee_cents: 29900 },
-    membership_agreements: { id: agreementId, status: 'signed', checkout_status: 'paid',
+    public_purchase_intents: { id: saleId, status: 'completed', created_by_user_id: repId,
+      agreement_id: agreementId, client_id: clientId, activated_at: '2026-07-08T19:00:00Z', selected_billing_cadence: 'monthly', platform_fee_cents: 29900 },
+    clients: { id: clientId, billing_status: 'active', subscription_status: 'active' },
+    membership_agreements: { id: agreementId, client_id: clientId, status: 'signed', checkout_status: 'paid',
       signed_at: '2026-07-08T18:00:00Z', checkout_paid_at: '2026-07-08T18:30:00Z',
       initial_term_start: '2026-07-08', initial_renewal_date: '2027-07-08' },
     sales_reps: { user_id: repId, active: true },
@@ -79,6 +81,15 @@ test('reviewing one monthly receipt stores one net payment, not twelve annualize
     });
     assert.equal(tooLarge.status, 422);
     assert.deepEqual(await tooLarge.json(), { error: 'gross_exceeds_contract_platform_fee' });
+    records.clients.billing_status = 'past_due';
+    const inactive = await fetch(`${base}/admin/sales-payroll/receipts`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ purchase_intent_id: saleId, provider: 'stripe', provider_payment_id: 'pi_local_inactive',
+        payment_kind: 'monthly', payment_success_at: '2026-09-08T18:00:00Z', funds_received_at: '2026-09-10T18:00:00Z',
+        gross_membership_cents: 29900, discount_cents: 0, provider_fee_cents: 897, evidence_reference: 'receipt local' }),
+    });
+    assert.equal(inactive.status, 422);
+    assert.deepEqual(await inactive.json(), { error: 'client_not_active' });
   }, db);
 });
 
