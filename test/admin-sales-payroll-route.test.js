@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const express = require('express');
 const { createAdminSalesPayrollRouter } = require('../routes/adminSalesPayroll');
+const { HEADERS } = require('../src/lib/mercuryPayrollCsv');
 
 async function withServer(callback, db = {}) {
   const app = express();
@@ -108,4 +109,42 @@ test('receipt review rejects a payment time without explicit timezone before dat
     assert.equal(response.status, 422);
     assert.deepEqual(await response.json(), { error: 'invalid_payment_success_at_timezone' });
   });
+});
+
+test('Mercury preview never writes and import stays closed without approved source account', async () => {
+  const values = {
+    'Date (UTC)': '07-10-2026', Description: 'Synthetic QA ACH', Amount: '-100.00',
+    Status: 'Sent', 'Source Account': 'Synthetic Checking', 'Bank Description': '',
+    Reference: '', Note: '', 'Last Four Digits': '', 'Name On Card': '', 'Merchant Type': '',
+    Category: '', 'Source of Category': '', 'GL Code': '', 'Source of GL Code': '',
+    Timestamp: '07-10-2026 12:00:00', 'Original Currency': '', 'Check Number': '',
+    'Cardholder Email': '', 'Tracking ID': '123456789012345', 'Failure Reason': '',
+  };
+  const csv = `${HEADERS.join(',')}\n${HEADERS.map((name) => values[name]).join(',')}\n`;
+  let calls = 0;
+  const db = { rpc() { calls += 1; throw new Error('rpc_must_not_run'); } };
+  const previous = process.env.SALES_MERCURY_PAYROLL_ACCOUNT_SHA256;
+  delete process.env.SALES_MERCURY_PAYROLL_ACCOUNT_SHA256;
+  try {
+    await withServer(async (base) => {
+      const preview = await fetch(`${base}/admin/sales-payroll/mercury/preview`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ csv }),
+      });
+      assert.equal(preview.status, 200);
+      const rows = (await preview.json()).rows;
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].source_account_allowed, false);
+      const attempted = await fetch(`${base}/admin/sales-payroll/mercury/import`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ csv, row_number: 2, rep_user_id: '11111111-1111-4111-8111-111111111111',
+          allocations: [{ receipt_id: '22222222-2222-4222-8222-222222222222', amount_cents: 10000 }], attested: true }),
+      });
+      assert.equal(attempted.status, 409);
+      assert.deepEqual(await attempted.json(), { error: 'unapproved_mercury_source_account' });
+    }, db);
+  } finally {
+    if (previous === undefined) delete process.env.SALES_MERCURY_PAYROLL_ACCOUNT_SHA256;
+    else process.env.SALES_MERCURY_PAYROLL_ACCOUNT_SHA256 = previous;
+  }
+  assert.equal(calls, 0);
 });

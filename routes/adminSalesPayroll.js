@@ -3,6 +3,7 @@
 const express = require('express');
 const { fromZonedTime } = require('date-fns-tz');
 const { calculateReceiptCommission, weekRangeForTimestamp } = require('../src/lib/salesCommissionPolicy');
+const { parseMercuryPayrollCsv } = require('../src/lib/mercuryPayrollCsv');
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PAYMENT_KINDS = new Set(['monthly', 'paid_in_full', 'financed_checkout']);
@@ -74,7 +75,15 @@ async function requireUnlockedWeek(db, repUserId, weekStart) {
 
 function safeError(res, error) {
   if (error?.code === '23505') return res.status(409).json({ error: 'duplicate_ledger_record' });
-  if (error?.code === '23514' || error?.code === 'P0001') return res.status(409).json({ error: 'commission_ledger_constraint' });
+  if (error?.code === '23514') return res.status(409).json({ error: 'commission_ledger_constraint' });
+  if (error?.code === 'P0001') {
+    const known = new Set(['ach_before_following_tuesday', 'source_statement_not_locked', 'adjustment_statement_not_locked',
+      'commission_payout_exceeds_unpaid_verified_source', 'representative_has_unrecovered_commission_debit',
+      'bank_import_collision', 'bank_allocation_rep_mismatch', 'invalid_bank_import', 'invalid_bank_allocations',
+      'unknown_representative', 'unknown_bank_transaction']);
+    const code = String(error.message || '');
+    return res.status(409).json({ error: known.has(code) ? code : 'commission_ledger_constraint' });
+  }
   const code = error?.code || 'sales_payroll_unavailable';
   const status = error?.status || (/^(invalid_|unsupported_|funds_received_before_payment)/.test(code) ? 422 : 503);
   if (status >= 500) console.error('[admin-sales-payroll] request_failed', { code });
@@ -111,6 +120,77 @@ function createAdminSalesPayrollRouter({ db } = {}) {
         receipts, adjustments, payouts, departures, locked_statements: locks,
         truncated: [reps, intents, receipts, adjustments, payouts].some((rows) => rows.length === MAX_ROWS),
       });
+    } catch (error) { return safeError(res, error); }
+  });
+
+  router.get('/payments', async (req, res) => {
+    try {
+      const page = Number(req.query.page || 0);
+      if (!Number.isSafeInteger(page) || page < 0 || page > 10000) throw failure('invalid_page');
+      const repId = req.query.rep_user_id ? uuid(req.query.rep_user_id, 'rep_user_id') : null;
+      const { data: summary, error: summaryError } = await db.from('sales_commission_payment_summary')
+        .select('rep_user_id,display_name,email,receipt_count,net_membership_cents,adjustment_cents,earned_cents,paid_cents,outstanding_cents')
+        .order('display_name');
+      if (summaryError || !Array.isArray(summary)) throw failure('payments_summary_read_failed', 503);
+      let query = db.from('sales_commission_payment_rows')
+        .select('receipt_id,purchase_intent_id,rep_user_id,provider_payment_id,payment_kind,net_membership_cents,commission_cents,adjustment_cents,paid_cents,outstanding_cents,paid_dates,statement_week_start,reviewed_at', { count: 'exact' })
+        .order('reviewed_at', { ascending: false }).order('receipt_id', { ascending: false });
+      if (repId) query = query.eq('rep_user_id', repId);
+      const { data: rows, count, error } = await query.range(page * 100, page * 100 + 99);
+      if (error || !Array.isArray(rows)) throw failure('payments_rows_read_failed', 503);
+      return res.json({ summary, rows, page, total: count || 0 });
+    } catch (error) { return safeError(res, error); }
+  });
+
+  router.post('/mercury/preview', async (req, res) => {
+    try {
+      const rows = parseMercuryPayrollCsv(req.body?.csv);
+      const allowed = new Set(String(process.env.SALES_MERCURY_PAYROLL_ACCOUNT_SHA256 || '').split(',').map((v) => v.trim().toLowerCase()).filter(Boolean));
+      return res.json({ rows: rows.map((row) => ({ ...row, source_account_allowed: allowed.has(row.source_account_fingerprint) })),
+        posting_available: allowed.size > 0 });
+    } catch (error) { return safeError(res, error); }
+  });
+
+  router.post('/mercury/import', async (req, res) => {
+    try {
+      const body = req.body || {};
+      if (body.attested !== true) throw failure('mercury_review_attestation_required');
+      const rows = parseMercuryPayrollCsv(body.csv);
+      const row = rows.find((item) => item.row_number === body.row_number);
+      if (!row) throw failure('unknown_mercury_csv_row');
+      const allowed = new Set(String(process.env.SALES_MERCURY_PAYROLL_ACCOUNT_SHA256 || '').split(',').map((v) => v.trim().toLowerCase()).filter(Boolean));
+      if (!allowed.has(row.source_account_fingerprint)) throw failure('unapproved_mercury_source_account', 409);
+      const repId = uuid(body.rep_user_id, 'rep_user_id');
+      if (!Array.isArray(body.allocations) || body.allocations.length < 1 || body.allocations.length > 50) throw failure('invalid_bank_allocations');
+      const allocations = body.allocations.map((item) => ({
+        receipt_id: uuid(item?.receipt_id, 'receipt_id'), amount_cents: nonnegativeCents(item?.amount_cents, 'amount_cents'),
+      }));
+      if (allocations.some((item) => item.amount_cents <= 0) || new Set(allocations.map((item) => item.receipt_id)).size !== allocations.length ||
+          allocations.reduce((sum, item) => sum + item.amount_cents, 0) !== row.amount_cents) throw failure('invalid_bank_allocations');
+      const { data, error } = await db.rpc('import_sales_commission_bank_transaction', {
+        p_source_account_fingerprint: row.source_account_fingerprint, p_ach_trace: row.ach_trace,
+        p_value_date: row.value_date, p_paid_at: row.paid_at, p_amount_cents: row.amount_cents,
+        p_rep_user_id: repId, p_counterparty_label: row.counterparty_label,
+        p_attestation: 'Admin verified outgoing ACH, recipient, posted status, and exact commission allocation in Mercury.',
+        p_imported_by_user_id: req.user.id, p_allocations: allocations,
+      });
+      if (error) throw error;
+      return res.status(201).json({ bank_transaction_id: data.id, amount_cents: data.amount_cents });
+    } catch (error) { return safeError(res, error); }
+  });
+
+  router.post('/mercury/reverse', async (req, res) => {
+    try {
+      const body = req.body || {};
+      const observedAt = timestamp(body.observed_at, 'observed_at');
+      if (new Date(observedAt) > new Date()) throw failure('future_reversal_not_allowed');
+      const { data, error } = await db.rpc('reverse_sales_commission_bank_transaction', {
+        p_bank_transaction_id: uuid(body.bank_transaction_id, 'bank_transaction_id'),
+        p_observed_at: observedAt, p_evidence_reference: requiredText(body.evidence_reference, 'evidence_reference'),
+        p_recorded_by_user_id: req.user.id,
+      });
+      if (error) throw error;
+      return res.status(201).json({ reversal: data });
     } catch (error) { return safeError(res, error); }
   });
 
@@ -209,9 +289,11 @@ function createAdminSalesPayrollRouter({ db } = {}) {
       if (!receipt) throw failure('unknown_receipt', 404);
       const paidAt = timestamp(body.paid_at, 'paid_at');
       if (new Date(paidAt) > new Date()) throw failure('future_payout_not_allowed');
+      const reference = requiredText(body.ach_reference, 'ach_reference', 200);
+      if (/^mercury:/i.test(reference) || /^\d{15}$/.test(reference)) throw failure('reserved_mercury_reference');
       const { data, error } = await db.from('sales_commission_payouts').insert({
         receipt_id: receipt.id, amount_cents: nonnegativeCents(body.amount_cents, 'amount_cents'),
-        ach_reference: requiredText(body.ach_reference, 'ach_reference', 200), paid_at: paidAt,
+        ach_reference: reference, paid_at: paidAt,
         evidence_reference: requiredText(body.evidence_reference, 'evidence_reference'),
         recorded_by_user_id: req.user.id,
       }).select('id,amount_cents').single();
