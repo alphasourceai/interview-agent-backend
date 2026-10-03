@@ -34,7 +34,7 @@ function acceptedSession() {
       output_audio_format: 'not specified',
       temperature: -1,
       tool_choice: 'auto',
-      turn_detection: { prefix_padding_ms: 300, silence_duration_ms: 800, threshold: 0.85, type: 'server_vad' },
+      turn_detection: { type: 'server_vad' },
     },
   };
 }
@@ -47,22 +47,45 @@ test('authoritative update pins audio-only, transcription off, no tools, and res
   assert.equal(Object.hasOwn(update.session, 'tools'), false);
   assert.equal(update.session.instructions, prompt);
   assert.equal(update.session.voice, 'carina');
+  assert.deepEqual(update.session.turn_detection, { type: 'server_vad', idle_timeout_ms: null });
 });
 
 test('closed session.updated attestation accepts the sanitized live provider shape', () => {
   assert.equal(validateSessionUpdated(acceptedSession(), { prompt, voice: 'carina' }), true);
 });
 
-test('provider omission of documented default VAD threshold is accepted, but drift remains closed', () => {
+test('provider VAD echo accepts only documented type and disabled idle timeout', () => {
   const event = acceptedSession();
-  delete event.session.turn_detection.threshold;
   assert.equal(validateSessionUpdated(event, { prompt, voice: 'carina' }), true);
-  event.session.turn_detection.threshold = 0.5;
+  event.session.turn_detection.idle_timeout_ms = null;
+  assert.equal(validateSessionUpdated(event, { prompt, voice: 'carina' }), true);
+  event.session.turn_detection.idle_timeout_ms = 0;
+  assert.deepEqual(attestSessionUpdated(event, { prompt, voice: 'carina' }), {
+    ok: false,
+    failure_category: 'vad_drift',
+    field: 'turn_detection.idle_timeout_ms',
+  });
+  delete event.session.turn_detection.idle_timeout_ms;
+  event.session.turn_detection.type = null;
   assert.deepEqual(attestSessionUpdated(event, { prompt, voice: 'carina' }), {
     ok: false,
     failure_category: 'vad_drift',
     field: 'turn_detection',
   });
+});
+
+test('undocumented VAD timing echoes fail closed even at former requested values', () => {
+  const event = acceptedSession();
+  event.session.turn_detection = { type: 'server_vad', silence_duration_ms: 800, prefix_padding_ms: 300 };
+  assert.deepEqual(attestSessionUpdated(event, { prompt, voice: 'carina' }), {
+    ok: false,
+    failure_category: 'unexpected_field',
+    field: 'turn_detection',
+  });
+  event.session.turn_detection = { type: 'server_vad', threshold: 0.85 };
+  assert.equal(validateSessionUpdated(event, { prompt, voice: 'carina' }), false);
+  event.session.turn_detection.threshold = 0.5;
+  assert.equal(validateSessionUpdated(event, { prompt, voice: 'carina' }), false);
 });
 
 test('provider-managed noise suppression echo accepts either bounded boolean and nothing else', () => {

@@ -57,7 +57,7 @@ class FakeUpstream extends EventEmitter {
             output_audio_format: 'not specified',
             temperature: -1,
             tool_choice: 'auto',
-            turn_detection: { prefix_padding_ms: 300, silence_duration_ms: 800, threshold: 0.85, type: 'server_vad' },
+            turn_detection: { type: 'server_vad' },
           },
         });
       };
@@ -494,7 +494,7 @@ test('a duplicate late session.updated is never ignored or applied twice', async
         output_audio_format: 'not specified',
         temperature: -1,
         tool_choice: 'auto',
-        turn_detection: { prefix_padding_ms: 300, silence_duration_ms: 800, threshold: 0.85, type: 'server_vad' },
+        turn_detection: { type: 'server_vad' },
       },
     });
     await waitFor(() => h.messages.some((message) => message.type === 'error'));
