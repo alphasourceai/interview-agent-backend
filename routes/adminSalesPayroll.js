@@ -4,6 +4,8 @@ const express = require('express');
 const { fromZonedTime } = require('date-fns-tz');
 const { calculateReceiptCommission, weekRangeForTimestamp } = require('../src/lib/salesCommissionPolicy');
 const { parseMercuryPayrollCsv } = require('../src/lib/mercuryPayrollCsv');
+const { loadSalesPayrollReport } = require('../src/lib/salesPayrollReportQuery');
+const { buildSalesPayrollWorkbook } = require('../src/lib/salesPayrollWorkbook');
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PAYMENT_KINDS = new Set(['monthly', 'paid_in_full', 'financed_checkout']);
@@ -84,8 +86,8 @@ function safeError(res, error) {
     const code = String(error.message || '');
     return res.status(409).json({ error: known.has(code) ? code : 'commission_ledger_constraint' });
   }
-  const code = error?.code || 'sales_payroll_unavailable';
-  const status = error?.status || (/^(invalid_|unsupported_|funds_received_before_payment)/.test(code) ? 422 : 503);
+  const code = error?.code || (/^(invalid_report_date|invalid_report_range|report_range_too_large)$/.test(error?.message || '') ? error.message : 'sales_payroll_unavailable');
+  const status = error?.status || (/^(invalid_|unsupported_|funds_received_before_payment)/.test(code) ? 422 : code === 'report_range_too_large' ? 413 : 503);
   if (status >= 500) console.error('[admin-sales-payroll] request_failed', { code });
   return res.status(status).json({ error: status >= 500 ? 'sales_payroll_unavailable' : code });
 }
@@ -100,12 +102,13 @@ function createAdminSalesPayrollRouter({ db } = {}) {
 
   router.get('/', async (_req, res) => {
     try {
-      const [reps, intents, receipts, adjustments, payouts, departures, locks] = await Promise.all([
+      const [reps, intents, receipts, adjustments, payouts, reversals, departures, locks] = await Promise.all([
         list(db, 'sales_reps', 'user_id,email,display_name,active', 'email'),
         list(db, 'sales_commission_review_candidates', 'id,company_legal_name,buyer_email,selected_plan_key,selected_billing_cadence,created_by_user_id,activated_at', 'activated_at'),
         list(db, 'sales_commission_receipts', 'id,purchase_intent_id,rep_user_id,provider,provider_payment_id,payment_kind,payment_success_at,funds_received_at,qualification_closed_at,rep_final_day,gross_membership_cents,discount_cents,provider_fee_cents,net_membership_cents,commission_cents,statement_week_start,evidence_reference,reviewed_at', 'reviewed_at'),
         list(db, 'sales_commission_adjustments', 'id,receipt_id,adjustment_type,provider_event_id,net_membership_delta_cents,commission_delta_cents,statement_week_start,evidence_reference,reviewed_at', 'reviewed_at'),
-        list(db, 'sales_commission_payouts', 'id,receipt_id,amount_cents,ach_reference,paid_at,recorded_at', 'recorded_at'),
+        list(db, 'sales_commission_payouts', 'id,receipt_id,bank_transaction_id,amount_cents,ach_reference,paid_at,recorded_at', 'recorded_at'),
+        list(db, 'sales_commission_bank_reversals', 'bank_transaction_id', 'recorded_at'),
         list(db, 'sales_commission_departures', 'rep_user_id,final_day,reviewed_at', 'reviewed_at'),
         list(db, 'sales_commission_statement_locks', 'rep_user_id,week_start,snapshot_sha256,locked_at', 'locked_at'),
       ]);
@@ -113,13 +116,31 @@ function createAdminSalesPayrollRouter({ db } = {}) {
       for (const row of receipts) receiptCountByIntent.set(row.purchase_intent_id, (receiptCountByIntent.get(row.purchase_intent_id) || 0) + 1);
       const reviewCandidates = intents.map((row) => ({ ...row, reviewed_receipt_count: receiptCountByIntent.get(row.id) || 0 }));
       const pendingEvidence = reviewCandidates.filter((row) => row.reviewed_receipt_count === 0);
+      const reversedBankIds = new Set(reversals.map((row) => row.bank_transaction_id));
+      const effectivePayouts = payouts.filter((row) => !row.bank_transaction_id || !reversedBankIds.has(row.bank_transaction_id));
       return res.json({
         policy: { rate: 0.5, basis: 'each reviewed net first-term platform payment', timezone: 'America/Denver', annual_paid_monthly: 'each funded monthly receipt', automation_enabled: false },
         automation: { enabled: false, can_enable: false, reason: 'Worker, reconciliation, and payout controls require a separate reviewed release.' },
         representatives: reps, pending_evidence: pendingEvidence, review_candidates: reviewCandidates,
-        receipts, adjustments, payouts, departures, locked_statements: locks,
-        truncated: [reps, intents, receipts, adjustments, payouts].some((rows) => rows.length === MAX_ROWS),
+        receipts, adjustments, payouts: effectivePayouts, departures, locked_statements: locks,
+        truncated: [reps, intents, receipts, adjustments, payouts, reversals].some((rows) => rows.length === MAX_ROWS),
       });
+    } catch (error) { return safeError(res, error); }
+  });
+
+  router.get('/report', async (req, res) => {
+    try {
+      return res.json(await loadSalesPayrollReport(db, req.query));
+    } catch (error) { return safeError(res, error); }
+  });
+
+  router.get('/export', async (req, res) => {
+    try {
+      const report = await loadSalesPayrollReport(db, req.query);
+      const workbook = await buildSalesPayrollWorkbook(report);
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="sales-payroll-${report.date_from}-to-${report.date_to}.xlsx"`);
+      return res.send(workbook);
     } catch (error) { return safeError(res, error); }
   });
 
@@ -210,8 +231,8 @@ function createAdminSalesPayrollRouter({ db } = {}) {
       const fundsAt = timestamp(body.funds_received_at, 'funds_received_at');
       if (new Date(paymentAt) > new Date()) throw failure('future_payment_not_allowed');
       if (new Date(fundsAt) > new Date()) throw failure('future_funds_not_allowed');
-      const intent = await one(db, 'public_purchase_intents', 'id,status,created_by_user_id,agreement_id,client_id,activated_at,selected_billing_cadence,platform_fee_cents', 'id', intentId);
-      if (!intent || intent.status !== 'completed' || !intent.created_by_user_id || !intent.agreement_id || !intent.client_id || !intent.activated_at) throw failure('unverified_qualifying_sale');
+      const intent = await one(db, 'public_purchase_intents', 'id,status,channel,created_by_user_id,agreement_id,client_id,activated_at,selected_billing_cadence,platform_fee_cents', 'id', intentId);
+      if (!intent || intent.status !== 'completed' || intent.channel !== 'sales_assisted' || !intent.created_by_user_id || !intent.agreement_id || !intent.client_id || !intent.activated_at) throw failure('unverified_qualifying_sale');
       const client = await one(db, 'clients', 'id,billing_status,subscription_status', 'id', intent.client_id);
       if (!isActiveClient(client)) throw failure('client_not_active');
       const cadence = String(intent.selected_billing_cadence || '').toLowerCase();
