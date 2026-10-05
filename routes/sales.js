@@ -4,6 +4,8 @@ const express = require('express')
 const crypto = require('crypto')
 const Stripe = require('stripe')
 const { supabaseAdmin } = require('../src/lib/supabaseClient')
+const { salesRepProfile } = require('../src/lib/salesRepProfile')
+const { salesHubMetrics } = require('../src/lib/salesHubMetrics')
 const { verifyReadyGhlBinding } = require('../src/lib/ghlSalesIntegration')
 const { htmlToPdf } = require('../utils/pdfRenderer')
 const { buildMembershipAgreementHtml } = require('../utils/renderMembershipAgreement')
@@ -510,7 +512,21 @@ function createSalesRouter(options = {}) {
     }
   }
 
-  router.get('/me', (req, res) => res.json(req.salesRep))
+  router.get('/me', async (req, res) => {
+    try {
+      return res.json(await salesRepProfile(req.salesRep, db))
+    } catch (_error) {
+      return res.status(503).json({ code: 'sales_profile_unavailable', detail: 'Your sales profile could not be loaded. Please try again.' })
+    }
+  })
+
+  router.get('/hub-metrics', async (_req, res) => {
+    try {
+      return res.json(await salesHubMetrics(db))
+    } catch (_error) {
+      return res.status(503).json({ code: 'sales_hub_metrics_unavailable', detail: 'Team metrics could not be loaded. Please try again.' })
+    }
+  })
 
   router.get('/packages', (_req, res) => {
     return res.json({ items: listSalesPackages({ env: process.env }) })
