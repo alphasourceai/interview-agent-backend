@@ -51,8 +51,8 @@ async function htmlToPdf(html, options = {}) {
   const launchCommon = {
     executablePath,
     defaultViewport: chromium.defaultViewport,
-    args: chromium.args,
-    headless: chromium.headless,
+    args: process.platform === 'darwin' ? chromium.args.filter(arg => !['--single-process', '--no-zygote', '--in-process-gpu'].includes(arg) && !arg.startsWith('--headless')) : chromium.args,
+    headless: process.platform === 'darwin' ? true : chromium.headless,
     protocolTimeout: 90_000
   };
 
@@ -79,6 +79,10 @@ async function htmlToPdf(html, options = {}) {
 
     const pdfBuffer = await page.pdf({
       format: options.format || 'A4',
+      landscape: options.landscape === true,
+      displayHeaderFooter: options.displayHeaderFooter === true,
+      headerTemplate: options.headerTemplate || '<span></span>',
+      footerTemplate: options.footerTemplate || '<span></span>',
       printBackground: options.printBackground !== false,
       margin: options.margin || { top: '16mm', right: '14mm', bottom: '16mm', left: '14mm' },
       preferCSSPageSize: true

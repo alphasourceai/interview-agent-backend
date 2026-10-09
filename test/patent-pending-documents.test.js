@@ -17,6 +17,10 @@ const gettingStartedPlaybook = fs.readFileSync(
   path.join(root, 'templates', 'email-attachments', 'alphascreen-getting-started-playbook-source', 'playbook.html'),
   'utf8'
 )
+const candidateReportMark = fs.readFileSync(
+  path.join(root, 'templates', 'pdf', 'assets', 'alphascreen-mark-08-navy.svg'),
+  'utf8'
+)
 
 function count(value, phrase) {
   return String(value).split(phrase).length - 1
@@ -37,7 +41,7 @@ test('new membership agreements include the scoped Section 10 sentence once', ()
   assert.match(html, /10\. Intellectual Property[\s\S]*Certain alphaScreen technologies are patent pending\./)
 })
 
-test('new candidate reports include one visually secondary first-page notice', () => {
+test('new candidate reports use the static alphaScreen vector lockup and one secondary first-page notice', () => {
   const html = buildCandidateReportHtml({
     name: 'Synthetic Candidate',
     email: 'candidate@example.test',
@@ -49,8 +53,12 @@ test('new candidate reports include one visually secondary first-page notice', (
   })
 
   assert.equal(count(html, 'alphaScreen technology — Patent Pending'), 1)
-  assert.match(html, /<h2>Candidate Report<\/h2>\s*<p class="patent-notice">alphaScreen technology — Patent Pending<\/p>/)
-  assert.match(html, /\.patent-notice[\s\S]*font-size: 11px/)
+  assert.match(html, /data:image\/svg\+xml;base64,/)
+  assert.match(html, /alphaScreen \/ Candidate review brief/)
+  assert.match(html, /<header class="hero">[\s\S]*<p class="patent-notice">alphaScreen technology — Patent Pending<\/p>[\s\S]*<\/header>/)
+  assert.match(html, /\.patent-notice[\s\S]*font-size:9px/)
+  assert.match(candidateReportMark, /<path\b/)
+  assert.doesNotMatch(candidateReportMark, /<image\b|data:image/i)
 })
 
 test('the security overview cover includes one compact approved badge', () => {

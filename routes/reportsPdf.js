@@ -1,6 +1,13 @@
 const router = require('express').Router();
 const { htmlToPdf } = require('../utils/pdfRenderer');
 const { buildCandidateReportHtml } = require('../utils/renderCandidateReport');
+const { buildCandidateReportPayload } = require('../utils/candidateReportData');
+const { getCandidateReportPdfOptions } = require('../utils/renderCandidateReport');
+
+function interviewSelect() {
+  const base = 'id, created_at, candidate_id, client_id, role_id, attempt_number, attempt_mode, previous_attempt_id, replacement_authorization_id, status, video_url, transcript_url, transcript, analysis_url, analysis, transcript_scores, perception_scores, interview_summary, unanswered_candidate_questions, failure_code, failure_stage, conversation_progress_state, client_end_reason, has_substantive_response';
+  return process.env.EXPOSE_INTERVIEW_ANALYSIS_V2 === 'true' ? base + ', interview_analysis_v2' : base;
+}
 const Sentry = require('@sentry/node');
 const { supabaseAdmin } = require('../src/lib/supabaseClient');
 const {
@@ -129,7 +136,7 @@ router.post('/preview-pdf', async (req, res) => {
   try {
     const data = extractData(req.body);
     const html = buildCandidateReportHtml(data);
-    const pdf = await htmlToPdf(html);
+    const pdf = await htmlToPdf(html, getCandidateReportPdfOptions(data));
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', 'inline; filename="candidate-report.pdf"');
     return res.send(pdf);
@@ -171,7 +178,7 @@ async function handleGenerate(req, res) {
     if (interview_id) {
       const { data: ivById, error: ivByIdErr } = await supabaseAdmin
         .from('interviews')
-        .select('id, created_at, candidate_id, client_id, role_id, attempt_number, attempt_mode, previous_attempt_id, replacement_authorization_id, status, video_url, transcript_url, transcript, analysis_url, analysis, transcript_scores, perception_scores, interview_summary, unanswered_candidate_questions')
+        .select(interviewSelect())
         .eq('id', interview_id)
         .maybeSingle();
       if (ivByIdErr) throw ivByIdErr;
@@ -219,7 +226,7 @@ async function handleGenerate(req, res) {
       if (!latestInterview && reportRow.interview_id) {
         const { data: boundInterview, error: boundInterviewError } = await supabaseAdmin
           .from('interviews')
-          .select('id, created_at, candidate_id, client_id, role_id, attempt_number, attempt_mode, previous_attempt_id, replacement_authorization_id, status, video_url, transcript_url, transcript, analysis_url, analysis, transcript_scores, perception_scores, interview_summary, unanswered_candidate_questions')
+          .select(interviewSelect())
           .eq('id', reportRow.interview_id)
           .maybeSingle();
         if (boundInterviewError) throw boundInterviewError;
@@ -307,7 +314,7 @@ async function handleGenerate(req, res) {
     if (!latestInterview) {
         const { data: ivs, error: ivErr } = await supabaseAdmin
           .from('interviews')
-          .select('id, created_at, candidate_id, client_id, role_id, attempt_number, attempt_mode, previous_attempt_id, replacement_authorization_id, status, video_url, transcript_url, transcript, analysis_url, analysis, transcript_scores, perception_scores, interview_summary, unanswered_candidate_questions')
+          .select(interviewSelect())
           .eq('candidate_id', reportRow.candidate_id)
           .order('created_at', { ascending: false })
           .limit(1);
@@ -355,307 +362,17 @@ async function handleGenerate(req, res) {
       client = clientRow || null;
     }
 
-    // Normalize to the template contract (flat keys expected by candidate-report.hbs)
-    const analysis = reportRow.analysis || {};
-    const rbRaw = analysis.interview || reportRow.interview_breakdown || {};
-    const resumeRaw = analysis.resume || reportRow.resume_breakdown || {};
-
-    // If shape is { scores: {...}, summary }, flatten to a single object
-    const rb = rbRaw?.scores ? { ...rbRaw.scores, summary: rbRaw.summary } : rbRaw;
-    const resume = resumeRaw?.scores ? { ...resumeRaw.scores, summary: resumeRaw.summary } : resumeRaw;
-
-    const ivAnalysis = latestInterview?.analysis || null;
-    const ivScores = (ivAnalysis && ivAnalysis.scores) || {};
-    const reportLevelSummary = typeof reportRow?.analysis?.summary === 'string'
-      ? reportRow.analysis.summary.trim()
-      : '';
-
-    const name = (cand?.name && cand.name.trim()) || 'Unknown Candidate';
-    const email = (cand?.email && cand.email.trim()) || '';
-
-    function coerceNumber(val) {
-      if (val === null || val === undefined) return null;
-      if (typeof val === 'number' && Number.isFinite(val)) {
-        // Normalize 0–1 to 0–100 if clearly intended as a percent
-        if (val > 0 && val <= 1) return Math.round(val * 100);
-        return val;
-      }
-      if (typeof val === 'string') {
-        // If it already contains a %, parse the numeric part and return
-        if (val.includes('%')) {
-          const m = val.match(/-?\d+(?:\.\d+)?/);
-          return m ? Number(m[0]) : null;
-        }
-        // Otherwise parse and normalize 0–1 style strings
-        const m = val.match(/-?\d+(?:\.\d+)?/);
-        if (!m) return null;
-        const n = Number(m[0]);
-        if (!Number.isFinite(n)) return null;
-        return (n > 0 && n <= 1) ? Math.round(n * 100) : n;
-      }
-      return null;
-    }
-
-    function parseJsonObject(value) {
-      if (!value) return null;
-      if (typeof value === 'object' && !Array.isArray(value)) return value;
-      if (typeof value === 'string') {
-        try {
-          const parsed = JSON.parse(value);
-          return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
-        } catch {
-          return null;
-        }
-      }
-      return null;
-    }
-
-    function pickScore(obj, keys = []) {
-      if (!obj || typeof obj !== 'object') return null;
-      for (const k of keys) {
-        if (Object.prototype.hasOwnProperty.call(obj, k)) {
-          const n = coerceNumber(obj[k]);
-          if (n !== null) return n;
-        }
-      }
-      return null;
-    }
-
-    function pickScoreFromArray(arr, names = []) {
-      if (!Array.isArray(arr)) return null;
-      const keys = ['id','key','name','label','type'];
-      for (const target of names) {
-        for (const item of arr) {
-          for (const k of keys) {
-            if (item && typeof item === 'object' && typeof item[k] === 'string') {
-              if (item[k].toLowerCase() === String(target).toLowerCase()) {
-                const n = coerceNumber(item.score ?? item.value ?? item.percent ?? item.percentage);
-                if (n !== null) return n;
-              }
-            }
-          }
-        }
-      }
-      return null;
-    }
-
-    // Deep search for a named score anywhere in a nested object/array
-    function deepFindScore(source, names = []) {
-      const seen = new Set();
-      const targets = names.map((n) => String(n).toLowerCase());
-      const valueAliases = ['score','value','percent','percentage','pct'];
-      const idAliases = ['id','key','name','label','type'];
-      const queue = [source];
-      while (queue.length) {
-        const cur = queue.shift();
-        if (!cur || typeof cur !== 'object') continue;
-        if (seen.has(cur)) continue;
-        seen.add(cur);
-
-        // 1) Direct property match: { experience: 0.82 } or { experience: "82%" }
-        for (const [k, v] of Object.entries(cur)) {
-          if (targets.includes(String(k).toLowerCase())) {
-            const n = coerceNumber(v);
-            if (n !== null) return n;
-          }
-        }
-        // 2) Array of objects with id/name/label matching and a score/value/percent
-        if (Array.isArray(cur)) {
-          for (const item of cur) {
-            if (!item || typeof item !== 'object') continue;
-            for (const idk of idAliases) {
-              const idv = item[idk];
-              if (typeof idv === 'string' && targets.includes(idv.toLowerCase())) {
-                for (const vk of valueAliases) {
-                  const n = coerceNumber(item[vk]);
-                  if (n !== null) return n;
-                }
-              }
-            }
-          }
-        }
-        // 3) Recurse into nested objects/arrays
-        for (const v of Object.values(cur)) {
-          if (v && typeof v === 'object') queue.push(v);
-        }
-      }
-      return null;
-    }
-
-    // Helper to fetch the dashboard-normalized row
-    async function getDashboardRowNormalized(clientId, candidateId) {
-      try {
-        const port = process.env.PORT || 10000;
-        const url = `http://localhost:${port}/dashboard/rows?client_id=${encodeURIComponent(clientId)}&candidate_id=${encodeURIComponent(candidateId)}`;
-        const resp = await fetch(url, { method: 'GET' });
-        if (!resp || !resp.ok) return null;
-        const json = await resp.json().catch(() => null);
-        if (!json) return null;
-        const item = Array.isArray(json?.items) ? json.items[0] : (Array.isArray(json) ? json[0] : json);
-        return item || null;
-      } catch (_) {
-        return null;
-      }
-    }
-
-    // Summaries (prefer report analysis → report-level → interview analysis)
-    const resume_summary = (typeof resume.summary === 'string' && resume.summary.trim())
-      ? resume.summary.trim()
-      : 'Summary not available';
-
-    const interview_summary =
-      (typeof rb.summary === 'string' && rb.summary.trim())
-        ? rb.summary.trim()
-        : (reportLevelSummary ||
-           (typeof ivAnalysis?.summary === 'string' && ivAnalysis.summary.trim()) ||
-           'Summary not available');
-
-    // Breakdowns with numeric coercion AND embedded summaries (template expects nested .summary)
-    const resumeScores = (resume && (resume.scores || resume)) || {};
-
-    const experienceScore =
-      pickScore(resumeScores, ['experience','exp','experience_score','experienceScore','experiencePercent','experience_percentage','experience_pct','exp_pct','experience_match_percent']) ??
-      pickScore(resume,      ['experience','exp','experience_score','experienceScore','experiencePercent','experience_percentage','experience_pct','exp_pct','experience_match_percent']) ??
-      pickScoreFromArray(resumeRaw.categories || resumeRaw.items || resumeRaw.metrics || [], ['experience','exp']) ??
-      deepFindScore(analysis.resume || resumeRaw, ['experience','exp']) ??
-      0;
-
-    const skillsScore =
-      pickScore(resumeScores, ['skills','skill','skills_score','skillsScore','skillsPercent','skills_percentage','skills_pct','skill_pct','skills_match_percent']) ??
-      pickScore(resume,       ['skills','skill','skills_score','skillsScore','skillsPercent','skills_percentage','skills_pct','skill_pct','skills_match_percent']) ??
-      pickScoreFromArray(resumeRaw.categories || resumeRaw.items || resumeRaw.metrics || [], ['skills','skill']) ??
-      deepFindScore(analysis.resume || resumeRaw, ['skills','skill']) ??
-      0;
-
-    const educationScore =
-      pickScore(resumeScores, ['education','edu','education_score','educationScore','educationPercent','education_percentage','education_pct','edu_pct','education_match_percent']) ??
-      pickScore(resume,       ['education','edu','education_score','educationScore','educationPercent','education_percentage','education_pct','edu_pct','education_match_percent']) ??
-      pickScoreFromArray(resumeRaw.categories || resumeRaw.items || resumeRaw.metrics || [], ['education','edu']) ??
-      deepFindScore(analysis.resume || resumeRaw, ['education','edu']) ??
-      0;
-
-    const resume_breakdown = {
-      experience: experienceScore,
-      skills: skillsScore,
-      education: educationScore,
-      summary: resume_summary
-    };
-    const transcriptScores = parseJsonObject(latestInterview?.transcript_scores) || {};
-    const evidenceStrengthFromTranscript = coerceNumber(transcriptScores.confidence);
-    const aiAidedRiskFromTranscript = typeof transcriptScores.ai_aided_risk === 'string' ? transcriptScores.ai_aided_risk.trim().toLowerCase() : '';
-    const aiAidedRiskReasonFromTranscript = typeof transcriptScores.ai_aided_risk_reason === 'string' ? transcriptScores.ai_aided_risk_reason.trim() : '';
-
-    const clarityFromReport = coerceNumber(rb.clarity);
-    const confidenceFromReport = coerceNumber(rb.confidence);
-    const clarityFromIvScores = coerceNumber(ivScores.clarity);
-    const confidenceFromIvScores = coerceNumber(ivScores.confidence);
-    const interview_breakdown = {
-      clarity: clarityFromReport !== null ? clarityFromReport : clarityFromIvScores,
-      confidence: confidenceFromReport !== null ? confidenceFromReport : confidenceFromIvScores,
-      evidence_strength: evidenceStrengthFromTranscript !== null ? evidenceStrengthFromTranscript : null,
-      ai_aided_risk: aiAidedRiskFromTranscript,
-      ai_aided_risk_reason: aiAidedRiskReasonFromTranscript,
-      summary: interview_summary
-    };
-
-    let unansweredCandidateQuestions = Array.isArray(reportRow.unanswered_candidate_questions)
-      ? reportRow.unanswered_candidate_questions.filter(q => typeof q === 'string' && q.trim())
-      : [];
-
-    // Use the same source-of-truth fields as /dashboard/rows.
-    const candidateSummary = parseJsonObject(cand?.analysis_summary) || {};
-    const resumeFromCandidate =
-      coerceNumber(
-        candidateSummary.resume_score ??
-        candidateSummary.resume ??
-        candidateSummary.resume_match_percent ??
-        candidateSummary.resumeMatchPercent
-      );
-    const interviewFromTranscript = coerceNumber(transcriptScores.overall);
-    const overallFromCurrent =
-      (resumeFromCandidate !== null && interviewFromTranscript !== null)
-        ? Math.round((resumeFromCandidate + interviewFromTranscript) / 2)
-        : null;
-
-    if (resumeFromCandidate !== null) reportRow.resume_score = resumeFromCandidate;
-    if (interviewFromTranscript !== null) reportRow.interview_score = interviewFromTranscript;
-    reportRow.overall_score = overallFromCurrent;
-
-    const resumeSummaryFromCandidate =
-      (typeof candidateSummary.summary === 'string' && candidateSummary.summary.trim()) ||
-      (typeof candidateSummary.resume_summary === 'string' && candidateSummary.resume_summary.trim()) ||
-      (typeof candidateSummary.resumeSummary === 'string' && candidateSummary.resumeSummary.trim()) ||
-      (typeof candidateSummary.resume_analysis?.summary === 'string' && candidateSummary.resume_analysis.summary.trim()) ||
-      '';
-    if (resumeSummaryFromCandidate) {
-      resume_breakdown.summary = resumeSummaryFromCandidate;
-    }
-
-    const experienceFromCandidate = coerceNumber(
-      candidateSummary.experience_match_percent ?? candidateSummary.experienceMatchPercent
-    );
-    const skillsFromCandidate = coerceNumber(
-      candidateSummary.skills_match_percent ?? candidateSummary.skillsMatchPercent
-    );
-    const educationFromCandidate = coerceNumber(
-      candidateSummary.education_match_percent ?? candidateSummary.educationMatchPercent
-    );
-    if (experienceFromCandidate !== null) resume_breakdown.experience = experienceFromCandidate;
-    if (skillsFromCandidate !== null) resume_breakdown.skills = skillsFromCandidate;
-    if (educationFromCandidate !== null) resume_breakdown.education = educationFromCandidate;
-
-    const perceptionScores = parseJsonObject(latestInterview?.perception_scores) || {};
-    const clarityFromInterview = coerceNumber(perceptionScores.clarity);
-    const confidenceFromInterview = coerceNumber(perceptionScores.confidence);
-    const engagementFromInterview = coerceNumber(perceptionScores.engagement);
-    if (clarityFromInterview !== null) interview_breakdown.clarity = clarityFromInterview;
-    if (confidenceFromInterview !== null) interview_breakdown.confidence = confidenceFromInterview;
-    if (engagementFromInterview !== null) {
-      interview_breakdown.engagement = engagementFromInterview;
-    }
-
-    const interviewSummaryFromInterview = typeof latestInterview?.interview_summary === 'string'
-      ? latestInterview.interview_summary.trim()
-      : '';
-    if (interviewSummaryFromInterview) {
-      interview_breakdown.summary = interviewSummaryFromInterview;
-    }
-
-    if (Array.isArray(latestInterview?.unanswered_candidate_questions)) {
-      const cleaned = latestInterview.unanswered_candidate_questions
-        .map((q) => (q == null ? '' : String(q).trim()))
-        .filter(Boolean);
-      unansweredCandidateQuestions = cleaned;
-    }
-
-    const status = latestInterview?.video_url ? 'Interview Completed' : 'Pending';
-
-    if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
-      Sentry.addBreadcrumb({ category: 'reports', level: 'info', message: 'payload:build' });
-    }
-    const payload = {
-      name,
-      email,
-      company_name: typeof client?.name === 'string' ? client.name.trim() : '',
-      role_name: typeof role?.title === 'string' ? role.title.trim() : '',
-      status,
-      resume_score: coerceNumber(reportRow.resume_score) ?? null,
-      interview_score: coerceNumber(reportRow.interview_score) ?? null,
-      overall_score: coerceNumber(reportRow.overall_score) ?? null,
-      resume_breakdown,
-      resume_summary: resume_breakdown.summary || resume_summary,
-      interview_breakdown,
-      interview_summary: interview_breakdown.summary || interview_summary,
-      created_at: reportRow.created_at,
-      unanswered_candidate_questions: unansweredCandidateQuestions
-    };
+    const payload = buildCandidateReportPayload({
+      candidate: cand, interview: latestInterview, role, client: client || {},
+      exposeAdvanced: process.env.EXPOSE_INTERVIEW_ANALYSIS_V2 === 'true',
+    });
 
     // 4) Render and convert to PDF
     const html = buildCandidateReportHtml(payload);
     if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
       Sentry.addBreadcrumb({ category: 'render', level: 'info', message: 'html:built' });
     }
-    const pdfBuffer = await htmlToPdf(html);
+    const pdfBuffer = await htmlToPdf(html, getCandidateReportPdfOptions(payload));
     if (process.env.SENTRY_ENABLED === '1' && process.env.SENTRY_DSN) {
       Sentry.addBreadcrumb({ category: 'render', level: 'info', message: 'pdf:generated', data: { bytes: Buffer.isBuffer(pdfBuffer) ? pdfBuffer.length : undefined } });
     }

@@ -147,7 +147,7 @@ async function withRouter(db, callback) {
     }
     if (request === '../utils/pdfRenderer' && /routes\/reportsPdf\.js$/.test(parent?.filename || '')) return { htmlToPdf: async (html) => Buffer.from(html) };
     if (request === '../utils/renderCandidateReport' && /routes\/reportsPdf\.js$/.test(parent?.filename || '')) {
-      return { buildCandidateReportHtml: (payload) => { capture.payloads.push(payload); return JSON.stringify(payload); } };
+      return { buildCandidateReportHtml: (payload) => { capture.payloads.push(payload); return JSON.stringify(payload); }, getCandidateReportPdfOptions: () => ({ landscape: true }) };
     }
     return originalLoad.call(this, request, parent, isMain);
   };

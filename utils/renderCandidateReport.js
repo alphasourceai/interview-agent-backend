@@ -1,12 +1,13 @@
 const fs = require('fs');
 const path = require('path');
 const Handlebars = require('handlebars');
+const { score, advanced } = require('./candidateReportData');
 
 const templatePath = path.join(__dirname, '..', 'templates', 'pdf', 'candidate-report.hbs');
 const templateSrc = fs.readFileSync(templatePath, 'utf8');
 const template = Handlebars.compile(templateSrc);
 
-const LOGO_FILENAME = 'No bg - color logo - dark text.png';
+const LOGO_FILENAME = 'alphascreen-mark-08-navy.svg';
 
 let cachedLogoSrc = null;
 let triedLogoLoad = false;
@@ -25,22 +26,26 @@ Handlebars.registerHelper('scoreBarWidth', (v) => {
 });
 
 function coerceNumber(val) {
-  if (val === null || val === undefined) return null;
-  if (typeof val === 'number' && Number.isFinite(val)) {
-    if (val > 0 && val <= 1) return Math.round(val * 100);
-    return val;
-  }
-  if (typeof val === 'string') {
-    const t = val.trim();
-    if (!t) return null;
-    const m = t.match(/-?\d+(?:\.\d+)?/);
-    if (!m) return null;
-    const n = Number(m[0]);
-    if (!Number.isFinite(n)) return null;
-    if (n > 0 && n <= 1) return Math.round(n * 100);
-    return n;
-  }
-  return null;
+  return score(val);
+}
+
+const fontDir = path.join(__dirname, '../templates/email-attachments/alphascreen-getting-started-playbook-source/fonts');
+const fontCss = [['Regular',400], ['SemiBold',600], ['Bold',700]].map(([name, weight]) =>
+  `@font-face{font-family:Raleway;font-weight:${weight};src:url(data:font/ttf;base64,${fs.readFileSync(path.join(fontDir, 'Raleway-' + name + '.ttf')).toString('base64')}) format('truetype');}`
+).join('');
+function enumLabel(value) {
+  return nonEmptyString(value).replace(/[_-]/g, ' ').replace(/^\w/, c => c.toUpperCase()) || 'Not assessed';
+}
+const candidateReportPdfOptions = Object.freeze({
+  landscape: true, margin: { top: '12mm', right: '10mm', bottom: '14mm', left: '10mm' },
+  displayHeaderFooter: true,
+  footerTemplate: '<div style="font-family:Arial;font-size:8px;color:#66718a;width:100%;padding:0 10mm;display:flex;justify-content:space-between"><span>alphaScreen · Decision support, not a hiring decision.</span><span><span class="pageNumber"></span> / <span class="totalPages"></span></span></div>',
+});
+function getCandidateReportPdfOptions(payload = {}) {
+  const uuid = value => /^[0-9a-f-]{36}$/i.test(String(value || '')) ? String(value) : 'Unavailable';
+  return { ...candidateReportPdfOptions,
+    headerTemplate: '<div style="font-family:Arial;font-size:7px;color:#66718a;padding:0 10mm;width:100%">Candidate reference: ' + uuid(payload.candidate_id) + ' · Interview reference: ' + uuid(payload.interview_id) + '</div>',
+  };
 }
 
 function nonEmptyString(value) {
@@ -104,21 +109,19 @@ function normalizeQuestions(value) {
 }
 
 function readLogoAsDataUri() {
-  if (process.env.PDF_LOGO_DATA_URI) return String(process.env.PDF_LOGO_DATA_URI);
+  if (/^data:image\/(svg\+xml|png);base64,[A-Za-z0-9+/=]+$/.test(process.env.PDF_LOGO_DATA_URI || '')) return String(process.env.PDF_LOGO_DATA_URI);
   if (triedLogoLoad) return cachedLogoSrc || '';
   triedLogoLoad = true;
 
   const candidates = [
     path.join(__dirname, '..', 'templates', 'pdf', 'assets', LOGO_FILENAME),
-    path.join(__dirname, '..', 'templates', 'pdf', 'assets', 'logo.png'),
-    path.join(__dirname, '..', 'public', LOGO_FILENAME),
   ];
 
   for (const logoPath of candidates) {
     try {
       if (fs.existsSync(logoPath)) {
         const base64 = fs.readFileSync(logoPath).toString('base64');
-        cachedLogoSrc = `data:image/png;base64,${base64}`;
+        cachedLogoSrc = `data:image/svg+xml;base64,${base64}`;
         return cachedLogoSrc;
       }
     } catch (_) {}
@@ -171,6 +174,12 @@ function buildCandidateReportHtml(payload) {
   );
 
   const renderData = {
+    font_css: fontCss,
+    advanced: advanced(p.interview_analysis_v2),
+    synthetic_demo: p.synthetic_demo === true,
+    reliability_note: nonEmptyString(p.reliability_note),
+    date_label: p.created_at && Number.isFinite(Date.parse(p.created_at)) ? new Date(p.created_at).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' }) : 'Date unavailable',
+    attempt_label: Number.isInteger(Number(p.attempt_number)) && Number(p.attempt_number) > 0 ? 'Attempt ' + Number(p.attempt_number) : 'Attempt unavailable',
     name: nonEmptyString(p.name),
     email: nonEmptyString(p.email),
     company_name: nonEmptyString(p.company_name ?? p.client_name),
@@ -196,7 +205,15 @@ function buildCandidateReportHtml(payload) {
     logo_src: readLogoAsDataUri()
   };
 
+  renderData.resume_rows = ['experience', 'skills', 'education'].map(key => ({ label: enumLabel(key), score: resumeBreakdown[key], color: '#03ACDF' }));
+  renderData.interview_rows = ['clarity', 'confidence', 'engagement'].map(key => ({ label: enumLabel(key), score: interviewBreakdown[key], color: '#A37FF5' }));
+  renderData.advanced_rows = ['response_specificity', 'answer_directness', 'answer_consistency', 'communication_structure'].map((key, i) => ({ label: enumLabel(key), score: renderData.advanced.scores[key], color: ['#03ACDF','#A37FF5','#00BB88','#EDA311'][i] }));
+  renderData.has_advanced = Object.values(renderData.advanced.scores).some(value => value !== null) || !!renderData.advanced.evidence_summary || renderData.advanced.evidence.length > 0 || renderData.advanced.limitations.length > 0 || Object.values(renderData.advanced.conditions).some(Boolean) || Object.values(renderData.advanced.risk).some(Boolean);
+  renderData.badges = ['evaluation_conditions', 'signal_confidence', 'audio_quality_issues', 'distraction_risk'].filter(key => renderData.advanced.conditions[key]).map(key => ({ label: enumLabel(key), value: enumLabel(renderData.advanced.conditions[key]) }));
+  if (renderData.advanced.risk.integrity_risk) renderData.badges.push({ label: 'Integrity risk', value: enumLabel(renderData.advanced.risk.integrity_risk) });
+  renderData.risk_label = enumLabel(interviewBreakdown.ai_aided_risk);
+
   return template(renderData);
 }
 
-module.exports = { buildCandidateReportHtml };
+module.exports = { buildCandidateReportHtml, candidateReportPdfOptions, getCandidateReportPdfOptions };
