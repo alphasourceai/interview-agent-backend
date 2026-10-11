@@ -116,9 +116,16 @@ function normalizeRubricQuestions(questions) {
   return normalized
 }
 
-function generationContext(role, membershipLevel) {
-  const normalizedMembership = normalizeMembershipLevel(membershipLevel || role?.membership_level || role?.plan_tier)
-  const planCapacity = requirePlanCapacity(normalizedMembership)
+// `capacity` is the client's resolved capacity (planCapacity.js), which for an
+// Enterprise client carries its own question count and length. Without one, the
+// tier's plan values apply.
+function generationContext(role, membershipLevel, capacity = null) {
+  const normalizedMembership = normalizeMembershipLevel(
+    membershipLevel || capacity?.membership_level || role?.membership_level || role?.plan_tier
+  )
+  const planCapacity = capacity && capacity.membership_level === normalizedMembership
+    ? capacity
+    : requirePlanCapacity(normalizedMembership)
   const interviewType = requireInterviewType(role?.interview_type || 'core')
   const typeConfig = getInterviewTypeConfig(interviewType)
   return { membershipLevel: normalizedMembership, planCapacity, interviewType, typeConfig }
@@ -136,8 +143,13 @@ function coerceGeneratedRubric(value) {
   }
 }
 
-function validateRubric(rubric, { membershipLevel, interviewType } = {}) {
-  const capacity = getPlanCapacity(membershipLevel)
+// `scoredQuestionCount` is the count the rubric was generated for; without it the
+// tier's plan count is expected.
+function validateRubric(rubric, { membershipLevel, interviewType, scoredQuestionCount } = {}) {
+  const planCapacity = getPlanCapacity(membershipLevel)
+  const capacity = planCapacity && Number.isInteger(scoredQuestionCount) && scoredQuestionCount > 0
+    ? { ...planCapacity, scored_question_count: scoredQuestionCount }
+    : planCapacity
   const canonicalType = normalizeInterviewType(interviewType)
   const typeConfig = getInterviewTypeConfig(canonicalType)
   const errors = []
@@ -184,8 +196,8 @@ function validateRubric(rubric, { membershipLevel, interviewType } = {}) {
   return { ok: errors.length === 0, errors, questions }
 }
 
-function buildRubricPrompt(role, jdText, membershipLevel) {
-  const context = generationContext(role, membershipLevel)
+function buildRubricPrompt(role, jdText, membershipLevel, capacity = null) {
+  const context = generationContext(role, membershipLevel, capacity)
   const blueprint = context.typeConfig.blueprint.slice(0, context.planCapacity.scored_question_count)
   return `You are an AI interview designer. Create a role-specific scored interview rubric.
 
@@ -246,8 +258,8 @@ Client-provided manual questions or priorities:
 ${Array.isArray(role?.manual_questions) ? JSON.stringify(role.manual_questions) : String(role?.manual_questions || 'None')}`
 }
 
-function buildRubricCorrectionPrompt(role, jdText, membershipLevel, priorRubric, errors) {
-  return `${buildRubricPrompt(role, jdText, membershipLevel)}
+function buildRubricCorrectionPrompt(role, jdText, membershipLevel, priorRubric, errors, capacity = null) {
+  return `${buildRubricPrompt(role, jdText, membershipLevel, capacity)}
 
 QUALITY CORRECTION:
 The prior output was rejected by deterministic validation.
@@ -320,8 +332,8 @@ function scoringGuidance(primaryCompetency) {
   }
 }
 
-function buildFallbackRubric(role, membershipLevel) {
-  const context = generationContext(role, membershipLevel)
+function buildFallbackRubric(role, membershipLevel, capacity = null) {
+  const context = generationContext(role, membershipLevel, capacity)
   const roleTitle = cleanText(role?.title) || 'this role'
   const questions = context.typeConfig.blueprint
     .slice(0, context.planCapacity.scored_question_count)
@@ -342,32 +354,47 @@ function buildFallbackRubric(role, membershipLevel) {
   }
 }
 
-async function generateRubricForRole({ role, jdText, membershipLevel, openaiClient = openai, logger = console }) {
-  const context = generationContext(role, membershipLevel)
+async function generateRubricForRole({ role, jdText, membershipLevel, capacity = null, openaiClient = openai, logger = console }) {
+  const context = generationContext(role, membershipLevel, capacity)
   const rubricObj = await requestRubric({
-    prompt: buildRubricPrompt(role, jdText, context.membershipLevel),
+    prompt: buildRubricPrompt(role, jdText, context.membershipLevel, context.planCapacity),
     openaiClient,
     logger
   })
   return rubricObj
     ? coerceGeneratedRubric(rubricObj)
-    : buildFallbackRubric(role, context.membershipLevel)
+    : buildFallbackRubric(role, context.membershipLevel, context.planCapacity)
 }
 
-async function generateReplacementRubric({ role, jdText, membershipLevel, openaiClient = openai, logger = console }) {
-  const context = generationContext(role, membershipLevel)
+// The length and question count the rubric was generated for, stamped on it so
+// the role keeps them when the client's settings change later
+// (resolveRoleInterviewCapacity in planCapacity.js).
+function stampCapacity(rubric, planCapacity) {
+  return {
+    ...rubric,
+    max_interview_minutes: planCapacity.max_interview_minutes,
+    scored_question_count: planCapacity.scored_question_count,
+  }
+}
+
+async function generateReplacementRubric({ role, jdText, membershipLevel, capacity = null, openaiClient = openai, logger = console }) {
+  const context = generationContext(role, membershipLevel, capacity)
   const initialRubric = await generateRubricForRole({
     role,
     jdText,
     membershipLevel: context.membershipLevel,
+    capacity: context.planCapacity,
     openaiClient,
     logger,
   })
   const initialValidation = validateRubric(initialRubric, {
     membershipLevel: context.membershipLevel,
     interviewType: context.interviewType,
+    scoredQuestionCount: context.planCapacity.scored_question_count,
   })
-  if (initialValidation.ok) return { ...initialRubric, questions: initialValidation.questions }
+  if (initialValidation.ok) {
+    return stampCapacity({ ...initialRubric, questions: initialValidation.questions }, context.planCapacity)
+  }
 
   const retryRubricRaw = await requestRubric({
     prompt: buildRubricCorrectionPrompt(
@@ -376,6 +403,7 @@ async function generateReplacementRubric({ role, jdText, membershipLevel, openai
       context.membershipLevel,
       initialRubric,
       initialValidation.errors,
+      context.planCapacity,
     ),
     openaiClient,
     logger,
@@ -384,6 +412,7 @@ async function generateReplacementRubric({ role, jdText, membershipLevel, openai
   const retryValidation = validateRubric(retryRubric, {
     membershipLevel: context.membershipLevel,
     interviewType: context.interviewType,
+    scoredQuestionCount: context.planCapacity.scored_question_count,
   })
   if (!retryValidation.ok) {
     throw new RubricQuestionQualityError({
@@ -392,7 +421,7 @@ async function generateReplacementRubric({ role, jdText, membershipLevel, openai
       errors: retryValidation.errors,
     })
   }
-  return { ...retryRubric, questions: retryValidation.questions }
+  return stampCapacity({ ...retryRubric, questions: retryValidation.questions }, context.planCapacity)
 }
 
 function makeKBFromRubric(rubricObj) {
@@ -444,17 +473,43 @@ async function resolveMembershipLevelForRole(role, { membershipLevel, supabaseCl
   }
 }
 
+// The capacity a new rubric for this role is generated at: the client's resolved
+// capacity (its billing owner's, for a child entity), so an Enterprise client's
+// own question count and length apply. An explicitly named membership level is
+// taken at that tier's plan values, as before.
+async function resolveGenerationCapacityForRole(role, { membershipLevel, supabaseClient = supabase } = {}) {
+  const explicit = normalizeMembershipLevel(membershipLevel || role?.membership_level || role?.plan_tier)
+  if (explicit) return requirePlanCapacity(explicit)
+  const clientId = cleanText(role?.client_id)
+  if (!clientId) {
+    const error = new Error('role_membership_level_required')
+    error.code = 'ROLE_MEMBERSHIP_LEVEL_REQUIRED'
+    throw error
+  }
+  try {
+    return await resolvePlanCapacityForClient({ db: supabaseClient, clientId })
+  } catch (error) {
+    if (error?.code === 'PLAN_CAPACITY_LOOKUP_FAILED') {
+      throw new Error('plan_settings_lookup_failed')
+    }
+    const missing = new Error('role_membership_level_required')
+    missing.code = 'ROLE_MEMBERSHIP_LEVEL_REQUIRED'
+    throw missing
+  }
+}
+
 async function generateJdDerivedArtifactsForRole(
   { role, jdText },
   { supabaseClient = supabase, openaiClient = openai, logger = console, kbId, membershipLevel } = {}
 ) {
   if (!role?.id) throw new Error('role_id_required')
   const normalizedJdText = String(jdText || '').trim()
-  const resolvedMembership = await resolveMembershipLevelForRole(role, { membershipLevel, supabaseClient })
+  const capacity = await resolveGenerationCapacityForRole(role, { membershipLevel, supabaseClient })
   const rubric = await generateReplacementRubric({
     role,
     jdText: normalizedJdText,
-    membershipLevel: resolvedMembership,
+    membershipLevel: capacity.membership_level,
+    capacity,
     openaiClient,
     logger
   })
@@ -478,7 +533,7 @@ async function generateRubricAndKBForRole(roleId) {
     .single()
   if (roleErr || !role) throw new Error(`role_lookup_failed: ${roleErr?.message || 'not found'}`)
 
-  const membershipLevel = await resolveMembershipLevelForRole(role, { supabaseClient: supabase })
+  const capacity = await resolveGenerationCapacityForRole(role, { supabaseClient: supabase })
   let jdText = ''
   if (role.job_description_url) {
     const { bucket, key } = splitBucketAndKey(role.job_description_url)
@@ -488,7 +543,12 @@ async function generateRubricAndKBForRole(roleId) {
     }
   }
 
-  const rubric = await generateReplacementRubric({ role, jdText, membershipLevel })
+  const rubric = await generateReplacementRubric({
+    role,
+    jdText,
+    membershipLevel: capacity.membership_level,
+    capacity,
+  })
   const rubricQuestions = rubric.questions
   const descriptionExcerpt = jdText ? jdText.replace(/\s+/g, ' ').trim().slice(0, 400) : ''
   await supabase.from('roles').update({
@@ -533,6 +593,7 @@ module.exports = {
   generateRubricForRole,
   makeKBFromRubric,
   normalizeRubricQuestions,
+  resolveGenerationCapacityForRole,
   resolveMembershipLevelForRole,
   validateRubric,
 }

@@ -1,7 +1,9 @@
 'use strict';
 
 // A newly provisioned client must land on the billing model its tier implies,
-// so nothing has to be set by hand after a subscription starts.
+// so nothing has to be set by hand after a subscription starts. It does so by
+// leaving billing_model empty, which follows the tier: a stored value is an
+// explicit choice, and the webhook never writes one.
 //
 // Driven through the real webhook rather than an exported internal, so the
 // assertion is on what actually reaches client_plan_settings. The Stripe SDK,
@@ -16,6 +18,14 @@ const request = require('supertest');
 
 const ROOT = path.join(__dirname, '..');
 const routerPath = path.join(ROOT, 'src', 'routes', 'webhooks', 'stripe.js');
+const { normalizeBillingModel } = require(path.join(ROOT, 'src', 'services', 'billingModel.js'));
+
+// The model a provisioned row resolves to, and proof that it came from the tier
+// rather than from a value the webhook stored.
+function assertFollowsTier(upsert, expectedModel) {
+  assert.ok(!('billing_model' in upsert), 'the webhook does not write billing_model');
+  assert.equal(normalizeBillingModel(upsert.billing_model, upsert.plan_tier), expectedModel);
+}
 const stripeClientPath = path.join(ROOT, 'src', 'clients', 'stripe.js');
 const supabasePath = path.join(ROOT, 'src', 'clients', 'supabase.js');
 const activationPath = path.join(ROOT, 'src', 'services', 'publicPurchaseActivation.js');
@@ -127,7 +137,7 @@ test('an Essentials subscription provisions the fixed model', async () => {
   assert.equal((await post(app)).status, 200);
   assert.equal(db.upserts.length, 1);
   assert.equal(db.upserts[0].plan_tier, 'basic');
-  assert.equal(db.upserts[0].billing_model, 'fixed');
+  assertFollowsTier(db.upserts[0], 'fixed');
 });
 
 test('a Pro subscription provisions the rollover model', async () => {
@@ -138,7 +148,7 @@ test('a Pro subscription provisions the rollover model', async () => {
 
   assert.equal((await post(app)).status, 200);
   assert.equal(db.upserts[0].plan_tier, 'pro');
-  assert.equal(db.upserts[0].billing_model, 'rollover');
+  assertFollowsTier(db.upserts[0], 'rollover');
 });
 
 test('an Enterprise subscription provisions the usage model', async () => {
@@ -149,7 +159,7 @@ test('an Enterprise subscription provisions the usage model', async () => {
 
   assert.equal((await post(app)).status, 200);
   assert.equal(db.upserts[0].plan_tier, 'enterprise');
-  assert.equal(db.upserts[0].billing_model, 'usage');
+  assertFollowsTier(db.upserts[0], 'usage');
 });
 
 test('an Enterprise usage price carries through from the subscription metadata', async () => {
@@ -189,8 +199,7 @@ test('the existing plan settings fields are unchanged by the new column', async 
     per_role_fee: 699,
     included_interviews_per_role: 30,
     additional_interview_fee: 30,
-    max_interview_minutes: 12,
-    billing_model: 'rollover'
+    max_interview_minutes: 12
   });
 });
 

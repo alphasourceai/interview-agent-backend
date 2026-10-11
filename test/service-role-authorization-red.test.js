@@ -49,11 +49,11 @@ function createDb() {
 async function withRouter(routeName, db, callback) {
   const originalLoad = Module._load;
   Module._load = function patchedLoad(request, parent, isMain) {
-    const parentFile = parent?.filename || '';
-    if (request === '../../clients/supabase' && parentFile.includes(`/routes/client/${routeName}.js`)) {
+    const parentFile = (parent?.filename || '').replace(/\\/g, '/');
+    if (request === '../../clients/supabase' && parentFile.endsWith(`/src/routes/client/${routeName}.js`)) {
       return { supabaseAdmin: db, supabase: db };
     }
-    if (request === '../../middleware/auth' && parentFile.includes(`/routes/client/${routeName}.js`)) {
+    if (request === '../../middleware/auth' && parentFile.endsWith(`/src/routes/client/${routeName}.js`)) {
       return {
         requireAuth: (_req, _res, next) => next(),
         withClientScope: (_req, _res, next) => next(),

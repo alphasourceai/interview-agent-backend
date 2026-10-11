@@ -3,6 +3,7 @@
 const path = require('path');
 const { randomUUID } = require('crypto');
 const { getPlanCapacity } = require('./planCapacity');
+const { SCORED_QUESTIONS_MAX, SCORED_QUESTIONS_MIN } = require('./enterpriseSettings');
 
 const JD_MAX_BYTES = 20 * 1024 * 1024;
 const JD_FILE_TYPES = Object.freeze({
@@ -392,11 +393,21 @@ function createRoleJdReplacementService(options = {}) {
         });
       }
       const rubricQuestions = normalizeGeneratedRubricQuestions(artifacts.rubric_questions);
+      // The count the rubric was generated for: an Enterprise client's own,
+      // stamped on the rubric by generateRubric.js, within what an agreement may
+      // set; for every other tier, and any other stamp, the tier's plan count.
       const artifactCapacity = getPlanCapacity(artifacts.rubric.membership_level);
-      if (!artifactCapacity || rubricQuestions.length !== artifactCapacity.scored_question_count) {
+      const stampedCount = Number(artifacts.rubric.scored_question_count);
+      const expectedQuestionCount = artifactCapacity?.membership_level === 'enterprise'
+        && Number.isInteger(stampedCount)
+        && stampedCount >= SCORED_QUESTIONS_MIN
+        && stampedCount <= SCORED_QUESTIONS_MAX
+        ? stampedCount
+        : artifactCapacity?.scored_question_count;
+      if (!artifactCapacity || rubricQuestions.length !== expectedQuestionCount) {
         throw rubricQuestionQualityError({
           membership_level: artifacts.rubric.membership_level || null,
-          expected_question_count: artifactCapacity?.scored_question_count || null,
+          expected_question_count: expectedQuestionCount || null,
           valid_question_count: rubricQuestions.length,
         });
       }

@@ -1429,6 +1429,8 @@ async function recordInterviewCompletion({ interview, fresh, requestId, conversa
   try {
     await markInterviewCompleted({ db: supabaseAdmin, interviewId });
   } catch (completionErr) {
+    // Bounded like the other final-transcript logs: no interview or
+    // conversation id, no error text.
     console.error('[webhook] interview completion stamp failed', {
       stage: 'completion_stamp',
       outcome: 'failed',

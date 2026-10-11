@@ -16,9 +16,16 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { test } = require('node:test');
+const { afterEach, beforeEach, test } = require('node:test');
 
 const { createFakeSupabase } = require('./helpers/fakeSupabase');
+const { pinClock } = require('./helpers/fixedClock');
+
+// The fixtures are August 2026 usage billed as "the prior month", so every test
+// runs with the clock in September 2026 rather than on whatever day this runs.
+let restoreClock = null;
+beforeEach(() => { restoreClock = pinClock(); });
+afterEach(() => { restoreClock?.(); restoreClock = null; });
 
 const ROOT = path.join(__dirname, '..');
 const supabasePath = path.join(ROOT, 'src', 'clients', 'supabase.js');

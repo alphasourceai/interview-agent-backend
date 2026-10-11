@@ -5,6 +5,8 @@ const crypto = require('crypto');
 const stripe = require('../../clients/stripe');
 const { supabaseAnon, supabaseAdmin } = require('../../clients/supabase');
 const { requireParentClient } = require('../../services/clientBillingScope');
+const { validateEnterpriseSettings } = require('../../services/enterpriseSettings');
+const { priceEnterprisePool } = require('../../services/enterprisePoolPricing');
 const { htmlToPdf } = require('../../render/pdfRenderer');
 const { buildMembershipAgreementHtml, normalizeMembershipAgreementInput } = require('../../render/membershipAgreement');
 const { sendMembershipAgreementEmail, sendMembershipAgreementInternalNotification } = require('../../clients/sendgrid');
@@ -133,6 +135,27 @@ function validateAgreementPayload(payload) {
   }
 
   return { ok: true };
+}
+
+// An Enterprise pool is priced from the bands when the agreement is drawn up, and
+// the agreement carries that discount and total. Checkout charges the same
+// discount (subscriptionCheckout.js), so the agreement shows what is charged.
+// Values typed into the request are never used: without a pool and a usage
+// price there is nothing to price, and both are cleared.
+async function withPricedPool(payload) {
+  if (payload.membership_tier !== 'enterprise') return payload;
+  const quantity = Number(payload.pool_quantity);
+  const unitPriceCents = Number(payload.usage_interview_fee_cents);
+  if (!(Number.isInteger(quantity) && quantity > 0 && Number.isInteger(unitPriceCents) && unitPriceCents >= 0)) {
+    return { ...payload, pool_discount_pct: '', pool_total_cents: null, pool_discount_priced: false };
+  }
+  const quote = await priceEnterprisePool({ db: supabaseAdmin, quantity, unitPriceCents });
+  return {
+    ...payload,
+    pool_discount_pct: String(quote.discount_pct),
+    pool_total_cents: quote.total_cents,
+    pool_discount_priced: true
+  };
 }
 
 async function requireParentClientForAdminBilling(clientId, context) {
@@ -756,7 +779,7 @@ router.post('/agreements/preview-html', async (req, res) => {
       if (!parentGuard.ok) return respondWithParentClientGuard(res, parentGuard, request_id);
     }
 
-    const { html } = buildMembershipAgreementHtml(payload);
+    const { html } = buildMembershipAgreementHtml(await withPricedPool(payload));
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(200).send(html);
   } catch (e) {
@@ -805,7 +828,7 @@ async function renderAgreementPreviewPdf(req, res) {
       }
     }
 
-    const { html } = buildMembershipAgreementHtml(payload);
+    const { html } = buildMembershipAgreementHtml(await withPricedPool(payload));
     const pdf = await htmlToPdf(html, {
       format: 'Letter',
       margin: { top: '0.75in', right: '0.75in', bottom: '0.75in', left: '0.75in' }
@@ -836,6 +859,22 @@ router.post('/agreements/send', async (req, res) => {
         request_id
       });
     }
+
+    // Read from the request as sent: the normaliser drops a value it cannot
+    // parse, which would turn "invalid" into "absent". Refused before a client is
+    // created or an agreement written; Essentials and Pro may not send them.
+    const enterpriseSettings = validateEnterpriseSettings(req.body || {}, { planTier: payload.membership_tier });
+    if (!enterpriseSettings.ok) {
+      return res.status(400).json({
+        error: enterpriseSettings.code,
+        code: enterpriseSettings.code,
+        detail: enterpriseSettings.detail,
+        field: enterpriseSettings.field,
+        request_id
+      });
+    }
+    // Priced before a client can be created, so a pricing failure leaves nothing behind.
+    const pricedPayload = await withPricedPool(payload);
 
     const clientContext = await resolveAgreementClientContext(payload);
     const resolvedClientId = clientContext?.client_id || null;
@@ -884,8 +923,9 @@ router.post('/agreements/send', async (req, res) => {
       });
     }
 
+    // The agreement record and its PDF both carry the priced pool.
     const payloadWithClient = {
-      ...payload,
+      ...pricedPayload,
       client_id: resolvedClientId,
       attached_client_id: resolvedClientId
     };

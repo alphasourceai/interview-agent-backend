@@ -629,6 +629,63 @@ test('replacement service rejects too many questions and missing plan metadata b
   }
 });
 
+test('an Enterprise replacement rubric at the client\'s own question count is accepted', async () => {
+  const db = makeDb();
+  const fourQuestions = NEW_RUBRIC_QUESTIONS.slice(0, 4);
+  const { service } = makeService(db, {
+    generateArtifacts: async () => ({
+      description: 'New JD excerpt',
+      rubric: {
+        membership_level: 'enterprise',
+        interview_type: 'leadership',
+        max_interview_minutes: 30,
+        scored_question_count: 4,
+        questions: fourQuestions
+      },
+      rubric_questions: fourQuestions,
+      kb_document_id: 'kb-enterprise-four'
+    })
+  });
+
+  const result = await service.replaceJobDescription(replacementRequest());
+  assert.equal(result.ok, true);
+  assert.equal(result.role.rubric_questions.length, 4);
+});
+
+test('a stamp cannot change the count for Essentials or Pro, or go past the blueprint', async () => {
+  for (const rubric of [
+    {
+      membership_level: 'basic',
+      interview_type: 'leadership',
+      scored_question_count: 4,
+      questions: NEW_RUBRIC_QUESTIONS.slice(0, 4)
+    },
+    {
+      membership_level: 'enterprise',
+      interview_type: 'leadership',
+      scored_question_count: 99,
+      questions: NEW_RUBRIC_QUESTIONS
+    }
+  ]) {
+    const db = makeDb();
+    const { service, tavusCalls } = makeService(db, {
+      generateArtifacts: async () => ({
+        description: 'New JD excerpt',
+        rubric,
+        rubric_questions: rubric.questions,
+        kb_document_id: 'kb-rejected-stamp'
+      })
+    });
+
+    await assert.rejects(
+      service.replaceJobDescription(replacementRequest()),
+      (error) => error.code === 'RUBRIC_QUESTION_QUALITY_FAILED'
+    );
+    assert.equal(db.state.rpcCalls.length, 0);
+    assert.equal(tavusCalls.length, 0);
+  }
+});
+
 test('quality rejection preserves a generated KB reference in failed history without Tavus activation', async () => {
   const db = makeDb();
   const { service, tavusCalls } = makeService(db, {

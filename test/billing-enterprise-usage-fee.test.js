@@ -2,10 +2,12 @@
 
 // usage_interview_fee_cents on the Enterprise checkout.
 //
-// It is optional: leaving it out must behave exactly as before, so no existing
-// Enterprise caller breaks. Supplying something unusable is a 400 rather than a
-// silently dropped price. When supplied it rides the subscription metadata, which
-// is where the webhook reads plan settings back from.
+// On the usage model, which is the Enterprise default, it is required and must be
+// above zero (Step E3): without it, overage was silently never billed. On any
+// other model it stays optional and behaves exactly as before. Supplying
+// something unusable is a 400 rather than a silently dropped price. When
+// supplied it rides the subscription metadata, which is where the webhook reads
+// plan settings back from.
 //
 // Stripe, Supabase and the URL config are stubbed; no network.
 
@@ -115,8 +117,19 @@ async function enterpriseCheckout(enterpriseFees) {
   }
 }
 
-test('an Enterprise checkout without a usage fee behaves exactly as before', async () => {
-  const { result, stripeCalls } = await enterpriseCheckout({ ...BASE_FEES })
+test('on the usage model, a checkout without a usage fee is refused', async () => {
+  await assert.rejects(
+    () => enterpriseCheckout({ ...BASE_FEES }),
+    (err) => {
+      assert.equal(err.status, 400)
+      assert.equal(err.code, 'usage_price_required')
+      return true
+    }
+  )
+})
+
+test('on another model, an Enterprise checkout without a usage fee behaves exactly as before', async () => {
+  const { result, stripeCalls } = await enterpriseCheckout({ ...BASE_FEES, billing_model: 'fixed' })
 
   assert.equal(result.session.id, 'cs_enterprise')
   assert.equal(stripeCalls.sessions.length, 1)
@@ -137,8 +150,19 @@ test('a supplied usage fee reaches both the price and the session metadata', asy
     'the webhook reads plan settings from the price metadata too')
 })
 
-test('a zero usage fee is a real price and is carried through', async () => {
-  const { stripeCalls } = await enterpriseCheckout({ ...BASE_FEES, usage_interview_fee_cents: 0 })
+test('a zero usage fee is refused on the usage model, which would never bill overage', async () => {
+  await assert.rejects(
+    () => enterpriseCheckout({ ...BASE_FEES, usage_interview_fee_cents: 0 }),
+    (err) => {
+      assert.equal(err.status, 400)
+      assert.equal(err.code, 'usage_price_required')
+      return true
+    }
+  )
+})
+
+test('a zero usage fee on another model is still carried through', async () => {
+  const { stripeCalls } = await enterpriseCheckout({ ...BASE_FEES, billing_model: 'fixed', usage_interview_fee_cents: 0 })
 
   assert.equal(stripeCalls.sessions[0].metadata.usage_interview_fee_cents, '0')
 })

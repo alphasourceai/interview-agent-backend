@@ -136,7 +136,16 @@ router.post('/checkout-session', publicAgreementTokenRateLimit, async (req, res)
           additional_interview_fee: agreementInput.additional_interview_fee,
           // Optional, so it is deliberately left out of the required-field check below.
           usage_interview_fee_cents: agreementInput.usage_interview_fee_cents,
-          pool_quantity: agreementInput.pool_quantity
+          pool_quantity: agreementInput.pool_quantity,
+          // Priced when the agreement was sent; the client signed this discount.
+          // An agreement from before that (no mark) is priced from the bands, as
+          // it always was, never at a discount someone typed.
+          pool_discount_pct: agreementInput.pool_discount_priced ? agreementInput.pool_discount_pct : '',
+          // Per-client settings beyond the prices; empty means the plan default.
+          billing_model: agreementInput.billing_model,
+          rollover_days: agreementInput.rollover_days,
+          max_interview_minutes: agreementInput.max_interview_minutes,
+          scored_question_count: agreementInput.scored_question_count
         }
       : null;
 

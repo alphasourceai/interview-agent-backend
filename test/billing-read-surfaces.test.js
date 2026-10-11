@@ -20,6 +20,7 @@ const request = require('supertest');
 beforeEach((t) => t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-09-15T12:00:00.000Z') }));
 
 const { createFakeSupabase } = require('./helpers/fakeSupabase');
+const { atFixedClock } = require('./helpers/fixedClock');
 
 const ROOT = path.join(__dirname, '..');
 const clientBillingPath = path.join(ROOT, 'src', 'routes', 'client', 'billing.js');
@@ -140,7 +141,9 @@ function loadClientApp(db, { memberships = [MINE], isGlobalAdmin = false } = {})
   return app;
 }
 
-test('a client sees its credits, soonest to expire first, with the role they came from', async () => {
+// The route filters credits that have expired by "now", and c_soon expires on
+// 2026-10-01, so the clock is pinned to September 2026.
+test('a client sees its credits, soonest to expire first, with the role they came from', () => atFixedClock(async () => {
   const db = makeDb({
     credits: [
       credit({ id: 'c_late', source_role_id: 'role_closed', quantity: 2, expires_at: '2026-12-01T00:00:00.000Z' }),
@@ -157,7 +160,7 @@ test('a client sees its credits, soonest to expire first, with the role they cam
   assert.equal(res.body.items[0].remaining, 3);
   assert.equal(res.body.items[0].expires_at, '2026-10-01T00:00:00.000Z');
   assert.equal(res.body.total_remaining, 5);
-});
+}));
 
 test('a client on a model with no credits gets an empty list, not an error', async () => {
   for (const [planTier, billingModel] of [['basic', 'fixed'], ['enterprise', 'usage']]) {

@@ -8,8 +8,13 @@ const { getRoleInterviewAvailability } = require('../../services/roleInterviewAv
 const { buildAlphaScreenPlanSettingsPayload } = require('../../services/alphaScreenPackages');
 const { activatePublicPurchaseAgreementCheckout } = require('../../services/publicPurchaseActivation');
 const { finalizePendingRolePurchase } = require('../../services/rolePurchaseFinalizer');
-const { requirePlanCapacity } = require('../../services/planCapacity');
-const { defaultBillingModelForPlanTier, resolveBillingModel } = require('../../services/billingModel');
+const { getPlanCapacity } = require('../../services/planCapacity');
+const {
+  ENTERPRISE_SETTING_FIELDS,
+  recordExplicitBillingModel,
+  validateEnterpriseSettings
+} = require('../../services/enterpriseSettings');
+const { resolveBillingModel } = require('../../services/billingModel');
 const { applyUsageToInvoice } = require('../../services/usageBilling');
 const { markPoolFailed, markPoolPaid } = require('../../services/interviewPool');
 const router = express.Router();
@@ -216,6 +221,22 @@ function buildClientPlanSettingsPayloadFromSubscription(subscription, clientId, 
       return null;
     }
 
+    // The per-client settings the agreement stated. Shape only: the commercial
+    // rules were enforced when the agreement was sent and checked out, and a
+    // subscription from before they existed must still provision.
+    const settingsInput = {};
+    for (const field of ENTERPRISE_SETTING_FIELDS) {
+      const value = getSubscriptionMetadataValue(metadataSources, field, null);
+      if (value != null) settingsInput[field] = value;
+    }
+    const settings = validateEnterpriseSettings(settingsInput, { planTier: 'enterprise', enforcePolicy: false });
+    if (!settings.ok) {
+      // The metadata is fixed on the subscription, so no redelivery can fix it.
+      const err = permanentFailure(`Enterprise plan settings metadata invalid: ${settings.code}`);
+      err.code = settings.code;
+      throw err;
+    }
+
     return {
       client_id: clientId,
       plan_tier: 'enterprise',
@@ -224,8 +245,19 @@ function buildClientPlanSettingsPayloadFromSubscription(subscription, clientId, 
       per_role_fee: perRoleFee,
       included_interviews_per_role: includedInterviewsPerRole,
       additional_interview_fee: additionalInterviewFee,
-      max_interview_minutes: requirePlanCapacity('enterprise').max_interview_minutes,
-      ...(usageInterviewFeeCents === null ? {} : { usage_interview_fee_cents: usageInterviewFeeCents })
+      // Never null: the column is NOT NULL with no default in the hosted
+      // database. The agreement's length, else the tier's default length.
+      // Written on every event, like the prices.
+      max_interview_minutes: settings.settings.max_interview_minutes
+        ?? getPlanCapacity('enterprise').max_interview_minutes,
+      // Nullable: empty means the plan's question count.
+      scored_question_count: settings.settings.scored_question_count,
+      // The column is not nullable and defaults to 90, so it is only written
+      // when the agreement stated a value.
+      ...(settings.settings.rollover_days === null ? {} : { rollover_days: settings.settings.rollover_days }),
+      ...(usageInterviewFeeCents === null ? {} : { usage_interview_fee_cents: usageInterviewFeeCents }),
+      // Not a column write: the caller stores it only where none is stored yet.
+      ...(settings.settings.billing_model === null ? {} : { billing_model: settings.settings.billing_model })
     };
   }
 
@@ -275,15 +307,18 @@ async function upsertClientPlanSettingsFromSubscription(subscription, clientId, 
     client_id: clientId,
     subscription_id: pickId(subscription?.id) || null
   });
-  // The tier decides the billing model for a newly provisioned client. The column
-  // is set on every upsert so a tier change moves the client onto the right model.
+  // billing_model is never upserted. A stored value is an explicit choice for
+  // this client and must survive subscription events; an empty one follows
+  // plan_tier. An agreement that states a model has it recorded only where the
+  // column is still empty, so a later event never clears or changes it.
+  const { billing_model: explicitBillingModel, ...columns } = payload;
   const { error } = await supabaseAdmin
     .from('client_plan_settings')
-    .upsert(
-      { ...payload, billing_model: defaultBillingModelForPlanTier(payload.plan_tier) },
-      { onConflict: 'client_id' }
-    );
+    .upsert(columns, { onConflict: 'client_id' });
   if (error) throw new Error(error.message || 'Client plan settings upsert failed');
+  if (explicitBillingModel) {
+    await recordExplicitBillingModel({ db: supabaseAdmin, clientId, billingModel: explicitBillingModel });
+  }
   return true;
 }
 
@@ -414,6 +449,78 @@ function shouldIgnoreStaleSubscriptionUpdate(client, incomingSubscriptionId, eve
   return true;
 }
 
+// Reads and cross-checks the pool a checkout session names, writing nothing.
+// Metadata that disagrees with the row means the session is not describing this
+// pool, the same cross-checks the additional-interviews branch makes, and no
+// retry will change that.
+async function loadInterviewPoolForCheckout(metadata = {}) {
+  const poolId = String(metadata?.client_interview_pool_id || '').trim();
+  if (!poolId) throw permanentFailure('Interview pool id missing from checkout metadata');
+
+  const { data: pool, error: poolLookupErr } = await supabaseAdmin
+    .from('client_interview_pools')
+    .select('id,client_id,quantity_purchased,status')
+    .eq('id', poolId)
+    .maybeSingle();
+  if (poolLookupErr) throw new Error(poolLookupErr.message || 'Interview pool lookup failed');
+  if (!pool) throw permanentFailure('Interview pool not found');
+
+  const metadataClientId = String(metadata?.client_id || '').trim();
+  if (metadataClientId && String(pool.client_id) !== metadataClientId) {
+    throw permanentFailure('Interview pool client mismatch');
+  }
+  const metadataPoolQuantity = Number(metadata?.pool_quantity);
+  if (Number.isInteger(metadataPoolQuantity) && metadataPoolQuantity > 0
+    && Number(pool.quantity_purchased) !== metadataPoolQuantity) {
+    throw permanentFailure('Interview pool quantity mismatch');
+  }
+  return pool;
+}
+
+// Grants the pool only on settled money; a failed payment fails it, and an
+// unsettled one leaves it pending.
+async function settleInterviewPoolFromCheckout(pool, { paymentFailed, paymentSettled, session, requestId } = {}) {
+  if (paymentFailed) {
+    await markPoolFailed({ db: supabaseAdmin, poolId: pool.id });
+    console.warn('[stripe-webhook][interview-pool] payment_failed', {
+      request_id: requestId, client_interview_pool_id: pool.id, client_id: pool.client_id
+    });
+    return;
+  }
+  if (!paymentSettled) {
+    console.log('[stripe-webhook][interview-pool] payment_not_settled', {
+      request_id: requestId,
+      client_interview_pool_id: pool.id,
+      payment_status: String(session?.payment_status || '') || null
+    });
+    return;
+  }
+  const result = await markPoolPaid({
+    db: supabaseAdmin,
+    poolId: pool.id,
+    stripePaymentIntentId: pickId(session?.payment_intent) || null
+  });
+  console.log('[stripe-webhook][interview-pool] settled', {
+    request_id: requestId,
+    client_interview_pool_id: pool.id,
+    client_id: pool.client_id,
+    paid: result.paid === true,
+    reason: result.reason || null
+  });
+}
+
+function buildEnterprisePlanSettingsForActivation(options = {}) {
+  const subscription = options.subscription || null;
+  const clientId = String(options.fallbackClientId || subscription?.metadata?.client_id || '').trim();
+  if (!subscription || !clientId) return null;
+  const payload = buildClientPlanSettingsPayloadFromSubscription(subscription, clientId, {
+    fallbackSource: 'agreement_checkout',
+    fallbackPlanTier: options.fallbackPlanTier || null,
+    fallbackBillingInterval: options.fallbackBillingInterval || null
+  });
+  return payload?.plan_tier === 'enterprise' ? payload : null;
+}
+
 async function markAgreementCheckoutPaid(agreementId, options = {}) {
   const normalizedAgreementId = String(agreementId || '').trim();
   if (!normalizedAgreementId) return;
@@ -479,6 +586,10 @@ async function markAgreementCheckoutPaid(agreementId, options = {}) {
   }
   try {
     const activate = options.activate || activatePublicPurchaseAgreementCheckout;
+    // Enterprise prices are per client and travel on the subscription, so they are
+    // read here with the same builder the subscription events use. Null for any
+    // other tier, which takes its package defaults.
+    const enterprisePlanSettings = buildEnterprisePlanSettingsForActivation(options);
     const result = await activate({
       agreementId: normalizedAgreementId,
       checkoutSessionId: options.checkoutSessionId || null,
@@ -490,6 +601,7 @@ async function markAgreementCheckoutPaid(agreementId, options = {}) {
       fallbackPlanTier: options.fallbackPlanTier || null,
       fallbackBillingInterval: options.fallbackBillingInterval || null,
       requestId: options.requestId || null,
+      enterprisePlanSettings,
       activationClaimKey: claim.claimed ? claim.key : null,
       activationIntentId: claim.claimed ? claim.intentId : null,
       assertActivationFence: assertFence,
@@ -748,56 +860,20 @@ router.post('/', async (req, res) => {
       // status rather than on the session having completed.
       const paymentFailed = event.type === 'checkout.session.async_payment_failed';
       const paymentSettled = !paymentFailed && isSettledPayment(eventObject);
+      const isSubscriptionSession = String(eventObject?.mode || '').toLowerCase() === 'subscription';
 
-      if (purchaseType === 'interview_pool') {
-        const poolId = String(metadata?.client_interview_pool_id || '').trim();
-        if (!poolId) throw permanentFailure('Interview pool id missing from checkout metadata');
+      // An Enterprise pool is sold on the membership's own subscription session, so
+      // that one event has to settle the pool and activate the subscription. The
+      // pool is checked first, before anything is written: a pool the session does
+      // not describe is a permanent failure, and refusing it here leaves nothing
+      // half-done. It is settled last, once activation has succeeded, so a pool is
+      // never spendable for a membership whose activation failed.
+      const interviewPool = purchaseType === 'interview_pool'
+        ? await loadInterviewPoolForCheckout(metadata)
+        : null;
 
-        const { data: pool, error: poolLookupErr } = await supabaseAdmin
-          .from('client_interview_pools')
-          .select('id,client_id,quantity_purchased,status')
-          .eq('id', poolId)
-          .maybeSingle();
-        if (poolLookupErr) throw new Error(poolLookupErr.message || 'Interview pool lookup failed');
-        if (!pool) throw permanentFailure('Interview pool not found');
-
-        // Same cross-checks the additional-interviews branch makes: metadata that
-        // disagrees with the row means the session is not describing this pool,
-        // and no retry will change that.
-        if (metadataClientId && String(pool.client_id) !== metadataClientId) {
-          throw permanentFailure('Interview pool client mismatch');
-        }
-        const metadataPoolQuantity = Number(metadata?.pool_quantity);
-        if (Number.isInteger(metadataPoolQuantity) && metadataPoolQuantity > 0
-          && Number(pool.quantity_purchased) !== metadataPoolQuantity) {
-          throw permanentFailure('Interview pool quantity mismatch');
-        }
-
-        if (paymentFailed) {
-          await markPoolFailed({ db: supabaseAdmin, poolId });
-          console.warn('[stripe-webhook][interview-pool] payment_failed', {
-            request_id, client_interview_pool_id: poolId, client_id: pool.client_id
-          });
-        } else if (!paymentSettled) {
-          console.log('[stripe-webhook][interview-pool] payment_not_settled', {
-            request_id,
-            client_interview_pool_id: poolId,
-            payment_status: String(eventObject?.payment_status || '') || null
-          });
-        } else {
-          const result = await markPoolPaid({
-            db: supabaseAdmin,
-            poolId,
-            stripePaymentIntentId: pickId(eventObject?.payment_intent) || null
-          });
-          console.log('[stripe-webhook][interview-pool] settled', {
-            request_id,
-            client_interview_pool_id: poolId,
-            client_id: pool.client_id,
-            paid: result.paid === true,
-            reason: result.reason || null
-          });
-        }
+      if (interviewPool && !isSubscriptionSession) {
+        // A pool on a session of its own: nothing to activate; settled below.
       } else if (purchaseType === 'additional_interviews') {
         const purchaseId = String(metadata?.role_interview_purchase_id || '').trim();
         const metadataRoleId = String(metadata?.role_id || '').trim();
@@ -1108,6 +1184,12 @@ router.post('/', async (req, res) => {
           });
           requireAgreementActivationResult(activation);
         }
+      }
+
+      if (interviewPool) {
+        await settleInterviewPoolFromCheckout(interviewPool, {
+          paymentFailed, paymentSettled, session: eventObject, requestId: request_id
+        });
       }
     } else if (event.type === 'invoice.payment_succeeded' || event.type === 'invoice.payment_failed') {
       const customerId = pickId(eventObject?.customer);

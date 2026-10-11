@@ -71,6 +71,20 @@
       height: 72px;
     }
 
+    .enterprise-terms tr {
+      break-inside: avoid;
+      page-break-inside: avoid;
+    }
+
+    .enterprise-terms td {
+      height: auto;
+      padding: 10px;
+    }
+
+    .enterprise-terms .cell-label {
+      margin-bottom: 0;
+    }
+
     .cell-label {
       font-size: 10px;
       font-weight: 800;
@@ -313,7 +327,7 @@
   </style>
 </head>
 <body>
-  <section class="page{{#if show_package_terms}} package-page{{/if}}">
+  <section class="page{{#if show_package_page}} package-page{{/if}}">
     <div class="logo-wrap">
       {{#if logo_src}}
       <img src="{{logo_src}}" alt="alphaSource logo" />
@@ -396,7 +410,7 @@
       </tr>
     </table>
 
-    {{#if show_package_terms}}
+    {{#if show_standard_package_terms}}
       <table class="details-table">
         <tr>
           <td>
@@ -452,6 +466,27 @@
     <p class="generated-note"><strong>Signature and initial payment deadline:</strong> {{agreement_expires_at_label}}. After this deadline, alphaSource must issue a newly dated agreement for signature.</p>
     {{/if}}
   </section>
+
+  {{#if enterprise_terms}}
+  <section class="page page-break">
+    <h1 class="agreement-title">Enterprise Commercial Terms</h1>
+    <p class="section-paragraph">{{client_legal_name}} · Terms of this membership agreement</p>
+    <table class="details-table enterprise-terms">
+      {{#each enterprise_terms.rows}}
+      <tr>
+        <td style="width: 35%"><div class="cell-label">{{label}}</div></td>
+        <td>
+          <div class="cell-value">{{value}}</div>
+          {{#if note}}<div class="triplet-note">{{note}}</div>{{/if}}
+        </td>
+      </tr>
+      {{/each}}
+    </table>
+    {{#if enterprise_terms.usage_billing_schedule}}
+    <p class="section-paragraph">{{enterprise_terms.usage_billing_schedule}}</p>
+    {{/if}}
+  </section>
+  {{/if}}
 
   <section class="page page-break">
     <h1 class="agreement-title">alphaScreen Membership Agreement</h1>

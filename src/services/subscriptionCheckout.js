@@ -8,7 +8,8 @@ const {
   getAlphaScreenFirstRolePrepayStripePriceId
 } = require('./alphaScreenPackages')
 const { resolvePublicBackendBase, buildClientDashboardReturnUrl } = require('../config/urlConfig')
-const { priceEnterprisePool } = require('./enterprisePoolPricing')
+const { priceEnterprisePool, quoteEnterprisePool } = require('./enterprisePoolPricing')
+const { enterpriseSettingsMetadata, validateEnterpriseSettings } = require('./enterpriseSettings')
 
 function makeError(status, code, detail) {
   const err = new Error(detail || code || 'checkout_failed')
@@ -61,6 +62,77 @@ function asWholeNumberOrNull(value, { allowZero = true } = {}) {
 // so an optional field can still be validated when it is supplied.
 function isSuppliedValue(value) {
   return value !== undefined && value !== null && String(value).trim() !== ''
+}
+
+// Parses and validates an Enterprise checkout's terms without any I/O, and
+// returns what the session needs: the platform charge, the pool, and the
+// metadata the webhook turns into the client's plan settings.
+function parseEnterpriseCheckoutTerms(enterpriseFees) {
+  const platformFee = asMoneyOrNull(enterpriseFees?.platform_fee, { allowZero: false })
+  const perRoleFee = asMoneyOrNull(enterpriseFees?.per_role_fee, { allowZero: true })
+  const includedInterviewsPerRole = asWholeNumberOrNull(enterpriseFees?.included_interviews_per_role, { allowZero: true })
+  const additionalInterviewFee = asMoneyOrNull(enterpriseFees?.additional_interview_fee, { allowZero: true })
+  if (
+    platformFee === null ||
+    perRoleFee === null ||
+    includedInterviewsPerRole === null ||
+    additionalInterviewFee === null
+  ) {
+    throw makeError(400, 'invalid_enterprise_fees', 'Invalid enterprise pricing fields.')
+  }
+  // Supplying something unparseable is refused here; whether the model needs a
+  // price at all is decided by validateEnterpriseSettings below.
+  const usageFeeSupplied = isSuppliedValue(enterpriseFees?.usage_interview_fee_cents)
+  const usageInterviewFeeCents = usageFeeSupplied
+    ? asWholeNumberOrNull(enterpriseFees.usage_interview_fee_cents, { allowZero: true })
+    : null
+  if (usageFeeSupplied && usageInterviewFeeCents === null) {
+    throw makeError(400, 'invalid_enterprise_fees', 'Invalid enterprise pricing fields.')
+  }
+  // Optional. A pool cannot be priced without a per-interview price, since the
+  // pool is sold at that same number.
+  const poolSupplied = isSuppliedValue(enterpriseFees?.pool_quantity)
+  const poolQuantity = poolSupplied
+    ? asWholeNumberOrNull(enterpriseFees.pool_quantity, { allowZero: false })
+    : null
+  if (poolSupplied && poolQuantity === null) {
+    throw makeError(400, 'invalid_enterprise_fees', 'Invalid enterprise pricing fields.')
+  }
+  if (poolQuantity !== null && usageInterviewFeeCents === null) {
+    throw makeError(400, 'pool_requires_usage_price', 'An interview pool needs a per-interview usage price.')
+  }
+  // The discount an agreement was priced at when it was sent, which is what the
+  // client signed. Absent (an admin checkout without an agreement), the pool is
+  // priced from the bands at checkout, as before.
+  const poolDiscountSupplied = poolQuantity !== null && isSuppliedValue(enterpriseFees?.pool_discount_pct)
+  const agreedPoolDiscountPct = poolDiscountSupplied ? Number(enterpriseFees.pool_discount_pct) : null
+  if (poolDiscountSupplied && !(Number.isFinite(agreedPoolDiscountPct) && agreedPoolDiscountPct >= 0 && agreedPoolDiscountPct <= 100)) {
+    throw makeError(400, 'invalid_enterprise_fees', 'Invalid enterprise pricing fields.')
+  }
+  const platformCents = Math.round(platformFee * 100)
+  if (!Number.isFinite(platformCents) || platformCents <= 0) {
+    throw makeError(400, 'invalid_enterprise_fees', 'Invalid enterprise pricing fields.')
+  }
+
+  const settings = validateEnterpriseSettings(enterpriseFees || {}, { planTier: 'enterprise' })
+  if (!settings.ok) throw makeError(settings.status, settings.code, settings.detail)
+
+  return {
+    platformCents,
+    usageInterviewFeeCents,
+    poolQuantity,
+    agreedPoolDiscountPct,
+    metadata: {
+      platform_fee: String(Math.round(platformFee * 100) / 100),
+      per_role_fee: String(Math.round(perRoleFee * 100) / 100),
+      included_interviews_per_role: String(includedInterviewsPerRole),
+      additional_interview_fee: String(Math.round(additionalInterviewFee * 100) / 100),
+      ...(usageInterviewFeeCents === null
+        ? {}
+        : { usage_interview_fee_cents: String(usageInterviewFeeCents) }),
+      ...enterpriseSettingsMetadata(settings.settings)
+    }
+  }
 }
 
 /**
@@ -212,6 +284,10 @@ async function createSubscriptionCheckoutSession({
   if (!normalizedBillingInterval) throw makeError(400, 'invalid_billing_interval', 'Invalid billing interval.')
   if (!normalizedMetadataSource) throw makeError(400, 'invalid_metadata_source', 'Checkout source is required.')
 
+  // Every Enterprise term is checked here, before the client lookup and before
+  // anything reaches Stripe, so a refused checkout leaves nothing behind.
+  const enterpriseTerms = normalizedPlanTier === 'enterprise' ? parseEnterpriseCheckoutTerms(enterpriseFees) : null
+
   const parentGuard = await requireParentClient(supabaseAdmin, normalizedClientId, {
     source: normalizedMetadataSource
   })
@@ -306,52 +382,9 @@ async function createSubscriptionCheckoutSession({
   let poolMetadata = null
   let poolPoolId = null
   if (normalizedPlanTier === 'enterprise') {
-    const platformFee = asMoneyOrNull(enterpriseFees?.platform_fee, { allowZero: false })
-    const perRoleFee = asMoneyOrNull(enterpriseFees?.per_role_fee, { allowZero: true })
-    const includedInterviewsPerRole = asWholeNumberOrNull(enterpriseFees?.included_interviews_per_role, { allowZero: true })
-    const additionalInterviewFee = asMoneyOrNull(enterpriseFees?.additional_interview_fee, { allowZero: true })
-    if (
-      platformFee === null ||
-      perRoleFee === null ||
-      includedInterviewsPerRole === null ||
-      additionalInterviewFee === null
-    ) {
-      throw makeError(400, 'invalid_enterprise_fees', 'Invalid enterprise pricing fields.')
-    }
-    // Optional, for Enterprise clients on the usage model. Omitting it is valid;
-    // supplying something unparseable is not, so presence is checked separately.
-    const usageFeeSupplied = isSuppliedValue(enterpriseFees?.usage_interview_fee_cents)
-    const usageInterviewFeeCents = usageFeeSupplied
-      ? asWholeNumberOrNull(enterpriseFees.usage_interview_fee_cents, { allowZero: true })
-      : null
-    if (usageFeeSupplied && usageInterviewFeeCents === null) {
-      throw makeError(400, 'invalid_enterprise_fees', 'Invalid enterprise pricing fields.')
-    }
-    // Also optional. A pool cannot be priced without a per-interview price,
-    // since the pool is sold at that same number.
-    const poolSupplied = isSuppliedValue(enterpriseFees?.pool_quantity)
-    poolQuantity = poolSupplied
-      ? asWholeNumberOrNull(enterpriseFees.pool_quantity, { allowZero: false })
-      : null
-    if (poolSupplied && poolQuantity === null) {
-      throw makeError(400, 'invalid_enterprise_fees', 'Invalid enterprise pricing fields.')
-    }
-    if (poolQuantity !== null && usageInterviewFeeCents === null) {
-      throw makeError(400, 'pool_requires_usage_price', 'An interview pool needs a per-interview usage price.')
-    }
-    const platformCents = Math.round(platformFee * 100)
-    if (!Number.isFinite(platformCents) || platformCents <= 0) {
-      throw makeError(400, 'invalid_enterprise_fees', 'Invalid enterprise pricing fields.')
-    }
-    enterpriseCheckoutMetadata = {
-      platform_fee: String(Math.round(platformFee * 100) / 100),
-      per_role_fee: String(Math.round(perRoleFee * 100) / 100),
-      included_interviews_per_role: String(includedInterviewsPerRole),
-      additional_interview_fee: String(Math.round(additionalInterviewFee * 100) / 100),
-      ...(usageInterviewFeeCents === null
-        ? {}
-        : { usage_interview_fee_cents: String(usageInterviewFeeCents) })
-    }
+    const { platformCents, usageInterviewFeeCents } = enterpriseTerms
+    poolQuantity = enterpriseTerms.poolQuantity
+    enterpriseCheckoutMetadata = enterpriseTerms.metadata
     const enterprisePrice = await stripe.prices.create({
       currency: 'usd',
       unit_amount: platformCents,
@@ -374,11 +407,17 @@ async function createSubscriptionCheckoutSession({
     // unit amount with quantity 1 because the volume discount is rounded on the
     // whole order — see enterprisePoolPricing.
     if (poolQuantity !== null) {
-      const quote = await priceEnterprisePool({
-        db: supabaseAdmin,
-        quantity: poolQuantity,
-        unitPriceCents: usageInterviewFeeCents
-      })
+      const quote = enterpriseTerms.agreedPoolDiscountPct !== null
+        ? quoteEnterprisePool({
+          quantity: poolQuantity,
+          unitPriceCents: usageInterviewFeeCents,
+          discountPct: enterpriseTerms.agreedPoolDiscountPct
+        })
+        : await priceEnterprisePool({
+          db: supabaseAdmin,
+          quantity: poolQuantity,
+          unitPriceCents: usageInterviewFeeCents
+        })
       const poolPrice = await stripe.prices.create({
         currency: 'usd',
         unit_amount: quote.total_cents,

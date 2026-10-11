@@ -34,7 +34,13 @@ async function markInterviewCompleted({ db, interviewId, completedAt } = {}) {
     .is('completed_at', null)
     .select('id')
     .maybeSingle();
-  if (error) throw new Error(error.message || 'Interview completion stamp failed');
+  if (error) {
+    // A fixed message and the code only: the database's message, details and
+    // hint can carry row values, and callers log what this throws.
+    const stampError = new Error('interview_completion_stamp_failed');
+    stampError.code = error.code;
+    throw stampError;
+  }
   if (!data) return { marked: false, reason: 'already_completed' };
   return { marked: true, completed_at: stampedAt };
 }

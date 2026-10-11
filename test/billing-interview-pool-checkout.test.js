@@ -17,6 +17,7 @@ const { test } = require('node:test');
 const request = require('supertest');
 
 const { createFakeSupabase } = require('./helpers/fakeSupabase');
+const { guardPlanSettingsNotNull } = require('./helpers/planSettingsNotNull');
 
 const ROOT = path.join(__dirname, '..');
 const checkoutPath = path.join(ROOT, 'src', 'services', 'subscriptionCheckout.js');
@@ -41,7 +42,8 @@ const DISCOUNTS = [
 ];
 
 function makeDb({ pools = [] } = {}) {
-  return createFakeSupabase({
+  // max_interview_minutes is NOT NULL with no default in the hosted database.
+  return guardPlanSettingsNotNull(createFakeSupabase({
     clients: [{
       id: CLIENT, parent_client_id: null, name: 'Acme Dental Group',
       email: 'owner@acme.example', stripe_customer_id: 'cus_1', stripe_subscription_id: null
@@ -50,7 +52,7 @@ function makeDb({ pools = [] } = {}) {
     enterprise_pool_discounts: DISCOUNTS,
     client_interview_pools: pools,
     client_interview_pool_draws: []
-  });
+  }));
 }
 
 // --- buying ---------------------------------------------------------------
@@ -212,13 +214,35 @@ test('an unusable pool quantity is refused', async () => {
 
 // --- settling -------------------------------------------------------------
 
+// What buy() puts on the session: the pool rides an Enterprise subscription
+// checkout, so settling it and activating the membership arrive as one event.
+const SUBSCRIPTION_METADATA = Object.freeze({
+  source: 'admin_subscription_checkout',
+  client_id: CLIENT,
+  plan_tier: 'enterprise',
+  billing_interval: 'monthly',
+  platform_fee: '1200',
+  per_role_fee: '0',
+  included_interviews_per_role: '0',
+  additional_interview_fee: '0',
+  usage_interview_fee_cents: '2500'
+});
+
 function loadWebhook(event, db) {
-  for (const p of [webhookPath, stripeClientPath, supabasePath, activationPath]) delete require.cache[p];
+  for (const p of [webhookPath, stripeClientPath, supabasePath, activationPath, clientBillingScopePath]) {
+    delete require.cache[p];
+  }
 
   injectModule(activationPath, { activatePublicPurchaseAgreementCheckout: async () => ({ ok: true }) });
   injectModule(stripeClientPath, {
     webhooks: { constructEvent: () => event },
-    subscriptions: { retrieve: async () => ({ id: 'sub_1', status: 'active', items: { data: [] }, metadata: {} }) }
+    subscriptions: {
+      retrieve: async () => ({
+        id: 'sub_1', status: 'active', customer: 'cus_1',
+        items: { data: [{ price: { recurring: { interval: 'month' } } }] },
+        metadata: { ...SUBSCRIPTION_METADATA }
+      })
+    }
   });
   injectModule(supabasePath, { supabaseAdmin: db, supabase: db, supabaseAnon: db });
 
@@ -237,6 +261,7 @@ function poolEvent({ type = 'checkout.session.completed', payment_status = 'paid
         id: 'cs_1', mode: 'subscription', status: 'complete', payment_status,
         customer: 'cus_1', subscription: 'sub_1', payment_intent: 'pi_1',
         metadata: {
+          ...SUBSCRIPTION_METADATA,
           purchase_type: 'interview_pool',
           client_interview_pool_id: 'pool_1',
           client_id: CLIENT,
@@ -259,6 +284,22 @@ const post = (app) => request(app)
   .set('stripe-signature', 't=1,v1=stubbed')
   .send(Buffer.from('{}'));
 
+function assertMembershipActivated(db) {
+  const client = db.tables.clients[0];
+  assert.equal(client.stripe_subscription_id, 'sub_1', 'the client is linked to the subscription');
+  assert.equal(client.plan_tier, 'enterprise');
+  const settings = db.tables.client_plan_settings.filter((row) => row.client_id === CLIENT);
+  assert.equal(settings.length, 1, 'Enterprise plan settings are written');
+  assert.equal(settings[0].usage_interview_fee_cents, 2500);
+  assert.equal(settings[0].max_interview_minutes, 15, 'no length: the plan default');
+  assert.deepEqual(db.notNullViolations, [], 'no null max_interview_minutes was sent');
+}
+
+function assertMembershipNotActivated(db) {
+  assert.equal(db.tables.clients[0].stripe_subscription_id, null);
+  assert.deepEqual(db.tables.client_plan_settings || [], []);
+}
+
 test('a settled pool checkout makes the interviews spendable', async () => {
   const db = makeDb({ pools: [pendingPool()] });
 
@@ -268,6 +309,7 @@ test('a settled pool checkout makes the interviews spendable', async () => {
   assert.equal(row.status, 'paid', 'paid is what makes the interviews spendable');
   assert.equal(row.quantity_purchased, 30);
   assert.equal(row.stripe_payment_intent_id, 'pi_1');
+  assertMembershipActivated(db);
 });
 
 test('an unsettled session leaves the pool pending', async () => {
@@ -277,6 +319,7 @@ test('an unsettled session leaves the pool pending', async () => {
 
   assert.equal(db.tables.client_interview_pools[0].status, 'pending');
   assert.equal(db.tables.client_interview_pools[0].quantity_remaining, 0);
+  assertMembershipNotActivated(db);
 });
 
 test('a failed payment marks the pool failed', async () => {
@@ -286,6 +329,7 @@ test('a failed payment marks the pool failed', async () => {
     poolEvent({ type: 'checkout.session.async_payment_failed', payment_status: 'unpaid' }), db));
 
   assert.equal(db.tables.client_interview_pools[0].status, 'failed');
+  assertMembershipNotActivated(db);
 });
 
 test('a redelivered settlement does not refill a drawn-down pool', async () => {
@@ -295,6 +339,7 @@ test('a redelivered settlement does not refill a drawn-down pool', async () => {
 
   assert.equal(db.tables.client_interview_pools[0].quantity_remaining, 4,
     'Stripe redelivers; spent interviews must not come back');
+  assertMembershipActivated(db);
 });
 
 test('metadata that disagrees with the row is acknowledged, not retried', async () => {
@@ -308,6 +353,7 @@ test('metadata that disagrees with the row is acknowledged, not retried', async 
 
     assert.equal(res.status, 200, `${why} must be acknowledged, since no retry can fix it`);
     assert.equal(db.tables.client_interview_pools[0].status, 'pending');
+    assertMembershipNotActivated(db);
   }
 });
 
@@ -317,11 +363,17 @@ test('a pool id that does not exist is acknowledged', async () => {
   const res = await post(loadWebhook(poolEvent(), db));
 
   assert.equal(res.status, 200);
+  assertMembershipNotActivated(db);
 });
 
-test('the webhook branch is registered ahead of the additional-interviews one', () => {
+test('the pool is checked before the purchase branches and settled after them', () => {
   const source = fs.readFileSync(webhookPath, 'utf8');
-  assert.match(source, /if \(purchaseType === 'interview_pool'\)/);
-  assert.match(source, /\} else if \(purchaseType === 'additional_interviews'\)/,
-    'the two purchase types must be exclusive branches of the same check');
+  const loaded = source.indexOf("purchaseType === 'interview_pool'\n        ? await loadInterviewPoolForCheckout(metadata)");
+  const poolOnly = source.indexOf('if (interviewPool && !isSubscriptionSession) {');
+  const additional = source.indexOf("} else if (purchaseType === 'additional_interviews') {");
+  const settled = source.indexOf('await settleInterviewPoolFromCheckout(interviewPool');
+  assert.ok(loaded > 0 && poolOnly > loaded, 'the pool is checked, writing nothing, before any branch runs');
+  assert.ok(additional > poolOnly,
+    'a pool on its own session and additional interviews stay exclusive branches of the same chain');
+  assert.ok(settled > additional, 'the pool is settled after the branches, so a subscription session also activates');
 });

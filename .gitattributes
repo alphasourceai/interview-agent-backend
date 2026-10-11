@@ -4,3 +4,6 @@ demo/reports/*.pdf binary
 # Hash-verified at runtime: the bytes on disk must match the bytes committed.
 src/content/support-voice-knowledge.json -text
 src/content/support-voice-knowledge.sha256 -text
+# SQL is always checked out with LF, whatever core.autocrlf says: several tests
+# compare migration text byte-for-byte or search it for "\n".
+*.sql text eol=lf
