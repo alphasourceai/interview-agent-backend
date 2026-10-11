@@ -6,7 +6,7 @@
 const crypto=require('node:crypto');
 const {createMembershipQuoteDraftService}=require('./membershipQuoteDrafts');
 const UUID=/^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const SOURCES='membership_v2_sales_prospects',HEADS='membership_v2_sales_prospect_heads';
+const SOURCES='membership_v2_sales_prospects';
 const CHALLENGES='membership_v2_sales_email_challenges',PROOFS='membership_v2_sales_email_proofs';
 const COLUMNS='id,scope_id,issuer_user_id,quote_id,quote_digest,previous_source_id,protocol,source_version,buyer_snapshot,canonical_source,source_fingerprint,created_at';
 const BUYER_KEYS=['company_legal_name','company_dba','buyer_first_name','buyer_last_name','buyer_email','buyer_phone','buyer_title'];
@@ -42,10 +42,9 @@ function document(row){return {protocol:'retail_sales_prospect_v2',source_versio
 function scope(row){return {scope_id:row.scope_id,audience:'sales',issuer_user_id:row.issuer_user_id,
   original_salesperson_user_id:row.issuer_user_id,client_id:null,billing_owner_user_id:null};}
 
-function createMembershipSalesProspectService({db,authorizeScope,handoffVerification,catalog,now=()=>Date.now()}={}){
+function createMembershipSalesProspectService({db,authorizeScope,handoffVerification,catalog}={}){
   check(typeof db?.from==='function' && typeof db.rpc==='function' && typeof authorizeScope==='function'
-    && typeof handoffVerification==='function' && typeof now==='function','sales_prospect_not_configured',503);
-  function clock(){const value=now();check(Number.isSafeInteger(value),'sales_prospect_clock_unavailable',503);return value;}
+    && typeof handoffVerification==='function','sales_prospect_not_configured',503);
   async function one(table,columns,filters){let result;
     try{let q=db.from(table).select(columns);for(const [k,v] of Object.entries(filters))q=v===null?q.is(k,null):q.eq(k,v);
       result=await q.maybeSingle();}catch(_){fail('sales_prospect_store_unavailable',503);}
@@ -63,25 +62,36 @@ function createMembershipSalesProspectService({db,authorizeScope,handoffVerifica
       && UUID.test(row.quote_id) && (row.previous_source_id===null || UUID.test(row.previous_source_id))
       && row.protocol==='retail_sales_prospect_v2' && row.source_version===1
       && /^[0-9a-f]{64}$/.test(row.quote_digest) && /^[0-9a-f]{64}$/.test(row.source_fingerprint)
-      && typeof row.created_at==='string' && Number.isFinite(Date.parse(row.created_at))
-      && Date.parse(row.created_at)<=clock(),'sales_prospect_unverified',503);
+      && typeof row.created_at==='string' && Number.isFinite(Date.parse(row.created_at)),'sales_prospect_unverified',503);
     check(canonical(buyer(row.buyer_snapshot))===canonical(row.buyer_snapshot)
       && row.canonical_source===canonical(document(row)) && hash(row.canonical_source)===row.source_fingerprint,'sales_prospect_unverified',503);
     return row;
   }
-  async function currentRow(id,ctx){const row=await one(SOURCES,COLUMNS,{id,scope_id:ctx.scope_id,issuer_user_id:ctx.issuer_user_id});
+  async function facts(id,ctx){let result;
+    try{result=await db.rpc('membership_v2_read_sales_prospect',{p_actor:ctx.issuer_user_id,p_scope:ctx.scope_id,p_source:id});}
+    catch(_){fail('sales_prospect_store_unavailable',503);}
+    if(result?.error){if(result.error.code==='P0001' && result.error.message==='sales_source_denied')fail('sales_prospect_denied');
+      fail('sales_prospect_store_unavailable',503);}
+    const row=result?.data?.[0];
+    check(Array.isArray(result?.data) && result.data.length===1 && plain(row,['scope_id','current_source_id','quote_live','challenge_live','proof_valid','observed_at'])
+      && Object.keys(row).length===6 && row.scope_id===ctx.scope_id && (row.current_source_id===null || UUID.test(row.current_source_id))
+      && (id===null || row.current_source_id===id) && ['quote_live','challenge_live','proof_valid'].every(k=>typeof row[k]==='boolean')
+      && typeof row.observed_at==='string' && Number.isFinite(Date.parse(row.observed_at)),'sales_prospect_unverified',503);
+    return row;
+  }
+  async function currentRow(id,ctx){await facts(id,ctx);const row=await one(SOURCES,COLUMNS,{id,scope_id:ctx.scope_id,issuer_user_id:ctx.issuer_user_id});
     check(row,'sales_prospect_denied');validate(row,ctx);
-    const head=await one(HEADS,'scope_id,current_source_id',{scope_id:ctx.scope_id,current_source_id:id});
-    check(head?.scope_id===ctx.scope_id && head.current_source_id===id,'sales_prospect_denied');return row;}
+    return row;}
   async function quoteFor(row,ctx,subject){
+    const observed=await facts(row.id,ctx);check(observed.quote_live,'sales_prospect_denied');
     const quoteService=createMembershipQuoteDraftService({db,authorizeScope:async()=>{
       if(subject){const fresh=await authorize(subject);check(canonical(fresh)===canonical(ctx),'sales_prospect_denied');return fresh;}
       const grant=await one('sales_reps','user_id,active',{user_id:ctx.issuer_user_id,active:true});
       const owner=await one('membership_v2_sales_quote_scopes','id,issuer_user_id',{id:ctx.scope_id,issuer_user_id:ctx.issuer_user_id});
       check(grant?.user_id===ctx.issuer_user_id && grant.active===true && owner?.id===ctx.scope_id && owner.issuer_user_id===ctx.issuer_user_id,'sales_prospect_denied');return ctx;
-    },catalog,now:()=>new Date(clock()).toISOString()});
+    },catalog,now:()=>new Date(observed.observed_at).toISOString()});
     const result=await quoteService.readQuote(subject,row.quote_id);
-    check(result.quote_digest===row.quote_digest && !result.expired && !result.stale,'sales_prospect_denied');return result;
+    check(result.quote_digest===row.quote_digest && !result.stale,'sales_prospect_denied');return result;
   }
   function response(row,proof){return frozen({source:document(row),source_fingerprint:row.source_fingerprint,
     email_verified:Boolean(proof),verified_at:proof?.verified_at || null,signing_enabled:false,checkout_enabled:false});}
@@ -92,15 +102,16 @@ function createMembershipSalesProspectService({db,authorizeScope,handoffVerifica
       && challenge?.source_id===row.id && challenge.source_fingerprint===row.source_fingerprint && challenge.token_hash===proof.token_hash
       && challenge.method==='email_link_v1' && Number.isFinite(Date.parse(challenge.issued_at))
       && Number.isFinite(Date.parse(challenge.expires_at)) && Number.isFinite(Date.parse(proof.verified_at))
-      && Date.parse(proof.verified_at)>=Date.parse(challenge.issued_at) && Date.parse(proof.verified_at)<Date.parse(challenge.expires_at)
-      && Date.parse(proof.verified_at)<=clock(),'sales_prospect_unverified',503);return proof;
+      && Date.parse(proof.verified_at)>=Date.parse(challenge.issued_at)
+      && (await facts(row.id,scope(row))).proof_valid,'sales_prospect_unverified',503);return proof;
   }
   return Object.freeze({
     async createProspect(subject,input){
       check(plain(input,['quoteId','expectedSourceId','buyer']) && Object.hasOwn(input,'quoteId') && Object.hasOwn(input,'buyer') && UUID.test(input.quoteId)
         && Object.hasOwn(input,'expectedSourceId') && (input.expectedSourceId===null || UUID.test(input.expectedSourceId)),'invalid_sales_prospect',400);
       const ctx=await authorize(subject),snapshot=buyer(input.buyer);
-      const quoteService=createMembershipQuoteDraftService({db,authorizeScope:authorize,catalog,now:()=>new Date(clock()).toISOString()});
+      const observed=await facts(null,ctx);
+      const quoteService=createMembershipQuoteDraftService({db,authorizeScope:authorize,catalog,now:()=>new Date(observed.observed_at).toISOString()});
       const quote=await quoteService.readQuote(subject,input.quoteId);
       check(!quote.expired && !quote.stale,'sales_prospect_denied');
       const id=crypto.randomUUID(),token=crypto.randomBytes(32).toString('base64url'),hashed=tokenHash(id,token);
@@ -123,9 +134,10 @@ function createMembershipSalesProspectService({db,authorizeScope,handoffVerifica
       const challenge=await one(CHALLENGES,'source_id,source_fingerprint,token_hash,issued_at,expires_at,method',{source_id:id,token_hash:hashed});
       check(challenge?.source_id===id && challenge.source_fingerprint===fingerprint && challenge.token_hash===hashed
         && challenge.method==='email_link_v1' && Number.isFinite(Date.parse(challenge.issued_at))
-        && Date.parse(challenge.issued_at)<=clock() && Date.parse(challenge.expires_at)>clock()
+        && Number.isFinite(Date.parse(challenge.expires_at))
         && Date.parse(challenge.expires_at)-Date.parse(challenge.issued_at)<=600000,'sales_prospect_create_unverified',503);
       await currentRow(id,ctx);check(canonical(await authorize(subject))===canonical(ctx),'sales_prospect_denied');
+      const beforeHandoff=await facts(id,ctx);check(beforeHandoff.quote_live && beforeHandoff.challenge_live,'sales_prospect_denied');
       // No resend on lost commit: recovery verifies persistence, not delivery.
       // A fresh quote + explicit CAS replacement can safely issue another link.
       let handoff='held_unknown_commit';
@@ -135,7 +147,15 @@ function createMembershipSalesProspectService({db,authorizeScope,handoffVerifica
     },
     async readProspect(subject,id){check(UUID.test(id),'sales_prospect_denied');const ctx=await authorize(subject);
       const row=await currentRow(id,ctx);await quoteFor(row,ctx,subject);const proof=await proofFor(row);
-      await currentRow(id,ctx);check(canonical(await authorize(subject))===canonical(ctx),'sales_prospect_denied');return response(row,proof);},
+      await quoteFor(row,ctx,subject);check(canonical(await authorize(subject))===canonical(ctx),'sales_prospect_denied');return response(row,proof);},
+    async readCurrentProspect(subject){const ctx=await authorize(subject),observed=await facts(null,ctx);
+      let row=null;if(observed.current_source_id)row=await currentRow(observed.current_source_id,ctx);
+      check(canonical(await authorize(subject))===canonical(ctx),'sales_prospect_denied');
+      const after=await facts(row?.id || null,ctx);check(after.current_source_id===observed.current_source_id,'sales_prospect_denied');
+      // Recovery deliberately works after quote/link expiry or catalog changes.
+      // It reports no proof/eligibility and cannot issue/resend a link.
+      return frozen({current_source:row?document(row):null,source_fingerprint:row?.source_fingerprint || null,
+        quote_expired:!after.quote_live,recovery_only:true,signing_enabled:false,checkout_enabled:false});},
     async verifyEmail(input){
       check(plain(input,['sourceId','token']) && UUID.test(input.sourceId) && typeof input.token==='string'
         && /^[A-Za-z0-9_-]{43}$/.test(input.token),'sales_email_denied');
@@ -146,9 +166,8 @@ function createMembershipSalesProspectService({db,authorizeScope,handoffVerifica
         catch(error){if(definite(error))fail('sales_email_denied');}
         if(ack?.error && definite(ack.error))fail('sales_email_denied');
         const proof=await proofFor(row,hashed);check(proof,'sales_email_denied');
-        const challenge=await one(CHALLENGES,'expires_at',{source_id:row.id,token_hash:hashed});
-        check(Date.parse(challenge?.expires_at)>clock(),'sales_email_denied');
-        await currentRow(row.id,ctx);await quoteFor(row,ctx);return response(row,proof);
+        await quoteFor(row,ctx);const observed=await facts(row.id,ctx);
+        check(observed.quote_live && observed.challenge_live && observed.proof_valid,'sales_email_denied');return response(row,proof);
       }catch(_){fail('sales_email_denied');}
     }
   });

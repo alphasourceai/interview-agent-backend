@@ -43,7 +43,7 @@ function serviceDB(hooks={}){return {from(table){return {
 };},async rpc(name,params){if(hooks.beforeRPC){const result=await hooks.beforeRPC(name,params);if(result)return result;}
   const ordered={membership_v2_reserve_sales_quote_scope:['p_actor','p_key_hash','p_fingerprint'],
     membership_v2_register_sales_prospect:['p_id','p_actor','p_scope','p_quote','p_quote_digest','p_previous','p_buyer','p_canonical','p_fingerprint','p_token_hash'],
-    membership_v2_verify_sales_email:['p_source','p_token_hash']}[name];assert.ok(ordered,name);
+    membership_v2_verify_sales_email:['p_source','p_token_hash'],membership_v2_read_sales_prospect:['p_actor','p_scope','p_source']}[name];assert.ok(ordered,name);
   const r=run(`set role service_role;select coalesce(json_agg(t),'[]'::json) from public.${name}(${ordered.map(k=>literal(params[k])).join(',')}) t;`);
   let result;if(r.status){const found=r.stderr.match(/ERROR:\s+([0-9A-Z]{5}):\s+([^\n]+)/);
     result={error:{code:found?.[1]||'SQLERR',message:found?.[2]||'synthetic SQL error'}};}
@@ -60,7 +60,7 @@ async function fixture(actor=rep,hooks={},handoffFailure=false){
   const ctx=await scopes.createScope({accessToken:'synthetic-test-token'},{idempotencyKey:crypto.randomBytes(16).toString('hex')});
   const subject={accessToken:'synthetic-test-token',scopeId:ctx.scope_id};
   const quotes=createMembershipQuoteDraftService({db,authorizeScope:scopes.authorizeScope,now:()=>new Date(Date.now()+offset).toISOString()});
-  const service=createMembershipSalesProspectService({db,authorizeScope:scopes.authorizeScope,now:()=>Date.now()+offset,
+  const service=createMembershipSalesProspectService({db,authorizeScope:hooks.sourceAuthorize?async()=>hooks.sourceAuthorize(ctx):scopes.authorizeScope,
     catalog:hooks.catalog,
     handoffVerification:async item=>{captured.push(item);if(handoffFailure)throw new Error('secret transport detail');}});
   async function quote(choice={}){return quotes.createQuote(subject,{planKey:'basic',commitmentMonths:3,paymentOption:'prepaid',offerVersion:OFFER_VERSION,...choice});}
@@ -204,7 +204,9 @@ test('populated RLS/grants/invoker searches, parent invariance and no client/con
     for(const action of ['select','insert','update','delete','truncate'])assert.equal(sql(`select has_table_privilege('service_role','${table}','${action}');`),
       ['select','insert'].includes(action)||(action==='update'&&table.endsWith('_heads'))?'t':'f');
   }
-  for(const signature of ['membership_v2_register_sales_prospect(uuid,uuid,uuid,uuid,text,uuid,jsonb,text,text,text)','membership_v2_verify_sales_email(uuid,text)']){
+  for(const signature of ['membership_v2_register_sales_prospect(uuid,uuid,uuid,uuid,text,uuid,jsonb,text,text,text)',
+    'membership_v2_verify_sales_email(uuid,text)','membership_v2_read_sales_prospect(uuid,uuid,uuid)',
+    'membership_v2_valid_buyer(jsonb)','membership_v2_sales_head_guard()']){
     assert.equal(sql(`select not prosecdef and proconfig @> array['search_path=pg_catalog'] from pg_proc where oid='${signature}'::regprocedure;`),'t');
     for(const role of ['anon','authenticated'])assert.equal(sql(`select has_function_privilege('${role}','${signature}','execute');`),'f');
     assert.equal(sql(`select has_function_privilege('service_role','${signature}','execute');`),'t');
@@ -268,4 +270,56 @@ test('malformed buyer/canonical/token inputs roll back source/challenge/head ato
     denied(`set role service_role;select * from ${registerSQL({...base,...change})};`,/check constraint|sales_source_denied/);
   assert.equal(sql(`select (select count(*) from membership_v2_sales_prospects),(select count(*) from membership_v2_sales_email_challenges);`),counts);
   assert.equal(sql(`select current_source_id from membership_v2_sales_prospect_heads where scope_id='${f.ctx.scope_id}';`),a.source.source_id);
+});
+test('scoped head recovery handles empty scope, postcommit revocation and reactivation without stale quote dependency',options,async()=>{
+  let revoked=false;
+  const f=await fixture(rep,{authError:()=>revoked,afterRPC:async(name,p,r)=>{if(name==='membership_v2_register_sales_prospect')revoked=true;return r;}});
+  const empty=await f.service.readCurrentProspect(f.subject);assert.equal(empty.current_source,null);assert.equal(empty.recovery_only,true);
+  await assert.rejects(()=>f.create(),e=>e.code==='sales_prospect_denied');revoked=false;
+  const recovered=await f.service.readCurrentProspect(f.subject),p=f.rpcs.find(r=>r.name==='membership_v2_register_sales_prospect').p;
+  assert.equal(recovered.current_source.source_id,p.p_id);assert.equal(recovered.signing_enabled,false);
+  assert.equal(f.captured.length,0);
+  // Temporarily stop the synthetic revoke hook; replace recovered source once.
+  const later=await fixture();const unauthorized={...later.subject,scopeId:f.ctx.scope_id};
+  // Same actor may own both scopes, but a DIFFERENT actor cannot read this head.
+  const otherRep=await fixture(other);await assert.rejects(()=>otherRep.service.readCurrentProspect({...otherRep.subject,scopeId:f.ctx.scope_id}),e=>e.code==='sales_prospect_denied');
+  assert.equal((await later.service.readCurrentProspect(unauthorized)).current_source.source_id,p.p_id);
+});
+test('recovery works after DB quote expiry and permits explicit CAS replacement using recovered ID',options,async()=>{
+  const f=await fixture();f.setOffset(-30*60000+1500);const q=await f.quote();f.setOffset(0);
+  await f.service.createProspect(f.subject,{quoteId:q.quote.quote_id,expectedSourceId:null,buyer});sql('select pg_sleep(1.6);');
+  const recovered=await f.service.readCurrentProspect(f.subject);assert.equal(recovered.quote_expired,true);
+  const replaced=await f.create(recovered.current_source.source_id,{buyer_email:'replacement@example.invalid'});
+  assert.equal(replaced.source.previous_source_id,recovered.current_source.source_id);assert.equal(replaced.email_verified,false);
+});
+test('source and consume readbacks use DB time despite process clock ahead/behind; original Auth adapter separately covered',options,async()=>{
+  for(const offset of [-120000,120000]){
+    // Isolate source clock behavior from the parent Auth/scope clock policy.
+    const f=await fixture(rep,{sourceAuthorize:async ctx=>{const grant=JSON.parse(sql(`set role service_role;select row_to_json(t) from (select user_id,active from sales_reps where user_id='${rep}') t;`));assert.equal(grant.active,true);return ctx;}});
+    const q=await f.quote(),originalNow=Date.now;
+    try{Date.now=()=>originalNow()+offset;
+      const a=await f.service.createProspect(f.subject,{quoteId:q.quote.quote_id,expectedSourceId:null,buyer});
+      const first=await f.service.verifyEmail({sourceId:a.source.source_id,token:f.captured[0].token});
+      const second=await f.service.verifyEmail({sourceId:a.source.source_id,token:f.captured[0].token});
+      assert.deepEqual(second,first);assert.equal(first.email_verified,true);
+      assert.equal((await f.service.readCurrentProspect(f.subject)).current_source.source_id,a.source.source_id);
+    }finally{Date.now=originalNow;}
+  }
+});
+test('native microsecond cutoff expressions and RPC clock remain untruncated',options,()=>{
+  for(const signature of ['membership_v2_register_sales_prospect(uuid,uuid,uuid,uuid,text,uuid,jsonb,text,text,text)','membership_v2_verify_sales_email(uuid,text)','membership_v2_read_sales_prospect(uuid,uuid,uuid)']){
+    const def=sql(`select pg_get_functiondef('${signature}'::regprocedure);`);
+    assert.match(def,/n := clock_timestamp\(\)/);assert.doesNotMatch(def,/date_trunc/);
+  }
+  assert.equal(sql("with t as (select '2026-10-11 12:00:00.000000Z'::timestamptz as expiry) select expiry+interval '1 microsecond'<expiry,expiry<expiry from t;"),'f|f');
+});
+test('catalog failure after commit does not strand a head; recovery is independent, replacement later succeeds',options,async()=>{
+  let unavailable=false,breakOnce=true;
+  const f=await fixture(rep,{catalog:{currentVersion:()=>{if(unavailable)throw new Error('synthetic catalogue unavailable');return OFFER_VERSION;},
+    resolveOffer:(choice,channel)=>buildRetailOffer({...choice,channel}),listOffers:channel=>listRetailOffers({channel})},
+    afterRPC:async(name,p,r)=>{if(name==='membership_v2_register_sales_prospect' && breakOnce){unavailable=true;breakOnce=false;}return r;}});
+  await assert.rejects(()=>f.create(),e=>e.code==='quote_catalog_unavailable');assert.equal(f.captured.length,0);
+  const recovered=await f.service.readCurrentProspect(f.subject);assert.ok(recovered.current_source.source_id);assert.equal(recovered.recovery_only,true);
+  unavailable=false;const replaced=await f.create(recovered.current_source.source_id);
+  assert.equal(replaced.source.previous_source_id,recovered.current_source.source_id);assert.equal(f.captured.length,1);
 });

@@ -108,7 +108,7 @@ begin
     raise exception 'sales_source_denied'; end if;
   insert into public.membership_v2_sales_prospect_heads(scope_id) values(p_scope) on conflict do nothing;
   select * into strict h from public.membership_v2_sales_prospect_heads where scope_id=p_scope for update;
-  n := date_trunc('milliseconds',clock_timestamp());
+  n := clock_timestamp();
   select * into q from public.membership_v2_quote_drafts where id=p_quote and scope_id=p_scope
     and audience='sales' and issuer_user_id=p_actor and original_salesperson_user_id=p_actor
     and client_id is null and billing_owner_user_id is null and quote_digest=p_quote_digest;
@@ -143,7 +143,7 @@ begin
   perform 1 from public.sales_reps where user_id=s.issuer_user_id and active=true for share;
   if not found then raise exception 'sales_email_denied'; end if;
   select * into h from public.membership_v2_sales_prospect_heads where scope_id=s.scope_id for update;
-  n := date_trunc('milliseconds',clock_timestamp());
+  n := clock_timestamp();
   select * into c from public.membership_v2_sales_email_challenges where source_id=p_source and token_hash=p_token_hash;
   if h.current_source_id is distinct from p_source or c.source_id is null or c.source_fingerprint<>s.source_fingerprint
     or c.issued_at>n or c.expires_at<=n or not exists(select 1 from public.membership_v2_quote_drafts
@@ -154,10 +154,37 @@ begin
   select * into strict proof from public.membership_v2_sales_email_proofs where source_id=p_source and token_hash=p_token_hash;
   return next proof;
 end $$;
+-- Authoritative clock + actor-scoped recovery, including expired unsigned heads.
+-- Read locks follow rep->head, never change a row and never enable signing.
+create function public.membership_v2_read_sales_prospect(p_actor uuid,p_scope uuid,p_source uuid)
+returns table(scope_id uuid,current_source_id uuid,quote_live boolean,challenge_live boolean,proof_valid boolean,observed_at timestamptz)
+language plpgsql security invoker set search_path=pg_catalog as $$
+declare h public.membership_v2_sales_prospect_heads; s public.membership_v2_sales_prospects;
+  q public.membership_v2_quote_drafts; c public.membership_v2_sales_email_challenges;
+  p public.membership_v2_sales_email_proofs; n timestamptz;
+begin
+  perform 1 from public.sales_reps r where r.user_id=p_actor and r.active=true for share;
+  if not found or not exists(select 1 from public.membership_v2_sales_quote_scopes ss
+    where ss.id=p_scope and ss.issuer_user_id=p_actor) then raise exception 'sales_source_denied'; end if;
+  select * into h from public.membership_v2_sales_prospect_heads hh where hh.scope_id=p_scope for share;
+  n := clock_timestamp();
+  if p_source is not null and h.current_source_id is distinct from p_source then raise exception 'sales_source_denied'; end if;
+  if h.current_source_id is null then return query select p_scope,null::uuid,false,false,false,n; return; end if;
+  select * into strict s from public.membership_v2_sales_prospects ss where ss.id=h.current_source_id
+    and ss.scope_id=p_scope and ss.issuer_user_id=p_actor and ss.created_at<=n;
+  select * into strict q from public.membership_v2_quote_drafts qq where qq.id=s.quote_id and qq.quote_digest=s.quote_digest
+    and qq.scope_id=p_scope and qq.issuer_user_id=p_actor and qq.original_salesperson_user_id=p_actor
+    and qq.audience='sales' and qq.client_id is null and qq.billing_owner_user_id is null;
+  select * into c from public.membership_v2_sales_email_challenges cc where cc.source_id=s.id and cc.source_fingerprint=s.source_fingerprint;
+  select * into p from public.membership_v2_sales_email_proofs pp where pp.source_id=s.id and pp.token_hash=c.token_hash;
+  return query select p_scope,s.id,q.issued_at<=n and n<q.expires_at,
+    coalesce(c.issued_at<=n and n<c.expires_at,false),
+    coalesce(p.verified_at>=c.issued_at and p.verified_at<c.expires_at and p.verified_at<=n,false),n;
+end $$;
 revoke all on function public.membership_v2_valid_buyer(jsonb),public.membership_v2_sales_head_guard(),
   public.membership_v2_register_sales_prospect(uuid,uuid,uuid,uuid,text,uuid,jsonb,text,text,text),
-  public.membership_v2_verify_sales_email(uuid,text) from public,anon,authenticated,service_role;
+  public.membership_v2_verify_sales_email(uuid,text),public.membership_v2_read_sales_prospect(uuid,uuid,uuid) from public,anon,authenticated,service_role;
 grant execute on function public.membership_v2_valid_buyer(jsonb),public.membership_v2_sales_head_guard(),
   public.membership_v2_register_sales_prospect(uuid,uuid,uuid,uuid,text,uuid,jsonb,text,text,text),
-  public.membership_v2_verify_sales_email(uuid,text) to service_role;
+  public.membership_v2_verify_sales_email(uuid,text),public.membership_v2_read_sales_prospect(uuid,uuid,uuid) to service_role;
 commit;

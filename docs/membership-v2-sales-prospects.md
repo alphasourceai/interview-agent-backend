@@ -47,6 +47,16 @@ capability. Recorded proof can be read after ten-minute link expiry but only
 while the quote remains current and unexpired; replacement invalidates it.
 Both result flags `signing_enabled` and `checkout_enabled` are always false.
 
+`readCurrentProspect(subject)` is authenticated actor/scope recovery. It returns
+the immutable current source even when its quote expired or catalog changed,
+without a token, proof assertion, resend or eligibility grant. This permits CAS
+replacement after a committed create whose final readback failed or whose rep
+was temporarily revoked. An empty owned scope returns null. Current-head/expiry
+facts and proof timestamps are checked by a service-only read RPC under rep/head
+locks using FULL native database clock precision, never the Node clock. This
+corrects Grok's initial design findings; parent Auth/scope timing policy itself
+is unchanged and still requires hosted version/clock acceptance before mounting.
+
 ## Database and limits
 
 Sources/challenges/proofs are immutable including TRUNCATE; head deletion and
