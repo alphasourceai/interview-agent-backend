@@ -108,6 +108,17 @@ test('month-end and leap-year dates are derived from original anchor, without dr
   assert.throws(() => anchoredMonthInstant('9999-12-31T00:00:00.000Z', 1), { code: 'invalid_month_offset' });
 });
 
+test('independent UTC civil calendar oracle covers every approved clamp case', () => {
+  const oracle = [
+    ['2026-01-31T15:04:05Z', 1, '2026-02-28T15:04:05.000Z'],
+    ['2026-01-31T15:04:05Z', 2, '2026-03-31T15:04:05.000Z'],
+    ['2026-01-31T15:04:05Z', 3, '2026-04-30T15:04:05.000Z'],
+    ['2028-01-31T00:00:00Z', 1, '2028-02-29T00:00:00.000Z'],
+    ['2028-02-29T12:00:00Z', 12, '2029-02-28T12:00:00.000Z']
+  ];
+  for (const [start, offset, expected] of oracle) assert.equal(anchoredMonthInstant(start, offset), expected);
+});
+
 test('term windows keep selected term and separate 30-day reminder from cancellation cutoff', () => {
   const originalStart = '2026-11-30T12:00:00.000Z';
   const first = retailTermWindow({ originalStart, commitmentMonths: 3 });

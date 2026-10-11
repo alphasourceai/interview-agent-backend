@@ -34,7 +34,7 @@ function fixture({ planKey = 'basic', commitmentMonths = 3, paymentOption = 'pre
     checkout: { ...common, object: 'checkout.session', id: 'cs_synthetic', mode: 'subscription',
       subscription: 'sub_synthetic', invoice: 'in_initial', currency: 'usd',
       status: 'complete', payment_status: 'paid', amount_total: amount },
-    subscription: { ...common, object: 'subscription', id: 'sub_synthetic', currency: 'usd',
+    subscription: { ...common, object: 'subscription', id: 'sub_synthetic', currency: 'usd', status: 'active',
       items: { has_more: false, data: [{ id: 'si_platform', subscription: 'sub_synthetic', quantity: 1, price: recurringPrice }] } },
     invoice: { ...common, object: 'invoice', id: 'in_initial', subscription: 'sub_synthetic',
       payment_intent: 'pi_initial', charge: 'ch_initial', currency: 'usd',
@@ -103,11 +103,31 @@ test('conflicting original receipt, contract version, or start is held rather th
   const input = fixture();
   const original = planFirstMembershipActivation(input).activation;
   for (const patch of [{ invoice_id: 'in_other' }, { contract_version: 2 },
-    { original_start_at: '2027-01-28T12:13:14.000Z' }, { first_role_payment_cents: 1 },
-    { term_end_at: '2027-05-01T12:13:14.000Z' }]) {
+    { payment_success_at: '2027-01-28T12:13:14.000Z' }, { platform_price_id: 'price_other' },
+    { platform_item_id: 'si_other' }]) {
     assert.throws(() => planFirstMembershipActivation({ ...input, existingActivation: { ...original, ...patch } }),
       { code: 'conflicting_initial_activation' });
   }
+});
+
+test('replay of an already activated receipt is no-write before later refund/dispute/credit-note checks', () => {
+  const input = structuredClone(fixture());
+  const existingActivation = planFirstMembershipActivation(input).activation;
+  input.charge.amount_refunded = 10;
+  input.charge.refunded = true;
+  input.charge.disputed = true;
+  input.invoice.post_payment_credit_notes_amount = 10;
+  input.subscription.status = 'canceled';
+  assert.deepEqual(planFirstMembershipActivation({ ...input, existingActivation }), { action: 'already_activated' });
+  assert.throws(() => planFirstMembershipActivation(input), { code: 'initial_subscription_not_active' });
+  input.binding.contractVersion = 2;
+  assert.throws(() => planFirstMembershipActivation({ ...input, existingActivation }), { code: 'conflicting_initial_activation' });
+});
+
+test('installment reminder uses commitment end, never the one-month paid-access end', () => {
+  const result = planFirstMembershipActivation(fixture({ paymentOption: 'monthly_installments' }));
+  assert.equal(result.activation.initial_paid_access_end_at, '2027-02-28T12:13:14.000Z');
+  assert.equal(result.activation.renewal_reminder_at, '2027-03-31T12:13:14.000Z');
 });
 
 test('first-role and native tax are proved separately, not included in platform renewal/commission amount', () => {
@@ -124,6 +144,7 @@ const rejectCases = [
   ['partial payment', input => { input.paymentIntent.amount_received--; }, 'initial_payment_not_succeeded'],
   ['manual paid', input => { input.invoice.paid_out_of_band = true; }, 'initial_invoice_not_fully_collected'],
   ['not paid', input => { input.invoice.status = 'open'; }, 'initial_invoice_not_fully_collected'],
+  ['inactive subscription', input => { input.subscription.status = 'incomplete'; }, 'initial_subscription_not_active'],
   ['zero invoice', input => { input.invoice.amount_due = 0; }, 'initial_invoice_not_fully_collected'],
   ['customer credit', input => { input.invoice.starting_balance = -100; }, 'initial_invoice_not_fully_collected'],
   ['credit note', input => { input.invoice.post_payment_credit_notes_amount = 100; }, 'initial_invoice_not_fully_collected'],
@@ -141,7 +162,7 @@ const rejectCases = [
   ['incomplete lines', input => { input.invoice.lines.has_more = true; }, 'initial_lines_incomplete'],
   ['incomplete subscription items', input => { input.subscription.items.has_more = true; }, 'initial_items_incomplete'],
   ['unknown line', input => { input.invoice.lines.data.push({ id: 'il_unknown' }); }, 'initial_lines_incomplete'],
-  ['wrong platform price', input => { input.invoice.lines.data[0].price = { ...input.invoice.lines.data[0].price, id: 'price_other' }; }, 'initial_price_mismatch'],
+  ['wrong platform price', input => { input.invoice.lines.data[0].price = { ...input.invoice.lines.data[0].price, id: 'price_other' }; }, 'initial_price_identity_mismatch'],
   ['wrong platform amount', input => { input.invoice.lines.data[0].amount--; }, 'initial_platform_amount_mismatch'],
   ['wrong recurrence', input => { input.subscription.items.data[0].price.recurring.interval_count = 6; }, 'initial_recurrence_mismatch'],
   ['unknown tax', input => { input.invoice.total++; }, 'initial_invoice_not_fully_collected'],
@@ -162,7 +183,7 @@ for (const [label, mutate, code] of rejectCases) {
 test('bad price/tax on the one-time first-role line fails closed', () => {
   const input = structuredClone(fixture({ firstRole: true, tax: 100 }));
   input.invoice.lines.data[1].price.id = 'price_other';
-  assert.throws(() => planFirstMembershipActivation(input), { code: 'initial_price_mismatch' });
+  assert.throws(() => planFirstMembershipActivation(input), { code: 'initial_price_identity_mismatch' });
   const wrongTax = structuredClone(fixture({ tax: 100 }));
   wrongTax.invoice.lines.data[0].tax_amounts[0].amount = 99;
   assert.throws(() => planFirstMembershipActivation(wrongTax), { code: 'initial_total_mismatch' });

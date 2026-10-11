@@ -134,7 +134,7 @@ function verifyInitialLines(binding, subscription, invoice) {
     && invoice.total === offer.initial_payment_cents + nativeTaxes, 'initial_total_mismatch');
 }
 
-function proveFirstMembershipPayment({ binding, checkout, subscription, invoice, paymentIntent, charge, observedAt } = {}) {
+function initialPaymentIdentity({ binding, checkout, subscription, invoice, paymentIntent, charge, observedAt } = {}) {
   validateAcceptedOffer(binding?.offer);
   requireProof(typeof binding.contractId === 'string' && binding.contractId.length > 0
     && Number.isSafeInteger(binding.contractVersion) && binding.contractVersion > 0
@@ -151,7 +151,6 @@ function proveFirstMembershipPayment({ binding, checkout, subscription, invoice,
     && (expectedId === null || object.id === expectedId) && object.livemode === binding.livemode
     && id(object.customer) === binding.customerId), 'initial_provider_identity_mismatch');
   requireProof(validId(invoice.id, 'in') && validId(paymentIntent.id, 'pi') && validId(charge.id, 'ch')
-    && checkout.mode === 'subscription' && checkout.status === 'complete' && checkout.payment_status === 'paid'
     && id(checkout.subscription) === binding.subscriptionId && id(checkout.invoice) === invoice.id
     && id(invoice.subscription) === binding.subscriptionId && id(invoice.payment_intent) === paymentIntent.id
     && id(paymentIntent.invoice) === invoice.id && id(paymentIntent.latest_charge) === charge.id
@@ -159,12 +158,53 @@ function proveFirstMembershipPayment({ binding, checkout, subscription, invoice,
     && id(invoice.charge) === charge.id, 'initial_provider_link_mismatch');
   requireProof(invoice.currency === 'usd' && paymentIntent.currency === 'usd' && charge.currency === 'usd'
     && checkout.currency === 'usd' && subscription.currency === 'usd', 'initial_currency_mismatch');
+  // Establish only identity and completeness before checking an existing
+  // activation. A later refund/dispute belongs to its own adjustment processor;
+  // it must not turn an original activation replay into a new financial write.
+  requireProof(subscription.items?.has_more === false && Array.isArray(subscription.items.data)
+    && subscription.items.data.length === 1, 'initial_items_incomplete');
+  requireProof(invoice.lines?.has_more === false && Array.isArray(invoice.lines.data)
+    && invoice.lines.data.length === (binding.offer.first_role_prepay.selected ? 2 : 1)
+    && (invoice.lines.total_count == null || invoice.lines.total_count === invoice.lines.data.length),
+  'initial_lines_incomplete');
+  requireProof(invoice.lines.data.every(line => validId(line?.id, 'il'))
+    && new Set(invoice.lines.data.map(line => line.id)).size === invoice.lines.data.length,
+  'initial_line_identity_mismatch');
+  const item = subscription.items.data[0];
+  const platform = invoice.lines.data.filter(line => id(line?.subscription_item) === binding.platformItemId);
+  const firstRole = invoice.lines.data.filter(line => line !== platform[0]);
+  requireProof(item?.id === binding.platformItemId && id(item.price) === binding.platformPriceId
+    && platform.length === 1 && id(platform[0].price) === binding.platformPriceId
+    && (!binding.offer.first_role_prepay.selected || (firstRole.length === 1
+      && id(firstRole[0].price) === binding.firstRolePriceId)), 'initial_price_identity_mismatch');
+  const objectsCreated = objects.map(([object]) => object.created);
+  const paidAt = invoice.status_transitions?.paid_at;
+  requireProof(epoch(observedAt) && epoch(paidAt) && paidAt <= observedAt
+    && objectsCreated.every(created => epoch(created) && created <= paidAt), 'initial_payment_time_unverified');
+  return Object.freeze({
+    contract_id: binding.contractId, contract_version: binding.contractVersion,
+    offer_version: binding.offer.offer_version, checkout_session_id: checkout.id,
+    customer_id: binding.customerId, subscription_id: subscription.id,
+    invoice_id: invoice.id, payment_intent_id: paymentIntent.id, charge_id: charge.id,
+    platform_price_id: binding.platformPriceId, platform_item_id: binding.platformItemId,
+    first_role_price_id: binding.offer.first_role_prepay.selected ? binding.firstRolePriceId : null,
+    livemode: binding.livemode, currency: 'usd',
+    payment_success_at: new Date(paidAt * 1000).toISOString()
+  });
+}
+
+function proveFirstMembershipPayment(input = {}) {
+  const identity = initialPaymentIdentity(input);
+  const { binding, checkout, subscription, invoice, paymentIntent, charge } = input;
+  requireProof(subscription.status === 'active', 'initial_subscription_not_active');
+  requireProof(checkout.mode === 'subscription' && checkout.status === 'complete'
+    && checkout.payment_status === 'paid', 'initial_checkout_not_paid');
   requireProof(invoice.billing_reason === 'subscription_create' && invoice.status === 'paid' && invoice.paid === true
     && invoice.paid_out_of_band === false && invoice.collection_method === 'charge_automatically'
     && cents(invoice.amount_due) && invoice.amount_due > 0 && invoice.amount_paid === invoice.amount_due
     && invoice.amount_remaining === 0 && invoice.amount_paid === invoice.total
     && checkout.amount_total === invoice.total
-    && invoice.starting_balance === 0 && (invoice.ending_balance === 0 || invoice.ending_balance === null)
+    && invoice.starting_balance === 0 && invoice.ending_balance === 0
     && invoice.pre_payment_credit_notes_amount === 0 && invoice.post_payment_credit_notes_amount === 0
     && empty(invoice.discounts) && empty(invoice.total_discount_amounts), 'initial_invoice_not_fully_collected');
   requireProof(paymentIntent.status === 'succeeded' && paymentIntent.amount === invoice.amount_paid
@@ -173,23 +213,23 @@ function proveFirstMembershipPayment({ binding, checkout, subscription, invoice,
     && charge.amount_captured === invoice.amount_paid && charge.amount_refunded === 0
     && charge.refunded === false && charge.disputed === false, 'initial_payment_not_succeeded');
   verifyInitialLines(binding, subscription, invoice);
-  const paidAt = invoice.status_transitions?.paid_at;
-  requireProof(epoch(observedAt) && epoch(paidAt) && paidAt <= observedAt
-    && objects.every(([object]) => epoch(object.created) && object.created <= paidAt), 'initial_payment_time_unverified');
   return Object.freeze({
-    contract_id: binding.contractId, contract_version: binding.contractVersion,
-    offer_version: binding.offer.offer_version, checkout_session_id: checkout.id,
-    customer_id: binding.customerId, subscription_id: subscription.id,
-    invoice_id: invoice.id, payment_intent_id: paymentIntent.id, charge_id: charge.id,
-    livemode: binding.livemode, currency: 'usd', collected_cents: invoice.amount_paid,
+    ...identity, collected_cents: invoice.amount_paid,
     platform_payment_cents: binding.offer.platform_payment_cents,
     first_role_payment_cents: binding.offer.first_role_prepay.amount_cents,
-    tax_cents: invoice.total - binding.offer.initial_payment_cents,
-    payment_success_at: new Date(paidAt * 1000).toISOString()
+    tax_cents: invoice.total - binding.offer.initial_payment_cents
   });
 }
 
 function planFirstMembershipActivation(input = {}) {
+  const identity = initialPaymentIdentity(input);
+  if (input.existingActivation != null) {
+    requireProof(Object.keys(identity).every(key => input.existingActivation[key] === identity[key]),
+      'conflicting_initial_activation');
+    // No financial re-proof: refunded/disputed/credited historical receipts go
+    // to adjustment handling. The future transaction must treat this as no write.
+    return Object.freeze({ action: 'already_activated' });
+  }
   const receipt = proveFirstMembershipPayment(input);
   const { offer } = input.binding;
   const term = retailTermWindow({ originalStart: receipt.payment_success_at, commitmentMonths: offer.commitment_months });
@@ -198,13 +238,6 @@ function planFirstMembershipActivation(input = {}) {
     initial_paid_access_end_at: anchoredMonthInstant(receipt.payment_success_at,
       offer.payment_option === 'monthly_installments' ? 1 : offer.commitment_months)
   });
-  if (input.existingActivation != null) {
-    requireProof(Object.keys(activation).every(key => input.existingActivation[key] === activation[key]),
-      'conflicting_initial_activation');
-    // Do not return mutable current-term/access/preference fields. The caller's
-    // transaction must treat this action as no write, even after later renewal.
-    return Object.freeze({ action: 'already_activated' });
-  }
   return Object.freeze({ action: 'reserve_initial_activation', activation, renewal_ready: false,
     provider_alignment: 'requires_verified_executor' });
 }
