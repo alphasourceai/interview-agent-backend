@@ -240,7 +240,10 @@ test('missing, nonpositive or malformed offer cap and unsupported option fail cl
     {...c.offer,platform_payment_cents:-1},{...c.offer,platform_payment_cents:'not-cents'},
     {...c.offer,payment_option:'unsupported'}]) {
     assert.equal(service(`select membership_v2_valid_offer(${literal(malformed)})`),'f');
-    assert.throws(()=>setup({payment:'monthly_installments',qualify:false,snapshotChanges:malformed}),/check constraint/);
+    // setup merges over a complete quote; use explicit null for absent keys in
+    // this normal INSERT check. The damaged-row case below tests actual absence.
+    assert.throws(()=>setup({payment:'monthly_installments',qualify:false,snapshotChanges:{...malformed,
+      platform_payment_cents:malformed.platform_payment_cents??null,payment_option:malformed.payment_option??null}}),/check constraint/);
     fails(damagedOffer(c,malformed,insert('sales_commission_receipts',receipt(c))),/membership_commission_receipt_snapshot_conflict/);
   }
   assert.equal(service(`select offer_snapshot=${literal(c.offer)} from membership_v2_contracts where id='${c.id}'`),'t');
