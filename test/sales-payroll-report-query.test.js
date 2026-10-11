@@ -22,14 +22,14 @@ function fakeDb(seed) {
         gte(column, value) { state.filters.push([column, 'gte', value]); return builder; },
         lt(column, value) { state.filters.push([column, 'lt', value]); return builder; },
         lte(column, value) { state.filters.push([column, 'lte', value]); return builder; },
-        in(_column, ids) { state.ids = ids; return builder; },
+        in(column, ids) { state.ids = ids; state.idColumn = column; return builder; },
         order() { return builder; },
         range(start, end) { state.range = [start, end]; return builder; },
         limit(value) { state.limit = value; return builder; },
         then(resolve, reject) {
           reads.push(state);
           let data = seed[table] || [];
-          if (state.ids) data = data.filter((row) => state.ids.includes(row.id));
+          if (state.ids) data = data.filter((row) => state.ids.includes(row[state.idColumn]));
           for (const [column, operator, value] of state.filters) data = data.filter((row) =>
             operator === 'gte' ? row[column] >= value : operator === 'lt' ? row[column] < value : row[column] <= value);
           const count = data.length;
@@ -84,4 +84,44 @@ test('pagination rejects absent counts, short pages, and duplicate identifiers',
   await assert.rejects(allRows(response([{ user_id: rep }], 2), 'sales_reps', 'user_id', (value) => value, 'user_id'), /incomplete_read/);
   await assert.rejects(allRows(response([{ user_id: rep }, { user_id: rep }], 2), 'sales_reps', 'user_id', (value) => value, 'user_id'), /duplicate_or_missing_id/);
   await assert.rejects(allRows(response([], 10001), 'sales_reps', 'user_id', (value) => value, 'user_id'), /report_range_too_large/);
+});
+
+test('v2 report/export source uses frozen original rep after reassignment, and adjustment effective date', async () => {
+  const contract='55555555-5555-4555-8555-555555555555';
+  const v2={...oldReceipt,membership_terms_protocol:'retail_terms_v2',membership_contract_id:contract,membership_contract_version:1};
+  const seed={
+    sales_reps:[{user_id:rep,display_name:'Original Synthetic Rep',email:'rep@example.invalid',created_at:'2026-09-01T00:00:00Z'}],
+    sales_commission_receipts:[v2],
+    sales_commission_adjustments:[{id:'adjustment-v2',receipt_id:v2.id,adjustment_type:'refund',net_membership_delta_cents:-10000,
+      commission_delta_cents:-5000,effective_at:'2026-10-02T18:00:00Z',reviewed_at:'2026-10-02T19:00:00Z'}],
+    public_purchase_intents:[{id:intent,channel:'self_service',created_by_user_id:contract,company_legal_name:'Original buyer'}],
+    membership_v2_sales_qualifications:[{contract_id:contract,contract_version:1,purchase_intent_id:intent,rep_user_id:rep}],
+  };
+  const db=fakeDb(seed);
+  const result=await loadSalesPayrollReport(db,{date_from:'2026-10-01',date_to:'2026-10-03'},'2026-10-03T20:00:00Z');
+  assert.equal(result.totals.sale_count,0);assert.equal(result.totals.adjustment_cents,-10000);
+  assert.equal(result.representatives[0].user_id,rep);assert.equal(result.representatives[0].events[0].date,'2026-10-02');
+  assert.deepEqual(db.reads.find(r=>r.table==='membership_v2_sales_qualifications').ids,[contract]);
+  seed.sales_commission_adjustments=[];
+  seed.sales_commission_receipts=[{...v2,funds_received_at:'2026-10-02T18:00:00Z'}];
+  const received=await loadSalesPayrollReport(fakeDb(seed),{date_from:'2026-10-01',date_to:'2026-10-03'},'2026-10-03T20:00:00Z');
+  assert.equal(received.totals.sale_count,1);assert.equal(received.representatives[0].events[0].activity,'Monthly installment');
+  seed.sales_commission_receipts[0].payment_kind='paid_in_full';
+  assert.equal((await loadSalesPayrollReport(fakeDb(seed),{date_from:'2026-10-01',date_to:'2026-10-03'},'2026-10-03T20:00:00Z'))
+    .representatives[0].events[0].activity,'Prepaid membership payment');
+});
+
+test('v2 report cannot use mutable ownership when immutable qualification is missing or mismatched', async () => {
+  const contract='55555555-5555-4555-8555-555555555555';
+  const seed={sales_reps:[{user_id:rep,display_name:'Synthetic Rep',created_at:'2026-09-01T00:00:00Z'}],
+    sales_commission_receipts:[{...oldReceipt,funds_received_at:'2026-10-02T18:00:00Z',membership_terms_protocol:'retail_terms_v2',
+      membership_contract_id:contract,membership_contract_version:1}],sales_commission_adjustments:[],
+    public_purchase_intents:[{id:intent,channel:'sales_assisted',created_by_user_id:rep,company_legal_name:'Synthetic buyer'}],
+    membership_v2_sales_qualifications:[]};
+  const query={date_from:'2026-10-01',date_to:'2026-10-03'};
+  await assert.rejects(loadSalesPayrollReport(fakeDb(seed),query),/membership_v2_sales_qualifications_join_failed/);
+  for (const change of [{rep_user_id:contract},{contract_version:2},{purchase_intent_id:contract}]) {
+    seed.membership_v2_sales_qualifications=[{contract_id:contract,contract_version:1,purchase_intent_id:intent,rep_user_id:rep,...change}];
+    await assert.rejects(loadSalesPayrollReport(fakeDb(seed),query),/report_missing_sales_attribution/);
+  }
 });

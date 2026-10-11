@@ -50,20 +50,20 @@ async function allRows(db, table, columns, configure = (query) => query, orderCo
   throw new Error('report_range_too_large');
 }
 
-async function matchingIds(db, table, columns, ids) {
+async function matchingIds(db, table, columns, ids, idColumn = 'id') {
   if (!ids.length) return [];
   const rows = [];
   for (let index = 0; index < ids.length; index += 100) {
     const chunk = ids.slice(index, index + 100);
-    const { data, error } = await db.from(table).select(columns).in('id', chunk).limit(chunk.length);
-    if (error || !Array.isArray(data) || data.length !== chunk.length || new Set(data.map((row) => row.id)).size !== chunk.length ||
-        data.some((row) => !chunk.includes(row.id))) throw new Error(`report_${table}_join_failed`);
+    const { data, error } = await db.from(table).select(columns).in(idColumn, chunk).limit(chunk.length);
+    if (error || !Array.isArray(data) || data.length !== chunk.length || new Set(data.map((row) => row[idColumn])).size !== chunk.length ||
+        data.some((row) => !chunk.includes(row[idColumn]))) throw new Error(`report_${table}_join_failed`);
     rows.push(...data);
   }
   return rows;
 }
 
-const RECEIPT_COLUMNS = 'id,purchase_intent_id,rep_user_id,funds_received_at,payment_kind,gross_membership_cents,discount_cents,provider_fee_cents,net_membership_cents,commission_cents';
+const RECEIPT_COLUMNS = 'id,purchase_intent_id,rep_user_id,funds_received_at,payment_kind,gross_membership_cents,discount_cents,provider_fee_cents,net_membership_cents,commission_cents,membership_terms_protocol,membership_contract_id,membership_contract_version';
 
 async function loadSalesPayrollReport(db, query, generatedAt = new Date().toISOString()) {
   const bounds = reportBounds(query);
@@ -79,7 +79,11 @@ async function loadSalesPayrollReport(db, query, generatedAt = new Date().toISOS
   const linkedReceipts = await matchingIds(db, 'sales_commission_receipts', RECEIPT_COLUMNS, linkedIds);
   const intentIds = [...new Set([...receipts, ...linkedReceipts].map((row) => row.purchase_intent_id))];
   const intents = await matchingIds(db, 'public_purchase_intents', 'id,channel,created_by_user_id,company_legal_name,buyer_email', intentIds);
-  return buildSalesPayrollReport({ ...bounds, representatives, receipts, adjustments, linkedReceipts, intents, generatedAt });
+  const v2Contracts = [...new Set([...receipts,...linkedReceipts]
+    .filter(row=>row.membership_terms_protocol==='retail_terms_v2').map(row=>row.membership_contract_id))];
+  const qualifications = await matchingIds(db,'membership_v2_sales_qualifications',
+    'contract_id,contract_version,purchase_intent_id,rep_user_id',v2Contracts,'contract_id');
+  return buildSalesPayrollReport({ ...bounds, representatives, receipts, adjustments, linkedReceipts, intents, qualifications, generatedAt });
 }
 
 module.exports = { loadSalesPayrollReport, reportBounds, allRows };

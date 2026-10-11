@@ -3,6 +3,7 @@
 const express = require('express');
 const { fromZonedTime } = require('date-fns-tz');
 const { calculateReceiptCommission, weekRangeForTimestamp } = require('../../services/salesCommissionPolicy');
+const { loadMembershipCommissionTerms } = require('../../services/membershipCommissionTerms');
 const { parseMercuryPayrollCsv } = require('../../services/mercuryPayrollCsv');
 const { loadSalesPayrollReport } = require('../../services/salesPayrollReportQuery');
 const { buildSalesPayrollWorkbook } = require('../../services/salesPayrollWorkbook');
@@ -119,7 +120,7 @@ function createAdminSalesPayrollRouter({ db } = {}) {
       const reversedBankIds = new Set(reversals.map((row) => row.bank_transaction_id));
       const effectivePayouts = payouts.filter((row) => !row.bank_transaction_id || !reversedBankIds.has(row.bank_transaction_id));
       return res.json({
-        policy: { rate: 0.5, basis: 'each reviewed net first-term platform payment', timezone: 'America/Denver', annual_paid_monthly: 'each funded monthly receipt', automation_enabled: false },
+        policy: { rate: 0.5, basis: 'each reviewed net platform payment; original first year for new retail terms, first term for legacy', timezone: 'America/Denver', annual_paid_monthly: 'each funded monthly receipt', automation_enabled: false },
         automation: { enabled: false, can_enable: false, reason: 'Worker, reconciliation, and payout controls require a separate reviewed release.' },
         representatives: reps, pending_evidence: pendingEvidence, review_candidates: reviewCandidates,
         receipts, adjustments, payouts: effectivePayouts, departures, locked_statements: locks,
@@ -232,41 +233,50 @@ function createAdminSalesPayrollRouter({ db } = {}) {
       if (new Date(paymentAt) > new Date()) throw failure('future_payment_not_allowed');
       if (new Date(fundsAt) > new Date()) throw failure('future_funds_not_allowed');
       const intent = await one(db, 'public_purchase_intents', 'id,status,channel,created_by_user_id,agreement_id,client_id,activated_at,selected_billing_cadence,platform_fee_cents', 'id', intentId);
-      if (!intent || intent.status !== 'completed' || intent.channel !== 'sales_assisted' || !intent.created_by_user_id || !intent.agreement_id || !intent.client_id || !intent.activated_at) throw failure('unverified_qualifying_sale');
+      if (!intent || !intent.agreement_id || !intent.client_id) throw failure('unverified_qualifying_sale');
+      const membership = await loadMembershipCommissionTerms(db, intent);
+      if (!membership && (intent.status !== 'completed' || intent.channel !== 'sales_assisted' || !intent.created_by_user_id || !intent.activated_at)) throw failure('unverified_qualifying_sale');
       const client = await one(db, 'clients', 'id,billing_status,subscription_status', 'id', intent.client_id);
       if (!isActiveClient(client)) throw failure('client_not_active');
       const cadence = String(intent.selected_billing_cadence || '').toLowerCase();
-      if (!((cadence === 'monthly' && paymentKind === 'monthly') ||
+      if (membership ? paymentKind !== membership.paymentKind || provider !== 'stripe' : !((cadence === 'monthly' && paymentKind === 'monthly') ||
         (cadence === 'annual' && (paymentKind === 'paid_in_full' || paymentKind === 'financed_checkout')))) {
         throw failure('payment_kind_billing_cadence_mismatch');
       }
-      const platformFee = Number(intent.platform_fee_cents);
+      const platformFee = membership ? membership.platformPaymentCents : Number(intent.platform_fee_cents);
       if (!Number.isSafeInteger(platformFee) || platformFee <= 0 || gross > platformFee) throw failure('gross_exceeds_contract_platform_fee');
-      const agreement = await one(db, 'membership_agreements', 'id,client_id,status,checkout_status,signed_at,checkout_paid_at,initial_term_start,initial_renewal_date', 'id', intent.agreement_id);
-      if (!agreement || agreement.client_id !== intent.client_id || agreement.status !== 'signed' || agreement.checkout_status !== 'paid' || !agreement.signed_at || !agreement.checkout_paid_at) throw failure('unverified_qualifying_sale');
-      if (new Date(paymentAt) < new Date(agreement.signed_at)) throw failure('payment_precedes_signed_agreement');
-      const rep = await one(db, 'sales_reps', 'user_id,active', 'user_id', intent.created_by_user_id);
+      let agreement = null;
+      if (!membership) {
+        agreement = await one(db, 'membership_agreements', 'id,client_id,status,checkout_status,signed_at,checkout_paid_at,initial_term_start,initial_renewal_date', 'id', intent.agreement_id);
+        if (!agreement || agreement.client_id !== intent.client_id || agreement.status !== 'signed' || agreement.checkout_status !== 'paid' || !agreement.signed_at || !agreement.checkout_paid_at) throw failure('unverified_qualifying_sale');
+        if (new Date(paymentAt) < new Date(agreement.signed_at)) throw failure('payment_precedes_signed_agreement');
+      }
+      const rep = await one(db, 'sales_reps', 'user_id,active', 'user_id', membership ? membership.repUserId : intent.created_by_user_id);
       if (!rep) throw failure('unattributed_sale');
       const departure = await one(db, 'sales_commission_departures', 'final_day', 'rep_user_id', rep.user_id);
       if (!rep.active && !departure) throw failure('departed_rep_needs_reviewed_final_day');
-      const closeAt = new Date(Math.max(...[agreement.signed_at, agreement.checkout_paid_at, intent.activated_at].map((v) => new Date(v).getTime()))).toISOString();
+      const closeAt = membership ? membership.qualificationClosedAt : new Date(Math.max(...[agreement.signed_at, agreement.checkout_paid_at, intent.activated_at].map((v) => new Date(v).getTime()))).toISOString();
       if (new Date(closeAt) > new Date()) throw failure('future_qualifying_close');
+      const firstTermStart = membership ? membership.firstTermStartAt : termInstant(agreement.initial_term_start, 'first_term_start');
+      const firstTermEnd = membership ? membership.firstTermEndAt : termInstant(agreement.initial_renewal_date, 'first_term_end');
       const result = calculateReceiptCommission({
+        ...(membership ? membership.policyInput : {}),
         currency: 'usd', payment_kind: paymentKind, payment_succeeded: true, qualification_verified: true,
         gross_membership_cents: gross, discount_cents: discount, provider_fee_cents: fee,
         payment_success_at: paymentAt, funds_received_at: fundsAt, qualification_closed_at: closeAt,
-        first_term_start_at: termInstant(agreement.initial_term_start, 'first_term_start'),
-        first_term_end_at: termInstant(agreement.initial_renewal_date, 'first_term_end'),
+        first_term_start_at: firstTermStart,
+        first_term_end_at: firstTermEnd,
         rep_final_day: departure?.final_day || null,
       });
       if (result.status !== 'payable') throw failure(result.reason || 'receipt_not_payable');
       const weekStart = latestWeek(result.statement_week.from_iso, new Date().toISOString());
       await requireUnlockedWeek(db, rep.user_id, weekStart);
       const { data, error } = await db.from('sales_commission_receipts').insert({
+        ...(membership ? membership.ledgerFields : {}),
         purchase_intent_id: intentId, rep_user_id: rep.user_id, provider, provider_payment_id: paymentId,
         payment_kind: paymentKind, currency: 'usd', payment_success_at: paymentAt, funds_received_at: fundsAt,
-        qualification_closed_at: closeAt, first_term_start_at: termInstant(agreement.initial_term_start, 'first_term_start'),
-        first_term_end_at: termInstant(agreement.initial_renewal_date, 'first_term_end'), rep_final_day: departure?.final_day || null,
+        qualification_closed_at: closeAt, first_term_start_at: firstTermStart,
+        first_term_end_at: firstTermEnd, rep_final_day: departure?.final_day || null,
         gross_membership_cents: gross, discount_cents: discount, provider_fee_cents: fee,
         statement_week_start: weekStart, evidence_reference: evidence,
         review_note: String(body.review_note || '').trim().slice(0, 1000) || null,

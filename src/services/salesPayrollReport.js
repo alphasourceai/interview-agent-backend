@@ -30,7 +30,7 @@ function addEvent(representative, event) {
     representative.commission_cents].every(Number.isSafeInteger)) throw new Error('report_amount_out_of_range');
 }
 
-function buildSalesPayrollReport({ dateFrom, dateTo, representatives, receipts, adjustments, linkedReceipts, intents, generatedAt = new Date().toISOString() }) {
+function buildSalesPayrollReport({ dateFrom, dateTo, representatives, receipts, adjustments, linkedReceipts, intents, qualifications = [], generatedAt = new Date().toISOString() }) {
   const reps = representatives.map((row) => ({
     user_id: row.user_id, display_name: String(row.display_name || '').trim(), email: String(row.email || '').trim(),
     ...emptyTotals(), events: [],
@@ -38,13 +38,25 @@ function buildSalesPayrollReport({ dateFrom, dateTo, representatives, receipts, 
   const repById = new Map(reps.map((row) => [row.user_id, row]));
   const receiptsById = new Map([...linkedReceipts, ...receipts].map((row) => [row.id, row]));
   const intentById = new Map(intents.map((row) => [row.id, row]));
+  const qualificationByContract = new Map();
+  for (const row of qualifications) {
+    if (!row.contract_id || qualificationByContract.has(row.contract_id)) throw new Error('report_invalid_membership_qualification');
+    qualificationByContract.set(row.contract_id,row);
+  }
   const salesByRep = new Map(reps.map((row) => [row.user_id, new Set()]));
 
   function context(receipt) {
     if (!receipt) throw new Error('report_missing_receipt');
     const representative = repById.get(receipt.rep_user_id);
     const intent = intentById.get(receipt.purchase_intent_id);
-    if (!representative || !intent || intent.created_by_user_id !== receipt.rep_user_id || intent.channel !== 'sales_assisted') {
+    const protocol=receipt.membership_terms_protocol;
+    if (protocol != null && !['legacy_receipt_v1','retail_terms_v2'].includes(protocol)) throw new Error('report_invalid_membership_protocol');
+    const q=qualificationByContract.get(receipt.membership_contract_id);
+    const attributed=protocol==='retail_terms_v2'
+      ? q && Number.isSafeInteger(receipt.membership_contract_version) && receipt.membership_contract_version>0
+        && q.contract_version===receipt.membership_contract_version && q.purchase_intent_id===receipt.purchase_intent_id && q.rep_user_id===receipt.rep_user_id
+      : intent && intent.created_by_user_id===receipt.rep_user_id && intent.channel==='sales_assisted';
+    if (!representative || !intent || !attributed) {
       throw new Error('report_missing_sales_attribution');
     }
     const client = String(intent.company_legal_name || intent.buyer_email || '').trim();
@@ -62,7 +74,9 @@ function buildSalesPayrollReport({ dateFrom, dateTo, representatives, receipts, 
     if (gross <= 0 || discount < 0 || fee < 0 || gross - discount - fee !== net) throw new Error('report_receipt_reconciliation_failed');
     addEvent(representative, {
       id: `receipt:${receipt.id}`, date: localDate(receipt.funds_received_at), client_name: client,
-      activity: receipt.payment_kind === 'monthly' ? 'Monthly payment' : receipt.payment_kind === 'financed_checkout' ? 'Financed payment' : 'Annual payment',
+      activity: receipt.membership_terms_protocol==='retail_terms_v2'
+        ? (receipt.payment_kind==='monthly'?'Monthly installment':'Prepaid membership payment')
+        : receipt.payment_kind === 'monthly' ? 'Monthly payment' : receipt.payment_kind === 'financed_checkout' ? 'Financed payment' : 'Annual payment',
       gross_sales_cents: gross, adjustment_cents: -discount - fee, net_revenue_cents: net,
       commission_cents: commission, purchase_intent_id: receipt.purchase_intent_id, receipt_id: receipt.id,
     });
