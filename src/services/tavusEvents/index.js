@@ -1429,11 +1429,11 @@ async function recordInterviewCompletion({ interview, fresh, requestId, conversa
   try {
     await markInterviewCompleted({ db: supabaseAdmin, interviewId });
   } catch (completionErr) {
+    // Bounded like the other final-transcript logs: no interview or
+    // conversation id, no error text.
     console.error('[webhook] interview completion stamp failed', {
       request_id: requestId || null,
-      interview_id: interviewId,
-      conversation_id: conversationId || null,
-      error: completionErr?.message || completionErr
+      error_code: completionErr?.code || null
     });
   }
 }

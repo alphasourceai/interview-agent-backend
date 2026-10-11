@@ -547,7 +547,9 @@ const postUsageInvoice = (app, key, body = {}) => {
   return req.send(body);
 };
 
-test('an admin can raise a usage invoice on demand', async () => {
+// Pinned to NOW: the route bills the month before the wall clock, and the
+// fixtures are August 2026 usage.
+test('an admin can raise a usage invoice on demand', () => atFixedClock(new Date(NOW), async () => {
   const db = makeDb({ interviews: usedInterviews(3) });
   const stripe = makeStripe();
   const originalLog = console.log;
@@ -563,7 +565,7 @@ test('an admin can raise a usage invoice on demand', async () => {
   assert.equal(res.body.ok, true);
   assert.equal(res.body.total_cents, 7500);
   assert.equal(stripe.calls.invoices[0].metadata.reason, 'admin_request');
-});
+}));
 
 test('the Idempotency-Key header is required and must be well formed', async () => {
   const stripe = makeStripe();
@@ -577,7 +579,9 @@ test('the Idempotency-Key header is required and must be well formed', async () 
   assert.deepEqual(stripe.calls.invoices, [], 'a malformed key must not spend money');
 });
 
-test('reusing a key with the same body replays the first answer', async () => {
+// Pinned to NOW: the route bills the month before the wall clock, and the
+// fixtures are August 2026 usage.
+test('reusing a key with the same body replays the first answer', () => atFixedClock(new Date(NOW), async () => {
   const db = makeDb({ interviews: usedInterviews(3) });
   const stripe = makeStripe();
   const originalLog = console.log;
@@ -596,9 +600,11 @@ test('reusing a key with the same body replays the first answer', async () => {
   assert.equal(second.status, 200);
   assert.deepEqual(second.body, first.body, 'a double submit must return the first answer');
   assert.equal(stripe.calls.invoices.length, 1, 'and must not raise a second invoice');
-});
+}));
 
-test('reusing a key with a different body is refused', async () => {
+// Pinned to NOW: the route bills the month before the wall clock, and the
+// fixtures are August 2026 usage.
+test('reusing a key with a different body is refused', () => atFixedClock(new Date(NOW), async () => {
   const db = makeDb({ interviews: usedInterviews(3) });
   const stripe = makeStripe();
   const originalLog = console.log;
@@ -615,7 +621,7 @@ test('reusing a key with a different body is refused', async () => {
   assert.equal(second.status, 409);
   assert.equal(second.body.code, 'IDEMPOTENCY_KEY_REUSED');
   assert.equal(stripe.calls.invoices.length, 1);
-});
+}));
 
 test('a key seen while the first call is still running is refused', async () => {
   const db = makeDb({

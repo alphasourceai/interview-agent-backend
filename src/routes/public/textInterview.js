@@ -994,8 +994,7 @@ router.post('/answers', async (req, res) => {
           await markInterviewCompleted({ db: supabaseAdmin, interviewId: insertedInterview.id });
         } catch (completionErr) {
           console.error('[text-interview] interview completion stamp failed', {
-            interview_id: insertedInterview.id,
-            error: completionErr?.message || completionErr
+            error_code: completionErr?.code || null
           });
         }
       }

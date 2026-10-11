@@ -95,6 +95,38 @@ test('missing arguments are refused without writing', async () => {
   assert.equal(db.tables.interviews[0].completed_at, null);
 });
 
+test('a database error throws a fixed message with the code and nothing else', async () => {
+  const marker = 'synthetic-stamp-diagnostic iv_1';
+  const db = {
+    from() {
+      const chain = {
+        update: () => chain,
+        eq: () => chain,
+        is: () => chain,
+        select: () => chain,
+        maybeSingle: async () => ({
+          data: null,
+          error: { code: '57014', message: marker, details: marker, hint: marker }
+        })
+      };
+      return chain;
+    }
+  };
+
+  await assert.rejects(
+    markInterviewCompleted({ db, interviewId: 'iv_1', completedAt: '2026-09-15T10:00:00.000Z' }),
+    (err) => {
+      assert.equal(err.message, 'interview_completion_stamp_failed');
+      assert.equal(err.code, '57014');
+      assert.equal(Object.hasOwn(err, 'details'), false);
+      assert.equal(Object.hasOwn(err, 'hint'), false);
+      assert.equal(JSON.stringify({ ...err, message: err.message, stack: err.stack }).includes(marker), false,
+        'the database message, details and hint must not travel on the thrown error');
+      return true;
+    }
+  );
+});
+
 // --- the three used points ------------------------------------------------
 
 test('every path that makes an interview used stamps it', () => {

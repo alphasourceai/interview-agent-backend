@@ -97,7 +97,13 @@ const RAW_DIAGNOSTIC = [
   PRIVACY_SENTINELS.transcriptHash,
 ].join('|');
 
+const COMPLETION_STAMP_MARKER = 'privacy-probe-completion-stamp-diagnostic';
+const COMPLETION_STAMP_ERROR_CODE = '57014';
+
 const routePath = path.join(__dirname, '..', 'src', 'routes', 'webhooks', 'tavus.js');
+// The webhook pipeline (and its Supabase client) moved from the router into this
+// service, so it is reloaded with the router for each scenario's stubbed database.
+const tavusEventsPath = path.join(__dirname, '..', 'src', 'services', 'tavusEvents', 'index.js');
 const scoringPath = path.join(__dirname, '..', 'src', 'services', 'interviewScoring.js');
 const roleAvailabilityPath = path.join(__dirname, '..', 'src', 'services', 'roleInterviewAvailability.js');
 const backfillPath = path.join(__dirname, '..', 'scripts', 'backfillInterviews.js');
@@ -219,6 +225,7 @@ class FakeQuery {
   }
   select() { return this; }
   eq(column, value) { this.filters.push([column, value]); return this; }
+  is(column, value) { this.filters.push([column, value]); return this; }
   update(value) {
     this.operation = 'update';
     this.value = value;
@@ -254,6 +261,25 @@ class FakeQuery {
       }
     }
     const matches = this.filters.every(([key, value]) => String(row?.[key] ?? '') === String(value ?? ''));
+    // The billing completion stamp (markInterviewCompleted) is tracked on its own:
+    // it is not a reconciliation status or evidence write.
+    if (this.operation === 'update' && Object.keys(this.value || {}).join() === 'completed_at') {
+      this.db.tracker.completionStampCalls += 1;
+      if (this.db.options.completionStampError) {
+        return {
+          data: null,
+          error: {
+            code: COMPLETION_STAMP_ERROR_CODE,
+            message: `${COMPLETION_STAMP_MARKER} ${ID.interview} ${ID.conversation}`,
+            details: COMPLETION_STAMP_MARKER,
+            hint: COMPLETION_STAMP_MARKER,
+          },
+        };
+      }
+      if (!matches) return { data: null, error: null };
+      Object.assign(row, structuredClone(this.value));
+      return { data: { id: row.id }, error: null };
+    }
     if (this.operation === 'update') {
       this.db.tracker.directUpdates += 1;
       if (Object.hasOwn(this.value || {}, 'interview_analysis_v2')) {
@@ -309,6 +335,7 @@ function makeDb(options = {}) {
     scoreCalls: 0,
     storageUploads: 0,
     directUpdates: 0,
+    completionStampCalls: 0,
     analysisV2Calls: 0,
     analysisV2Inputs: [],
     analysisV2Updates: 0,
@@ -763,7 +790,7 @@ function buildApp(db, buildOptions = {}) {
     }
   }
   Module._load = function patchedLoad(request, parent, isMain) {
-    if (request === '../src/clients/supabase' && /routes\/webhook\.js$/.test(parent?.filename || '')) {
+    if (request === '../../clients/supabase' && /services[\\/]tavusEvents[\\/]index\.js$/.test(parent?.filename || '')) {
       return { supabaseAdmin: db, supabase: db };
     }
     if (request === '@sentry/node' && buildOptions.realSentry !== true) {
@@ -801,6 +828,7 @@ function buildApp(db, buildOptions = {}) {
     return originalLoad.call(this, request, parent, isMain);
   };
   delete require.cache[routePath];
+  delete require.cache[tavusEventsPath];
   try {
     const router = require(routePath);
     const app = express();
@@ -831,7 +859,7 @@ function buildApp(db, buildOptions = {}) {
       router,
       restore() {
         Module._load = originalLoad;
-        for (const filename of [routePath, scoringPath, roleAvailabilityPath, backfillPath, analysisV2Path]) {
+        for (const filename of [routePath, tavusEventsPath, scoringPath, roleAvailabilityPath, backfillPath, analysisV2Path]) {
           delete require.cache[filename];
         }
       },
@@ -2120,6 +2148,47 @@ test('final transcript logs contain bounded state only', async () => {
   const serialized = JSON.stringify(captured);
   assert.doesNotMatch(serialized, /76000000-|synthetic-final-transcript-conversation|synthetic-final-event/i);
   assert.doesNotMatch(serialized, /Describe a synthetic|built a synthetic|claim_token|candidate_id|interview_id|conversation_id/i);
+});
+
+test('failed completion stamp keeps the success answer and logs no identifiers or database text', async () => {
+  let expectedStatus;
+  let expectedBody;
+  await withScenario({}, async (app, db) => {
+    const response = await postTranscription(app);
+    expectedStatus = response.status;
+    expectedBody = await response.json();
+    assert.equal(db.tracker.completionStampCalls, 1);
+    assert.match(db.interview.completed_at, /^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  let scenarioDb;
+  let responseStatus;
+  let responseBody;
+  const captured = await captureConsole(async () => {
+    await withScenario({ completionStampError: true }, async (app, db) => {
+      scenarioDb = db;
+      const response = await postTranscription(app);
+      responseStatus = response.status;
+      responseBody = await response.json();
+      await drainDeferred();
+    });
+  });
+
+  assert.equal(responseStatus, expectedStatus);
+  assert.deepEqual(responseBody, expectedBody);
+  assert.equal(scenarioDb.tracker.completionStampCalls, 1);
+  assert.equal(scenarioDb.interview.completed_at, undefined);
+  const serializedConsole = JSON.stringify(captured);
+  assert.match(serializedConsole, /\[webhook\] interview completion stamp failed/);
+  assert.match(serializedConsole, new RegExp(`"error_code":"${COMPLETION_STAMP_ERROR_CODE}"`));
+  const allOutput = JSON.stringify({
+    responseBody,
+    captured,
+    sentry: serializedSentry(scenarioDb.tracker),
+  });
+  assert.equal(allOutput.includes(ID.interview), false, 'the interview id must not be logged');
+  assert.equal(allOutput.includes(ID.conversation), false, 'the conversation id must not be logged');
+  assert.equal(allOutput.includes(COMPLETION_STAMP_MARKER), false, 'the database error text must not be logged');
 });
 
 test('real Sentry SDK final events contain only bounded allowlisted telemetry', async (t) => {
