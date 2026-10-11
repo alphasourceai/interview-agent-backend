@@ -35,7 +35,7 @@ function fixture({ planKey = 'basic', commitmentMonths = 3, paymentOption = 'pre
       subscription: 'sub_synthetic', invoice: 'in_initial', currency: 'usd',
       status: 'complete', payment_status: 'paid', amount_total: amount },
     subscription: { ...common, object: 'subscription', id: 'sub_synthetic', currency: 'usd', status: 'active',
-      items: { has_more: false, data: [{ id: 'si_platform', subscription: 'sub_synthetic', quantity: 1, price: recurringPrice }] } },
+      items: { object: 'list', has_more: false, data: [{ id: 'si_platform', subscription: 'sub_synthetic', quantity: 1, price: recurringPrice }] } },
     invoice: { ...common, object: 'invoice', id: 'in_initial', subscription: 'sub_synthetic',
       payment_intent: 'pi_initial', charge: 'ch_initial', currency: 'usd',
       billing_reason: 'subscription_create', status: 'paid', paid: true, paid_out_of_band: false,
@@ -45,12 +45,13 @@ function fixture({ planKey = 'basic', commitmentMonths = 3, paymentOption = 'pre
       discounts: [], total_discount_amounts: [], total_tax_amounts: taxes,
       subtotal: offer.initial_payment_cents, total: amount, tax,
       status_transitions: { paid_at: seconds(paidAt) },
-      lines: { has_more: false, data: lines, total_count: lines.length } },
+      lines: { object: 'list', has_more: false, data: lines, total_count: lines.length } },
     paymentIntent: { ...common, object: 'payment_intent', id: 'pi_initial', invoice: 'in_initial',
       latest_charge: 'ch_initial', currency: 'usd', status: 'succeeded', amount, amount_received: amount },
     charge: { ...common, object: 'charge', id: 'ch_initial', invoice: 'in_initial', payment_intent: 'pi_initial',
       currency: 'usd', status: 'succeeded', paid: true, captured: true, amount, amount_captured: amount,
-      amount_refunded: 0, refunded: false, disputed: false },
+      amount_refunded: 0, refunded: false, disputed: false,
+      refunds: { object: 'list', has_more: false, data: [] } },
     observedAt: seconds('2027-02-10T00:00:00.000Z')
   };
 }
@@ -92,8 +93,12 @@ test('same immutable initial activation is no-write even after later renewal and
   const currentState = { initialActivation: activation, term_index: 3, auto_renew: false,
     access_end_at: '2028-01-31T12:13:14.000Z', intent_version: 8 };
   const before = structuredClone(currentState);
-  assert.deepEqual(planFirstMembershipActivation({ ...input, existingActivation: currentState.initialActivation }),
-    { action: 'already_activated' });
+  const replay = planFirstMembershipActivation({ ...input, existingActivation: currentState.initialActivation });
+  assert.equal(replay.action, 'already_activated');
+  assert.equal(replay.identity.payment_success_at, activation.payment_success_at);
+  for (const key of ['term_start_at', 'term_end_at', 'auto_renew', 'renewal_reminder_at', 'renewal_ready', 'initial_paid_access_end_at']) {
+    assert.equal(Object.hasOwn(replay.identity, key), false);
+  }
   assert.deepEqual(currentState, before);
   assert.ok(Object.isFrozen(activation));
   assert.throws(() => { activation.original_start_at = '2000-01-01'; }, TypeError);
@@ -116,9 +121,10 @@ test('replay of an already activated receipt is no-write before later refund/dis
   input.charge.amount_refunded = 10;
   input.charge.refunded = true;
   input.charge.disputed = true;
+  input.charge.refunds.data = [{ id: 're_synthetic', charge: input.charge.id, amount: 10 }];
   input.invoice.post_payment_credit_notes_amount = 10;
   input.subscription.status = 'canceled';
-  assert.deepEqual(planFirstMembershipActivation({ ...input, existingActivation }), { action: 'already_activated' });
+  assert.equal(planFirstMembershipActivation({ ...input, existingActivation }).action, 'already_activated');
   assert.throws(() => planFirstMembershipActivation(input), { code: 'initial_subscription_not_active' });
   input.binding.contractVersion = 2;
   assert.throws(() => planFirstMembershipActivation({ ...input, existingActivation }), { code: 'conflicting_initial_activation' });
@@ -163,7 +169,12 @@ const rejectCases = [
   ['credit note', input => { input.invoice.post_payment_credit_notes_amount = 100; }, 'initial_invoice_not_fully_collected'],
   ['coupon', input => { input.invoice.discounts = ['di_coupon']; }, 'initial_invoice_not_fully_collected'],
   ['refund', input => { input.charge.amount_refunded = 1; }, 'initial_payment_not_succeeded'],
+  ['pending refund object', input => { input.charge.refunds.data = [{ id: 're_pending', amount: 1 }]; }, 'initial_payment_not_succeeded'],
+  ['missing refund pagination', input => { delete input.charge.refunds; }, 'initial_refunds_incomplete'],
+  ['incomplete refund pagination', input => { input.charge.refunds.has_more = true; }, 'initial_refunds_incomplete'],
+  ['bare refund array', input => { input.charge.refunds = []; }, 'initial_refunds_incomplete'],
   ['dispute', input => { input.charge.disputed = true; }, 'initial_payment_not_succeeded'],
+  ['dispute ID', input => { input.charge.dispute = 'dp_synthetic'; }, 'initial_payment_not_succeeded'],
   ['wrong customer', input => { input.charge.customer = 'cus_other'; }, 'initial_provider_identity_mismatch'],
   ['wrong mode', input => { input.paymentIntent.livemode = true; }, 'initial_provider_identity_mismatch'],
   ['wrong subscription', input => { input.invoice.subscription = 'sub_other'; }, 'initial_provider_link_mismatch'],
@@ -200,6 +211,23 @@ test('bad price/tax on the one-time first-role line fails closed', () => {
   const wrongTax = structuredClone(fixture({ tax: 100 }));
   wrongTax.invoice.lines.data[0].tax_amounts[0].amount = 99;
   assert.throws(() => planFirstMembershipActivation(wrongTax), { code: 'initial_total_mismatch' });
+});
+
+test('each initial provider receipt ID has a single contract/version owner within mode', () => {
+  const keys = ['checkout_session_id', 'subscription_id', 'invoice_id', 'payment_intent_id', 'charge_id'];
+  const input = fixture();
+  const activation = planFirstMembershipActivation(input).activation;
+  for (const key of keys) {
+    const owner = { contract_id: 'other-contract', contract_version: 1, livemode: false, [key]: activation[key] };
+    assert.throws(() => planFirstMembershipActivation({ ...input, receiptOwners: [owner] }), { code: 'conflicting_receipt_owner' });
+    assert.throws(() => planFirstMembershipActivation({ ...input, existingActivation: activation, receiptOwners: [owner] }),
+      { code: 'conflicting_receipt_owner' });
+    assert.equal(planFirstMembershipActivation({ ...input, receiptOwners: [{ ...owner, livemode: true }] }).action,
+      'reserve_initial_activation');
+    assert.equal(planFirstMembershipActivation({ ...input, existingActivation: activation,
+      receiptOwners: [{ ...owner, contract_id: activation.contract_id }] }).action, 'already_activated');
+  }
+  assert.throws(() => planFirstMembershipActivation({ ...input, receiptOwners: [{}] }), { code: 'invalid_receipt_owners' });
 });
 
 test('accepted past catalog versions remain authoritative, without consulting current catalog', () => {

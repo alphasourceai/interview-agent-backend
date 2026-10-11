@@ -40,6 +40,28 @@ function empty(value) {
   return Array.isArray(value) && value.length === 0;
 }
 
+function completeList(value) {
+  return value?.object === 'list' && value.has_more === false && Array.isArray(value.data);
+}
+
+const RECEIPT_OWNER_KEYS = Object.freeze({ checkout_session_id: 'cs', subscription_id: 'sub',
+  invoice_id: 'in', payment_intent_id: 'pi', charge_id: 'ch' });
+
+function assertReceiptOwner(identity, owners = []) {
+  requireProof(Array.isArray(owners), 'invalid_receipt_owners');
+  for (const owner of owners) {
+    requireProof(owner && typeof owner.contract_id === 'string' && owner.contract_id.length > 0
+      && Number.isSafeInteger(owner.contract_version) && owner.contract_version > 0
+      && typeof owner.livemode === 'boolean'
+      && Object.entries(RECEIPT_OWNER_KEYS).every(([key, prefix]) => owner[key] == null || validId(owner[key], prefix))
+      && Object.keys(RECEIPT_OWNER_KEYS).some(key => owner[key] != null), 'invalid_receipt_owners');
+    const shared = owner.livemode === identity.livemode
+      && Object.keys(RECEIPT_OWNER_KEYS).some(key => owner[key] === identity[key]);
+    requireProof(!shared || (owner.contract_id === identity.contract_id
+      && owner.contract_version === identity.contract_version), 'conflicting_receipt_owner');
+  }
+}
+
 function validateAcceptedOffer(offer) {
   requireProof(offer?.schema_version === 2 && typeof offer.offer_version === 'string'
     && offer.offer_version.length > 0 && ['basic', 'pro'].includes(offer.plan_key)
@@ -93,13 +115,13 @@ function taxTotal(taxes) {
 
 function verifyInitialLines(binding, subscription, invoice) {
   const { offer } = binding;
-  requireProof(subscription.items?.has_more === false && Array.isArray(subscription.items.data)
+  requireProof(completeList(subscription.items)
     && subscription.items.data.length === 1, 'initial_items_incomplete');
   const item = subscription.items.data[0];
   requireProof(item?.id === binding.platformItemId && item.quantity === 1
     && id(item.subscription) === binding.subscriptionId, 'initial_item_mismatch');
   validatePrice(item.price, binding.platformPriceId, offer.platform_payment_cents, offer.stripe_recurrence);
-  requireProof(invoice.lines?.has_more === false && Array.isArray(invoice.lines.data)
+  requireProof(completeList(invoice.lines)
     && invoice.lines.data.length === (offer.first_role_prepay.selected ? 2 : 1)
     && (invoice.lines.total_count == null || invoice.lines.total_count === invoice.lines.data.length),
   'initial_lines_incomplete');
@@ -134,7 +156,7 @@ function verifyInitialLines(binding, subscription, invoice) {
     && invoice.total === offer.initial_payment_cents + nativeTaxes, 'initial_total_mismatch');
 }
 
-function initialPaymentIdentity({ binding, checkout, subscription, invoice, paymentIntent, charge, observedAt } = {}) {
+function initialPaymentIdentity({ binding, checkout, subscription, invoice, paymentIntent, charge, observedAt, receiptOwners } = {}) {
   validateAcceptedOffer(binding?.offer);
   requireProof(typeof binding.contractId === 'string' && binding.contractId.length > 0
     && Number.isSafeInteger(binding.contractVersion) && binding.contractVersion > 0
@@ -161,15 +183,16 @@ function initialPaymentIdentity({ binding, checkout, subscription, invoice, paym
   // Establish only identity and completeness before checking an existing
   // activation. A later refund/dispute belongs to its own adjustment processor;
   // it must not turn an original activation replay into a new financial write.
-  requireProof(subscription.items?.has_more === false && Array.isArray(subscription.items.data)
+  requireProof(completeList(subscription.items)
     && subscription.items.data.length === 1, 'initial_items_incomplete');
-  requireProof(invoice.lines?.has_more === false && Array.isArray(invoice.lines.data)
+  requireProof(completeList(invoice.lines)
     && invoice.lines.data.length === (binding.offer.first_role_prepay.selected ? 2 : 1)
     && (invoice.lines.total_count == null || invoice.lines.total_count === invoice.lines.data.length),
   'initial_lines_incomplete');
   requireProof(invoice.lines.data.every(line => validId(line?.id, 'il'))
     && new Set(invoice.lines.data.map(line => line.id)).size === invoice.lines.data.length,
   'initial_line_identity_mismatch');
+  requireProof(completeList(charge.refunds), 'initial_refunds_incomplete');
   const item = subscription.items.data[0];
   const platform = invoice.lines.data.filter(line => id(line?.subscription_item) === binding.platformItemId);
   const firstRole = invoice.lines.data.filter(line => line !== platform[0]);
@@ -185,7 +208,7 @@ function initialPaymentIdentity({ binding, checkout, subscription, invoice, paym
   const paidAt = invoice.status_transitions?.paid_at;
   requireProof(epoch(observedAt) && epoch(paidAt) && paidAt <= observedAt
     && objectsCreated.every(created => epoch(created) && created <= paidAt), 'initial_payment_time_unverified');
-  return Object.freeze({
+  const identity = Object.freeze({
     contract_id: binding.contractId, contract_version: binding.contractVersion,
     offer_version: binding.offer.offer_version, checkout_session_id: checkout.id,
     customer_id: binding.customerId, subscription_id: subscription.id,
@@ -195,10 +218,11 @@ function initialPaymentIdentity({ binding, checkout, subscription, invoice, paym
     livemode: binding.livemode, currency: 'usd',
     payment_success_at: new Date(paidAt * 1000).toISOString()
   });
+  assertReceiptOwner(identity, receiptOwners);
+  return identity;
 }
 
-function proveFirstMembershipPayment(input = {}) {
-  const identity = initialPaymentIdentity(input);
+function proveNewPayment(input, identity) {
   const { binding, checkout, subscription, invoice, paymentIntent, charge } = input;
   requireProof(subscription.status === 'active', 'initial_subscription_not_active');
   requireProof(checkout.mode === 'subscription' && checkout.status === 'complete'
@@ -215,7 +239,8 @@ function proveFirstMembershipPayment(input = {}) {
     && paymentIntent.amount_received === invoice.amount_paid && charge.status === 'succeeded'
     && charge.paid === true && charge.captured === true && charge.amount === invoice.amount_paid
     && charge.amount_captured === invoice.amount_paid && charge.amount_refunded === 0
-    && charge.refunded === false && charge.disputed === false, 'initial_payment_not_succeeded');
+    && charge.refunded === false && empty(charge.refunds.data)
+    && charge.disputed === false && charge.dispute == null, 'initial_payment_not_succeeded');
   verifyInitialLines(binding, subscription, invoice);
   return Object.freeze({
     ...identity, collected_cents: invoice.amount_paid,
@@ -225,16 +250,23 @@ function proveFirstMembershipPayment(input = {}) {
   });
 }
 
+function proveFirstMembershipPayment(input = {}) {
+  return proveNewPayment(input, initialPaymentIdentity(input));
+}
+
 function planFirstMembershipActivation(input = {}) {
   const identity = initialPaymentIdentity(input);
   if (input.existingActivation != null) {
     requireProof(Object.keys(identity).every(key => input.existingActivation[key] === identity[key]),
       'conflicting_initial_activation');
-    // No financial re-proof: refunded/disputed/credited historical receipts go
-    // to adjustment handling. The future transaction must treat this as no write.
-    return Object.freeze({ action: 'already_activated' });
+    // Recheck current financial state without changing the historical no-op.
+    // Bounded dirty-proof outcomes belong to the separate adjustment processor;
+    // unexpected programming exceptions still surface, rather than be swallowed.
+    try { proveNewPayment(input, identity); }
+    catch (error) { if (error?.status !== 409 || typeof error.code !== 'string') throw error; }
+    return Object.freeze({ action: 'already_activated', identity });
   }
-  const receipt = proveFirstMembershipPayment(input);
+  const receipt = proveNewPayment(input, identity);
   const { offer } = input.binding;
   const term = retailTermWindow({ originalStart: receipt.payment_success_at, commitmentMonths: offer.commitment_months });
   const activation = Object.freeze({
