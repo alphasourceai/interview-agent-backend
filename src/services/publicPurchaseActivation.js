@@ -8,6 +8,7 @@ const {
   normalizeAlphaScreenPlanKey,
   normalizeBillingInterval
 } = require('./alphaScreenPackages');
+const { recordExplicitBillingModel } = require('./enterpriseSettings');
 const { ensureUserAndSendRecovery, redactEmail } = require('./recoveryHelper');
 const { sendMemberRecoveryEmail, sendAlphaScreenWelcomeEmail } = require('../clients/sendgrid');
 const { buildClientPwResetUrl } = require('../config/urlConfig');
@@ -1122,20 +1123,27 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     .eq('id', clientId);
   if (clientUpdateErr) throw new Error(clientUpdateErr.message || 'Client activation update failed');
 
+  // An Enterprise agreement may state a billing model; it is split off so it is
+  // never upserted (see below).
+  const { billing_model: explicitBillingModel = null, ...enterpriseColumns } = enterprisePlanSettings || {};
   const planSettingsPayload = enterprisePlanSettings
-    ? { ...enterprisePlanSettings, client_id: clientId }
+    ? { ...enterpriseColumns, client_id: clientId }
     : buildAlphaScreenPlanSettingsPayload({
       clientId,
       planKey,
       billingInterval
     });
-  // billing_model is not written: left empty, it follows plan_tier, and a
+  // billing_model is not upserted: left empty, it follows plan_tier, and a
   // value already stored is an explicit choice this activation must not undo.
   await assertFence();
   const { error: settingsErr } = await db
     .from('client_plan_settings')
     .upsert(planSettingsPayload, { onConflict: 'client_id' });
   if (settingsErr) throw new Error(settingsErr.message || 'Client plan settings upsert failed');
+  if (explicitBillingModel) {
+    await assertFence();
+    await recordExplicitBillingModel({ db, clientId, billingModel: explicitBillingModel });
+  }
 
   await assertFence();
   const firstRoleCreditStatus = await createFirstRolePrepayCredit({

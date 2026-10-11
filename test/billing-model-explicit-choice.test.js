@@ -17,6 +17,7 @@ const { test } = require('node:test');
 const request = require('supertest');
 
 const { createFakeSupabase } = require('./helpers/fakeSupabase');
+const { guardPlanSettingsNotNull } = require('./helpers/planSettingsNotNull');
 
 const ROOT = path.join(__dirname, '..');
 const webhookPath = path.join(ROOT, 'src', 'routes', 'webhooks', 'stripe.js');
@@ -66,7 +67,8 @@ function makeDb(planSettings) {
     };
     return query;
   };
-  return db;
+  // max_interview_minutes is NOT NULL with no default in the hosted database.
+  return guardPlanSettingsNotNull(db);
 }
 
 function subscriptionEvent(metadata) {

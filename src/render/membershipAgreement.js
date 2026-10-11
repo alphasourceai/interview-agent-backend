@@ -256,6 +256,11 @@ function normalizeMembershipAgreementInput(input = {}) {
     pool_discount_pct: normalizeMoneyInput(input.pool_discount_pct ?? input.poolDiscountPct),
     pool_total_cents: normalizeCentsInput(String(input.pool_total_cents ?? input.poolTotalCents ?? '')),
     max_interview_minutes: normalizeWholeNumberInput(input.max_interview_minutes || input.maxInterviewMinutes || input.interview_duration_minutes || input.interviewDurationMinutes),
+    // Enterprise settings beyond the prices. Validated by enterpriseSettings.js
+    // before an agreement is sent; empty means "use the plan default".
+    scored_question_count: normalizeWholeNumberInput(input.scored_question_count || input.scoredQuestionCount),
+    billing_model: normalizeText(input.billing_model || input.billingModel).toLowerCase(),
+    rollover_days: normalizeWholeNumberInput(input.rollover_days || input.rolloverDays),
     first_role_prepay: normalizeFirstRolePrepayInput(input.first_role_prepay || input.firstRolePrepay),
     initial_term_start: normalizeDateInput(input.initial_term_start || input.initialTermStart),
     initial_renewal_date: normalizeDateInput(input.initial_renewal_date || input.initialRenewalDate),

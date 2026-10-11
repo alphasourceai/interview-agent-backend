@@ -8,7 +8,12 @@ const { getRoleInterviewAvailability } = require('../../services/roleInterviewAv
 const { buildAlphaScreenPlanSettingsPayload } = require('../../services/alphaScreenPackages');
 const { activatePublicPurchaseAgreementCheckout } = require('../../services/publicPurchaseActivation');
 const { finalizePendingRolePurchase } = require('../../services/rolePurchaseFinalizer');
-const { requirePlanCapacity } = require('../../services/planCapacity');
+const { getPlanCapacity } = require('../../services/planCapacity');
+const {
+  ENTERPRISE_SETTING_FIELDS,
+  recordExplicitBillingModel,
+  validateEnterpriseSettings
+} = require('../../services/enterpriseSettings');
 const { resolveBillingModel } = require('../../services/billingModel');
 const { applyUsageToInvoice } = require('../../services/usageBilling');
 const { markPoolFailed, markPoolPaid } = require('../../services/interviewPool');
@@ -216,6 +221,22 @@ function buildClientPlanSettingsPayloadFromSubscription(subscription, clientId, 
       return null;
     }
 
+    // The per-client settings the agreement stated. Shape only: the commercial
+    // rules were enforced when the agreement was sent and checked out, and a
+    // subscription from before they existed must still provision.
+    const settingsInput = {};
+    for (const field of ENTERPRISE_SETTING_FIELDS) {
+      const value = getSubscriptionMetadataValue(metadataSources, field, null);
+      if (value != null) settingsInput[field] = value;
+    }
+    const settings = validateEnterpriseSettings(settingsInput, { planTier: 'enterprise', enforcePolicy: false });
+    if (!settings.ok) {
+      // The metadata is fixed on the subscription, so no redelivery can fix it.
+      const err = permanentFailure(`Enterprise plan settings metadata invalid: ${settings.code}`);
+      err.code = settings.code;
+      throw err;
+    }
+
     return {
       client_id: clientId,
       plan_tier: 'enterprise',
@@ -224,8 +245,19 @@ function buildClientPlanSettingsPayloadFromSubscription(subscription, clientId, 
       per_role_fee: perRoleFee,
       included_interviews_per_role: includedInterviewsPerRole,
       additional_interview_fee: additionalInterviewFee,
-      max_interview_minutes: requirePlanCapacity('enterprise').max_interview_minutes,
-      ...(usageInterviewFeeCents === null ? {} : { usage_interview_fee_cents: usageInterviewFeeCents })
+      // Never null: the column is NOT NULL with no default in the hosted
+      // database. The agreement's length, else the tier's default length.
+      // Written on every event, like the prices.
+      max_interview_minutes: settings.settings.max_interview_minutes
+        ?? getPlanCapacity('enterprise').max_interview_minutes,
+      // Nullable: empty means the plan's question count.
+      scored_question_count: settings.settings.scored_question_count,
+      // The column is not nullable and defaults to 90, so it is only written
+      // when the agreement stated a value.
+      ...(settings.settings.rollover_days === null ? {} : { rollover_days: settings.settings.rollover_days }),
+      ...(usageInterviewFeeCents === null ? {} : { usage_interview_fee_cents: usageInterviewFeeCents }),
+      // Not a column write: the caller stores it only where none is stored yet.
+      ...(settings.settings.billing_model === null ? {} : { billing_model: settings.settings.billing_model })
     };
   }
 
@@ -275,13 +307,18 @@ async function upsertClientPlanSettingsFromSubscription(subscription, clientId, 
     client_id: clientId,
     subscription_id: pickId(subscription?.id) || null
   });
-  // billing_model is deliberately not written. A stored value is an explicit
-  // choice for this client and must survive subscription events; an empty one
-  // follows plan_tier, so a tier change moves such a client with no write here.
+  // billing_model is never upserted. A stored value is an explicit choice for
+  // this client and must survive subscription events; an empty one follows
+  // plan_tier. An agreement that states a model has it recorded only where the
+  // column is still empty, so a later event never clears or changes it.
+  const { billing_model: explicitBillingModel, ...columns } = payload;
   const { error } = await supabaseAdmin
     .from('client_plan_settings')
-    .upsert(payload, { onConflict: 'client_id' });
+    .upsert(columns, { onConflict: 'client_id' });
   if (error) throw new Error(error.message || 'Client plan settings upsert failed');
+  if (explicitBillingModel) {
+    await recordExplicitBillingModel({ db: supabaseAdmin, clientId, billingModel: explicitBillingModel });
+  }
   return true;
 }
 

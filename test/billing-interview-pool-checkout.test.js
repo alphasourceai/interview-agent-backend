@@ -17,6 +17,7 @@ const { test } = require('node:test');
 const request = require('supertest');
 
 const { createFakeSupabase } = require('./helpers/fakeSupabase');
+const { guardPlanSettingsNotNull } = require('./helpers/planSettingsNotNull');
 
 const ROOT = path.join(__dirname, '..');
 const checkoutPath = path.join(ROOT, 'src', 'services', 'subscriptionCheckout.js');
@@ -41,7 +42,8 @@ const DISCOUNTS = [
 ];
 
 function makeDb({ pools = [] } = {}) {
-  return createFakeSupabase({
+  // max_interview_minutes is NOT NULL with no default in the hosted database.
+  return guardPlanSettingsNotNull(createFakeSupabase({
     clients: [{
       id: CLIENT, parent_client_id: null, name: 'Acme Dental Group',
       email: 'owner@acme.example', stripe_customer_id: 'cus_1', stripe_subscription_id: null
@@ -50,7 +52,7 @@ function makeDb({ pools = [] } = {}) {
     enterprise_pool_discounts: DISCOUNTS,
     client_interview_pools: pools,
     client_interview_pool_draws: []
-  });
+  }));
 }
 
 // --- buying ---------------------------------------------------------------
@@ -289,6 +291,8 @@ function assertMembershipActivated(db) {
   const settings = db.tables.client_plan_settings.filter((row) => row.client_id === CLIENT);
   assert.equal(settings.length, 1, 'Enterprise plan settings are written');
   assert.equal(settings[0].usage_interview_fee_cents, 2500);
+  assert.equal(settings[0].max_interview_minutes, 15, 'no length: the plan default');
+  assert.deepEqual(db.notNullViolations, [], 'no null max_interview_minutes was sent');
 }
 
 function assertMembershipNotActivated(db) {

@@ -14,6 +14,7 @@ const { test } = require('node:test');
 const request = require('supertest');
 
 const { createFakeSupabase } = require('./helpers/fakeSupabase');
+const { guardPlanSettingsNotNull } = require('./helpers/planSettingsNotNull');
 
 const ROOT = path.join(__dirname, '..');
 const webhookPath = path.join(ROOT, 'src', 'routes', 'webhooks', 'stripe.js');
@@ -107,7 +108,8 @@ function makeDb({ pool = {}, agreement = {}, client = {}, intents = [] } = {}) {
       getUserById: async () => ({ data: { user: { id: 'user_owner', email: ADMIN_EMAIL } }, error: null })
     }
   };
-  return db;
+  // max_interview_minutes is NOT NULL with no default in the hosted database.
+  return guardPlanSettingsNotNull(db);
 }
 
 function liveSubscription(metadata = { ...ENTERPRISE_METADATA, ...POOL_METADATA }) {
@@ -186,6 +188,8 @@ function assertActivated(db) {
   assert.equal(latest.plan_tier, 'enterprise');
   assert.equal(latest.usage_interview_fee_cents, 2500);
   assert.equal(latest.included_interviews_per_role, 0);
+  assert.equal(latest.max_interview_minutes, 15, 'no length on the agreement: the plan default');
+  assert.deepEqual(db.notNullViolations, [], 'no null max_interview_minutes was sent');
   assert.equal(agreementRow(db).checkout_status, 'paid', 'the agreement is marked paid');
   assert.equal(agreementRow(db).checkout_session_id, 'cs_ent');
 }

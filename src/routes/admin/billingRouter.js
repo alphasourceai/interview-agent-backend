@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const stripe = require('../../clients/stripe');
 const { supabaseAnon, supabaseAdmin } = require('../../clients/supabase');
 const { requireParentClient } = require('../../services/clientBillingScope');
+const { validateEnterpriseSettings } = require('../../services/enterpriseSettings');
 const { htmlToPdf } = require('../../render/pdfRenderer');
 const { buildMembershipAgreementHtml, normalizeMembershipAgreementInput } = require('../../render/membershipAgreement');
 const { sendMembershipAgreementEmail, sendMembershipAgreementInternalNotification } = require('../../clients/sendgrid');
@@ -833,6 +834,20 @@ router.post('/agreements/send', async (req, res) => {
         error: validation.code,
         code: validation.code,
         detail: validation.detail,
+        request_id
+      });
+    }
+
+    // Read from the request as sent: the normaliser drops a value it cannot
+    // parse, which would turn "invalid" into "absent". Refused before a client is
+    // created or an agreement written; Essentials and Pro may not send them.
+    const enterpriseSettings = validateEnterpriseSettings(req.body || {}, { planTier: payload.membership_tier });
+    if (!enterpriseSettings.ok) {
+      return res.status(400).json({
+        error: enterpriseSettings.code,
+        code: enterpriseSettings.code,
+        detail: enterpriseSettings.detail,
+        field: enterpriseSettings.field,
         request_id
       });
     }
