@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; font-src data:; style-src 'unsafe-inline'" />
+  <title>alphaScreen Retail Membership - Review Draft</title>
+  <style>
+    {{{font_css}}}
+    @page { size: Letter; margin: 0.6in 0.6in 0.65in; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: #142044; background: #fff; font: 11px/1.5 'Raleway', Arial, sans-serif; }
+    .page + .page { break-before: page; }
+    .brand { width: 204px; height: auto; display: block; margin: 0 0 14px; }
+    .eyebrow { color: #6c4ac8; font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+    h1 { margin: 4px 0 5px; color: #08165b; font-size: 27px; line-height: 1.15; }
+    .subtitle { color: #5d6375; margin: 0 0 14px; }
+    .draft { border-left: 3px solid #a582ff; background: #f5f1ff; padding: 9px 12px; margin: 12px 0 16px; font-size: 10px; }
+    .draft strong { color: #6c4ac8; }
+    .identity, .totals, .charges { width: 100%; table-layout: fixed; border-collapse: collapse; margin: 0 0 12px; }
+    .identity td, .charges td { padding: 9px 11px; border: 1px solid #dde2ed; vertical-align: top; }
+    .label { font-size: 9px; font-weight: 700; color: #5d6375; text-transform: uppercase; letter-spacing: .035em; }
+    .value { font-weight: 700; color: #08165b; font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
+    .totals td { padding: 12px; background: #f5f1ff; border: 1px solid #d7c9fd; vertical-align: top; }
+    .total { font-size: 23px; line-height: 1.2; font-weight: 700; color: #6c4ac8; margin: 6px 0 4px; }
+    .note { color: #5d6375; font-size: 10px; line-height: 1.5; }
+    .section { margin-bottom: 11px; break-inside: avoid; }
+    h2 { color: #08165b; font-size: 13px; line-height: 1.3; margin: 13px 0 5px; break-after: avoid; }
+    p { margin: 0 0 7px; overflow-wrap: anywhere; }
+    .ref { border-top: 1px solid #dde2ed; padding-top: 9px; font-size: 9px; color: #5d6375; overflow-wrap: anywhere; }
+    .legal { font-size: 10.5px; line-height: 1.48; }
+    .legal h1 { font-size: 24px; }
+    .legal h2 { font-size: 12px; margin-top: 12px; }
+    .ack { margin: 12px 0 0; padding: 0; list-style: none; }
+    .ack li { padding: 5px 0 5px 14px; position: relative; }
+    .ack li::before { content: '\2022'; color: #6c4ac8; position: absolute; left: 0; }
+    .signing-held { border: 1px dashed #a582ff; background: #faf8ff; padding: 12px 14px; margin-top: 14px; }
+    tr { break-inside: avoid; }
+  </style>
+</head>
+<body>
+  <section class="page">
+    <img class="brand" src="{{logo_src}}" alt="alphaSource" />
+    <div class="eyebrow">alphaScreen / Retail membership</div>
+    <h1>Your membership details</h1>
+    <p class="subtitle">{{plan_name}} - {{months}}-month commitment - {{payment_label}}</p>
+    <p class="note">Term starts with the first full initial payment. Actual term dates will be shown after payment, not set by preparation or signature.</p>
+    <div class="draft"><strong>REVIEW DRAFT - NOT FOR SIGNATURE OR PAYMENT.</strong><br />New retail terms and the refund-policy reference require final approval. This document does not activate a membership.</div>
+    <table class="identity">
+      <tr><td><div class="label">Client legal name</div><div class="value">{{buyer.company_legal_name}}</div></td><td><div class="label">DBA / Trade name</div><div class="value">{{dba_label}}</div></td></tr>
+      <tr><td><div class="label">Primary contact</div><div class="value">{{buyer.buyer_first_name}} {{buyer.buyer_last_name}}</div></td><td><div class="label">Email</div><div class="value">{{buyer.buyer_email}}</div></td></tr>
+    </table>
+    <table class="totals">
+      <tr><td><div class="label">Platform payment</div><div class="total">{{platform_payment}}</div><div class="note">{{payment_note}}</div></td>
+      <td><div class="label">Total platform commitment</div><div class="total">{{platform_total}}</div><div class="note">For the full {{months}}-month term. Role, interview and tax charges are separate.</div></td></tr>
+    </table>
+    <table class="charges">
+      <tr><td><div class="label">Initial payment before tax</div><div class="value">{{initial_payment}}</div></td><td><div class="label">One-time first-role prepayment</div><div class="value">{{first_role_label}}</div></td></tr>
+      <tr><td><div class="label">Per-role fee</div><div class="value">{{per_role_fee}} when a role is opened</div></td><td><div class="label">Additional interview fee</div><div class="value">{{extra_interview_fee}} per additional interview</div></td></tr>
+      <tr><td><div class="label">Included interviews per role</div><div class="value">{{included_interviews}}</div></td><td><div class="label">Interview format</div><div class="value">Up to {{interview_minutes}} minutes / {{question_count}} scored questions</div></td></tr>
+    </table>
+    <p>{{capacity_note}}</p>
+  </section>
+
+  <section class="page">
+    <div class="eyebrow">Review draft / Your commitment</div>
+    <h1>Term, payments and renewal</h1>
+    <p class="subtitle">{{plan_name}} - {{months}} calendar months - {{payment_label}}</p>
+    <table class="identity"><tr><td><div class="label">Contact title</div><div class="value">{{title_label}}</div></td><td><div class="label">Contact phone</div><div class="value">{{phone_label}}</div></td></tr></table>
+    <div class="section" id="membership-term">
+      <h2>2. Membership Term</h2>
+      <p>The initial Membership term begins when alphaSource successfully receives the full initial payment and continues for {{months}} calendar months. Invoice creation, signature and payment-notification delivery do not set the term start. Term dates are calculated from the original confirmed payment instant in UTC, preserving its calendar day and time and using the last day of a shorter month when necessary.</p>
+      <p>The Membership automatically renews for successive {{months}}-month terms at the platform pricing accepted in this agreement. Auto-renewal is enabled by default. Client may turn off renewal at any time <strong>before the current term ends</strong> through the account's renewal controls.</p>
+      <p>A reminder is planned 30 days before renewal. That reminder is not a cancellation deadline and does not remove Client's ability to turn off renewal before the term ends. Turning off renewal stops the next term; it does not shorten the current term or cancel amounts still owed for it. No additional cancellation fee is charged for turning off renewal.</p>
+    </div>
+    <div class="section" id="membership-billing">
+      <h2>3. Fees, Billing, and Payment</h2>
+      {{#if installments}}
+      <p>Client's payment option is <strong>{{months}} monthly installments of {{platform_payment}}</strong>, for a total platform commitment of <strong>{{platform_total}}</strong>. The first installment is part of the initial payment. This is not an unrestricted month-to-month membership.</p>
+      <p>Client remains responsible for every installment in the full {{months}}-month term even if renewal is turned off. Access continues while required payments are made. The commitment end and the date through which payments fund access are different; turning off renewal does not forgive remaining installments.</p>
+      {{else}}
+      <p>Client's payment option is <strong>{{platform_payment}} prepaid for the full {{months}}-month term</strong>. After successful payment, Membership access remains active for that full prepaid term. Turning off renewal does not shorten the prepaid term or request a refund.</p>
+      {{/if}}
+      <p>The initial payment before tax is {{initial_payment}}. {{first_role_note}} Role and interview fees are separate from platform membership. The one-time first-role prepayment, if selected, is not charged again on renewal.</p>
+      <p>Client authorizes alphaSource and its payment processors to charge the payment method on file for applicable fees, renewals, additional usage purchases, taxes, and related charges. If any payment is late, declined, reversed, or unpaid, alphaSource may restrict, suspend, or disable access until the account is brought current.</p>
+    </div>
+    <div class="section">
+      <h2>Refund policy - final publication pending</h2>
+      <p>Ordinary early cancellation, non-use or turning off renewal does not entitle Client to a refund of prepaid fees or forgive installments owed for the current term. Refund exceptions will follow the final published refund policy, applicable law and specifically approved administrative exceptions.</p>
+      <p><strong>This review draft does not invent a refund-policy URL, publication version or exception. The final policy reference must be approved and attached before the agreement can be sent or signed.</strong></p>
+    </div>
+    <ul class="ack">
+      <li>The Membership commitment is {{months}} calendar months, starting after full initial payment.</li>
+      <li>{{ack_payment}}</li>
+      <li>Renewal retains the accepted platform pricing and term unless turned off before the current term ends.</li>
+      <li>Role and interview charges, one-time first-role credit and applicable tax are separate.</li>
+    </ul>
+    <p class="ref">Prepared {{prepared_label}}. Review document {{document_id}}.<br />Offer {{offer_version}} / Document {{template_version}}.</p>
+  </section>
+
+  <section class="page legal">
+    <div class="eyebrow">Review draft / General provisions</div>
+    <h1>alphaScreen Membership Agreement</h1>
+    <p>This Agreement is entered into by and between alphaSource Network, LLC, a Wyoming limited liability company (“alphaSource”), and {{buyer.company_legal_name}}, the client identified in the Membership Details page, order summary, checkout, invoice, or account registration (“Client”), individually a “Party”, and together with alphaSource, the “Parties”.</p>
+    <div class="section" data-clause="1"><h2>1. Services</h2>
+    <p>alphaSource provides an AI-assisted hiring and interview workflow platform that may include role creation, candidate intake, resume processing, candidate verification, AI-led interview workflows, dashboards, reporting, accommodation-request workflows, and related analytics, summaries, and reports. Features may vary by plan, configuration, availability, and third-party service dependencies.</p></div>
+    <div class="section" data-clause="4"><h2>4. Client Access and Permitted Use</h2>
+    <p>Client may use the Services only for its internal business purposes in connection with recruiting, interviewing, candidate evaluation, and related workforce decision-support activities. Client is responsible for all activity occurring under its account, including activity by its administrators, managers, employees, contractors, and representatives.</p></div>
+    <div class="section" data-clause="5"><h2>5. Client Data, Candidate Data, and Privacy</h2>
+    <p>alphaSource may process information provided by Client or candidates, including candidate and user identity information, contact information, resumes, interview content, assessment data, accommodation-request information, reports, and related account data. alphaSource will keep Client and candidate information private and confidential and will not sell such information to third parties.</p>
+    <p>Client represents and warrants that it has all rights, permissions, notices, and legal authority necessary to submit, upload, use, and direct alphaSource to process Client data and candidate data in connection with the Services.</p></div>
+    <div class="section" data-clause="6"><h2>6. Confidentiality</h2>
+    <p>Each Party will use the other Party’s non-public business, technical, commercial, candidate, pricing, account, and platform information only as necessary to perform or exercise rights under this Agreement and will protect such information using reasonable care.</p></div>
+    <div class="section" data-clause="7"><h2>7. AI Outputs, Reports, and Limitations</h2>
+    <p>The Services may generate or assist with interview prompts, transcripts, summaries, scores, analyses, reports, AI-aided risk indicators, and other outputs using automated systems, machine learning models, third-party AI providers, and related tooling. Client acknowledges that AI-assisted outputs may be incomplete, inaccurate, probabilistic, inconsistent, or context-dependent.</p></div>
+    <div class="section" data-clause="8"><h2>8. Client Responsibility for Hiring and Legal Compliance</h2>
+    <p>Client is solely responsible for all recruiting, screening, accommodation, interview, hiring, rejection, promotion, compensation, employment, and related business or employment decisions. alphaSource does not make employment decisions and is not the employer of any candidate. Client is solely responsible for compliance with all laws and regulations applicable to its recruiting and employment practices.</p></div>
+    <div class="section" data-clause="9"><h2>9. Service Availability and Third-Party Dependencies</h2>
+    <p>The Services may depend on third-party infrastructure and providers, including hosting providers, storage providers, AI/model providers, communications providers, payment processors, video/interview providers, and related integrations. alphaSource does not guarantee uninterrupted availability, continuous uptime, error-free operation, immediate processing, successful message delivery, successful webhook delivery, or availability of any third-party integration at all times.</p></div>
+    <div class="section" data-clause="10"><h2>10. Intellectual Property</h2>
+    <p>alphaSource and its licensors retain all right, title, and interest in and to the Services, software, platform, workflows, interface designs, documentation, know-how, and all related intellectual property. As between the Parties, Client retains ownership of Client data and candidate data submitted by or on behalf of Client, subject to alphaSource’s right to process such data as necessary to provide and support the Services.</p>
+    <p>Certain alphaScreen technologies are patent pending.</p></div>
+  </section>
+
+  <section class="page legal">
+    <div class="eyebrow">Review draft / Final provisions</div>
+    <h1>Protection and acknowledgment</h1>
+    <div class="section" data-clause="11"><h2>11. Suspension and Termination</h2>
+    <p>alphaSource may suspend or restrict access immediately if Client fails to pay amounts due, breaches this Agreement, uses the Services in a way that presents legal, security, operational, or reputational risk, or if alphaSource reasonably believes suspension is necessary to prevent harm or protect the Services, candidates, Client, or third parties.</p>
+    <p>Upon termination or expiration, Client’s access rights end, accrued payment obligations survive, and alphaSource may disable account access and related workflows. Client will have thirty (30) days from the effective date of termination to export or download its Client Data and Candidate Data from the Services.</p></div>
+    <div class="section" data-clause="12"><h2>12. Warranty Disclaimer</h2>
+    <p>To the maximum extent permitted by law, the Services are provided “as is” and “as available.” alphaSource disclaims all warranties, whether express, implied, statutory, or otherwise, including any implied warranties of merchantability, fitness for a particular purpose, title, non-infringement, accuracy, availability, or that the Services or outputs will be error-free, complete, secure, or legally sufficient for Client’s intended use.</p></div>
+    <div class="section" data-clause="13"><h2>13. Limitation of Liability</h2>
+    <p>To the maximum extent permitted by law, neither Party will be liable to the other for any indirect, incidental, special, consequential, exemplary, or punitive damages, or for any loss of profits, revenue, goodwill, data, business opportunity, or business interruption, even if advised of the possibility of such damages.</p>
+    <p>To the maximum extent permitted by law, alphaSource’s total aggregate liability arising out of or related to this Agreement or the Services will not exceed the total amount of fees paid or payable by Client to alphaSource under this Agreement during the twelve (12) months immediately preceding the event giving rise to the claim.</p></div>
+    <div class="section" data-clause="14"><h2>14. Indemnification</h2>
+    <p>Client will defend, indemnify, and hold harmless alphaSource and its officers, directors, employees, affiliates, contractors, and agents from and against any third-party claims, demands, actions, damages, liabilities, losses, costs, and expenses (including reasonable attorneys’ fees) arising from or related to Client data, Client’s use of the Services, Client’s recruiting and employment decisions, or Client’s unlawful or non-compliant use of the Services or any outputs.</p></div>
+    <div class="section" data-clause="15"><h2>15. General</h2>
+    <p>This Agreement, together with any applicable Membership Details form, order summary, checkout terms, invoice, or written addendum executed by the Parties, constitutes the entire agreement between the Parties regarding the Services and supersedes prior or contemporaneous understandings on that subject.</p>
+    <p>This Agreement is governed by the laws of the State of Wyoming, without regard to conflict-of-laws rules. Any dispute arising from or related to this Agreement will be brought exclusively in the state or federal courts located in Sheridan County, Wyoming, and each Party consents to that venue and jurisdiction.</p>
+    <p>Client may turn off renewal through the account's renewal controls before the current term ends, as described in Section 2. Other formal communications must be sent to memberships@alphasourceai.com. Notices to alphaSource may also be sent by mail to alphaSource Network, LLC, 30 N. Gould St, Ste R, Sheridan, WY 82801.</p></div>
+    <div class="signing-held"><strong>Acceptance and signatures - unavailable in this review draft.</strong>
+    <p>Electronic acceptance will be available only after the legal body and refund-policy reference are approved and the document is issued through the reviewed source-bound signing flow. No signature or payment may be recorded from this PDF.</p></div>
+    <p class="ref">{{document_id}} / {{template_version}}. REVIEW DRAFT - NOT AN EXECUTED AGREEMENT.</p>
+  </section>
+</body>
+</html>
