@@ -414,6 +414,78 @@ function shouldIgnoreStaleSubscriptionUpdate(client, incomingSubscriptionId, eve
   return true;
 }
 
+// Reads and cross-checks the pool a checkout session names, writing nothing.
+// Metadata that disagrees with the row means the session is not describing this
+// pool, the same cross-checks the additional-interviews branch makes, and no
+// retry will change that.
+async function loadInterviewPoolForCheckout(metadata = {}) {
+  const poolId = String(metadata?.client_interview_pool_id || '').trim();
+  if (!poolId) throw permanentFailure('Interview pool id missing from checkout metadata');
+
+  const { data: pool, error: poolLookupErr } = await supabaseAdmin
+    .from('client_interview_pools')
+    .select('id,client_id,quantity_purchased,status')
+    .eq('id', poolId)
+    .maybeSingle();
+  if (poolLookupErr) throw new Error(poolLookupErr.message || 'Interview pool lookup failed');
+  if (!pool) throw permanentFailure('Interview pool not found');
+
+  const metadataClientId = String(metadata?.client_id || '').trim();
+  if (metadataClientId && String(pool.client_id) !== metadataClientId) {
+    throw permanentFailure('Interview pool client mismatch');
+  }
+  const metadataPoolQuantity = Number(metadata?.pool_quantity);
+  if (Number.isInteger(metadataPoolQuantity) && metadataPoolQuantity > 0
+    && Number(pool.quantity_purchased) !== metadataPoolQuantity) {
+    throw permanentFailure('Interview pool quantity mismatch');
+  }
+  return pool;
+}
+
+// Grants the pool only on settled money; a failed payment fails it, and an
+// unsettled one leaves it pending.
+async function settleInterviewPoolFromCheckout(pool, { paymentFailed, paymentSettled, session, requestId } = {}) {
+  if (paymentFailed) {
+    await markPoolFailed({ db: supabaseAdmin, poolId: pool.id });
+    console.warn('[stripe-webhook][interview-pool] payment_failed', {
+      request_id: requestId, client_interview_pool_id: pool.id, client_id: pool.client_id
+    });
+    return;
+  }
+  if (!paymentSettled) {
+    console.log('[stripe-webhook][interview-pool] payment_not_settled', {
+      request_id: requestId,
+      client_interview_pool_id: pool.id,
+      payment_status: String(session?.payment_status || '') || null
+    });
+    return;
+  }
+  const result = await markPoolPaid({
+    db: supabaseAdmin,
+    poolId: pool.id,
+    stripePaymentIntentId: pickId(session?.payment_intent) || null
+  });
+  console.log('[stripe-webhook][interview-pool] settled', {
+    request_id: requestId,
+    client_interview_pool_id: pool.id,
+    client_id: pool.client_id,
+    paid: result.paid === true,
+    reason: result.reason || null
+  });
+}
+
+function buildEnterprisePlanSettingsForActivation(options = {}) {
+  const subscription = options.subscription || null;
+  const clientId = String(options.fallbackClientId || subscription?.metadata?.client_id || '').trim();
+  if (!subscription || !clientId) return null;
+  const payload = buildClientPlanSettingsPayloadFromSubscription(subscription, clientId, {
+    fallbackSource: 'agreement_checkout',
+    fallbackPlanTier: options.fallbackPlanTier || null,
+    fallbackBillingInterval: options.fallbackBillingInterval || null
+  });
+  return payload?.plan_tier === 'enterprise' ? payload : null;
+}
+
 async function markAgreementCheckoutPaid(agreementId, options = {}) {
   const normalizedAgreementId = String(agreementId || '').trim();
   if (!normalizedAgreementId) return;
@@ -479,6 +551,10 @@ async function markAgreementCheckoutPaid(agreementId, options = {}) {
   }
   try {
     const activate = options.activate || activatePublicPurchaseAgreementCheckout;
+    // Enterprise prices are per client and travel on the subscription, so they are
+    // read here with the same builder the subscription events use. Null for any
+    // other tier, which takes its package defaults.
+    const enterprisePlanSettings = buildEnterprisePlanSettingsForActivation(options);
     const result = await activate({
       agreementId: normalizedAgreementId,
       checkoutSessionId: options.checkoutSessionId || null,
@@ -490,6 +566,7 @@ async function markAgreementCheckoutPaid(agreementId, options = {}) {
       fallbackPlanTier: options.fallbackPlanTier || null,
       fallbackBillingInterval: options.fallbackBillingInterval || null,
       requestId: options.requestId || null,
+      enterprisePlanSettings,
       activationClaimKey: claim.claimed ? claim.key : null,
       activationIntentId: claim.claimed ? claim.intentId : null,
       assertActivationFence: assertFence,
@@ -748,56 +825,20 @@ router.post('/', async (req, res) => {
       // status rather than on the session having completed.
       const paymentFailed = event.type === 'checkout.session.async_payment_failed';
       const paymentSettled = !paymentFailed && isSettledPayment(eventObject);
+      const isSubscriptionSession = String(eventObject?.mode || '').toLowerCase() === 'subscription';
 
-      if (purchaseType === 'interview_pool') {
-        const poolId = String(metadata?.client_interview_pool_id || '').trim();
-        if (!poolId) throw permanentFailure('Interview pool id missing from checkout metadata');
+      // An Enterprise pool is sold on the membership's own subscription session, so
+      // that one event has to settle the pool and activate the subscription. The
+      // pool is checked first, before anything is written: a pool the session does
+      // not describe is a permanent failure, and refusing it here leaves nothing
+      // half-done. It is settled last, once activation has succeeded, so a pool is
+      // never spendable for a membership whose activation failed.
+      const interviewPool = purchaseType === 'interview_pool'
+        ? await loadInterviewPoolForCheckout(metadata)
+        : null;
 
-        const { data: pool, error: poolLookupErr } = await supabaseAdmin
-          .from('client_interview_pools')
-          .select('id,client_id,quantity_purchased,status')
-          .eq('id', poolId)
-          .maybeSingle();
-        if (poolLookupErr) throw new Error(poolLookupErr.message || 'Interview pool lookup failed');
-        if (!pool) throw permanentFailure('Interview pool not found');
-
-        // Same cross-checks the additional-interviews branch makes: metadata that
-        // disagrees with the row means the session is not describing this pool,
-        // and no retry will change that.
-        if (metadataClientId && String(pool.client_id) !== metadataClientId) {
-          throw permanentFailure('Interview pool client mismatch');
-        }
-        const metadataPoolQuantity = Number(metadata?.pool_quantity);
-        if (Number.isInteger(metadataPoolQuantity) && metadataPoolQuantity > 0
-          && Number(pool.quantity_purchased) !== metadataPoolQuantity) {
-          throw permanentFailure('Interview pool quantity mismatch');
-        }
-
-        if (paymentFailed) {
-          await markPoolFailed({ db: supabaseAdmin, poolId });
-          console.warn('[stripe-webhook][interview-pool] payment_failed', {
-            request_id, client_interview_pool_id: poolId, client_id: pool.client_id
-          });
-        } else if (!paymentSettled) {
-          console.log('[stripe-webhook][interview-pool] payment_not_settled', {
-            request_id,
-            client_interview_pool_id: poolId,
-            payment_status: String(eventObject?.payment_status || '') || null
-          });
-        } else {
-          const result = await markPoolPaid({
-            db: supabaseAdmin,
-            poolId,
-            stripePaymentIntentId: pickId(eventObject?.payment_intent) || null
-          });
-          console.log('[stripe-webhook][interview-pool] settled', {
-            request_id,
-            client_interview_pool_id: poolId,
-            client_id: pool.client_id,
-            paid: result.paid === true,
-            reason: result.reason || null
-          });
-        }
+      if (interviewPool && !isSubscriptionSession) {
+        // A pool on a session of its own: nothing to activate; settled below.
       } else if (purchaseType === 'additional_interviews') {
         const purchaseId = String(metadata?.role_interview_purchase_id || '').trim();
         const metadataRoleId = String(metadata?.role_id || '').trim();
@@ -1108,6 +1149,12 @@ router.post('/', async (req, res) => {
           });
           requireAgreementActivationResult(activation);
         }
+      }
+
+      if (interviewPool) {
+        await settleInterviewPoolFromCheckout(interviewPool, {
+          paymentFailed, paymentSettled, session: eventObject, requestId: request_id
+        });
       }
     } else if (event.type === 'invoice.payment_succeeded' || event.type === 'invoice.payment_failed') {
       const customerId = pickId(eventObject?.customer);

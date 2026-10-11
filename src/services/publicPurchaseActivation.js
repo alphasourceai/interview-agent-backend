@@ -339,13 +339,21 @@ async function sendWelcomeEmailOnce({
   }
 }
 
+// Enterprise is sold only through an agreement an admin sends, never through the
+// public purchase flow, so it is accepted only when there is no purchase intent.
+// Its prices are per client and come from the subscription, not from a package.
+const ENTERPRISE_PLAN_KEY = 'enterprise';
+
 function resolvePlanSelection({ agreement, intent, packageSnapshot, fallbackPlanTier, fallbackBillingInterval }) {
-  const planKey = normalizeAlphaScreenPlanKey(
+  const requestedPlanKey = cleanText(
     packageSnapshot?.plan_key ||
     intent?.selected_plan_key ||
     agreement?.membership_tier ||
     fallbackPlanTier
-  );
+  ).toLowerCase();
+  const planKey = requestedPlanKey === ENTERPRISE_PLAN_KEY && !intent?.id
+    ? ENTERPRISE_PLAN_KEY
+    : normalizeAlphaScreenPlanKey(requestedPlanKey);
   const billingInterval = normalizeBillingInterval(
     packageSnapshot?.billing_cadence ||
     intent?.selected_billing_cadence ||
@@ -353,7 +361,7 @@ function resolvePlanSelection({ agreement, intent, packageSnapshot, fallbackPlan
     fallbackBillingInterval
   );
 
-  if (!['basic', 'pro'].includes(planKey)) {
+  if (!['basic', 'pro', ENTERPRISE_PLAN_KEY].includes(planKey)) {
     const err = new Error('Public purchase agreement has an invalid membership key.');
     err.code = 'invalid_public_purchase_plan_key';
     throw err;
@@ -850,6 +858,14 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     fallbackPlanTier: options.fallbackPlanTier,
     fallbackBillingInterval: options.fallbackBillingInterval
   });
+  // Checked before anything is written, so a subscription without usable
+  // Enterprise terms is refused whole rather than activated without its prices.
+  const enterprisePlanSettings = planKey === ENTERPRISE_PLAN_KEY ? options.enterprisePlanSettings || null : null;
+  if (planKey === ENTERPRISE_PLAN_KEY && !enterprisePlanSettings) {
+    const err = new Error('Enterprise agreement activation requires plan settings from the subscription.');
+    err.code = 'enterprise_plan_settings_missing';
+    throw err;
+  }
 
   const assertFence = options.assertActivationFence || (async () => {});
   const claimKey = cleanText(options.activationClaimKey);
@@ -1107,11 +1123,13 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     .eq('id', clientId);
   if (clientUpdateErr) throw new Error(clientUpdateErr.message || 'Client activation update failed');
 
-  const planSettingsPayload = buildAlphaScreenPlanSettingsPayload({
-    clientId,
-    planKey,
-    billingInterval
-  });
+  const planSettingsPayload = enterprisePlanSettings
+    ? { ...enterprisePlanSettings, client_id: clientId }
+    : buildAlphaScreenPlanSettingsPayload({
+      clientId,
+      planKey,
+      billingInterval
+    });
   // The tier decides the billing model for a newly activated client.
   const planSettingsUpsert = planSettingsPayload
     ? { ...planSettingsPayload, billing_model: defaultBillingModelForPlanTier(planSettingsPayload.plan_tier) }
