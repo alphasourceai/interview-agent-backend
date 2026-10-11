@@ -18,7 +18,7 @@ function check(ok,code='retail_review_unverified',status){if(!ok)fail(code,statu
 function plain(v,keys){return v && typeof v==='object' && !Array.isArray(v)
   && [Object.prototype,null].includes(Object.getPrototypeOf(v)) && Object.keys(v).every(k=>keys.includes(k));}
 function bounded(text,limit){return typeof text==='string' && text.length>0 && [...text].length<=limit
-  && text===text.trim() && !/[\p{Cc}\p{Cs}<>]/u.test(text);}
+  && text===text.trim() && !/[\p{Cc}\p{Cs}<>\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(text);}
 function cents(v){check(Number.isSafeInteger(v) && v>=0);const n=BigInt(v);
   return `$${(n/100n).toString().replace(/\B(?=(\d{3})+(?!\d))/g,',')}.${(n%100n).toString().padStart(2,'0')}`;}
 function safeOffer(o){

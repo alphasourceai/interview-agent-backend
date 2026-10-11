@@ -20,7 +20,9 @@ test('all24 offer/term/schedule/first-role choices preserve source amounts and d
   for(const planKey of ['basic','pro'])for(const commitmentMonths of [3,6,12])for(const paymentOption of ['prepaid','monthly_installments'])for(const firstRolePrepaySelected of [false,true]){
     const f=fixture({planKey,commitmentMonths,paymentOption,firstRolePrepaySelected}),o=f.quoteReply.quote.offer,r=await prepare(f),t=text(r.html);
     for(const v of [o.platform_payment_cents,o.platform_commitment_total_cents,o.initial_payment_cents,o.per_role_fee_cents,o.additional_interview_fee_cents])assert.ok(t.includes(amounts(v)));
-    assert.ok(t.includes(`${commitmentMonths}-month commitment`));assert.ok(t.includes(`${o.installment_count} monthly installments`)||paymentOption==='prepaid');
+    assert.ok(t.includes(`${commitmentMonths}-month commitment`));
+    if(paymentOption==='prepaid')assert.ok(t.includes(`${amounts(o.platform_payment_cents)} prepaid for the full ${commitmentMonths}-month term`));
+    else assert.ok(t.includes(`${o.installment_count} monthly installments of ${amounts(o.platform_payment_cents)}`));
     assert.ok(t.includes(firstRolePrepaySelected?`${amounts(o.first_role_prepay.amount_cents)} - selected`:'Not selected'));
     assert.equal(r.manifest.publication,'draft_only');assert.equal(r.manifest.refund_policy_reference,null);
     assert.equal(r.manifest.signing_enabled,false);assert.equal(r.manifest.send_enabled,false);assert.equal(r.manifest.checkout_enabled,false);
@@ -93,7 +95,7 @@ test('late replacement/staleness/expiry/authorization error holds generated PDF 
     await assert.rejects(()=>prepare(f,{renderPdf:async()=>{late=true;if(mode==='replace'){f.sourceReply.source.buyer.buyer_first_name='Changed';f.rehash();}
       if(mode==='stale')f.quoteReply.stale=true;if(mode==='expire')f.quoteReply.expired=true;return fakePdf();},
       loadSource:async()=>{if(late && mode==='revoke')throw new Error('secret token synthetic');return f.sourceReply;}}),e=>
-        ['retail_review_changed','retail_review_unverified','retail_review_scope_unavailable'].includes(e.code) && !e.message.includes('secret'));
+        e.code===({replace:'retail_review_changed',stale:'retail_review_unverified',expire:'retail_review_unverified',revoke:'retail_review_scope_unavailable'}[mode]) && !e.message.includes('secret'));
   }
 });
 test('loader and renderer errors are sanitized; malformed/oversized PDF results rejected',async()=>{
@@ -142,4 +144,12 @@ test('existing boilerplate unchanged for clauses1,4-14 and first2 General paragr
   assert.match(legacy,/initial term of twelve \(12\) months|initial renewal date/);assert.match(legacy,/at least 30 days/);
   const enterprise=buildMembershipAgreementHtml({client_legal_name:'Enterprise Synthetic',membership_tier:'enterprise',billing_model:'usage',billing_option:'annual',platform_fee:'1000',usage_interview_fee_cents:2500},{generatedAt:'2026-10-11T00:00:00Z'}).html;
   assert.match(enterprise,/Enterprise Commercial Terms/);assert.match(enterprise,/\$25\.00 per interview/);assert.doesNotMatch(enterprise,/REVIEW DRAFT/);
+});
+test('buyer bidi override/isolate marks are rejected, not silently stripped or rendered as ambiguous identity',async()=>{
+  for(const mark of ['\u061c','\u200e','\u200f','\u202a','\u202b','\u202c','\u202d','\u202e','\u2066','\u2067','\u2068','\u2069'])
+    for(const field of ['company_legal_name','company_dba','buyer_first_name','buyer_last_name','buyer_title']){
+      const f=fixture({}, {[field]:`Synthetic${mark} Identity`});let renderCount=0;
+      await assert.rejects(()=>prepare(f,{renderPdf:async()=>{renderCount++;return fakePdf();}}),e=>e.code==='retail_review_unverified');
+      assert.equal(renderCount,0);assert.equal(f.sourceReply.source.buyer[field],`Synthetic${mark} Identity`,'no silent normalization/write');
+    }
 });

@@ -57,7 +57,11 @@ per-document immutable object names and upsert:false; none is implemented here.
 
 Local logo/embedded Raleway fonts only; no environment logo overrides, remote
 font/asset imports, scripts, forms or capability links. Handlebars escapes buyer
-text; all buyer fields wrap without truncation. The trusted injected PDF renderer
+text; all buyer fields wrap without truncation. Buyer validation
+rejects directional override/isolate marks in buyer names, company/title and
+other displayed terms rather than stripping them or printing ambiguous identity.
+Ordinary Unicode letters and accents remain supported; broader hosted glyph
+coverage is not claimed. The trusted injected PDF renderer
 must honor the frozen render profile. Local verification uses the actual existing
 application htmlToPdf with a fresh signed-out dev profile, JavaScript disabled and
 non-data requests blocked. It is not evidence of hosted Linux/browser parity.
