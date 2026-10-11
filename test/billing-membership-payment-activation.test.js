@@ -130,6 +130,19 @@ test('installment reminder uses commitment end, never the one-month paid-access 
   assert.equal(result.activation.renewal_reminder_at, '2027-03-31T12:13:14.000Z');
 });
 
+test('replay still checks line ownership and completeness before the no-write decision', () => {
+  for (const mutate of [
+    input => { input.invoice.lines.has_more = true; },
+    input => { input.invoice.lines.data[0].subscription = 'sub_foreign'; },
+    input => { input.subscription.items.data[0].subscription = 'sub_foreign'; }
+  ]) {
+    const input = structuredClone(fixture());
+    const existingActivation = planFirstMembershipActivation(input).activation;
+    mutate(input);
+    assert.throws(() => planFirstMembershipActivation({ ...input, existingActivation }));
+  }
+});
+
 test('first-role and native tax are proved separately, not included in platform renewal/commission amount', () => {
   const input = fixture({ planKey: 'pro', firstRole: true, tax: 15000 });
   const result = proveFirstMembershipPayment(input);

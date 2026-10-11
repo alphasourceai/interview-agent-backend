@@ -174,9 +174,13 @@ function initialPaymentIdentity({ binding, checkout, subscription, invoice, paym
   const platform = invoice.lines.data.filter(line => id(line?.subscription_item) === binding.platformItemId);
   const firstRole = invoice.lines.data.filter(line => line !== platform[0]);
   requireProof(item?.id === binding.platformItemId && id(item.price) === binding.platformPriceId
+    && id(item.subscription) === binding.subscriptionId
     && platform.length === 1 && id(platform[0].price) === binding.platformPriceId
+    && id(platform[0].subscription) === binding.subscriptionId
     && (!binding.offer.first_role_prepay.selected || (firstRole.length === 1
-      && id(firstRole[0].price) === binding.firstRolePriceId)), 'initial_price_identity_mismatch');
+      && id(firstRole[0].price) === binding.firstRolePriceId && firstRole[0].subscription_item == null
+      && (firstRole[0].subscription == null || id(firstRole[0].subscription) === binding.subscriptionId))),
+  'initial_price_identity_mismatch');
   const objectsCreated = objects.map(([object]) => object.created);
   const paidAt = invoice.status_transitions?.paid_at;
   requireProof(epoch(observedAt) && epoch(paidAt) && paidAt <= observedAt
