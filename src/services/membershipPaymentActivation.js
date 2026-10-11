@@ -151,7 +151,8 @@ function verifyInitialLines(binding, subscription, invoice) {
     requireProof(cents(lineTaxes), 'initial_tax_unverified');
   }
   const nativeTaxes = taxTotal(invoice.total_tax_amounts);
-  requireProof(lineTaxes === nativeTaxes && (invoice.tax == null || invoice.tax === nativeTaxes)
+  requireProof(lineTaxes === nativeTaxes
+    && (invoice.tax === nativeTaxes || (nativeTaxes === 0 && invoice.tax == null))
     && invoice.subtotal === offer.initial_payment_cents
     && invoice.total === offer.initial_payment_cents + nativeTaxes, 'initial_total_mismatch');
 }

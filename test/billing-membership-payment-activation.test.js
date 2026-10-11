@@ -158,6 +158,26 @@ test('first-role and native tax are proved separately, not included in platform 
   assert.equal(result.collected_cents, 287900);
 });
 
+test('positive reconciled tax requires its matching invoice scalar; null/missing cannot activate', () => {
+  for (const missing of [false, true]) {
+    const input = structuredClone(fixture({ tax: 100 }));
+    if (missing) delete input.invoice.tax;
+    else input.invoice.tax = null;
+    assert.throws(() => planFirstMembershipActivation(input), { code: 'initial_total_mismatch' });
+  }
+});
+
+test('proven zero tax allows null/missing scalar without inventing a tax amount', () => {
+  for (const missing of [false, true]) {
+    const input = structuredClone(fixture());
+    if (missing) delete input.invoice.tax;
+    else input.invoice.tax = null;
+    const result = planFirstMembershipActivation(input);
+    assert.equal(result.action, 'reserve_initial_activation');
+    assert.equal(result.activation.tax_cents, 0);
+  }
+});
+
 const rejectCases = [
   ['processing', input => { input.paymentIntent.status = 'processing'; }, 'initial_payment_not_succeeded'],
   ['partial payment', input => { input.paymentIntent.amount_received--; }, 'initial_payment_not_succeeded'],
