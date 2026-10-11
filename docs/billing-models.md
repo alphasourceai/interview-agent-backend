@@ -69,8 +69,9 @@ bought at $30 each.
 
 **When a role is closed**, whatever is left of that role's allowance becomes
 client credit. Credit is not tied to the role it came from: it can be spent on
-any role the client has open. It expires 90 days after the role closed. The
-window is configurable per client.
+any role the client has open. It expires 90 days after the role closed. For Pro
+the window is always 90 days; an Enterprise client on the rollover model can be
+given its own window (see "Per-client Enterprise settings").
 
 **Closing the same role twice** does not hand out a second credit.
 
@@ -94,8 +95,65 @@ credit left either, so a client holding credit is never told to buy more.
 
 Enterprise pricing is set per client: the platform fee, the per-role fee, the
 number of interviews included per role, and a per-interview price for anything
-beyond it. Any of these may be zero — an Enterprise client can have no included
-interviews at all and simply pay per interview.
+beyond it. The fees and the included count may be zero — an Enterprise client can
+have no included interviews at all and simply pay per interview. The
+per-interview price may not: on the usage model it must be more than zero (see
+below).
+
+### Per-client Enterprise settings
+
+Beyond the prices, an Enterprise agreement can set four things for that one
+client. Each is optional; leaving it out means the plan default. They are set on
+the agreement and reach the client's plan settings the same way the prices do.
+Essentials and Pro agreements cannot set any of them: the agreement is refused.
+
+| Setting | Allowed values | Left out means | Notes |
+| --- | --- | --- | --- |
+| `billing_model` | `fixed`, `rollover` or `usage` | follow the tier: `usage` | Recorded only if the client has no model stored yet, and never changed or cleared by a later Stripe event |
+| `rollover_days` | whole number, 1 to 365 | 90 | Only with `billing_model: rollover` |
+| `max_interview_minutes` | whole number, 5 to 59 | 15 | Must be given together with `scored_question_count` |
+| `scored_question_count` | whole number, 1 to 7 | 7 | Must be given together with `max_interview_minutes` |
+
+Where the limits come from:
+
+- **59 minutes** is the longest interview the provider allows: a call ends at 60
+  minutes, and the system keeps 20 seconds for the closing.
+- **7 questions** is the size of the question blueprint every interview type
+  draws from: one scored question per blueprint entry.
+- **5 minutes** is the shortest interview that still leaves time for questions
+  after the introduction and warm-up.
+
+Two commercial rules are checked when the agreement is sent and again at
+checkout, before anything is written or sent to Stripe:
+
+- **The usage model needs a usage price above zero.** That is the Enterprise
+  default model, so an Enterprise agreement that names no model needs the price
+  too. Without it, overage used to be silently never billed.
+- **An interview pool is sold only on the usage model.**
+
+A refused agreement gets a `400` naming the rule: `invalid_billing_model`,
+`usage_price_required`, `pool_requires_usage_model`, `invalid_rollover_days`,
+`rollover_days_requires_rollover_model`, `invalid_max_interview_minutes`,
+`invalid_scored_question_count`, `interview_length_and_questions_required_together`
+or `enterprise_settings_not_allowed`.
+
+### Interview length and question count
+
+Every client's interviews run at their plan's length and question count —
+Essentials 10 minutes and 5 questions, Pro 12 and 6, Enterprise 15 and 7 —
+except an Enterprise client whose agreement set its own. Essentials and Pro
+always run at their plan values, whatever their plan settings hold. A child
+entity runs at its parent's values.
+
+**A role keeps the length and question count it was created with.** When a
+role's questions are generated, the length and count they were made for are
+recorded with them. A later change to the client's settings applies to roles
+created afterwards; an existing role keeps its questions and its length.
+Regenerating a role's questions — replacing its job description, or an
+administrator regenerating them — makes a new set at the client's current
+values, so the questions and the length change together. A role whose questions
+predate this behaviour runs at its plan's values, which is what they were made
+for.
 
 **What gets billed.** For each role, the included count is free. Every used
 interview beyond it is charged at the client's per-interview price. The included
@@ -147,7 +205,8 @@ That holds across retries, redelivered Stripe events, and a re-run of the same
 period.
 
 **If no per-interview price is set**, nothing is billed. The system will not
-guess a price.
+guess a price. A new Enterprise sale on the usage model cannot be made without
+one; this only affects a client set up before that rule.
 
 **If Stripe is unavailable part-way through**, the work is already written down
 before any charge is created, so the retry picks up exactly the part that did not
@@ -172,46 +231,66 @@ client's plan settings only once the client has signed and paid:
 1. An administrator generates the agreement
    (`POST /admin/billing/agreements/send`), choosing the membership tier and
    billing option, and for Enterprise the platform fee, per-role fee, included
-   interviews per role, additional-interview fee and per-interview usage price.
+   interviews per role, additional-interview fee, per-interview usage price,
+   an optional interview pool, and any of the four per-client settings above.
 2. The client opens the signing link, signs, and pays through Stripe checkout.
-3. The Stripe subscription webhook writes `client_plan_settings` from the
-   agreement's values.
+3. The Stripe webhook writes `client_plan_settings` from the agreement's values.
 
 Until step 3 nothing is written, so an agreement that is never paid changes
 nothing.
 
+**The agreement shows exactly what will be charged.** An Enterprise agreement —
+the PDF sent for signing and the signed copy — always lists its commercial terms:
+the platform fee and billing interval, the per-role fee, the included interviews
+per role, the billing model in plain words, the per-interview usage price, the
+pool's size, discount and total when one is bought, the rollover window on the
+rollover model, the interview length and the number of scored questions, and that
+usage is billed monthly on the 1st for the previous month. A line is left out
+only when it does not apply to the billing model. The pool is priced from the
+volume bands when the agreement is sent, and checkout charges that same
+discount, so a later change to the bands does not change a signed price.
+Essentials and Pro agreements are unchanged.
+
+The request fields for an Enterprise agreement:
+
 | Field | Meaning | Units |
 | --- | --- | --- |
+| `platform_fee` | Recurring membership fee | dollars |
 | `per_role_fee` | Charge to open a role | dollars |
 | `included_interviews_per_role` | Free interviews per role | count |
-| `additional_interview_fee` | Price of a top-up interview | dollars |
-| `usage_interview_fee_cents` | Enterprise per-interview price | **cents** |
+| `additional_interview_fee` | Price of a top-up interview (not used on the usage model) | dollars |
+| `usage_interview_fee_cents` | Enterprise per-interview price; required, above zero, on the usage model | **cents** |
+| `pool_quantity` | Interviews bought up front as a pool; usage model only; `0` or absent means none | count |
+| `billing_model` | `fixed`, `rollover` or `usage`; absent follows the tier | — |
+| `rollover_days` | Credit window, rollover model only | days |
+| `max_interview_minutes` | Interview length, with `scored_question_count` | minutes |
+| `scored_question_count` | Scored questions per interview, with `max_interview_minutes` | count |
 
 Note the mixed units: `usage_interview_fee_cents` is in cents, the other money
 fields are in dollars. This follows the existing column conventions.
 
-**Nothing in the backend writes `billing_model`.** Not the Stripe webhook, not
-the agreement activation, not the public purchase activation. Every new client
-therefore starts with it empty, which means "follow the tier", and a Stripe
-event never changes it.
+**`billing_model` is written only when an agreement states one,** and then only
+if the client has no model stored yet. Nothing else in the backend writes it —
+not the Stripe webhook, not the public purchase activation. A client whose
+agreement names no model therefore has it empty, which means "follow the tier",
+and no Stripe event changes or clears it.
 
 A value in the column is an explicit choice for that one client: for example,
 an Enterprise client billed on `rollover` instead of `usage`. It wins over the
-tier and survives every subscription event, including a change of tier. There
-is no admin screen or endpoint for it yet; it is set directly in the database.
-To put a client back on their tier's model, set it to empty (`null`), not to
-the tier's model, or a later tier change will not move them.
+tier and survives every subscription event, including a change of tier. To put a
+client back on their tier's model, set it to empty (`null`), not to the tier's
+model, or a later tier change will not move them.
 
-`rollover_days` is 90 for every client; there is no setting for it.
-
-> **The Agreement Generator form does not yet have a field for the Enterprise
-> per-interview usage price.** The backend accepts `usage_interview_fee_cents`
-> on the agreement and carries it through to the client's plan settings, but
-> the form has no input for it. Until one is added, Enterprise usage cannot be
-> priced through the form, and a usage client is billed nothing for overage.
+**`max_interview_minutes` is never empty.** It holds the plan default for the
+client's tier unless an Enterprise agreement set it. `scored_question_count` may
+be empty, which means the plan's count. `rollover_days` is 90 unless an
+Enterprise agreement on the rollover model set it.
 
 `POST /admin/clients/:id/subscription-checkout` is the other way to start an
-Enterprise subscription. It takes the same fields directly in the request body.
+Enterprise subscription. It takes the prices and the pool directly in the request
+body, but not the four per-client settings, so a client set up this way is on
+the usage model and needs a usage price above zero. Its pool is priced from the
+bands at checkout.
 
 ### Raise a usage invoice now
 
@@ -277,7 +356,9 @@ interviews table, by the same function the invoice is built from — so a screen
 and a bill cannot disagree, and no number needs repairing after a failure.
 
 `GET /roles` also now returns `own_remaining_interviews`, `credit_interviews` and
-`billing_model` for each role, alongside the counts it already returned.
+`billing_model` for each role, alongside the counts it already returned. Its
+`max_interview_minutes` and `scored_question_count` are the role's own — what its
+questions were created with — and a child entity's roles show the parent's values.
 
 ---
 
@@ -337,6 +418,7 @@ timestamps, so alphabetical order is run order.
 | `20261009190000_interviews_completed_at.sql` | Adds `completed_at` to `interviews`, indexes `(client_id, completed_at)`, and backfills existing rows |
 | `20261009200000_client_plan_settings_money_units.sql` | Comments only: records which `client_plan_settings` money columns are dollars and which are cents, and that a zero included count is a setting. Changes no column and no value |
 | `20261011120000_billing_model_follow_plan_tier.sql` | Empties `billing_model` wherever it only repeats the client's own tier (Essentials with `fixed`, Pro with `rollover`, Enterprise with `usage`). Those values were stamped by the first migration and by the webhook, not chosen. No client changes model when it runs; afterwards a tier change moves them. A value that differs from the tier is left alone |
+| `20261011130000_client_plan_settings_interview_settings.sql` | Adds `scored_question_count` to `client_plan_settings` (may be empty: the plan's count; must be above zero when set), and comments `max_interview_minutes`, which already exists and is never empty. Changes no value |
 
 ### Why these run after the client's own migrations
 
@@ -367,6 +449,7 @@ that touches one is changing a table whose access model is **not** visible here.
 | `20261009190000_interviews_completed_at.sql` | `interviews` | Adds one column and one index, and backfills it. |
 | `20261009200000_client_plan_settings_money_units.sql` | `client_plan_settings` | Comments only. No column, value or access changes. |
 | `20261011120000_billing_model_follow_plan_tier.sql` | `client_plan_settings` | Empties `billing_model` where it equals the tier's default. No column or access changes. |
+| `20261011130000_client_plan_settings_interview_settings.sql` | `client_plan_settings` | Adds one nullable column with a check, and two column comments. No access changes. |
 
 **`20261009190000_interviews_completed_at.sql` deliberately contains no RLS,
 `grant` or `revoke` statement**, and a test asserts it never gains one.
@@ -401,7 +484,8 @@ addition is guarded by an existence check, and every backfill only fills rows
 that are still null — so re-running will not overwrite a model an administrator
 has since changed by hand, or move a completion time that is already recorded.
 `20261011120000` only empties values that equal the tier's default, so a second
-run finds nothing to do.
+run finds nothing to do. `20261011130000` checks for its column and its
+constraint before adding them.
 
 ### Rolling back
 

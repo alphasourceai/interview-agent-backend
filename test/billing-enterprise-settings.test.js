@@ -621,6 +621,145 @@ test('an admin Enterprise agreement without a length activates with the plan def
   });
 });
 
+// --- the agreement shows what Stripe charges (Step E5) ----------------------------------
+
+const POOL_BANDS = [
+  { id: 'band_20', min_quantity: 20, discount_pct: 0 },
+  { id: 'band_30', min_quantity: 30, discount_pct: 5 },
+  { id: 'band_50', min_quantity: 50, discount_pct: 10 }
+];
+
+// Sends the agreement, signs it, checks it out, and returns the agreement's terms
+// (read back from the stored record, as the signed PDF is) beside what reached
+// Stripe.
+async function agreementAndCharge(settings, { changeBandsBeforeCheckout = false, beforeCheckout = null } = {}) {
+  const db = makeDb();
+  db.tables.enterprise_pool_discounts = POOL_BANDS.map((band) => ({ ...band }));
+  const system = loadSystem(db);
+  const previous = process.env.STRIPE_SECRET_KEY;
+  process.env.STRIPE_SECRET_KEY = 'sk_test_fake';
+  try {
+    const sent = await sendAgreement(system.app, agreementBody(settings));
+    assert.equal(sent.status, 200, JSON.stringify(sent.body));
+    const token = decodeURIComponent(system.emails[0].signingUrl.split('/').pop());
+    Object.assign(db.tables.membership_agreements[0], { status: 'signed', is_current: true });
+
+    if (changeBandsBeforeCheckout) {
+      for (const band of db.tables.enterprise_pool_discounts) band.discount_pct = 40;
+    }
+    if (beforeCheckout) beforeCheckout(db.tables.membership_agreements[0]);
+
+    const checkout = await request(system.app).post('/membership-agreements/checkout-session').send({ token });
+    assert.equal(checkout.status, 200, JSON.stringify(checkout.body));
+
+    const agreement = db.tables.membership_agreements[0];
+    const { buildExecutedMembershipAgreementHtml } = require(PATHS.agreementsService);
+    const executed = buildExecutedMembershipAgreementHtml(agreement, {});
+    return {
+      terms: executed.commercial_terms,
+      draftHtml: agreement.template_snapshot.rendered_html,
+      executedHtml: executed.html,
+      stripe: system.stripe.calls
+    };
+  } finally {
+    if (previous === undefined) delete process.env.STRIPE_SECRET_KEY;
+    else process.env.STRIPE_SECRET_KEY = previous;
+  }
+}
+
+// Every term the agreement shows, against what checkout sent to Stripe. Fails
+// on the first figure that differs.
+function assertAgreementMatchesCharge({ terms, stripe }) {
+  const membershipPrice = stripe.prices.find((price) => price.recurring);
+  const poolPrice = stripe.prices.find((price) => price.metadata?.purchase_type === 'interview_pool');
+  const metadata = stripe.sessions[0].subscription_data.metadata;
+
+  assert.equal(membershipPrice.unit_amount, terms.platform_fee_cents, 'platform fee');
+  assert.equal(membershipPrice.recurring.interval, terms.billing_interval === 'annual' ? 'year' : 'month', 'billing interval');
+  assert.equal(Math.round(Number(metadata.per_role_fee) * 100), terms.per_role_fee_cents, 'per-role fee');
+  assert.equal(Number(metadata.included_interviews_per_role), terms.included_interviews_per_role, 'included interviews');
+  assert.equal(metadata.billing_model || 'usage', terms.billing_model, 'billing model');
+  assert.equal(Number(metadata.max_interview_minutes || PLAN_CAPACITY.enterprise.max_interview_minutes),
+    terms.max_interview_minutes, 'interview length');
+  assert.equal(Number(metadata.scored_question_count || PLAN_CAPACITY.enterprise.scored_question_count),
+    terms.scored_question_count, 'scored questions');
+  if (terms.billing_model === 'usage') {
+    assert.equal(Number(metadata.usage_interview_fee_cents), terms.usage_interview_fee_cents, 'usage price');
+  }
+  if (terms.rollover_days !== null) {
+    assert.equal(Number(metadata.rollover_days || 90), terms.rollover_days, 'rollover days');
+  }
+  if (terms.pool) {
+    assert.ok(poolPrice, 'a pool on the agreement is charged');
+    assert.equal(poolPrice.unit_amount, terms.pool.total_cents, 'pool total');
+    assert.equal(Number(poolPrice.metadata.discount_pct), terms.pool.discount_pct, 'pool discount');
+    assert.equal(Number(poolPrice.metadata.quantity), terms.pool.quantity, 'pool quantity');
+  } else {
+    assert.equal(poolPrice, undefined, 'no pool on the agreement, none charged');
+  }
+}
+
+function assertHtmlShowsTerms(html, terms) {
+  for (const row of terms.rows) {
+    assert.ok(html.includes(row.label), `the agreement shows "${row.label}"`);
+    assert.ok(html.includes(row.value), `the agreement shows "${row.label}: ${row.value}"`);
+  }
+}
+
+test('an Enterprise usage agreement with a pool shows every term, and each one is what Stripe charges', async () => {
+  const result = await agreementAndCharge({ pool_quantity: '30', max_interview_minutes: '30', scored_question_count: '6' });
+
+  assert.equal(result.terms.billing_model, 'usage');
+  assert.deepEqual(result.terms.pool, { quantity: 30, discount_pct: 5, total_cents: 71250 }, '30 x $25 less 5%');
+  assertAgreementMatchesCharge(result);
+  assertHtmlShowsTerms(result.draftHtml, result.terms);
+  assertHtmlShowsTerms(result.executedHtml, result.terms);
+  assert.match(result.draftHtml, /Usage is billed monthly, on the 1st of each month, for the previous calendar month\./);
+});
+
+test('an Enterprise rollover agreement shows its rollover days and no usage price, and matches the charge', async () => {
+  const result = await agreementAndCharge({ billing_model: 'rollover', rollover_days: '120' });
+
+  assert.equal(result.terms.rollover_days, 120);
+  assert.equal(result.terms.usage_interview_fee_cents, null, 'a usage price does not apply on rollover');
+  assert.equal(result.terms.pool, null);
+  assert.equal(result.terms.max_interview_minutes, 15, 'no length on the agreement: the plan default');
+  assertAgreementMatchesCharge(result);
+  assertHtmlShowsTerms(result.draftHtml, result.terms);
+  assert.doesNotMatch(result.draftHtml, /Per-Interview Usage Price|Usage is billed monthly/);
+});
+
+test('the pool is charged at the price the agreement shows, even if the bands change before checkout', async () => {
+  const result = await agreementAndCharge({ pool_quantity: '30' }, { changeBandsBeforeCheckout: true });
+
+  assert.equal(result.terms.pool.discount_pct, 5, 'the agreement was priced at send');
+  assertAgreementMatchesCharge(result);
+});
+
+test('a pool discount or total typed into the request is ignored; the bands price it', async () => {
+  const result = await agreementAndCharge({ pool_quantity: '30', pool_discount_pct: '90', pool_total_cents: '1' });
+
+  assert.deepEqual(result.terms.pool, { quantity: 30, discount_pct: 5, total_cents: 71250 });
+  assertAgreementMatchesCharge(result);
+});
+
+test('an agreement sent before pools were priced at send is charged at the bands, never at a typed discount', async () => {
+  const result = await agreementAndCharge({ pool_quantity: '30' }, {
+    beforeCheckout: (agreement) => {
+      // What an older agreement looks like: a typed discount, and no mark that
+      // the system priced it.
+      const values = agreement.template_snapshot.values;
+      delete values.pool_discount_priced;
+      values.pool_discount_pct = '90';
+      values.pool_total_cents = 7500;
+    }
+  });
+
+  const poolPrice = result.stripe.prices.find((price) => price.metadata?.purchase_type === 'interview_pool');
+  assert.equal(poolPrice.unit_amount, 71250, 'priced from the bands (5%), as before this step');
+  assert.equal(Number(poolPrice.metadata.discount_pct), 5);
+});
+
 // --- the migration --------------------------------------------------------------------
 
 test('the migration adds scored_question_count safely and only comments max_interview_minutes', () => {

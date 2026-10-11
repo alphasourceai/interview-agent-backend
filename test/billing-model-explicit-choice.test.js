@@ -199,5 +199,8 @@ test('the migration runs after the billing migrations and is documented', () => 
     > names.indexOf('20261009200000_client_plan_settings_money_units.sql'));
   const doc = fs.readFileSync(path.join(ROOT, 'docs', 'billing-models.md'), 'utf8');
   assert.match(doc, /20261011120000_billing_model_follow_plan_tier\.sql/);
-  assert.match(doc, /Nothing in the backend writes `billing_model`/);
+  // Since E3 an agreement that states a model records it, once; nothing else
+  // writes the column, and no Stripe event changes or clears it.
+  assert.match(doc, /`billing_model` is written only when an agreement states one/);
+  assert.match(doc, /no Stripe event changes or clears it/);
 });

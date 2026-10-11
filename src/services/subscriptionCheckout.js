@@ -8,7 +8,7 @@ const {
   getAlphaScreenFirstRolePrepayStripePriceId
 } = require('./alphaScreenPackages')
 const { resolvePublicBackendBase, buildClientDashboardReturnUrl } = require('../config/urlConfig')
-const { priceEnterprisePool } = require('./enterprisePoolPricing')
+const { priceEnterprisePool, quoteEnterprisePool } = require('./enterprisePoolPricing')
 const { enterpriseSettingsMetadata, validateEnterpriseSettings } = require('./enterpriseSettings')
 
 function makeError(status, code, detail) {
@@ -101,6 +101,14 @@ function parseEnterpriseCheckoutTerms(enterpriseFees) {
   if (poolQuantity !== null && usageInterviewFeeCents === null) {
     throw makeError(400, 'pool_requires_usage_price', 'An interview pool needs a per-interview usage price.')
   }
+  // The discount an agreement was priced at when it was sent, which is what the
+  // client signed. Absent (an admin checkout without an agreement), the pool is
+  // priced from the bands at checkout, as before.
+  const poolDiscountSupplied = poolQuantity !== null && isSuppliedValue(enterpriseFees?.pool_discount_pct)
+  const agreedPoolDiscountPct = poolDiscountSupplied ? Number(enterpriseFees.pool_discount_pct) : null
+  if (poolDiscountSupplied && !(Number.isFinite(agreedPoolDiscountPct) && agreedPoolDiscountPct >= 0 && agreedPoolDiscountPct <= 100)) {
+    throw makeError(400, 'invalid_enterprise_fees', 'Invalid enterprise pricing fields.')
+  }
   const platformCents = Math.round(platformFee * 100)
   if (!Number.isFinite(platformCents) || platformCents <= 0) {
     throw makeError(400, 'invalid_enterprise_fees', 'Invalid enterprise pricing fields.')
@@ -113,6 +121,7 @@ function parseEnterpriseCheckoutTerms(enterpriseFees) {
     platformCents,
     usageInterviewFeeCents,
     poolQuantity,
+    agreedPoolDiscountPct,
     metadata: {
       platform_fee: String(Math.round(platformFee * 100) / 100),
       per_role_fee: String(Math.round(perRoleFee * 100) / 100),
@@ -398,11 +407,17 @@ async function createSubscriptionCheckoutSession({
     // unit amount with quantity 1 because the volume discount is rounded on the
     // whole order — see enterprisePoolPricing.
     if (poolQuantity !== null) {
-      const quote = await priceEnterprisePool({
-        db: supabaseAdmin,
-        quantity: poolQuantity,
-        unitPriceCents: usageInterviewFeeCents
-      })
+      const quote = enterpriseTerms.agreedPoolDiscountPct !== null
+        ? quoteEnterprisePool({
+          quantity: poolQuantity,
+          unitPriceCents: usageInterviewFeeCents,
+          discountPct: enterpriseTerms.agreedPoolDiscountPct
+        })
+        : await priceEnterprisePool({
+          db: supabaseAdmin,
+          quantity: poolQuantity,
+          unitPriceCents: usageInterviewFeeCents
+        })
       const poolPrice = await stripe.prices.create({
         currency: 'usd',
         unit_amount: quote.total_cents,

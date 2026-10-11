@@ -253,7 +253,11 @@ function normalizeMembershipAgreementInput(input = {}) {
     // priced by enterprisePoolPricing when the agreement is sent and carried
     // here, because this normalizer is synchronous and has no database.
     pool_quantity: normalizeWholeNumberInput(input.pool_quantity ?? input.poolQuantity),
-    pool_discount_pct: normalizeMoneyInput(input.pool_discount_pct ?? input.poolDiscountPct),
+    // Through firstSupplied like the fees: a 0% discount is a price, not an absence.
+    pool_discount_pct: normalizeMoneyInput(String(firstSupplied(input.pool_discount_pct, input.poolDiscountPct))),
+    // True only when the admin routes priced the pool from the bands themselves
+    // (withPricedPool); checkout honours an agreed discount only then.
+    pool_discount_priced: input.pool_discount_priced === true || String(input.pool_discount_priced) === 'true',
     pool_total_cents: normalizeCentsInput(String(input.pool_total_cents ?? input.poolTotalCents ?? '')),
     max_interview_minutes: normalizeWholeNumberInput(input.max_interview_minutes || input.maxInterviewMinutes || input.interview_duration_minutes || input.interviewDurationMinutes),
     // Enterprise settings beyond the prices. Validated by enterpriseSettings.js
@@ -270,6 +274,120 @@ function normalizeMembershipAgreementInput(input = {}) {
     auto_renew: normalizeAutoRenew(input.auto_renew ?? input.autoRenew),
     notice_deadline_days: normalizeNoticeDays(input.notice_deadline_days || input.noticeDeadlineDays)
   };
+}
+
+const ENTERPRISE_BILLING_MODEL_WORDS = Object.freeze({
+  usage: Object.freeze({
+    label: 'Usage',
+    description: 'Interviews beyond the included count per role, and beyond any interview pool, are billed per interview.'
+  }),
+  rollover: Object.freeze({
+    label: 'Rollover',
+    description: 'When a role closes, its unused included interviews become client credit, usable on any role until the credit expires.'
+  }),
+  fixed: Object.freeze({
+    label: 'Fixed',
+    description: 'Each role has its included interviews; unused interviews lapse when the role closes.'
+  })
+});
+
+const USAGE_BILLING_SCHEDULE = 'Usage is billed monthly, on the 1st of each month, for the previous calendar month.';
+
+function dollarsToCents(value) {
+  const raw = normalizeText(value);
+  if (!raw) return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? Math.round(parsed * 100) : null;
+}
+
+// formatUsdCents passes a number to formatUsd, which reads a numeric 0 as empty;
+// on an Enterprise agreement a zero fee is a real term and prints as $0.00.
+function formatTermCents(cents) {
+  return cents == null ? '—' : formatUsd(String(cents / 100));
+}
+
+function wholeOrNull(value) {
+  const parsed = Number(normalizeText(String(value ?? '')));
+  return normalizeText(String(value ?? '')) && Number.isInteger(parsed) ? parsed : null;
+}
+
+/**
+ * The commercial terms of an Enterprise agreement, read from the agreement's own
+ * values — the same normalized values checkout sends to Stripe — so what the
+ * agreement shows is what is charged. Null for any other tier.
+ *
+ * `rows` is what the agreement prints, in order. A row is left out only when its
+ * setting does not apply to the billing model.
+ */
+function buildEnterpriseCommercialTerms(normalized = {}) {
+  if (normalized.membership_tier !== 'enterprise') return null;
+  // Required lazily: the renderer is loaded by routes that never reach Enterprise.
+  const { PLAN_CAPACITY } = require('../services/planCapacity');
+  const { DEFAULT_ROLLOVER_DAYS, defaultBillingModelForPlanTier } = require('../services/billingModel');
+
+  // The model to print: the one the agreement states, else the tier's.
+  const statedModel = normalized.billing_model;
+  const billingModel = ENTERPRISE_BILLING_MODEL_WORDS[statedModel] ? statedModel : defaultBillingModelForPlanTier('enterprise');
+  const isUsage = billingModel === 'usage';
+  const annual = normalized.billing_option === 'annual';
+  const poolQuantity = wholeOrNull(normalized.pool_quantity);
+  const hasPool = isUsage && poolQuantity !== null && poolQuantity > 0;
+
+  const terms = {
+    billing_model: billingModel,
+    billing_interval: annual ? 'annual' : 'monthly',
+    platform_fee_cents: dollarsToCents(normalized.platform_fee),
+    per_role_fee_cents: dollarsToCents(normalized.per_role_fee),
+    included_interviews_per_role: wholeOrNull(normalized.included_interviews_per_role),
+    usage_interview_fee_cents: isUsage ? (normalized.usage_interview_fee_cents ?? null) : null,
+    additional_interview_fee_cents: isUsage ? null : dollarsToCents(normalized.additional_interview_fee),
+    pool: hasPool
+      ? {
+          quantity: poolQuantity,
+          discount_pct: normalizeText(normalized.pool_discount_pct) === '' ? null : Number(normalized.pool_discount_pct),
+          total_cents: normalized.pool_total_cents ?? null
+        }
+      : null,
+    rollover_days: billingModel === 'rollover'
+      ? (wholeOrNull(normalized.rollover_days) ?? DEFAULT_ROLLOVER_DAYS)
+      : null,
+    max_interview_minutes: wholeOrNull(normalized.max_interview_minutes) ?? PLAN_CAPACITY.enterprise.max_interview_minutes,
+    scored_question_count: wholeOrNull(normalized.scored_question_count) ?? PLAN_CAPACITY.enterprise.scored_question_count,
+    usage_billing_schedule: isUsage ? USAGE_BILLING_SCHEDULE : null
+  };
+
+  const words = ENTERPRISE_BILLING_MODEL_WORDS[billingModel];
+  const rows = [
+    { label: 'Platform Fee', value: `${formatTermCents(terms.platform_fee_cents)} ${annual ? 'per year' : 'per month'}` },
+    { label: 'Billing Interval', value: annual ? 'Annual' : 'Monthly' },
+    { label: 'Per-Role Fee', value: formatTermCents(terms.per_role_fee_cents) },
+    { label: 'Included Interviews (Per Role)', value: String(terms.included_interviews_per_role ?? '—') },
+    { label: 'Billing Model', value: words.label, note: words.description }
+  ];
+  if (isUsage) {
+    rows.push({
+      label: 'Per-Interview Usage Price',
+      value: terms.usage_interview_fee_cents == null ? '—' : `${formatTermCents(terms.usage_interview_fee_cents)} per interview`
+    });
+  } else {
+    rows.push({ label: 'Additional Interview Fee', value: formatTermCents(terms.additional_interview_fee_cents) });
+  }
+  if (terms.pool) {
+    rows.push(
+      { label: 'Interview Pool', value: `${terms.pool.quantity} interviews`, note: 'Bought at signup; used before any interview is billed as usage.' },
+      { label: 'Pool Discount', value: terms.pool.discount_pct == null ? '—' : `${terms.pool.discount_pct}%` },
+      { label: 'Pool Total', value: terms.pool.total_cents == null ? '—' : `${formatTermCents(terms.pool.total_cents)}, charged at signup` }
+    );
+  }
+  if (terms.rollover_days !== null) {
+    rows.push({ label: 'Rollover Credit', value: `${terms.rollover_days} days`, note: 'How long credit from a closed role stays usable.' });
+  }
+  rows.push(
+    { label: 'Interview Length', value: `${terms.max_interview_minutes} minutes` },
+    { label: 'Scored Questions', value: `${terms.scored_question_count} per interview` }
+  );
+
+  return { ...terms, rows };
 }
 
 function normalizeBooleanFlag(value) {
@@ -311,6 +429,7 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
       })
     : '';
 
+  const enterpriseTerms = buildEnterpriseCommercialTerms(normalized);
   const renderData = {
     logo_src: readLogoAsDataUri(),
     generated_at: generatedAtIso,
@@ -323,25 +442,15 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
     membership_tier: formatMembershipTier(normalized.membership_tier),
     is_enterprise: normalized.membership_tier === 'enterprise',
     show_package_terms: showPackageTerms,
+    // An Enterprise agreement always shows its own terms, in place of the
+    // package table, whatever the flag says. Every other tier is unchanged.
+    enterprise_terms: enterpriseTerms,
+    show_standard_package_terms: showPackageTerms && !enterpriseTerms,
+    show_package_page: showPackageTerms || !!enterpriseTerms,
     package_platform_fee: formatUsd(normalized.platform_fee),
     package_per_role_fee: formatUsd(normalized.per_role_fee),
     package_additional_interview_fee: formatUsd(normalized.additional_interview_fee),
     package_included_interviews_per_role: normalized.included_interviews_per_role || '—',
-    // The Enterprise interview pool bought at signup, and the price every
-    // interview beyond it is charged at.
-    show_interview_pool_terms: showPackageTerms
-      && normalized.membership_tier === 'enterprise'
-      && !!normalized.pool_quantity,
-    package_pool_quantity: normalized.pool_quantity || '—',
-    package_pool_discount_pct: normalized.pool_discount_pct
-      ? `${normalized.pool_discount_pct}%`
-      : '0%',
-    package_pool_total: normalized.pool_total_cents == null
-      ? '—'
-      : formatUsdCents(normalized.pool_total_cents),
-    package_usage_interview_fee: normalized.usage_interview_fee_cents == null
-      ? '—'
-      : formatUsdCents(normalized.usage_interview_fee_cents),
     package_max_interview_minutes: normalized.max_interview_minutes || '—',
     package_fee_period_label: normalized.billing_option === 'annual' ? 'per year' : 'per month',
     show_first_role_prepay_terms: showPackageTerms && normalized.first_role_prepay.present,
@@ -370,11 +479,14 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
 
   return {
     html: template(renderData),
-    normalized
+    normalized,
+    commercial_terms: enterpriseTerms
   };
 }
 
 module.exports = {
+  USAGE_BILLING_SCHEDULE,
+  buildEnterpriseCommercialTerms,
   buildMembershipAgreementHtml,
   normalizeMembershipAgreementInput
 };

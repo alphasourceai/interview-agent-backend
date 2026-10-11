@@ -103,15 +103,43 @@ async function priceEnterprisePool({ db, quantity, unitPriceCents } = {}) {
   const { discount_pct: discountPct, threshold_min: thresholdMin } =
     await resolvePoolDiscount({ db, quantity: normalizedQuantity });
 
-  const grossCents = normalizedQuantity * normalizedUnitPrice;
-  const totalCents = Math.round((grossCents * (100 - discountPct)) / 100);
+  return quoteEnterprisePool({
+    quantity: normalizedQuantity,
+    unitPriceCents: normalizedUnitPrice,
+    discountPct,
+    thresholdMin
+  });
+}
 
+/**
+ * Prices a pool at a discount already agreed, without the database.
+ *
+ * An agreement is priced from the bands when it is sent, and that discount is
+ * what the client signs. Checkout charges it with this same arithmetic, so the
+ * total on the agreement is the total charged even if the bands change between
+ * the two.
+ */
+function quoteEnterprisePool({ quantity, unitPriceCents, discountPct, thresholdMin = null } = {}) {
+  const normalizedQuantity = parsePositiveInteger(quantity);
+  if (normalizedQuantity == null) {
+    throw new Error('Enterprise pool quantity must be a positive whole number.');
+  }
+  const normalizedUnitPrice = parseNonNegativeInteger(unitPriceCents);
+  if (normalizedUnitPrice == null) {
+    throw new Error('Enterprise pool unit price must be a whole number of cents.');
+  }
+  const normalizedDiscount = parsePercent(discountPct);
+  if (normalizedDiscount == null) {
+    throw new Error('Enterprise pool discount must be a percentage from 0 to 100.');
+  }
+
+  const grossCents = normalizedQuantity * normalizedUnitPrice;
   return {
     quantity: normalizedQuantity,
     unit_price_cents: normalizedUnitPrice,
-    discount_pct: discountPct,
-    discounted_unit_price_cents: Math.round((normalizedUnitPrice * (100 - discountPct)) / 100),
-    total_cents: totalCents,
+    discount_pct: normalizedDiscount,
+    discounted_unit_price_cents: Math.round((normalizedUnitPrice * (100 - normalizedDiscount)) / 100),
+    total_cents: Math.round((grossCents * (100 - normalizedDiscount)) / 100),
     threshold_min: thresholdMin
   };
 }
@@ -119,5 +147,6 @@ async function priceEnterprisePool({ db, quantity, unitPriceCents } = {}) {
 module.exports = {
   DISCOUNT_TABLE,
   priceEnterprisePool,
+  quoteEnterprisePool,
   resolvePoolDiscount
 };
