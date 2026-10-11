@@ -9,7 +9,7 @@ const { buildAlphaScreenPlanSettingsPayload } = require('../../services/alphaScr
 const { activatePublicPurchaseAgreementCheckout } = require('../../services/publicPurchaseActivation');
 const { finalizePendingRolePurchase } = require('../../services/rolePurchaseFinalizer');
 const { requirePlanCapacity } = require('../../services/planCapacity');
-const { defaultBillingModelForPlanTier, resolveBillingModel } = require('../../services/billingModel');
+const { resolveBillingModel } = require('../../services/billingModel');
 const { applyUsageToInvoice } = require('../../services/usageBilling');
 const { markPoolFailed, markPoolPaid } = require('../../services/interviewPool');
 const router = express.Router();
@@ -275,14 +275,12 @@ async function upsertClientPlanSettingsFromSubscription(subscription, clientId, 
     client_id: clientId,
     subscription_id: pickId(subscription?.id) || null
   });
-  // The tier decides the billing model for a newly provisioned client. The column
-  // is set on every upsert so a tier change moves the client onto the right model.
+  // billing_model is deliberately not written. A stored value is an explicit
+  // choice for this client and must survive subscription events; an empty one
+  // follows plan_tier, so a tier change moves such a client with no write here.
   const { error } = await supabaseAdmin
     .from('client_plan_settings')
-    .upsert(
-      { ...payload, billing_model: defaultBillingModelForPlanTier(payload.plan_tier) },
-      { onConflict: 'client_id' }
-    );
+    .upsert(payload, { onConflict: 'client_id' });
   if (error) throw new Error(error.message || 'Client plan settings upsert failed');
   return true;
 }

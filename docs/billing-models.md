@@ -9,9 +9,10 @@ exactly one of them, recorded as `billing_model` on their plan settings.
 | `rollover` | Pro | Become client credit, usable for 90 days |
 | `usage` | Enterprise | Interviews past the included count are invoiced |
 
-A client's model is set from their plan tier when their subscription starts, and
-can be changed afterwards by an administrator. Clients whose records predate this
-feature behave as their tier implies, so nothing had to be migrated by hand.
+A client's model normally comes from their plan tier, and moves with it: a
+client who goes from Pro to Enterprise is billed on `usage` from then on, with
+nothing to update. A client can instead be given a model of their own, which
+then stays put whatever happens to their subscription.
 
 **An empty `billing_model` means "follow the plan tier".** The column has no
 default and may be left empty. When it is empty, the client is billed as their
@@ -189,11 +190,19 @@ nothing.
 Note the mixed units: `usage_interview_fee_cents` is in cents, the other money
 fields are in dollars. This follows the existing column conventions.
 
-`billing_model` is not a field anyone sets. It is derived from the tier every
-time the webhook runs — Essentials → `fixed`, Pro → `rollover`, Enterprise →
-`usage`. A client activated through the public purchase flow gets no value at
-all, which means the same thing: follow the tier. `rollover_days` is 90 for
-every client; there is no setting for it.
+**Nothing in the backend writes `billing_model`.** Not the Stripe webhook, not
+the agreement activation, not the public purchase activation. Every new client
+therefore starts with it empty, which means "follow the tier", and a Stripe
+event never changes it.
+
+A value in the column is an explicit choice for that one client: for example,
+an Enterprise client billed on `rollover` instead of `usage`. It wins over the
+tier and survives every subscription event, including a change of tier. There
+is no admin screen or endpoint for it yet; it is set directly in the database.
+To put a client back on their tier's model, set it to empty (`null`), not to
+the tier's model, or a later tier change will not move them.
+
+`rollover_days` is 90 for every client; there is no setting for it.
 
 > **The Agreement Generator form does not yet have a field for the Enterprise
 > per-interview usage price.** The backend accepts `usage_interview_fee_cents`
@@ -327,6 +336,7 @@ timestamps, so alphabetical order is run order.
 | `20261009180000_client_interview_pools.sql` | Creates `client_interview_pools` — what was bought and whether it was paid for |
 | `20261009190000_interviews_completed_at.sql` | Adds `completed_at` to `interviews`, indexes `(client_id, completed_at)`, and backfills existing rows |
 | `20261009200000_client_plan_settings_money_units.sql` | Comments only: records which `client_plan_settings` money columns are dollars and which are cents, and that a zero included count is a setting. Changes no column and no value |
+| `20261011120000_billing_model_follow_plan_tier.sql` | Empties `billing_model` wherever it only repeats the client's own tier (Essentials with `fixed`, Pro with `rollover`, Enterprise with `usage`). Those values were stamped by the first migration and by the webhook, not chosen. No client changes model when it runs; afterwards a tier change moves them. A value that differs from the tier is left alone |
 
 ### Why these run after the client's own migrations
 
@@ -356,6 +366,7 @@ that touches one is changing a table whose access model is **not** visible here.
 | `20261009120000_billing_models.sql` | `client_plan_settings` | Adds three columns and backfills them. No change to who can read the table. |
 | `20261009190000_interviews_completed_at.sql` | `interviews` | Adds one column and one index, and backfills it. |
 | `20261009200000_client_plan_settings_money_units.sql` | `client_plan_settings` | Comments only. No column, value or access changes. |
+| `20261011120000_billing_model_follow_plan_tier.sql` | `client_plan_settings` | Empties `billing_model` where it equals the tier's default. No column or access changes. |
 
 **`20261009190000_interviews_completed_at.sql` deliberately contains no RLS,
 `grant` or `revoke` statement**, and a test asserts it never gains one.
@@ -389,6 +400,8 @@ All of them. Every table creation is `create table if not exists`, every column
 addition is guarded by an existence check, and every backfill only fills rows
 that are still null — so re-running will not overwrite a model an administrator
 has since changed by hand, or move a completion time that is already recorded.
+`20261011120000` only empties values that equal the tier's default, so a second
+run finds nothing to do.
 
 ### Rolling back
 
@@ -397,12 +410,10 @@ Rolling back is a configuration change, not a migration.
 1. **Stop the charging.** Remove the `invoice.created` subscription from the
    Stripe webhook endpoint and disable the daily usage cron. No further usage is
    billed from that moment.
-2. **Stop the credits.** The billing model is derived from the plan tier, so
-   there is no setting to flip. The durable rollback is to revert the Billing 2
-   and Billing 3 commits. As a stopgap, `update client_plan_settings set
-   billing_model = 'fixed'` stops minting and spending immediately — but the
-   next subscription webhook for a Pro client will derive `rollover` again, so
-   this holds only until that client's subscription next changes.
+2. **Stop the credits.** `update client_plan_settings set billing_model =
+   'fixed'` stops minting and spending immediately, and it holds: no Stripe
+   event writes the column, so it stays `fixed` until someone changes it. The
+   durable rollback is still to revert the Billing 2 and Billing 3 commits.
 
 Once no client is on `rollover` or `usage`, the new columns and tables are inert. Leave them in place: they hold the record of what was
 billed and what credit was issued, which is needed to answer questions about past

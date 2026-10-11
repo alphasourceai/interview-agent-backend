@@ -26,6 +26,7 @@ const {
   resolvePublicCheckoutReturnState
 } = require('../src/services/publicPurchaseActivation')
 const { buildAlphaScreenPackageSnapshot } = require('../src/services/alphaScreenPackages')
+const { normalizeBillingModel } = require('../src/services/billingModel')
 
 const AGREEMENT_ID = '33333333-3333-4333-8333-333333333333'
 const INTENT_ID = '11111111-1111-4111-8111-111111111111'
@@ -388,9 +389,12 @@ test('public purchase webhook activation provisions Essential and Pro monthly/an
       per_role_fee: perRoleFee,
       included_interviews_per_role: included,
       additional_interview_fee: overage,
-      max_interview_minutes: minutes,
-      billing_model: billingModel
+      max_interview_minutes: minutes
     })
+    // billing_model is left empty and follows the tier; a stored value would be
+    // an explicit choice, which an activation must never make.
+    assert.ok(!('billing_model' in settings))
+    assert.equal(normalizeBillingModel(settings.billing_model, settings.plan_tier), billingModel)
     assert.doesNotMatch(JSON.stringify(result), /recovery-token|setup\.example/)
   }
 })
