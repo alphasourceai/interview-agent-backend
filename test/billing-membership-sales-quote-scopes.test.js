@@ -32,11 +32,13 @@ function fixture(){
     if(f.rpcMode==='definite')return {error:{code:'23514',message:'private constraint detail'}};
     if(f.rpcMode==='throw-sql'){const e=Error('private SQL detail');e.code='42501';throw e;}
     if(f.rpcMode==='before')throw Error('private lost connection');
+    if(f.rpcMode==='returned-before')return {error:{message:'SECRETTOKENVALUE lost response'}};
     if(!f.active.has(args.p_actor))return {error:{code:'P0001',message:'sales_scope_denied'}};
     let row=[...rows.values()].find(r=>r.issuer_user_id===args.p_actor && r.idempotency_key_hash===args.p_key_hash);
     if(!row){row={id:crypto.randomUUID(),issuer_user_id:args.p_actor,audience:'sales',scope_kind:'manual_prospect',source_verified:false,
       idempotency_key_hash:args.p_key_hash,request_fingerprint:args.p_fingerprint,created_at:new Date(now).toISOString()};rows.set(row.id,row);}
     if(f.rpcMode==='after')throw Error('private lost ack');
+    if(f.rpcMode==='returned-after')return {error:{message:'SECRETTOKENVALUE lost response'}};
     if(f.rpcMode==='key-conflict')return {error:{code:'23505',constraint:'membership_v2_sales_scopes_actor_key_unique'}};
     if(f.rpcMode==='wrong-conflict')return {error:{code:'23505',constraint:'membership_v2_sales_quote_scopes_pkey'}};
     return {data:f.rpcData===null?[structuredClone(row)]:structuredClone(f.rpcData),error:null};
@@ -62,9 +64,9 @@ test('same actor/key retries and concurrent calls return one scope; new key crea
   assert.notEqual((await f.service.createScope(subject,{idempotencyKey:`${key}_new`})).scope_id,results[0].scope_id);
 });
 test('invalid identities fail before RPC/quote reads; user_metadata is never authority',async()=>{
-  for(const change of [{id:other,user_metadata:{role:'admin'}},{id:''},{is_anonymous:true},{is_anonymous:undefined},
+  for(const change of [{id:other,user_metadata:{role:'admin'}},{id:''},{id:'00000000-0000-0000-0000-000000000000'},{is_anonymous:true},{is_anonymous:undefined},
     {email_confirmed_at:null},{email_confirmed_at:'not-a-date'},{email_confirmed_at:'2027-01-01T00:00:00Z'},
-    {deleted_at:'2026-10-10T00:00:00Z'},{banned_until:'2027-01-01T00:00:00Z'},{banned_until:'invalid'}]){
+    {deleted_at:'2026-10-10T00:00:00Z'},{deleted_at:''},{banned_until:'2027-01-01T00:00:00Z'},{banned_until:'invalid'}]){
     const f=fixture();Object.assign(f.user,change);if(change.id===other)f.active.delete(other);
     await assert.rejects(f.service.createScope(subject,{idempotencyKey:key}),code('sales_scope_denied'));
     assert.equal(f.rows.size,0);assert.equal(f.calls.filter(c=>c[0]==='rpc').length,0);
@@ -192,4 +194,33 @@ test('own scope plus another rep quote does not reveal quote; repeated quotes ar
   assert.notEqual(a.quote.quote_id,b.quote.quote_id);assert.notEqual(a.quote_digest,b.quote_digest);
   f.user.id=other;const otherScope=await f.service.createScope(subject,{idempotencyKey:key});
   await assert.rejects(q.readQuote({...subject,scopeId:otherScope.scope_id},a.quote.quote_id),code('quote_not_found',404));
+});
+test('returned non-SQL transport outcomes reconcile once with fresh post-read authorization',async()=>{
+  const f=fixture();f.rpcMode='returned-after';const scope=await f.service.createScope(subject,{idempotencyKey:key});
+  assert.ok(scope.scope_id);assert.equal(f.readCalls,1);assert.equal(f.authCalls,3);assert.equal(f.calls.filter(c=>c[0]==='rpc').length,1);
+  const missing=fixture();missing.rpcMode='returned-before';
+  await assert.rejects(missing.service.createScope(subject,{idempotencyKey:key}),e=>e.code==='sales_scope_create_unverified' && !JSON.stringify(e).includes('SECRETTOKENVALUE'));
+  assert.equal(missing.readCalls,1);assert.equal(missing.calls.filter(c=>c[0]==='rpc').length,1);
+  const revoked=fixture();revoked.rpcMode='returned-after';revoked.beforeAuth=n=>{if(n===3)revoked.active.delete(rep);};
+  await assert.rejects(revoked.service.createScope(subject,{idempotencyKey:key}),code('sales_scope_denied'));
+  assert.equal(revoked.readCalls,1);assert.equal(revoked.rows.size,1);
+});
+test('last readQuote Auth/grant check denies revocation without mutating the stored draft',async()=>{
+  const f=fixture(),scope=await f.service.createScope(subject,{idempotencyKey:key});
+  const q=createMembershipQuoteDraftService({db:f.db,authorizeScope:f.service.authorizeScope,now:()=>new Date(now).toISOString()});
+  const draft=await q.createQuote({...subject,scopeId:scope.scope_id},{planKey:'basic',commitmentMonths:3,paymentOption:'prepaid',offerVersion:OFFER_VERSION});
+  const before=structuredClone(f.quotes.get(draft.quote.quote_id));f.authCalls=0;
+  f.beforeAuth=n=>{if(n===4)f.active.delete(rep);};
+  await assert.rejects(q.readQuote({...subject,scopeId:scope.scope_id},draft.quote.quote_id),code('quote_scope_denied'));
+  assert.equal(f.authCalls,4);assert.deepEqual(f.quotes.get(draft.quote.quote_id),before);
+  assert.equal(before.issuer_user_id,rep);assert.equal(before.scope_id,scope.scope_id);
+  assert.equal(JSON.parse(before.canonical_quote).acceptance_state,'unsigned');
+});
+test('admin metadata on an active rep cannot change attribution, and without a rep grant cannot create',async()=>{
+  const f=fixture();f.user.user_metadata={role:'admin',original_salesperson_user_id:other};
+  const scope=await f.service.createScope(subject,{idempotencyKey:key});assert.equal(scope.original_salesperson_user_id,rep);
+  assert.ok(!f.calls.some(c=>c[0]==='table' && c[1]==='admins'));
+  const absent=fixture();absent.user.user_metadata={role:'admin'};absent.active.delete(rep);
+  await assert.rejects(absent.service.createScope(subject,{idempotencyKey:key}),code('sales_scope_denied'));assert.equal(absent.rows.size,0);
+  assert.ok(!absent.calls.some(c=>c[0]==='table' && c[1]==='admins'));
 });

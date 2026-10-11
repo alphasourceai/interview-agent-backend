@@ -59,6 +59,9 @@ test('migration preserves legacy clients/activation protocol; no acceptance, rec
  assert.equal(sql("select count(*) from pg_tables where schemaname='cron';"),'0');
 });
 test('service-only non-owner grants, invoker/search_path and RLS deny browsers even after accidental grant',options,()=>{
+ sql(`set role service_role;select id from ${rpc()};`);
+ assert.equal(sql("set role service_role;select count(*) from membership_v2_sales_quote_scopes;"),'1');
+ assert.equal(sql("select has_function_privilege('service_role','membership_v2_reserve_sales_quote_scope(uuid,text,text)','execute');"),'t');
  assert.equal(sql("select relrowsecurity and relowner<>(select oid from pg_roles where rolname='service_role') from pg_class where oid='membership_v2_sales_quote_scopes'::regclass;"),'t');
  assert.equal(sql("select rolsuper from pg_roles where rolname='service_role';"),'f');
  assert.equal(sql("select count(*) from pg_policies where tablename='membership_v2_sales_quote_scopes';"),'0');

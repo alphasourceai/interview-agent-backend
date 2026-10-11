@@ -31,7 +31,8 @@ IDs and key hashes are not access capabilities. Do not log tokens or raw errors.
 Idempotency applies to scope creation, not repeated createQuote calls. Key hash
 plus issuer is unique; both hashes have distinct fixed v1 domain prefixes;
 fingerprint binds manual scope kind, audience and verified issuer. Every retry still checks current access.
-Unknown transport outcome reconciles exactly one actor/key read, no second RPC.
+Thrown or returned non-SQLSTATE transport outcome reconciles exactly one
+actor/key read, no second RPC; post-read authentication must still succeed.
 Only a 23505 naming the actor/key constraint may also use that recovery read;
 every other definite database/PostgREST failure returns a sanitized error, not
 guessed success. Post-commit revocation/readback failure can leave an inert row.
