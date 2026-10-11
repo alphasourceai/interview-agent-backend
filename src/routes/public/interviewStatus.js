@@ -5,7 +5,7 @@ const { supabase } = require('../../clients/supabase');
 const { getRequestSubjectKey, checkAndIncrementRateLimit } = require('../../services/rateLimit');
 const { isRoleInactive, buildRoleInactivePayload, logInactiveRoleBlocked } = require('../../services/roleLifecycle');
 const { validateConfiguredInterviewDuration } = require('../../services/interviewDuration');
-const { resolvePlanCapacityForClient } = require('../../services/planCapacity');
+const { resolveRoleInterviewCapacity } = require('../../services/planCapacity');
 
 const router = express.Router();
 const PUBLIC_STATUS_RATE_WINDOW_MS = 5 * 60 * 1000;
@@ -62,7 +62,7 @@ router.get('/interview-status', publicStatusRateLimit, async (req, res) => {
 
     const { data: role, error: roleError } = await supabase
       .from('roles')
-      .select('id, client_id, status')
+      .select('id, client_id, status, rubric')
       .eq('slug_or_token', role_token)
       .maybeSingle();
 
@@ -89,10 +89,9 @@ router.get('/interview-status', publicStatusRateLimit, async (req, res) => {
     if (role?.client_id) {
       let capacity;
       try {
-        capacity = await resolvePlanCapacityForClient({
-          db: supabase,
-          clientId: role.client_id,
-        });
+        // The same per-role length the launch uses, so the countdown and the
+        // call limit agree.
+        capacity = await resolveRoleInterviewCapacity({ db: supabase, role });
       } catch (capacityError) {
         if (capacityError?.code === 'PLAN_CAPACITY_LOOKUP_FAILED') {
           return res.status(503).json({

@@ -17,7 +17,7 @@ const {
 const { resolvePublicBackendBase } = require('../../config/urlConfig');
 const { normalizePrimitiveString, normalizeUuid } = require('../../services/strictRequestValidation');
 const { validateConfiguredInterviewDuration } = require('../../services/interviewDuration');
-const { resolvePlanCapacityForClient } = require('../../services/planCapacity');
+const { resolveRoleInterviewCapacity } = require('../../services/planCapacity');
 const { buildAuthenticatedTavusWebhookUrl } = require('../../services/tavusWebhookAuth');
 const {
   clearOtpLaunchCapability,
@@ -243,9 +243,11 @@ router.post('/', requireOtpLaunchCapability, createTavusRateLimit, async (req, r
     try {
       let planCapacity;
       try {
-        planCapacity = await resolvePlanCapacityForClient({
+        // The role's own length: what its rubric was generated with, so a later
+        // change to the client's settings does not reach an existing role.
+        planCapacity = await resolveRoleInterviewCapacity({
           db: supabaseAdmin,
-          clientId,
+          role: { ...role, client_id: clientId },
         });
       } catch (capacityError) {
         console.warn('[create-tavus-interview] duration_preflight_blocked', {

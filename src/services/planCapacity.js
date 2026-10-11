@@ -73,7 +73,22 @@ function validInternalSyntheticDuration(value) {
   return Number.isInteger(duration) && duration > 0 && duration <= 59 ? duration : null;
 }
 
-function resolvePlanCapacity({ planTier, clientId, configuredDurationMinutes, env = process.env } = {}) {
+// An Enterprise client's own length and question count, from its plan settings.
+// A value outside what an agreement may set is ignored in favour of the plan
+// value rather than trusted: the agreement validator is the only writer, so an
+// out-of-range value means the row was edited by hand.
+function enterpriseSetting(value, min, max) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : null;
+}
+
+function resolvePlanCapacity({
+  planTier,
+  clientId,
+  configuredDurationMinutes,
+  configuredScoredQuestionCount,
+  env = process.env,
+} = {}) {
   const capacity = requirePlanCapacity(planTier);
   const internalDuration = isInternalSyntheticClient(clientId, env)
     ? validInternalSyntheticDuration(configuredDurationMinutes)
@@ -95,7 +110,31 @@ function resolvePlanCapacity({ planTier, clientId, configuredDurationMinutes, en
     });
   }
 
-  return capacity;
+  // Only Enterprise is configured per client. Essentials and Pro always run at
+  // their plan values, whatever their plan settings hold.
+  if (capacity.membership_level !== 'enterprise') return capacity;
+
+  const {
+    INTERVIEW_MINUTES_MAX,
+    INTERVIEW_MINUTES_MIN,
+    SCORED_QUESTIONS_MAX,
+    SCORED_QUESTIONS_MIN,
+  } = require('./enterpriseSettings');
+  const minutes = enterpriseSetting(configuredDurationMinutes, INTERVIEW_MINUTES_MIN, INTERVIEW_MINUTES_MAX)
+    ?? capacity.max_interview_minutes;
+  // Empty means the plan's count.
+  const scoredQuestionCount = enterpriseSetting(configuredScoredQuestionCount, SCORED_QUESTIONS_MIN, SCORED_QUESTIONS_MAX)
+    ?? capacity.scored_question_count;
+  if (minutes === capacity.max_interview_minutes && scoredQuestionCount === capacity.scored_question_count) {
+    return capacity;
+  }
+  return Object.freeze({
+    ...capacity,
+    interview_duration_minutes: minutes,
+    max_interview_minutes: minutes,
+    scored_question_count: scoredQuestionCount,
+    client_configured: true,
+  });
 }
 
 function planCapacityLookupError(error) {
@@ -111,7 +150,7 @@ function planCapacityLookupError(error) {
 async function lookupPlanSettings(db, clientId) {
   const { data, error } = await db
     .from('client_plan_settings')
-    .select('client_id,plan_tier,max_interview_minutes')
+    .select('client_id,plan_tier,max_interview_minutes,scored_question_count')
     .eq('client_id', clientId)
     .maybeSingle();
   if (error) throw planCapacityLookupError(error);
@@ -142,6 +181,7 @@ async function resolvePlanCapacityForClient({ db, clientId, env = process.env } 
       planTier: scopedSettings.plan_tier,
       clientId: scopedClientId,
       configuredDurationMinutes: scopedSettings.max_interview_minutes,
+      configuredScoredQuestionCount: scopedSettings.scored_question_count,
       env,
     });
   }
@@ -154,14 +194,71 @@ async function resolvePlanCapacityForClient({ db, clientId, env = process.env } 
     planTier: billingSettings.plan_tier,
     clientId: billingClientId,
     configuredDurationMinutes: billingSettings.max_interview_minutes,
+    configuredScoredQuestionCount: billingSettings.scored_question_count,
     env,
   });
+}
+
+// The length and question count a role's rubric was generated with, stamped on
+// the rubric when it was generated (generateRubric.js). Null for a rubric from
+// before stamping, or one without a usable stamp.
+function stampedRubricCapacity(rubric) {
+  const parsed = typeof rubric === 'string' ? (() => {
+    try { return JSON.parse(rubric); } catch (_) { return null; }
+  })() : rubric;
+  if (!parsed || typeof parsed !== 'object') return { rubric: null, minutes: null, questions: null };
+  const minutes = Number(parsed.max_interview_minutes);
+  const questions = Number(parsed.scored_question_count);
+  return {
+    rubric: parsed,
+    minutes: Number.isInteger(minutes) && minutes > 0 ? minutes : null,
+    questions: Number.isInteger(questions) && questions > 0 ? questions : null,
+  };
+}
+
+/**
+ * The capacity an interview for this role runs at.
+ *
+ * A role keeps the length its rubric was generated with, so a later change to
+ * the client's settings applies only to roles created (or regenerated) after it.
+ * The client is still resolved first: a lookup failure or a client with no valid
+ * plan is refused exactly as before, and an internal synthetic client keeps its
+ * configured override, live, as it always has.
+ *
+ * A rubric from before stamping falls back to its own tier's plan values, which
+ * is what every rubric was generated at until per-client settings existed.
+ */
+async function resolveRoleInterviewCapacity({ db, role, env = process.env } = {}) {
+  const clientCapacity = await resolvePlanCapacityForClient({ db, clientId: role?.client_id, env });
+  return capacityForRole(clientCapacity, role?.rubric);
+}
+
+// The rule above, given a client's already-resolved capacity, for callers that
+// resolve each client once and apply it to many roles.
+function capacityForRole(clientCapacity, rubric) {
+  if (!clientCapacity) return null;
+  if (clientCapacity.internal_synthetic_duration_override) return clientCapacity;
+
+  const stamp = stampedRubricCapacity(rubric);
+  if (stamp.minutes !== null) {
+    return Object.freeze({
+      ...clientCapacity,
+      interview_duration_minutes: stamp.minutes,
+      max_interview_minutes: stamp.minutes,
+      scored_question_count: stamp.questions ?? clientCapacity.scored_question_count,
+      capacity_source: 'role_rubric',
+    });
+  }
+  const rubricPlan = getPlanCapacity(stamp.rubric?.membership_level);
+  if (rubricPlan) return Object.freeze({ ...rubricPlan, capacity_source: 'role_rubric_plan' });
+  return clientCapacity;
 }
 
 module.exports = {
   INTERNAL_SYNTHETIC_CLIENT_IDS_ENV,
   PLAN_CAPACITY,
   PlanCapacityError,
+  capacityForRole,
   getPlanCapacity,
   isInternalSyntheticClient,
   normalizeMembershipLevel,
@@ -169,4 +266,5 @@ module.exports = {
   requirePlanCapacity,
   resolvePlanCapacity,
   resolvePlanCapacityForClient,
+  resolveRoleInterviewCapacity,
 };

@@ -8,7 +8,7 @@ const { getRoleInterviewAvailability } = require('../../services/roleInterviewAv
 const { getRoleJdReplacementEligibility } = require('../../services/roleJdReplacement');
 const { loadEntityMap, resolveEntityFilter, uniqueIds, withEntityFields } = require('../../services/entityScopeFilter');
 const { buildBrandedEmailShell, escapeHtml } = require('../../clients/sendgrid');
-const { resolvePlanCapacity, resolvePlanCapacityForClient } = require('../../services/planCapacity');
+const { capacityForRole, resolvePlanCapacityForClient } = require('../../services/planCapacity');
 const { normalizeInterviewType, normalizeRoleInterviewTypeForRead } = require('../../services/interviewTypes');
 const { hasClientAccess, hasClientManagerAccess } = require('../../services/serviceRoleAuthorization');
 const { resolveBillingOwnerForScope } = require('../../services/clientBillingScope');
@@ -185,42 +185,18 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
         request_id
       });
     }
+    // Each client through the per-client resolver, so a child entity gets its
+    // billing owner's settings and an Enterprise client its own; then each role
+    // at the capacity its rubric was generated with (capacityForRole).
     const planClientIds = uniqueIds(roles.map((role) => role.client_id).concat(scopedClientIds));
     const planCapacityByClientId = {};
-    const clientsWithDirectPlanSettings = new Set();
-    const { data: planSettings, error: planSettingsError } = await db
-      .from('client_plan_settings')
-      .select('client_id,plan_tier,max_interview_minutes')
-      .in('client_id', planClientIds.length ? planClientIds : [clientId]);
-    if (planSettingsError) {
-      console.warn('[GET /roles] plan settings lookup failed', planSettingsError?.message || planSettingsError);
-    } else {
-      for (const row of planSettings || []) {
-        const rowClientId = String(row?.client_id || '').trim();
-        if (!rowClientId) continue;
-        clientsWithDirectPlanSettings.add(rowClientId);
-        try {
-          planCapacityByClientId[rowClientId] = resolvePlanCapacity({
-            planTier: row.plan_tier,
-            clientId: rowClientId,
-            configuredDurationMinutes: row.max_interview_minutes,
-          });
-        } catch (_) {
-          planCapacityByClientId[rowClientId] = null;
-        }
+    await Promise.all(planClientIds.map(async (planClientId) => {
+      try {
+        planCapacityByClientId[planClientId] = await resolvePlanCapacityForClient({ db, clientId: planClientId });
+      } catch (_) {
+        planCapacityByClientId[planClientId] = null;
       }
-      const clientsNeedingBillingFallback = planClientIds.filter((id) => !clientsWithDirectPlanSettings.has(id));
-      await Promise.all(clientsNeedingBillingFallback.map(async (fallbackClientId) => {
-        try {
-          planCapacityByClientId[fallbackClientId] = await resolvePlanCapacityForClient({
-            db,
-            clientId: fallbackClientId,
-          });
-        } catch (_) {
-          planCapacityByClientId[fallbackClientId] = null;
-        }
-      }));
-    }
+    }));
 
     const availabilityByRoleId = {};
     if (roles.length) {
@@ -270,7 +246,7 @@ router.get('/', requireAuth, withClientScope, async (req, res) => {
 
     const items = roles.map((role) => {
       const availability = availabilityByRoleId[role.id] || null;
-      const capacity = planCapacityByClientId[role.client_id] || null;
+      const capacity = capacityForRole(planCapacityByClientId[role.client_id] || null, role.rubric);
       return withEntityFields(normalizeRoleInterviewTypeForRead({
         ...role,
         included_interviews_per_role: availability?.included_interviews_per_role ?? null,
