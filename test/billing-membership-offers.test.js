@@ -24,6 +24,8 @@ for (const [planKey, terms] of Object.entries(accepted)) {
         assert.equal(offer.platform_payment_cents, payment);
         assert.equal(offer.platform_commitment_total_cents, payment * (installments ? commitmentMonths : 1));
         assert.equal(offer.initial_payment_cents, payment);
+        assert.equal(offer.term_start_basis, 'first_payment_success');
+        assert.equal(offer.contract_timezone, 'UTC');
         assert.equal(offer.installment_count, installments ? commitmentMonths : 1);
         assert.deepEqual(offer.stripe_recurrence, { interval: 'month', interval_count: installments ? 1 : commitmentMonths });
         assert.equal(offer.renewal.default_auto_renew, true);

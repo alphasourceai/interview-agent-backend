@@ -89,6 +89,8 @@ function buildRetailOffer(input = {}) {
     display_name: pkg.display_name,
     currency: 'usd',
     commitment_months: months,
+    term_start_basis: 'first_payment_success',
+    contract_timezone: 'UTC',
     payment_option: paymentOption,
     platform_payment_cents: platformPayment,
     platform_commitment_total_cents: platformPayment * (installment ? months : 1),
