@@ -1,6 +1,7 @@
 'use strict';
 
 const { formatInTimeZone, fromZonedTime } = require('date-fns-tz');
+const { anchoredMonthInstant } = require('./membershipOffers');
 
 const TIME_ZONE = 'America/Denver';
 const COMMISSION_RATE = 0.5;
@@ -66,18 +67,41 @@ function calculateReceiptCommission(input = {}) {
   if (!PAYMENT_KINDS.has(input.payment_kind)) throw policyError('invalid_payment_kind');
   const paid = instant(input.payment_success_at, 'payment_success_at');
   const received = instant(input.funds_received_at, 'funds_received_at', true);
-  const closed = instant(input.qualification_closed_at, 'qualification_closed_at');
+  const v2 = input.membership_terms_protocol === 'retail_terms_v2';
+  if (input.membership_terms_protocol != null && !v2) throw policyError('unsupported_membership_terms_protocol');
+  // These prospective fields must come from the immutable accepted contract and
+  // original sale qualification, not renewal metadata or browser receipt input.
+  // Existing callers omit the marker and retain their exact legacy policy.
+  const closed = instant(v2 ? input.original_qualification_closed_at : input.qualification_closed_at,
+    v2 ? 'original_qualification_closed_at' : 'qualification_closed_at');
   const termStart = instant(input.first_term_start_at, 'first_term_start_at');
   const termEnd = instant(input.first_term_end_at, 'first_term_end_at');
   if (termEnd <= termStart) throw policyError('invalid_first_term');
+  let windowEnd = termEnd;
+  let qualificationVerified = input.qualification_verified;
+  if (v2) {
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (![3,6,12].includes(input.original_commitment_months)) throw policyError('invalid_original_commitment_months');
+    if (!uuid.test(input.original_salesperson_user_id || '') || !uuid.test(input.sales_rep_user_id || '')
+      || input.original_salesperson_user_id !== input.sales_rep_user_id) throw policyError('original_salesperson_mismatch');
+    const original = input.original_membership_start_at;
+    const initialEnd = new Date(anchoredMonthInstant(original,input.original_commitment_months));
+    windowEnd = new Date(anchoredMonthInstant(original,12));
+    if (termStart.toISOString() !== new Date(original).toISOString() || termEnd.getTime() !== initialEnd.getTime()) {
+      throw policyError('original_membership_term_mismatch');
+    }
+    qualificationVerified = input.original_qualification_verified;
+  }
   // A later monthly installment succeeds after the original qualifying close.
   // The close and each individual payment are independent cutoff gates.
   const net = gross - discount - fee;
   const cutoff = input.rep_final_day ? departureCutoffExclusive(input.rep_final_day) : null;
   let reason = null;
   if (input.payment_succeeded !== true) reason = 'payment_not_successful';
-  else if (input.qualification_verified !== true) reason = 'sale_not_verified';
-  else if (closed < termStart || closed >= termEnd || paid >= termEnd) reason = 'outside_first_term';
+  else if (qualificationVerified !== true) reason = 'sale_not_verified';
+  else if (closed < termStart || closed >= termEnd || paid >= windowEnd || (v2 && paid < termStart)) {
+    reason = v2 ? 'outside_original_first_year' : 'outside_first_term';
+  }
   else if (cutoff && (paid >= cutoff || closed >= cutoff)) reason = 'after_departure_window';
   else if (net <= 0) reason = 'no_net_membership_fee';
   if (reason) return { status: 'ineligible', reason, net_membership_cents: net, commission_cents: 0, statement_week: null };
