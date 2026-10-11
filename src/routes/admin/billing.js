@@ -200,7 +200,11 @@ router.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin, asy
           included_interviews_per_role: req.body?.included_interviews_per_role,
           additional_interview_fee: req.body?.additional_interview_fee,
           usage_interview_fee_cents: req.body?.usage_interview_fee_cents,
-          pool_quantity: req.body?.pool_quantity
+          pool_quantity: req.body?.pool_quantity,
+          billing_model: req.body?.billing_model,
+          rollover_days: req.body?.rollover_days,
+          max_interview_minutes: req.body?.max_interview_minutes,
+          scored_question_count: req.body?.scored_question_count
         }
       : null
 
