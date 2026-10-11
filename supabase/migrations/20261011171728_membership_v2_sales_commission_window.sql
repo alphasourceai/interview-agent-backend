@@ -33,8 +33,10 @@ declare
   v_agreement public.membership_agreements;
   v_close timestamptz;
 begin
-  select * into v_contract from public.membership_v2_contracts where id = new.contract_id;
-  select * into v_receipt from public.membership_v2_initial_receipts where contract_id = new.contract_id;
+  select * into v_contract from public.membership_v2_contracts
+    where id = new.contract_id and contract_version = new.contract_version;
+  select * into v_receipt from public.membership_v2_initial_receipts
+    where contract_id = new.contract_id and contract_version = new.contract_version;
   select * into v_intent from public.public_purchase_intents where id = new.purchase_intent_id;
   select * into v_agreement from public.membership_agreements where id = v_intent.agreement_id;
   if v_contract.id is null or v_receipt.contract_id is null or v_intent.id is null
@@ -57,6 +59,14 @@ begin
       and coalesce(nullif(lower(btrim(c.subscription_status)),''),'active') in ('active','trialing'))
     or not exists (select 1 from public.sales_reps r where r.user_id = new.rep_user_id) then
     raise exception using message = 'membership_sales_qualification_source_conflict', errcode = '23000';
+  end if;
+  -- The parent contract CHECK already enforces this. Repeat it here so this
+  -- commission boundary is independently fail-closed if persisted data is ever
+  -- damaged, and never opens a first-year window for a non-retail commitment.
+  if not public.membership_v2_valid_offer(v_contract.offer_snapshot)
+    or coalesce(v_contract.offer_snapshot->'commitment_months','null'::jsonb)
+      not in ('3'::jsonb,'6'::jsonb,'12'::jsonb) then
+    raise exception using message = 'membership_sales_qualification_window_conflict', errcode = '23000';
   end if;
   v_close := greatest(v_agreement.signed_at,v_receipt.paid_at,v_intent.activated_at);
   if new.original_start_at is distinct from v_receipt.paid_at
@@ -134,7 +144,14 @@ begin
   end if;
   select * into v_qualification from public.membership_v2_sales_qualifications
     where contract_id = new.membership_contract_id;
-  select offer_snapshot into v_offer from public.membership_v2_contracts where id = new.membership_contract_id;
+  select offer_snapshot into v_offer from public.membership_v2_contracts
+    where id = new.membership_contract_id and contract_version = v_qualification.contract_version;
+  -- Validate before casting cents or deriving the payment kind. In particular,
+  -- NULL cap comparisons and the CASE's monthly fallback cannot authorize an
+  -- invalid offer. The immutable contract is PK(id); versions cannot duplicate.
+  if v_offer is null or not public.membership_v2_valid_offer(v_offer) then
+    raise exception using message = 'membership_commission_receipt_snapshot_conflict', errcode = '23000';
+  end if;
   if v_qualification.contract_id is null
     or new.membership_contract_version is distinct from v_qualification.contract_version
     or new.purchase_intent_id is distinct from v_qualification.purchase_intent_id

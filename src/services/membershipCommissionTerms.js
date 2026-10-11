@@ -11,9 +11,12 @@ function canonical(value) {
   if (!Number.isFinite(time.getTime())) fail('invalid_membership_commission_snapshot');
   return time.toISOString();
 }
-async function read(db,table,columns,key,id) {
+async function read(db,table,columns,key,id,version=null) {
   let result;
-  try { result=await db.from(table).select(columns).eq(key,id).maybeSingle(); }
+  try {
+    const query=db.from(table).select(columns).eq(key,id);
+    result=await (version==null?query:query.eq('contract_version',version)).maybeSingle();
+  }
   catch { fail('membership_commission_read_failed',503); }
   if (!result || result.error) fail('membership_commission_read_failed',503);
   if (result.data == null) return null;
@@ -41,8 +44,8 @@ async function loadMembershipCommissionTerms(db,intent) {
   if (q.purchase_intent_id !== intent.id || !UUID.test(q.contract_id || '') || !UUID.test(q.rep_user_id || '')
     || !Number.isSafeInteger(q.contract_version) || q.contract_version <= 0) fail('invalid_membership_commission_snapshot');
   const contract=await read(db,'membership_v2_contracts',
-    'id,contract_version,client_id,agreement_id,purchase_intent_id,original_salesperson_user_id,offer_snapshot', 'id',q.contract_id);
-  const initial=await read(db,'membership_v2_initial_receipts','contract_id,contract_version,paid_at','contract_id',q.contract_id);
+    'id,contract_version,client_id,agreement_id,purchase_intent_id,original_salesperson_user_id,offer_snapshot', 'id',q.contract_id,q.contract_version);
+  const initial=await read(db,'membership_v2_initial_receipts','contract_id,contract_version,paid_at','contract_id',q.contract_id,q.contract_version);
   const offer=contract?.offer_snapshot;
   if (!contract || !initial || contract.id !== q.contract_id || initial.contract_id !== q.contract_id
     || contract.contract_version !== q.contract_version || initial.contract_version !== q.contract_version

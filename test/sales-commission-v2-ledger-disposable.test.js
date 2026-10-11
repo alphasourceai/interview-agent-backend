@@ -74,6 +74,14 @@ function receipt(c,changes={}) {
     membership_terms_protocol:'retail_terms_v2',membership_contract_id:c.id,membership_contract_version:1,
     policy_version:'retail-terms-v2-commission-v1',...changes};
 }
+// Fault injection is confined to a synthetic transaction which fails and rolls
+// back on psql exit. Normal inserts cannot bypass the parent's CHECK or PK.
+function damagedOffer(c,snapshot,attempt) {
+  return `begin; alter table membership_v2_contracts drop constraint membership_v2_contracts_offer_snapshot_check;
+    alter table membership_v2_contracts disable trigger membership_v2_contracts_immutable;
+    update membership_v2_contracts set offer_snapshot=${literal(snapshot)} where id='${c.id}';
+    set role service_role; ${attempt}`;
+}
 before(()=>{
   if (!enabled) return;
   assert.match(socket,/^\/private\/tmp\/alphascreen-membership-v2-pg\.[A-Za-z0-9]+$/);
@@ -203,6 +211,39 @@ test('a v2 sale cannot fall back to legacy dates, even before qualification is r
     fails(`set role service_role; ${insert('sales_commission_receipts',receipt(c,{membership_terms_protocol:'legacy_receipt_v1',
       membership_contract_id:null,membership_contract_version:null,first_term_end_at:'2027-01-31T14:20:30Z'}))}`,/protocol_required/);
   }
+});
+test('parent contract CHECK and qualification boundary both reject every non-retail commitment',options,()=>{
+  for (const months of [1,2,4,5,7,8,9,10,11,13]) {
+    const c=setup({qualify:false});
+    const malformed={...c.offer,commitment_months:months,renewal:{...c.offer.renewal,commitment_months:months},
+      stripe_recurrence:{interval:'month',interval_count:months}};
+    assert.equal(service(`select membership_v2_valid_offer(${literal(malformed)})`),'f');
+    assert.throws(()=>setup({qualify:false,snapshotChanges:malformed}),/check constraint/);
+    const q=qualification(c,{original_term_end_at:anchoredMonthInstant(original,months)});
+    fails(damagedOffer(c,malformed,q),/membership_sales_qualification_window_conflict/);
+    assert.equal(service(`select offer_snapshot=${literal(c.offer)} from membership_v2_contracts where id='${c.id}'`),'t');
+  }
+});
+test('contract PK prevents a second version sharing an ID, and missing qualified version is held',options,()=>{
+  const c=setup({qualify:false});
+  fails(`set role service_role; insert into membership_v2_contracts
+    select id,contract_version+1,client_id,billing_owner_user_id,agreement_id,purchase_intent_id,
+      offer_snapshot,acceptance_digest,accepted_at,original_salesperson_user_id,created_at
+    from membership_v2_contracts where id='${c.id}'`,/duplicate key.*membership_v2_contracts_pkey/);
+  fails(`set role service_role; ${qualification(c,{contract_version:2})}`,/membership_sales_qualification_source_conflict/);
+});
+test('missing, nonpositive or malformed offer cap and unsupported option fail closed at receipt boundary',options,()=>{
+  const c=setup({payment:'monthly_installments'});
+  const noCap={...c.offer};delete noCap.platform_payment_cents;
+  const noOption={...c.offer};delete noOption.payment_option;
+  for (const malformed of [noCap,noOption,{...c.offer,platform_payment_cents:0},
+    {...c.offer,platform_payment_cents:-1},{...c.offer,platform_payment_cents:'not-cents'},
+    {...c.offer,payment_option:'unsupported'}]) {
+    assert.equal(service(`select membership_v2_valid_offer(${literal(malformed)})`),'f');
+    assert.throws(()=>setup({payment:'monthly_installments',qualify:false,snapshotChanges:malformed}),/check constraint/);
+    fails(damagedOffer(c,malformed,insert('sales_commission_receipts',receipt(c))),/membership_commission_receipt_snapshot_conflict/);
+  }
+  assert.equal(service(`select offer_snapshot=${literal(c.offer)} from membership_v2_contracts where id='${c.id}'`),'t');
 });
 test('v2 frozen attribution survives later reassignment; linked effective-date adjustments remain valid',options,()=>{
   const c=setup(),r=receipt(c);service(insert('sales_commission_receipts',r));
