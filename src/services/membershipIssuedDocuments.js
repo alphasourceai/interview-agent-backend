@@ -2,6 +2,7 @@
 // LOCAL/unmounted. No default legal publisher, renderer, storage, Auth, sender,
 // contract linkage or signing route. REVIEW bundles are never issued artifacts.
 const crypto=require('node:crypto');
+const {validIssuedMembershipVersion}=require('./membershipCapabilityPredicates');
 const UUID=/^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const HASH=/^[0-9a-f]{64}$/;
 const canonical=v=>v && typeof v==='object'?(Array.isArray(v)?`[${v.map(canonical).join(',')}]`:
@@ -23,8 +24,7 @@ function scope(v){check(plain(v,['scope_id','audience','issuer_user_id','origina
   && Object.keys(v).length===6 && UUID.test(v.scope_id) && UUID.test(v.issuer_user_id) && v.audience==='sales'
   && v.issuer_user_id===v.original_salesperson_user_id && v.client_id===null && v.billing_owner_user_id===null,'issued_scope_denied',403);return v;}
 function legal(v){check(plain(v,['version','template_sha256','refund_policy_version','refund_policy_reference','refund_policy_sha256','approval_reference','approved_at'])
-  && Object.keys(v).length===7 && /^retail-membership-issued-[A-Za-z0-9._-]{1,100}$/.test(v.version)
-  && !/draft|review/i.test(v.version)
+  && Object.keys(v).length===7 && validIssuedMembershipVersion(v.version)
   && HASH.test(v.template_sha256) && HASH.test(v.refund_policy_sha256)
   && typeof v.refund_policy_version==='string' && v.refund_policy_version.length>0 && v.refund_policy_version.length<=120
   && typeof v.refund_policy_reference==='string' && /^https:\/\/[^\s<>]+$/.test(v.refund_policy_reference) && v.refund_policy_reference.length<=500
@@ -34,7 +34,7 @@ function legal(v){check(plain(v,['version','template_sha256','refund_policy_vers
 
 function createMembershipIssuedDocumentService({db,authorizeScope,loadSource,loadQuote,legalVersion,loadPublishedLegal,renderIssuedDocument,artifacts}={}){
   check(typeof db?.from==='function' && typeof db.rpc==='function' && [authorizeScope,loadSource,loadQuote,loadPublishedLegal,renderIssuedDocument].every(f=>typeof f==='function')
-    && typeof legalVersion==='string' && /^retail-membership-issued-[A-Za-z0-9._-]{1,100}$/.test(legalVersion) && !/draft|review/i.test(legalVersion)
+    && validIssuedMembershipVersion(legalVersion)
     && typeof artifacts?.putIfAbsent==='function' && typeof artifacts.readPrivate==='function','issued_service_not_configured',503);
   async function auth(subject){try{return structuredClone(scope(await authorizeScope(subject)));}catch(_){fail('issued_scope_denied',403);}}
   async function read(ctx,id){let r;try{r=await db.from(DOCUMENTS).select(FIELDS).eq('id',id).eq('scope_id',ctx.scope_id).eq('issuer_user_id',ctx.issuer_user_id).maybeSingle();}

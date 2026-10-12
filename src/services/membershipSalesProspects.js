@@ -4,6 +4,7 @@
 // handoffVerification is a trusted SERVER callback, not a browser response. No
 // default mail client. Delivery ledger/rate limits remain required before mount.
 const crypto=require('node:crypto');
+const {validMembershipBuyerEmail}=require('./membershipCapabilityPredicates');
 const {createMembershipQuoteDraftService}=require('./membershipQuoteDrafts');
 const UUID=/^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SOURCES='membership_v2_sales_prospects';
@@ -30,8 +31,7 @@ function buyer(input){
       check(value.length>0 && [...value].length<=LIMITS[key] && !/[\p{Cc}\p{Cs}<>]/u.test(value),'invalid_sales_buyer',400);}
     result[key]=value;
   }
-  check(/^[a-z0-9][a-z0-9.!#$%&'*+/=?^_`{|}~-]*@[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(result.buyer_email)
-    && !/\.\.|\.@/.test(result.buyer_email)
+  check(validMembershipBuyerEmail(result.buyer_email)
     && (result.buyer_phone===null || /^\+[1-9][0-9]{7,14}$/.test(result.buyer_phone)),'invalid_sales_buyer',400);
   return frozen(result);
 }

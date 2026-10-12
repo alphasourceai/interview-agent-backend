@@ -9,6 +9,13 @@ constructor or __proto__), duplicate-byte rejection, exact nonzero-offset views.
 New seals only use active key. Old envelopes decrypt only while that key is
 explicitly configured. destroy zeroes owned buffers and permanently disables
 the instance; no claim that JavaScript strings or crypto internals are erased.
+Internal keyIdentity exposes SHA256 of the ACTUAL owned key plus environment/ID,
+never bytes; native delivery registry must match it. One enumerable data-
+descriptor snapshot is used for validation/AAD/results; accessors, nonenumerable
+fields and all Proxies rejected. Input inspection cannot call changing getters.
+The source/issuer use the same extracted email/version grammar. Pure errors have
+no HTTP status or automatic retry policy. Temporary AAD/hash/cipher/tag bytes
+are cleared along with plaintext, with no forensic-erasure guarantee.
 
 Two distinct closed server bindings:
 

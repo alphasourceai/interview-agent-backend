@@ -103,3 +103,18 @@ test('unexpected reflection/getter failures cannot disclose underlying input or 
   assert.throws(()=>create(bad),e=>e.code==='membership_capability_not_configured' && e.message===e.code && !e.cause);
   x.service.destroy();
 });
+test('nonenumerable inputs and proxies fail without invoking changing getters',()=>{
+  const x=fixture(),hidden={...x.binding};Object.defineProperty(hidden,'buyer_email',{value:x.binding.buyer_email,enumerable:false});
+  denied(()=>x.service.seal({binding:hidden,token:x.token}));
+  const proxy=new Proxy(x.binding,{get(){throw Error('changing getter must never be consulted');}});
+  denied(()=>x.service.seal({binding:proxy,token:x.token}));const e=x.service.seal({binding:x.binding,token:x.token});denied(()=>x.service.open({envelope:e,binding:proxy}));
+  const body=new Proxy({binding:x.binding,token:x.token},{get(){throw Error('must never call body getter');}});
+  denied(()=>x.service.seal(body));
+  const keyView=new Proxy({k1:x.key},{get(){throw Error('must never call key getter');}});
+  assert.throws(()=>create({environment:'dev',activeKeyId:'k1',keys:keyView}),e=>e.code==='membership_capability_not_configured');
+  const s=create({environment:'dev',activeKeyId:'k1',keys:{k1:x.key}});assert.equal(s.open({envelope:e,binding:x.binding}),x.token);
+  assert.deepEqual(s.keyIdentity('k1'),{environment:'dev',key_id:'k1',physical_key_fingerprint:sha(x.key)});
+  assert.ok(Object.isFrozen(s.keyIdentity('k1')));denied(()=>s.keyIdentity('missing'));
+  try{x.service.open({envelope:{...e,tag:'!'},binding:x.binding});assert.fail();}catch(err){assert.equal(err.status,undefined);}
+  x.service.destroy();s.destroy();denied(()=>s.keyIdentity('k1'));
+});
