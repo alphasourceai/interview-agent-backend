@@ -34,7 +34,6 @@ create table public.membership_v2_checkout_operations (
  purchase_id uuid not null unique references public.membership_v2_pending_purchases(id) on delete restrict on update restrict,
  context_id uuid not null references public.membership_v2_checkout_contexts(id) on delete restrict on update restrict,
  source_digest text not null,
- dispatch_hash text not null check(dispatch_hash ~ '^[0-9a-f]{64}$' and dispatch_hash<>repeat('0',64)),
  request_body jsonb not null check(jsonb_typeof(request_body)='object' and octet_length(request_body::text)<=32768),
  body_digest text not null check(body_digest=encode(sha256(convert_to(request_body::text,'UTF8')),'hex')),
  idempotency_key text not null unique,
@@ -44,7 +43,7 @@ create table public.membership_v2_checkout_operations (
 );
 create table public.membership_v2_checkout_dispatches (
  operation_id uuid primary key references public.membership_v2_checkout_operations(id) on delete restrict on update restrict,
- dispatch_hash text not null,
+ dispatch_hash text not null check(dispatch_hash ~ '^[0-9a-f]{64}$' and dispatch_hash<>repeat('0',64)),
  claim_nonce text check(claim_nonce is null),
  started_at timestamptz not null check(isfinite(started_at))
 );
@@ -175,7 +174,7 @@ end $$;
 create trigger membership_v2_guard_checkout_operation before insert on public.membership_v2_checkout_operations
  for each row execute function public.membership_v2_guard_checkout_operation();
 
-create function public.membership_v2_claim_checkout_operation(p_id uuid,p_purchase uuid,p_token_hash text,p_context uuid,p_dispatch_hash text)
+create function public.membership_v2_claim_checkout_operation(p_id uuid,p_purchase uuid,p_token_hash text,p_context uuid)
 returns jsonb language plpgsql security invoker set search_path=pg_catalog as $$
 declare ctx jsonb; op public.membership_v2_checkout_operations;
 begin
@@ -186,8 +185,8 @@ begin
    raise exception 'checkout_operation_conflict';end if;
   return jsonb_build_object('action','existing','operation_id',op.id);
  end if;
- insert into public.membership_v2_checkout_operations(id,purchase_id,context_id,dispatch_hash)
-  values(p_id,p_purchase,p_context,p_dispatch_hash) returning * into op;
+ insert into public.membership_v2_checkout_operations(id,purchase_id,context_id)
+  values(p_id,p_purchase,p_context) returning * into op;
  return jsonb_build_object('action','created','operation_id',op.id);
 end $$;
 
@@ -204,10 +203,9 @@ begin
  n:=(ctx->>'observed_at')::timestamptz;
  if new.claim_nonce is null or new.claim_nonce !~ '^[A-Za-z0-9_-]{43}$' or new.dispatch_hash is not null
   or new.started_at is not null
-  or n<op.created_at or n>=op.created_at+interval '30 seconds'
+  or n<op.created_at
   or op.expires_epoch<floor(extract(epoch from n))::bigint+1950 then raise exception 'checkout_dispatch_denied';end if;
  hashed:=encode(sha256(convert_to('membership-checkout-dispatch-v2'||chr(10)||op.id::text||chr(10)||op.source_digest||chr(10)||new.claim_nonce,'UTF8')),'hex');
- if hashed is distinct from op.dispatch_hash then raise exception 'checkout_dispatch_denied';end if;
  new.dispatch_hash:=hashed;new.claim_nonce:=null;
  new.started_at:=n;return new;
 end $$;
@@ -216,13 +214,15 @@ create trigger membership_v2_guard_checkout_dispatch before insert on public.mem
 
 create function public.membership_v2_claim_checkout_dispatch(p_operation uuid,p_token_hash text,p_nonce text)
 returns jsonb language plpgsql security invoker set search_path=pg_catalog as $$
-declare op public.membership_v2_checkout_operations; ctx jsonb; hashed text;
+declare op public.membership_v2_checkout_operations; ctx jsonb;
 begin
  select * into op from public.membership_v2_checkout_operations where id=p_operation;
  if not found or p_nonce is null or p_nonce !~ '^[A-Za-z0-9_-]{43}$' then raise exception 'checkout_dispatch_denied';end if;
  ctx:=public.membership_v2_checkout_context(op.purchase_id,p_token_hash,op.context_id,true);
- hashed:=encode(sha256(convert_to('membership-checkout-dispatch-v2'||chr(10)||op.id::text||chr(10)||op.source_digest||chr(10)||p_nonce,'UTF8')),'hex');
- if hashed is distinct from op.dispatch_hash then raise exception 'checkout_dispatch_denied';end if;
+ -- A fresh capability-authorized call can claim the SAME immutable operation
+ -- while no dispatch exists. The permanent PK admits ONE winner; its in-memory
+ -- nonce proves that winner on separate post-COMMIT readback. An existing
+ -- marker's hash is NEVER sufficient SDK authority after ambiguous ACK.
  insert into public.membership_v2_checkout_dispatches(operation_id,claim_nonce) values(op.id,p_nonce);
  return jsonb_build_object('action','dispatch_claimed','operation_id',op.id);
 end $$;
@@ -239,11 +239,11 @@ begin
  select * into ctx from public.membership_v2_checkout_contexts where id=op.context_id;
  select * into dispatch from public.membership_v2_checkout_dispatches where operation_id=op.id;
  if not found or jsonb_typeof(p_proof) is distinct from 'object' or octet_length(p_proof::text)>65536 then return false;end if;
- if (select count(*) from jsonb_object_keys(p_proof))<>24
+ if (select count(*) from jsonb_object_keys(p_proof))<>25
   or exists(select 1 from jsonb_object_keys(p_proof) key where key<>all(array[
    'session_id','provider_account_id','livemode','api_version','mode','currency','customer_creation','customer_email',
    'client_reference_id','metadata','success_url','cancel_url','expires_at','automatic_tax_enabled','amount_discount',
-   'amount_tax','amount_shipping','has_more','status','payment_status','created','items','amount_subtotal','amount_total']))
+   'amount_tax','amount_shipping','has_more','status','payment_status','created','items','amount_subtotal','amount_total','invoice_metadata']))
   or coalesce(p_proof->>'session_id','') !~ '^cs_[A-Za-z0-9_]+$'
   or p_proof->>'provider_account_id' is distinct from ctx.provider_account_id
   or p_proof->'livemode' is distinct from to_jsonb(ctx.livemode)
@@ -253,6 +253,7 @@ begin
   or p_proof->>'customer_email' is distinct from op.request_body->>'customer_email'
   or p_proof->>'client_reference_id' is distinct from op.purchase_id::text
   or p_proof->'metadata' is distinct from op.request_body->'metadata'
+  or p_proof->'invoice_metadata' is distinct from op.request_body->'invoice_creation'->'invoice_data'->'metadata'
   or p_proof->>'success_url' is distinct from op.request_body->>'success_url'
   or p_proof->>'cancel_url' is distinct from op.request_body->>'cancel_url'
   or p_proof->'expires_at' is distinct from to_jsonb(op.expires_epoch)
@@ -343,13 +344,13 @@ do $$declare t text;begin
 end $$;
 revoke all on function public.membership_v2_lock_checkout_context(uuid),public.membership_v2_guard_checkout_context_update(),public.membership_v2_checkout_context(uuid,text,uuid,boolean),
  public.membership_v2_checkout_body(uuid,uuid,jsonb,text,bigint),public.membership_v2_checkout_window(timestamptz,timestamptz),public.membership_v2_guard_checkout_operation(),
- public.membership_v2_claim_checkout_operation(uuid,uuid,text,uuid,text),public.membership_v2_guard_checkout_dispatch(),
+ public.membership_v2_claim_checkout_operation(uuid,uuid,text,uuid),public.membership_v2_guard_checkout_dispatch(),
  public.membership_v2_claim_checkout_dispatch(uuid,text,text),public.membership_v2_checkout_proof_matches(uuid,jsonb),
  public.membership_v2_guard_checkout_binding(),public.membership_v2_bind_checkout(uuid,text,jsonb)
  from public,anon,authenticated,service_role;
 grant execute on function public.membership_v2_lock_checkout_context(uuid),public.membership_v2_checkout_context(uuid,text,uuid,boolean),
  public.membership_v2_checkout_body(uuid,uuid,jsonb,text,bigint),public.membership_v2_checkout_window(timestamptz,timestamptz),public.membership_v2_guard_checkout_operation(),
- public.membership_v2_claim_checkout_operation(uuid,uuid,text,uuid,text),public.membership_v2_guard_checkout_dispatch(),
+ public.membership_v2_claim_checkout_operation(uuid,uuid,text,uuid),public.membership_v2_guard_checkout_dispatch(),
  public.membership_v2_claim_checkout_dispatch(uuid,text,text),public.membership_v2_checkout_proof_matches(uuid,jsonb),
  public.membership_v2_guard_checkout_binding(),public.membership_v2_bind_checkout(uuid,text,jsonb) to service_role;
 commit;

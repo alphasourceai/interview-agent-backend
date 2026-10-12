@@ -79,14 +79,46 @@ test('actual signer capability and PDF bytes are rechecked, never browser price 
   x.files.set(path, Buffer.from('%PDF-1.7\nALTERED SYNTHETIC\n%%EOF')); await assert.rejects(x.service.checkout(x.input));
   assert.equal(x.providerCalls.length, 0);
 });
-test('native guards reject forged derived columns and direct dispatch without its winning raw nonce', h.opts, async () => {
+test('native guards reject forged derived columns, missing nonce, wrong capability and duplicate dispatch', h.opts, async () => {
   const x = setup(); await x.sign(); await x.service.checkout(x.input); const op = x.op();
   h.denied(`set role service_role;${h.insert('membership_v2_checkout_operations', { id: crypto.randomUUID(), purchase_id: op.purchase_id,
-    context_id: x.contextId, dispatch_hash: 'a'.repeat(64), request_body: { amount: 1 } })}`, /derived_fields_denied/);
-  h.denied(`set role service_role;${h.insert('membership_v2_checkout_dispatches', { operation_id: op.id, dispatch_hash: op.dispatch_hash })}`, /dispatch_denied/);
-  h.denied(`set role service_role;select membership_v2_claim_checkout_dispatch('${op.id}','${x.f.p.signer_token_hash}','${'X'.repeat(43)}')`, /dispatch_denied/);
+    context_id: x.contextId, request_body: { amount: 1 } })}`, /derived_fields_denied/);
+  h.denied(`set role service_role;${h.insert('membership_v2_checkout_dispatches', { operation_id: op.id, dispatch_hash: 'a'.repeat(64) })}`, /dispatch_denied/);
+  h.denied(`set role service_role;select membership_v2_claim_checkout_dispatch('${op.id}','${'f'.repeat(64)}','${'X'.repeat(43)}')`, /pending_purchase_source_denied/);
+  h.denied(`set role service_role;select membership_v2_claim_checkout_dispatch('${op.id}','${x.f.p.signer_token_hash}','${'X'.repeat(43)}')`, /duplicate key/);
   assert.equal(h.sql(`select membership_v2_checkout_proof_matches('${op.id}','null'::jsonb)`), 'f');
   assert.equal(h.sql(`select membership_v2_checkout_proof_matches('${op.id}','[]'::jsonb)`), 'f');
+});
+
+test('zero-marker failure recovers the same immutable request on a fresh authorized call, even after 30 seconds', h.opts, async () => {
+  let failOnce = true;
+  const x = setup({}, { beforeRPC: name => {
+    if (name === 'membership_v2_claim_checkout_dispatch' && failOnce) { failOnce = false; throw Error('SYNTHETIC pre-dispatch outage'); }
+  } }); await x.sign(); await assert.rejects(x.service.checkout(x.input)); const initial = x.op();
+  assert.equal(h.sql(`select count(*) from membership_v2_checkout_dispatches where operation_id='${initial.id}'`), '0');
+  // Isolated privileged fixture: simulate an older operation, not a runtime
+  // clock input, legal deadline rewrite, lease renewal or provider supersession.
+  h.sql(`begin;alter table membership_v2_checkout_operations disable trigger membership_v2_checkout_operations_immutable;
+    update membership_v2_checkout_operations set created_at=created_at-interval '1 minute' where id='${initial.id}';
+    alter table membership_v2_checkout_operations enable trigger membership_v2_checkout_operations_immutable;commit;`);
+  const recovered = await x.service.checkout(x.input); const after = x.op();
+  assert.equal(after.id, initial.id); assert.deepEqual(after.request_body, initial.request_body); assert.equal(after.expires_epoch, initial.expires_epoch);
+  assert.equal(after.idempotency_key, initial.idempotency_key); assert.equal(recovered.activation_enabled, false);
+  assert.equal(x.providerCalls.filter(n => n === 'create').length, 1);
+});
+test('retrieved invoice metadata must echo native request, and created PaymentIntent settings are actually read', h.opts, async () => {
+  // Before completion the provider's PI/Checkout customer may both be null.
+  const y = setup({}, { session: r => { r.payment_intent = 'pi_SYNTHETIC'; } }); await y.sign();
+  await y.service.checkout(y.input); assert.equal(y.providerCalls.filter(n => n === 'intent').length, 1);
+  for (const hook of [{ session: r => { r.invoice_creation.invoice_data.metadata = {}; } },
+    { session: r => { r.payment_intent = 'pi_SYNTHETIC'; }, intent: r => { r.setup_future_usage = null; } },
+    { session: r => { r.payment_intent = 'pi_SYNTHETIC'; }, intent: r => { r.capture_method = 'manual'; } },
+    { session: r => { r.payment_intent = 'pi_SYNTHETIC'; }, intent: r => { r.metadata = {}; } },
+    { session: r => { r.payment_intent = 'pi_SYNTHETIC'; }, intent: r => { r.livemode = true; } },
+    { session: r => { r.payment_intent = undefined; } }]) {
+    const z = setup({}, hook); await z.sign(); await assert.rejects(z.service.checkout(z.input));
+    assert.equal(h.sql(`select count(*) from membership_v2_checkout_bindings where operation_id='${z.op().id}'`), '0');
+  }
 });
 test('RLS and ACL deny browser read/write/RPC, service mutations and context updates; triggers deny owner truncate', h.opts, async () => {
   const x = setup(); await x.sign(); await x.service.checkout(x.input);
@@ -108,7 +140,9 @@ test('RLS and ACL deny browser read/write/RPC, service mutations and context upd
 test('same signed sale racing native claims creates exactly one operation, dispatch and provider session', h.opts, async () => {
   const x = setup({}, { concurrent: true }); await x.sign();
   const results = await Promise.allSettled([x.service.checkout(x.input), x.service.checkout(x.input)]);
-  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+  assert.ok(results.some(r => r.status === 'fulfilled'));
+  const delivered = results.filter(r => r.status === 'fulfilled').map(r => r.value.checkout_url);
+  assert.equal(new Set(delivered).size, 1);
   assert.equal(x.providerCalls.filter(n => n === 'create').length, 1);
   assert.equal(h.sql(`select count(*) from membership_v2_checkout_operations where purchase_id='${x.op().purchase_id}'`), '1');
 });
@@ -139,8 +173,9 @@ async function sdkTransport(x, failCreate, run) {
     try {
       assert.equal(req.headers['stripe-version'], '2023-10-16'); assert.equal(req.headers['stripe-account'], undefined);
       const options = { maxNetworkRetries: 0, timeout: 10000 };
-      if (u.pathname === '/v1/account') reply = await x.stripe.accounts.retrieve(options);
-      else if (u.pathname === '/v1/balance') reply = await x.stripe.balance.retrieve(options);
+      if (req.method === 'GET' && !u.pathname.endsWith('/line_items')) { assert.equal(u.search, ''); assert.equal(body, ''); }
+      if (u.pathname === '/v1/account') reply = await x.stripe.accounts.retrieve({}, options);
+      else if (u.pathname === '/v1/balance') reply = await x.stripe.balance.retrieve({}, options);
       else if (req.method === 'POST' && u.pathname === '/v1/checkout/sessions') {
         const op = x.op(); assert.equal(req.headers['idempotency-key'], op.idempotency_key);
         assert.deepEqual(Object.fromEntries(new URLSearchParams(body)), flatten(op.request_body));
@@ -150,7 +185,8 @@ async function sdkTransport(x, failCreate, run) {
       } else if (u.pathname.endsWith('/line_items')) {
         assert.equal(u.searchParams.get('limit'), '100'); assert.equal(u.searchParams.get('expand[0]'), 'data.price.product');
         reply = await x.stripe.checkout.sessions.listLineItems(u.pathname.split('/').at(-2), { limit: 100, expand: ['data.price.product'] }, options);
-      } else reply = await x.stripe.checkout.sessions.retrieve(u.pathname.split('/').at(-1), options);
+      } else if (u.pathname.startsWith('/v1/payment_intents/')) reply = await x.stripe.paymentIntents.retrieve(u.pathname.split('/').at(-1), {}, options);
+      else reply = await x.stripe.checkout.sessions.retrieve(u.pathname.split('/').at(-1), {}, options);
       delete reply.lastResponse;
       res.writeHead(200, { 'Content-Type': 'application/json', 'Stripe-Version': '2023-10-16' }); res.end(JSON.stringify(reply));
     } catch (error) {
@@ -160,10 +196,13 @@ async function sdkTransport(x, failCreate, run) {
   });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   try {
+    const client = Stripe.createNodeHttpClient(), send = client.makeRequest.bind(client), transportCalls = [];
+    client.makeRequest = (...args) => { transportCalls.push({ path: args[2], timeout: args[7] }); return send(...args); };
     const stripe = new Stripe('sk_test_SYNTHETIC_ONLY_NOT_A_SECRET', { apiVersion: '2023-10-16', maxNetworkRetries: 0,
-      timeout: 10000, protocol: 'http', host: '127.0.0.1', port: server.address().port });
+      timeout: 60000, httpClient: client, protocol: 'http', host: '127.0.0.1', port: server.address().port });
     const service = createMembershipCheckoutExecutor({ db: x.db, signing: x.signing, stripe, environment: 'dev', contextId: x.contextId });
     await run(service, requests); assert.deepEqual(requests.filter(r => r.failure), []);
+    assert.ok(transportCalls.length > 0); assert.ok(transportCalls.every(c => c.timeout === 10000));
   } finally { await new Promise(resolve => server.close(resolve)); }
 }
 test('installed Stripe SDK sends the exact 2023 body/expiry/idempotency header and reads bound session without recreating', h.opts, async () => {
@@ -179,6 +218,13 @@ test('installed Stripe SDK does not retry a 500; subsequent request cannot repla
     await assert.rejects(service.checkout(x.input)); await assert.rejects(service.checkout(x.input));
     assert.equal(requests.filter(r => r.method === 'POST').length, 1);
     assert.equal(h.sql(`select count(*) from membership_v2_checkout_bindings where operation_id='${x.op().id}'`), '0');
+  });
+});
+test('installed SDK actually retrieves an existing PaymentIntent with empty params and pinned request options', h.opts, async () => {
+  const x = setup({}, { session: r => { r.payment_intent = 'pi_SYNTHETIC'; } }); await x.sign();
+  await sdkTransport(x, false, async (service, requests) => {
+    await service.checkout(x.input); assert.equal(requests.filter(r => r.path === '/v1/payment_intents/pi_SYNTHETIC').length, 1);
+    assert.equal(requests.filter(r => r.method === 'POST').length, 1);
   });
 });
 

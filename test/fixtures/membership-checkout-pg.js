@@ -19,7 +19,7 @@ const rpcKeys = {
   membership_v2_reserve_pending_purchase: ['p_id', 'p_document', 'p_token_hash', 'p_environment'],
   membership_v2_read_pending_purchase: ['p_document', 'p_token_hash', 'p_environment'],
   membership_v2_checkout_context: ['p_purchase', 'p_token_hash', 'p_context', 'p_current'],
-  membership_v2_claim_checkout_operation: ['p_id', 'p_purchase', 'p_token_hash', 'p_context', 'p_dispatch_hash'],
+  membership_v2_claim_checkout_operation: ['p_id', 'p_purchase', 'p_token_hash', 'p_context'],
   membership_v2_claim_checkout_dispatch: ['p_operation', 'p_token_hash', 'p_nonce'],
   membership_v2_checkout_proof_matches: ['p_operation', 'p_proof'],
   membership_v2_bind_checkout: ['p_operation', 'p_token_hash', 'p_proof']
@@ -58,15 +58,22 @@ function setup(selection = {}, hooks = {}) {
   const opts = o => assert.deepEqual(o, { maxNetworkRetries: 0, timeout: 10000 });
   const stripe = {
     getApiField(k) { return k === 'version' ? (hooks.version || '2023-10-16') : undefined; }, getMaxNetworkRetries() { return 0; },
-    accounts: { async retrieve(o) { opts(o); providerCalls.push('account'); return response({ object: 'account', id: hooks.account || 'acct_SYNTHETIC' }); } },
-    balance: { async retrieve(o) { opts(o); providerCalls.push('balance'); return response({ object: 'balance', livemode: hooks.live || false }); } },
+    accounts: { async retrieve(p, o) { assert.deepEqual(p, {}); opts(o); providerCalls.push('account'); return response({ object: 'account', id: hooks.account || 'acct_SYNTHETIC' }); } },
+    balance: { async retrieve(p, o) { assert.deepEqual(p, {}); opts(o); providerCalls.push('balance'); return response({ object: 'balance', livemode: hooks.live || false }); } },
+    paymentIntents: { async retrieve(id, p, o) {
+      assert.deepEqual(p, {}); opts(o); providerCalls.push('intent');
+      const value = { object: 'payment_intent', id, livemode: false, currency: 'usd', capture_method: 'automatic',
+        setup_future_usage: 'off_session', metadata: body.payment_intent_data.metadata, amount: session.amount_total,
+        customer: session.customer, status: 'requires_action' };
+      if (hooks.intent) hooks.intent(value); return response(value);
+    } },
     checkout: { sessions: {
       async create(b, o) {
         providerCalls.push('create'); body = structuredClone(b);
         assert.equal(o.timeout, 10000); assert.equal(o.maxNetworkRetries, 0); assert.match(o.idempotencyKey, /^membership-checkout-v2:/);
         if (hooks.onCreate) await hooks.onCreate(b);
         const sessionId = `cs_test_SYNTHETIC_${b.metadata.operation_id.replaceAll('-', '')}`;
-        session = { object: 'checkout.session', id: sessionId, livemode: false, currency: 'usd', ...b,
+        session = { object: 'checkout.session', id: sessionId, livemode: false, currency: 'usd', payment_intent: null, customer: null, ...b,
           automatic_tax: b.automatic_tax, total_details: { amount_tax: 0, amount_discount: 0, amount_shipping: 0 },
           amount_subtotal: b.line_items.reduce((n, l) => n + l.price_data.unit_amount, 0), status: 'open', payment_status: 'unpaid',
           created: Math.floor(Date.now() / 1000), url: `https://checkout.stripe.com/c/pay/${sessionId}#provider-fragment` };
@@ -78,7 +85,7 @@ function setup(selection = {}, hooks = {}) {
             product: { object: 'product', id: `prod_SYNTHETIC${i}`, livemode: false, ...l.price_data.product_data } } })) };
         return response({ id: session.id });
       },
-      async retrieve(id, o) { opts(o); providerCalls.push('retrieve'); assert.equal(id, session.id);
+      async retrieve(id, p, o) { assert.deepEqual(p, {}); opts(o); providerCalls.push('retrieve'); assert.equal(id, session.id);
         const r = structuredClone(session); if (hooks.session) hooks.session(r); return response(r); },
       async listLineItems(id, p, o) { opts(o); providerCalls.push('lines'); assert.equal(id, session.id);
         assert.deepEqual(p, { limit: 100, expand: ['data.price.product'] }); const r = structuredClone(lineList);

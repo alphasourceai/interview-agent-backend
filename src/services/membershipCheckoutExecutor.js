@@ -29,6 +29,7 @@ function createMembershipCheckoutExecutor({ db, signing, stripe, environment, co
   check(['dev', 'qa', 'production'].includes(environment) && UUID.test(contextId || '')
     && typeof stripe?.getApiField === 'function' && typeof stripe.getMaxNetworkRetries === 'function'
     && typeof stripe.accounts?.retrieve === 'function' && typeof stripe.balance?.retrieve === 'function'
+    && typeof stripe.paymentIntents?.retrieve === 'function'
     && ['create', 'retrieve', 'listLineItems'].every(k => typeof stripe.checkout?.sessions?.[k] === 'function'),
   'membership_checkout_not_configured');
   const pending = createMembershipPendingPurchase({ db, signing, environment });
@@ -78,8 +79,8 @@ function createMembershipCheckoutExecutor({ db, signing, stripe, environment, co
     check(same(expected, offer), 'membership_checkout_offer_unverified'); return c;
   }
   async function account(c) {
-    const a = await provider(() => stripe.accounts.retrieve(OPTIONS));
-    const b = await provider(() => stripe.balance.retrieve(OPTIONS));
+    const a = await provider(() => stripe.accounts.retrieve({}, OPTIONS));
+    const b = await provider(() => stripe.balance.retrieve({}, OPTIONS));
     check(a?.object === 'account' && a.id === c.context.provider_account_id && b?.object === 'balance'
       && b.livemode === c.context.livemode, 'membership_checkout_provider_mismatch');
   }
@@ -99,7 +100,7 @@ function createMembershipCheckoutExecutor({ db, signing, stripe, environment, co
       success_url: `${c.context.frontend_origin}/membership/checkout-return?purchase_id=${p.id}&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${c.context.frontend_origin}/membership/checkout-return?purchase_id=${p.id}&checkout=canceled`, expires_at: op?.expires_epoch };
     check(UUID.test(op?.id || '') && op.purchase_id === p.id && op.context_id === contextId && op.source_digest === p.source_digest
-      && HASH.test(op.dispatch_hash || '') && HASH.test(op.body_digest || '') && Number.isFinite(Date.parse(op.created_at))
+      && HASH.test(op.body_digest || '') && Number.isFinite(Date.parse(op.created_at))
       && Number.isSafeInteger(op.expires_epoch) && op.expires_epoch <= Math.floor(Date.parse(p.expires_at) / 1000)
       && op.expires_epoch <= Math.floor(Date.parse(op.created_at) / 1000) + 86280 && same(body, expected)
       && op.idempotency_key === `membership-checkout-v2:${op.id}`, 'membership_checkout_operation_unverified');
@@ -107,11 +108,25 @@ function createMembershipCheckoutExecutor({ db, signing, stripe, environment, co
   }
   async function retrieve(op, c, id) {
     check(typeof id === 'string' && /^cs_(test|live)_[A-Za-z0-9_]+$/.test(id));
-    const session = await provider(() => stripe.checkout.sessions.retrieve(id, OPTIONS));
+    const session = await provider(() => stripe.checkout.sessions.retrieve(id, {}, OPTIONS));
     const lines = await provider(() => stripe.checkout.sessions.listLineItems(id, { limit: 100, expand: ['data.price.product'] }, OPTIONS));
     check(session?.object === 'checkout.session' && session.id === id && Array.isArray(lines?.data)
       && session.invoice_creation?.enabled === true && session.allow_promotion_codes === false
+      && same(session.invoice_creation.invoice_data?.metadata, op.request_body.invoice_creation.invoice_data.metadata)
       && lines.object === 'list' && lines.has_more === false && lines.data.length <= 2);
+    // API2023 defers PI creation until Checkout confirmation. Null is not an
+    // observed echo of PI settings. Once present, verify the actual object.
+    if (session.payment_intent !== null) {
+      const piId = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id;
+      check(typeof piId === 'string' && /^pi_[A-Za-z0-9_]+$/.test(piId));
+      const pi = await provider(() => stripe.paymentIntents.retrieve(piId, {}, OPTIONS));
+      const customerId = v => typeof v === 'string' ? v : v?.id ?? null;
+      check(pi?.object === 'payment_intent' && pi.id === piId && pi.livemode === c.context.livemode
+        && pi.currency === 'usd' && pi.capture_method === 'automatic' && pi.setup_future_usage === 'off_session'
+        && same(pi.metadata, op.request_body.payment_intent_data.metadata) && pi.amount === session.amount_total
+        && customerId(pi.customer) === customerId(session.customer)
+        && ['requires_payment_method', 'requires_confirmation', 'requires_action', 'processing'].includes(pi.status));
+    }
     const items = lines.data.map(l => {
       const p = l.price, product = p?.product;
       check(l.object === 'item' && p?.object === 'price' && p.currency === 'usd' && p.livemode === c.context.livemode
@@ -124,6 +139,7 @@ function createMembershipCheckoutExecutor({ db, signing, stripe, environment, co
     const attestation = { session_id: session.id, provider_account_id: c.context.provider_account_id, livemode: session.livemode,
       api_version: API_VERSION, mode: session.mode, currency: session.currency, customer_creation: session.customer_creation,
       customer_email: session.customer_email, client_reference_id: session.client_reference_id, metadata: session.metadata,
+      invoice_metadata: session.invoice_creation.invoice_data.metadata,
       success_url: session.success_url, cancel_url: session.cancel_url, expires_at: session.expires_at,
       automatic_tax_enabled: session.automatic_tax?.enabled, amount_discount: session.total_details?.amount_discount,
       amount_tax: session.total_details?.amount_tax, amount_shipping: session.total_details?.amount_shipping,
@@ -147,14 +163,14 @@ function createMembershipCheckoutExecutor({ db, signing, stripe, environment, co
     check(tokenHash === d.signer_token_hash, 'membership_checkout_capability_denied', 403);
     let c = await context(linked.purchase_id, tokenHash, original);
     let op = await row('membership_v2_checkout_operations', 'purchase_id', linked.purchase_id);
+    // Read-only provider failures precede allocating a new operation.
+    await account(c);
     const proposal = crypto.randomUUID(), nonce = crypto.randomBytes(32).toString('base64url');
-    let owns = false;
     if (!op) {
-      const hash = dispatchHash(proposal, c.purchase.source_digest, nonce); let ack;
+      let ack;
       try { ack = await db.rpc('membership_v2_claim_checkout_operation', { p_id: proposal, p_purchase: linked.purchase_id,
-        p_token_hash: tokenHash, p_context: contextId, p_dispatch_hash: hash }); } catch (_) { /* Exact readback only. */ }
+        p_token_hash: tokenHash, p_context: contextId }); } catch (_) { /* Exact readback only. */ }
       op = await row('membership_v2_checkout_operations', 'purchase_id', linked.purchase_id);
-      owns = op?.id === proposal && op?.dispatch_hash === hash;
       if (ack && !ack.error) check(exact(ack.data, ['action', 'operation_id'])
         && ['created', 'existing'].includes(ack.data.action) && ack.data.operation_id === op?.id);
     }
@@ -165,18 +181,18 @@ function createMembershipCheckoutExecutor({ db, signing, stripe, environment, co
       await account(c); verified = await retrieve(op, c, binding.session_id);
       check(same(binding.proof, verified.attestation), 'membership_checkout_binding_unverified');
     } else {
-      check(owns && !await row('membership_v2_checkout_dispatches', 'operation_id', op.id), 'membership_checkout_uncertain', 409);
+      check(!await row('membership_v2_checkout_dispatches', 'operation_id', op.id), 'membership_checkout_uncertain', 409);
       await account(c); check(same(await signed(input), original), 'membership_checkout_source_changed', 409);
       c = await context(linked.purchase_id, tokenHash, original); operation(op, c);
       // This RPC must COMMIT before returning. The read is a separate transaction.
       const ack = await rpc('membership_v2_claim_checkout_dispatch', { p_operation: op.id, p_token_hash: tokenHash, p_nonce: nonce });
       check(exact(ack, ['action', 'operation_id']) && ack.action === 'dispatch_claimed' && ack.operation_id === op.id);
       const dispatch = await row('membership_v2_checkout_dispatches', 'operation_id', op.id);
-      check(dispatch?.operation_id === op.id && dispatch.dispatch_hash === op.dispatch_hash && dispatch.claim_nonce === null
-        && Number.isFinite(Date.parse(dispatch.started_at)) && Date.parse(dispatch.started_at) >= Date.parse(op.created_at)
-        && Date.parse(dispatch.started_at) < Date.parse(op.created_at) + 30000);
+      check(dispatch?.operation_id === op.id && dispatch.dispatch_hash === dispatchHash(op.id, op.source_digest, nonce) && dispatch.claim_nonce === null
+        && Number.isFinite(Date.parse(dispatch.started_at)) && Date.parse(dispatch.started_at) >= Date.parse(op.created_at));
       c = await context(linked.purchase_id, tokenHash, original);
-      check(op.expires_epoch >= Math.floor(Date.parse(c.observed_at) / 1000) + 1930);
+      check(op.expires_epoch >= Math.floor(Date.parse(c.observed_at) / 1000) + 1930
+        && Date.parse(c.observed_at) >= Date.parse(dispatch.started_at) && Date.parse(c.observed_at) < Date.parse(dispatch.started_at) + 30000);
       const created = await provider(() => stripe.checkout.sessions.create(structuredClone(op.request_body),
         { ...OPTIONS, idempotencyKey: op.idempotency_key }));
       verified = await retrieve(op, c, created?.id); let bindAck;
