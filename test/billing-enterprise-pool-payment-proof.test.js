@@ -86,8 +86,8 @@ for (const field of ['poolId', 'clientId', 'providerAccountId', 'customerId', 'c
   held(`missing binding ${field}`, p => { delete p.binding[field]; });
 }
 held('unvalidated snapshot digest', p => { p.binding.digest = '0'.repeat(64); });
-held('fractional nominal platform', p => { p.binding.platformMonthlyCents = 10000.5; });
-held('zero nominal platform requires separate reviewed policy', p => { p.binding.platformMonthlyCents = 0; });
+held('fractional nominal platform', p => { p.binding.platformCents = 10000.5; });
+held('zero nominal platform requires separate reviewed policy', p => { p.binding.platformCents = 0; });
 held('unknown price aliases', p => { p.binding.poolPriceId = p.binding.platformPriceId; });
 held('foreign authenticated account', p => { p.account.id = 'acct_other'; });
 for (const kind of ['checkout', 'subscription', 'invoice', 'paymentIntent', 'charge']) {

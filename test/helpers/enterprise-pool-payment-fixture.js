@@ -3,7 +3,7 @@
 // Entirely synthetic pinned-API shape, NOT Stripe Sandbox acceptance.
 const { prepareEnterprisePoolTerms } = require('../../src/services/enterprisePoolSnapshot');
 module.exports = function fixture({ platformAmount = 7000, tax = 0, poolTax = 0,
-  quantity = 30, unit = 2500, proration = true } = {}) {
+  quantity = 30, unit = 2500, proration = true, platformCents = 10000, platformInterval = 'month' } = {}) {
   const terms = prepareEnterprisePoolTerms({ membership_tier: 'enterprise', billing_model: 'usage',
     pool_quantity: quantity, usage_interview_fee_cents: unit });
   const net = terms.pool_offer_snapshot.net_cents;
@@ -13,8 +13,8 @@ module.exports = function fixture({ platformAmount = 7000, tax = 0, poolTax = 0,
     livemode: false, currency: 'usd', billing_scheme: 'per_unit',
     unit_amount: amount, unit_amount_decimal: String(amount), custom_unit_amount: null,
     transform_quantity: null, tiers_mode: null, type: recurring ? 'recurring' : 'one_time',
-    recurring: recurring ? { interval: 'month', interval_count: 1, usage_type: 'licensed' } : null });
-  const platformPrice = nativePrice('price_platform', 10000, true);
+    recurring: recurring ? { interval: platformInterval, interval_count: 1, usage_type: 'licensed' } : null });
+  const platformPrice = nativePrice('price_platform', platformCents, true);
   const poolPrice = nativePrice('price_pool', net, false);
   const taxes = amount => amount ? [{ amount, inclusive: false, tax_rate: 'txr_synthetic' }] : [];
   const invoiceLines = [
@@ -39,7 +39,7 @@ module.exports = function fixture({ platformAmount = 7000, tax = 0, poolTax = 0,
       providerAccountId: 'acct_synthetic', livemode: false, customerId: 'cus_synthetic',
       checkoutSessionId: 'cs_synthetic', subscriptionId: 'sub_synthetic',
       platformPriceId: 'price_platform', platformItemId: 'si_platform',
-      platformMonthlyCents: 10000, poolPriceId: 'price_pool' },
+      platformCents, platformInterval, poolPriceId: 'price_pool' },
     account: { object: 'account', id: 'acct_synthetic' },
     checkout: { ...common, object: 'checkout.session', id: 'cs_synthetic', mode: 'subscription',
       subscription: 'sub_synthetic', invoice: 'in_initial', payment_intent: null, currency: 'usd',

@@ -55,15 +55,15 @@ function list(value, prefix, length) {
   return value.data;
 }
 
-function price(p, expectedId, amount, recurring, mode, paidAt) {
+function price(p, expectedId, amount, interval, mode, paidAt) {
   check(p?.object === 'price' && p.id === expectedId && p.livemode === mode
     && p.currency === 'usd' && p.unit_amount === amount
     && (p.unit_amount_decimal == null || p.unit_amount_decimal === String(amount))
     && p.billing_scheme === 'per_unit' && p.custom_unit_amount === null
     && p.transform_quantity === null && p.tiers_mode === null
-    && p.type === (recurring ? 'recurring' : 'one_time')
+    && p.type === (interval ? 'recurring' : 'one_time')
     && epoch(p.created) && p.created <= paidAt, 'pool_proof_price_mismatch');
-  if (recurring) check(p.recurring?.interval === 'month' && p.recurring.interval_count === 1
+  if (interval) check(p.recurring?.interval === interval && p.recurring.interval_count === 1
     && p.recurring.usage_type === 'licensed', 'pool_proof_price_mismatch');
   else check(p.recurring === null, 'pool_proof_price_mismatch');
 }
@@ -90,8 +90,9 @@ function proveEnterprisePoolPayment(raw = {}) {
     && nativeId(b.customerId, 'cus') && nativeId(b.checkoutSessionId, 'cs')
     && nativeId(b.subscriptionId, 'sub') && nativeId(b.platformItemId, 'si')
     && nativeId(b.platformPriceId, 'price') && nativeId(b.poolPriceId, 'price')
-    && b.platformPriceId !== b.poolPriceId && cents(b.platformMonthlyCents)
-    && b.platformMonthlyCents > 0, 'pool_proof_invalid_binding');
+    && b.platformPriceId !== b.poolPriceId && cents(b.platformCents)
+    && b.platformCents > 0 && ['month','year'].includes(b.platformInterval)
+    && !Object.hasOwn(b,'platformMonthlyCents'), 'pool_proof_invalid_binding');
   const offer = validateEnterprisePoolSnapshot(b.snapshot, b.digest);
   check(offer.net_cents > 0, 'pool_proof_free_pool_requires_policy');
   check(account?.object === 'account' && account.id === b.providerAccountId, 'pool_proof_account_mismatch');
@@ -137,7 +138,9 @@ function proveEnterprisePoolPayment(raw = {}) {
   check(item.id === b.platformItemId && item.quantity === 1 && id(item.subscription) === b.subscriptionId,
     'pool_proof_subscription_item_mismatch');
   check(empty(item.discounts), 'pool_proof_provider_discount');
-  price(item.price, b.platformPriceId, b.platformMonthlyCents, true, b.livemode, paidAt);
+  // The trusted adapter must supply the frozen native nominal/cadence. Never
+  // infer annual as monthly, multiply by12, or reuse present-day client pricing.
+  price(item.price, b.platformPriceId, b.platformCents, b.platformInterval, b.livemode, paidAt);
   const nativeLines = list(invoice.lines, 'il', 2);
   const poolLines = nativeLines.filter(v => id(v.price) === b.poolPriceId);
   const platformLines = nativeLines.filter(v => id(v.price) === b.platformPriceId);
@@ -153,10 +156,10 @@ function proveEnterprisePoolPayment(raw = {}) {
     && pool.amount === offer.net_cents, 'pool_proof_pool_line_mismatch');
   check(platform.type === 'subscription' && id(platform.subscription) === b.subscriptionId
     && id(platform.subscription_item) === b.platformItemId && typeof platform.proration === 'boolean'
-    && platform.amount <= b.platformMonthlyCents
-    && (platform.proration || platform.amount === b.platformMonthlyCents), 'pool_proof_platform_line_mismatch');
-  price(pool.price, b.poolPriceId, offer.net_cents, false, b.livemode, paidAt);
-  price(platform.price, b.platformPriceId, b.platformMonthlyCents, true, b.livemode, paidAt);
+    && platform.amount <= b.platformCents
+    && (platform.proration || platform.amount === b.platformCents), 'pool_proof_platform_line_mismatch');
+  price(pool.price, b.poolPriceId, offer.net_cents, null, b.livemode, paidAt);
+  price(platform.price, b.platformPriceId, b.platformCents, b.platformInterval, b.livemode, paidAt);
   const poolTax = taxes(pool.tax_amounts), platformTax = taxes(platform.tax_amounts);
   const totalTax = taxes(invoice.total_tax_amounts), subtotal = pool.amount + platform.amount;
   check(cents(subtotal) && totalTax === poolTax + platformTax
@@ -177,7 +180,7 @@ function proveEnterprisePoolPayment(raw = {}) {
       && line.amount_subtotal === amount && line.amount_tax === tax
       && line.amount_total === amount + tax, 'pool_proof_checkout_line_mismatch');
     price(line.price, isPool ? b.poolPriceId : b.platformPriceId,
-      isPool ? offer.net_cents : b.platformMonthlyCents, !isPool, b.livemode, paidAt);
+      isPool ? offer.net_cents : b.platformCents, isPool ? null : b.platformInterval, b.livemode, paidAt);
   }
   check(checkout.amount_subtotal === subtotal && checkout.amount_total === invoice.total
     && checkout.total_details?.amount_tax === totalTax && checkout.total_details.amount_discount === 0
@@ -190,6 +193,7 @@ function proveEnterprisePoolPayment(raw = {}) {
     customer_id: b.customerId, checkout_session_id: checkout.id, subscription_id: subscription.id,
     invoice_id: invoice.id, pool_line_id: pool.id, payment_intent_id: pi.id, charge_id: charge.id,
     platform_item_id: item.id, platform_price_id: b.platformPriceId, pool_price_id: b.poolPriceId,
+    platform_interval: b.platformInterval, platform_nominal_cents: b.platformCents,
     payment_success_at: new Date(paidAt * 1000).toISOString(), quantity: offer.quantity,
     pool_paid_cents: pool.amount, pool_tax_cents: poolTax, platform_line_cents: platform.amount,
     tax_cents: totalTax, collected_cents: invoice.total, credits_spendable: false,
