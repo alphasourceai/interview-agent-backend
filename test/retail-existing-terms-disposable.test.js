@@ -21,8 +21,9 @@ if (enabled) {
   assert.equal(process.env.PGUSER, 'postgres');
   assert.equal(process.env.PGPASSWORD, undefined);
 }
-function sql(text) {
-  return execFileSync(psql, ['-X', '-A', '-t', '-v', 'ON_ERROR_STOP=1'], { input: text, encoding: 'utf8' }).trim();
+function sql(text, database = 'postgres') {
+  assert.ok(['postgres', 'retail_pricing_drift_test'].includes(database));
+  return execFileSync(psql, ['-X', '-A', '-t', '-d', database, '-v', 'ON_ERROR_STOP=1'], { input: text, encoding: 'utf8' }).trim();
 }
 const quote = value => value == null ? 'null' : `'${String(value).replaceAll("'", "''")}'`;
 const json = value => `${quote(JSON.stringify(value))}::jsonb`;
@@ -79,8 +80,8 @@ function billing(r) {
     ${quote(i.first_role_prepay_discount_percent)},${i.first_role_prepay_selected ? 'true,false' : 'null,null'})`;
 }
 
-test('setup actual activation fences and pricing compatibility in disposable PG only', options, () => {
-  sql(fs.readFileSync(path.join(__dirname, 'fixtures/qa-activation-fence-disposable-bootstrap.sql'), 'utf8'));
+function prepareDatabase(database = 'postgres') {
+  sql(fs.readFileSync(path.join(__dirname, 'fixtures/qa-activation-fence-disposable-bootstrap.sql'), 'utf8'), database);
   sql(`create schema private_auth;
     alter table public.membership_agreements add column membership_tier text, add column billing_option text,
       add column auto_renew boolean, add column signer_accepted boolean, add column template_version text,
@@ -89,8 +90,11 @@ test('setup actual activation fences and pricing compatibility in disposable PG 
     alter table public.client_plan_settings add constraint client_plan_settings_billing_interval_check check(billing_interval in ('monthly','annual'));
     alter table public.membership_agreements add constraint membership_agreements_billing_option_check check(billing_option in ('monthly','annual'));
     create table public.retail_signup_email_verifications (billing_cadence text constraint retail_signup_email_verifications_billing_cadence_check check(billing_cadence in ('monthly','annual')));
-    create table private_auth.retail_signup_sms_verifications (billing_cadence text constraint retail_signup_sms_verifications_billing_cadence_check check(billing_cadence in ('monthly','annual')));`);
-  sql(fs.readFileSync(path.join(root, 'supabase/migrations/20261001131612_qa_public_purchase_activation_fences.sql'), 'utf8'));
+    create table private_auth.retail_signup_sms_verifications (billing_cadence text constraint retail_signup_sms_verifications_billing_cadence_check check(billing_cadence in ('monthly','annual')));`, database);
+  sql(fs.readFileSync(path.join(root, 'supabase/migrations/20261001131612_qa_public_purchase_activation_fences.sql'), 'utf8'), database);
+}
+test('setup actual activation fences and pricing compatibility in disposable PG only', options, () => {
+  prepareDatabase();
   sql(fs.readFileSync(migration, 'utf8'));
 });
 test('original native legacy completion/billing/member/welcome assertions remain unchanged', options, () => {
@@ -126,6 +130,16 @@ for (const plan of ['basic', 'pro']) for (const months of [3, 6, 12])
       assert.equal(JSON.parse(sql(`select ${billing(r)};`)).status, 'already_applied');
     });
   }
+// Staff may sell BOTH prepaid and monthly installments. Public checkout is
+// prepaid-only. This is the approved sales catalog, not an exclusive split.
+for (const plan of ['basic', 'pro']) for (const months of [3, 6, 12]) for (const role of [false, true]) {
+  test(`native staff prepaid is allowed ${plan}/${months}/role:${role}`, options, () => {
+    const r = rows(plan, months, 'prepaid', role);
+    r.a.template_snapshot.source = 'sales_assisted'; setup(r);
+    assert.equal(JSON.parse(sql(`select ${complete(r)};`)).status, 'completed');
+    assert.equal(JSON.parse(sql(`select ${billing(r)};`)).status, 'applied');
+  });
+}
 test('native anchors derive from original UTC day/time, including leap/nonleap January31', options, () => {
   for (const year of [2024, 2026]) for (const months of [1, 2, 3, 6, 12]) {
     const start = `${year}-01-31T15:45:00.000Z`;
@@ -203,4 +217,18 @@ test('browser roles have no native pricing helper or activation writer execute p
     assert.equal(sql(`select has_function_privilege(${quote(role)},'public.complete_public_purchase_activation(uuid,text,timestamptz,text,uuid,boolean,text,text,date,date)','EXECUTE');`), 'f');
   }
   assert.equal(sql("select has_function_privilege('service_role','public.retail_existing_terms_months(jsonb,jsonb)','EXECUTE');"), 't');
+});
+test('writer assignment source drift rolls back all compatibility DDL in a second isolated database', options, () => {
+  sql('create database retail_pricing_drift_test template template0;');
+  prepareDatabase('retail_pricing_drift_test');
+  sql(`do $$ declare d text; begin
+    d:=pg_get_functiondef('public.apply_public_purchase_billing(uuid,text,uuid,uuid,text,text,text,text,text,text,timestamptz,boolean,boolean,timestamptz,timestamptz,timestamptz,numeric,numeric,integer,numeric,integer,boolean,text,integer,integer,integer,boolean,boolean)'::regprocedure);
+    d:=replace(d,'contract_end_at = p_contract_end_at','contract_end_at = clock_timestamp()');
+    execute d; end $$;`, 'retail_pricing_drift_test');
+  assert.throws(() => sql(fs.readFileSync(migration, 'utf8'), 'retail_pricing_drift_test'), /retail_activation_assignment_source_drift/);
+  assert.equal(sql("select to_regprocedure('public.retail_existing_month_anchor(timestamptz,integer)') is null;", 'retail_pricing_drift_test'), 't');
+  assert.equal(sql(`select count(*) from pg_constraint where conname in (
+    'client_plan_settings_billing_interval_check','membership_agreements_billing_option_check',
+    'retail_signup_email_verifications_billing_cadence_check','retail_signup_sms_verifications_billing_cadence_check')
+    and pg_get_constraintdef(oid) like '%prepaid%';`, 'retail_pricing_drift_test'), '0');
 });
