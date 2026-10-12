@@ -9,6 +9,7 @@ const {
 } = require('./alphaScreenPackages')
 const { resolvePublicBackendBase, buildClientDashboardReturnUrl } = require('../config/urlConfig')
 const { priceEnterprisePool, quoteEnterprisePool } = require('./enterprisePoolPricing')
+const {enterprisePoolCheckoutQuote}=require('./enterprisePoolSnapshot')
 const { enterpriseSettingsMetadata, validateEnterpriseSettings } = require('./enterpriseSettings')
 
 function makeError(status, code, detail) {
@@ -68,6 +69,7 @@ function isSuppliedValue(value) {
 // returns what the session needs: the platform charge, the pool, and the
 // metadata the webhook turns into the client's plan settings.
 function parseEnterpriseCheckoutTerms(enterpriseFees) {
+  const acceptedPoolQuote=enterprisePoolCheckoutQuote(enterpriseFees||{})
   const platformFee = asMoneyOrNull(enterpriseFees?.platform_fee, { allowZero: false })
   const perRoleFee = asMoneyOrNull(enterpriseFees?.per_role_fee, { allowZero: true })
   const includedInterviewsPerRole = asWholeNumberOrNull(enterpriseFees?.included_interviews_per_role, { allowZero: true })
@@ -122,6 +124,7 @@ function parseEnterpriseCheckoutTerms(enterpriseFees) {
     usageInterviewFeeCents,
     poolQuantity,
     agreedPoolDiscountPct,
+    acceptedPoolQuote,
     metadata: {
       platform_fee: String(Math.round(platformFee * 100) / 100),
       per_role_fee: String(Math.round(perRoleFee * 100) / 100),
@@ -286,7 +289,9 @@ async function createSubscriptionCheckoutSession({
 
   // Every Enterprise term is checked here, before the client lookup and before
   // anything reaches Stripe, so a refused checkout leaves nothing behind.
+  if(normalizedPlanTier!=='enterprise' && (enterpriseFees?.pool_offer_snapshot!=null || enterpriseFees?.pool_offer_digest!=null))throw makeError(409,'invalid_enterprise_pool_snapshot','Enterprise pool terms do not apply to this plan.')
   const enterpriseTerms = normalizedPlanTier === 'enterprise' ? parseEnterpriseCheckoutTerms(enterpriseFees) : null
+  if(enterpriseTerms?.acceptedPoolQuote && normalizedPromotionCodeId)throw makeError(409,'enterprise_pool_extra_discount_denied','The accepted pool total cannot be changed by an additional checkout discount.')
 
   const parentGuard = await requireParentClient(supabaseAdmin, normalizedClientId, {
     source: normalizedMetadataSource
@@ -407,7 +412,7 @@ async function createSubscriptionCheckoutSession({
     // unit amount with quantity 1 because the volume discount is rounded on the
     // whole order — see enterprisePoolPricing.
     if (poolQuantity !== null) {
-      const quote = enterpriseTerms.agreedPoolDiscountPct !== null
+      const quote = enterpriseTerms.acceptedPoolQuote || (enterpriseTerms.agreedPoolDiscountPct !== null
         ? quoteEnterprisePool({
           quantity: poolQuantity,
           unitPriceCents: usageInterviewFeeCents,
@@ -417,7 +422,7 @@ async function createSubscriptionCheckoutSession({
           db: supabaseAdmin,
           quantity: poolQuantity,
           unitPriceCents: usageInterviewFeeCents
-        })
+        }))
       const poolPrice = await stripe.prices.create({
         currency: 'usd',
         unit_amount: quote.total_cents,
@@ -428,7 +433,8 @@ async function createSubscriptionCheckoutSession({
           purchase_type: 'interview_pool',
           quantity: String(quote.quantity),
           discount_pct: String(quote.discount_pct),
-          discounted_unit_price_cents: String(quote.discounted_unit_price_cents)
+          discounted_unit_price_cents: String(quote.discounted_unit_price_cents),
+          ...(quote.offer_snapshot?{pool_offer_version:quote.offer_snapshot.offer_version,pool_offer_digest:quote.offer_digest}:{})
         }
       })
       lineItems.push({ price: poolPrice.id, quantity: 1 })
@@ -443,6 +449,8 @@ async function createSubscriptionCheckoutSession({
           unit_price_cents: quote.unit_price_cents,
           discount_pct: quote.discount_pct,
           total_cents: quote.total_cents,
+          offer_snapshot:quote.offer_snapshot||null,
+          offer_digest:quote.offer_digest||null,
           status: 'pending'
         })
         .select('id')
@@ -459,7 +467,8 @@ async function createSubscriptionCheckoutSession({
         pool_unit_price_cents: String(quote.unit_price_cents),
         pool_discount_pct: String(quote.discount_pct),
         pool_discounted_unit_price_cents: String(quote.discounted_unit_price_cents),
-        pool_total_cents: String(quote.total_cents)
+        pool_total_cents: String(quote.total_cents),
+        ...(quote.offer_snapshot?{pool_offer_version:quote.offer_snapshot.offer_version,pool_offer_digest:quote.offer_digest}:{})
       }
     }
   } else {
@@ -509,14 +518,15 @@ async function createSubscriptionCheckoutSession({
     ...normalizeMetadataObject(firstRolePrepayMetadata || {}),
     ...normalizeMetadataObject(poolMetadata || {}),
     ...normalizeMetadataObject(metadata),
-    ...normalizeMetadataObject(replacementMetadata || {})
+    ...normalizeMetadataObject(replacementMetadata || {}),
+    ...(enterpriseTerms?.acceptedPoolQuote?normalizeMetadataObject(poolMetadata||{}):{})
   }
 
   const checkoutBasePayload = {
     mode: 'subscription',
     customer: resolvedStripeCustomerId,
     line_items: lineItems,
-    ...(normalizedPromotionCodeId
+    ...(enterpriseTerms?.acceptedPoolQuote?{}:normalizedPromotionCodeId
       ? { discounts: [{ promotion_code: normalizedPromotionCodeId }] }
       : { allow_promotion_codes: true }),
     metadata: checkoutMetadata,

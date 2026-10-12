@@ -13,6 +13,8 @@ const { rejectChildClientForAdminBilling } = require('../../services/admin/admin
 const { resolveBillingModel } = require('../../services/billingModel');
 const { readBillingForClient } = require('../../services/billingReadModel');
 const { createImmediateUsageInvoice } = require('../../services/usageBilling');
+const {prepareEnterprisePoolTerms}=require('../../services/enterprisePoolSnapshot');
+const {validateEnterpriseSettings}=require('../../services/enterpriseSettings');
 
 const router = express.Router();
 
@@ -193,8 +195,19 @@ router.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin, asy
   if (!parentGuard) return
 
   try {
+    // Validate raw intent before model/quantity clearing can discard an invalid
+    // requested pool and accidentally continue with a platform-only checkout.
+    if(planTier==='enterprise'){
+      const raw=req.body?.pool_quantity;
+      if(raw!=null && String(raw).trim()!==''){
+        const count=typeof raw==='number'?raw:typeof raw==='string' && /^[0-9]+$/.test(raw.trim())?Number(raw):NaN;
+        if(!Number.isSafeInteger(count)||count<0)return res.status(400).json({error:'invalid_enterprise_pool_quantity',code:'invalid_enterprise_pool_quantity'});
+      }
+      const checked=validateEnterpriseSettings(req.body||{},{planTier:'enterprise'});
+      if(!checked.ok)return res.status(checked.status||400).json({error:checked.code,code:checked.code,detail:checked.detail});
+    }
     const enterpriseFees = planTier === 'enterprise'
-      ? {
+      ? prepareEnterprisePoolTerms({membership_tier:'enterprise',
           platform_fee: req.body?.platform_fee,
           per_role_fee: req.body?.per_role_fee,
           included_interviews_per_role: req.body?.included_interviews_per_role,
@@ -205,7 +218,7 @@ router.post('/clients/:id/subscription-checkout', requireAuth, requireAdmin, asy
           rollover_days: req.body?.rollover_days,
           max_interview_minutes: req.body?.max_interview_minutes,
           scored_question_count: req.body?.scored_question_count
-        }
+        })
       : null
 
     const { session, client, clientEmail } = await createSubscriptionCheckoutSession({

@@ -82,7 +82,8 @@ function makeDb({ pool = {}, agreement = {}, client = {}, intents = [] } = {}) {
     public_purchase_intents: intents,
     client_interview_pools: [{
       id: POOL, client_id: CLIENT, quantity_purchased: 30, unit_price_cents: 2500,
-      discount_pct: 5, total_cents: 71250, status: 'pending', ...pool
+      discount_pct: 5, total_cents: 71250, status: 'pending', ...pool,
+      offer_snapshot:pool.offer_snapshot??null,offer_digest:pool.offer_digest??null
     }],
     client_plan_settings: [],
     client_members: [],
@@ -325,4 +326,18 @@ test('Enterprise is still refused through a public purchase', async () => {
   assert.match(String(eventRow(db).error), /invalid membership key/);
   assertNotActivated(db);
   assert.equal(poolRow(db).status, 'pending');
+});
+
+test('new snapshot, split markers and missing selected columns hold before any client or pool activation',async()=>{
+  for(const mode of ['v2','split','missing']){
+    const db=makeDb();if(mode==='v2'){
+      const {prepareEnterprisePoolTerms}=require('../src/services/enterprisePoolSnapshot');
+      const p=prepareEnterprisePoolTerms({membership_tier:'enterprise',billing_model:'usage',pool_quantity:30,usage_interview_fee_cents:2500});
+      Object.assign(poolRow(db),{offer_snapshot:p.pool_offer_snapshot,offer_digest:p.pool_offer_digest,total_cents:69750,discount_pct:7});
+    }else if(mode==='split')poolRow(db).offer_digest='a'.repeat(64);else delete poolRow(db).offer_snapshot;
+    const {app,subscriptionRetrievals}=loadApp(checkoutEvent(),db),res=await post(app);
+    assert.equal(res.status,200,JSON.stringify(res.body));assertNotActivated(db);assert.equal(poolRow(db).status,'pending');
+    assert.equal(subscriptionRetrievals.length,0);assert.match(String(eventRow(db).error),/ENTERPRISE_POOL_V2_PAYMENT_PROOF_REQUIRED/);
+    assert.equal(writesTo(db,'client_interview_pools','update'),0);
+  }
 });

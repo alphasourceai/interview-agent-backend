@@ -50,6 +50,7 @@ const pool = (overrides = {}) => ({
   unit_price_cents: 2500,
   discount_pct: 0,
   total_cents: 25000,
+  offer_snapshot:null,offer_digest:null,
   status: 'paid',
   created_at: '2026-09-01T00:00:00.000Z',
   paid_at: '2026-09-01T00:00:00.000Z',
@@ -103,6 +104,15 @@ test('paying a pending pool makes its interviews spendable', async () => {
   assert.equal(row.quantity_remaining, undefined, 'no balance is stored');
   assert.equal(row.stripe_payment_intent_id, 'pi_1');
   assert.ok(row.paid_at);
+});
+
+test('paid helper refuses v2/split/missing pair and native-null compare gate is on the actual write',async()=>{
+  for(const extra of [{offer_snapshot:{}},{offer_digest:'a'.repeat(64)},{offer_snapshot:undefined}]){
+    const db=makeDb({pools:[pool({status:'pending',...extra})]});await assert.rejects(()=>markPoolPaid({db,poolId:'pool_1'}),/PAYMENT_PROOF_REQUIRED/);
+    assert.equal(db.tables.client_interview_pools[0].status,'pending');assert.ok(!db.calls.some(c=>c.table==='client_interview_pools' && c.op==='update'));
+  }
+  const source=fs.readFileSync(path.join(ROOT,'src/services/interviewPool.js'),'utf8');
+  assert.match(source,/\.is\('offer_snapshot',null\)\s*\.is\('offer_digest',null\)/);
 });
 
 test('a redelivered payment changes nothing about a pool already paid', async () => {

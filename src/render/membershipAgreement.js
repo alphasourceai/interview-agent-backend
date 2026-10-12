@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const Handlebars = require('handlebars');
+const {readEnterprisePoolSnapshot,enterprisePoolCheckoutQuote}=require('../services/enterprisePoolSnapshot');
 
 const templatePath = path.join(__dirname, '..', '..', 'templates', 'pdf', 'membership-agreement.hbs');
 const templateSrc = fs.readFileSync(templatePath, 'utf8');
@@ -226,6 +227,11 @@ function readLogoAsDataUri() {
 }
 
 function normalizeMembershipAgreementInput(input = {}) {
+  const poolOffer=readEnterprisePoolSnapshot(input);
+  if(poolOffer){
+    if(normalizeTier(input.membership_tier||input.membershipTier)!=='enterprise')throw new Error('invalid_enterprise_pool_snapshot');
+    enterprisePoolCheckoutQuote(input);
+  }
   return {
     client_id: normalizeText(input.client_id || input.clientId),
     client_legal_name: normalizeText(input.client_legal_name || input.clientLegalName),
@@ -259,6 +265,8 @@ function normalizeMembershipAgreementInput(input = {}) {
     // (withPricedPool); checkout honours an agreed discount only then.
     pool_discount_priced: input.pool_discount_priced === true || String(input.pool_discount_priced) === 'true',
     pool_total_cents: normalizeCentsInput(String(input.pool_total_cents ?? input.poolTotalCents ?? '')),
+    pool_offer_snapshot:poolOffer,
+    pool_offer_digest:poolOffer?input.pool_offer_digest:null,
     max_interview_minutes: normalizeWholeNumberInput(input.max_interview_minutes || input.maxInterviewMinutes || input.interview_duration_minutes || input.interviewDurationMinutes),
     // Enterprise settings beyond the prices. Validated by enterpriseSettings.js
     // before an agreement is sent; empty means "use the plan default".
@@ -373,11 +381,20 @@ function buildEnterpriseCommercialTerms(normalized = {}) {
     rows.push({ label: 'Additional Interview Fee', value: formatTermCents(terms.additional_interview_fee_cents) });
   }
   if (terms.pool) {
+    const snapshot=readEnterprisePoolSnapshot(normalized);
+    if(snapshot){
+      rows.push({label:'Interview Pool',value:`${snapshot.quantity} interviews`,note:'Bought at signup; used before any interview is billed as usage.'},
+        {label:'Pool Gross',value:formatTermCents(snapshot.gross_cents)},
+        {label:'Pool Volume Discount',value:`${snapshot.automatic_discount_percent}% (${formatTermCents(snapshot.automatic_discount_cents)})`},
+        {label:'Pool Coupon',value:formatTermCents(snapshot.coupon_cents)},
+        {label:'Pool Total',value:`${formatTermCents(snapshot.net_cents)}, charged at signup`});
+    }else{
     rows.push(
       { label: 'Interview Pool', value: `${terms.pool.quantity} interviews`, note: 'Bought at signup; used before any interview is billed as usage.' },
       { label: 'Pool Discount', value: terms.pool.discount_pct == null ? '—' : `${terms.pool.discount_pct}%` },
       { label: 'Pool Total', value: terms.pool.total_cents == null ? '—' : `${formatTermCents(terms.pool.total_cents)}, charged at signup` }
     );
+    }
   }
   if (terms.rollover_days !== null) {
     rows.push({ label: 'Rollover Credit', value: `${terms.rollover_days} days`, note: 'How long credit from a closed role stays usable.' });

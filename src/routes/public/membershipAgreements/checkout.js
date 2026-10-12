@@ -141,6 +141,9 @@ router.post('/checkout-session', publicAgreementTokenRateLimit, async (req, res)
           // An agreement from before that (no mark) is priced from the bands, as
           // it always was, never at a discount someone typed.
           pool_discount_pct: agreementInput.pool_discount_priced ? agreementInput.pool_discount_pct : '',
+          pool_total_cents:agreementInput.pool_total_cents,
+          pool_offer_snapshot:agreementInput.pool_offer_snapshot,
+          pool_offer_digest:agreementInput.pool_offer_digest,
           // Per-client settings beyond the prices; empty means the plan default.
           billing_model: agreementInput.billing_model,
           rollover_days: agreementInput.rollover_days,

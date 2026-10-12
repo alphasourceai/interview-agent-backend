@@ -50,7 +50,7 @@ function makeDb({ pools = [] } = {}) {
     }],
     billing_customers: [],
     enterprise_pool_discounts: DISCOUNTS,
-    client_interview_pools: pools,
+    client_interview_pools: pools.map(p=>({offer_snapshot:null,offer_digest:null,...p})),
     client_interview_pool_draws: []
   }));
 }

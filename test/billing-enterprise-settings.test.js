@@ -659,6 +659,7 @@ async function agreementAndCharge(settings, { changeBandsBeforeCheckout = false,
       terms: executed.commercial_terms,
       draftHtml: agreement.template_snapshot.rendered_html,
       executedHtml: executed.html,
+      pendingPools:db.tables.client_interview_pools,
       stripe: system.stripe.calls
     };
   } finally {
@@ -710,7 +711,7 @@ test('an Enterprise usage agreement with a pool shows every term, and each one i
   const result = await agreementAndCharge({ pool_quantity: '30', max_interview_minutes: '30', scored_question_count: '6' });
 
   assert.equal(result.terms.billing_model, 'usage');
-  assert.deepEqual(result.terms.pool, { quantity: 30, discount_pct: 5, total_cents: 71250 }, '30 x $25 less 5%');
+  assert.deepEqual(result.terms.pool, { quantity: 30, discount_pct: 7, total_cents: 69750 }, 'prospective v2: 30 x $25 less 7%');
   assertAgreementMatchesCharge(result);
   assertHtmlShowsTerms(result.draftHtml, result.terms);
   assertHtmlShowsTerms(result.executedHtml, result.terms);
@@ -732,15 +733,25 @@ test('an Enterprise rollover agreement shows its rollover days and no usage pric
 test('the pool is charged at the price the agreement shows, even if the bands change before checkout', async () => {
   const result = await agreementAndCharge({ pool_quantity: '30' }, { changeBandsBeforeCheckout: true });
 
-  assert.equal(result.terms.pool.discount_pct, 5, 'the agreement was priced at send');
+  assert.equal(result.terms.pool.discount_pct, 7, 'the prospective agreement was priced at send');
   assertAgreementMatchesCharge(result);
 });
 
 test('a pool discount or total typed into the request is ignored; the bands price it', async () => {
   const result = await agreementAndCharge({ pool_quantity: '30', pool_discount_pct: '90', pool_total_cents: '1' });
 
-  assert.deepEqual(result.terms.pool, { quantity: 30, discount_pct: 5, total_cents: 71250 });
+  assert.deepEqual(result.terms.pool, { quantity: 30, discount_pct: 7, total_cents: 69750 });
   assertAgreementMatchesCharge(result);
+});
+
+test('v2 accepted snapshot matches pending row/price, protected metadata and no unchecked checkout promotion',async()=>{
+  const r=await agreementAndCharge({pool_quantity:'51',usage_interview_fee_cents:5,pool_discount_pct:'90',pool_total_cents:1});
+  const p=r.pendingPools[0],poolPrice=r.stripe.prices.find(v=>v.metadata?.purchase_type==='interview_pool'),session=r.stripe.sessions[0];
+  assert.equal(p.total_cents,229);assert.equal(p.offer_snapshot.net_cents,229);assert.equal(poolPrice.unit_amount,229);
+  assert.equal(p.offer_digest,poolPrice.metadata.pool_offer_digest);assert.equal(p.offer_digest,session.metadata.pool_offer_digest);
+  assert.equal(session.metadata.pool_offer_version,'enterprise-pool-v2-2026-10-11');
+  assert.equal(Object.hasOwn(session,'allow_promotion_codes'),false);assert.equal(Object.hasOwn(session,'discounts'),false);
+  assert.equal(p.status,'pending');assertAgreementMatchesCharge(r);
 });
 
 test('an agreement sent before pools were priced at send is charged at the bands, never at a typed discount', async () => {
@@ -749,6 +760,10 @@ test('an agreement sent before pools were priced at send is charged at the bands
       // What an older agreement looks like: a typed discount, and no mark that
       // the system priced it.
       const values = agreement.template_snapshot.values;
+      // Explicit synthetic LEGACY fixture, not a permitted native backfill or
+      // way to strip a new signed snapshot. Real native v2 rows forbid this.
+      delete values.pool_offer_snapshot;
+      delete values.pool_offer_digest;
       delete values.pool_discount_priced;
       values.pool_discount_pct = '90';
       values.pool_total_cents = 7500;

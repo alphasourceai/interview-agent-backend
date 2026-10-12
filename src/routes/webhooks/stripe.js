@@ -459,11 +459,14 @@ async function loadInterviewPoolForCheckout(metadata = {}) {
 
   const { data: pool, error: poolLookupErr } = await supabaseAdmin
     .from('client_interview_pools')
-    .select('id,client_id,quantity_purchased,status')
+    .select('id,client_id,quantity_purchased,status,offer_snapshot,offer_digest')
     .eq('id', poolId)
     .maybeSingle();
   if (poolLookupErr) throw new Error(poolLookupErr.message || 'Interview pool lookup failed');
   if (!pool) throw permanentFailure('Interview pool not found');
+  // Prospective native price proof is required BEFORE any client activation;
+  // old metadata-only settlement must never grant new-protocol pool credits.
+  if(pool.offer_snapshot!==null || pool.offer_digest!==null)throw permanentFailure('ENTERPRISE_POOL_V2_PAYMENT_PROOF_REQUIRED');
 
   const metadataClientId = String(metadata?.client_id || '').trim();
   if (metadataClientId && String(pool.client_id) !== metadataClientId) {

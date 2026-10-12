@@ -6,7 +6,7 @@ const stripe = require('../../clients/stripe');
 const { supabaseAnon, supabaseAdmin } = require('../../clients/supabase');
 const { requireParentClient } = require('../../services/clientBillingScope');
 const { validateEnterpriseSettings } = require('../../services/enterpriseSettings');
-const { priceEnterprisePool } = require('../../services/enterprisePoolPricing');
+const { prepareEnterprisePoolTerms } = require('../../services/enterprisePoolSnapshot');
 const { htmlToPdf } = require('../../render/pdfRenderer');
 const { buildMembershipAgreementHtml, normalizeMembershipAgreementInput } = require('../../render/membershipAgreement');
 const { sendMembershipAgreementEmail, sendMembershipAgreementInternalNotification } = require('../../clients/sendgrid');
@@ -73,7 +73,8 @@ function normalizeAgreementClientMode(value) {
 
 function normalizeAgreementPayload(raw) {
   const body = raw || {};
-  const normalized = normalizeMembershipAgreementInput(body);
+  // Draft pricing is server-owned, never a browser-supplied accepted snapshot.
+  const normalized = normalizeMembershipAgreementInput({...body,pool_offer_snapshot:null,pool_offer_digest:null});
   const normalizedClientId = UUID_RE.test(normalized.client_id || '') ? normalized.client_id : null;
   const attachedClientIdRaw = String(
     body.attached_client_id ||
@@ -143,19 +144,7 @@ function validateAgreementPayload(payload) {
 // Values typed into the request are never used: without a pool and a usage
 // price there is nothing to price, and both are cleared.
 async function withPricedPool(payload) {
-  if (payload.membership_tier !== 'enterprise') return payload;
-  const quantity = Number(payload.pool_quantity);
-  const unitPriceCents = Number(payload.usage_interview_fee_cents);
-  if (!(Number.isInteger(quantity) && quantity > 0 && Number.isInteger(unitPriceCents) && unitPriceCents >= 0)) {
-    return { ...payload, pool_discount_pct: '', pool_total_cents: null, pool_discount_priced: false };
-  }
-  const quote = await priceEnterprisePool({ db: supabaseAdmin, quantity, unitPriceCents });
-  return {
-    ...payload,
-    pool_discount_pct: String(quote.discount_pct),
-    pool_total_cents: quote.total_cents,
-    pool_discount_priced: true
-  };
+  return prepareEnterprisePoolTerms(payload);
 }
 
 async function requireParentClientForAdminBilling(clientId, context) {

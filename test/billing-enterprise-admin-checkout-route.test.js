@@ -27,7 +27,8 @@ stub('services/admin/adminHelpers', { rejectChildClientForAdminBilling: async (r
   if (req.params.id === 'synthetic-child') { res.sendStatus(403); return null; }
   return { ok: true };
 } });
-stub('services/billingModel', {});
+// Keep real pure model constants/defaults for raw validation; no billing read
+// is executed by these scoped requests.
 stub('services/billingReadModel', {});
 stub('services/usageBilling', {});
 
@@ -49,15 +50,25 @@ test('admin Enterprise fallback passes explicit model, paired capacity and usage
   const input = calls.at(-1);
   assert.equal(input.planTier, 'enterprise');
   assert.deepEqual(input.enterpriseFees, {
+    membership_tier:'enterprise',
     platform_fee: '1200', per_role_fee: '0', included_interviews_per_role: '0',
     additional_interview_fee: '0', usage_interview_fee_cents: 2349, pool_quantity: 37,
     billing_model: 'usage', rollover_days: null, max_interview_minutes: 30, scored_question_count: 4,
+    pool_discount_pct:'7',pool_total_cents:80829,pool_discount_priced:true,
+    pool_offer_snapshot:{offer_version:'enterprise-pool-v2-2026-10-11',currency:'usd',quantity:37,unit_price_cents:2349,
+      gross_cents:86913,automatic_discount_percent:7,automatic_discount_cents:6084,coupon_cents:0,net_cents:80829},
+    pool_offer_digest:'c39c0461f0cce1724f3afbd8b0fdec07cd5db1809225fa0babf44ccc252bb686',
   });
-  assert.equal(input.enterpriseFees.pool_discount_pct, undefined);
+  assert.equal(input.enterpriseFees.pool_discount_pct,'7','browser100% ignored; prospective server band applies');
 });
 test('retail fallback never forwards client-supplied Enterprise overrides', async () => {
   assert.equal((await send({ plan_tier: 'basic', billing_interval: 'monthly', billing_model: 'usage', platform_fee: 1 })).status, 200);
   assert.equal(calls.at(-1).enterpriseFees, null);
+});
+test('invalid raw pool intent is rejected before it can be cleared into a platform-only checkout',async()=>{
+  const before=calls.length;
+  const r=await send({plan_tier:'enterprise',billing_interval:'monthly',billing_model:'usage',usage_interview_fee_cents:2500,pool_quantity:'not-a-number'});
+  assert.equal(r.status,400);assert.equal(calls.length,before);
 });
 test('auth, admin and parent guards precede fallback checkout', async () => {
   const before = calls.length;

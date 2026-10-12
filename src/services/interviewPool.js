@@ -32,11 +32,12 @@ async function markPoolPaid({ db, poolId, stripePaymentIntentId, now } = {}) {
 
   const { data: pool, error: lookupError } = await db
     .from('client_interview_pools')
-    .select('id,client_id,quantity_purchased,status')
+    .select('id,client_id,quantity_purchased,status,offer_snapshot,offer_digest')
     .eq('id', poolId)
     .maybeSingle();
   if (lookupError) throw new Error(lookupError.message || 'Interview pool lookup failed');
   if (!pool) return { paid: false, reason: 'not_found' };
+  if(pool.offer_snapshot!==null || pool.offer_digest!==null)throw new Error('ENTERPRISE_POOL_V2_PAYMENT_PROOF_REQUIRED');
   if (String(pool.status) === PAID_STATUS) return { paid: false, reason: 'already_paid', pool };
 
   const paidAt = nowIso(now);
@@ -49,6 +50,8 @@ async function markPoolPaid({ db, poolId, stripePaymentIntentId, now } = {}) {
     })
     .eq('id', poolId)
     .eq('status', 'pending')
+    .is('offer_snapshot',null)
+    .is('offer_digest',null)
     .select('id,client_id,quantity_purchased')
     .maybeSingle();
   if (updateError) throw new Error(updateError.message || 'Interview pool paid update failed');
