@@ -30,10 +30,12 @@ function fixture(hooks={}){
    events.push('upload');assert.equal(headers.get('x-upsert'),'false');assert.equal(headers.get('cache-control'),'no-store');
    assert.equal(headers.get('content-type'),path.endsWith('.png')?'image/png':'application/pdf');
    hooks.uploadHook?.({body:init.body,bucket,files,events});
-   const canCommit=hooks.status==null||[408,425,429,500,502,503,504].includes(hooks.status);
+   const status=hooks.statusForPath?.(path)??hooks.status;
+   const canCommit=status==null||[408,425,429,500,502,503,504].includes(status);
    if(canCommit && !hooks.absent)files.set(path,Buffer.from(init.body));
    if(hooks.unknown==='throw')throw Error('SYNTHETIC SECRET');
-   if(hooks.status)return Response.json({message:'SYNTHETIC SECRET',statusCode:String(hooks.bodyStatusCode??hooks.status)},{status:hooks.status});
+   if(status && hooks.rawErrorBody)return new Response('SYNTHETIC NON-JSON ERROR',{status});
+   if(status)return Response.json({message:'SYNTHETIC SECRET',statusCode:String(hooks.bodyStatusCode??status)},{status});
    return Response.json(hooks.malformedAck?{}:{Id:crypto.randomUUID(),Key:`agreements/${path}`});
   }
   assert.equal(method,'GET');events.push('download');hooks.downloadHook?.({bucket,files,events});
@@ -73,6 +75,22 @@ test('actual HTTP status outranks disagreeing JSON body code, even when same byt
  }
  const recover=fixture({status:503,bodyStatusCode:403});
  assert.equal((await recover.service.putIfAbsent(executed,PDF,opts)).persistence,'recovered_exact_bytes');
+});
+test('known denied HTTP with malformed JSON is not transport ambiguity',async()=>{
+ for(const status of [403,409,501]){
+  const f=fixture({status,rawErrorBody:true});
+  await assert.rejects(f.service.putIfAbsent(preview,PDF,opts),code('membership_artifact_write_denied'));
+  assert.deepEqual(f.events,['bucket','upload']);
+ }
+ const f=fixture({status:503,rawErrorBody:true});
+ assert.equal((await f.service.putIfAbsent(executed,PDF,opts)).persistence,'recovered_exact_bytes');
+});
+test('parallel uploads keep separate captured HTTP outcomes and each sends one POST',async()=>{
+ const f=fixture({rawErrorBody:true,statusForPath:path=>path===executed?503:403});
+ const results=await Promise.allSettled([f.service.putIfAbsent(executed,PDF,opts),f.service.putIfAbsent(preview,PDF,opts)]);
+ assert.equal(results[0].status,'fulfilled');assert.equal(results[0].value.persistence,'recovered_exact_bytes');
+ assert.equal(results[1].status,'rejected');assert.equal(results[1].reason.code,'membership_artifact_write_denied');
+ assert.equal(f.events.filter(v=>v==='upload').length,2);assert.equal(f.events.filter(v=>v==='download').length,1);
 });
 for(const hooks of [{unknown:'throw',absent:true},{status:503,changed:Buffer.from('%PDF-1.7\nWRONG BYTES\n%%EOF')},
  {changed:Buffer.from('not an artifact')},{mime:'text/html'}])test('unknown/missing/corrupt/MIME readback never retries upload',async()=>{

@@ -33,6 +33,12 @@ One upload only. Known success still reads and compares exact retained bytes,
 hash and size. Transport ambiguity or408/425/429/500/502/503/504 may recover by
 one same-path metadata/body read. Other statuses deny without read/retry. Missing
 or corrupt recovery never creates another object or overwrites/removes one.
+Each upload has an isolated AsyncLocalStorage context: the fetch wrapper records
+HTTP status BEFORE SDK JSON parsing and limits POST transmission to one. A
+malformed HTTP403/409 body cannot be mistaken for transport ambiguity, and a
+JSON statusCode cannot override HTTP status. Parallel operations do not share
+status/counters. Successful HTTP2xx with a malformed acknowledgment may recover
+exact bytes, but no permission denial or second POST is authorized.
 Three bucket checks plus one metadata read intentionally retain the final
 post-download check to detect a mid-operation public toggle. No write retry.
 Errors have fixed code, empty message and no raw cause/token/customer/provider text.

@@ -3,6 +3,7 @@
 // issuer/signer services must establish scope and verify their frozen hashes.
 const crypto=require('node:crypto'),{isProxy}=require('node:util').types;
 const {createClient}=require('@supabase/supabase-js');
+const {AsyncLocalStorage}=require('node:async_hooks');
 const UUID='(?!00000000-0000-0000-0000-000000000000)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const sha=b=>crypto.createHash('sha256').update(b).digest('hex');
 const recoverable=new Set([408,425,429,500,502,503,504]);
@@ -25,6 +26,7 @@ function createMembershipPrivateArtifacts({configuration,fetchImplementation=glo
   && !/\s/.test(config.serviceKey) && typeof fetchImplementation==='function','membership_artifact_configuration_invalid');
  Object.freeze(config);
  const origin=`https://${config.projectRef}.supabase.co`,storageUrl=`${origin}/storage/v1`;
+ const writeContext=new AsyncLocalStorage();
  const pattern=new RegExp(`^${config.namespace}/${UUID}/(?:preview\\.pdf|attempts/${UUID}/(?:signature\\.png|executed\\.pdf))$`);
  function pathInfo(path){
   check(typeof path==='string' && path.length<=220 && pattern.test(path),'membership_artifact_invalid_path',400);
@@ -43,7 +45,19 @@ function createMembershipPrivateArtifacts({configuration,fetchImplementation=glo
    if(method==='POST')check(headers.get('x-upsert')==='false' && headers.get('content-type')===info.type
     && headers.get('cache-control')==='no-store','membership_artifact_request_denied');
   }
-  return fetchImplementation(target,{...init,redirect:'error',cache:'no-store'});
+  if(method==='POST'){
+   const context=writeContext.getStore();
+   check(context && ++context.posts===1,'membership_artifact_request_denied');
+  }
+  const response=await fetchImplementation(target,{...init,redirect:'error',cache:'no-store'});
+  if(method==='POST'){
+   const context=writeContext.getStore();
+   check(Number.isInteger(response?.status) && response.status>=200 && response.status<=599,'membership_artifact_request_denied');
+   // Capture before the SDK parses JSON: a malformed error body otherwise
+   // becomes StorageUnknownError and loses a known denial's HTTP status.
+   context.httpStatus=response.status;
+  }
+  return response;
  }
  // Own narrow SDK client; a request cannot supply a DB/Auth handle.
  const db=createClient(origin,config.serviceKey,{auth:{persistSession:false,autoRefreshToken:false,detectSessionInUrl:false},
@@ -101,12 +115,12 @@ function createMembershipPrivateArtifacts({configuration,fetchImplementation=glo
     bytes=Buffer.from(new Uint8Array(backing,offset,length));
    }catch(_){fail('membership_artifact_invalid_input',400);}
    validateBytes(bytes,info);const digest=sha(bytes);
-   await bucket(info);let ack,unknown=false;
+   await bucket(info);let ack,unknown=false;const context={httpStatus:null,posts:0};
    // SDK status is the HTTP response. statusCode comes from untrusted JSON and
    // must not turn a permission/conflict denial into transport recovery.
-   function classify(error){const raw=error?.status??error?.statusCode;
-    if(raw!=null && !recoverable.has(Number(raw)))fail('membership_artifact_write_denied');return true;}
-   try{ack=await files().upload(path,Buffer.from(bytes),{contentType:info.type,upsert:false,cacheControl:'0',headers:{'cache-control':'no-store'}});}
+   function classify(error){const raw=context.httpStatus??error?.status;
+    if(raw!=null && !(Number(raw)>=200 && Number(raw)<300) && !recoverable.has(Number(raw)))fail('membership_artifact_write_denied');return true;}
+   try{ack=await writeContext.run(context,()=>files().upload(path,Buffer.from(bytes),{contentType:info.type,upsert:false,cacheControl:'0',headers:{'cache-control':'no-store'}}));}
    catch(e){unknown=classify(e);}
    endpoint();
    if(ack?.error)unknown=classify(ack.error);
