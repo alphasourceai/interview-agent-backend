@@ -3,6 +3,7 @@
 // Opening a signing session and recording the signature.
 
 const express = require('express');
+const {createEnterpriseAgreementExecution,isMarkedEnterpriseAgreement}=require('../../../services/enterpriseAgreementExecution');
 const { requireAuth, withClientScope } = require('../../../middleware/auth');
 const {
   AGREEMENTS_BUCKET,
@@ -180,12 +181,37 @@ router.post('/sign', publicAgreementTokenRateLimit, async (req, res) => {
         request_id
       });
     }
+    let classification;
+    try{classification=await supabaseAdmin.rpc('enterprise_v2_classify_signing_source',{p_agreement:agreement.id,p_token_hash:tokenHash});}
+    catch(_){const e=new Error('');e.code='enterprise_execution_source_unavailable';e.status=503;throw e;}
+    if(classification?.error || !['marked','unmarked'].includes(classification?.data)
+      || (classification.data==='marked')!==isMarkedEnterpriseAgreement(agreement)){
+      return res.status(503).json({error:'enterprise_execution_source_invalid',code:'enterprise_execution_source_invalid',
+        detail:'This agreement could not be safely signed. Please contact support.',request_id});
+    }
     const parentGuard = await requireAgreementClientWhenPresent(agreement, { route: 'membership_agreements_sign', agreement_id: agreement.id });
     if (!parentGuard.ok) return respondWithAgreementClientGuard(res, parentGuard, request_id);
 
-    const signedAt = new Date().toISOString();
-    const signatureSha256 = crypto.createHash('sha256').update(signaturePayload.buffer).digest('hex');
+    let signedAt = new Date().toISOString();
     const clientSlug = slugify(agreement.client_legal_name);
+    let executedPdf,executedPdfPath,updatedAgreement,notify=true;
+    if(classification.data==='marked'){
+      // Prospective Enterprise sources use per-attempt, immutable artifacts and
+      // native atomic signing. Never fall back to legacy upserts on a failure.
+      const service=createEnterpriseAgreementExecution({db:supabaseAdmin,loadByTokenHash:loadAgreementByTokenHash,
+        renderExecution:async (source,execution)=>{
+          const {html}=buildExecutedMembershipAgreementHtml(source,execution);
+          return htmlToPdf(html,{format:'Letter',margin:{top:'0.75in',right:'0.75in',bottom:'0.75in',left:'0.75in'}});
+        }});
+      const result=await service.sign({agreement,tokenHash,typedName,
+        consent:req.body?.accepted ?? req.body?.agreement_accepted ?? req.body?.agreementAccepted,
+        signatureDataUrl:req.body?.signature_image || req.body?.signatureImage || req.body?.signature_image_data_url || req.body?.signatureDataUrl,
+        ip:String(req.ip||'').slice(0,128)||null,userAgent:String(req.headers['user-agent']||'').slice(0,1024)||null});
+      updatedAgreement=result.agreement;executedPdf=result.executedPdf;executedPdfPath=result.execution.executed_pdf_path;
+      signedAt=result.execution.signed_at;
+      notify=result.notify;
+    }else{
+    const signatureSha256 = crypto.createHash('sha256').update(signaturePayload.buffer).digest('hex');
     const signaturePath = `membership-agreements/${agreement.id}/signature.${signaturePayload.ext}`;
 
     const signatureUpload = await supabaseAdmin
@@ -218,12 +244,12 @@ router.post('/sign', publicAgreementTokenRateLimit, async (req, res) => {
       signed_at: signedAt
     });
 
-    const executedPdf = await htmlToPdf(html, {
+    executedPdf = await htmlToPdf(html, {
       format: 'Letter',
       margin: { top: '0.75in', right: '0.75in', bottom: '0.75in', left: '0.75in' }
     });
 
-    const executedPdfPath = `membership-agreements/${agreement.id}/${clientSlug}-executed.pdf`;
+    executedPdfPath = `membership-agreements/${agreement.id}/${clientSlug}-executed.pdf`;
     const executedUpload = await supabaseAdmin
       .storage
       .from(AGREEMENTS_BUCKET)
@@ -276,7 +302,7 @@ router.post('/sign', publicAgreementTokenRateLimit, async (req, res) => {
         p_executed_pdf_path: executedPdfPath,
         p_template_snapshot: nextTemplateSnapshot
       });
-    const updatedAgreement = Array.isArray(signingRows) ? (signingRows[0] || null) : (signingRows || null);
+    updatedAgreement = Array.isArray(signingRows) ? (signingRows[0] || null) : (signingRows || null);
 
     if (updateErr) {
       console.error('[membership-agreements/sign] status_update_failed', {
@@ -303,6 +329,7 @@ router.post('/sign', publicAgreementTokenRateLimit, async (req, res) => {
         request_id
       });
     }
+    }
 
     const emailDownloadUrl = await createAgreementSignedUrl(executedPdfPath, EMAIL_SIGNED_URL_TTL_SECONDS);
     const responseDownloadUrl = await createAgreementSignedUrl(executedPdfPath, SIGNED_URL_TTL_SECONDS);
@@ -312,7 +339,7 @@ router.post('/sign', publicAgreementTokenRateLimit, async (req, res) => {
         ? Buffer.from(executedPdf.buffer, executedPdf.byteOffset, executedPdf.byteLength)
         : Buffer.from(executedPdf);
 
-    try {
+    if(notify)try {
       const signedCopyEmailResult = await sendMembershipAgreementSignedCopyEmail(updatedAgreement.admin_email, {
         client_legal_name: updatedAgreement.client_legal_name,
         primary_admin_name: updatedAgreement.primary_admin_name,
@@ -351,7 +378,7 @@ router.post('/sign', publicAgreementTokenRateLimit, async (req, res) => {
       });
     }
 
-    try {
+    if(notify)try {
       await sendMembershipAgreementCompletedInternalNotification(MEMBERSHIP_INTERNAL_NOTIFY_EMAIL, {
         agreement_id: updatedAgreement.id,
         client_legal_name: updatedAgreement.client_legal_name,
@@ -380,6 +407,9 @@ router.post('/sign', publicAgreementTokenRateLimit, async (req, res) => {
       request_id
     });
   } catch (e) {
+    if(String(e?.code||'').startsWith('enterprise_execution_') || e?.code==='invalid_enterprise_signature'){
+      return res.status(e.status||503).json({error:e.code,code:e.code,detail:'This agreement could not be safely signed. Please try again or contact support.',request_id});
+    }
     console.error('[membership-agreements/sign] unexpected', { request_id, error: e?.message || e, code: e?.code || null });
     return res.status(500).json({
       error: 'server_error',

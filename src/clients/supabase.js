@@ -19,4 +19,19 @@ const anonKey = SUPABASE_ANON_KEY
 const supabaseAdmin = createClient(SUPABASE_URL, adminKey, clientOptions)
 const supabaseAnon = createClient(SUPABASE_URL, anonKey, clientOptions)
 
-module.exports = { supabase: supabaseAdmin, supabaseAdmin, supabaseAnon }
+// Keep all runtime key reads here. Callers receive only the narrow immutable
+// artifact methods, never the private key or a second general-purpose client.
+function createEnterpriseAgreementArtifacts(db) {
+  if (db !== supabaseAdmin) throw Object.assign(new Error(''), { code: 'enterprise_execution_configuration_invalid', status: 503 });
+  const match = /^https:\/\/([a-z0-9]{20})\.supabase\.co\/?$/.exec(SUPABASE_URL);
+  if (!match || ![SUPABASE_URL, SUPABASE_URL.replace(/\/$/, '')].includes(db.supabaseUrl)) {
+    throw Object.assign(new Error(''), { code: 'enterprise_execution_configuration_invalid', status: 503 });
+  }
+  const { createMembershipPrivateArtifacts } = require('../services/membershipPrivateArtifacts');
+  return createMembershipPrivateArtifacts({ configuration: {
+    projectRef: match[1], bucket: process.env.SUPABASE_AGREEMENTS_BUCKET || 'agreements',
+    namespace: 'enterprise-v2', serviceKey: SUPABASE_SERVICE_ROLE_KEY
+  } });
+}
+
+module.exports = { supabase: supabaseAdmin, supabaseAdmin, supabaseAnon, createEnterpriseAgreementArtifacts }
