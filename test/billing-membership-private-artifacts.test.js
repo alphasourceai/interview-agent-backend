@@ -33,7 +33,7 @@ function fixture(hooks={}){
    const canCommit=hooks.status==null||[408,425,429,500,502,503,504].includes(hooks.status);
    if(canCommit && !hooks.absent)files.set(path,Buffer.from(init.body));
    if(hooks.unknown==='throw')throw Error('SYNTHETIC SECRET');
-   if(hooks.status)return Response.json({message:'SYNTHETIC SECRET',statusCode:String(hooks.status)},{status:hooks.status});
+   if(hooks.status)return Response.json({message:'SYNTHETIC SECRET',statusCode:String(hooks.bodyStatusCode??hooks.status)},{status:hooks.status});
    return Response.json(hooks.malformedAck?{}:{Id:crypto.randomUUID(),Key:`agreements/${path}`});
   }
   assert.equal(method,'GET');events.push('download');hooks.downloadHook?.({bucket,files,events});
@@ -64,6 +64,15 @@ for(const options of [{unknown:'throw'},{malformedAck:true}])test('transport/mal
 for(const status of [400,401,403,404,409,411,413,415,422,501,505])test(`definite HTTP${status} holds with no info/download/retry`,async()=>{
  const f=fixture({status});await assert.rejects(f.service.putIfAbsent(executed,PDF,opts),code('membership_artifact_write_denied'));
  assert.deepEqual(f.events,['bucket','upload']);
+});
+test('actual HTTP status outranks disagreeing JSON body code, even when same bytes already exist',async()=>{
+ for(const status of [403,409]){
+  const f=fixture({status,bodyStatusCode:503});
+  await assert.rejects(f.service.putIfAbsent(preview,PDF,opts),code('membership_artifact_write_denied'));
+  assert.deepEqual(f.events,['bucket','upload']);
+ }
+ const recover=fixture({status:503,bodyStatusCode:403});
+ assert.equal((await recover.service.putIfAbsent(executed,PDF,opts)).persistence,'recovered_exact_bytes');
 });
 for(const hooks of [{unknown:'throw',absent:true},{status:503,changed:Buffer.from('%PDF-1.7\nWRONG BYTES\n%%EOF')},
  {changed:Buffer.from('not an artifact')},{mime:'text/html'}])test('unknown/missing/corrupt/MIME readback never retries upload',async()=>{

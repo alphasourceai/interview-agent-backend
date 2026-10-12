@@ -102,7 +102,9 @@ function createMembershipPrivateArtifacts({configuration,fetchImplementation=glo
    }catch(_){fail('membership_artifact_invalid_input',400);}
    validateBytes(bytes,info);const digest=sha(bytes);
    await bucket(info);let ack,unknown=false;
-   function classify(error){const raw=error?.statusCode??error?.status;
+   // SDK status is the HTTP response. statusCode comes from untrusted JSON and
+   // must not turn a permission/conflict denial into transport recovery.
+   function classify(error){const raw=error?.status??error?.statusCode;
     if(raw!=null && !recoverable.has(Number(raw)))fail('membership_artifact_write_denied');return true;}
    try{ack=await files().upload(path,Buffer.from(bytes),{contentType:info.type,upsert:false,cacheControl:'0',headers:{'cache-control':'no-store'}});}
    catch(e){unknown=classify(e);}
