@@ -30,14 +30,16 @@ function source({target=client,fee=100,interval='monthly',expiry='7 days',signed
    admin_email:'synthetic@example.invalid',initial_term_start:'2026-10-12',initial_renewal_date:'2027-10-12'});
   snapshot.values=r.normalized;snapshot.rendered_html=r.html;
  }
- if(oversized)snapshot.rendered_html='x'.repeat(1048576);
+ // Generate the oversized fixture natively: passing 1MiB in a process argument
+ // hits macOS ARG_MAX before PostgreSQL ever evaluates the source-size guard.
+ const snapshotSQL=value=>oversized?`jsonb_set(${lit(value)},'{rendered_html}',to_jsonb(repeat('x',1048576)))`:lit(value);
  sql(`set role service_role;insert into membership_agreements(id,client_id,status,client_legal_name,primary_admin_name,admin_email,membership_tier,
   initial_term_start,initial_renewal_date,billing_option,template_snapshot,draft_pdf_path,signer_token_hash,signer_token_expires_at,agreement_expires_at)
  values('${id}','${target}','draft','SYNTHETIC ONLY','SYNTHETIC OWNER','synthetic@example.invalid','enterprise',current_date,current_date+365,
- ${lit(interval)},${lit(snapshot)},'synthetic/${id}/draft.pdf','${crypto.randomBytes(32).toString('hex')}',clock_timestamp()+interval '7 days',clock_timestamp()+interval '${expiry}');`);
+ ${lit(interval)},${snapshotSQL(snapshot)},'synthetic/${id}/draft.pdf','${crypto.randomBytes(32).toString('hex')}',clock_timestamp()+interval '7 days',clock_timestamp()+interval '${expiry}');`);
  if(signed)sql(`set role service_role;update membership_agreements set status='sent' where id='${id}';
   select id from complete_membership_agreement_signing('${id}',${lit(timestamp)},null,'SYNTHETIC OWNER',${lit(execution.signature_image_path)},
-  '${'a'.repeat(64)}',null,'SYNTHETIC',${lit(execution.executed_pdf_path)},${lit({...snapshot,execution})});`);
+  '${'a'.repeat(64)}',null,'SYNTHETIC',${lit(execution.executed_pdf_path)},${snapshotSQL({...snapshot,execution})});`);
  return id;
 }
 function parameters(agreement,overrides={}){return {p_id:crypto.randomUUID(),p_pool:crypto.randomUUID(),p_agreement:agreement,p_owner:owner,
