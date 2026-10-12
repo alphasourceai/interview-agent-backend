@@ -187,7 +187,8 @@ test('owned operation and pool bindings immutable; authority/provider IDs cannot
 });
 test('owned failed/voided bookkeeping is permitted but neither becomes recoverable/spendable',opts,()=>{
  for(const status of ['failed','voided']){
-  const p=parameters(source());sql(`set role service_role;${reserve(p)}update client_interview_pools set status='${status}' where id='${p.p_pool}';`);
+  const p=parameters(source());sql(`set role service_role;${reserve(p)}`);
+  sql(`set role service_role;update client_interview_pools set status='${status}' where id='${p.p_pool}';`);
   denied(`set role service_role;${read(p)}`,/readback_denied/);
   assert.equal(sql(`select checkout_creation_authorized or credits_spendable from enterprise_v2_checkout_operations where id='${p.p_id}';`),'f');
  }
