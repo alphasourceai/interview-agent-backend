@@ -72,10 +72,14 @@ function simulatePastClockHistory(x){
 }
 for(const planKey of ['basic','pro'])for(const commitmentMonths of [3,6,12])for(const paymentOption of ['prepaid','monthly_installments'])for(const firstRolePrepay of [false,true]){
  test(`actual native accepted pending linkage ${planKey}/${commitmentMonths}/${paymentOption}/first-role:${firstRolePrepay}`,h.opts,async()=>{
-  const before=invariants(),x=setup({planKey,commitmentMonths,paymentOption,firstRolePrepay});await x.sign();const result=await x.service.reserve(x.input),r=read(x);
+  const before=invariants(),x=setup({planKey,commitmentMonths,paymentOption,firstRolePrepaySelected:firstRolePrepay});await x.sign();const result=await x.service.reserve(x.input),r=read(x);
   assert.equal(result.disposition,'recorded_pending_linkage');assert.equal(result.account_ownership_verified,false);assert.equal(result.provider_effects_enabled,false);
   assert.equal(r.purchase.source_snapshot.quote.offer.plan_key,planKey);assert.equal(r.purchase.source_snapshot.quote.offer.commitment_months,commitmentMonths);
   assert.equal(r.purchase.source_snapshot.quote.offer.payment_option,paymentOption);assert.equal(r.purchase.original_salesperson_user_id,h.rep);
+  assert.equal(r.purchase.source_snapshot.quote.offer.first_role_prepay.selected,firstRolePrepay);
+  assert.equal(r.purchase.source_snapshot.quote.offer.first_role_prepay.amount_cents,firstRolePrepay?(planKey==='basic'?35900:62900):0);
+  assert.equal(r.purchase.source_snapshot.quote.offer.initial_payment_cents,r.purchase.source_snapshot.quote.offer.platform_payment_cents+
+   r.purchase.source_snapshot.quote.offer.first_role_prepay.amount_cents);
   const again=await x.service.reserve(x.input);assert.equal(again.purchase_id,result.purchase_id);assert.equal(again.created_at,result.created_at);
   assert.equal(again.disposition,'historical_inert');assert.equal(read(x).purchase.source_digest,r.purchase.source_digest);assert.equal(invariants(),before);
  });
