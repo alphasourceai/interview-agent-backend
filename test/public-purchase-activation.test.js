@@ -23,15 +23,77 @@ require.cache[supabaseClientPath] = {
 
 const {
   activatePublicPurchaseAgreementCheckout,
-  resolvePublicCheckoutReturnState
+  resolvePublicCheckoutReturnState,
+  buildClientActivationPayload
 } = require('../src/services/publicPurchaseActivation')
 const { buildAlphaScreenPackageSnapshot } = require('../src/services/alphaScreenPackages')
 const { normalizeBillingModel } = require('../src/services/billingModel')
+const { OFFER_VERSION } = require('../src/services/membershipOffers')
 
 const AGREEMENT_ID = '33333333-3333-4333-8333-333333333333'
 const INTENT_ID = '11111111-1111-4111-8111-111111111111'
 const CLIENT_ID = '44444444-4444-4444-8444-444444444444'
 const BUYER_EMAIL = 'alex@acmedental.example'
+
+function revisedSnapshot(plan='basic',months=3,payment='prepaid') {
+  return buildAlphaScreenPackageSnapshot(plan,payment==='prepaid'?'prepaid':'monthly',{
+    commitmentMonths:months,paymentOption:payment,channel:'sales',offerVersion:OFFER_VERSION
+  })
+}
+test('existing client activation payload uses frozen new-term price context and original full-paid UTC anchor, not subscription creation',()=>{
+  for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments']){
+    const s=revisedSnapshot('basic',months,payment),p=buildClientActivationPayload({agreement:{auto_renew:true},
+      subscription:{id:'sub_SYNTHETIC',customer:'cus_SYNTHETIC',status:'active',start_date:1769644800,current_period_end:1798761600},
+      planKey:'basic',billingInterval:s.billing_cadence,packageSnapshot:s,paidAt:'2026-01-31T12:00:00.000Z'});
+    assert.equal(p.contract_start_at,'2026-01-31T12:00:00.000Z');assert.equal(p.contract_end_at,months===3?'2026-04-30T12:00:00.000Z':months===6?'2026-07-31T12:00:00.000Z':'2027-01-31T12:00:00.000Z');
+    assert.equal(p.billing_interval,s.billing_cadence);assert.equal(p.stripe_subscription_id,'sub_SYNTHETIC');
+    assert.equal(p.auto_renew,true);
+  }
+});
+test('new activation payload cannot invent its first-paid clock or accept conflicting plan/cadence; legacy default remains12months',()=>{
+  const s=revisedSnapshot(),base={agreement:{auto_renew:true},subscription:{id:'sub_SYNTHETIC',status:'active',start_date:1769644800},
+    planKey:'basic',billingInterval:'prepaid',packageSnapshot:s};
+  assert.throws(()=>buildClientActivationPayload(base),/invalid_original_start/);
+  assert.throws(()=>buildClientActivationPayload({...base,paidAt:'2026-02-31T12:00:00.000Z'}),/invalid_original_start/);
+  assert.throws(()=>buildClientActivationPayload({...base,planKey:'pro',paidAt:'2026-01-31T12:00:00.000Z'}),/retail_terms_source_mismatch/);
+  const old=buildClientActivationPayload({...base,billingInterval:'monthly',packageSnapshot:undefined});
+  assert.equal(new Date(old.contract_end_at).getUTCFullYear(),new Date(old.contract_start_at).getUTCFullYear()+1);
+});
+test('new pricing uses existing fenced activation and password-email behavior; retry keeps original paid term and fees',async()=>{
+  for(const existing of [false,true]){
+    const db=makeDb(),s=revisedSnapshot(),a=db.membershipAgreements[0],i=db.purchaseIntents[0],calls=[];
+    a.billing_option='prepaid';a.template_snapshot.package_snapshot=s;
+    i.protocol='fenced_v2';i.package_snapshot=s;i.selected_billing_cadence='prepaid';i.term_start_basis='successful_payment';
+    const paid='2026-01-31T12:00:00.000Z',users=existing?[{id:'synthetic-existing-user',email:BUYER_EMAIL}]:[];
+    let recovery=0,setupEmails=0;
+    db.rpc=async(name,p)=>{
+      calls.push(name);
+      if(name==='complete_public_purchase_activation'){
+        assert.equal(p.p_term_start,'2026-01-31');assert.equal(p.p_renewal_date,'2026-04-30');assert.equal(p.p_billing_interval,'prepaid');
+        a.checkout_paid_at=paid;a.checkout_status='paid';return{data:{status:'completed',client_id:CLIENT_ID,paid_at:paid},error:null};
+      }
+      if(name==='apply_public_purchase_billing'){
+        assert.equal(p.p_contract_start_at,paid);assert.equal(p.p_contract_end_at,'2026-04-30T12:00:00.000Z');
+        assert.equal(p.p_platform_fee,1200);assert.equal(p.p_per_role_fee,399);assert.equal(p.p_billing_interval,'prepaid');
+        return{data:{status:'applied'},error:null};
+      }
+      if(name==='ensure_public_purchase_buyer_member')return{data:{status:'existing',role:'manager'},error:null};
+      if(name==='reserve_public_purchase_welcome')return{data:{status:'sent'},error:null};
+      throw Error('Unexpected synthetic RPC');
+    };
+    const options={db,agreementId:AGREEMENT_ID,checkoutSessionId:'cs_test_public',paidAt:paid,activationClaimKey:'synthetic-fence',
+      assertActivationFence:async()=>{},requireParentClient:async()=>({ok:true,clientId:CLIENT_ID}),
+      subscription:{id:'sub_SYNTHETIC',customer:'cus_SYNTHETIC',status:'active',start_date:1769644800,current_period_end:1777550400},
+      authAdmin:{listUsers:async()=>({data:{users},error:null})},
+      ensureRecovery:async()=>{recovery++;users.push({id:'synthetic-new-user',email:BUYER_EMAIL});return{userId:'synthetic-new-user',method:'recovery',actionLink:'https://setup.example/SYNTHETIC'}},
+      sendRecoveryEmail:async()=>{setupEmails++;return{statusCode:202}},sendWelcomeEmail:async()=>{throw Error('No duplicate welcome')},
+      logger:{info(){},warn(){},error(){}}};
+    const first=await activatePublicPurchaseAgreementCheckout(options),second=await activatePublicPurchaseAgreementCheckout({...options,paidAt:'2026-02-02T12:00:00.000Z'});
+    assert.equal(first.ok,true);assert.equal(second.ok,true);assert.equal(first.plan_settings.platform_fee,1200);
+    assert.equal(recovery,existing?0:1);assert.equal(setupEmails,existing?0:1);
+    assert.equal(calls.filter(x=>x==='apply_public_purchase_billing').length,2);
+  }
+});
 
 function matchesFilters(row, filters) {
   return filters.every(({ column, value, op = 'eq' }) => {

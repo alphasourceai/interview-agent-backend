@@ -13,6 +13,8 @@ const { ensureUserAndSendRecovery, redactEmail } = require('./recoveryHelper');
 const { sendMemberRecoveryEmail, sendAlphaScreenWelcomeEmail } = require('../clients/sendgrid');
 const { buildClientPwResetUrl } = require('../config/urlConfig');
 const { enqueueSalesWonDelivery } = require('./salesIntegrations');
+const { readRetailPackageOffer } = require('./membershipPackageCompatibility');
+const { retailTermWindow } = require('./membershipOffers');
 
 const LIVE_SUBSCRIPTION_STATUSES = new Set(['active', 'trialing']);
 const PRIVILEGED_MEMBER_ROLES = new Set(['manager', 'admin', 'owner', 'super_admin']);
@@ -345,6 +347,17 @@ async function sendWelcomeEmailOnce({
 const ENTERPRISE_PLAN_KEY = 'enterprise';
 
 function resolvePlanSelection({ agreement, intent, packageSnapshot, fallbackPlanTier, fallbackBillingInterval }) {
+  const retail = readRetailPackageOffer(packageSnapshot);
+  if (retail) {
+    const billing = retail.payment_option === 'prepaid' ? 'prepaid' : 'monthly';
+    const intentOffer = intent?.id ? readRetailPackageOffer(intent.package_snapshot) : retail;
+    if (JSON.stringify(intentOffer) !== JSON.stringify(retail)
+      || (intent?.id && (normalizeAlphaScreenPlanKey(intent.selected_plan_key) !== retail.plan_key || intent.selected_billing_cadence !== billing))
+      || normalizeAlphaScreenPlanKey(agreement?.membership_tier) !== retail.plan_key || agreement?.billing_option !== billing) {
+      const e = new Error('retail_terms_source_mismatch'); e.code = e.message; throw e;
+    }
+    return { planKey:retail.plan_key, billingInterval:billing };
+  }
   const requestedPlanKey = cleanText(
     packageSnapshot?.plan_key ||
     intent?.selected_plan_key ||
@@ -491,7 +504,12 @@ async function ensureLinkedClient({ db, agreement, intent, planKey, billingInter
   return clientId;
 }
 
-function buildClientActivationPayload({ agreement, subscription, planKey, billingInterval, fallbackCustomerId, fallbackSubscriptionId }) {
+function buildClientActivationPayload({ agreement, subscription, planKey, billingInterval, fallbackCustomerId, fallbackSubscriptionId, packageSnapshot, paidAt }) {
+  const retail = readRetailPackageOffer(packageSnapshot);
+  const term = retail ? retailTermWindow({ originalStart:paidAt, commitmentMonths:retail.commitment_months }) : null;
+  if (retail && (planKey !== retail.plan_key || billingInterval !== (retail.payment_option === 'prepaid' ? 'prepaid' : 'monthly'))) {
+    const e = new Error('retail_terms_source_mismatch'); e.code = e.message; throw e;
+  }
   const status = cleanText(subscription?.status).toLowerCase();
   const isLive = LIVE_SUBSCRIPTION_STATUSES.has(status);
   const cancelAtTermEnd = subscription?.cancel_at_period_end === true;
@@ -500,8 +518,8 @@ function buildClientActivationPayload({ agreement, subscription, planKey, billin
     subscription?.items?.data?.[0]?.current_period_end ??
     null
   );
-  const contractStartAt = toIsoFromUnixSeconds(subscription?.start_date) || new Date().toISOString();
-  const contractEndAt = addMonthsToIso(contractStartAt, 12);
+  const contractStartAt = term?.term_start_at || toIsoFromUnixSeconds(subscription?.start_date) || new Date().toISOString();
+  const contractEndAt = term?.term_end_at || addMonthsToIso(contractStartAt, 12);
   const intervalRaw =
     subscription?.items?.data?.[0]?.price?.recurring?.interval ||
     subscription?.plan?.interval ||
@@ -513,7 +531,7 @@ function buildClientActivationPayload({ agreement, subscription, planKey, billin
     stripe_subscription_id: pickId(subscription?.id) || cleanText(fallbackSubscriptionId) || null,
     subscription_status: isLive ? status : 'active',
     billing_status: 'active',
-    billing_interval: stripeBillingInterval || billingInterval,
+    billing_interval: retail ? billingInterval : stripeBillingInterval || billingInterval,
     plan_tier: planKey,
     current_term_end: currentTermEnd || contractEndAt,
     cancel_at_term_end: isLive ? cancelAtTermEnd : false,
@@ -819,7 +837,7 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
   const agreementId = cleanText(options.agreementId);
   if (!agreementId) return { ok: false, status: 'agreement_missing' };
 
-  const paidAt = cleanText(options.paidAt) || new Date().toISOString();
+  let paidAt = cleanText(options.paidAt) || new Date().toISOString();
   const checkoutSessionId = cleanText(options.checkoutSessionId);
 
   const { data: agreement, error: agreementErr } = await db
@@ -851,6 +869,16 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     return { ok: false, status: 'purchase_canceled', purchase_intent_id: intent?.id || null };
   }
   const packageSnapshot = getPackageSnapshot({ agreement, intent });
+  const retailOffer = readRetailPackageOffer(packageSnapshot);
+  if (retailOffer) {
+    const original = cleanText(agreement.checkout_paid_at || intent?.activated_at || options.paidAt);
+    if (!original) { const e = new Error('retail_original_payment_time_required'); e.code = e.message; throw e; }
+    retailTermWindow({ originalStart:original, commitmentMonths:retailOffer.commitment_months });
+    paidAt = original;
+    if (!getTemplateSnapshot(agreement).package_snapshot || (intent?.id && cleanText(intent.protocol) !== 'fenced_v2')) {
+      const e = new Error('retail_terms_source_mismatch'); e.code = e.message; throw e;
+    }
+  }
   const { planKey, billingInterval } = resolvePlanSelection({
     agreement,
     intent,
@@ -881,7 +909,7 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     const proposedClientId = linkedClientId || stablePurchaseClientId(intent.id);
     const paidDate = new Date(paidAt);
     if (!Number.isFinite(paidDate.getTime())) throw new Error('Invalid public purchase payment timestamp');
-    const renewalDate = new Date(Date.UTC(
+    const renewalDate = retailOffer ? retailTermWindow({ originalStart:paidAt, commitmentMonths:retailOffer.commitment_months }).term_end_at.slice(0,10) : new Date(Date.UTC(
       paidDate.getUTCFullYear() + 1,
       paidDate.getUTCMonth(),
       paidDate.getUTCDate()
@@ -967,17 +995,16 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     const clientPayload = buildClientActivationPayload({
       agreement, subscription: options.subscription, planKey, billingInterval,
       fallbackCustomerId: options.fallbackCustomerId,
-      fallbackSubscriptionId: options.fallbackSubscriptionId
+      fallbackSubscriptionId: options.fallbackSubscriptionId, packageSnapshot, paidAt:activationPaidAt
     });
     // A retry without Stripe's original start timestamp must not invent a new
     // digest from the current wall clock.
-    clientPayload.contract_start_at = cleanText(existingClientState?.contract_start_at) ||
-      subscriptionStartAt;
-    clientPayload.contract_end_at = cleanText(existingClientState?.contract_end_at) ||
-      addMonthsToIso(clientPayload.contract_start_at, 12);
-    clientPayload.current_term_end = cleanText(existingClientState?.current_term_end) ||
-      clientPayload.current_term_end || clientPayload.contract_end_at;
-    const planPayload = buildAlphaScreenPlanSettingsPayload({ clientId, planKey, billingInterval });
+    if (!retailOffer) {
+      clientPayload.contract_start_at = cleanText(existingClientState?.contract_start_at) || subscriptionStartAt;
+      clientPayload.contract_end_at = cleanText(existingClientState?.contract_end_at) || addMonthsToIso(clientPayload.contract_start_at, 12);
+      clientPayload.current_term_end = cleanText(existingClientState?.current_term_end) || clientPayload.current_term_end || clientPayload.contract_end_at;
+    }
+    const planPayload = buildAlphaScreenPlanSettingsPayload({ clientId, planKey, billingInterval, packageSnapshot });
     if (!planPayload) throw new Error('Public purchase plan settings are invalid');
     const credit = getFirstRolePrepaySnapshot(packageSnapshot);
     const creditSelected = credit?.selected === true;
@@ -1055,7 +1082,7 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     const paidDate = new Date(activationPaidAt);
     if (!Number.isNaN(paidDate.getTime())) {
       const initialTermStart = paidDate.toISOString().slice(0, 10);
-      const renewal = new Date(Date.UTC(
+      const renewal = retailOffer ? new Date(retailTermWindow({ originalStart:activationPaidAt, commitmentMonths:retailOffer.commitment_months }).term_end_at) : new Date(Date.UTC(
         paidDate.getUTCFullYear() + 1,
         paidDate.getUTCMonth(),
         paidDate.getUTCDate()
@@ -1114,7 +1141,7 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     planKey,
     billingInterval,
     fallbackCustomerId: options.fallbackCustomerId,
-    fallbackSubscriptionId: options.fallbackSubscriptionId
+    fallbackSubscriptionId: options.fallbackSubscriptionId, packageSnapshot, paidAt:activationPaidAt
   });
   await assertFence();
   const { error: clientUpdateErr } = await db
@@ -1131,7 +1158,8 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     : buildAlphaScreenPlanSettingsPayload({
       clientId,
       planKey,
-      billingInterval
+      billingInterval,
+      packageSnapshot
     });
   // billing_model is not upserted: left empty, it follows plan_tier, and a
   // value already stored is an explicit choice this activation must not undo.
