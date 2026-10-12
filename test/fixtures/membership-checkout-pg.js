@@ -5,6 +5,7 @@ const assert = require('node:assert/strict'), fs = require('node:fs'), path = re
 const h = require('./retail-signing-pg'), { sha } = require('./retail-review-fixture'), { signature } = require('./retail-signature');
 const { createMembershipRetailSigningService } = require('../../src/services/membershipRetailSigning');
 const { createMembershipCheckoutExecutor } = require('../../src/services/membershipCheckoutExecutor');
+const { createMembershipCheckoutTransport } = require('../../src/services/membershipCheckoutTransport');
 const PDF = Buffer.from('%PDF-1.7\nSYNTHETIC CHECKOUT FIXTURE\n%%EOF');
 before(() => {
   if (process.env.MEMBERSHIP_V2_DISPOSABLE !== 'true') return;
@@ -56,8 +57,10 @@ function setup(selection = {}, hooks = {}) {
   let body, session, lineList;
   const response = v => Object.assign(v, { lastResponse: { headers: { 'stripe-version': hooks.responseVersion || '2023-10-16' } } });
   const opts = o => assert.deepEqual(o, { maxNetworkRetries: 0, timeout: 10000 });
+  const httpClient = createMembershipCheckoutTransport({ getClientName: () => 'SYNTHETIC',
+    makeRequest: () => { throw Error('SYNTHETIC port must not use network'); } });
   const stripe = {
-    getApiField(k) { return k === 'version' ? (hooks.version || '2023-10-16') : undefined; }, getMaxNetworkRetries() { return 0; },
+    getApiField(k) { return k === 'version' ? (hooks.version || '2023-10-16') : k === 'httpClient' ? httpClient : undefined; }, getMaxNetworkRetries() { return 0; },
     accounts: { async retrieve(p, o) { assert.deepEqual(p, {}); opts(o); providerCalls.push('account'); return response({ object: 'account', id: hooks.account || 'acct_SYNTHETIC' }); } },
     balance: { async retrieve(p, o) { assert.deepEqual(p, {}); opts(o); providerCalls.push('balance'); return response({ object: 'balance', livemode: hooks.live || false }); } },
     paymentIntents: { async retrieve(id, p, o) {

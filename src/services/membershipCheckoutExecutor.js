@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const { isProxy } = require('node:util').types;
 const { createMembershipPendingPurchase } = require('./membershipPendingPurchase');
 const { buildRetailOffer, OFFER_VERSION } = require('./membershipOffers');
+const { isMembershipCheckoutTransport } = require('./membershipCheckoutTransport');
 const UUID = /^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const HASH = /^[0-9a-f]{64}$/;
 const API_VERSION = '2023-10-16';
@@ -35,7 +36,8 @@ function createMembershipCheckoutExecutor({ db, signing, stripe, environment, co
   const pending = createMembershipPendingPurchase({ db, signing, environment });
   function version() {
     check(stripe.getApiField('version') === API_VERSION && !stripe.getApiField('stripeAccount')
-      && stripe.getMaxNetworkRetries() === 0, 'membership_checkout_provider_mismatch');
+      && stripe.getMaxNetworkRetries() === 0 && isMembershipCheckoutTransport(stripe.getApiField('httpClient')),
+      'membership_checkout_provider_mismatch');
   }
   async function provider(call) {
     version(); let r; try { r = await call(); } catch (_) { fail('membership_checkout_provider_unavailable'); }

@@ -2,6 +2,7 @@
 const { test } = require('node:test'), assert = require('node:assert/strict'), crypto = require('node:crypto');
 const { h, setup } = require('./fixtures/membership-checkout-pg');
 const { createMembershipCheckoutExecutor } = require('../src/services/membershipCheckoutExecutor');
+const { createMembershipCheckoutTransport } = require('../src/services/membershipCheckoutTransport');
 for (const planKey of ['basic', 'pro']) for (const commitmentMonths of [3, 6, 12])
   for (const paymentOption of ['prepaid', 'monthly_installments']) for (const firstRolePrepaySelected of [false, true]) {
     test(`native Checkout ${planKey}/${commitmentMonths}/${paymentOption}/role:${firstRolePrepaySelected}`, h.opts, async () => {
@@ -179,9 +180,10 @@ async function sdkTransport(x, failCreate, run) {
       else if (req.method === 'POST' && u.pathname === '/v1/checkout/sessions') {
         const op = x.op(); assert.equal(req.headers['idempotency-key'], op.idempotency_key);
         assert.deepEqual(Object.fromEntries(new URLSearchParams(body)), flatten(op.request_body));
-        if (failCreate) { res.writeHead(500, { 'Content-Type': 'application/json', 'Stripe-Version': '2023-10-16' });
+        if (failCreate === true) { res.writeHead(500, { 'Content-Type': 'application/json', 'Stripe-Version': '2023-10-16' });
           res.end(JSON.stringify({ error: { type: 'api_error', message: 'SYNTHETIC provider unavailable' } })); return; }
         reply = await x.stripe.checkout.sessions.create(op.request_body, { ...options, idempotencyKey: op.idempotency_key });
+        if (failCreate === 'connection-reset') { req.socket.destroy(); return; }
       } else if (u.pathname.endsWith('/line_items')) {
         assert.equal(u.searchParams.get('limit'), '100'); assert.equal(u.searchParams.get('expand[0]'), 'data.price.product');
         reply = await x.stripe.checkout.sessions.listLineItems(u.pathname.split('/').at(-2), { limit: 100, expand: ['data.price.product'] }, options);
@@ -197,12 +199,16 @@ async function sdkTransport(x, failCreate, run) {
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   try {
     const client = Stripe.createNodeHttpClient(), send = client.makeRequest.bind(client), transportCalls = [];
-    client.makeRequest = (...args) => { transportCalls.push({ path: args[2], timeout: args[7] }); return send(...args); };
+    client.makeRequest = async (...args) => {
+      const call = { path: args[2], timeout: args[7] }; transportCalls.push(call);
+      try { return await send(...args); } catch (error) { call.errorCode = error.code; throw error; }
+    };
     const stripe = new Stripe('sk_test_SYNTHETIC_ONLY_NOT_A_SECRET', { apiVersion: '2023-10-16', maxNetworkRetries: 0,
-      timeout: 60000, httpClient: client, protocol: 'http', host: '127.0.0.1', port: server.address().port });
+      timeout: 60000, httpClient: createMembershipCheckoutTransport(client), protocol: 'http', host: '127.0.0.1', port: server.address().port });
     const service = createMembershipCheckoutExecutor({ db: x.db, signing: x.signing, stripe, environment: 'dev', contextId: x.contextId });
     await run(service, requests); assert.deepEqual(requests.filter(r => r.failure), []);
     assert.ok(transportCalls.length > 0); assert.ok(transportCalls.every(c => c.timeout === 10000));
+    if (failCreate === 'connection-reset') assert.deepEqual(transportCalls.filter(c => c.errorCode).map(c => c.errorCode), ['ECONNRESET']);
   } finally { await new Promise(resolve => server.close(resolve)); }
 }
 test('installed Stripe SDK sends the exact 2023 body/expiry/idempotency header and reads bound session without recreating', h.opts, async () => {
@@ -226,6 +232,20 @@ test('installed SDK actually retrieves an existing PaymentIntent with empty para
     await service.checkout(x.input); assert.equal(requests.filter(r => r.path === '/v1/payment_intents/pi_SYNTHETIC').length, 1);
     assert.equal(requests.filter(r => r.method === 'POST').length, 1);
   });
+});
+test('actual socket reset after provider create causes one POST, permanent hold and no SDK forced replay', h.opts, async () => {
+  const x = setup(); await x.sign(); await sdkTransport(x, 'connection-reset', async (service, requests) => {
+    await assert.rejects(service.checkout(x.input)); await assert.rejects(service.checkout(x.input));
+    assert.equal(requests.filter(r => r.method === 'POST').length, 1);
+    assert.equal(x.providerCalls.filter(n => n === 'create').length, 1);
+    assert.equal(h.sql(`select count(*) from membership_v2_checkout_bindings where operation_id='${x.op().id}'`), '0');
+  });
+});
+test('unprotected SDK transport is rejected before provider I/O', h.opts, async () => {
+  const x = setup(); await x.sign();
+  const stripe = { ...x.stripe, getApiField: k => k === 'httpClient' ? { makeRequest() {} } : x.stripe.getApiField(k) };
+  const service = createMembershipCheckoutExecutor({ db: x.db, signing: x.signing, stripe, environment: 'dev', contextId: x.contextId });
+  await assert.rejects(service.checkout(x.input), { code: 'membership_checkout_provider_mismatch' }); assert.equal(x.providerCalls.length, 0);
 });
 
 test('native expiry calculator respects an earlier deadline, 30m minimum plus tolerance, and 24h upper tolerance', h.opts, () => {
