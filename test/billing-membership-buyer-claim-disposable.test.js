@@ -29,8 +29,8 @@ async function fixture(t, hooks = {}) {
     insert into membership_v2_buyer_contexts(id,checkout_context_id,project_url,environment,claim_enabled)
      values('${contextId}','${f.x.contextId}','${projectUrl}','dev',true);`);
   const requests = [], rpcs = [], actorProofs = [];
-  const keys = { membership_v2_buyer_context: ['p_operation','p_context'],
-    membership_v2_record_buyer_claim: ['p_operation','p_context','p_actor'], membership_v2_read_buyer_claim: ['p_operation','p_context','p_actor'] };
+  const keys = Object.fromEntries(['membership_v2_buyer_context','membership_v2_record_buyer_claim','membership_v2_read_buyer_claim']
+    .map(k=>[k,['p_operation','p_context','p_actor','p_project','p_environment']]));
   const server = http.createServer(async (req, res) => {
     let body = ''; for await (const b of req) body += b;
     requests.push({ path: req.url, method: req.method });
@@ -64,7 +64,7 @@ async function fixture(t, hooks = {}) {
   const create = overrides => createMembershipBuyerClaim({ db, projectUrl, publicApiKey, environment:'dev',contextId,fetchImplementation,...overrides });
   const service = create(), input = {operationId:f.op.id,accessToken:token};
   const get = () => JSON.parse(h.sql(`select coalesce((select row_to_json(t) from membership_v2_buyer_claims t where operation_id='${f.op.id}'),'null'::json)`));
-  const native = (write = true, proof = actor) => `set role service_role;select membership_v2_${write?'record':'read'}_buyer_claim('${f.op.id}','${contextId}',${h.literal(proof)});`;
+  const native = (write = true, proof = actor) => `set role service_role;select membership_v2_${write?'record':'read'}_buyer_claim('${f.op.id}','${contextId}',${h.literal(proof)},'${projectUrl}','dev');`;
   return { f, userId, sessionId, contextId, token, actor, payload, input, service, requests, rpcs, actorProofs, create, get, native,
     changeUser: changes => { authUser = {...authUser,...changes}; } };
 }
@@ -88,7 +88,7 @@ test('lost commit ACK: fresh Auth + one authorized read, zero repeat insert', h.
 test('wrong/missing native payment or config closed prevents claim', h.opts, async t => {
   const unpaid = await fixture(t,{unpaid:true}); await hold(unpaid.service.claim(unpaid.input)); assert.equal(unpaid.get(),null);
   const f = await fixture(t); h.sql(`update membership_v2_buyer_contexts set claim_enabled=false where id='${f.contextId}'`);
-  await hold(f.service.claim(f.input)); assert.equal(f.requests.length,1); assert.equal(f.get(),null);
+  await hold(f.service.claim(f.input)); assert.equal(f.requests.length,2); assert.equal(f.requests[0].path,'/auth/v1/user'); assert.equal(f.get(),null);
 });
 test('verified source email stays exact; plus/dot aliases are not collapsed; metadata cannot authorize', h.opts, async t => {
   const f=await fixture(t); f.changeUser({email:'different@example.invalid',user_metadata:{email:f.actor.email}});
@@ -109,7 +109,7 @@ test('logout between verified getUser and native insert, or after insert before 
     const hooks=after?{afterRPC:(name,{sessionId})=>{if(name==='membership_v2_record_buyer_claim')h.sql(`delete from auth.sessions where id='${sessionId}'`);}}
       :{onAuth:(count,{sessionId})=>{if(count===1)h.sql(`delete from auth.sessions where id='${sessionId}'`);}};
     const f=await fixture(t,hooks);await hold(f.service.claim(f.input));assert.equal(!!f.get(),after);
-    assert.equal(f.rpcs.filter(n=>n==='membership_v2_record_buyer_claim').length,1);
+    assert.equal(f.rpcs.filter(n=>n==='membership_v2_record_buyer_claim').length,after?1:0);
   }
 });
 test('successful/lost-ACK read revalidates current SDK actor, with no leaked winner', h.opts, async t => {
@@ -170,7 +170,7 @@ test('ACL/RLS private routines deny browsers, direct runtime writes/reads and de
   }
   h.denied('set role service_role;select * from membership_v2_buyer_claims',/permission denied/);
   h.denied(`set role service_role;insert into membership_v2_buyer_claims(operation_id,user_id,access_eligible)values('${f.f.op.id}','${f.userId}',true)`,/permission denied/);
-  h.denied(`set role authenticated;select membership_v2_record_buyer_claim('${f.f.op.id}','${f.contextId}',${h.literal(f.actor)})`,/permission denied/);
+  h.denied(`set role authenticated;select membership_v2_record_buyer_claim('${f.f.op.id}','${f.contextId}',${h.literal(f.actor)},'${projectUrl}','dev')`,/permission denied/);
   h.denied(`set role service_role;select * from auth.users`,/permission denied/);
   h.denied(`set role service_role;select * from auth.sessions`,/permission denied/);
   h.denied(`update membership_v2_buyer_contexts set project_url='https://zyxwvutsrqponmlkjihg.supabase.co' where id='${f.contextId}'`,/immutable_buyer_context/);
@@ -188,8 +188,38 @@ test('malformed/accessor/proxy/request-selected identities and project/key misma
   assert.equal(f.get(),null);
 });
 test('original payment stays historical despite later refund/dispute; ownership gives NO funded access', h.opts, async t => {
-  const f=await fixture(t);f.f.graph.charge.amount_refunded=f.f.graph.charge.amount;f.f.graph.charge.disputed=true;await f.f.observe();
+  const f=await fixture(t),capture=f.f.get('membership_v2_capture_facts'),invoice=f.f.get('membership_v2_paid_invoice_facts');
+  f.f.graph.charge.amount_refunded=f.f.graph.charge.amount;f.f.graph.charge.disputed=true;await f.f.observe();
+  const observation=JSON.parse(h.sql(`select observation from membership_v2_capture_observations where operation_id='${f.f.op.id}' order by observed_at desc limit 1`));
+  assert.equal(observation.amount_refunded,capture.captured_cents);assert.equal(observation.disputed,true);
+  assert.deepEqual(f.f.get('membership_v2_capture_facts'),capture);assert.deepEqual(f.f.get('membership_v2_paid_invoice_facts'),invoice);
   const r=await f.service.claim(f.input);assert.equal(r.accountOwnershipVerified,true);assert.equal(r.activationEnabled,false);
   assert.equal(r.paidAt,f.f.graph.invoice.status_transitions.paid_at);
   for(const k of ['access','term','commission','collection'])assert.equal(f.get()[`${k}_eligible`],false);
+  const stored=f.get();assert.deepEqual(await f.service.claim(f.input),r);assert.deepEqual(f.get(),stored);
+  const other=crypto.randomUUID(),sid=crypto.randomUUID();
+  h.sql(`insert into auth.users(id,email,email_confirmed_at) values('${other}',${h.literal(f.actor.email)},${h.literal(f.actor.confirmed_at)});
+    insert into auth.sessions values('${sid}','${other}',clock_timestamp()-interval '1 second',null);`);
+  for(const write of [true,false])h.denied(f.native(write,{...f.actor,user_id:other,session_id:sid}),/membership_buyer_claim_held/);
+  assert.deepEqual(f.get(),stored);
+});
+test('every preflight read is freshly authenticated and native project/session scoped', h.opts, async t => {
+  const f=await fixture(t);await f.service.claim(f.input);assert.equal(f.requests[0].path,'/auth/v1/user');
+  h.denied(`set role service_role;select membership_v2_buyer_context('${f.f.op.id}','${f.contextId}',${h.literal(f.actor)},'https://zyxwvutsrqponmlkjihg.supabase.co','dev')`,/membership_buyer_claim_held/);
+  h.denied(`set role service_role;select membership_v2_buyer_context('${f.f.op.id}','${f.contextId}',${h.literal(f.actor)},'${projectUrl}','production')`,/membership_buyer_claim_held/);
+  h.sql(`delete from auth.sessions where id='${f.sessionId}'`);
+  h.denied(`set role service_role;select membership_v2_buyer_context('${f.f.op.id}','${f.contextId}',${h.literal(f.actor)},'${projectUrl}','dev')`,/membership_buyer_claim_held/);
+});
+test('pg_catalog SHA256 is core, schema pinned; temp/public shadows cannot affect native digest verification', h.opts, async t => {
+  const f=await fixture(t);
+  assert.equal(h.sql(`select n.nspname from pg_proc p join pg_namespace n on n.oid=p.pronamespace where p.oid='pg_catalog.sha256(bytea)'::regprocedure`),'pg_catalog');
+  const sql=`set role service_role;create temporary table buyer_hash_shadow(x integer);
+    create function pg_temp.sha256(bytea) returns bytea language sql as 'select decode(repeat(''0'',64),''hex'')';
+    ${f.native()}`;
+  const result=h.run(sql);assert.equal(result.status,0,result.stderr);assert.ok(f.get());
+  h.sql(`create function public.sha256(bytea) returns bytea language sql as 'select decode(repeat(''0'',64),''hex'')'`);
+  try {const r=h.run(f.native(false));assert.equal(r.status,0,r.stderr);}
+  finally {h.sql('drop function public.sha256(bytea)');}
+  const m=fs.readFileSync(path.join(__dirname,'../supabase/migrations',migration),'utf8');
+  assert.match(m,/security definer set search_path=pg_catalog as/);assert.equal((m.match(/pg_catalog\.sha256\(/g)||[]).length,2);
 });

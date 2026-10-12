@@ -59,13 +59,13 @@ end $$;
 -- private INSERT. No Auth grants, directory lookup, arbitrary SQL, or browser
 -- entrypoint. The service is already the trusted private runtime, not a caller
 -- supplying its own decoded JWT identity. SDK verification precedes this RPC.
-create function membership_v2_private.buyer_claim(p_operation uuid,p_context uuid,p_actor jsonb,p_write boolean)
-returns jsonb language plpgsql security definer set search_path=pg_catalog,pg_temp as $$
+create function membership_v2_private.buyer_claim(p_operation uuid,p_context uuid,p_actor jsonb,p_project text,p_environment text,p_action text)
+returns jsonb language plpgsql security definer set search_path=pg_catalog as $$
 declare o public.membership_v2_checkout_operations; cfg public.membership_v2_buyer_contexts;
  c public.membership_v2_capture_facts; i public.membership_v2_paid_invoice_facts;
  u auth.users; s auth.sessions; n timestamptz; x jsonb; e text; r public.membership_v2_buyer_claims;
 begin
- if current_setting('role',true) is distinct from 'service_role' or p_write is null
+ if current_setting('role',true) is distinct from 'service_role' or p_action is null or p_action not in ('context','record','read')
   or not public.membership_v2_fact_keys(p_actor,array['user_id','email','confirmed_at','session_id','expires_epoch'])
   or octet_length(p_actor::text)>1024
   or exists(select 1 from jsonb_each(p_actor) z where z.key<>'expires_epoch' and jsonb_typeof(z.value)<>'string')
@@ -78,7 +78,9 @@ begin
  select * into o from public.membership_v2_checkout_operations where id=p_operation for update;
  if not found then raise exception 'membership_buyer_claim_held';end if;
  select * into cfg from public.membership_v2_buyer_contexts where id=p_context for share;
- if not found or not cfg.claim_enabled or cfg.checkout_context_id<>o.context_id then raise exception 'membership_buyer_claim_held';end if;
+ if not found or not cfg.claim_enabled or cfg.checkout_context_id<>o.context_id
+  or cfg.project_url is distinct from p_project or cfg.environment is distinct from p_environment then
+  raise exception 'membership_buyer_claim_held';end if;
  select * into u from auth.users where id=(p_actor->>'user_id')::uuid for share;
  if not found then raise exception 'membership_buyer_claim_held';end if;
  select * into s from auth.sessions where id=(p_actor->>'session_id')::uuid and user_id=u.id for share;
@@ -101,15 +103,18 @@ begin
  if not found then raise exception 'membership_buyer_claim_held';end if;
  select * into i from public.membership_v2_paid_invoice_facts where operation_id=o.id;
  if not found or c.purchase_id<>o.purchase_id or c.source_digest<>o.source_digest or i.source_digest<>o.source_digest
-  or c.proof_digest<>encode(sha256(convert_to(c.proof::text,'UTF8')),'hex')
-  or i.proof_digest<>encode(sha256(convert_to(i.proof::text,'UTF8')),'hex')
+  or c.proof_digest<>encode(pg_catalog.sha256(convert_to(c.proof::text,'UTF8')),'hex')
+  or i.proof_digest<>encode(pg_catalog.sha256(convert_to(i.proof::text,'UTF8')),'hex')
   or not public.membership_v2_capture_proof_matches(o.id,c.proof)
   or not public.membership_v2_invoice_proof_matches(o.id,i.proof)
   or to_timestamp(i.provider_paid_at)>n then raise exception 'membership_buyer_claim_held';end if;
  -- Original capture/invoice are historical identity only. Current refunds or
  -- disputes do NOT erase who paid. This deliberately grants NO funded access;
  -- later admission must perform fresh current-risk/remaining-funds checks.
- if p_write then
+ if p_action='context' then
+  return jsonb_build_object('project_url',cfg.project_url,'environment',cfg.environment,'claim_enabled',cfg.claim_enabled);
+ end if;
+ if p_action='record' then
   insert into public.membership_v2_buyer_claims(purchase_id,operation_id,context_id,user_id,canonical_email,
    source_digest,capture_digest,invoice_digest,provider_paid_at,claimed_at)
    values(o.purchase_id,o.id,cfg.id,u.id,e,o.source_digest,c.proof_digest,i.proof_digest,i.provider_paid_at,n)
@@ -124,20 +129,17 @@ begin
   'commission_eligible',r.commission_eligible,'collection_eligible',r.collection_eligible);
 exception when others then raise exception 'membership_buyer_claim_held' using errcode='P0001';
 end $$;
-create function public.membership_v2_record_buyer_claim(p_operation uuid,p_context uuid,p_actor jsonb)
+create function public.membership_v2_record_buyer_claim(p_operation uuid,p_context uuid,p_actor jsonb,p_project text,p_environment text)
 returns jsonb language sql security invoker set search_path=pg_catalog as $$
- select membership_v2_private.buyer_claim(p_operation,p_context,p_actor,true);
+ select membership_v2_private.buyer_claim(p_operation,p_context,p_actor,p_project,p_environment,'record');
 $$;
-create function public.membership_v2_read_buyer_claim(p_operation uuid,p_context uuid,p_actor jsonb)
+create function public.membership_v2_read_buyer_claim(p_operation uuid,p_context uuid,p_actor jsonb,p_project text,p_environment text)
 returns jsonb language sql security invoker set search_path=pg_catalog as $$
- select membership_v2_private.buyer_claim(p_operation,p_context,p_actor,false);
+ select membership_v2_private.buyer_claim(p_operation,p_context,p_actor,p_project,p_environment,'read');
 $$;
-create function public.membership_v2_buyer_context(p_operation uuid,p_context uuid)
+create function public.membership_v2_buyer_context(p_operation uuid,p_context uuid,p_actor jsonb,p_project text,p_environment text)
 returns jsonb language sql security invoker set search_path=pg_catalog as $$
- select jsonb_build_object('project_url',c.project_url,'environment',c.environment,'claim_enabled',c.claim_enabled)
- from public.membership_v2_buyer_contexts c join public.membership_v2_checkout_operations o on o.context_id=c.checkout_context_id
- join public.membership_v2_checkout_contexts k on k.id=o.context_id and k.environment=c.environment
- where c.id=p_context and o.id=p_operation;
+ select membership_v2_private.buyer_claim(p_operation,p_context,p_actor,p_project,p_environment,'context');
 $$;
 do $$declare t text;begin
  foreach t in array array['membership_v2_buyer_contexts','membership_v2_buyer_claims'] loop
@@ -148,10 +150,10 @@ do $$declare t text;begin
  end loop;
 end $$;
 grant select on public.membership_v2_buyer_contexts to service_role;
-revoke all on function membership_v2_private.buyer_claim(uuid,uuid,jsonb,boolean),public.membership_v2_guard_buyer_context(),
- public.membership_v2_buyer_email(text),public.membership_v2_record_buyer_claim(uuid,uuid,jsonb),
- public.membership_v2_read_buyer_claim(uuid,uuid,jsonb),public.membership_v2_buyer_context(uuid,uuid)
+revoke all on function membership_v2_private.buyer_claim(uuid,uuid,jsonb,text,text,text),public.membership_v2_guard_buyer_context(),
+ public.membership_v2_buyer_email(text),public.membership_v2_record_buyer_claim(uuid,uuid,jsonb,text,text),
+ public.membership_v2_read_buyer_claim(uuid,uuid,jsonb,text,text),public.membership_v2_buyer_context(uuid,uuid,jsonb,text,text)
  from public,anon,authenticated,service_role;
-grant execute on function membership_v2_private.buyer_claim(uuid,uuid,jsonb,boolean),public.membership_v2_record_buyer_claim(uuid,uuid,jsonb),
- public.membership_v2_read_buyer_claim(uuid,uuid,jsonb),public.membership_v2_buyer_context(uuid,uuid) to service_role;
+grant execute on function membership_v2_private.buyer_claim(uuid,uuid,jsonb,text,text,text),public.membership_v2_record_buyer_claim(uuid,uuid,jsonb,text,text),
+ public.membership_v2_read_buyer_claim(uuid,uuid,jsonb,text,text),public.membership_v2_buyer_context(uuid,uuid,jsonb,text,text) to service_role;
 commit;

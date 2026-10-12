@@ -23,7 +23,7 @@ function publicKey(v) {
   if (typeof v !== 'string' || v.length > 4096) return false;
   if (/^sb_publishable_[A-Za-z0-9_-]{16,}$/.test(v)) return true;
   if (!TOKEN.test(v)) return false;
-  const p = jwtPart(v); return p.role === 'anon'; // Config class, not JWT authentication.
+  const p = jwtPart(v); return p?.role === 'anon'; // Config class, not JWT authentication.
 }
 function createMembershipBuyerClaim({ db, projectUrl, publicApiKey, environment, contextId, fetchImplementation = globalThis.fetch } = {}) {
   check(typeof projectUrl === 'string' && /^https:\/\/[a-z0-9]{20}\.supabase\.co$/.test(projectUrl)
@@ -42,9 +42,11 @@ function createMembershipBuyerClaim({ db, projectUrl, publicApiKey, environment,
   async function rpc(name, args) {
     const r = await db.rpc(name, args); check(r && !r.error); return r.data;
   }
-  async function context(operationId) {
+  const nativeArgs = (operationId, a) => ({ p_operation: operationId, p_context: contextId, p_actor: a,
+    p_project: projectUrl, p_environment: environment });
+  async function context(operationId, a) {
     check(db.supabaseUrl === projectUrl);
-    const c = await rpc('membership_v2_buyer_context', { p_operation: operationId, p_context: contextId });
+    const c = await rpc('membership_v2_buyer_context', nativeArgs(operationId, a));
     check(c?.project_url === projectUrl && c.environment === environment && c.claim_enabled === true); return c;
   }
   async function actor(token) {
@@ -66,14 +68,15 @@ function createMembershipBuyerClaim({ db, projectUrl, publicApiKey, environment,
     try {
       check(exact(input, ['operationId', 'accessToken']) && typeof input.operationId === 'string' && UUID.test(input.operationId)
         && typeof input.accessToken === 'string' && input.accessToken.length <= 16384 && TOKEN.test(input.accessToken));
-      await context(input.operationId); const a = await actor(input.accessToken);
+      const a = await actor(input.accessToken); await context(input.operationId, a);
       let ack;
-      try { ack = await db.rpc('membership_v2_record_buyer_claim', { p_operation: input.operationId, p_context: contextId, p_actor: a }); }
+      try { ack = await db.rpc('membership_v2_record_buyer_claim', nativeArgs(input.operationId, a)); }
       catch (_) { /* Unknown ACK: fresh authorized read once, no second insert. */ }
       // Every read, including successful ACK, requires a fresh same actor.
-      await context(input.operationId); const fresh = await actor(input.accessToken);
+      const fresh = await actor(input.accessToken);
       check(fresh.user_id === a.user_id && fresh.email === a.email && fresh.session_id === a.session_id);
-      const row = await rpc('membership_v2_read_buyer_claim', { p_operation: input.operationId, p_context: contextId, p_actor: fresh });
+      await context(input.operationId, fresh);
+      const row = await rpc('membership_v2_read_buyer_claim', nativeArgs(input.operationId, fresh));
       check(row?.operation_id === input.operationId && row.user_id === fresh.user_id && UUID.test(row.claim_id || '')
         && ['access', 'term', 'commission', 'collection'].every(k => row[`${k}_eligible`] === false));
       if (ack && !ack.error) check(ack.data?.claim_id === row.claim_id);
