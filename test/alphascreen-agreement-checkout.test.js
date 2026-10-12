@@ -608,7 +608,8 @@ test('mismatched/malformed new saved sources, templates, terms and expiration ho
     ({ i }) => { i.expires_at = 'bad-date'; },
     ({ i }) => { i.expires_at = new Date(Date.now() - 1000).toISOString(); },
     ({ i }) => { i.package_snapshot = retailRows({ months: 6 }).snapshot; },
-    ({ i }) => { i.package_snapshot = makeSnapshot('basic', 'monthly'); }
+    ({ i }) => { i.package_snapshot = makeSnapshot('basic', 'monthly'); },
+    ({ i }) => { i.promotion_code_id = 'promo_synthetic'; }
   ];
   for (const change of cases) {
     // Separately cloned persisted JSON objects, as returned by the database.

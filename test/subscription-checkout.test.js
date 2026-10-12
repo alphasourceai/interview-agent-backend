@@ -98,7 +98,7 @@ function makeDb() {
   return db
 }
 
-function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder }) {
+function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder, customerOverride = {} }) {
   delete require.cache[checkoutPath]
   delete require.cache[supabaseClientPath]
   delete require.cache[clientBillingScopePath]
@@ -121,7 +121,7 @@ function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder }) {
   injectModule(stripePath, stripeConstructor || function Stripe() {
     return {
       customers: {
-        retrieve: async (id) => ({ id }),
+        retrieve: async (id) => ({ id, discount: null, balance: 0, ...customerOverride }),
         update: async (id, payload) => {
           stripeCalls.customerUpdates.push({ id, payload })
           return { id, ...payload }
@@ -345,7 +345,7 @@ test('existing subscription checkout prices all24 retail variants from frozen pa
     assert.equal(p.customer,'cus_existing');assert.equal(p.line_items.length,role?2:1);
     assert.equal(p.line_items[0].price_data.unit_amount,offer.platform_payment_cents);
     assert.deepEqual(p.line_items[0].price_data.recurring,{interval:'month',interval_count:payment==='prepaid'?months:1});
-    assert.equal(p.allow_promotion_codes,true);assert.equal(p.metadata.client_id,'client-1');assert.equal(p.metadata.plan_tier,planKey);
+    assert.equal(p.allow_promotion_codes,payment!=='prepaid');assert.equal(p.metadata.client_id,'client-1');assert.equal(p.metadata.plan_tier,planKey);
     assert.equal(p.metadata.billing_interval,snapshot.billing_cadence);assert.equal(p.metadata.membership_commitment_months,String(months));
     assert.equal(p.metadata.first_role_prepay_selected,String(role));assert.equal(p.metadata.first_role_prepay_amount_cents,String(offer.first_role_prepay.amount_cents));
     assert.deepEqual(p.subscription_data.metadata,p.metadata);assert.equal('trial_end' in p.subscription_data,false);
@@ -377,18 +377,31 @@ test('confirmed new retail embedded checkout retains its primary session without
   assert.equal(calls.sessions.length,1);assert.equal(result.session.id,'cs_SYNTHETIC_EMBEDDED');assert.equal(result.fallbackSession,null);
   assert.equal(result.checkoutClientSecret,'SYNTHETIC_NOT_A_REAL_SECRET');
 });
-test('new retail pricing preserves the existing validated promotion-code behavior',async()=>{
+test('monthly retail installments preserve the existing validated promotion-code behavior',async()=>{
   const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls});
-  await create({clientId:'client-1',planTier:'basic',billingInterval:'prepaid',packageSnapshot:retailSnapshot(),
+  await create({clientId:'client-1',planTier:'basic',billingInterval:'monthly',packageSnapshot:retailSnapshot('basic',3,'monthly_installments'),
     idempotencyKey:'existing-agreement:promotion',metadataSource:'agreement_checkout',promotionCodeId:'promo_validated'});
   assert.deepEqual(calls.sessions[0].payload.discounts,[{promotion_code:'promo_validated'}]);
   assert.equal('allow_promotion_codes' in calls.sessions[0].payload,false);
+});
+test('new prepaid refuses extra promotions before provider effects and customer discounts/credits before updates or checkout',async()=>{
+  const base={clientId:'client-1',planTier:'basic',billingInterval:'prepaid',packageSnapshot:retailSnapshot(),
+    idempotencyKey:'existing-agreement:exact-prepaid',metadataSource:'agreement_checkout'};
+  const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls});
+  await assert.rejects(create({...base,promotionCodeId:'promo_synthetic'}),e=>e.code==='retail_prepaid_discount_denied');
+  assert.equal(calls.sessions.length,0);assert.equal(calls.customerCreates.length,0);assert.equal(calls.customerUpdates.length,0);
+  for(const customerOverride of [{discount:{id:'di_synthetic'}},{balance:-120000},{balance:100},{balance:undefined},{discount:undefined},
+    {discounts:['di_synthetic']},{invoice_credit_balance:{usd:100}},{cash_balance:{available:{usd:100}}},{deleted:true}]){
+    const c=retailCalls(),{createSubscriptionCheckoutSession:fn}=loadCheckout({stripeCalls:c,customerOverride});
+    await assert.rejects(fn(base),e=>e.code==='retail_customer_adjustment_denied');
+    assert.equal(c.sessions.length,0);assert.equal(c.customerCreates.length,0);assert.equal(c.customerUpdates.length,0);assert.equal(c.subscriptionLists.length,0);
+  }
 });
 test('installed Stripe16 SDK serializes new retail terms through the existing Checkout function on loopback only',async t=>{
   const requests=[],server=http.createServer(async(req,res)=>{
     let body='';for await(const b of req)body+=b;const p=new URLSearchParams(body);
     requests.push({method:req.method,path:req.url,body:p,version:req.headers['stripe-version'],key:req.headers['idempotency-key']});
-    let data;if(req.method==='GET'&&req.url==='/v1/customers/cus_existing')data={object:'customer',id:'cus_existing'};
+    let data;if(req.method==='GET'&&req.url==='/v1/customers/cus_existing')data={object:'customer',id:'cus_existing',discount:null,balance:0};
     else if(req.method==='POST'&&req.url==='/v1/customers/cus_existing')data={object:'customer',id:'cus_existing'};
     else if(req.method==='GET'&&req.url.startsWith('/v1/subscriptions?'))data={object:'list',data:[],has_more:false};
     else if(req.method==='POST'&&req.url==='/v1/checkout/sessions')data={object:'checkout.session',id:'cs_SYNTHETIC',url:'https://checkout.stripe.test/SYNTHETIC'};
@@ -405,6 +418,7 @@ test('installed Stripe16 SDK serializes new retail terms through the existing Ch
     const request=requests.at(-1),p=request.body;assert.equal(request.path,'/v1/checkout/sessions');assert.equal(request.method,'POST');
     assert.equal(request.version,'2023-10-16');assert.equal(request.key,`existing-agreement:${plan}:${months}:${payment}:sdk`);
     assert.equal(p.get('mode'),'subscription');assert.equal(p.get('line_items[0][price_data][unit_amount]'),String(s.platform_fee_cents));
+    assert.equal(p.get('allow_promotion_codes'),String(payment!=='prepaid'));assert.equal(p.has('discounts[0][promotion_code]'),false);
     assert.equal(p.get('line_items[0][price_data][recurring][interval_count]'),String(payment==='prepaid'?months:1));
     assert.equal(p.get('line_items[1][price_data][unit_amount]'),String(plan==='basic'?35900:62900));
     assert.equal(p.has('line_items[1][price_data][recurring][interval]'),false);assert.equal(p.get('metadata[membership_commitment_months]'),String(months));

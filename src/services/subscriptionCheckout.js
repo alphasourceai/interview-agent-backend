@@ -194,7 +194,8 @@ function normalizeFirstRolePrepayCheckout(value) {
 async function resolveStripeCustomerId({
   stripe,
   client,
-  billingCustomerList
+  billingCustomerList,
+  exactPrepaid = false
 }) {
   const candidateStripeCustomerIds = []
   const customerRows = Array.isArray(billingCustomerList) ? billingCustomerList : []
@@ -211,7 +212,18 @@ async function resolveStripeCustomerId({
   let resolvedStripeCustomerId = null
   for (const candidateId of candidateStripeCustomerIds) {
     try {
-      await stripe.customers.retrieve(candidateId)
+      const customer = await stripe.customers.retrieve(candidateId)
+      // New prepaid commercial totals must not inherit old customer discounts
+      // or account credits. Refuse, never clear/change the customer's balance.
+      // Actual paid-invoice proof is still independently required at fulfillment.
+      if (exactPrepaid && (customer.deleted === true || customer.discount !== null
+        || !Number.isSafeInteger(customer.balance) || customer.balance !== 0
+        || (customer.discounts != null && (!Array.isArray(customer.discounts) || customer.discounts.length > 0))
+        || (customer.invoice_credit_balance != null && Object.values(customer.invoice_credit_balance).some(value => value !== 0))
+        || (customer.cash_balance != null && (typeof customer.cash_balance !== 'object'
+          || Object.values(customer.cash_balance.available || {}).some(value => value !== 0))))) {
+        throw makeError(409, 'retail_customer_adjustment_denied', 'This prepaid checkout requires review of existing customer discounts or credits.')
+      }
       resolvedStripeCustomerId = candidateId
       break
     } catch (e) {
@@ -274,6 +286,10 @@ async function createSubscriptionCheckoutSession({
   const embeddedCheckoutRequested = wantsEmbeddedCheckout(embedded)
   const normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey)
   const normalizedPromotionCodeId = String(promotionCodeId || '').trim().slice(0, 255)
+  const exactPrepaid = retailOffer?.payment_option === 'prepaid'
+  if (exactPrepaid && normalizedPromotionCodeId) {
+    throw makeError(409, 'retail_prepaid_discount_denied', 'Additional checkout discounts are not available for this prepaid offer.')
+  }
   const firstRolePrepayCheckout = normalizeFirstRolePrepayCheckout(firstRolePrepay)
   if (retailOffer && firstRolePrepayCheckout && (!retailOffer.first_role_prepay.selected
     || firstRolePrepayCheckout.amount_cents !== retailOffer.first_role_prepay.amount_cents
@@ -353,9 +369,11 @@ async function createSubscriptionCheckoutSession({
     resolvedStripeCustomerId = await resolveStripeCustomerId({
       stripe,
       client,
-      billingCustomerList
+      billingCustomerList,
+      exactPrepaid
     })
   } catch (e) {
+    if (e?.code === 'retail_customer_adjustment_denied') throw e
     throw makeError(500, 'stripe_customer_failed', e?.message || 'Stripe customer resolution failed.')
   }
   if (!resolvedStripeCustomerId) throw makeError(400, 'missing_billing_customer', 'Missing billing customer.')
@@ -566,7 +584,7 @@ async function createSubscriptionCheckoutSession({
     mode: 'subscription',
     customer: resolvedStripeCustomerId,
     line_items: lineItems,
-    ...(enterpriseTerms?.acceptedPoolQuote?{}:normalizedPromotionCodeId
+    ...(exactPrepaid ? { allow_promotion_codes: false } : enterpriseTerms?.acceptedPoolQuote?{}:normalizedPromotionCodeId
       ? { discounts: [{ promotion_code: normalizedPromotionCodeId }] }
       : { allow_promotion_codes: true }),
     metadata: checkoutMetadata,

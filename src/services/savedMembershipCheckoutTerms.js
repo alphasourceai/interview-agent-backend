@@ -63,6 +63,7 @@ function readSavedRetailCheckoutTerms({ agreement, intent } = {}) {
         && intent.first_role_prepay_discount_percent === 10 && intent.first_role_prepay_credit_type === 'first_role_prepay');
     }
     validDeadline(intent.expires_at, 'purchase_intent_expired');
+    if (offer.payment_option === 'prepaid') check(!String(intent.promotion_code_id || '').trim(), 'retail_prepaid_discount_denied');
     if (saved.source === 'public_purchase_intent') check(offer.payment_option === 'prepaid', 'public_installments_not_available');
   } else check(!intent && !intentOffer);
   return { offer, billingInterval: cadence, packageSnapshot: saved.package_snapshot };
