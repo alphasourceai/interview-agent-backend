@@ -865,6 +865,20 @@ router.post('/agreements/send', async (req, res) => {
     // Priced before a client can be created, so a pricing failure leaves nothing behind.
     const pricedPayload = await withPricedPool(payload);
 
+    // Only new marked pool drafts acquire a frozen checkout deadline. Use the
+    // existing seven-day signing window when none was explicitly chosen; legacy
+    // drafts/accepted agreements and later resend-token rotations are untouched.
+    const markedPool = pricedPayload.pool_offer_snapshot != null;
+    const initialSigningExpiry = new Date(Date.now() + SIGNING_LINK_TTL_MS).toISOString();
+    if (markedPool) {
+      const deadline = pricedPayload.agreement_expires_at || initialSigningExpiry;
+      const epoch = Date.parse(deadline);
+      if (!Number.isFinite(epoch) || epoch <= Date.now()) {
+        return res.status(400).json({ error: 'invalid_agreement_expiry', code: 'invalid_agreement_expiry', request_id });
+      }
+      pricedPayload.agreement_expires_at = new Date(epoch).toISOString();
+    }
+
     const clientContext = await resolveAgreementClientContext(payload);
     const resolvedClientId = clientContext?.client_id || null;
     if (!resolvedClientId) {
@@ -953,7 +967,9 @@ router.post('/agreements/send', async (req, res) => {
 
     const signerToken = crypto.randomBytes(32).toString('hex');
     const signerTokenHash = crypto.createHash('sha256').update(signerToken).digest('hex');
-    const signerTokenExpiresAt = new Date(Date.now() + SIGNING_LINK_TTL_MS).toISOString();
+    const signerTokenExpiresAt = markedPool
+      ? new Date(Math.min(Date.parse(initialSigningExpiry), Date.parse(normalized.agreement_expires_at))).toISOString()
+      : new Date(Date.now() + SIGNING_LINK_TTL_MS).toISOString();
     const signingUrl = buildMembershipAgreementSignUrl(signerToken);
 
     const templateSnapshot = {
@@ -995,6 +1011,7 @@ router.post('/agreements/send', async (req, res) => {
         draft_pdf_path: draftPdfPath,
         signer_token_hash: signerTokenHash,
         signer_token_expires_at: signerTokenExpiresAt,
+        ...(markedPool ? { agreement_expires_at: normalized.agreement_expires_at } : {}),
         created_by_user_id: req.user?.id || null,
         created_by_email: req.user?.email || null
       })

@@ -28,17 +28,32 @@ Before-row guards derive source/money/time instead of accepting caller-priced
 columns. Operation updates/deletes/truncate and pool binding backfill/reassignment
 are denied. Owned pools cannot acquire provider IDs through this primitive.
 Unowned legacy pools retain earlier behavior.
+Owned failed/voided pools are terminal: neither a status reset nor a matching
+reservation retry can resurrect them. Same-state bookkeeping remains allowed.
+
+New marked admin pool drafts persist an explicit finite future deadline in both
+the native row and the rendered/snapshot values before sending. When absent,
+the existing initial seven-day signing window supplies that deadline. The link
+cannot outlive it; resend tokens do not extend it. No old accepted draft or
+unmarked legacy agreement is backfilled or changed. The column already exists
+in 20260919161500_sales_completion_tweaks.sql.
 
 Agreement and owner/environment/key uniqueness prevent a new operation after
 retry. Known/unknown reservation replies require a separate scoped READ-only
 native ownership check of both rows. No second reservation, provider effect or
 fallback occurs on ambiguous/missing/corrupt readback. Source supersession,
 customer/member/Auth changes and expiry hold instead of extending/repricing.
+Temporal admission uses the native database clock, not the application clock.
+The JavaScript adapter validates the frozen window's shape, but does not reject
+a committed pair merely because its own wall clock is ahead or behind.
 
 The operation source_digest is an opaque native-only checksum of stored jsonb
 bytes. It is not cross-language canonical JSON and must not be recomputed with
 JavaScript serialization. Native JSONB equality governs logical source replay;
 the nine-field pool digest keeps its prior fixed-order UTF8 canonical scheme.
+PostgreSQL's built-in pg_catalog.sha256(bytea) supplies the opaque checksum; it
+does not depend on pgcrypto installation or schema. The older pool digest uses
+the separately resolved pgcrypto extension, tested in public and extensions.
 
 This slice supports an existing authenticated parent owner and signed, dated
 marked Enterprise usage source. It does not solve new-buyer account timing,

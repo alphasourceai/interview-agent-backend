@@ -44,8 +44,8 @@ function createEnterpriseCheckoutReservationService({db,configuration}={}){
   let result;try{result=await getUser(token);}catch(_){fail('enterprise_reservation_auth_unavailable',503);}
   const user=result?.data?.user;
   check(!result?.error && user && UUID.test(user.id) && user.is_anonymous===false && user.deleted_at==null
-   && instant(user.email_confirmed_at) && Date.parse(user.email_confirmed_at)<=Date.now()
-   && (user.banned_until==null || (instant(user.banned_until) && Date.parse(user.banned_until)<=Date.now()))
+   && instant(user.email_confirmed_at)
+   && (user.banned_until==null || instant(user.banned_until))
    && email(user.email).length>0,'enterprise_reservation_scope_denied',403);
   return Object.freeze({id:user.id,email:email(user.email)});
  }
@@ -100,8 +100,9 @@ function createEnterpriseCheckoutReservationService({db,configuration}={}){
    && Number.isSafeInteger(o.platform_cents) && o.platform_cents>0 && o.platform_cents<=2147483647
    && ['month','year'].includes(o.platform_interval) && instant(o.created_at) && instant(o.expires_at)
    && instant(o.calendar_anchor_at) && Date.parse(o.expires_at)-Date.parse(o.created_at)===3600000
-   && Date.parse(o.expires_at)<Date.parse(o.calendar_anchor_at) && Date.parse(o.expires_at)>Date.now()
-   && Date.parse(o.created_at)<=Date.now() && Date.parse(o.created_at)%1000===0
+   // Native READ checks current expiry/Auth status using the database clock.
+   // Application-clock skew must not strand an otherwise valid committed pair.
+   && Date.parse(o.expires_at)<Date.parse(o.calendar_anchor_at) && Date.parse(o.created_at)%1000===0
    && instant(o.source_snapshot.document_fields.agreement_expires_at)
    && Date.parse(o.expires_at)<=Date.parse(o.source_snapshot.document_fields.agreement_expires_at),
    'enterprise_reservation_readback_unverified',503);

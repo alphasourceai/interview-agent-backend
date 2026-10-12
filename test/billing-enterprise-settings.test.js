@@ -301,6 +301,30 @@ const sendAgreement = (app, body) => request(app)
   .set('Authorization', 'Bearer admin-token')
   .send(body);
 
+test('new marked Enterprise draft freezes default/custom deadline in native row, document and snapshot; legacy unchanged',async()=>{
+  const now=Date.now();
+  for(const explicit of [null,new Date(now+3*86400000).toISOString(),new Date(now+10*86400000).toISOString()]){
+    const db=makeDb(),system=loadSystem(db);
+    const res=await sendAgreement(system.app,agreementBody({pool_quantity:'30',...(explicit?{agreement_expires_at:explicit}:{})}));
+    assert.equal(res.status,200,res.text);
+    const row=db.tables.membership_agreements[0],deadline=Date.parse(row.agreement_expires_at);
+    assert.equal(row.template_snapshot.values.agreement_expires_at,row.agreement_expires_at);
+    assert.ok(deadline>now && deadline<=Date.now()+10*86400000);
+    if(explicit)assert.equal(row.agreement_expires_at,explicit);
+    else assert.ok(deadline>=now+7*86400000 && deadline<=Date.now()+7*86400000);
+    assert.ok(Date.parse(row.signer_token_expires_at)<=deadline);
+    assert.match(row.template_snapshot.rendered_html,/Signature and initial payment deadline:/);
+  }
+  for(const expiry of ['not-a-date','2000-01-01T00:00:00Z']){
+    const db=makeDb(),system=loadSystem(db);
+    const res=await sendAgreement(system.app,agreementBody({pool_quantity:'30',agreement_expires_at:expiry}));
+    assert.equal(res.status,400);assert.equal(res.body.code,'invalid_agreement_expiry');assertNothingWritten(db,system.stripe);
+  }
+  const db=makeDb(),system=loadSystem(db);
+  const res=await sendAgreement(system.app,agreementBody({billing_model:'rollover',rollover_days:'90'}));
+  assert.equal(res.status,200,res.text);assert.equal(db.tables.membership_agreements[0].agreement_expires_at,undefined);
+});
+
 const postWebhook = (system, event, subscription) => {
   system.webhook.event = event;
   system.webhook.subscription = subscription;

@@ -44,9 +44,12 @@ function parallelSql(q){return new Promise((resolve,reject)=>{
  child.on('close',code=>resolve({code,out:out.trim(),err}));
 });}
 function counts(){return sql(`select jsonb_build_object('operations',(select count(*) from enterprise_v2_checkout_operations),'ownedpools',(select count(*) from client_interview_pools where checkout_operation_id is not null));`);}
-let grants;
+let grants,nativeShaWithoutExtension;
 before(()=>{if(!enabled)return;assert.match(socket,/^\/private\/tmp\/alphascreen-reservation-pg\.[A-Za-z0-9]+$/);
  const r=cp.spawnSync(`${bin}createdb`,['-h',socket,'-p',port,'-U','postgres',database],{encoding:'utf8'});assert.equal(r.status,0,r.stderr);
+ nativeShaWithoutExtension=sql(`select encode(pg_catalog.sha256(convert_to('hello','UTF8')),'hex'),
+  exists(select 1 from pg_extension where extname='pgcrypto'),
+  exists(select 1 from pg_depend where classid='pg_proc'::regclass and objid='pg_catalog.sha256(bytea)'::regprocedure and deptype='e');`);
  sql(`create role anon nologin;create role authenticated nologin;create role service_role nologin bypassrls;
  create schema auth;grant usage on schema public,auth to service_role;
  create table auth.users(id uuid primary key,email text,email_confirmed_at timestamptz,is_anonymous boolean,deleted_at timestamptz,banned_until timestamptz);
@@ -59,12 +62,28 @@ before(()=>{if(!enabled)return;assert.match(socket,/^\/private\/tmp\/alphascreen
  for(const name of ['20260418130000_membership_agreements.sql','20260418170000_membership_agreements_signing_pass2.sql',
   '20260420102000_membership_agreements_current_model.sql','20260422113000_membership_agreements_checkout_state.sql',
   '20260427112000_membership_agreement_voided_status.sql','20261009180000_client_interview_pools.sql'])apply(name);
- sql(`alter table membership_agreements add column agreement_expires_at timestamptz;alter table membership_agreements enable row level security;
+ // Exact product DDL, isolated from this migration's unrelated sales tables.
+ const expiryDDL=fs.readFileSync(path.join(root,'20260919161500_sales_completion_tweaks.sql'),'utf8')
+  .match(/alter table public\.membership_agreements\s+add column if not exists agreement_expires_at timestamptz null;/)?.[0];
+ assert.ok(expiryDDL,'production migration owns the expiry column');
+ sql(`${expiryDDL}alter table membership_agreements enable row level security;
   grant select,insert,update,delete on membership_agreements to service_role;`);
  for(const name of ['20261012032211_enterprise_pool_offer_snapshots.sql','20261012051946_enterprise_pool_source_immutability.sql'])apply(name);
  grants=sql(`select jsonb_agg(jsonb_build_object('name',relname,'acl',relacl::text,'rls',relrowsecurity) order by relname)
   from pg_class where oid in('membership_agreements'::regclass,'client_interview_pools'::regclass,'clients'::regclass,'auth.users'::regclass);`);
  apply(migration);
+});
+test('pg_catalog SHA256 is native before pgcrypto exists, and reservation works with pgcrypto in either public or extensions',opts,()=>{
+ assert.equal(nativeShaWithoutExtension,'2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824|f|f');
+ const p=parameters(source());
+ assert.equal(sql(`select extnamespace::regnamespace from pg_extension where extname='pgcrypto';`),'public');
+ const moved=JSON.parse(sql(`begin;create schema extensions;alter extension pgcrypto set schema extensions;
+  grant usage on schema extensions to service_role;set role service_role;${reserve(p)}
+  ${read(p)}rollback;`).split('\n').at(-1));
+ sql(`set role service_role;${reserve(p)}`);const original=pair(p);
+ assert.equal(moved.operation.source_digest,original.operation.source_digest);
+ assert.equal(moved.operation.pool_offer_digest,original.operation.pool_offer_digest);
+ assert.equal(moved.operation.id,original.operation.id);
 });
 after(()=>{if(!enabled)return;const r=cp.spawnSync(`${bin}dropdb`,['-h',socket,'-p',port,'-U','postgres',database],{encoding:'utf8'});assert.equal(r.status,0,r.stderr);});
 
@@ -190,6 +209,12 @@ test('owned failed/voided bookkeeping is permitted but neither becomes recoverab
   const p=parameters(source());sql(`set role service_role;${reserve(p)}`);
   sql(`set role service_role;update client_interview_pools set status='${status}' where id='${p.p_pool}';`);
   denied(`set role service_role;${read(p)}`,/readback_denied/);
+  const before=counts();
+  denied(`set role service_role;${reserve(p)}`,/reservation_conflict/);
+  for(const replacement of ['pending',status==='failed'?'voided':'failed'])
+   denied(`set role service_role;update client_interview_pools set status='${replacement}' where id='${p.p_pool}';`,/pool_terminal/);
+  sql(`set role service_role;update client_interview_pools set status='${status}' where id='${p.p_pool}';`);
+  assert.equal(counts(),before);assert.equal(sql(`select status from client_interview_pools where id='${p.p_pool}';`),status);
   assert.equal(sql(`select checkout_creation_authorized or credits_spendable from enterprise_v2_checkout_operations where id='${p.p_id}';`),'f');
  }
 });

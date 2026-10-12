@@ -153,6 +153,10 @@ begin
   if new.checkout_operation_id is distinct from old.checkout_operation_id then raise exception 'enterprise_reservation_pool_backfill_denied';end if;
   if old.checkout_operation_id is not null and(new.stripe_checkout_session_id,new.stripe_payment_intent_id,new.paid_at)
     is distinct from(old.stripe_checkout_session_id,old.stripe_payment_intent_id,old.paid_at) then raise exception 'enterprise_reservation_no_authority';end if;
+  if old.checkout_operation_id is not null and
+   (new.status not in('pending','failed','voided') or new.status is null
+    or (old.status in('failed','voided') and new.status is distinct from old.status))
+   then raise exception 'enterprise_reservation_pool_terminal';end if;
   return new;
  end if;
  if new.checkout_operation_id is null then return new;end if;
@@ -183,7 +187,7 @@ create constraint trigger enterprise_v2_check_operation_pool after insert on pub
 create function public.enterprise_v2_reserve_checkout(p_id uuid,p_pool uuid,p_agreement uuid,p_owner uuid,
  p_environment text,p_account text,p_mode boolean,p_customer text,p_key_hash text)
 returns jsonb language plpgsql security invoker set search_path=pg_catalog as $$
-declare s jsonb;o public.enterprise_v2_checkout_operations%rowtype;
+declare s jsonb;o public.enterprise_v2_checkout_operations%rowtype;p public.client_interview_pools%rowtype;
 begin
  s:=public.enterprise_v2_reservation_source(p_agreement,p_owner,p_customer);
  -- The locked agreement serializes same-source contenders; native unique key
@@ -193,6 +197,11 @@ begin
   if(o.billing_owner_user_id,o.environment,o.expected_provider_account_id,o.expected_livemode,o.expected_customer_id,o.request_key_hash,o.source_snapshot)
    is distinct from(p_owner,p_environment,p_account,p_mode,p_customer,p_key_hash,s->'source_snapshot')
    or o.expires_at<=clock_timestamp() then raise exception 'enterprise_reservation_conflict';end if;
+  select * into p from public.client_interview_pools where id=o.pool_id and checkout_operation_id=o.id for share;
+  if not found or(p.client_id,p.offer_snapshot,p.offer_digest,p.created_at,p.status)
+   is distinct from(o.client_id,o.pool_offer_snapshot,o.pool_offer_digest,o.created_at,'pending'::text)
+   or p.stripe_checkout_session_id is not null or p.stripe_payment_intent_id is not null or p.paid_at is not null
+   then raise exception 'enterprise_reservation_conflict';end if;
   return jsonb_build_object('action','already_reserved','operation_id',o.id,'pool_id',o.pool_id);
  end if;
  insert into public.enterprise_v2_checkout_operations(id,pool_id,agreement_id,billing_owner_user_id,environment,

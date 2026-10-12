@@ -24,7 +24,7 @@ function fixture(options={}){
   if(name==='enterprise_v2_reserve_checkout'){
    writes++;if(options.sqlError)return {error:{code:options.sqlError}};
    if(!stored){const p=prepareEnterprisePoolTerms({membership_tier:'enterprise',billing_model:'usage',pool_quantity:30,usage_interview_fee_cents:2500});
-    const now=new Date(Math.floor(Date.now()/1000)*1000),expiry=new Date(+now+3600000).toISOString();
+    const now=new Date(Math.floor((options.nativeNow??Date.now())/1000)*1000),expiry=new Date(+now+3600000).toISOString();
     const source={protocol:'enterprise_signed_source_v2',document_fields:{id:agreement,client_id:client,admin_email:principal.email,
      membership_tier:'enterprise',billing_option:options.annual?'annual':'monthly',agreement_expires_at:new Date(+now+86400000).toISOString()},
      signature_fields:{signer_accepted:true,signature_sha256:'b'.repeat(64)},template_snapshot:{values:{...p,platform_fee:options.fee??100}}};
@@ -70,13 +70,31 @@ test('exact decimal cents use integer arithmetic, preserve annual recurrence, do
  const bad=fixture({fee:'100.009',cents:10000});await assert.rejects(bad.service.reserve(subject,request),/readback_unverified/);
 });
 for(const bad of [{is_anonymous:true},{email_confirmed_at:null},{deleted_at:'2026-01-01Z'},
- {banned_until:'9999-01-01Z'},{email:'other@example.invalid'},{id:'not-a-valid-auth-uuid'}]){
+ {banned_until:'not-an-instant'},{email:'other@example.invalid'},{id:'not-a-valid-auth-uuid'}]){
  test(`initial Auth rejects ${Object.keys(bad).join(',')} before native mutation`,async()=>{
   const f=fixture({userHook:u=>Object.assign(u,bad)});
   await assert.rejects(f.service.reserve(subject,request),/scope_denied|enterprise_reservation_denied/);
   assert.equal(f.stats().writes,0);
  });
 }
+test('database clock, not application clock, decides valid committed readback and unknown ACK recovery',async()=>{
+ const nativeNow=Date.now(),original=Date.now;
+ try {
+  for(const skew of [-86400000,86400000])for(const lostAck of [false,true]){
+   Date.now=()=>nativeNow+skew;
+   const f=fixture({nativeNow,lostAck,userHook:u=>{u.email_confirmed_at=new Date(nativeNow-60000).toISOString();}});
+   const a=await f.service.reserve(subject,request),b=await f.service.reserve(subject,request);
+   assert.equal(a.operation_id,b.operation_id);assert.equal(a.created_at,b.created_at);
+   assert.equal(a.checkout_creation_authorized,false);assert.equal(f.stats().writes,2);assert.equal(f.stats().reads,2);
+  }
+ }finally{Date.now=original;}
+});
+test('native Auth/expiry denial still holds without trusting app-side temporal decisions',async()=>{
+ const banned=fixture({userHook:u=>{u.banned_until='9999-01-01Z';},sqlError:'P0001'});
+ await assert.rejects(banned.service.reserve(subject,request),/reservation_denied/);assert.equal(banned.stats().writes,1);
+ const expired=fixture({lostAck:true,readError:true});
+ await assert.rejects(expired.service.reserve(subject,request),/readback_unavailable/);assert.equal(expired.stats().writes,1);
+});
 for(const step of [2,3,4])test(`fresh principal change at Auth check ${step} holds without another mutation`,async()=>{
  const f=fixture({userHook:(u,n)=>{if(n===step)u.email='changed@example.invalid';}});
  await assert.rejects(f.service.reserve(subject,request),/scope_changed/);assert.equal(f.stats().writes,step===2?0:1);
