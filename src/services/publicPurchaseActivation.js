@@ -66,13 +66,19 @@ function getTemplateSnapshot(agreement) {
 
 function getPackageSnapshot({ agreement, intent }) {
   const agreementSnapshot = getTemplateSnapshot(agreement);
-  const snapshot = agreementSnapshot.package_snapshot && typeof agreementSnapshot.package_snapshot === 'object'
-    ? agreementSnapshot.package_snapshot
-    : null;
-  if (snapshot) return snapshot;
-  return intent?.package_snapshot && typeof intent.package_snapshot === 'object'
-    ? intent.package_snapshot
-    : null;
+  const snapshot = agreementSnapshot.package_snapshot ?? null;
+  const intentSnapshot = intent?.package_snapshot ?? null;
+  // Inspect BOTH records before choosing a legacy source. Otherwise a legacy
+  // agreement can hide a v2 intent (or malformed v2 discriminator) and activate
+  // at old fees/12 months. Saved source disagreement is never a fallback.
+  const agreementOffer = readRetailPackageOffer(snapshot), intentOffer = readRetailPackageOffer(intentSnapshot);
+  if (agreementOffer || intentOffer || agreement?.billing_option === 'prepaid' || intent?.selected_billing_cadence === 'prepaid') {
+    if (!agreementOffer || ((intent?.id || intentSnapshot !== null) && (!intentOffer || JSON.stringify(intentOffer) !== JSON.stringify(agreementOffer)))
+      || (intent?.id && cleanText(intent.protocol) !== 'fenced_v2')) {
+      const e = new Error('retail_terms_source_mismatch'); e.code = e.message; throw e;
+    }
+  }
+  return snapshot || intentSnapshot;
 }
 
 function getFirstRolePrepaySnapshot(packageSnapshot) {

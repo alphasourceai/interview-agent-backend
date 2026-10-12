@@ -94,6 +94,22 @@ test('new pricing uses existing fenced activation and password-email behavior; r
     assert.equal(calls.filter(x=>x==='apply_public_purchase_billing').length,2);
   }
 });
+test('either-side v2 or invalid discriminator cannot hide behind a legacy snapshot and cause activation effects',async()=>{
+  const edits=[db=>{db.purchaseIntents[0].package_snapshot=revisedSnapshot();db.purchaseIntents[0].selected_billing_cadence='prepaid'},
+    db=>{db.membershipAgreements[0].template_snapshot.package_snapshot=revisedSnapshot();db.membershipAgreements[0].billing_option='prepaid'},
+    db=>{db.purchaseIntents[0].package_snapshot={...revisedSnapshot(),pricing_protocol:'invalid-v2'}},
+    db=>{db.membershipAgreements[0].template_snapshot.package_snapshot={membership_terms:revisedSnapshot().membership_terms}},
+    db=>{db.purchaseIntents[0].selected_billing_cadence='prepaid'},
+    db=>{db.purchaseIntents[0].package_snapshot=revisedSnapshot();db.membershipAgreements[0].template_snapshot.package_snapshot=revisedSnapshot();db.purchaseIntents[0].protocol='legacy_complete'}];
+  for(const edit of edits){const db=makeDb();db.purchaseIntents[0].protocol='fenced_v2';edit(db);let effects=0;
+    db.rpc=async()=>{effects++;throw Error('No native write permitted')};
+    const result=activatePublicPurchaseAgreementCheckout({db,agreementId:AGREEMENT_ID,paidAt:'2026-01-31T12:00:00.000Z',activationClaimKey:'synthetic-fence',
+      ensureRecovery:async()=>{effects++;throw Error('No account effect')},sendRecoveryEmail:async()=>{effects++;throw Error('No send')},logger:{info(){},warn(){},error(){}}});
+    if(db.purchaseIntents[0].protocol==='legacy_complete')assert.equal((await result).status,'historical_complete');
+    else await assert.rejects(result,/retail_terms_source_mismatch|invalid_retail_package_terms/);
+    assert.equal(effects,0);assert.equal(db.updates.length,0);assert.equal(db.upserts.length,0);assert.equal(db.clientMembers.length,0);
+  }
+});
 
 function matchesFilters(row, filters) {
   return filters.every(({ column, value, op = 'eq' }) => {
