@@ -14,7 +14,9 @@ create table public.enterprise_v2_checkout_operations (
  expected_livemode boolean not null,
  expected_customer_id text not null check(expected_customer_id ~ '^cus_[A-Za-z0-9_]+$'),
  request_key_hash text not null check(request_key_hash ~ '^[0-9a-f]{64}$'),
- source_snapshot jsonb not null check(jsonb_typeof(source_snapshot)='object' and octet_length(source_snapshot::text)<=65536),
+ -- Real branded HTML includes the inline logo (~234KB). Bound the complete
+ -- frozen source at 1MiB rather than excluding any accepted document fields.
+ source_snapshot jsonb not null check(jsonb_typeof(source_snapshot)='object' and octet_length(source_snapshot::text)<=1048576),
  source_digest text not null check(source_digest=encode(pg_catalog.sha256(convert_to(source_snapshot::text,'UTF8')),'hex')),
  pool_offer_snapshot jsonb not null check(public.enterprise_pool_v2_valid_offer(pool_offer_snapshot)),
  pool_offer_digest text not null check(pool_offer_digest=public.enterprise_pool_v2_offer_digest(pool_offer_snapshot)),
@@ -114,7 +116,7 @@ begin
   'agreement_expires_at',to_char(a.agreement_expires_at at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
  signature:=signature||jsonb_build_object('signed_at',to_char(a.signed_at at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
  snapshot:=jsonb_build_object('protocol','enterprise_signed_source_v2','document_fields',fields,'signature_fields',signature,'template_snapshot',a.template_snapshot);
- if octet_length(snapshot::text)>65536 then raise exception 'enterprise_reservation_source_denied';end if;
+ if octet_length(snapshot::text)>1048576 then raise exception 'enterprise_reservation_source_denied';end if;
  return jsonb_build_object('source_snapshot',snapshot,'client_id',c.id,'pool_offer_snapshot',s,'pool_offer_digest',v->>'pool_offer_digest',
   'platform_cents',fee::integer,'platform_interval',case when a.billing_option='annual' then 'year' else 'month' end,
   'source_expires_at',a.agreement_expires_at);

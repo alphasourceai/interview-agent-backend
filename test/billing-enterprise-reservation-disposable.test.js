@@ -2,6 +2,7 @@
 const {test,before,after}=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),cp=require('node:child_process');
 const {prepareEnterprisePoolTerms}=require('../src/services/enterprisePoolSnapshot');
+const {buildMembershipAgreementHtml}=require('../src/render/membershipAgreement');
 const enabled=process.env.ENTERPRISE_RESERVATION_DISPOSABLE==='true',opts={skip:!enabled};
 const socket=process.env.PGHOST||'',port='55443',bin='/opt/homebrew/opt/postgresql@17/bin/';
 const database=`enterprise_reservation_${process.pid}`,root=path.join(__dirname,'../supabase/migrations');
@@ -14,7 +15,7 @@ function run(q){return cp.spawnSync(`${bin}psql`,['-h',socket,'-p',port,'-U','po
 function sql(q){const r=run(q);assert.equal(r.status,0,r.stderr);return r.stdout.trim();}
 function denied(q,re){const r=run(q);assert.notEqual(r.status,0);assert.match(r.stderr,re);}
 function apply(name){sql(fs.readFileSync(path.join(root,name),'utf8'));}
-function source({target=client,fee=100,interval='monthly',expiry='7 days',signed=true,netZero=false}={}){
+function source({target=client,fee=100,interval='monthly',expiry='7 days',signed=true,netZero=false,rendered=false,oversized=false}={}){
  const id=crypto.randomUUID(),p=prepareEnterprisePoolTerms({membership_tier:'enterprise',billing_model:'usage',pool_quantity:30,usage_interview_fee_cents:2500});
  if(netZero){p.pool_offer_snapshot={...p.pool_offer_snapshot,coupon_cents:p.pool_offer_snapshot.net_cents,net_cents:0};
   p.pool_offer_digest=sql(`select enterprise_pool_v2_offer_digest(${lit(p.pool_offer_snapshot)});`);p.pool_total_cents=0;}
@@ -24,6 +25,12 @@ function source({target=client,fee=100,interval='monthly',expiry='7 days',signed
   signature_image_path:`synthetic/${id}/signature.png`,signature_sha256:'a'.repeat(64),
   signer_ip:null,signer_user_agent:'SYNTHETIC',executed_pdf_path:`synthetic/${id}/executed.pdf`};
  const snapshot={values:p,generated_at:timestamp,legal:{synthetic:true}};
+ if(rendered){
+  const r=buildMembershipAgreementHtml({...p,client_legal_name:'SYNTHETIC ONLY',primary_admin_name:'SYNTHETIC OWNER',
+   admin_email:'synthetic@example.invalid',initial_term_start:'2026-10-12',initial_renewal_date:'2027-10-12'});
+  snapshot.values=r.normalized;snapshot.rendered_html=r.html;
+ }
+ if(oversized)snapshot.rendered_html='x'.repeat(1048576);
  sql(`set role service_role;insert into membership_agreements(id,client_id,status,client_legal_name,primary_admin_name,admin_email,membership_tier,
   initial_term_start,initial_renewal_date,billing_option,template_snapshot,draft_pdf_path,signer_token_hash,signer_token_expires_at,agreement_expires_at)
  values('${id}','${target}','draft','SYNTHETIC ONLY','SYNTHETIC OWNER','synthetic@example.invalid','enterprise',current_date,current_date+365,
@@ -95,6 +102,18 @@ test('one native transaction freezes original source/money/cadence/time and reci
  const anchor=new Date(o.calendar_anchor_at);assert.equal(anchor.getUTCDate(),1);assert.equal(anchor.getUTCHours(),0);
  assert.equal(pool.checkout_operation_id,o.id);assert.equal(pool.created_at,o.created_at);assert.equal(pool.status,'pending');assert.equal(pool.total_cents,69750);
  for(const k of ['checkout_creation_authorized','provider_binding_verified','source_artifacts_verified','credits_spendable'])assert.equal(o[k],false);
+});
+test('real branded rendered agreement fits bounded full source; over-1MiB source holds without an intent or pool',opts,()=>{
+ const p=parameters(source({rendered:true}));sql(`set role service_role;${reserve(p)}`);
+ const {operation:o}=pair(p),html=o.source_snapshot.template_snapshot.rendered_html;
+ assert.ok(Buffer.byteLength(html)>65536,'actual renderer exercises the old cap failure');
+ assert.match(html,/alphaScreen Membership Agreement/);
+ const size=Number(sql(`select octet_length(source_snapshot::text) from enterprise_v2_checkout_operations where id='${p.p_id}';`));
+ assert.ok(size>65536 && size<=1048576);
+ assert.equal(sql(`select source_snapshot->'template_snapshot'=a.template_snapshot from enterprise_v2_checkout_operations o
+  join membership_agreements a on a.id=o.agreement_id where o.id='${p.p_id}';`),'t');
+ const tooLarge=parameters(source({oversized:true})),before=counts();
+ denied(`set role service_role;${reserve(tooLarge)}`,/source_denied/);assert.equal(counts(),before);
 });
 test('matching retry retains original IDs/time/window without another pool; another key/config conflicts',opts,()=>{
  const p=parameters(source());sql(`set role service_role;${reserve(p)}`);const before=pair(p),beforeCounts=counts();

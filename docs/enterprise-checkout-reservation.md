@@ -21,6 +21,9 @@ monthly/yearly platform recurrence, next-first-UTC anchor and a one-hour native
 window are frozen. Insufficient source/anchor window, free pool or malformed
 amount holds. Missing Auth/table read privileges hold; no grant or definer
 bypass is added. The existing source freeze and pool paid holds remain.
+The complete source, including branded rendered HTML, is bounded at 1MiB.
+The ordinary inline-logo template is about234KB; a64KB cap blocked it. Oversized
+sources fail closed without omitting source fields or creating a partial pair.
 
 Operation→pool FK is deferred only for the atomic pair; pool→operation FK and
 native reciprocal check forbid orphan/reused/mismatched pools at commit.
