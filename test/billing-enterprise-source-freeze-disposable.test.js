@@ -91,6 +91,28 @@ test('all non-execution snapshot keys, including legal text, version and generat
  }
  assert.deepEqual(state(id),old);
 });
+test('nullable frozen native columns reject value-to-NULL and NULL-to-value transitions',opts,()=>{
+ const changes={dba_trade_name:'SYNTHETIC trade',created_by_email:'synthetic@example.invalid',
+  created_by_user_id:'20000000-0000-4000-8000-000000000003',agreement_expires_at:'2026-11-12T00:00:00Z'};
+ for(const [field,value] of Object.entries(changes)){
+  const present=makeAgreement({overrides:{[field]:value}}),absent=makeAgreement({overrides:{[field]:null}});
+  for(const [id,next] of [[present,null],[absent,value]]){
+   const old=state(id);denied(`set role service_role;update membership_agreements set ${field}=${lit(next)} where id='${id}';`,/source_immutable/);
+   assert.deepEqual(state(id),old);
+  }
+ }
+});
+test('execution combined with any named commercial snapshot edit is denied before AND after signing',opts,()=>{
+ for(const signed of [false,true]){
+  const id=makeAgreement();if(signed)sign(id);const old=state(id);
+  for(const [field,value] of Object.entries({platform_fee:999,per_role_fee:999,included_interviews_per_role:99,
+   additional_interview_fee:999,max_interview_minutes:60,scored_question_count:1,rollover_days:90})){
+   const snapshot=structuredClone(old.template_snapshot);snapshot.execution={changed:true};snapshot.values[field]=value;
+   denied(`set role service_role;update membership_agreements set template_snapshot=${lit(snapshot)} where id='${id}';`,/source_immutable/);
+   assert.deepEqual(state(id),old);
+  }
+ }
+});
 for(const [field,value] of Object.entries({id:'20000000-0000-4000-8000-000000000001',client_id:'20000000-0000-4000-8000-000000000002',
  client_legal_name:'changed',dba_trade_name:'changed',primary_admin_name:'changed',admin_email:'changed@example.invalid',
  initial_term_start:'2026-11-12',initial_renewal_date:'2028-11-12',billing_option:'annual',auto_renew:false,
@@ -103,10 +125,13 @@ for(const [field,value] of Object.entries({id:'20000000-0000-4000-8000-000000000
  });
 }
 test('actual native signing RPC appends execution and supersedes both legacy and marked sources',opts,()=>{
- const first=makeAgreement(),a=sign(first),old=state(legacy);
+ // Other tests may sign their own sources. Make this legacy predecessor current
+ // immediately before this scenario rather than relying on shared suite state.
+ const priorLegacy=makeAgreement({marked:false}),priorState=sign(priorLegacy);
+ const first=makeAgreement(),a=sign(first),old=state(priorLegacy);
  assert.equal(a.status,'signed');assert.equal(a.is_current,true);assert.equal(a.signer_accepted,true);
  assert.equal(old.status,'superseded');assert.equal(old.is_current,false);
- assert.equal(old.superseded_by_agreement_id,first);assert.deepEqual(old.template_snapshot,baseline.template_snapshot);
+ assert.equal(old.superseded_by_agreement_id,first);assert.deepEqual(old.template_snapshot,priorState.template_snapshot);
  const second=makeAgreement(),b=sign(second),superseded=state(first);
  assert.equal(b.status,'signed');assert.equal(b.is_current,true);
  assert.equal(superseded.status,'superseded');assert.equal(superseded.is_current,false);
@@ -137,10 +162,26 @@ test('signed execution removal/edit, term changes, source deletion and regressio
  assert.deepEqual(state(id),old);
  const draft=makeAgreement();denied(`set role service_role;delete from membership_agreements where id='${draft}';`,/source_delete_denied/);
 });
+test('signed nullable native evidence rejects NULL in both directions using OLD signed-state predicate',opts,()=>{
+ const id=makeAgreement(),old=sign(id);
+ for(const field of ['signed_at','signer_typed_name','signer_accepted','signature_image_path','signature_sha256',
+  'signer_ip','signer_user_agent','executed_pdf_path']){
+  denied(`set role service_role;update membership_agreements set ${field}=null where id='${id}';`,/signed_source_immutable/);
+  assert.deepEqual(state(id),old);
+ }
+ // An actual nullable native signing-RPC input, not a fabricated browser proof.
+ const missingIp=makeAgreement();const snapshot={...state(missingIp).template_snapshot,execution:{synthetic:true}};
+ sql(`set role service_role;update membership_agreements set status='sent' where id='${missingIp}';
+  select id from complete_membership_agreement_signing('${missingIp}','2026-10-12T05:00:00Z',null,'SYNTHETIC signer',
+  'synthetic/signature.png','${'a'.repeat(64)}',null,null,'synthetic/executed.pdf',${lit(snapshot)});`);
+ for(const field of ['signer_ip','signer_user_agent'])denied(`set role service_role;update membership_agreements set ${field}='changed' where id='${missingIp}';`,/signed_source_immutable/);
+});
 test('operational delivery/signing/current/void/checkout updates retain existing behavior',opts,()=>{
  const id=makeAgreement();sql(`set role service_role;update membership_agreements set signer_token_hash='${crypto.randomBytes(32).toString('hex')}',
  signer_token_expires_at='2026-12-01Z',opened_at='2026-10-12Z',updated_at='2026-10-12Z' where id='${id}';`);
- const old=sign(id);sql(`set role service_role;update membership_agreements set checkout_status='pending_payment',checkout_session_id='cs_SYNTHETIC',
+ const old=sign(id);sql(`set role service_role;update membership_agreements set signer_token_hash='${crypto.randomBytes(32).toString('hex')}',
+ signer_token_expires_at='2026-12-01Z',sent_at='2026-10-13Z',opened_at='2026-10-13Z',
+ checkout_status='pending_payment',checkout_session_id='cs_SYNTHETIC',
  checkout_created_at='2026-10-12Z',updated_at='2026-10-13Z' where id='${id}';
  update membership_agreements set checkout_status='paid',checkout_paid_at='2026-10-14Z',status='voided',is_current=false,
  voided_at='2026-10-14Z',voided_by_email='synthetic@example.invalid',void_reason='Synthetic operational test, not payment proof' where id='${id}';`);
@@ -149,6 +190,19 @@ test('operational delivery/signing/current/void/checkout updates retain existing
  denied(`set role service_role;update membership_agreements set signed_at=null where id='${id}';`,/signed_source_immutable/);
  // This test proves legacy bookkeeping compatibility, NOT genuine activation.
 });
+test('native marked source restores prior superseded current row after void without rewriting evidence',opts,()=>{
+ const first=makeAgreement(),a=sign(first),second=makeAgreement();sign(second);
+ sql(`set role service_role;update membership_agreements set status='voided',is_current=false,voided_at='2026-10-13Z' where id='${second}';
+  update membership_agreements set status='signed',is_current=true,superseded_at=null,superseded_by_agreement_id=null,updated_at='2026-10-13Z' where id='${first}';`);
+ const restored=state(first);assert.equal(restored.status,'signed');assert.equal(restored.is_current,true);
+ assert.equal(restored.signed_at,a.signed_at);assert.deepEqual(restored.template_snapshot,a.template_snapshot);
+});
+test('actual legacy activation date rewrite is held for marked source, not interpreted as new v2 activation',opts,()=>{
+ const id=makeAgreement(),old=sign(id);
+ denied(`set role service_role;update membership_agreements set initial_term_start='2026-11-01',initial_renewal_date='2027-11-01',
+  checkout_status='paid',checkout_paid_at='2026-11-01Z' where id='${id}';`,/source_immutable/);
+ assert.deepEqual(state(id),old);
+});
 test('legacy rows retain prior mutability and removability without v2 backfill',opts,()=>{
  const id=makeAgreement({marked:false});sign(id);
  sql(`set role service_role;update membership_agreements set template_snapshot=jsonb_set(template_snapshot,'{values,platform_fee}','999'),
@@ -156,6 +210,12 @@ test('legacy rows retain prior mutability and removability without v2 backfill',
  assert.equal(state(id).template_snapshot.values.platform_fee,999);
  sql(`set role service_role;delete from membership_agreements where id='${id}';`);
  assert.equal(sql(`select count(*) from membership_agreements where id='${id}';`),'0');
+ const nullMarked=makeAgreement({marked:false});
+ // Missing marker and explicit JSON-null marker are both genuinely unmarked.
+ sql(`set role service_role;update membership_agreements set template_snapshot=jsonb_set(jsonb_set(template_snapshot,
+  '{values,pool_offer_snapshot}','null'),'{values,pool_offer_digest}','null') where id='${nullMarked}';
+  update membership_agreements set primary_admin_name='JSON null marker changed' where id='${nullMarked}';
+  delete from membership_agreements where id='${nullMarked}';`);
 });
 test('marked NULL pending state rejected by trigger even on nullable local fixture; legacy remains unchanged',opts,()=>{
  sql('alter table client_interview_pools alter column status drop not null;');
@@ -168,6 +228,14 @@ test('marked NULL pending state rejected by trigger even on nullable local fixtu
  sql('alter table client_interview_pools alter column status set not null;');
  row.status='pending';const pool=crypto.randomUUID();sql(`set role service_role;insert into client_interview_pools(id,${Object.keys(row).join(',')}) values('${pool}',${Object.values(row).map(lit).join(',')});`);
  denied(`set role service_role;update client_interview_pools set status='paid',paid_at=clock_timestamp() where id='${pool}';`,/PAYMENT_PROOF_REQUIRED/);
+ for(const status of ['paid','failed','voided','refunded','unknown']){
+  row.status=status;denied(`set role service_role;insert into client_interview_pools(${Object.keys(row).join(',')}) values(${Object.values(row).map(lit).join(',')});`,/pending_required/);
+ }
+ for(const status of ['pending','paid','failed','voided','refunded']){
+  const legacyPool=crypto.randomUUID();sql(`set role service_role;insert into client_interview_pools(id,client_id,quantity_purchased,unit_price_cents,total_cents,status)
+   values('${legacyPool}','${client}',1,0,0,${lit(status)});`);
+  assert.equal(sql(`select status from client_interview_pools where id='${legacyPool}';`),status);
+ }
 });
 test('new native functions invoker-only and browser-denied; original ACL/RLS unchanged',opts,()=>{
  for(const fn of ['enterprise_pool_v2_guard_source','enterprise_pool_v2_guard_pending_insert']){
@@ -177,5 +245,9 @@ test('new native functions invoker-only and browser-denied; original ACL/RLS unc
   assert.equal(sql(`select has_function_privilege('service_role','public.${fn}()','execute');`),'t');
  }
  assert.equal(permissions(),grants);
+ assert.deepEqual(JSON.parse(sql(`select jsonb_agg(jsonb_build_object('name',tgname,'type',tgtype,'deferrable',tgdeferrable,'constraint',tgconstraint::integer) order by tgname)
+  from pg_trigger where tgname in('enterprise_pool_v2_guard_source','enterprise_pool_v2_guard_pending_insert');`)),
+  [{name:'enterprise_pool_v2_guard_pending_insert',type:7,deferrable:false,constraint:0},
+   {name:'enterprise_pool_v2_guard_source',type:27,deferrable:false,constraint:0}]);
  for(const role of ['anon','authenticated'])denied(`set role ${role};select * from membership_agreements;`,/permission denied/);
 });

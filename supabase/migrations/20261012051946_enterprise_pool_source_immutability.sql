@@ -7,7 +7,8 @@ create or replace function public.enterprise_pool_v2_guard_source()
 returns trigger language plpgsql security invoker set search_path=pg_catalog as $$
 declare previous_row jsonb; next_row jsonb; field_name text;
 begin
- if coalesce(old.template_snapshot->'values'->'pool_offer_snapshot','null'::jsonb)='null'::jsonb then
+ if jsonb_typeof(old.template_snapshot->'values'->'pool_offer_snapshot') is null
+  or jsonb_typeof(old.template_snapshot->'values'->'pool_offer_snapshot')='null' then
   if TG_OP='DELETE' then return old;end if;return new;
  end if;
  if TG_OP='DELETE' then raise exception 'enterprise_pool_v2_source_delete_denied';end if;
