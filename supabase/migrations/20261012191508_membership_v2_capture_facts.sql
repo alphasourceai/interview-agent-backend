@@ -180,9 +180,11 @@ exception when numeric_value_out_of_range or invalid_text_representation then re
 end $$;
 
 create function public.membership_v2_invoice_clock_ready(p_operation uuid,p jsonb)
-returns boolean language sql volatile security invoker set search_path=pg_catalog,pg_temp as $$
- select public.membership_v2_invoice_proof_matches(p_operation,p)
-  and (p->>'provider_paid_at')::bigint<=floor(extract(epoch from clock_timestamp()))::bigint
+returns boolean language plpgsql volatile security invoker set search_path=pg_catalog,pg_temp as $$
+begin
+ if not public.membership_v2_invoice_proof_matches(p_operation,p) then return false;end if;
+ return (p->>'provider_paid_at')::bigint<=floor(extract(epoch from clock_timestamp()))::bigint;
+end
 $$;
 create function public.membership_v2_guard_paid_invoice_fact()
 returns trigger language plpgsql security invoker set search_path=pg_catalog,pg_temp as $$

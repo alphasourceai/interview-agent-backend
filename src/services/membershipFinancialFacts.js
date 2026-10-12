@@ -15,7 +15,8 @@ const epoch = v => Number.isSafeInteger(v) && v >= 946684800 && v <= 4102444799;
 function exactInput(v) {
   if (!v || typeof v !== 'object' || isProxy(v) || ![Object.prototype, null].includes(Object.getPrototypeOf(v))) return false;
   const d = Object.getOwnPropertyDescriptors(v);
-  return Reflect.ownKeys(d).length === 1 && d.operationId?.enumerable && Object.hasOwn(d.operationId, 'value') && UUID.test(d.operationId.value);
+  return Reflect.ownKeys(d).length === 1 && d.operationId?.enumerable && Object.hasOwn(d.operationId, 'value')
+    && typeof d.operationId.value === 'string' && UUID.test(d.operationId.value);
 }
 function createMembershipFinancialFacts({ db, stripe, environment, contextId } = {}) {
   check(db && typeof db.rpc === 'function' && typeof db.from === 'function'
@@ -61,7 +62,7 @@ function createMembershipFinancialFacts({ db, stripe, environment, contextId } =
     check(list?.object === 'list' && list.has_more === false && Array.isArray(list.data) && list.data.length >= 1 && list.data.length <= 2);
     const items = list.data.map(l => {
       const p = l.price, product = p?.product;
-      check(l.object === 'item' && p?.object === 'price' && p.livemode === ctx.livemode && product?.object === 'product'
+      check(l.object === 'item' && p?.object === 'price' && p.currency === 'usd' && p.livemode === ctx.livemode && product?.object === 'product'
         && product.deleted !== true && product.livemode === ctx.livemode);
       return { kind: product.metadata?.kind, line_id: l.id, price_id: p.id, product_id: product.id, metadata: product.metadata,
         name: product.name, unit_amount: p.unit_amount, amount_subtotal: l.amount_subtotal, amount_total: l.amount_total,
@@ -83,7 +84,7 @@ function createMembershipFinancialFacts({ db, stripe, environment, contextId } =
       && lines.data.length >= 1 && lines.data.length <= 2, 'membership_invoice_graph_held');
     const items = lines.data.map(l => {
       const p = l.price, product = p?.product;
-      check(l.object === 'line_item' && p?.object === 'price' && product?.object === 'product' && product.deleted !== true,
+      check(l.object === 'line_item' && p?.object === 'price' && p.currency === 'usd' && product?.object === 'product' && product.deleted !== true,
         'membership_invoice_graph_held');
       return { line_id: l.id, kind: product.metadata?.kind, price_id: p.id, product_id: product.id, unit_amount: p.unit_amount,
         quantity: l.quantity, amount: l.amount, currency: l.currency, price_type: p.type, recurring: p.recurring,

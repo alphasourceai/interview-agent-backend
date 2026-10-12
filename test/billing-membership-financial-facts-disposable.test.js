@@ -108,7 +108,7 @@ test('partial/unpaid/processing/auth-only graphs occupy neither full financial s
     g => { g.lines.has_more = true; }, g => { g.lines.data[0].price.product = 'prod_UNEXPANDED'; },
     g => { g.intent.currency = 'eur'; }, g => { g.charge.payment_intent = 'pi_OTHER'; }, g => { g.session.total_details.amount_tax = 1; },
     g => { g.intent.metadata = {}; }, g => { g.charge.transfer = 'tr_OTHER'; }, g => { g.charge.application_fee_amount = 1; },
-    g => { g.lines.data[0].id = 'li_OTHER'; }];
+    g => { g.lines.data[0].id = 'li_OTHER'; }, g => { g.lines.data[0].price.currency = 'eur'; }];
   for (const change of changes) { const f = await fixture(t); const original = structuredClone(f.graph); change(f.graph);
     await assert.rejects(f.observe()); assert.equal(f.get('membership_v2_capture_facts'), null); assert.equal(f.get('membership_v2_paid_invoice_facts'), null);
     Object.assign(f.graph, original); assert.equal((await f.observe()).paid_clock_recorded, true);
@@ -118,7 +118,8 @@ test('capture precedes invoice; invoice null/outage/truncated/unsupported backre
   const changes = [g => { g.session.invoice = null; }, g => { g.invoiceLines.has_more = true; },
     g => { g.invoice.payment_intent = null; }, g => { g.invoice.charge = null; }, g => { g.charge.invoice = null; },
     g => { g.invoice.paid_out_of_band = true; }, g => { g.intent.invoice = 'in_OTHER'; },
-    g => { g.invoice.pre_payment_credit_notes_amount = 1; }, g => { g.invoiceLines.data[0].price.product = 'prod_UNEXPANDED'; }];
+    g => { g.invoice.pre_payment_credit_notes_amount = 1; }, g => { g.invoiceLines.data[0].price.product = 'prod_UNEXPANDED'; },
+    g => { g.invoiceLines.data[0].price.currency = 'eur'; }];
   for (const change of changes) { const f = await fixture(t); const original = structuredClone(f.graph); change(f.graph);
     assert.equal((await f.observe()).paid_clock_recorded, false); const capture = f.get('membership_v2_capture_facts'); assert.ok(capture);
     Object.assign(f.graph, original); assert.equal((await f.observe()).paid_clock_recorded, true); assert.deepEqual(f.get('membership_v2_capture_facts'), capture);
@@ -202,4 +203,14 @@ test('opening/closing actual account and mode checks precede capture; wrong head
     } });
     await assert.rejects(f.observe()); assert.equal(f.get('membership_v2_capture_facts'), null);
   }
+});
+test('private worker input is exact data-only UUID, with no coercion/accessor/proxy effects', h.opts, async t => {
+  const f = await fixture(t); let effects = 0;
+  const accessor = {}; Object.defineProperty(accessor, 'operationId', { enumerable: true, get() { effects++; return f.op.id; } });
+  const coercible = { operationId: { toString() { effects++; return f.op.id; } } };
+  for (const v of [null, [], { operationId: 1 }, { operationId: Symbol('synthetic') }, coercible, accessor,
+    { operationId: f.op.id, providerId: 'pi_OTHER' }, new Proxy({ operationId: f.op.id }, { ownKeys() { effects++; return []; } })]) {
+    await assert.rejects(f.service.observe(v), { code: 'invalid_membership_financial_observation' });
+  }
+  assert.equal(effects, 0); assert.equal(f.calls.length, 0); assert.equal(f.requests.length, 0);
 });
