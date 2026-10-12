@@ -16,7 +16,14 @@ create table public.membership_v2_signature_pixels (
 create function public.membership_v2_guard_signature_pixels()
 returns trigger language plpgsql security invoker set search_path=pg_catalog as $$
 begin
-  if not exists(select 1 from public.membership_v2_document_acceptances where document_id=new.document_id and attempt_id=new.attempt_id) then
+  -- Only a freshly inserted acceptance in THIS top-level transaction can gain
+  -- its first pixel proof. Never upgrade a committed metadata-only acceptance.
+  -- Native time also excludes ancient/frozen rows after 32-bit XID wraparound.
+  -- An acceptance inserted in a subtransaction fails closed; this RPC does not
+  -- use savepoints or exception blocks that create subtransactions.
+  if not exists(select 1 from public.membership_v2_document_acceptances
+    where document_id=new.document_id and attempt_id=new.attempt_id
+      and xmin=pg_current_xact_id()::xid and accepted_at>=transaction_timestamp()) then
     raise exception 'retail_signing_denied'; end if;
   new.recorded_at:=clock_timestamp();return new;
 end $$;
@@ -41,6 +48,10 @@ begin
     if p.attempt_id<>a.attempt_id or p.pixels_sha256 is distinct from p_pixels_hash or p.width is distinct from p_width or p.height is distinct from p_height then
       raise exception 'document_acceptance_conflict'; end if;
   else
+    if not exists(select 1 from public.membership_v2_document_acceptances
+      where document_id=a.document_id and attempt_id=a.attempt_id
+        and xmin=pg_current_xact_id()::xid and accepted_at>=transaction_timestamp()) then
+      raise exception 'retail_signing_denied'; end if;
     insert into public.membership_v2_signature_pixels(document_id,attempt_id,width,height,pixels_sha256)
       values(a.document_id,a.attempt_id,p_width,p_height,p_pixels_hash);
   end if;

@@ -98,6 +98,30 @@ test('old metadata-only acceptance without pixel proof is held, not upgraded by 
   const x=setup();h.accept(h.acceptance(x.f));await assert.rejects(()=>x.service.sign(x.input),e=>e.code==='retail_signing_store_unverified');
   assert.equal(x.files.size,1);assert.equal(h.sql(`select count(*) from membership_v2_signature_pixels where document_id='${x.f.p.id}';`),'0');
 });
+test('committed metadata-only acceptance cannot gain invented pixels through RPC or direct service insert',h.opts,async()=>{
+  const x=setup(),a=h.acceptance(x.f);h.accept(a);
+  h.denied(`set role service_role;select * from membership_v2_accept_png_document(${h.literal(a)},'${sha('invented pixels')}',300,100);`,/retail_signing_denied/);
+  h.denied(`set role service_role;insert into membership_v2_signature_pixels(document_id,attempt_id,width,height,pixels_sha256,recorded_at)
+    values('${a.document_id}','${a.attempt_id}',300,100,'${sha('invented pixels')}',clock_timestamp());`,/retail_signing_denied/);
+  assert.equal(h.sql(`select count(*) from membership_v2_signature_pixels where document_id='${x.f.p.id}';`),'0');
+  assert.equal(h.sql(`select attempt_id from membership_v2_document_acceptances where document_id='${x.f.p.id}';`),a.attempt_id);
+  await assert.rejects(()=>x.service.sign(x.input),e=>e.code==='retail_signing_store_unverified');
+});
+test('uncommitted native acceptance can register pixels only in its original transaction; matching proof replay stays idempotent',h.opts,()=>{
+  const x=setup(),a=h.acceptance(x.f),pixels=sha('SYNTHETIC SAME TRANSACTION PIXELS');
+  h.sql(`begin;set role service_role;select document_id from membership_v2_accept_document(${h.literal(a)});
+    insert into membership_v2_signature_pixels(document_id,attempt_id,width,height,pixels_sha256)
+      values('${a.document_id}','${a.attempt_id}',300,100,'${pixels}');commit;`);
+  h.sql(`set role service_role;select document_id from membership_v2_accept_png_document(${h.literal(a)},'${pixels}',300,100);`);
+  h.denied(`set role service_role;select document_id from membership_v2_accept_png_document(${h.literal(a)},'${sha('different pixels')}',300,100);`,/document_acceptance_conflict/);
+  assert.equal(h.sql(`select count(*) from membership_v2_signature_pixels where document_id='${x.f.p.id}';`),'1');
+});
+test('savepoint-inserted acceptance fails closed when its subtransaction cannot prove same top-level transaction',h.opts,()=>{
+  const x=setup(),a=h.acceptance(x.f);
+  h.denied(`begin;set role service_role;savepoint nested;select document_id from membership_v2_accept_document(${h.literal(a)});
+    select document_id from membership_v2_accept_png_document(${h.literal(a)},'${sha('SYNTHETIC PIXELS')}',300,100);commit;`,/retail_signing_denied/);
+  assert.equal(h.sql(`select count(*) from membership_v2_document_acceptances where document_id='${x.f.p.id}';`),'0');
+});
 test('expired native document denies new signature before rendering',h.opts,async()=>{
   const x=setup();h.sql(`alter table membership_v2_issued_documents disable trigger membership_v2_issued_documents_immutable;
     update membership_v2_issued_documents set issued_at=issued_at-interval '2 days',expires_at=membership_v2_signing_deadline(issued_at-interval '2 days') where id='${x.f.p.id}';

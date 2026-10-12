@@ -39,6 +39,12 @@ uses UTF8 retail-signature-rgba-v1 + LF, width/height uint32 big-endian and raw
 unfiltered RGBA. An immutable per-acceptance pixel record binds dimensions,
 encoding, attempt and that identity in the SAME transaction as acceptance.
 Old metadata-only acceptances without it fail closed, no automatic backfill.
+Both the wrapper and direct-insert guard require a new acceptance's native xmin
+to equal the current top-level transaction ID and accepted_at to be within that
+transaction. The latter excludes ancient/frozen rows after XID wraparound. An
+existing matching pixel proof can be replayed, but a committed acceptance with
+no proof cannot acquire one. Savepoint/subtransaction insertion fails closed;
+the signing RPC uses neither savepoints nor exception subtransactions.
 
 Typed name is trim/NFC-normalized, 1..160 codepoints, no controls/angle brackets/
 bidi and every character must exist in both shipped Raleway cmaps. It is a
