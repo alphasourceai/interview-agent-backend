@@ -40,6 +40,7 @@
     "multer": "2.4.0",
     "openai": "^5.23.1",
     "pdf-parse": "2.4.5",
+    "pdf-lib": "1.17.1",
     "puppeteer-core": "25.11.0",
     "stripe": "^16.6.0",
     "undici": "6.29.0",

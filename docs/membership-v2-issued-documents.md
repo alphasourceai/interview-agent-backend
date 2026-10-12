@@ -1,5 +1,11 @@
 # Retail issued-document ledger — local and unmounted
 
+Continuation: an additional local `membershipRetailSigning` adapter and native
+session/pixel-proof wrapper now implement signature handling; see
+`membership-v2-retail-signing.md`. The issuer described here remains inert and
+does not deliver a capability. The newer signing migration increases only the
+executed-PDF bound to12MiB (preview8+receipt2+headroom2); no old row is rewritten.
+
 The ledger freezes exact source, quote, legal descriptor, UTF-8 HTML and private
 preview-PDF identity. It separately records one immutable acceptance per
 document/source/scope. It creates no client, Auth user, contract, paid access,
