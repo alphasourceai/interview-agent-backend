@@ -12,6 +12,12 @@ is retained after a native unmarked classification. No existing signed record
 receives fabricated provenance or a seal. Historical marked rows may still be
 voided, superseded, restored current or updated operationally as before.
 
+Classifier matrix: native+JS unmarked enters only legacy; native+JS marked enters
+only sealed signing. Marked-on-legacy, unmarked-on-marked, malformed/unknown
+classification, RPC errors and thrown timeouts all hold503 before uploads,
+seal, signing or email. Native BEFORE INSERT independently reclassifies the
+locked source, checks snapshot size<=1MiB, exact paths and native time window.
+
 New marked signatures require literal consent, a supported normalized typed
 name and a real nonblank browser-canvas RGBA PNG. Existing retail decoder strips
 metadata and records canonical bytes and pixel digest. Native UTC millisecond

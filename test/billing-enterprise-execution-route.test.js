@@ -2,7 +2,7 @@
 // Exercise the actual Express /sign handler, with isolated synthetic dependencies.
 const {test}=require('node:test'),assert=require('node:assert/strict'),Module=require('node:module'),crypto=require('node:crypto');
 const {isMarkedEnterpriseAgreement}=require('../src/services/enterpriseAgreementExecution');
-function setup({marked=true,notify=true,error=null}={}){
+function setup({marked=true,notify=true,error=null,classification=null,classifyError=false,classifyThrow=false}={}){
  const calls=[],agreement={id:crypto.randomUUID(),membership_tier:'enterprise',client_legal_name:'SYNTHETIC',admin_email:'synthetic@example.invalid',
   status:'sent',template_snapshot:{values:marked?{pool_offer_snapshot:{}}:{}}};
  const pdf=Buffer.from('%PDF-1.7\nSYNTHETIC\n%%EOF'),path='enterprise-v2/SYNTHETIC/attempts/SYNTHETIC/executed.pdf';
@@ -16,7 +16,8 @@ function setup({marked=true,notify=true,error=null}={}){
   sendMembershipAgreementSignedCopyEmail:async()=>{calls.push('copy_email');return {statusCode:202};},
   sendMembershipAgreementCompletedInternalNotification:async()=>{calls.push('internal_email');},
   supabaseAdmin:{storage:{from(){return {async upload(p,b,o){calls.push('legacy_upload');assert.equal(o.upsert,true);return {data:{path:p},error:null};}};}},
-   async rpc(name){if(name==='enterprise_v2_classify_signing_source'){calls.push('classify');return {data:marked?'marked':'unmarked',error:null};}
+   async rpc(name){if(name==='enterprise_v2_classify_signing_source'){calls.push('classify');if(classifyThrow)throw Error('SYNTHETIC transport timeout');
+    return {data:classification|| (marked?'marked':'unmarked'),error:classifyError?{code:'PGRST',message:'SYNTHETIC'}:null};}
     calls.push('legacy_rpc');return {data:[updated],error:null};}}};
  const routePath=require.resolve('../src/routes/public/membershipAgreements/signing'),original=Module._load;
  delete require.cache[routePath];
@@ -55,3 +56,9 @@ test('actual unmarked route retains legacy signing RPC/uploads and emails',async
  assert.equal(f.calls.filter(v=>v==='legacy_upload').length,2);assert.equal(f.calls.filter(v=>v==='legacy_rpc').length,1);
  assert.ok(!f.calls.includes('sealed_sign'));assert.ok(f.calls.includes('copy_email'));assert.ok(f.calls.includes('internal_email'));
 });
+for(const config of [{marked:true,classification:'unmarked'},{marked:false,classification:'marked'},
+ {classification:'malformed'},{classification:'unknown'},{classifyError:true},{classifyThrow:true}]){
+ test(`actual native/JS classifier mismatch or unavailable ${JSON.stringify(config)} is503/no effects`,async()=>{
+  const f=setup(config),r=await f.invoke();assert.equal(r.statusCode,503);assert.deepEqual(f.calls,['classify']);
+ });
+}

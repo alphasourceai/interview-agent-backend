@@ -57,6 +57,7 @@ begin
   or a.signer_token_hash is distinct from new.token_hash
   or a.signer_token_expires_at is null or a.signer_token_expires_at<=clock_timestamp()
   or a.agreement_expires_at is null or a.agreement_expires_at<=clock_timestamp()
+  or octet_length(new.source_snapshot::text)>1048576
   or new.source_snapshot is distinct from (a.template_snapshot-'execution') then
   raise exception 'enterprise_execution_denied';
  end if;
