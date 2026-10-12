@@ -25,7 +25,7 @@ function record(v, keys) {
   check(own.length === keys.length && keys.every(k => d[k]?.enumerable && Object.hasOwn(d[k], 'value')));
   return Object.fromEntries(keys.map(k => [k, d[k].value]));
 }
-const canonical = v => v && typeof v === 'object'
+const canonical = v => v !== null && typeof v === 'object'
   ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}` : JSON.stringify(v);
 function bind(v, environment, projectUrl) {
   const b = record(v, FIELDS);
