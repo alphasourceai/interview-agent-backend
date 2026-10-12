@@ -14,7 +14,8 @@ function exact(v,keys){if(!v || typeof v!=='object' || Array.isArray(v) || isPro
 function createMembershipDeliveryReservation({db,delivery}={}){
   check(typeof db?.from==='function' && exact(delivery,['environment','envelope'])
     && ['dev','staging','production'].includes(delivery.environment)
-    && typeof delivery.envelope?.seal==='function' && typeof delivery.envelope.keyIdentity==='function');
+    && typeof delivery.envelope?.seal==='function' && typeof delivery.envelope.keyIdentity==='function'
+    && delivery.envelope.environment===delivery.environment);
   const {environment,envelope}=delivery;
   async function one(table,fields,filters){let r;try{let q=db.from(table).select(fields);
     for(const [k,v] of Object.entries(filters))q=v===null?q.is(k,null):q.eq(k,v);r=await q.maybeSingle();}catch(_){fail();}

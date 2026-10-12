@@ -149,7 +149,8 @@ function createMembershipSalesProspectService({db,authorizeScope,handoffVerifica
         && Date.parse(challenge.expires_at)-Date.parse(challenge.issued_at)<=600000,'sales_prospect_create_unverified',503);
       await currentRow(id,ctx);check(canonical(await authorize(subject))===canonical(ctx),'sales_prospect_denied');
       const beforeHandoff=await facts(id,ctx);check(beforeHandoff.quote_live && beforeHandoff.challenge_live,'sales_prospect_denied');
-      if(queued){const safe=await queued.verify(reservation,expected,ackTime);
+      if(queued){check(canonical(await authorize(subject))===canonical(ctx),'sales_prospect_denied');
+        const safe=await queued.verify(reservation,expected,ackTime);
         check(canonical(await authorize(subject))===canonical(ctx),'sales_prospect_denied');
         return frozen({...response(stored,null),...safe,verification_handoff:'reserved',
           persistence:unknown?'recovered_unknown_commit':'verified'});}

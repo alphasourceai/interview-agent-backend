@@ -67,6 +67,8 @@ test('queued configuration explicit and malformed/null config never falls back t
   for(const delivery of [null,{}, {environment:'dev',envelope:{}},{environment:'qa',envelope:{seal(){},keyIdentity(){}}}]){
     assert.throws(()=>createMembershipSalesProspectService({db:{from(){},rpc(){}},authorizeScope(){},handoffVerification(){},delivery}),e=>e.code==='membership_delivery_reservation_held');
     assert.throws(()=>createMembershipIssuedDocumentService({delivery}),e=>e.code==='membership_delivery_reservation_held');}
+  const envelope=createMembershipCapabilityEnvelope({environment:'staging',activeKeyId:'synthetic',keys:{synthetic:crypto.randomBytes(32)}});
+  assert.throws(()=>createMembershipSalesProspectService({db:{from(){},rpc(){}},authorizeScope(){},delivery:{environment:'dev',envelope}}),e=>e.code==='membership_delivery_reservation_held');envelope.destroy();
 });
 test('actual producer contact -> verification -> issued document -> fake worker: one atomic job each, zero unpaid access',h.opts,async()=>{
   const f=setup(),r=await f.createVerified(),issued=await f.issuer().issue(f.subject,{sourceId:r.source.source_id});
@@ -162,4 +164,19 @@ test('signing queue ACK/envelope/document crossing holds exact immutable readbac
     await assert.rejects(()=>f.issuer().issue(f.subject,{sourceId:r.source.source_id}),e=>e.code==='membership_delivery_reservation_held');
     assert.equal(f.calls.filter(c=>c==='membership_v2_issue_document_and_delivery').length,1);assert.equal(f.legacy(),0);f.envelope.destroy();
   }
+});
+test('wrong actual scope owner and stale source CAS cannot durably reserve a queued source',h.opts,async()=>{
+  const f=setup(),first=await f.prospect.createProspect(f.subject,f.input);
+  await assert.rejects(()=>f.prospect.createProspect(f.subject,f.input),e=>e.code==='sales_prospect_conflict');
+  assert.equal(h.sql(`select count(*) from membership_v2_delivery_jobs where scope_id='${f.ctx.scope_id}';`),'1');
+  const g=createMembershipSalesProspectService({db:f.db,authorizeScope:async()=>({...f.ctx,issuer_user_id:h.other,original_salesperson_user_id:h.other}),delivery:f.delivery});
+  await assert.rejects(()=>g.createProspect(f.subject,f.input));assert.equal(h.sql(`select count(*) from membership_v2_delivery_jobs where scope_id='${f.ctx.scope_id}';`),'1');
+  // Parent ledger intentionally allows only one source per immutable quote.
+  // A deliberate replacement needs a fresh quote AND explicit current-head CAS.
+  const next=h.source({},first.source.source_id,f.ctx.scope_id);
+  const currentInput={...f.input,quoteId:next.quote.quote_id,expectedSourceId:first.source.source_id},second=await f.prospect.createProspect(f.subject,currentInput);
+  assert.notEqual(second.source.source_id,first.source.source_id);let sends=0;
+  const w=createMembershipDeliveryWorker({db:f.db,environment:'dev',origin:'https://interview-agent-frontend-qa.onrender.com',allowRecipients:[f.input.buyer.buyer_email],
+    envelope:f.envelope,send:async()=>{sends++;return {status:'accepted',reference:'synthetic'};}});
+  await assert.rejects(()=>w.process({jobId:first.delivery_job_id}));assert.equal(sends,0);assert.equal(f.legacy(),0);f.envelope.destroy();
 });

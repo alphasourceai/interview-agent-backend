@@ -108,6 +108,7 @@ function createMembershipIssuedDocumentService({db,authorizeScope,loadSource,loa
       else check(Array.isArray(ack?.data) && ack.data.length===1 && ack.data[0].id===id,'issued_create_unverified',503);}
     check(canonical(await auth(subject))===canonical(ctx),'issued_scope_denied',403);
     const stored=validate(await read(ctx,id),ctx,first,payload,l);
+    if(queued)check(canonical(await auth(subject))===canonical(ctx),'issued_scope_denied',403);
     const safe=queued?await queued.verify(reservation,expected,ackTime):{delivery:'not_configured'};
     // Recover only persistence after unknown commit; NEVER resend/retry/return
     // raw capability. Queued mode reserves a job, never sends it here.

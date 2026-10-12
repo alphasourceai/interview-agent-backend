@@ -56,6 +56,7 @@ function createMembershipCapabilityEnvelope(config){
   }catch(_){for(const key of owned.values())key.fill(0);fail(code);}
   function alive(){check(!destroyed);}
   return Object.freeze({
+    environment, // Immutable public configuration label; never a key/secret.
     keyIdentity:guarded(function(id){alive();check(typeof id==='string' && KEY.test(id) && owned.has(id));
       return Object.freeze({environment,key_id:id,physical_key_fingerprint:crypto.createHash('sha256').update(owned.get(id)).digest('hex')});}),
     seal:guarded(function(input){alive();input=snapshot(input,['binding','token']);const b=binding(input.binding,environment);verifyToken(input.token,b);
