@@ -86,6 +86,9 @@ class FakeQuery {
 
   async maybeSingle() {
     const row = this.tableRows().find((item) => matchesFilters(item, this.filters)) || null
+    if (row && this.db.projectSelectedColumns && this.selectColumns && this.selectColumns !== '*') {
+      return { data: Object.fromEntries(this.selectColumns.split(',').map(key => [key, row[key]])), error: null }
+    }
     return { data: row, error: null }
   }
 
@@ -265,6 +268,7 @@ function makeDb(options = {}) {
     touchedTables: [],
     checkoutCalls: [],
     nextClientId: options.nextClientId || CLIENT_ID,
+    projectSelectedColumns: options.projectSelectedColumns === true,
     from(table) {
       this.touchedTables.push(table)
       return new FakeQuery(this, table)
@@ -671,5 +675,15 @@ test('selected first-role amounts must match signed values AND saved public inte
     const rows = structuredClone(retailRows({ role: true })); change(rows);
     const db = makeDb({ membershipAgreements: [rows.a], purchaseIntents: [rows.i] });
     assert.equal((await postCheckout(buildApp(db))).status, 409); noCheckoutEffects(db);
+  }
+});
+
+test('real loader-shaped selects include the legal template version and public intent protocol for new checkout', async () => {
+  for (const payment of ['prepaid', 'monthly_installments']) {
+    const { a, i } = retailRows({ payment });
+    const db = makeDb({ membershipAgreements: [a], purchaseIntents: [i], projectSelectedColumns: true });
+    const result = await postCheckout(buildApp(db));
+    assert.equal(result.status, 200, JSON.stringify(result.body));
+    assert.equal(db.checkoutCalls.length, 1);
   }
 });
