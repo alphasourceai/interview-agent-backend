@@ -4,6 +4,8 @@
 
 const express = require('express');
 const { requireAuth, withClientScope } = require('../../../middleware/auth');
+const { readRetailPackageOffer } = require('../../../services/membershipPackageCompatibility');
+const { readSavedRetailCheckoutTerms } = require('../../../services/savedMembershipCheckoutTerms');
 const {
   appendQueryParam,
   buildAgreementInputFromRow,
@@ -82,6 +84,7 @@ router.post('/checkout-session', publicAgreementTokenRateLimit, async (req, res)
     }
 
     const agreementInput = buildAgreementInputFromRow(agreement);
+    const retailOffer = readRetailPackageOffer(agreement.template_snapshot?.package_snapshot);
     const planTier = String(agreementInput.membership_tier || '').trim().toLowerCase();
     const billingInterval = String(agreementInput.billing_option || '').trim().toLowerCase();
     if (!['basic', 'pro', 'enterprise'].includes(planTier)) {
@@ -92,7 +95,7 @@ router.post('/checkout-session', publicAgreementTokenRateLimit, async (req, res)
         request_id
       });
     }
-    if (!['monthly', 'annual'].includes(billingInterval)) {
+    if (!['monthly', 'annual'].includes(billingInterval) && !(retailOffer && billingInterval === 'prepaid')) {
       return res.status(409).json({
         error: 'invalid_agreement_billing_interval',
         code: 'invalid_agreement_billing_interval',
@@ -115,6 +118,10 @@ router.post('/checkout-session', publicAgreementTokenRateLimit, async (req, res)
         planTier: publicCheckout.planTier,
         billingInterval: publicCheckout.billingInterval
       });
+    } else {
+      // Always inspect the raw stored cadence too: the legacy input normalizer
+      // must not hide a stray prepaid label behind its monthly default.
+      publicPackageSnapshot = readSavedRetailCheckoutTerms({ agreement })?.packageSnapshot || null;
     }
 
     if (!clientId) {
@@ -179,10 +186,10 @@ router.post('/checkout-session', publicAgreementTokenRateLimit, async (req, res)
       : {
           agreement_id: agreement.id
         };
-    const firstRolePrepay = publicAgreement
+    const firstRolePrepay = publicAgreement || retailOffer
       ? buildFirstRolePrepayCheckout(publicPackageSnapshot)
       : null;
-    const idempotencyKey = publicAgreement
+    const idempotencyKey = publicAgreement || retailOffer
       ? `agreement_checkout:${agreement.id}:${planTier}:${billingInterval}`
       : '';
     const cancelUrl = publicAgreement
@@ -202,6 +209,7 @@ router.post('/checkout-session', publicAgreementTokenRateLimit, async (req, res)
       metadataSource: 'agreement_checkout',
       metadata: checkoutMetadata,
       firstRolePrepay,
+      packageSnapshot: retailOffer ? publicPackageSnapshot : null,
       promotionCodeId: purchaseIntent?.promotion_code_id || '',
       enterpriseFees,
       embedded: embeddedCheckoutRequested,

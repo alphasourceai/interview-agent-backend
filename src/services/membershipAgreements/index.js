@@ -21,6 +21,8 @@ const {
   sendMembershipAgreementCompletedInternalNotification
 } = require('../../clients/sendgrid');
 const { createSubscriptionCheckoutSession } = require('../subscriptionCheckout');
+const { readRetailPackageOffer } = require('../membershipPackageCompatibility');
+const { readSavedRetailCheckoutTerms } = require('../savedMembershipCheckoutTerms');
 const {
   normalizeAlphaScreenPlanKey,
   normalizeBillingInterval,
@@ -282,7 +284,8 @@ function buildFirstRolePrepayCheckout(packageSnapshot) {
 
 function buildPublicAgreementCheckoutMetadata({ agreement, agreementInput, intent, packageSnapshot }) {
   const planTier = normalizeAlphaScreenPlanKey(packageSnapshot?.plan_key || agreementInput?.membership_tier);
-  const billingInterval = normalizeBillingInterval(packageSnapshot?.billing_cadence || agreementInput?.billing_option);
+  const offer = readRetailPackageOffer(packageSnapshot);
+  const billingInterval = offer ? packageSnapshot.billing_cadence : normalizeBillingInterval(packageSnapshot?.billing_cadence || agreementInput?.billing_option);
   const firstRolePrepay = buildFirstRolePrepayCheckout(packageSnapshot);
   const metadata = {
     agreement_id: agreement.id,
@@ -324,6 +327,9 @@ function validatePublicPurchaseIntentForCheckout({ agreement, agreementInput, in
   if (!intentAgreementId || intentAgreementId !== agreementId) {
     throw makeCheckoutError(409, 'purchase_intent_agreement_mismatch', 'Signup request is not linked to this agreement.');
   }
+
+  const retail = readSavedRetailCheckoutTerms({ agreement, intent });
+  if (retail) return { planTier: retail.offer.plan_key, billingInterval: retail.billingInterval, packageSnapshot: retail.packageSnapshot };
 
   const packageSnapshot = packageSnapshotFromAgreement(agreement);
   if (!packageSnapshot) {
@@ -397,7 +403,7 @@ async function loadPublicPurchaseIntentForAgreement(agreement) {
 
   const { data, error } = await supabaseAdmin
     .from('public_purchase_intents')
-    .select('id,status,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,company_legal_name,company_dba,buyer_first_name,buyer_last_name,buyer_email,buyer_phone,buyer_title,source_path,agreement_id,stripe_checkout_session_id,client_id,promotion_code_id,expires_at,created_at')
+    .select('id,status,protocol,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,company_legal_name,company_dba,buyer_first_name,buyer_last_name,buyer_email,buyer_phone,buyer_title,source_path,agreement_id,stripe_checkout_session_id,client_id,promotion_code_id,expires_at,created_at')
     .eq('id', purchaseIntentId)
     .maybeSingle();
   if (error) {
@@ -559,7 +565,14 @@ function buildAgreementInputFromRow(row) {
       : null;
 
   if (snapshotValues) {
-    return normalizeMembershipAgreementInput(snapshotValues);
+    const normalized = normalizeMembershipAgreementInput(snapshotValues);
+    const offer = readRetailPackageOffer(row?.template_snapshot?.package_snapshot);
+    // The legacy PDF normalizer intentionally defaults unknown cadences to
+    // monthly. Do not let that change an accepted prepaid commercial selection.
+    if (offer) return { ...normalized, billing_option: snapshotValues.billing_option,
+      commitment_months: snapshotValues.commitment_months, payment_option: snapshotValues.payment_option,
+      pricing_version: snapshotValues.pricing_version };
+    return normalized;
   }
 
   return normalizeMembershipAgreementInput({

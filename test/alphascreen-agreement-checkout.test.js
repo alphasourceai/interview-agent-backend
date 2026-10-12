@@ -344,7 +344,7 @@ function buildApp(db) {
   return app
 }
 
-async function postCheckout(app) {
+async function postCheckout(app, extraBody = {}) {
   const server = http.createServer(app)
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const { port } = server.address()
@@ -352,7 +352,7 @@ async function postCheckout(app) {
     const response = await fetch(`http://127.0.0.1:${port}/membership-agreements/checkout-session`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: TOKEN, embedded: false })
+      body: JSON.stringify({ token: TOKEN, embedded: false, ...extraBody })
     })
     const text = await response.text()
     return {
@@ -524,3 +524,151 @@ test('public agreement checkout rejects missing or invalid purchase-intent state
   assert.equal(completedIntentResponse.body.code, 'purchase_intent_not_checkout_eligible')
   assert.equal(completedIntentDb.checkoutCalls.length, 0)
 })
+
+function retailRows({ plan = 'basic', months = 3, payment = 'prepaid', role = false, source = 'sales_assisted' } = {}) {
+  const { buildAlphaScreenPackageSnapshot } = require('../src/services/alphaScreenPackages');
+  const { OFFER_VERSION } = require('../src/services/membershipOffers');
+  const { TEMPLATE_VERSION } = require('../src/services/savedMembershipCheckoutTerms');
+  const cadence = payment === 'prepaid' ? 'prepaid' : 'monthly';
+  const snapshot = buildAlphaScreenPackageSnapshot(plan, cadence, { commitmentMonths: months, paymentOption: payment,
+    firstRolePrepaySelected: role, channel: 'sales', offerVersion: OFFER_VERSION });
+  const a = agreement({ plan, cadence, source, packageSnapshot: snapshot, firstRolePrepaySelected: role,
+    agreement_expires_at: new Date(Date.now() + 3600000).toISOString() });
+  a.template_version = a.template_snapshot.template_version = TEMPLATE_VERSION;
+  a.signer_accepted = true;
+  Object.assign(a.template_snapshot.values, { commitment_months: months, payment_option: payment, pricing_version: OFFER_VERSION,
+    term_start_basis: 'successful_payment', first_role_prepay: { ...snapshot.first_role_prepay } });
+  const i = intent({ plan, cadence, package_snapshot: snapshot, firstRolePrepaySelected: role });
+  i.protocol = 'fenced_v2';
+  return { a, i, snapshot };
+}
+const noCheckoutEffects = db => {
+  assert.equal(db.checkoutCalls.length, 0); assert.equal(db.inserts.length, 0); assert.equal(db.updates.length, 0);
+  assert.equal(db.clientMembers.length, 0);
+};
+
+test('existing signed sales checkout carries frozen 3/6/12 prices for all 24 variants without changing account flow', async () => {
+  for (const plan of ['basic', 'pro']) for (const months of [3, 6, 12])
+    for (const payment of ['prepaid', 'monthly_installments']) for (const role of [false, true]) {
+      const { a, i, snapshot } = retailRows({ plan, months, payment, role });
+      const db = makeDb({ membershipAgreements: [a], purchaseIntents: [i] });
+      const response = await postCheckout(buildApp(db), { packageSnapshot: { platform_fee: 1 },
+        commitment_months: 99, payment_option: 'free', plan_key: 'enterprise' });
+      assert.equal(response.status, 200, `${plan}/${months}/${payment}/${role}: ${JSON.stringify(response.body)}`);
+      assert.equal(db.checkoutCalls.length, 1);
+      const call = db.checkoutCalls[0];
+      assert.deepEqual(call.packageSnapshot, snapshot);
+      assert.equal(call.billingInterval, snapshot.billing_cadence);
+      assert.equal(call.metadata.package_billing_cadence, snapshot.billing_cadence);
+      assert.equal(call.metadata.platform_fee, snapshot.platform_fee);
+      assert.equal(call.idempotencyKey, `agreement_checkout:${AGREEMENT_ID}:${plan}:${snapshot.billing_cadence}`);
+      assert.equal(call.firstRolePrepay?.amount_cents || 0, role ? (plan === 'basic' ? 35900 : 62900) : 0);
+      assert.equal(db.clients.length, 1); assert.equal(db.clients[0].billing_status, 'inactive');
+      assert.equal(db.clientMembers.length, 0);
+      // The existing helper remains the only creator of the Checkout session;
+      // route does not create an Auth user or grant client membership.
+      assert.ok(!db.touchedTables.includes('client_members'));
+    }
+});
+
+test('public saved new offers allow only prepaid and require source equality before any write', async () => {
+  for (const months of [3, 6, 12]) {
+    const good = retailRows({ months, source: 'public_purchase_intent' });
+    const db = makeDb({ membershipAgreements: [good.a], purchaseIntents: [good.i] });
+    assert.equal((await postCheckout(buildApp(db))).status, 200);
+    const bad = retailRows({ months, source: 'public_purchase_intent', payment: 'monthly_installments' });
+    const denied = makeDb({ membershipAgreements: [bad.a], purchaseIntents: [bad.i] });
+    const result = await postCheckout(buildApp(denied));
+    assert.equal(result.status, 409); assert.equal(result.body.code, 'public_installments_not_available');
+    noCheckoutEffects(denied);
+  }
+});
+
+test('mismatched/malformed new saved sources, templates, terms and expiration hold before Stripe/client writes', async () => {
+  const cases = [
+    ({ a }) => { a.template_snapshot.package_snapshot.pricing_protocol = 'wrong'; },
+    ({ i }) => { i.package_snapshot.pricing_protocol = 'wrong'; },
+    ({ a }) => { a.template_snapshot.package_snapshot = makeSnapshot('basic', 'monthly'); },
+    ({ a }) => { a.billing_option = 'annual'; },
+    ({ a }) => { a.template_snapshot.values.billing_option = 'annual'; },
+    ({ a }) => { a.membership_tier = 'pro'; },
+    ({ a }) => { a.template_snapshot.values.commitment_months = 12; },
+    ({ a }) => { a.template_snapshot.values.platform_fee = '1'; },
+    ({ a }) => { a.template_snapshot.values.per_role_fee = ''; },
+    ({ a }) => { a.template_snapshot.values.auto_renew = false; },
+    ({ a }) => { a.template_snapshot.values.first_role_prepay.selected = true; },
+    ({ a }) => { a.template_version = 'membership_agreement_v2_phase1'; },
+    ({ a }) => { a.signer_accepted = false; },
+    ({ a }) => { a.superseded_by_agreement_id = 'new-agreement'; },
+    ({ i }) => { i.protocol = 'legacy_complete'; },
+    ({ i }) => { i.selected_plan_key = 'pro'; },
+    ({ i }) => { i.first_role_prepay_selected = true; },
+    ({ a }) => { a.agreement_expires_at = 'bad-date'; },
+    ({ a }) => { a.agreement_expires_at = null; },
+    ({ i }) => { i.expires_at = 'bad-date'; },
+    ({ i }) => { i.expires_at = new Date(Date.now() - 1000).toISOString(); },
+    ({ i }) => { i.package_snapshot = retailRows({ months: 6 }).snapshot; },
+    ({ i }) => { i.package_snapshot = makeSnapshot('basic', 'monthly'); }
+  ];
+  for (const change of cases) {
+    // Separately cloned persisted JSON objects, as returned by the database.
+    const rows = structuredClone(retailRows()); change(rows);
+    const db = makeDb({ membershipAgreements: [rows.a], purchaseIntents: [rows.i] });
+    const result = await postCheckout(buildApp(db));
+    assert.ok([409, 410].includes(result.status), `${change}: ${JSON.stringify(result)}`);
+    noCheckoutEffects(db);
+  }
+});
+
+test('legacy agreement cannot conceal new intent even with matching old monthly cadence', async () => {
+  const rows = retailRows({ payment: 'monthly_installments' });
+  const db = makeDb({ membershipAgreements: [agreement()], purchaseIntents: [rows.i] });
+  const result = await postCheckout(buildApp(db));
+  assert.equal(result.status, 409); noCheckoutEffects(db);
+});
+
+test('staff saved agreement reuses existing client/Checkout path; stray legacy prepaid never defaults to monthly', async () => {
+  const rows = retailRows({ source: 'admin' }); rows.a.client_id = CLIENT_ID;
+  const db = makeDb({ membershipAgreements: [rows.a], clients: [{ id: CLIENT_ID }] });
+  const result = await postCheckout(buildApp(db));
+  assert.equal(result.status, 200); assert.equal(db.checkoutCalls[0].packageSnapshot.platform_fee_cents, 120000);
+  assert.ok(db.checkoutCalls[0].idempotencyKey); assert.equal(db.inserts.length, 0);
+  const bad = agreement({ source: 'admin', client_id: CLIENT_ID }); bad.billing_option = 'prepaid';
+  const rejected = makeDb({ membershipAgreements: [bad], clients: [{ id: CLIENT_ID }] });
+  assert.equal((await postCheckout(buildApp(rejected))).status, 409); noCheckoutEffects(rejected);
+});
+
+test('accepted historic list prices survive current catalog and existing promotions without mutating the saved offer', async () => {
+  const rows = structuredClone(retailRows({ payment: 'monthly_installments' }));
+  const s = rows.a.template_snapshot.package_snapshot;
+  s.pricing_version = s.membership_terms.offer_version = 'previous-accepted-prices';
+  s.platform_fee = 412.25; s.platform_fee_cents = s.membership_terms.platform_payment_cents = 41225;
+  s.membership_terms.initial_payment_cents = 41225;
+  s.platform_commitment_total_cents = s.membership_terms.platform_commitment_total_cents = 41225 * 3;
+  rows.i.package_snapshot = structuredClone(s);
+  rows.i.promotion_code_id = 'promo_existing_synthetic';
+  rows.a.template_snapshot.values.platform_fee = '412.25';
+  rows.a.template_snapshot.values.pricing_version = s.pricing_version;
+  const before = structuredClone(s);
+  const db = makeDb({ membershipAgreements: [rows.a], purchaseIntents: [rows.i] });
+  const result = await postCheckout(buildApp(db), { promotion_code_id: 'promo_browser_ignored', platform_fee: 1 });
+  assert.equal(result.status, 200);
+  assert.deepEqual(db.checkoutCalls[0].packageSnapshot, before);
+  assert.equal(db.checkoutCalls[0].promotionCodeId, 'promo_existing_synthetic');
+  assert.equal(db.checkoutCalls[0].metadata.platform_fee, 412.25);
+  assert.deepEqual(rows.a.template_snapshot.package_snapshot, before);
+  assert.deepEqual(rows.i.package_snapshot, before);
+  assert.ok(db.updates.every(update => !Object.hasOwn(update.payload, 'package_snapshot')));
+  // This tests immutable nominal prices/correspondence, not a hosted coupon or
+  // a net-cash receipt. Actual discounts are separate existing Stripe inputs.
+});
+
+test('selected first-role amounts must match signed values AND saved public intent columns before any effect', async () => {
+  for (const change of [({ a }) => { a.template_snapshot.values.first_role_prepay.discounted_credit_amount_cents = 1; },
+    ({ i }) => { i.first_role_prepay_amount_cents = 1; },
+    ({ i }) => { i.first_role_prepay_credit_type = 'other'; }]) {
+    const rows = structuredClone(retailRows({ role: true })); change(rows);
+    const db = makeDb({ membershipAgreements: [rows.a], purchaseIntents: [rows.i] });
+    assert.equal((await postCheckout(buildApp(db))).status, 409); noCheckoutEffects(db);
+  }
+});
