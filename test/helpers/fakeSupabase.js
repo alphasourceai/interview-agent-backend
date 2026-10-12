@@ -81,6 +81,7 @@ function createFakeSupabase(tables = {}, options = {}) {
     let ordering = null;
     let limit = null;
     let range = null;
+    let requestedCount = null;
 
     const resolveRows = () => {
       let selected = rowsOf(table).filter((row) => matches(row, filters));
@@ -145,7 +146,7 @@ function createFakeSupabase(tables = {}, options = {}) {
     };
 
     const query = {
-      select() { return query; },
+      select(_columns, queryOptions = {}) { requestedCount = queryOptions.count || null; return query; },
       eq(column, value) { filters.push({ op: 'eq', column, value }); return query; },
       neq(column, value) { filters.push({ op: 'neq', column, value }); return query; },
       is(column, value) { filters.push({ op: 'is', column, value }); return query; },
@@ -186,7 +187,12 @@ function createFakeSupabase(tables = {}, options = {}) {
       then(resolve, reject) {
         try {
           const { data, error } = runWrite();
-          return Promise.resolve(resolve({ data, error }));
+          // Explicit exact counts cover the full filtered set, not the row cap.
+          // This allows tests to catch an incomplete read rather than blessing it.
+          const count = requestedCount === 'exact' ? (error ? null
+            : (pendingInsert || pendingUpdate || pendingDelete ? data?.length
+              : rowsOf(table).filter(row => matches(row, filters)).length)) : undefined;
+          return Promise.resolve(resolve({ data, error, ...(requestedCount ? { count } : {}) }));
         } catch (e) {
           return reject ? Promise.resolve(reject(e)) : Promise.reject(e);
         }

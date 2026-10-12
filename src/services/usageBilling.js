@@ -262,13 +262,15 @@ async function listBilledUsageInvoices({ db, clientId, limit = 12 } = {}) {
 /** Every ledger row attached to one Stripe invoice. */
 async function listLedgerRowsForInvoice({ db, stripeInvoiceId } = {}) {
   if (!db || !stripeInvoiceId) return [];
-  const { data, error } = await db
+  const { data, error, count } = await db
     .from('usage_billing_ledger')
-    .select('id,client_id,role_id,interview_id,unit_price_cents,stripe_invoice_item_id,billed_at,period_start,period_end')
+    .select('id,client_id,role_id,interview_id,unit_price_cents,stripe_invoice_item_id,billed_at,period_start,period_end', { count: 'exact' })
     .eq('stripe_invoice_id', stripeInvoiceId);
   if (error) throw new Error(error.message || 'Usage billing ledger lookup failed');
-  if ((data || []).length >= 1000) throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: invoice ledger scan limit');
-  return data || [];
+  if (!Array.isArray(data) || !Number.isSafeInteger(count) || count !== data.length || count >= 1000) {
+    throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: incomplete invoice ledger census');
+  }
+  return data;
 }
 
 /**
@@ -297,27 +299,117 @@ async function markUsageLinesBilled({ db, stripeInvoiceId, interviewIds, stripeI
 // Rebuilds invoice lines from ledger rows a previous attempt already reserved,
 // so a resumed run bills exactly what was reserved and nothing more.
 function linesFromLedgerRows(rows, roleMetaById) {
-  const byRole = new Map();
+  const byPrice = new Map();
+  const interviews = new Set();
+  const rowIds = new Set();
   for (const row of rows) {
     const roleId = String(row?.role_id ?? '');
-    if (!byRole.has(roleId)) {
+    const interviewId = String(row?.interview_id ?? '');
+    const rawPrice = row?.unit_price_cents;
+    const unitPrice = (typeof rawPrice === 'number' || (typeof rawPrice === 'string' && /^[0-9]+$/.test(rawPrice)))
+      ? parseWholeNonNegative(rawPrice) : null;
+    if (!roleId || !interviewId || interviews.has(interviewId) || (row?.id != null && rowIds.has(row.id))
+      || !Number.isSafeInteger(unitPrice) || unitPrice < 0 || unitPrice > 2147483647) {
+      throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: invalid reserved price group');
+    }
+    interviews.add(interviewId);
+    if (row?.id != null) rowIds.add(row.id);
+    const key = JSON.stringify([roleId, unitPrice]);
+    if (!byPrice.has(key)) {
       const meta = roleMetaById.get(roleId) || {};
-      byRole.set(roleId, {
+      byPrice.set(key, {
         role_id: roleId,
         role_title: meta.title || 'Role',
         entity_label: meta.entity_label || null,
         quantity: 0,
-        unit_price_cents: parseWholeNonNegative(row?.unit_price_cents) ?? 0,
+        unit_price_cents: unitPrice,
         amount_cents: 0,
         interview_ids: []
       });
     }
-    const line = byRole.get(roleId);
+    const line = byPrice.get(key);
     line.quantity += 1;
-    line.interview_ids.push(String(row.interview_id));
+    line.interview_ids.push(interviewId);
     line.amount_cents = line.quantity * line.unit_price_cents;
+    if (!Number.isSafeInteger(line.amount_cents) || line.amount_cents > 2147483647) {
+      throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: reserved price group overflow');
+    }
   }
-  return [...byRole.values()];
+  return [...byPrice.values()];
+}
+
+// Preserve the exact old key for valid uniform-price groups.
+function usageOperationKey({ invoiceId, clientId, line }) {
+  return createHash('sha256').update(JSON.stringify({
+    invoiceId, clientId, roleId: line.role_id, price: line.unit_price_cents,
+    interviews: [...line.interview_ids].sort()
+  })).digest('hex');
+}
+
+function assertWholeReservedGroups(rows) {
+  const states = new Map();
+  for (const row of rows) {
+    const key = JSON.stringify([String(row.role_id), Number(row.unit_price_cents)]);
+    if (!states.has(key)) states.set(key, new Set());
+    states.get(key).add(row.billed_at != null);
+  }
+  if ([...states.values()].some(v => v.size > 1)) {
+    throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: partially stamped price group');
+  }
+}
+
+// A former role-only item must not be ignored after splitting its prices: that
+// could duplicate money following an unknown response. The whole invoice census
+// (including siblings) detects wide items even when this worker owns one price.
+// All usage history is checked BEFORE any create/stamp. Uniform valid keys and
+// the old reconciliation below are retained. This is not a new
+// immutable invoice/batch ledger or an authenticated account proof.
+async function preflightReservedUsageItems({ stripe, invoiceId, customerId, clientId, allLines }) {
+  const counts = new Map();
+  for (const line of allLines) counts.set(line.role_id, (counts.get(line.role_id) || 0) + 1);
+  const expected = new Map(allLines
+    .map(line => [usageOperationKey({ invoiceId, clientId, line }), line]));
+  const found = new Map(), seen = new Set();
+  let cursor;
+  for (let page = 0; page < 100; page++) {
+    const result = await stripe.invoiceItems.list({ invoice: invoiceId, limit: 100,
+      ...(cursor ? { starting_after: cursor } : {}) });
+    if (!Array.isArray(result?.data) || result.data.length > 100 || typeof result.has_more !== 'boolean') {
+      throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: incomplete mixed-price provider history');
+    }
+    for (const item of result.data) {
+      if (typeof item?.id !== 'string' || !item.id || seen.has(item.id)) {
+        throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: duplicate or missing provider item identity');
+      }
+      seen.add(item.id);
+      const key = item.metadata?.usage_operation;
+      if (item.metadata?.source !== 'usage_billing') {
+        if (expected.has(key) || (key && counts.has(item.metadata?.role_id))) {
+          throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: changed mixed-price usage source');
+        }
+        continue;
+      }
+      if (!counts.has(item.metadata.role_id)) {
+        throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: unknown usage role in mixed-price invoice');
+      }
+      const line = expected.get(key);
+      if (!line || found.has(key)) {
+        throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: unknown or duplicate mixed-price operation');
+      }
+      if ((item.invoice?.id || item.invoice) !== invoiceId || (item.customer?.id || item.customer) !== customerId
+        || item.metadata.client_id !== clientId || item.metadata.role_id !== line.role_id
+        || item.currency !== 'usd' || !Number.isSafeInteger(item.quantity) || item.quantity !== line.quantity
+        || !Number.isSafeInteger(item.amount) || item.amount !== line.amount_cents) {
+        throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: mixed-price provider item mismatch');
+      }
+      found.set(key, item);
+    }
+    if (!result.has_more) return found;
+    const next = result.data.at(-1)?.id;
+    if (!next || next === cursor) throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: invalid mixed-price provider cursor');
+    cursor = next;
+  }
+  throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: mixed-price provider scan limit');
 }
 
 // A Stripe write can succeed even when its response, or our ledger stamp, fails.
@@ -354,7 +446,7 @@ async function findExistingUsageItem({ stripe, invoiceId, customerId, clientId, 
 }
 
 /**
- * Adds one usage item per role to a Stripe invoice and records the ledger.
+ * Adds one usage item per role and reserved price to a Stripe invoice.
  *
  * Ordering is what makes a partial failure recoverable: the ledger rows are
  * reserved first with billed_at null, then each Stripe item is created, then the
@@ -385,6 +477,7 @@ async function applyUsageToInvoice({
   }]));
 
   let lines;
+  let allLines;
   let periodStart = null;
   let periodEnd = null;
   let billedLabel = monthLabel(priorMonthBounds(asOf).start);
@@ -394,6 +487,8 @@ async function applyUsageToInvoice({
     periodEnd = existing[0]?.period_end || null;
     billedLabel = monthLabel(periodStart);
     // Resume: bill exactly what the failed attempt reserved.
+    allLines = linesFromLedgerRows(existing, roleMetaById);
+    assertWholeReservedGroups(existing);
     lines = linesFromLedgerRows(existing.filter((row) => row.billed_at == null), roleMetaById);
   } else {
     const usage = await computeUnbilledUsage({ db, clientId, asOf, allocation });
@@ -417,19 +512,30 @@ async function applyUsageToInvoice({
       return { applied: false, reason: 'already_reserved', items: 0, total_cents: 0 };
     }
     lines = linesFromLedgerRows(reserved.rows, roleMetaById);
+    // Wider detection must not widen this worker's charged reservation subset.
+    const census = await listLedgerRowsForInvoice({ db, stripeInvoiceId: invoiceId });
+    allLines = linesFromLedgerRows(census, roleMetaById);
+    assertWholeReservedGroups(census);
   }
 
   if (!lines.length) return { applied: false, reason: 'nothing_unbilled', items: 0, total_cents: 0 };
+
+  const completeKeys = new Set(allLines.map(line => usageOperationKey({ invoiceId, clientId, line })));
+  if (lines.some(line => !completeKeys.has(usageOperationKey({ invoiceId, clientId, line })))) {
+    throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: partial owned price group');
+  }
+  const reconciledMixed = await preflightReservedUsageItems({ stripe, invoiceId, customerId, clientId, allLines });
+  const roleCounts = new Map();
+  for (const line of allLines) roleCounts.set(line.role_id, (roleCounts.get(line.role_id) || 0) + 1);
+  const mixedRoleIds = new Set([...roleCounts].filter(([, n]) => n > 1).map(([role]) => role));
 
   const label = billedLabel;
   let items = 0;
   let totalCents = 0;
   for (const line of lines) {
-    const operationKey = createHash('sha256').update(JSON.stringify({
-      invoiceId, clientId, roleId: line.role_id, price: line.unit_price_cents,
-      interviews: [...line.interview_ids].sort()
-    })).digest('hex');
-    const existingItem = await findExistingUsageItem({ stripe, invoiceId, customerId, clientId, line, operationKey });
+    const operationKey = usageOperationKey({ invoiceId, clientId, line });
+    const existingItem = reconciledMixed.get(operationKey)
+      || await findExistingUsageItem({ stripe, invoiceId, customerId, clientId, line, operationKey });
     const item = existingItem || await stripe.invoiceItems.create({
       customer: customerId,
       invoice: invoiceId,
@@ -448,6 +554,13 @@ async function applyUsageToInvoice({
       }
     }, { idempotencyKey: `usage-item-${operationKey}` });
     if (!item?.id) throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: provider returned no item id');
+    if (mixedRoleIds.has(line.role_id)) {
+      // A returned identifier alone is not the reserved amount/ownership proof.
+      const readback = await preflightReservedUsageItems({ stripe, invoiceId, customerId, clientId, allLines });
+      if (readback.get(operationKey)?.id !== item.id) {
+        throw new Error('USAGE_INVOICE_REQUIRES_REVIEW: mixed-price item readback missing');
+      }
+    }
 
     await markUsageLinesBilled({
       db,

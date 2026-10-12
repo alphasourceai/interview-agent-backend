@@ -325,6 +325,12 @@ function withLedgerInvisibleToReads(db) {
       if (table !== 'usage_billing_ledger') return query;
 
       let isWrite = false;
+      let isCensus = false;
+      const realSelect = query.select.bind(query);
+      query.select = (columns, options) => {
+        isCensus = options?.count === 'exact';
+        return realSelect(columns, options);
+      };
       const realUpsert = query.upsert.bind(query);
       const realThen = query.then.bind(query);
       query.upsert = (payload, options) => {
@@ -332,7 +338,9 @@ function withLedgerInvisibleToReads(db) {
         return realUpsert(payload, options);
       };
       query.then = (resolve, reject) => {
-        if (isWrite) return realThen(resolve, reject);
+        // Only the stale unbilled lookup is invisible. The explicit invoice
+        // census must reflect actual rows after our owned reservation lands.
+        if (isWrite || isCensus) return realThen(resolve, reject);
         return Promise.resolve(resolve({ data: [], error: null }));
       };
       return query;
