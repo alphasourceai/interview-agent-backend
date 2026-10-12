@@ -2,6 +2,8 @@
 
 const assert = require('node:assert/strict')
 const path = require('node:path')
+const http = require('node:http')
+const InstalledStripe = require('stripe')
 const { test } = require('node:test')
 
 const checkoutPath = path.join(__dirname, '..', 'src', 'services', 'subscriptionCheckout.js')
@@ -96,7 +98,7 @@ function makeDb() {
   return db
 }
 
-function loadCheckout({ stripeCalls }) {
+function loadCheckout({ stripeCalls, stripeConstructor }) {
   delete require.cache[checkoutPath]
   delete require.cache[supabaseClientPath]
   delete require.cache[clientBillingScopePath]
@@ -116,7 +118,7 @@ function loadCheckout({ stripeCalls }) {
       return `https://qa.alphasourceai.com/dashboard?${params.toString()}`
     }
   })
-  injectModule(stripePath, function Stripe() {
+  injectModule(stripePath, stripeConstructor || function Stripe() {
     return {
       customers: {
         retrieve: async (id) => ({ id }),
@@ -372,4 +374,32 @@ test('new retail pricing preserves the existing validated promotion-code behavio
     idempotencyKey:'existing-agreement:promotion',metadataSource:'agreement_checkout',promotionCodeId:'promo_validated'});
   assert.deepEqual(calls.sessions[0].payload.discounts,[{promotion_code:'promo_validated'}]);
   assert.equal('allow_promotion_codes' in calls.sessions[0].payload,false);
+});
+test('installed Stripe16 SDK serializes new retail terms through the existing Checkout function on loopback only',async t=>{
+  const requests=[],server=http.createServer(async(req,res)=>{
+    let body='';for await(const b of req)body+=b;const p=new URLSearchParams(body);
+    requests.push({method:req.method,path:req.url,body:p,version:req.headers['stripe-version'],key:req.headers['idempotency-key']});
+    let data;if(req.method==='GET'&&req.url==='/v1/customers/cus_existing')data={object:'customer',id:'cus_existing'};
+    else if(req.method==='POST'&&req.url==='/v1/customers/cus_existing')data={object:'customer',id:'cus_existing'};
+    else if(req.method==='GET'&&req.url.startsWith('/v1/subscriptions?'))data={object:'list',data:[],has_more:false};
+    else if(req.method==='POST'&&req.url==='/v1/checkout/sessions')data={object:'checkout.session',id:'cs_SYNTHETIC',url:'https://checkout.stripe.test/SYNTHETIC'};
+    else{res.writeHead(400,{'Content-Type':'application/json'});return res.end(JSON.stringify({error:{type:'invalid_request_error',message:'unexpected synthetic request'}}))}
+    res.writeHead(200,{'Content-Type':'application/json','Stripe-Version':'2023-10-16'});res.end(JSON.stringify(data));
+  });
+  await new Promise(r=>server.listen(0,'127.0.0.1',r));t.after(()=>new Promise(r=>{server.closeAllConnections();server.close(r)}));
+  const stripeConstructor=function(_key,opts){assert.equal(opts.apiVersion,'2023-10-16');return new InstalledStripe('sk_test_SYNTHETIC_NOT_A_CREDENTIAL',{
+    apiVersion:opts.apiVersion,host:'127.0.0.1',port:server.address().port,protocol:'http',maxNetworkRetries:0})};
+  for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments']){
+    const calls=retailCalls(),s=retailSnapshot(plan,months,payment,true),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,stripeConstructor});
+    await create({clientId:'client-1',planTier:plan,billingInterval:s.billing_cadence,packageSnapshot:s,
+      metadataSource:'agreement_checkout',idempotencyKey:`existing-agreement:${plan}:${months}:${payment}:sdk`});
+    const request=requests.at(-1),p=request.body;assert.equal(request.path,'/v1/checkout/sessions');assert.equal(request.method,'POST');
+    assert.equal(request.version,'2023-10-16');assert.equal(request.key,`existing-agreement:${plan}:${months}:${payment}:sdk`);
+    assert.equal(p.get('mode'),'subscription');assert.equal(p.get('line_items[0][price_data][unit_amount]'),String(s.platform_fee_cents));
+    assert.equal(p.get('line_items[0][price_data][recurring][interval_count]'),String(payment==='prepaid'?months:1));
+    assert.equal(p.get('line_items[1][price_data][unit_amount]'),String(plan==='basic'?35900:62900));
+    assert.equal(p.has('line_items[1][price_data][recurring][interval]'),false);assert.equal(p.get('metadata[membership_commitment_months]'),String(months));
+    assert.equal(p.has('subscription_data[trial_end]'),false);assert.equal(p.has('payment_method_types[0]'),false);
+  }
+  assert.equal(requests.filter(r=>r.path==='/v1/checkout/sessions').length,12);
 });
