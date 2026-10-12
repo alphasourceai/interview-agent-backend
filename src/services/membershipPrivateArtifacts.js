@@ -2,9 +2,11 @@
 // UNMOUNTED server transport, not user/source authorization. Existing native
 // issuer/signer services must establish scope and verify their frozen hashes.
 const crypto=require('node:crypto'),{isProxy}=require('node:util').types;
+const {createClient}=require('@supabase/supabase-js');
 const UUID='(?!00000000-0000-0000-0000-000000000000)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 const sha=b=>crypto.createHash('sha256').update(b).digest('hex');
-function fail(code,status=503){const e=new Error(code);e.code=code;e.status=status;throw e;}
+const recoverable=new Set([408,425,429,500,502,503,504]);
+function fail(code,status=503){const e=new Error('');e.code=code;e.status=status;throw e;}
 function check(ok,code,status){if(!ok)fail(code,status);}
 function own(v,keys){
  check(v && typeof v==='object' && !isProxy(v) && !Array.isArray(v)
@@ -14,48 +16,73 @@ function own(v,keys){
   && Object.hasOwn(d[k],'value')),'membership_artifact_invalid_input',400);
  return Object.fromEntries(keys.map(k=>[k,d[k].value]));
 }
-function createMembershipPrivateArtifacts({db,configuration}={}){
- const config=own(configuration,['projectRef','bucket','namespace']);
+function createMembershipPrivateArtifacts({configuration,fetchImplementation=globalThis.fetch}={}){
+ const config=own(configuration,['projectRef','bucket','namespace','serviceKey']);
  check(typeof config.projectRef==='string' && /^[a-z0-9]{20}$/.test(config.projectRef)
   && typeof config.bucket==='string' && /^[a-z][a-z0-9-]{0,62}$/.test(config.bucket)
-  && ['retail-v2','enterprise-v2'].includes(config.namespace),'membership_artifact_configuration_invalid');
+  && ['retail-v2','enterprise-v2'].includes(config.namespace)
+  && typeof config.serviceKey==='string' && config.serviceKey.length>=20 && config.serviceKey.length<=8192
+  && !/\s/.test(config.serviceKey) && typeof fetchImplementation==='function','membership_artifact_configuration_invalid');
  Object.freeze(config);
  const origin=`https://${config.projectRef}.supabase.co`,storageUrl=`${origin}/storage/v1`;
  const pattern=new RegExp(`^${config.namespace}/${UUID}/(?:preview\\.pdf|attempts/${UUID}/(?:signature\\.png|executed\\.pdf))$`);
- function endpoint(){check(db && [origin,`${origin}/`].includes(db.supabaseUrl)
-  && db.storageUrl instanceof URL && db.storageUrl.href===storageUrl
-  && db.storage?.url===storageUrl && typeof db.storage.getBucket==='function'
-  && typeof db.storage.from==='function','membership_artifact_project_mismatch');}
- endpoint();
  function pathInfo(path){
   check(typeof path==='string' && path.length<=220 && pattern.test(path),'membership_artifact_invalid_path',400);
-  const png=path.endsWith('.png');return {type:png?'image/png':'application/pdf',max:png?2097152:12582912,png};
+  const png=path.endsWith('.png');return {type:png?'image/png':'application/pdf',max:png?2097152:path.endsWith('/preview.pdf')?8388608:12582912,png};
  }
+ async function guardedFetch(target,init={}){
+  let u;try{u=new URL(typeof target==='string'?target:target.url);}catch(_){fail('membership_artifact_request_denied');}
+  const method=init.method||'GET',base='/storage/v1/';
+  check(u.origin===origin && !u.username && !u.password && !u.search && !u.hash && u.pathname.startsWith(base),'membership_artifact_request_denied');
+  const route=u.pathname.slice(base.length);
+  if(route===`bucket/${config.bucket}`)check(method==='GET','membership_artifact_request_denied');
+  else{
+   const meta=route.startsWith(`object/info/${config.bucket}/`),prefix=meta?`object/info/${config.bucket}/`:`object/${config.bucket}/`;
+   check(route.startsWith(prefix) && (meta?method==='GET':['GET','POST'].includes(method)),'membership_artifact_request_denied');
+   const info=pathInfo(route.slice(prefix.length)),headers=new Headers(init.headers);
+   if(method==='POST')check(headers.get('x-upsert')==='false' && headers.get('content-type')===info.type
+    && headers.get('cache-control')==='no-store','membership_artifact_request_denied');
+  }
+  return fetchImplementation(target,{...init,redirect:'error',cache:'no-store'});
+ }
+ // Own narrow SDK client; a request cannot supply a DB/Auth handle.
+ const db=createClient(origin,config.serviceKey,{auth:{persistSession:false,autoRefreshToken:false,detectSessionInUrl:false},
+  storage:{useNewHostname:false},global:{fetch:guardedFetch}});
+ function endpoint(){check(db.supabaseUrl===origin && db.storageUrl instanceof URL && db.storageUrl.href===storageUrl
+  && db.storage.url===storageUrl,'membership_artifact_project_mismatch');}
+ endpoint();
  function validateBytes(bytes,info){
   check(bytes.length>=16 && bytes.length<=info.max && (info.png
    ?bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))
    :bytes.subarray(0,5).toString()==='%PDF-' && bytes.subarray(-1024).toString('latin1').includes('%%EOF')),
    'membership_artifact_bytes_invalid');return bytes;
  }
- async function bucket(){
+ async function bucket(info){
   endpoint();let r;try{r=await db.storage.getBucket(config.bucket);}catch(_){fail('membership_artifact_bucket_unavailable');}
   endpoint();check(!r?.error && r?.data?.id===config.bucket && r.data.name===config.bucket
-   && r.data.public===false,'membership_artifact_bucket_denied');
+   && r.data.public===false
+   && (r.data.file_size_limit==null || (Number.isSafeInteger(r.data.file_size_limit) && r.data.file_size_limit>=info.max))
+   && (r.data.allowed_mime_types==null || (Array.isArray(r.data.allowed_mime_types) && r.data.allowed_mime_types.includes(info.type))),
+   'membership_artifact_bucket_denied');
  }
  function files(){endpoint();const api=db.storage.from(config.bucket);
   check(api && api.url===storageUrl && api.bucketId===config.bucket && typeof api.upload==='function'
    && typeof api.download==='function','membership_artifact_project_mismatch');return api;}
  async function download(path,info){
-  await bucket();let r;try{r=await files().download(path);}catch(_){fail('membership_artifact_read_unavailable');}
-  endpoint();check(!r?.error && r?.data instanceof Blob && Number.isSafeInteger(r.data.size)
-   && r.data.size>=16 && r.data.size<=info.max
-   && [info.type,'application/octet-stream'].includes(r.data.type),'membership_artifact_read_unverified');
-  // Supabase download has already buffered a Blob. This bounds the subsequent
-  // allocation, not the SDK's transport-buffer memory; no streaming claim.
+  await bucket(info);const api=files();let metadata;
+  try{metadata=await api.info(path);}catch(_){fail('membership_artifact_read_unavailable');}
+  endpoint();const m=metadata?.data;
+  check(!metadata?.error && m?.name===path && m.bucketId===config.bucket && Number.isSafeInteger(m.size)
+   && m.size>=16 && m.size<=info.max && m.contentType===info.type,'membership_artifact_metadata_denied');
+  let r;try{r=await api.download(path);}catch(_){fail('membership_artifact_read_unavailable');}
+  endpoint();check(!r?.error && r?.data instanceof Blob && r.data.size===m.size && r.data.size<=info.max
+   && r.data.type===info.type,'membership_artifact_read_unverified');
+  // Metadata precedes download; an out-of-band replacement is still a race.
+  // SDK download buffers internally, so this is not streamed-memory proof.
   let body;try{body=await r.data.arrayBuffer();}catch(_){fail('membership_artifact_read_unavailable');}
-  check(body instanceof ArrayBuffer && body.byteLength===r.data.size && body.byteLength<=info.max,
+  check(body instanceof ArrayBuffer && body.byteLength===m.size,
    'membership_artifact_read_unverified');
-  const bytes=validateBytes(Buffer.from(body),info);await bucket();return Buffer.from(bytes);
+  const bytes=validateBytes(Buffer.from(body),info);await bucket(info);return Buffer.from(bytes);
  }
  return Object.freeze({
   async readPrivate(path){return download(path,pathInfo(path));},
@@ -74,18 +101,19 @@ function createMembershipPrivateArtifacts({db,configuration}={}){
     bytes=Buffer.from(new Uint8Array(backing,offset,length));
    }catch(_){fail('membership_artifact_invalid_input',400);}
    validateBytes(bytes,info);const digest=sha(bytes);
-   await bucket();let ack,unknown=false;
-   try{ack=await files().upload(path,Buffer.from(bytes),{contentType:info.type,upsert:false});}
-   catch(e){const status=Number(e?.statusCode??e?.status);if(status>=400 && status<500)fail('membership_artifact_write_denied');unknown=true;}
+   await bucket(info);let ack,unknown=false;
+   function classify(error){const raw=error?.statusCode??error?.status;
+    if(raw!=null && !recoverable.has(Number(raw)))fail('membership_artifact_write_denied');return true;}
+   try{ack=await files().upload(path,Buffer.from(bytes),{contentType:info.type,upsert:false,cacheControl:'0',headers:{'cache-control':'no-store'}});}
+   catch(e){unknown=classify(e);}
    endpoint();
-   if(ack?.error){const status=Number(ack.error.statusCode??ack.error.status);
-    if(status>=400 && status<500)fail('membership_artifact_write_denied');unknown=true;}
-   if(!unknown && (ack?.data?.path!==path || (ack.data.fullPath!=null && ack.data.fullPath!==`${config.bucket}/${path}`)))unknown=true;
+   if(ack?.error)unknown=classify(ack.error);
+   if(!unknown && (ack?.data?.path!==path || ack.data.fullPath!==`${config.bucket}/${path}`))unknown=true;
    // Unknown response recovers only the exact copied bytes at this same path.
    // No second upload, replacement, alternate bucket/path or delete fallback.
    const stored=await download(path,info);
    check(stored.length===bytes.length && sha(stored)===digest && stored.equals(bytes),'membership_artifact_write_unverified');
-   return Object.freeze({path,sha256:digest,size:bytes.length,persistence:unknown?'verified_bytes_after_unknown_ack':'verified_bytes'});
+   return Object.freeze({path,sha256:digest,size:bytes.length,persistence:unknown?'recovered_exact_bytes':'created'});
   }
  });
 }
