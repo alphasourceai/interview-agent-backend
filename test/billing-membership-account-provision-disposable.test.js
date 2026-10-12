@@ -168,3 +168,16 @@ test('same-email distinct purchases reserve different UUIDs; losing create perma
   assert.equal(b.posts(),0);assert.equal(b.get('membership_v2_account_bindings'),null);assert.deepEqual(b.get('membership_v2_account_operations'),opB);
   await hold(b.service.prepare(b.input));assert.equal(b.posts(),0);
 });
+test('private response normalization stops installed Auth SDK from logging raw network errors or provider secrets',h.opts,async t=>{
+  const f=await fixture(t,{lostCreate:true}),logs=[],old=console.error;
+  console.error=(...args)=>logs.push(args);
+  try{assert.equal((await f.service.prepare(f.input)).state,'new_account_prepared');}finally{console.error=old;}
+  assert.equal(logs.length,0);assert.equal(f.posts(),1);
+  const g=await fixture(t),failLogs=[],original=console.error;
+  console.error=(...args)=>failLogs.push(args);
+  try{
+    const svc=g.create({fetchImplementation:()=>{throw Error('SYNTHETIC_SECRET_SHOULD_NOT_REACH_SDK_LOGS');}});
+    await hold(svc.prepare(g.input));
+  }finally{console.error=original;}
+  assert.equal(failLogs.length,0);assert.equal(g.posts(),0);
+});

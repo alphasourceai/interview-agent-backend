@@ -21,6 +21,25 @@ function createMembershipAccountProvision({db,projectUrl,adminKey,environment,co
   let keyClaims;try{keyClaims=JSON.parse(Buffer.from(adminKey.split('.')[1],'base64url').toString('utf8'));}catch(_){held();}
   check(keyClaims?.role==='service_role' && keyClaims.iss==='supabase' && keyClaims.ref===new URL(projectUrl).hostname.split('.')[0]);
   const keyHash=sha(adminKey);
+  async function safeFetch(url,init) {
+    // auth-js logs raw fetch failures internally. Normalize privately BEFORE
+    // its parser, without replacing global console/fetch or touching the SDK.
+    const failure=status=>new Response(JSON.stringify({message:'membership_account_transport_unavailable'}),{
+      status:status>=400&&status<=599?status:503,headers:{'Content-Type':'application/json'}});
+    let response;
+    try{
+      response=await fetchImplementation(url,{...init,redirect:'error',signal:AbortSignal.timeout(10000)});
+      if(!response.ok){try{await response.body?.cancel();}catch(_){}return failure(response.status);}
+      const reader=response.body.getReader(),parts=[];let size=0;
+      while(true){const next=await reader.read();if(next.done)break;size+=next.value.length;
+        if(size>65536){await reader.cancel();return failure(503);}parts.push(Buffer.from(next.value));}
+      const raw=JSON.parse(Buffer.concat(parts).toString('utf8')),u=raw?.user??raw;
+      check(u&&typeof u==='object'&&!Array.isArray(u));
+      const body=Object.fromEntries(['id','email','created_at','email_confirmed_at','role','aud','is_anonymous','is_sso_user']
+        .filter(k=>Object.hasOwn(u,k)).map(k=>[k,u[k]]));
+      return new Response(JSON.stringify(body),{status:response.status,headers:{'Content-Type':'application/json'}});
+    }catch(_){try{await response?.body?.cancel();}catch(_){}return failure(503);}
+  }
   // Each request gets its OWN closure, not a shared mutable SDK POST allowance.
   function sdk(target,postAllowed) {
     let posts=0,gets=0;
@@ -31,7 +50,7 @@ function createMembershipAccountProvision({db,projectUrl,adminKey,environment,co
         let b;try{b=JSON.parse(init.body);}catch(_){held();}
         check(exact(b,['id','email','email_confirm']) && b.id===target.request_user_id && b.email===target.email && b.email_confirm===false);
       } else check(init.method==='GET' && !init.body && gets++===0 && String(url)===`${projectUrl}/auth/v1/admin/users/${target.request_user_id}`);
-      return fetchImplementation(url,{...init,redirect:'error',signal:AbortSignal.timeout(10000)});
+      return safeFetch(url,init);
     }}}).auth.admin;
   }
   const args=(id,action,nonce=null,user=null)=>({p_operation:id,p_context:contextId,p_project:projectUrl,p_environment:environment,
