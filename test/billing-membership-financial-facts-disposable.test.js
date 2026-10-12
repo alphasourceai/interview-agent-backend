@@ -13,7 +13,7 @@ const methods = {
   membership_v2_record_capture_observation: ['p_operation', 'p_observation']
 };
 async function fixture(t, selection = {}, hooks = {}) {
-  const x = setup(selection); await x.sign(); await x.service.checkout(x.input); const op = x.op(), suffix = op.id.replaceAll('-', '');
+  const x = setup(selection, { session: hooks.initialSession }); await x.sign(); await x.service.checkout(x.input); const op = x.op(), suffix = op.id.replaceAll('-', '');
   const binding = JSON.parse(h.sql(`select row_to_json(t) from membership_v2_checkout_bindings t where operation_id='${op.id}'`));
   const body = op.request_body, b = binding.proof, customer = `cus_SYNTHETIC_${suffix}`, piId = `pi_SYNTHETIC_${suffix}`;
   const chargeId = `ch_SYNTHETIC_${suffix}`, invoiceId = `in_SYNTHETIC_${suffix}`, clock = Math.max(b.created,
@@ -213,4 +213,34 @@ test('private worker input is exact data-only UUID, with no coercion/accessor/pr
     await assert.rejects(f.service.observe(v), { code: 'invalid_membership_financial_observation' });
   }
   assert.equal(effects, 0); assert.equal(f.calls.length, 0); assert.equal(f.requests.length, 0);
+});
+test('paid_at below real acceptance but above all provider creation times cannot establish clock', h.opts, async t => {
+  const f = await fixture(t, {}, { initialSession: s => { s.created -= 30; } });
+  const context = JSON.parse(h.sql(`set role service_role;select membership_v2_financial_context('${f.op.id}')`));
+  f.graph.intent.created = f.graph.session.created; f.graph.charge.created = f.graph.session.created; f.graph.invoice.created = f.graph.session.created;
+  f.graph.invoice.status_transitions.paid_at = context.accepted_epoch - 1;
+  assert.ok(f.graph.invoice.status_transitions.paid_at >= f.graph.session.created);
+  assert.equal((await f.observe()).paid_clock_recorded, false); assert.ok(f.get('membership_v2_capture_facts'));
+});
+test('native acceptance null/missing snapshot is denied independently before provider reads', h.opts, async t => {
+  for (const replacement of ["source_snapshot#-'{acceptance,accepted_at}'", "jsonb_set(source_snapshot,'{acceptance,accepted_at}','null'::jsonb)"]) {
+    const f = await fixture(t);
+    // Explicit owner-only corruption fixture, not possible under runtime grants.
+    h.sql(`begin;alter table membership_v2_pending_purchases disable trigger membership_v2_pending_purchases_immutable;
+      update membership_v2_pending_purchases set source_snapshot=${replacement},source_digest=encode(sha256(convert_to((${replacement})::text,'UTF8')),'hex') where id='${f.op.purchase_id}';
+      alter table membership_v2_pending_purchases enable trigger membership_v2_pending_purchases_immutable;commit;`);
+    h.denied(`set role service_role;select membership_v2_financial_context('${f.op.id}')`, /financial_acceptance_denied/);
+    await assert.rejects(f.observe()); assert.equal(f.requests.length, 0); assert.equal(f.get('membership_v2_capture_facts'), null);
+  }
+});
+test('rejected or unavailable risk observation never suppresses genuine invoice-paid clock', h.opts, async t => {
+  for (const change of [g => { g.charge.amount_refunded = null; }, g => { g.charge.amount_refunded = 0.5; },
+    g => { g.charge.amount_refunded = g.charge.amount + 1; }, g => { g.intent.capture_method = 'unsupported'; },
+    g => { g.intent.setup_future_usage = 'unsupported'; }]) {
+    const f = await fixture(t); change(f.graph); const r = await f.observe();
+    assert.equal(r.capture_recorded, true); assert.equal(r.paid_clock_recorded, true); assert.equal(r.risk_observation_held, true);
+    assert.equal(r.activation_enabled, false); assert.equal(r.collection_enabled, false);
+  }
+  const f = await fixture(t, {}, { afterRPC: name => name === 'membership_v2_record_capture_observation' ? { error: { code: 'SYNTHETIC_RISK_ACK_LOST' } } : null });
+  const r = await f.observe(); assert.equal(r.risk_observation_held, true); assert.equal(r.paid_clock_recorded, true);
 });

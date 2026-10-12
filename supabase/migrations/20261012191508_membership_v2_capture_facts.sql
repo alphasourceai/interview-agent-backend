@@ -22,6 +22,7 @@ create function public.membership_v2_financial_context(p_operation uuid)
 returns jsonb language plpgsql security invoker set search_path=pg_catalog,pg_temp as $$
 declare o public.membership_v2_checkout_operations; b public.membership_v2_checkout_bindings;
  p public.membership_v2_pending_purchases; c public.membership_v2_checkout_contexts;
+ a public.membership_v2_document_acceptances; accepted_epoch bigint;
 begin
  select * into o from public.membership_v2_checkout_operations where id=p_operation;
  if not found then raise exception 'financial_source_denied';end if;
@@ -29,6 +30,16 @@ begin
  if not found then raise exception 'financial_binding_denied';end if;
  select * into p from public.membership_v2_pending_purchases where id=o.purchase_id;
  select * into c from public.membership_v2_checkout_contexts where id=o.context_id;
+ select * into a from public.membership_v2_document_acceptances where document_id=p.document_id;
+ -- Do not let GREATEST ignore a null acceptance. Verify the snapshot against
+ -- the actual immutable acceptance row before deriving its integer bound.
+ if not found or jsonb_typeof(p.source_snapshot->'acceptance'->'accepted_at') is distinct from 'string'
+  or coalesce(p.source_snapshot->'acceptance'->>'accepted_at','') !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$'
+  or not isfinite(a.accepted_at) or a.attempt_id<>p.acceptance_attempt_id
+  or (p.source_snapshot->'acceptance'->>'accepted_at')::timestamptz is distinct from a.accepted_at then
+  raise exception 'financial_acceptance_denied';end if;
+ accepted_epoch:=floor(extract(epoch from a.accepted_at))::bigint;
+ if not public.membership_v2_fact_epoch(to_jsonb(accepted_epoch)) then raise exception 'financial_acceptance_denied';end if;
  if p.id is null or c.id is null or c.environment<>p.environment
   or p.source_digest<>encode(sha256(convert_to(p.source_snapshot::text,'UTF8')),'hex')
   or o.source_digest<>p.source_digest
@@ -37,7 +48,7 @@ begin
   or b.proof_digest<>encode(sha256(convert_to(b.proof::text,'UTF8')),'hex')
   or b.provider_account_id<>c.provider_account_id or b.livemode<>c.livemode
   or not public.membership_v2_checkout_proof_matches(o.id,b.proof) then raise exception 'financial_source_conflict';end if;
- return jsonb_build_object('operation',to_jsonb(o),'binding',to_jsonb(b),'purchase',to_jsonb(p),'context',to_jsonb(c),
+ return jsonb_build_object('operation',to_jsonb(o),'binding',to_jsonb(b),'purchase',to_jsonb(p),'context',to_jsonb(c),'accepted_epoch',accepted_epoch,
   'observed_at',to_char(clock_timestamp() at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
 end $$;
 
@@ -156,7 +167,7 @@ begin
   or p->'shipping_cost' is distinct from 'null'::jsonb or p->'has_more' is distinct from 'false'::jsonb
   or not public.membership_v2_fact_epoch(p->'created') or not public.membership_v2_fact_epoch(p->'provider_paid_at')
   or jsonb_typeof(p->'items') is distinct from 'array' then return false;end if;
- if (p->>'provider_paid_at')::bigint < greatest(floor(extract(epoch from (x->'purchase'->'source_snapshot'->'acceptance'->>'accepted_at')::timestamptz))::bigint,
+ if (p->>'provider_paid_at')::bigint < greatest((x->>'accepted_epoch')::bigint,
   (b->>'created')::bigint,(c.proof->>'intent_created')::bigint,(c.proof->>'charge_created')::bigint,(p->>'created')::bigint)
   or jsonb_array_length(p->'items')<>jsonb_array_length(b->'items') then return false;end if;
  for i in select value from jsonb_array_elements(p->'items') loop

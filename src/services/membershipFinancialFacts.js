@@ -138,9 +138,12 @@ function createMembershipFinancialFacts({ db, stripe, environment, contextId } =
     const capture = await record('membership_v2_capture_facts', 'membership_v2_record_capture', operationId, proof);
     // Current risks are separate observations. Never subtract a refund from the
     // original capture, or mistake a stored reuse setting for future authority.
-    await rpc('membership_v2_record_capture_observation', { p_operation: operationId, p_observation: {
-      charge_id: chargeId, amount_refunded: charge.amount_refunded, disputed: charge.disputed,
-      capture_method: pi.capture_method, setup_future_usage: pi.setup_future_usage } });
+    let riskObservationHeld = false;
+    try {
+      await rpc('membership_v2_record_capture_observation', { p_operation: operationId, p_observation: {
+        charge_id: chargeId, amount_refunded: charge.amount_refunded, disputed: charge.disputed,
+        capture_method: pi.capture_method, setup_future_usage: pi.setup_future_usage } });
+    } catch (_) { riskObservationHeld = true; }
     let clock = await row('membership_v2_paid_invoice_facts', operationId), invoiceHeld = false;
     try {
       const invoice = await invoiceProof(s, pi, charge);
@@ -159,7 +162,7 @@ function createMembershipFinancialFacts({ db, stripe, environment, contextId } =
       invoiceHeld = true;
     }
     return Object.freeze({ operation_id: operationId, capture_recorded: true, paid_clock_recorded: !!clock,
-      invoice_current_observation_held: invoiceHeld, provider_paid_at: clock?.provider_paid_at ?? null,
+      invoice_current_observation_held: invoiceHeld, risk_observation_held: riskObservationHeld, provider_paid_at: clock?.provider_paid_at ?? null,
       account_ownership_verified: false, activation_enabled: false, commission_enabled: false, collection_enabled: false });
   } });
 }
