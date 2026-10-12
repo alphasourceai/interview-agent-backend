@@ -624,7 +624,7 @@ async function createSubscriptionCheckoutSession({
       success_url: checkoutSuccessUrl,
       cancel_url: normalizedCancelUrl || buildClientDashboardReturnUrl(cancelParams)
     }, createOptions())
-  } else {
+  } else if (!retailOffer) {
     try {
       hostedFallbackSession = await stripe.checkout.sessions.create({
         ...checkoutBasePayload,

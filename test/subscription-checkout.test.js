@@ -98,7 +98,7 @@ function makeDb() {
   return db
 }
 
-function loadCheckout({ stripeCalls, stripeConstructor }) {
+function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder }) {
   delete require.cache[checkoutPath]
   delete require.cache[supabaseClientPath]
   delete require.cache[clientBillingScopePath]
@@ -141,6 +141,7 @@ function loadCheckout({ stripeCalls, stripeConstructor }) {
         sessions: {
           create: async (payload, options) => {
             stripeCalls.sessions.push({ payload, options })
+            if (sessionResponder) return sessionResponder(payload, options)
             return { id: 'cs_test_subscription', url: 'https://checkout.stripe.test/cs_test_subscription' }
           }
         }
@@ -367,6 +368,14 @@ test('new retail Checkout does not create a second hosted session after an ambig
   await assert.rejects(create({clientId:'client-1',planTier:'basic',billingInterval:'prepaid',packageSnapshot:retailSnapshot(),
     idempotencyKey:'existing-agreement:embedded',metadataSource:'agreement_checkout',embedded:true}),e=>e.code==='retail_checkout_ack_unknown');
   assert.equal(calls.sessions.length,1);assert.equal(calls.sessions[0].payload.ui_mode,'embedded');
+});
+test('confirmed new retail embedded checkout retains its primary session without a second payable fallback',async()=>{
+  const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,
+    sessionResponder:()=>({id:'cs_SYNTHETIC_EMBEDDED',url:null,client_secret:'SYNTHETIC_NOT_A_REAL_SECRET'})});
+  const result=await create({clientId:'client-1',planTier:'basic',billingInterval:'prepaid',packageSnapshot:retailSnapshot(),
+    idempotencyKey:'existing-agreement:embedded-confirmed',metadataSource:'agreement_checkout',embedded:true});
+  assert.equal(calls.sessions.length,1);assert.equal(result.session.id,'cs_SYNTHETIC_EMBEDDED');assert.equal(result.fallbackSession,null);
+  assert.equal(result.checkoutClientSecret,'SYNTHETIC_NOT_A_REAL_SECRET');
 });
 test('new retail pricing preserves the existing validated promotion-code behavior',async()=>{
   const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls});
