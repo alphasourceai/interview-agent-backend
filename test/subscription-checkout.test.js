@@ -324,3 +324,52 @@ test('subscription checkout applies a validated promotion code instead of allowi
     }
   }
 })
+
+function retailSnapshot(planKey='basic',commitmentMonths=3,paymentOption='prepaid',firstRolePrepaySelected=false) {
+  return require('../src/services/alphaScreenPackages').buildAlphaScreenPackageSnapshot(planKey,paymentOption==='prepaid'?'prepaid':'monthly',{
+    commitmentMonths,paymentOption,firstRolePrepaySelected,channel:'sales',offerVersion:require('../src/services/membershipOffers').OFFER_VERSION
+  })
+}
+function retailCalls() {return {sessions:[],customerUpdates:[],customerCreates:[],subscriptionLists:[]}}
+test('existing subscription checkout prices all24 retail variants from frozen package terms, without new Auth or Stripe-price configuration',async()=>{
+  for(const planKey of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])for(const role of [false,true]){
+    const calls=retailCalls(),snapshot=retailSnapshot(planKey,months,payment,role),offer=snapshot.membership_terms;
+    const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls});
+    await create({clientId:'client-1',planTier:planKey,billingInterval:snapshot.billing_cadence,packageSnapshot:snapshot,
+      metadataSource:'agreement_checkout',idempotencyKey:`existing-agreement:${planKey}:${months}:${payment}:${role}`,
+      metadata:{client_id:'wrong-client',plan_tier:'enterprise',billing_interval:'annual',membership_commitment_months:'99',first_role_prepay_selected:'wrong'}});
+    assert.equal(calls.sessions.length,1);const {payload:p,options}=calls.sessions[0];assert.equal(p.mode,'subscription');
+    assert.equal(p.customer,'cus_existing');assert.equal(p.line_items.length,role?2:1);
+    assert.equal(p.line_items[0].price_data.unit_amount,offer.platform_payment_cents);
+    assert.deepEqual(p.line_items[0].price_data.recurring,{interval:'month',interval_count:payment==='prepaid'?months:1});
+    assert.equal(p.allow_promotion_codes,true);assert.equal(p.metadata.client_id,'client-1');assert.equal(p.metadata.plan_tier,planKey);
+    assert.equal(p.metadata.billing_interval,snapshot.billing_cadence);assert.equal(p.metadata.membership_commitment_months,String(months));
+    assert.equal(p.metadata.first_role_prepay_selected,String(role));assert.equal(p.metadata.first_role_prepay_amount_cents,String(offer.first_role_prepay.amount_cents));
+    assert.deepEqual(p.subscription_data.metadata,p.metadata);assert.equal('trial_end' in p.subscription_data,false);
+    assert.equal('billing_cycle_anchor' in p.subscription_data,false);assert.ok(options.idempotencyKey.startsWith('existing-agreement:'));
+    if(role){assert.equal(p.line_items[1].price_data.unit_amount,planKey==='basic'?35900:62900);assert.equal('recurring' in p.line_items[1].price_data,false)}
+  }
+});
+test('new retail checkout rejects mismatched plan/cadence/role, malformed source and unsafe identity before provider effects',async()=>{
+  const snapshot=retailSnapshot(),cases=[{planTier:'pro'},{billingInterval:'annual'},{idempotencyKey:''},{idempotencyKey:'ambiguous key'},
+    {idempotencyKey:'A'.repeat(256)},
+    {firstRolePrepay:{selected:true,credit_type:'first_role_prepay',amount_cents:35900,normal_role_fee_cents:39900,discount_percent:10}},
+    {packageSnapshot:{pricing_protocol:'retail_package_terms_v2'}}];
+  for(const change of cases){const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls});
+    await assert.rejects(create({clientId:'client-1',planTier:'basic',billingInterval:'prepaid',packageSnapshot:snapshot,
+      idempotencyKey:'existing-agreement:synthetic',metadataSource:'agreement_checkout',...change}));
+    assert.equal(calls.sessions.length,0);assert.equal(calls.customerCreates.length,0);assert.equal(calls.customerUpdates.length,0);assert.equal(calls.subscriptionLists.length,0)}
+});
+test('new retail Checkout does not create a second hosted session after an ambiguous embedded result',async()=>{
+  const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls});
+  await assert.rejects(create({clientId:'client-1',planTier:'basic',billingInterval:'prepaid',packageSnapshot:retailSnapshot(),
+    idempotencyKey:'existing-agreement:embedded',metadataSource:'agreement_checkout',embedded:true}),e=>e.code==='retail_checkout_ack_unknown');
+  assert.equal(calls.sessions.length,1);assert.equal(calls.sessions[0].payload.ui_mode,'embedded');
+});
+test('new retail pricing preserves the existing validated promotion-code behavior',async()=>{
+  const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls});
+  await create({clientId:'client-1',planTier:'basic',billingInterval:'prepaid',packageSnapshot:retailSnapshot(),
+    idempotencyKey:'existing-agreement:promotion',metadataSource:'agreement_checkout',promotionCodeId:'promo_validated'});
+  assert.deepEqual(calls.sessions[0].payload.discounts,[{promotion_code:'promo_validated'}]);
+  assert.equal('allow_promotion_codes' in calls.sessions[0].payload,false);
+});

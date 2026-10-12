@@ -11,6 +11,7 @@ const { resolvePublicBackendBase, buildClientDashboardReturnUrl } = require('../
 const { priceEnterprisePool, quoteEnterprisePool } = require('./enterprisePoolPricing')
 const {enterprisePoolCheckoutQuote}=require('./enterprisePoolSnapshot')
 const { enterpriseSettingsMetadata, validateEnterpriseSettings } = require('./enterpriseSettings')
+const { readRetailPackageOffer } = require('./membershipPackageCompatibility')
 
 function makeError(status, code, detail) {
   const err = new Error(detail || code || 'checkout_failed')
@@ -254,6 +255,7 @@ async function createSubscriptionCheckoutSession({
   firstRolePrepay = null,
   promotionCodeId = '',
   enterpriseFees = null,
+  packageSnapshot = null,
   requestContext = null,
   idempotencyKey = '',
   checkoutExpiresAt = null,
@@ -261,13 +263,32 @@ async function createSubscriptionCheckoutSession({
 }) {
   const normalizedClientId = String(clientId || '').trim()
   const normalizedPlanTier = normalizePlanTier(planTier)
-  const normalizedBillingInterval = normalizeBillingInterval(billingInterval)
+  const retailOffer = readRetailPackageOffer(packageSnapshot)
+  const retailInterval = retailOffer?.payment_option === 'prepaid' ? 'prepaid' : 'monthly'
+  const normalizedBillingInterval = retailOffer ? retailInterval : normalizeBillingInterval(billingInterval)
+  if (retailOffer && (normalizedPlanTier !== retailOffer.plan_key || billingInterval !== retailInterval || normalizedPlanTier === 'enterprise')) {
+    throw makeError(409, 'retail_package_selection_mismatch', 'Checkout selection does not match the accepted pricing terms.')
+  }
   const normalizedMetadataSource = String(metadataSource || '').trim().toLowerCase()
   const normalizedReturnTab = String(returnTab || '').trim().toLowerCase()
   const embeddedCheckoutRequested = wantsEmbeddedCheckout(embedded)
   const normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey)
   const normalizedPromotionCodeId = String(promotionCodeId || '').trim().slice(0, 255)
   const firstRolePrepayCheckout = normalizeFirstRolePrepayCheckout(firstRolePrepay)
+  if (retailOffer && firstRolePrepayCheckout && (!retailOffer.first_role_prepay.selected
+    || firstRolePrepayCheckout.amount_cents !== retailOffer.first_role_prepay.amount_cents
+    || firstRolePrepayCheckout.normal_role_fee_cents !== retailOffer.first_role_prepay.normal_role_fee_cents
+    || firstRolePrepayCheckout.discount_percent !== packageSnapshot.first_role_prepay.discount_percent)) {
+    throw makeError(409, 'retail_first_role_mismatch', 'First-role payment does not match the accepted pricing terms.')
+  }
+  const retailMetadata = retailOffer ? { membership_pricing_version:retailOffer.offer_version,
+    membership_commitment_months:String(retailOffer.commitment_months), membership_payment_option:retailOffer.payment_option,
+    membership_platform_payment_cents:String(retailOffer.platform_payment_cents),
+    membership_commitment_total_cents:String(retailOffer.platform_commitment_total_cents) } : null
+  if (retailOffer && (!normalizedIdempotencyKey || typeof idempotencyKey !== 'string'
+    || !/^[A-Za-z0-9_.:-]{1,255}$/.test(idempotencyKey) || normalizedIdempotencyKey !== idempotencyKey)) {
+    throw makeError(409, 'retail_checkout_key_required', 'The existing agreement checkout identity is required.')
+  }
   const nowMs = now ? new Date(now).getTime() : Date.now()
   let checkoutExpiresAtEpoch = null
   if (checkoutExpiresAt) {
@@ -325,7 +346,7 @@ async function createSubscriptionCheckoutSession({
   const billingCustomerList = Array.isArray(billingCustomerRows) ? billingCustomerRows : []
   const billingCustomer = billingCustomerList[0] || null
 
-  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '')
+  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion:'2023-10-16' })
 
   let resolvedStripeCustomerId = null
   try {
@@ -471,13 +492,25 @@ async function createSubscriptionCheckoutSession({
         ...(quote.offer_snapshot?{pool_offer_version:quote.offer_snapshot.offer_version,pool_offer_digest:quote.offer_digest}:{})
       }
     }
+  } else if (retailOffer) {
+    lineItems.push({ quantity:1, price_data:{ currency:'usd', unit_amount:retailOffer.platform_payment_cents,
+      recurring:{ interval:'month', interval_count:retailOffer.stripe_recurrence.interval_count },
+      product_data:{ name:`alphaScreen ${retailOffer.display_name} — ${retailOffer.commitment_months}-month ${retailOffer.payment_option === 'prepaid' ? 'prepaid' : 'commitment'}`,
+        metadata:retailMetadata } } })
   } else {
     const priceId = getAlphaScreenStripePriceId(normalizedPlanTier, normalizedBillingInterval)
     if (!priceId) throw makeError(500, 'stripe_price_not_configured', 'Stripe price is not configured.')
     lineItems.push({ price: priceId, quantity: 1 })
   }
   let firstRolePrepayMetadata = null
-  if (firstRolePrepayCheckout) {
+  if (retailOffer?.first_role_prepay.selected) {
+    const role = retailOffer.first_role_prepay
+    lineItems.push({ quantity:1, price_data:{ currency:'usd', unit_amount:role.amount_cents,
+      product_data:{ name:`alphaScreen ${retailOffer.display_name} first-role prepay`, metadata:{ credit_type:role.credit_type } } } })
+    firstRolePrepayMetadata = { first_role_prepay_selected:'true', first_role_prepay_credit_type:role.credit_type,
+      first_role_prepay_amount_cents:String(role.amount_cents), first_role_prepay_normal_role_fee_cents:String(role.normal_role_fee_cents),
+      first_role_prepay_discount_percent:String(packageSnapshot.first_role_prepay.discount_percent) }
+  } else if (!retailOffer && firstRolePrepayCheckout) {
     const firstRolePrepayPriceId = getAlphaScreenFirstRolePrepayStripePriceId(normalizedPlanTier)
     if (!firstRolePrepayPriceId) {
       throw makeError(500, 'first_role_prepay_price_not_configured', 'First-role prepay Stripe price is not configured.')
@@ -519,7 +552,14 @@ async function createSubscriptionCheckoutSession({
     ...normalizeMetadataObject(poolMetadata || {}),
     ...normalizeMetadataObject(metadata),
     ...normalizeMetadataObject(replacementMetadata || {}),
-    ...(enterpriseTerms?.acceptedPoolQuote?normalizeMetadataObject(poolMetadata||{}):{})
+    ...(enterpriseTerms?.acceptedPoolQuote?normalizeMetadataObject(poolMetadata||{}):{}),
+    ...(retailOffer ? { ...retailMetadata, source:normalizedMetadataSource, client_id:client.id,
+      plan_tier:retailOffer.plan_key, billing_interval:normalizedBillingInterval,
+      first_role_prepay_selected:String(retailOffer.first_role_prepay.selected),
+      first_role_prepay_amount_cents:String(retailOffer.first_role_prepay.amount_cents),
+      first_role_prepay_credit_type:retailOffer.first_role_prepay.credit_type,
+      first_role_prepay_normal_role_fee_cents:String(retailOffer.first_role_prepay.normal_role_fee_cents),
+      first_role_prepay_discount_percent:String(packageSnapshot.first_role_prepay.discount_percent) } : {})
   }
 
   const checkoutBasePayload = {
@@ -569,9 +609,11 @@ async function createSubscriptionCheckoutSession({
       if (resolvedClientSecret) {
         checkoutClientSecret = resolvedClientSecret
       } else {
+        if (retailOffer) throw makeError(503, 'retail_checkout_ack_unknown', 'Checkout could not be confirmed. Reconcile the existing attempt before continuing.')
         primaryCheckoutSession = null
       }
     } catch (embeddedErr) {
+      if (retailOffer) throw makeError(503, 'retail_checkout_ack_unknown', 'Checkout could not be confirmed. Reconcile the existing attempt before continuing.')
       console.error('create_subscription_embedded_checkout_session_failed:', embeddedErr?.message || embeddedErr)
     }
   }

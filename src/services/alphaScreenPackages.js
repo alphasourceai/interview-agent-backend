@@ -1,6 +1,7 @@
 'use strict'
 
 const { requirePlanCapacity } = require('./planCapacity')
+const { buildRetailPackageSnapshot, readRetailPackageOffer } = require('./membershipPackageCompatibility')
 
 const PUBLIC_PACKAGE_KEYS = Object.freeze(['basic', 'pro'])
 const BILLING_INTERVALS = Object.freeze(['monthly', 'annual'])
@@ -112,7 +113,16 @@ function getAlphaScreenPlatformFee(planKey, billingInterval) {
   return interval === 'annual' ? pkg.platform_annual_fee : pkg.platform_monthly_fee
 }
 
-function buildAlphaScreenPlanSettingsPayload({ clientId, planKey, billingInterval } = {}) {
+function buildAlphaScreenPlanSettingsPayload({ clientId, planKey, billingInterval, packageSnapshot } = {}) {
+  const accepted = readRetailPackageOffer(packageSnapshot)
+  if (accepted) {
+    const interval = accepted.payment_option === 'prepaid' ? 'prepaid' : 'monthly'
+    if (!String(clientId || '').trim() || normalizeAlphaScreenPlanKey(planKey) !== accepted.plan_key || billingInterval !== interval) return null
+    return { client_id:String(clientId).trim(), plan_tier:accepted.plan_key, billing_interval:interval,
+      platform_fee:accepted.platform_payment_cents / 100, per_role_fee:accepted.per_role_fee_cents / 100,
+      included_interviews_per_role:accepted.included_interviews_per_role,
+      additional_interview_fee:accepted.additional_interview_fee_cents / 100, max_interview_minutes:accepted.max_interview_minutes }
+  }
   const client_id = String(clientId || '').trim()
   const plan_tier = normalizeAlphaScreenPlanKey(planKey)
   const billing_interval = normalizeBillingInterval(billingInterval)
@@ -180,6 +190,13 @@ function buildAlphaScreenFirstRolePrepaySnapshot(planKey, { selected = false } =
 }
 
 function buildAlphaScreenPackageSnapshot(planKey, billingInterval, options = {}) {
+  if (options.commitmentMonths !== undefined || options.paymentOption !== undefined) {
+    const snapshot = buildRetailPackageSnapshot({ planKey, commitmentMonths:options.commitmentMonths,
+      paymentOption:options.paymentOption, channel:options.channel, offerVersion:options.offerVersion,
+      firstRolePrepaySelected:options.firstRolePrepaySelected === true || options.first_role_prepay_selected === true })
+    if (snapshot.billing_cadence !== billingInterval) return null
+    return snapshot
+  }
   const pkg = getAlphaScreenPackage(planKey)
   const interval = normalizeBillingInterval(billingInterval)
   if (!pkg || !interval || !pkg.billing_cadences?.[interval]) return null
