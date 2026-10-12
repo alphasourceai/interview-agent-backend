@@ -3,6 +3,7 @@
 // contract linkage or signing route. REVIEW bundles are never issued artifacts.
 const crypto=require('node:crypto');
 const {validIssuedMembershipVersion}=require('./membershipCapabilityPredicates');
+const {createMembershipDeliveryReservation}=require('./membershipDeliveryReservation');
 const UUID=/^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const HASH=/^[0-9a-f]{64}$/;
 const canonical=v=>v && typeof v==='object'?(Array.isArray(v)?`[${v.map(canonical).join(',')}]`:
@@ -32,7 +33,8 @@ function legal(v){check(plain(v,['version','template_sha256','refund_policy_vers
   && v.approval_reference===v.approval_reference.trim() && typeof v.approved_at==='string' && Number.isFinite(Date.parse(v.approved_at)),
   'issued_legal_unavailable',503);return v;}
 
-function createMembershipIssuedDocumentService({db,authorizeScope,loadSource,loadQuote,legalVersion,loadPublishedLegal,renderIssuedDocument,artifacts}={}){
+function createMembershipIssuedDocumentService({db,authorizeScope,loadSource,loadQuote,legalVersion,loadPublishedLegal,renderIssuedDocument,artifacts,delivery}={}){
+  const queued=delivery===undefined?null:createMembershipDeliveryReservation({db,delivery});
   check(typeof db?.from==='function' && typeof db.rpc==='function' && [authorizeScope,loadSource,loadQuote,loadPublishedLegal,renderIssuedDocument].every(f=>typeof f==='function')
     && validIssuedMembershipVersion(legalVersion)
     && typeof artifacts?.putIfAbsent==='function' && typeof artifacts.readPrivate==='function','issued_service_not_configured',503);
@@ -92,18 +94,27 @@ function createMembershipIssuedDocumentService({db,authorizeScope,loadSource,loa
     const payload={id,source_id:input.sourceId,source_fingerprint:first.source_fingerprint,scope_id:ctx.scope_id,issuer_user_id:ctx.issuer_user_id,
       legal_version:l.version,rendered_html:html,html_sha256:sha(html),preview_pdf_path:preview,preview_pdf_sha256:sha(bytes),
       preview_pdf_size:bytes.length,signer_token_hash:signerHash(id,first.source_fingerprint,token)};
-    let ack,unknown=false;try{ack=await db.rpc('membership_v2_issue_document',{p_document:payload});}
+    const reservation=queued?await queued.prepare({purpose:'retail_signer_v2',environment:queued.environment,
+      document_id:id,source_fingerprint:first.source_fingerprint,buyer_email:first.source.buyer.buyer_email,legal_version:l.version,
+      html_sha256:payload.html_sha256,preview_pdf_sha256:payload.preview_pdf_sha256,token_hash:payload.signer_token_hash},token):null;
+    if(queued)check(canonical(await auth(subject))===canonical(ctx),'issued_scope_denied',403);
+    let ack,unknown=false;try{ack=queued?await db.rpc('membership_v2_issue_document_and_delivery',{
+      p_document:payload,p_job:reservation.job_id,p_envelope:reservation.sealed_envelope}):await db.rpc('membership_v2_issue_document',{p_document:payload});}
     catch(e){if(definite(e))fail('issued_create_failed',503);unknown=true;}
     if(ack?.error){if(definite(ack.error))fail('issued_create_failed',503);unknown=true;}
-    if(!unknown)check(Array.isArray(ack?.data) && ack.data.length===1 && ack.data[0].id===id,'issued_create_unverified',503);
+    const expected={source_id:input.sourceId,document_id:id,scope_id:ctx.scope_id,issuer_user_id:ctx.issuer_user_id};
+    let ackTime=null;
+    if(!unknown){if(queued)ackTime=queued.validateAck(ack?.data,reservation,expected);
+      else check(Array.isArray(ack?.data) && ack.data.length===1 && ack.data[0].id===id,'issued_create_unverified',503);}
     check(canonical(await auth(subject))===canonical(ctx),'issued_scope_denied',403);
     const stored=validate(await read(ctx,id),ctx,first,payload,l);
+    const safe=queued?await queued.verify(reservation,expected,ackTime):{delivery:'not_configured'};
     // Recover only persistence after unknown commit; NEVER resend/retry/return
-    // raw capability. Delivery registry/outbox integration is still required.
+    // raw capability. Queued mode reserves a job, never sends it here.
     check(canonical(await auth(subject))===canonical(ctx),'issued_scope_denied',403);
     return frozen({document_id:stored.id,source_id:stored.source_id,source_fingerprint:stored.source_fingerprint,
       legal_version:stored.legal_version,html_sha256:stored.html_sha256,preview_pdf_sha256:stored.preview_pdf_sha256,
-      issued_at:stored.issued_at,expires_at:stored.expires_at,delivery:'not_configured',
+      issued_at:stored.issued_at,expires_at:stored.expires_at,...safe,
       signing_enabled:false,checkout_enabled:false,persistence:unknown?'recovered_unknown_commit':'verified'});
   }});
 }

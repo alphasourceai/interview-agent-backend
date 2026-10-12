@@ -2,10 +2,12 @@
 
 // UNMOUNTED. Contact proof only: never signing, buyer Auth identity or access.
 // handoffVerification is a trusted SERVER callback, not a browser response. No
-// default mail client. Delivery ledger/rate limits remain required before mount.
+// default mail client. Optional queued mode uses the native delivery ledger;
+// runtime/rate-limit/sender integration still remains required before mount.
 const crypto=require('node:crypto');
 const {validMembershipBuyerEmail}=require('./membershipCapabilityPredicates');
 const {createMembershipQuoteDraftService}=require('./membershipQuoteDrafts');
+const {createMembershipDeliveryReservation}=require('./membershipDeliveryReservation');
 const UUID=/^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SOURCES='membership_v2_sales_prospects';
 const CHALLENGES='membership_v2_sales_email_challenges',PROOFS='membership_v2_sales_email_proofs';
@@ -42,9 +44,10 @@ function document(row){return {protocol:'retail_sales_prospect_v2',source_versio
 function scope(row){return {scope_id:row.scope_id,audience:'sales',issuer_user_id:row.issuer_user_id,
   original_salesperson_user_id:row.issuer_user_id,client_id:null,billing_owner_user_id:null};}
 
-function createMembershipSalesProspectService({db,authorizeScope,handoffVerification,catalog}={}){
+function createMembershipSalesProspectService({db,authorizeScope,handoffVerification,catalog,delivery}={}){
+  const queued=delivery===undefined?null:createMembershipDeliveryReservation({db,delivery});
   check(typeof db?.from==='function' && typeof db.rpc==='function' && typeof authorizeScope==='function'
-    && typeof handoffVerification==='function','sales_prospect_not_configured',503);
+    && (queued || typeof handoffVerification==='function'),'sales_prospect_not_configured',503);
   async function one(table,columns,filters){let result;
     try{let q=db.from(table).select(columns);for(const [k,v] of Object.entries(filters))q=v===null?q.is(k,null):q.eq(k,v);
       result=await q.maybeSingle();}catch(_){fail('sales_prospect_store_unavailable',503);}
@@ -118,16 +121,24 @@ function createMembershipSalesProspectService({db,authorizeScope,handoffVerifica
       const row={id,scope_id:ctx.scope_id,issuer_user_id:ctx.issuer_user_id,quote_id:input.quoteId,
         quote_digest:quote.quote_digest,previous_source_id:input.expectedSourceId,buyer_snapshot:snapshot};
       const bytes=canonical(document(row)),fingerprint=hash(bytes);
+      const reservation=queued?await queued.prepare({purpose:'sales_email_link_v1',environment:queued.environment,
+        source_id:id,source_fingerprint:fingerprint,buyer_email:snapshot.buyer_email,token_hash:hashed},token):null;
       check(canonical(await authorize(subject))===canonical(ctx),'sales_prospect_denied');
       let ack,unknown=false;
-      try{ack=await db.rpc('membership_v2_register_sales_prospect',{p_id:id,p_actor:ctx.issuer_user_id,p_scope:ctx.scope_id,
+      const payload={p_id:id,p_actor:ctx.issuer_user_id,p_scope:ctx.scope_id,
         p_quote:row.quote_id,p_quote_digest:row.quote_digest,p_previous:row.previous_source_id,p_buyer:snapshot,
-        p_canonical:bytes,p_fingerprint:fingerprint,p_token_hash:hashed});}
+        p_canonical:bytes,p_fingerprint:fingerprint,p_token_hash:hashed};
+      try{ack=queued?await db.rpc('membership_v2_register_source_and_delivery',{
+        p_source:Object.fromEntries(Object.entries(payload).map(([k,v])=>[k.slice(2),v])),
+        p_job:reservation.job_id,p_envelope:reservation.sealed_envelope}):await db.rpc('membership_v2_register_sales_prospect',payload);}
       catch(error){if(definite(error))fail('sales_prospect_create_failed',503);unknown=true;}
       if(ack?.error){if(ack.error.code==='P0001' && ack.error.message==='sales_source_conflict')fail('sales_prospect_conflict',409);
         if(ack.error.code==='P0001' && ack.error.message==='sales_source_denied')fail('sales_prospect_denied');
         if(definite(ack.error))fail('sales_prospect_create_failed',503);unknown=true;}
-      if(!unknown)check(Array.isArray(ack?.data) && ack.data.length===1 && ack.data[0].id===id,'sales_prospect_create_unverified',503);
+      const expected={source_id:id,document_id:null,scope_id:ctx.scope_id,issuer_user_id:ctx.issuer_user_id};
+      let ackTime=null;
+      if(!unknown){if(queued)ackTime=queued.validateAck(ack?.data,reservation,expected);
+        else check(Array.isArray(ack?.data) && ack.data.length===1 && ack.data[0].id===id,'sales_prospect_create_unverified',503);}
       check(canonical(await authorize(subject))===canonical(ctx),'sales_prospect_denied');
       const stored=await currentRow(id,ctx);check(stored.canonical_source===bytes && stored.source_fingerprint===fingerprint,'sales_prospect_create_unverified',503);
       await quoteFor(stored,ctx,subject);
@@ -138,6 +149,10 @@ function createMembershipSalesProspectService({db,authorizeScope,handoffVerifica
         && Date.parse(challenge.expires_at)-Date.parse(challenge.issued_at)<=600000,'sales_prospect_create_unverified',503);
       await currentRow(id,ctx);check(canonical(await authorize(subject))===canonical(ctx),'sales_prospect_denied');
       const beforeHandoff=await facts(id,ctx);check(beforeHandoff.quote_live && beforeHandoff.challenge_live,'sales_prospect_denied');
+      if(queued){const safe=await queued.verify(reservation,expected,ackTime);
+        check(canonical(await authorize(subject))===canonical(ctx),'sales_prospect_denied');
+        return frozen({...response(stored,null),...safe,verification_handoff:'reserved',
+          persistence:unknown?'recovered_unknown_commit':'verified'});}
       // No resend on lost commit: recovery verifies persistence, not delivery.
       // A fresh quote + explicit CAS replacement can safely issue another link.
       let handoff='held_unknown_commit';
