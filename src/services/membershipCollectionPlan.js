@@ -26,19 +26,20 @@ function ownKeys(value, keys) {
   return dataObject(value) && Reflect.ownKeys(value).length === keys.length
     && keys.every(key => Object.hasOwn(value, key));
 }
-function safeJson(value, depth = 0) {
-  if (depth > 12) return false;
+function safeJson(value, depth = 0, budget = { remaining: 4096, seen: new WeakSet() }) {
+  if (--budget.remaining < 0 || depth > 12) return false;
   if (value === null || typeof value === 'boolean') return true;
   if (typeof value === 'string') return value.length <= 2048;
   if (typeof value === 'number') return Number.isSafeInteger(value);
-  if (!dataObject(value)) return false;
+  if (!dataObject(value) || budget.seen.has(value)) return false;
+  budget.seen.add(value);
   return Object.keys(value).length <= 100
     && Object.values(Object.getOwnPropertyDescriptors(value))
-      .every(descriptor => safeJson(descriptor.value, depth + 1));
+      .every(descriptor => safeJson(descriptor.value, depth + 1, budget));
 }
 const cents = value => Number.isSafeInteger(value) && value >= 0;
 function acceptedOffer(value) {
-  requireValue(safeJson(value));
+  requireValue(dataObject(value) && safeJson(value));
   // Validate the accepted descriptor, not today's mutable catalog prices.
   requireValue(value.schema_version === 2 && typeof value.offer_version === 'string'
     && value.offer_version.length > 0 && ['basic', 'pro'].includes(value.plan_key)

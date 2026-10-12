@@ -102,6 +102,7 @@ test('invalid/extra body fields, unsupported cadence/instant and unsafe JSON fai
     { boundaryOffset: '1' }, { purchaseId: '00000000-0000-0000-0000-000000000000' }, { sourceDigest: 'bad' },
     { originalPaidAt: '2026-01-31' }, { originalPaidAt: '2026-01-31T00:00:00+00:00' },
     { originalPaidAt: '9999-12-31T00:00:00.000Z' }, { offer: { ...offer(), platform_commitment_total_cents: 1 } },
+    { offer: null }, { offer: true }, { offer: [] },
     { offer: { ...offer(), first_role_prepay: { selected: false, amount_cents: 1 } } },
     { offer: { ...offer(), renewal: { ...offer().renewal, non_renewal_cutoff: '30days' } } },
     { offer: offer('pro', 6, 'prepaid'), boundaryOffset: 1 }, { autoRenew: true }, { amount: 1 }, { environment: 'production' } ]) {
@@ -111,6 +112,11 @@ test('invalid/extra body fields, unsupported cadence/instant and unsafe JSON fai
   Object.defineProperty(poisoned, 'currency', { enumerable: true, get() { throw Error('must not execute'); } });
   assert.throws(() => plan({ offer: poisoned }), error => error.code === 'invalid_membership_collection_plan');
   assert.throws(() => plan({ offer: new Proxy(offer(), {}) }), error => error.code === 'invalid_membership_collection_plan');
+  const cycle = { ...offer() }; cycle.self = cycle;
+  assert.throws(() => plan({ offer: cycle }), error => error.code === 'invalid_membership_collection_plan');
+  let aliased = { leaf: true };
+  for (let level = 0; level < 10; level++) aliased = { a: aliased, b: aliased };
+  assert.throws(() => plan({ offer: { ...offer(), extra: aliased } }), error => error.code === 'invalid_membership_collection_plan');
   const outer = { ...base, offer: offer(), boundaryOffset: 1 };
   Object.defineProperty(outer, 'boundaryOffset', { enumerable: true, get() { throw Error('must not execute'); } });
   assert.throws(() => planMembershipCollection(outer), error => error.code === 'invalid_membership_collection_plan');
