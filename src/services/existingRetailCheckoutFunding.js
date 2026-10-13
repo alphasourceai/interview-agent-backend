@@ -141,8 +141,18 @@ async function readExistingRetailCheckoutFunding({db,stripe,agreementId,intentId
   const applied=agreement.checkout_paid_at||intent?.activated_at;
   if(applied) {
     check((!linked || agreement.checkout_paid_at===intent.activated_at) && Number.isFinite(Date.parse(applied))
-      && agreement.checkout_status==='paid' && client.stripe_subscription_id===subscription.id,'retail_funding_original_clock_mismatch');
-    return {...source,paidAt:new Date(applied).toISOString(),checkoutSessionId:checkoutId,subscription,customerId:expected.customerId,replay:true};
+      && agreement.checkout_status==='paid','retail_funding_original_clock_mismatch');
+    // Linked completion writes both clocks BEFORE the billing RPC assigns the
+    // subscription. Its durable native tail must resume even if that id is
+    // still absent; the trusted Session/subscription/customer graph owns it.
+    if(linked || client.stripe_subscription_id===subscription.id) {
+      return {...source,paidAt:new Date(applied).toISOString(),checkoutSessionId:checkoutId,subscription,customerId:expected.customerId,replay:true};
+    }
+    // An admin paid-clock-only retry is NOT an already-applied replay. Reprove
+    // the original cash, then finish its existing unfenced tail without setting
+    // another clock. An unrelated existing subscription must not be replaced.
+    check(!client.stripe_subscription_id || agreement.replaces_stripe_subscription_id===client.stripe_subscription_id,
+      'retail_funding_original_clock_mismatch');
   }
   let invoice;
   if(id(checkout.invoice)){await assertFence();invoice=await stripe.invoices.retrieve(id(checkout.invoice));}
@@ -161,6 +171,7 @@ async function readExistingRetailCheckoutFunding({db,stripe,agreementId,intentId
   await assertFence();const paymentIntent=await stripe.paymentIntents.retrieve(id(invoice.payment_intent));
   await assertFence();const charge=await stripe.charges.retrieve(id(invoice.charge));
   const proof=verifyExistingRetailFunding({offer:terms.offer,checkout,checkoutLines,subscription,subscriptionItems,invoice,invoiceLines,paymentIntent,charge,expected});
+  check(!applied || proof.paidAt===new Date(applied).toISOString(),'retail_funding_original_clock_mismatch');
   await assertFence();return{...source,...proof,checkoutSessionId:checkoutId,subscription,customerId:expected.customerId,replay:false};
 }
 async function assertExistingRetailFundingSource({db,funding}) {
@@ -181,6 +192,6 @@ async function assertExistingRetailFundingSource({db,funding}) {
   if(be)throw new Error(be.message||'retail_funding_customer_read_failed');
   check(c?.stripe_customer_id===funding.customerId && Array.isArray(customers) && customers.length>0 && customers.length===bCount
     && customers.every(b=>b.stripe_customer_id===funding.customerId)
-    && (!funding.replay || c.stripe_subscription_id===funding.subscription.id),'retail_funding_source_changed');
+    && (!funding.replay || funding.sourceIntentId || c.stripe_subscription_id===funding.subscription.id),'retail_funding_source_changed');
 }
 module.exports={readExistingRetailCheckoutFunding,verifyExistingRetailFunding,collect,assertExistingRetailFundingSource};

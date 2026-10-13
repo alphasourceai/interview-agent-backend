@@ -45,6 +45,16 @@ test('already-paid linked and admin replays skip monetary revalidation/refunds a
     f.sdk.invoices.retrieve=async()=>{throw Error('Do not recompute initial receipt')};
     const r=await read(f.options);assert.equal(r.paidAt,PAID);assert.equal(r.replay,true);await current({db:f.db,funding:r});}
 });
+test('linked completion-before-billing crash resumes stored-clock tail without requiring a client subscription id',async()=>{
+  const f=fixture();f.g.checkout_paid_at=PAID;f.g.checkout_status='paid';f.i.activated_at=PAID;f.c.stripe_subscription_id=null;
+  f.ch.refunded=true;f.sdk.invoices.retrieve=async()=>{throw Error('No new first-money proof on paired-clock retry')};
+  const r=await read(f.options);assert.equal(r.replay,true);assert.equal(r.paidAt,PAID);await current({db:f.db,funding:r});
+});
+test('admin paid-clock-only retry reproves original cash and finishes tail, never invents another clock',async()=>{
+  const f=fixture('basic',3,'prepaid',false,{admin:true});f.g.checkout_paid_at=PAID;f.g.checkout_status='paid';
+  const r=await read(f.options);assert.equal(r.replay,false);assert.equal(r.paidAt,PAID);await current({db:f.db,funding:r});
+  f.inv.status_transitions.paid_at=A+1;await assert.rejects(read(f.options),{code:'retail_funding_original_clock_mismatch'});
+});
 test('terminal sources bypass proof so current activate can retain its original terminal result',async()=>{
   for(const change of [f=>f.i.status='canceled',f=>f.g.superseded_by_agreement_id='superseded',f=>f.i.protocol='legacy_complete']){
     const f=fixture();change(f);assert.equal(await read(f.options),null);assert.deepEqual(f.calls,[]);}

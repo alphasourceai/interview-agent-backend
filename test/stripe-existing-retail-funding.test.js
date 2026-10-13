@@ -69,3 +69,12 @@ test('admin mounted proof does not require or create a public intent',async()=>{
   assert.equal(l.activations[0].paidAt,PAID);assert.equal(l.activations[0].retailFunding.sourceIntentId,null);
   assert.equal(f.tables.public_purchase_intents.length,0);
 });
+test('mounted linked and admin paid-clock-before-billing retries pass the original clock to the existing tail',async()=>{
+  for(const admin of [false,true]){
+    const f=fixture('basic',3,'prepaid',false,{admin});f.g.checkout_paid_at=PAID;f.g.checkout_status='paid';
+    if(!admin)f.i.activated_at=PAID;f.c.stripe_subscription_id=null;
+    const l=load(f),r=await l.mark(G,{db:f.db,stripe:f.sdk,eventLivemode:false,activate:l.activate});
+    assert.equal(r.ok,true);assert.equal(l.activations.length,1);assert.equal(l.activations[0].paidAt,PAID);
+    assert.equal(f.c.stripe_subscription_id,'sub_SYNTHETIC');
+  }
+});
