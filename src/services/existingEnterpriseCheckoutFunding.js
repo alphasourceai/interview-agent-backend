@@ -8,6 +8,7 @@ const {dollarsToCents,metadataFor}=require('./existingEnterpriseCheckoutAttempt'
 const {enterprisePoolCheckoutQuote}=require('./enterprisePoolSnapshot');
 const {validateEnterpriseSettings}=require('./enterpriseSettings');
 const {proveEnterprisePoolPayment,snapshotStripeSdkData}=require('./enterprisePoolPaymentProof');
+const {readVerifiedEnterpriseBillingReceipt}=require('./existingEnterpriseBillingReceipt');
 const id=v=>typeof v==='string'?v:v?.id;
 const uuid=v=>typeof v==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
 const nativeId=(v,p)=>typeof v==='string'&&new RegExp(`^${p}_[A-Za-z0-9_]+$`).test(v);
@@ -28,7 +29,7 @@ async function one(db,table,key,value){
 async function nativeScope(db,agreementId){
  check(uuid(agreementId));const a=await one(db,'membership_agreements','id',agreementId);
  if(a.enterprise_checkout_source==null&&a.enterprise_checkout_pool_id==null){
-  check(a.enterprise_checkout_prices==null,'enterprise_funding_untracked_attempt');return null;
+  check(a.enterprise_checkout_prices==null&&a.enterprise_billing_receipt==null,'enterprise_funding_untracked_attempt');return null;
  }
  const s=a.enterprise_checkout_source;
  check(exactKeys(s,['version','material','pool_id','created_at','expires_at','embedded','replacement_id','config'])
@@ -39,10 +40,13 @@ async function nativeScope(db,agreementId){
   &&a.membership_tier==='enterprise'&&a.signer_accepted===true&&nativeId(a.checkout_session_id,'cs')
   &&(s.replacement_id===null||nativeId(s.replacement_id,'sub'))&&a.replaces_stripe_subscription_id===s.replacement_id
   &&(a.replacement_policy??null)===(s.replacement_id?'immediate_cancel':null));
+ const billingReceipt=a.enterprise_billing_receipt==null?null:await readVerifiedEnterpriseBillingReceipt({db,agreement:a});
  const client=await one(db,'clients','id',a.client_id),seal=await one(db,'enterprise_v2_execution_seals','agreement_id',a.id);
  const pool=await one(db,'client_interview_pools','id',s.pool_id),prices=a.enterprise_checkout_prices;
  check(client.id===a.client_id&&!client.parent_client_id&&!client.archived_at&&nativeId(client.stripe_customer_id,'cus')
-  &&(!client.stripe_subscription_id||client.stripe_subscription_id===s.replacement_id),'enterprise_funding_parent_mismatch');
+  &&(billingReceipt?client.stripe_subscription_id===billingReceipt.funding_receipt.proof.subscription_id
+    &&client.stripe_customer_id===billingReceipt.funding_receipt.proof.customer_id
+    :!client.stripe_subscription_id||client.stripe_subscription_id===s.replacement_id),'enterprise_funding_parent_mismatch');
  check(exactKeys(prices,['platform_price_id','pool_price_id'])&&Object.values(prices).every(v=>nativeId(v,'price'))
   &&prices.platform_price_id!==prices.pool_price_id,'enterprise_funding_prices_mismatch');
  const {execution,...unsigned}=a.template_snapshot||{},v=a.template_snapshot?.values;
@@ -84,7 +88,7 @@ async function nativeScope(db,agreementId){
  const owners=await db.from('billing_customers').select('id,client_id,stripe_customer_id',{count:'exact'}).eq('stripe_customer_id',client.stripe_customer_id);
  check(!owners?.error&&owners?.count===1&&Array.isArray(owners.data)&&owners.data.length===1
   &&owners.data[0].client_id===client.id&&owners.data[0].stripe_customer_id===client.stripe_customer_id,'enterprise_funding_customer_owner_mismatch');
- return {a,seal,pool,client,owner:structuredClone(owners.data[0]),t,anchor,b,deadline,expiry};
+ return {a,seal,pool,client,owner:structuredClone(owners.data[0]),t,anchor,b,deadline,expiry,billingReceipt};
 }
 
 async function readExistingEnterpriseCheckoutFunding({db,stripe,agreementId,eventSessionId,eventSubscriptionId,eventInvoiceId,
@@ -167,7 +171,8 @@ async function readExistingEnterpriseCheckoutFunding({db,stripe,agreementId,even
  await assertFence();const current=await nativeScope(db,agreementId);
  check(current&&isDeepStrictEqual(current,n),'enterprise_funding_source_changed');await assertFence();
  return freeze({...proof,agreementId:a.id,customerId:customer.id,checkoutSessionId:checkout.id,sourceTemplate:a.template_snapshot,
-  sourceTemplateVersion:a.template_version,sourceCheckout:s,sourcePrices:prices,sourceSeal:n.seal,sourcePool:pool,subscription});
+  sourceTemplateVersion:a.template_version,sourceCheckout:s,sourcePrices:prices,sourceSeal:n.seal,sourcePool:pool,subscription,
+  sourceBillingReceipt:n.billingReceipt,sourceFundingReceipt:a.enterprise_funding_receipt??null});
 }
 
 module.exports={readExistingEnterpriseCheckoutFunding};

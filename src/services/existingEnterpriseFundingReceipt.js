@@ -5,10 +5,7 @@
 const {isDeepStrictEqual}=require('node:util');
 const {readExistingEnterpriseCheckoutFunding}=require('./existingEnterpriseCheckoutFunding');
 const {snapshotStripeSdkData}=require('./enterprisePoolPaymentProof');
-const PROOF_KEYS=Object.freeze(['pool_id','client_id','provider_account_id','livemode','currency','offer_version','offer_digest','customer_id',
- 'checkout_session_id','subscription_id','invoice_id','pool_line_id','payment_intent_id','charge_id','platform_item_id','platform_price_id','pool_price_id',
- 'platform_interval','platform_nominal_cents','payment_success_at','quantity','pool_paid_cents','pool_tax_cents','platform_line_cents','tax_cents',
- 'collected_cents','credits_spendable','membership_activation_required','native_receipt_required']);
+const PROOF_KEYS=require('./enterpriseExistingFundingKeys');
 function fail(){const e=new Error('enterprise_funding_receipt_ack_unknown');e.code=e.message;e.status=503;throw e;}
 function check(v){if(!v)fail();}
 function freeze(v){if(v&&typeof v==='object'){for(const x of Object.values(v))freeze(x);Object.freeze(v);}return v;}

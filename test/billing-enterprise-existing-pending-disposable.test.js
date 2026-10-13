@@ -3,7 +3,8 @@
 const {test,before,after}=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),cp=require('node:child_process');
 const {prepareEnterprisePoolTerms}=require('../src/services/enterprisePoolSnapshot');
-const billingEnabled=process.env.ENTERPRISE_BILLING_DISPOSABLE==='true',billingOpts={skip:!billingEnabled};
+const readbackEnabled=process.env.ENTERPRISE_READBACK_DISPOSABLE==='true',readbackOpts={skip:!readbackEnabled};
+const billingEnabled=process.env.ENTERPRISE_BILLING_DISPOSABLE==='true'||readbackEnabled,billingOpts={skip:!billingEnabled};
 const fundingEnabled=process.env.ENTERPRISE_FUNDING_DISPOSABLE==='true'||billingEnabled;
 const traceEnabled=process.env.ENTERPRISE_TRACE_DISPOSABLE==='true'||fundingEnabled;
 const fundingOpts={skip:!fundingEnabled};
@@ -143,6 +144,14 @@ before(()=>{if(!enabled)return;assert.match(socket,/^\/private\/tmp\/alphascreen
      "alter table client_plan_settings drop constraint client_plan_settings_client_id_key"])
      denied('begin;'+change+';'+candidate,/enterprise_billing_.*drift/);
     apply(next);denied(candidate,/enterprise_billing_schema_drift/);
+    if(readbackEnabled){
+     const file='20261013143809_enterprise_existing_billing_readback.sql',body=fs.readFileSync(path.join(root,file),'utf8');
+     for(const change of ["alter table membership_agreements disable trigger enterprise_existing_billing_guard",
+      "alter table membership_agreements disable trigger enterprise_existing_billing_commit_guard",
+      "drop index clients_stripe_subscription_id_uniq"])
+      denied('begin;'+change+';'+body,/enterprise_billing_readback_.*drift/);
+     apply(file);denied(body,/enterprise_billing_readback_schema_drift/);
+    }
    }
   }
  }
@@ -348,6 +357,33 @@ test('native billing replay cannot launder proof customer through a different cu
   values('${n.s.client}','SYNTHETIC','owner@example.invalid','${newCustomer}');
   ${billingCall(n)}commit;`,/binding_denied/);
  assert.deepEqual(clientRow(n.s),before);assert.deepEqual(row(n.s).enterprise_billing_receipt,w);
+});
+test('native billing verified readback returns null before billing, immutable winner after; no client/plan reapply',readbackOpts,async()=>{
+ const n=await readyBilling(),read='select read_enterprise_existing_billing('+lit(n.s.id)+');';
+ assert.equal(sql('set role service_role;'+read),'');
+ const w=JSON.parse(sql('set role service_role;'+billingCall(n)));
+ sql(`set role service_role;update clients set subscription_status='past_due',billing_status='inactive',auto_renew=false where id='${n.s.client}';
+  update client_plan_settings set billing_model='fixed',max_interview_minutes=30,platform_fee=123.45 where client_id='${n.s.client}'`);
+ const c=clientRow(n.s),p=planRow(n.s),a=row(n.s);
+ assert.deepEqual(JSON.parse(sql('set role service_role;'+read)),w);
+ assert.deepEqual(clientRow(n.s),c);assert.deepEqual(planRow(n.s),p);assert.deepEqual(row(n.s),a);
+ for(const role of ['anon','authenticated'])denied('set role '+role+';'+read,/permission denied/);
+ denied(read,/server_only/);
+ assert.equal(sql("select proconfig::text from pg_proc where proname='read_enterprise_existing_billing'"),'{search_path=pg_catalog,lock_timeout=10s}');
+ assert.equal(sql("select prosecdef from pg_proc where proname='read_enterprise_existing_billing'"),'f');
+});
+test('native billing verified readback refuses changed customer/owner/subscription/current source and missing agreement',readbackOpts,async()=>{
+ const n=await readyBilling(),other=source();sql('set role service_role;'+billingCall(n));
+ const read='select read_enterprise_existing_billing('+lit(n.s.id)+');',before=row(n.s);
+ for(const change of [
+  "update clients set stripe_subscription_id='sub_READBACK_OTHER_"+n.s.id.replaceAll('-','')+"' where id="+lit(n.s.client),
+  "update billing_customers set client_id="+lit(other.client)+" where stripe_customer_id="+lit(n.s.customer),
+  "update clients set stripe_customer_id='cus_READBACK_OTHER' where id="+lit(n.s.client),
+  "update membership_agreements set status='voided',is_current=false where id="+lit(n.s.id)]){
+  denied('begin;'+change+';set role service_role;'+read+'commit;',/conflict|source_denied|binding_denied/);
+  assert.deepEqual(row(n.s),before);
+ }
+ denied('set role service_role;select read_enterprise_existing_billing('+lit(crypto.randomUUID())+');',/missing/);
 });
 test('native receipt firstrecord/same replay has29 fields, original A and one native stamp, no paid state',fundingOpts,async()=>{
  const n=await fundingSource(),p=pool(n.s),before=row(n.s),w=JSON.parse(sql('set role service_role;'+receiptCall(n)));
@@ -634,9 +670,10 @@ class NativeQuery{
  then(resolve,reject){return this.execute().then(resolve,reject);}async maybeSingle(){const r=await this.execute();return{data:r.data?.[0]||null,error:r.error};}async single(){return this.maybeSingle();}
 }
 const nativeDb={from:table=>new NativeQuery(table),async rpc(name,args){
- assert.ok(['prepare_enterprise_existing_checkout','pin_enterprise_existing_checkout_prices','pin_enterprise_existing_checkout_session','record_enterprise_existing_funding'].includes(name));
+ assert.ok(['prepare_enterprise_existing_checkout','pin_enterprise_existing_checkout_prices','pin_enterprise_existing_checkout_session',
+  'record_enterprise_existing_funding','read_enterprise_existing_billing','apply_enterprise_existing_billing'].includes(name));
  const r=run(`set role service_role;select public.${name}(${Object.entries(args).map(([k,v])=>`${k} := ${lit(v)}`).join(',')});`);
- if(r.status!==0){if(fundingEnabled)console.error('SYNTHETIC native RPC failure:',r.stderr);return{data:null,error:{message:r.stderr}};}return{data:JSON.parse(r.stdout.trim()),error:null};
+ if(r.status!==0){if(fundingEnabled)console.error('SYNTHETIC native RPC failure:',r.stderr);return{data:null,error:{message:r.stderr}};}return{data:JSON.parse(r.stdout.trim()||'null'),error:null};
 }};
 for(const cadence of ['monthly','annual'])for(const embedded of [true,false])test(`actual existing JS Checkout -> real sealed PG price+CS pins ${cadence}/${embedded}`,traceOpts,async()=>{
  const {createExistingEnterpriseCheckout}=require('../src/services/existingEnterpriseCheckoutAttempt');
@@ -706,5 +743,30 @@ for(const cadence of ['monthly','annual'])for(const embedded of [true,false])tes
   assert.equal(record.receipt.proof.payment_success_at,proof.payment_success_at);assert.deepEqual(row(s).enterprise_funding_receipt,structuredClone(record.receipt));
   const replay=await recordExistingEnterpriseFunding({db:nativeDb,stripe:mock.stripe,agreementId:s.id});assert.deepEqual(replay.receipt,record.receipt);
   assert.equal(row(s).checkout_paid_at,null);assert.equal(row(s).checkout_status,'pending_payment');assert.deepEqual(pool(s),p);
+ }
+ if(readbackEnabled){
+  const {applyExistingEnterpriseBilling}=require('../src/services/existingEnterpriseBillingAdapter');
+  Object.assign(paid.subscription,{current_period_end:Math.floor(Date.now()/1000)+86400,cancel_at_period_end:false});
+  const names=[],bridge={from:table=>nativeDb.from(table),async rpc(name,params){names.push(name);
+   const response=await nativeDb.rpc(name,params);
+   if(name==='apply_enterprise_existing_billing'&&!bridge.lost){bridge.lost=true;return{data:null,error:{message:'SYNTHETIC lost ACK AFTER native billing commit'}};}
+   return response;
+  }};
+  const paymentArgs={db:bridge,stripe:mock.stripe,agreementId:s.id,eventSessionId:r.checkout_session_id,eventLivemode:false,now:()=>Date.now()};
+  await assert.rejects(applyExistingEnterpriseBilling(paymentArgs),{status:503,code:'enterprise_billing_ack_unknown'});
+  const savedBilling=row(s).enterprise_billing_receipt;assert.ok(savedBilling);assert.equal(clientRow(s).stripe_subscription_id,paid.subscription.id);
+  const fundingCalls=names.filter(name=>name==='record_enterprise_existing_funding').length;
+  sql("set role service_role;update clients set subscription_status='past_due',auto_renew=false where id="+lit(s.client)+";"+
+   "update client_plan_settings set billing_model='fixed',platform_fee=123.45,rollover_days=77,max_interview_minutes=30 where client_id="+lit(s.client));
+  const adminClient=clientRow(s),adminPlan=planRow(s);
+  paid.subscription.current_period_end+=86400;paid.subscription.cancel_at_period_end=true;
+  const complete=await applyExistingEnterpriseBilling({...paymentArgs,eventInvoiceId:paid.invoice.id,eventSubscriptionId:paid.subscription.id});
+  assert.deepEqual(structuredClone(complete.billingReceipt),savedBilling);assert.equal(complete.billing_applied,true);
+  assert.equal(complete.credits_spendable,false);assert.equal(complete.membership_activation_required,true);
+  assert.equal(names.filter(name=>name==='record_enterprise_existing_funding').length,fundingCalls);
+  assert.deepEqual(clientRow(s),adminClient);assert.deepEqual(planRow(s),adminPlan);
+  assert.equal(row(s).checkout_paid_at,null);assert.equal(row(s).checkout_status,'pending_payment');assert.deepEqual(pool(s),p);
+  paid.charge.amount_refunded=1;await assert.rejects(applyExistingEnterpriseBilling(paymentArgs));
+  assert.deepEqual(clientRow(s),adminClient);assert.deepEqual(planRow(s),adminPlan);
  }
 });
