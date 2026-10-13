@@ -61,3 +61,8 @@ test('metadata and pinned session disagreement fails closed for a marked source'
   customer:f.client.stripe_customer_id,subscription:f.p.subscription.id,
   metadata:{source:'agreement_checkout',agreement_id:f.a.id}})}),{status:503});
 });
+test('native version metadata cannot fall back when every native row marker is missing',async()=>{
+ const f=ready();Object.assign(f.a,{enterprise_checkout_source:null,enterprise_checkout_pool_id:null,enterprise_checkout_prices:null,
+  enterprise_funding_receipt:null,enterprise_billing_receipt:null});
+ await assert.rejects(classify({db:f.db,stripe:f.stripe,event:checkoutEvent(f)}),{status:503});
+});

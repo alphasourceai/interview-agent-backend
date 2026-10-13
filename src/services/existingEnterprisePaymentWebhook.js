@@ -19,6 +19,7 @@ function id(value){return typeof value==='string'?value:(value&&typeof value.id=
 function hasNativeMarker(row){return Boolean(row&&(row.enterprise_checkout_source!=null||row.enterprise_checkout_pool_id!=null
  ||row.enterprise_checkout_prices!=null||row.enterprise_funding_receipt!=null||row.enterprise_billing_receipt!=null));}
 function sourceHint(meta){return String(meta?.source||'').trim().toLowerCase()==='agreement_checkout';}
+function nativeVersionHint(meta){return /^enterprise_existing_/.test(String(meta?.enterprise_checkout_version||'').trim());}
 function metadata(value){return value&&typeof value==='object'&&!Array.isArray(value)?value:{};}
 function eventKind(type){
  if(CHECKOUT_EVENTS.has(type))return'checkout';
@@ -130,6 +131,12 @@ async function classifyExistingEnterprisePaymentEvent({db,stripe,event}){
  const agreementHint=eventMetadata.agreement_id||subMetadata.agreement_id||null;
  const sessionId=kind==='checkout'?id(eventObject):null;
  const {rows:discovered,unmarkedAgreementHint}=await candidateRows(db,{agreementId:agreementHint,sessionId,customerId:eventCustomer});
+ // The version marker is only a denial signal. It never authorizes an event;
+ // authorization still requires the native database source and fresh SDK graph.
+ // If a native row lost every marker, do not let a redelivery fall back to the
+ // legacy path and be acknowledged as already processed.
+ if(!discovered.length&&(nativeVersionHint(eventMetadata)||nativeVersionHint(subMetadata)))
+  fail('enterprise_payment_event_native_source_missing');
  const candidates=discovered.filter(row=>{
   const proofSub=row.enterprise_funding_receipt?.proof?.subscription_id;
   const billingSub=row.enterprise_billing_receipt?.funding_receipt?.proof?.subscription_id;
