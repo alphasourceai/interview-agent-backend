@@ -35,12 +35,13 @@ async function loadAcceptedEnterpriseUsageTerms({ db, clientId } = {}) {
     if (!receipt || receipt.client_initial.stripe_customer_id !== owner.stripe_customer_id
       || receipt.client_initial.stripe_subscription_id !== owner.stripe_subscription_id
       || receipt.funding_receipt.proof.client_id !== scope.billingClientId
+      || a.enterprise_checkout_pool_id !== receipt.funding_receipt.proof.pool_id
       || receipt.funding_receipt.proof.currency !== 'usd') hold();
     const unit = receipt.plan_initial.usage_interview_fee_cents;
     const start = Date.parse(receipt.client_initial.contract_start_at), end = Date.parse(receipt.client_initial.contract_end_at);
     if (!Number.isSafeInteger(unit) || unit <= 0 || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) hold();
     return Object.freeze({ billingClientId: scope.billingClientId, agreementId: a.id,
-      unitPriceCents: unit, start, end, poolId: a.enterprise_checkout_pool_id });
+      unitPriceCents: unit, start, end, poolId: receipt.funding_receipt.proof.pool_id });
   } catch (error) {
     // No read failure becomes a zero amount or a legacy source.
     if (error?.status === 503) throw error;

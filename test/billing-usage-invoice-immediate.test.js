@@ -509,6 +509,21 @@ test('the cron pages past the row cap instead of billing only the first page', a
   }));
 });
 
+for (const cadence of ['monthly','annual']) for (const partial of [false,true]) {
+  test(`marked ${cadence}/${partial} owner reaches cron hold despite fixed settings; zero provider calls`,async()=>{
+    const f=await require('./helpers/accepted-enterprise-usage-fixture')({cadence});
+    f.plan.billing_model='fixed';if(partial)f.a.enterprise_billing_receipt=null;
+    let providerCalls=0;const stripe=new Proxy({}, {get(){providerCalls++;throw Error('provider must remain untouched');}});
+    await withCronSecret(()=>onTheFirst(async()=>{
+      const res=await runCron(loadCron(f.db,stripe));
+      assert.equal(res.status,200);assert.equal(res.body.considered,1);assert.equal(res.body.failed,1);
+      assert.equal(res.body.results[0].retryable,true);assert.equal(res.body.results[0].http_status,503);
+      assert.equal(res.body.results[0].code,partial?'enterprise_usage_terms_unavailable':'enterprise_usage_invoice_executor_pending');
+      assert.equal(providerCalls,0);
+      assert.equal(f.db.calls.some(c=>c.table==='usage_billing_ledger'),false);
+    }));
+  });
+}
 test('the cron uses the same secret shape as the other internal routes', () => {
   const source = fs.readFileSync(internalUsagePath, 'utf8');
   assert.match(source, /process\.env\.USAGE_BILLING_CRON_SECRET/);
@@ -696,4 +711,16 @@ test('the idempotency migration mirrors the sales one', () => {
   assert.match(sql, /alter table public\.billing_idempotency_keys enable row level security/i);
   assert.match(sql, /revoke all privileges on table public\.billing_idempotency_keys\s*\n?from public, anon, authenticated/i);
   assert.match(sql, /grant select, insert, update, delete on table public\.billing_idempotency_keys\s*\n?to service_role/i);
+});
+for(const partial of [false,true])test(`admin persists and replays distinct503 hold (${partial}) without provider calls`,async()=>{
+  const f=await require('./helpers/accepted-enterprise-usage-fixture')();f.plan.billing_model='fixed';
+  if(partial)f.a.enterprise_billing_receipt=null;
+  let providerCalls=0;const stripe=new Proxy({}, {get(){providerCalls++;throw Error('provider touched');}});
+  const app=loadAdmin(f.db,stripe),key='synthetic-enterprise-hold-key';
+  const send=()=>request(app).post(`/admin/clients/${f.client.id}/usage-invoice`).set('Idempotency-Key',key).send({});
+  const first=await send();assert.equal(first.status,503);
+  assert.equal(first.body.code,partial?'enterprise_usage_terms_unavailable':'enterprise_usage_invoice_executor_pending');
+  const saved=f.db.tables.billing_idempotency_keys[0];assert.equal(saved.response_status,503);assert.equal(saved.response_body.code,first.body.code);
+  const replay=await send();assert.equal(replay.status,503);assert.equal(replay.body.code,first.body.code);
+  assert.equal(providerCalls,0);assert.equal(f.db.calls.some(c=>c.table==='usage_billing_ledger'),false);
 });

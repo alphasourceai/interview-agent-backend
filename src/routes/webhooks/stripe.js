@@ -18,6 +18,7 @@ const {
 } = require('../../services/enterpriseSettings');
 const { resolveBillingModel } = require('../../services/billingModel');
 const { applyUsageToInvoice } = require('../../services/usageBilling');
+const { fenceAcceptedEnterpriseUsageWriter } = require('../../services/acceptedEnterpriseUsageTerms');
 const { markPoolFailed, markPoolPaid } = require('../../services/interviewPool');
 const { loadExistingRetailSubscriptionTerms, assertExistingRetailSubscription } = require('../../services/contracts/subscriptionPricingTerms');
 const { readExistingRetailCheckoutFunding, assertExistingRetailFundingSource } = require('../../services/existingRetailCheckoutFunding');
@@ -391,14 +392,10 @@ function guardRetailSubscriptionUpdate(query, context) {
 //
 // Only a draft invoice can take items. A finalized one is left alone and the
 // usage stays unbilled for the next cycle, which is a delay rather than a loss.
-async function addUsageLinesToInvoice(invoice, requestId) {
-  const billingReason = String(invoice?.billing_reason || '').trim().toLowerCase();
-  if (billingReason !== 'subscription_cycle') return;
-
-  const invoiceId = pickId(invoice?.id);
+async function resolveUsageInvoiceClient(invoice) {
   const subscriptionId = pickId(invoice?.subscription);
   const customerId = pickId(invoice?.customer);
-  if (!invoiceId || (!subscriptionId && !customerId)) return;
+  if (!subscriptionId && !customerId) return null;
 
   let client = null;
   if (subscriptionId) {
@@ -419,7 +416,16 @@ async function addUsageLinesToInvoice(invoice, requestId) {
     if (error) throw new Error(error.message || 'Usage billing client lookup failed');
     client = data || null;
   }
+  return client;
+}
+async function addUsageLinesToInvoice(invoice, requestId) {
+  const billingReason = String(invoice?.billing_reason || '').trim().toLowerCase();
+  if (billingReason !== 'subscription_cycle') return;
+  const invoiceId = pickId(invoice?.id), customerId = pickId(invoice?.customer);
+  if (!invoiceId) return;
+  const client = await resolveUsageInvoiceClient(invoice);
   if (!client?.id) return;
+  await fenceAcceptedEnterpriseUsageWriter({ db: supabaseAdmin, clientId: client.id });
 
   const billing = await resolveBillingModel({ db: supabaseAdmin, clientId: client.id });
   if (billing.billing_model !== 'usage') return;
@@ -790,6 +796,16 @@ router.post('/', async (req, res) => {
   }
 
   const eventObject = event?.data?.object || null;
+  // Fence marked usage owners before agreement classification can make any
+  // provider read. This also follows markers after mutable model edits.
+  if (event.type === 'invoice.created' && eventObject?.billing_reason === 'subscription_cycle') {
+    try {
+      const usageClient = await resolveUsageInvoiceClient(eventObject);
+      if (usageClient?.id) await fenceAcceptedEnterpriseUsageWriter({ db: supabaseAdmin, clientId: usageClient.id });
+    } catch (error) {
+      return res.status(503).json({ error: 'billing_unavailable', code: error?.code || 'enterprise_usage_terms_unavailable', request_id });
+    }
+  }
   let retryableAgreementEvent = false;
   let existingEnterprisePaymentEvent = null;
   try {

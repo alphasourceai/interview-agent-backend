@@ -28,18 +28,28 @@ const ID_CHUNK_SIZE = 200;
 // A stop so a backend that never returns a short page cannot spin forever.
 const MAX_PAGES = 200;
 
-async function readAllPages(buildQuery) {
+async function readAllPages(buildQuery, { requireExactCount = false } = {}) {
   const rows = [];
+  let expectedCount;
   for (let page = 0; page < MAX_PAGES; page += 1) {
     const from = page * PAGE_SIZE;
-    const { data, error } = await buildQuery().range(from, from + PAGE_SIZE - 1);
+    const { data, error, count } = await buildQuery().range(from, from + PAGE_SIZE - 1);
     if (error) return { rows: null, error };
+    if (requireExactCount && (!Number.isSafeInteger(count) || count < 0
+      || (expectedCount !== undefined && expectedCount !== count))) {
+      return { rows: null, error: { message: 'enterprise_usage_owner_census_unavailable' } };
+    }
+    if (requireExactCount) expectedCount = count;
     const batch = data || [];
     rows.push(...batch);
-    if (batch.length < PAGE_SIZE) return { rows, error: null };
+    if (batch.length < PAGE_SIZE) {
+      if (requireExactCount && (rows.length !== expectedCount || new Set(rows.map(r => r.id)).size !== rows.length))
+        return { rows: null, error: { message: 'enterprise_usage_owner_census_unavailable' } };
+      return { rows, error: null };
+    }
   }
   console.warn('usage_billing_cron_page_limit_reached', { page_size: PAGE_SIZE, max_pages: MAX_PAGES });
-  return { rows, error: null };
+  return requireExactCount ? { rows: null, error: { message: 'enterprise_usage_owner_census_unavailable' } } : { rows, error: null };
 }
 
 function chunk(values, size) {
@@ -81,9 +91,16 @@ router.post('/billing/usage-invoices', async (req, res) => {
       return res.status(500).json({ error: 'usage_clients_lookup_failed', detail: settingsError.message })
     }
 
+    const markers = ['enterprise_checkout_source','enterprise_checkout_pool_id','enterprise_checkout_prices',
+      'enterprise_funding_receipt','enterprise_billing_receipt'];
+    const markedScan = await readAllPages(() => supabaseAdmin.from('membership_agreements')
+      .select(['id','client_id',...markers].join(','), { count: 'exact' }).order('id', { ascending: true }), { requireExactCount: true });
+    if (markedScan.error || markedScan.rows.some(a => !a.id || !a.client_id))
+      return res.status(503).json({ error: 'billing_unavailable', code: 'enterprise_usage_terms_unavailable' });
+    const markedIds = new Set(markedScan.rows.filter(a => markers.some(k => a[k] != null)).map(a => String(a.client_id)));
     const usageSettings = (settings || [])
       .filter((row) => normalizeBillingModel(row?.billing_model, row?.plan_tier) === 'usage')
-    const clientIds = [...new Set(usageSettings.map((row) => String(row?.client_id || '')).filter(Boolean))]
+    const clientIds = [...new Set([...usageSettings.map((row) => String(row?.client_id || '')).filter(Boolean), ...markedIds])]
     if (!clientIds.length) {
       console.log('usage_billing_cron_summary', { request_id: requestId, considered: 0, invoiced: 0, skipped: 0, failed: 0, total_cents: 0 })
       return res.json({ ok: true, considered: 0, invoiced: 0, skipped: 0, failed: 0, total_cents: 0, results: [] })
@@ -95,12 +112,11 @@ router.post('/billing/usage-invoices', async (req, res) => {
         .from('clients')
         .select('id,name,billing_interval,stripe_customer_id,contract_start_at,current_term_end')
         .in('id', idChunk)
-        .eq('billing_interval', 'annual')
         .order('id', { ascending: true }))
       if (clientsError) {
         return res.status(500).json({ error: 'usage_clients_lookup_failed', detail: clientsError.message })
       }
-      clients.push(...rows)
+      clients.push(...rows.filter(c => c.billing_interval === 'annual' || markedIds.has(String(c.id))))
     }
 
     const due = clients
@@ -141,7 +157,8 @@ router.post('/billing/usage-invoices', async (req, res) => {
         }
       } catch (e) {
         failed += 1
-        results.push({ client_id: client.id, status: 'failed', error: e?.message || 'usage_invoice_failed' })
+        results.push({ client_id: client.id, status: 'failed', error: e?.message || 'usage_invoice_failed',
+          ...(e?.status === 503 ? { retryable: true, code: e.code, http_status: 503 } : {}) })
         console.error('usage_billing_cron_client', { request_id: requestId, client_id: client.id, status: 'failed', error: e?.message || String(e) })
       }
     }

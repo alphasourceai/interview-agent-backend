@@ -25,6 +25,7 @@ test('the verified accepted pool allocation stays included while only metered ex
 for(const [name,mutate] of [
   ['customer',f=>{f.client.stripe_customer_id='cus_OTHER';}],['subscription',f=>{f.client.stripe_subscription_id='sub_OTHER';}],
   ['source',f=>{f.a.enterprise_checkout_source.material.customer_id='cus_OTHER';}],
+  ['pool column',f=>{f.a.enterprise_checkout_pool_id='other_pool';}],
   ['rate',f=>{f.w.plan_initial.usage_interview_fee_cents=0;}],['window',f=>{f.w.client_initial.contract_end_at='2026-10-02T00:00:00.000000Z';}],
   ['unreadable',f=>{f.db.rpc=async()=>({error:{message:'synthetic outage'}});}],
   ['native empty',f=>{f.db.rpc=async()=>({data:null,error:null});}],['missing source',f=>{f.a.enterprise_checkout_source=null;}],

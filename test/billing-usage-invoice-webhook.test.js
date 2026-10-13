@@ -120,14 +120,16 @@ function loadApp(event, db, { invoiceItemsCreate } = {}) {
   for (const p of [routerPath, stripeClientPath, supabasePath, activationPath]) delete require.cache[p];
 
   const itemCalls = [];
+  const providerCalls = [];
   injectModule(activationPath, { activatePublicPurchaseAgreementCheckout: async () => ({ ok: true }) });
   injectModule(stripeClientPath, {
     webhooks: { constructEvent: () => event },
-    subscriptions: { retrieve: async () => ({ id: SUBSCRIPTION, status: 'active', items: { data: [] }, metadata: {} }) },
+    subscriptions: { retrieve: async () => { providerCalls.push('subscriptionRetrieve');return { id: SUBSCRIPTION, status: 'active', items: { data: [] }, metadata: {} };} },
     invoiceItems: {
-      list: async () => ({ data: [], has_more: false }),
+      list: async () => {providerCalls.push('itemList');return { data: [], has_more: false };},
       create: async (payload) => {
         itemCalls.push(payload);
+        providerCalls.push('itemCreate');
         if (invoiceItemsCreate) return invoiceItemsCreate(payload, itemCalls.length);
         return { id: `ii_${itemCalls.length}` };
       }
@@ -137,7 +139,7 @@ function loadApp(event, db, { invoiceItemsCreate } = {}) {
 
   const app = express();
   app.use('/webhook/stripe', express.raw({ type: 'application/json' }), require(routerPath));
-  return { app, itemCalls };
+  return { app, itemCalls, providerCalls };
 }
 
 async function post(app) {
@@ -334,4 +336,12 @@ test('the transient failure is not tagged permanent, so Stripe keeps retrying', 
   assert.doesNotMatch(handler, /permanentFailure/,
     'a Stripe outage must not be acknowledged as permanent');
   assert.match(source, /event\.type === 'invoice\.created'/);
+});
+for(const partial of [false,true])test(`cycle webhook reaches marked hold despite fixed settings (${partial}) before provider calls`,async()=>{
+  const f=await require('./helpers/accepted-enterprise-usage-fixture')();f.plan.billing_model='fixed';
+  if(partial)f.a.enterprise_billing_receipt=null;
+  const event=invoiceEvent({customer:f.client.stripe_customer_id,subscription:f.client.stripe_subscription_id});
+  const loaded=loadApp(event,f.db),response=await post(loaded.app);
+  assert.equal(response.status,503);assert.deepEqual(loaded.providerCalls,[]);
+  assert.equal(f.db.calls.some(c=>c.table==='usage_billing_ledger'),false);
 });

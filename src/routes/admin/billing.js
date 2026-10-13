@@ -669,8 +669,9 @@ router.post('/clients/:id/usage-invoice', requireAuth, requireAdmin, async (req,
 
     return finish(200, { ok: true, ...result })
   } catch (e) {
-    return finish(500, {
-      error: 'internal_error', code: 'USAGE_INVOICE_FAILED',
+    return finish(e?.status === 503 ? 503 : 500, {
+      error: e?.status === 503 ? 'billing_unavailable' : 'internal_error',
+      code: e?.status === 503 ? e.code : 'USAGE_INVOICE_FAILED',
       detail: e?.message || 'usage_invoice_failed', hint: null, request_id
     })
   }
