@@ -565,14 +565,8 @@ function buildAgreementInputFromRow(row) {
       : null;
 
   if (snapshotValues) {
-    const normalized = normalizeMembershipAgreementInput(snapshotValues);
     const offer = readRetailPackageOffer(row?.template_snapshot?.package_snapshot);
-    // The legacy PDF normalizer intentionally defaults unknown cadences to
-    // monthly. Do not let that change an accepted prepaid commercial selection.
-    if (offer) return { ...normalized, billing_option: snapshotValues.billing_option,
-      commitment_months: snapshotValues.commitment_months, payment_option: snapshotValues.payment_option,
-      pricing_version: snapshotValues.pricing_version };
-    return normalized;
+    return normalizeMembershipAgreementInput(snapshotValues,offer?{packageSnapshot:row.template_snapshot.package_snapshot}:{});
   }
 
   return normalizeMembershipAgreementInput({
@@ -591,6 +585,14 @@ function buildAgreementInputFromRow(row) {
 }
 
 function buildExecutedMembershipAgreementHtml(agreement, execution) {
+  const snapshot=agreement?.template_snapshot;
+  const retailOffer=readRetailPackageOffer(snapshot?.package_snapshot);
+  const marker='membership_agreement_retail_terms_v2';
+  if(retailOffer || agreement?.template_version===marker || snapshot?.template_version===marker || agreement?.billing_option==='prepaid') {
+    if(!retailOffer || agreement.template_version!==marker || snapshot.template_version!==marker) {
+      const e=new Error('retail_agreement_terms_mismatch');e.code=e.message;e.status=409;throw e;
+    }
+  }
   const normalizedInput = buildAgreementInputFromRow(agreement);
   const generatedAt = String(agreement?.template_snapshot?.generated_at || agreement?.created_at || '').trim();
   const agreementInput = {
@@ -601,7 +603,8 @@ function buildExecutedMembershipAgreementHtml(agreement, execution) {
     showPackageTerms: isPublicPurchaseIntentAgreement(agreement),
     timeZone: SALES_AGREEMENT_TIME_ZONE,
     ...(generatedAt ? { generatedAt } : {}),
-    execution
+    execution,
+    ...(retailOffer?{packageSnapshot:snapshot.package_snapshot}:{})
   });
 }
 

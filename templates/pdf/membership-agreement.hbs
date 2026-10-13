@@ -324,10 +324,19 @@
       color: #5D6375;
       font-weight: 600;
     }
+    {{#if retail_terms}}
+    /* Fit the complete accepted quote and acknowledgments on the summary page. */
+    .retail-summary .details-table td { height: 45px; padding: 5px 8px; }
+    .retail-summary .cell-label { margin-bottom: 4px; }
+    .retail-summary .cell-value { font-size: 13px; }
+    .retail-summary .triplet td { height: 70px; padding: 6px 8px; }
+    .retail-summary .triplet-value { font-size: 16px; }
+    .retail-summary .ack-list { break-inside: avoid; page-break-inside: avoid; }
+    {{/if}}
   </style>
 </head>
 <body>
-  <section class="page{{#if show_package_page}} package-page{{/if}}">
+  <section class="page{{#if show_package_page}} package-page{{/if}}{{#if retail_terms}} retail-summary{{/if}}">
     <div class="logo-wrap">
       {{#if logo_src}}
       <img src="{{logo_src}}" alt="alphaSource logo" />
@@ -379,12 +388,17 @@
         </td>
         <td>
           <div class="triplet-label">Initial Renewal Date</div>
+          {{#if retail_terms}}
+          <div class="triplet-value">{{retail_terms.commitment_months}} months after initial payment</div>
+          <div class="triplet-note">Same-term auto-renewal</div>
+          {{else}}
           {{#if term_starts_on_payment}}
           <div class="triplet-value">One year after initial payment</div>
           <div class="triplet-note">12-month auto-renewal</div>
           {{else}}
           <div class="triplet-value">{{initial_renewal_date_display}}</div>
           <div class="triplet-note">12-month auto-renewal</div>
+          {{/if}}
           {{/if}}
         </td>
       </tr>
@@ -395,17 +409,31 @@
         <td>
           <div class="triplet-label">Billing Option</div>
           <div class="triplet-value">{{billing_option}}</div>
+          {{#if retail_terms}}
+          <div class="triplet-note">{{retail_terms.commitment_months}}-month commitment</div>
+          {{else}}
           <div class="triplet-note">12-month commitment</div>
+          {{/if}}
         </td>
         <td>
           <div class="triplet-label">Auto-Renew</div>
           <div class="triplet-value">{{auto_renew}}</div>
+          {{#if retail_terms}}
+          <div class="triplet-note">Turn off any time before term end</div>
+          {{else}}
           <div class="triplet-note">Unless canceled {{notice_deadline_plain}} days before renewal</div>
+          {{/if}}
         </td>
         <td>
+          {{#if retail_terms}}
+          <div class="triplet-label">Renewal Reminder</div>
+          <div class="triplet-value">{{retail_terms.reminder_days}} Days Before Renewal</div>
+          <div class="triplet-note">Reminder only, not a notice deadline</div>
+          {{else}}
           <div class="triplet-label">Notice Deadline</div>
           <div class="triplet-value">{{notice_deadline_days}}</div>
           <div class="triplet-note">Email: memberships@alphasourceai.com</div>
+          {{/if}}
         </td>
       </tr>
     </table>
@@ -442,10 +470,24 @@
             <div class="cell-value">{{billing_option}}</div>
           </td>
         </tr>
+        {{#if retail_terms}}
+        <tr>
+          <td><div class="cell-label">Scored Questions (Per Interview)</div><div class="cell-value">{{retail_terms.scored_question_count}}</div></td>
+          <td><div class="cell-label">Unused Included Interviews</div><div class="cell-value">{{#if retail_terms.rollover_days}}{{retail_terms.rollover_days}}-day rollover when a role closes{{else}}No rollover when a role closes{{/if}}</div></td>
+        </tr>
+        <tr>
+          <td><div class="cell-label">Platform Commitment Total</div><div class="cell-value">{{retail_terms.commitment_total}}</div></td>
+          <td><div class="cell-label">Initial Amount Due</div><div class="cell-value">{{retail_terms.initial_amount}}</div></td>
+        </tr>
+        {{/if}}
       </table>
       {{#if show_first_role_prepay_terms}}
         {{#if first_role_prepay_selected}}
+          {{#if retail_terms}}
+          <p class="section-paragraph"><strong>First-Role Prepay Credit:</strong> {{first_role_prepay_amount}}, included in the Initial Amount Due as a separate one-time purchase. The credit is non-refundable, does not expire, applies to the first role opened under the billing entity, and is not charged again on renewal. Later roles use the accepted per-role fee of {{package_per_role_fee}}.</p>
+          {{else}}
           <p class="section-paragraph">Client selected the optional discounted first-role prepayment of {{first_role_prepay_amount}}. The prepaid first-role credit is non-refundable, has no expiration, and applies to the first role opened under the billing entity. Additional roles are billed at the standard per-role fee of {{first_role_normal_role_fee}}. Membership changes require client success/support review to apply or adjust the credit.</p>
+          {{/if}}
         {{else}}
           <p class="section-paragraph">Client did not prepay the first role. The standard per-role fee is charged when Client opens a role.</p>
         {{/if}}
@@ -454,9 +496,19 @@
 
     <h2 class="ack-title">Membership Acknowledgments</h2>
     <ul class="ack-list">
+      {{#if retail_terms}}
+      <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges an initial term of {{retail_terms.commitment_months}} calendar months, starting with successful initial payment.</li>
+      {{#if retail_terms.is_installments}}
+      <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges {{retail_terms.installment_count}} monthly platform installments of {{retail_terms.platform_payment}}, totaling {{retail_terms.commitment_total}}. This is not a month-to-month term; remaining installment payments are still owed if renewal is turned off.</li>
+      {{else}}
+      <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges the platform fee of {{retail_terms.commitment_total}} is prepaid for the full {{retail_terms.commitment_months}}-month term. Turning off renewal does not shorten the full prepaid term.</li>
+      {{/if}}
+      <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges automatic renewal for successive {{retail_terms.commitment_months}}-month terms at the accepted pricing, unless renewal is turned off at any time before the renewal date. The {{retail_terms.reminder_days}}-day reminder is not a cancellation deadline.</li>
+      {{else}}
       <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges this is a 12-month Membership term.</li>
       <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges monthly billing is an installment option for the 12-month term and is not a month-to-month term.</li>
       <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges the Membership auto-renews for an additional 12-month term unless canceled with written notice at least {{notice_deadline_plain}} days before renewal and will continue as such until canceled.</li>
+      {{/if}}
       <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges no refunds or partial-term refunds will be issued except as expressly stated in this Agreement or required by law.</li>
       <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges access may be restricted or suspended if the account becomes delinquent.</li>
     </ul>
@@ -500,6 +552,16 @@
     <p class="section-paragraph">alphaSource provides an AI-assisted hiring and interview workflow platform that may include role creation, candidate intake, resume processing, candidate verification, AI-led interview workflows, dashboards, reporting, accommodation-request workflows, and related analytics, summaries, and reports. Features may vary by plan, configuration, availability, and third-party service dependencies.</p>
 
     <h2 class="section-title">2. Membership Term</h2>
+    {{#if retail_terms}}
+    <p class="section-paragraph">The Membership begins when alphaSource successfully receives the initial payment and continues for an initial term of {{retail_terms.commitment_months}} calendar months. The successful initial payment date anchors the term and renewal dates; the signature or agreement preparation date does not start the term. Membership automatically renews for successive {{retail_terms.commitment_months}}-month terms at the accepted pricing stated in this Agreement, unless the Parties separately agree otherwise in writing.</p>
+    <p class="section-paragraph">Client may turn off automatic renewal at any time before the renewal date through the account controls or by providing written notice under Section 15. This stops the next renewal, not the current term. A {{retail_terms.reminder_days}}-day renewal reminder is not a cancellation deadline or an advance-notice requirement.</p>
+    {{#if retail_terms.is_installments}}
+    <p class="section-paragraph">Turning off renewal does not terminate or reduce Client's remaining installment payments for the then-current term. Access continues through that term while payments remain current. No additional cancellation fee applies.</p>
+    {{else}}
+    <p class="section-paragraph">Turning off renewal leaves Client's Membership available for the full prepaid term. No ordinary refund or partial-term credit is provided for early cancellation, non-use, or reduced usage.</p>
+    {{/if}}
+    <p class="section-paragraph">Fees for the then-current term are non-refundable except as expressly provided in this Agreement or required by law. Any other exception requires alphaSource's written approval.</p>
+    {{else}}
     {{#if term_starts_on_payment}}
     <p class="section-paragraph">The Membership term begins on the date alphaSource successfully receives the initial payment and continues for an initial term of twelve (12) months. If this Agreement is signed before payment is received, the successful payment date controls the Membership start date, and renewal and notice dates tied to the Membership term are calculated from that date. Unless either party provides written notice of non-renewal at least {{notice_deadline_plain}} days before the end of the then-current term, the Membership will automatically renew for successive twelve (12) month renewal terms.</p>
     {{else}}
@@ -507,9 +569,19 @@
     {{/if}}
     <p class="section-paragraph">Client may cancel the Membership at any time by providing notice to alphaSource in accordance with Section 15 below. Cancellation will stop future renewal of the Membership but will not terminate or reduce Client’s payment obligations for the remainder of the then-current term. Client’s selected {{billing_option}} payment schedule will remain in effect through the end of the then-current term, and no additional cancellation fee will be charged.</p>
     <p class="section-paragraph">All fees for the then-current term are non-refundable. No refunds or partial-term credits will be issued for early cancellation, non-use, reduced usage, or early termination, except as otherwise required by law or expressly provided in this Agreement.</p>
+    {{/if}}
 
     <h2 class="section-title">3. Fees, Billing, and Payment</h2>
+    {{#if retail_terms}}
+    {{#if retail_terms.is_installments}}
+    <p class="section-paragraph">Client's selected payment schedule is {{retail_terms.installment_count}} monthly platform installments of {{retail_terms.platform_payment}}, for a platform commitment total of {{retail_terms.commitment_total}} over the {{retail_terms.commitment_months}}-month term. The first installment, plus any selected one-time first-role credit, is due initially; the whole commitment total is not due at checkout. Monthly installments are not a month-to-month Membership.</p>
+    {{else}}
+    <p class="section-paragraph">Client's selected payment schedule is a platform prepayment of {{retail_terms.commitment_total}} for the full {{retail_terms.commitment_months}}-month term. Any selected first-role credit is a separate one-time purchase, not a recurring platform fee.</p>
+    {{/if}}
+    <p class="section-paragraph">The Initial Amount Due is {{retail_terms.initial_amount}}, before any applicable taxes. Platform, per-role and additional-interview pricing is retained on same-term renewals; the one-time first-role purchase is not repeated. Usage beyond the accepted included capacity may require the additional fees stated in Membership Details.</p>
+    {{else}}
     <p class="section-paragraph">Client may elect annual billing for the full 12-month term or monthly billing as installment payments for the same 12-month term. Monthly billing is not a month-to-month term. Certain plans may include usage thresholds, interview allocations, role-based limits, or additional feature limitations. Additional usage or capacity may require additional fees.</p>
+    {{/if}}
     <p class="section-paragraph">Client authorizes alphaSource and its payment processors to charge the payment method on file for all applicable fees, renewals, additional usage purchases, taxes, and related charges. If any payment is late, declined, reversed, or unpaid, alphaSource may restrict, suspend, or disable some or all access to the Services until the account is brought current.</p>
 
     <h2 class="section-title">4. Client Access and Permitted Use</h2>
@@ -552,7 +624,11 @@
     <h2 class="section-title">15. General</h2>
     <p class="section-paragraph">This Agreement, together with any applicable Membership Details form, order summary, checkout terms, invoice, or written addendum executed by the Parties, constitutes the entire agreement between the Parties regarding the Services and supersedes prior or contemporaneous understandings on that subject.</p>
     <p class="section-paragraph">This Agreement is governed by the laws of the State of Wyoming, without regard to conflict-of-laws rules. Any dispute arising from or related to this Agreement will be brought exclusively in the state or federal courts located in Sheridan County, Wyoming, and each Party consents to that venue and jurisdiction.</p>
+    {{#if retail_terms}}
+    <p class="section-paragraph">Client may turn off automatic renewal in the account at any time before the renewal date, or send written non-renewal notice to memberships@alphasourceai.com. The renewal reminder is not a notice deadline. Other formal notices must be sent to memberships@alphasourceai.com. Notices to alphaSource may also be sent by mail to alphaSource Network, LLC, 30 N. Gould St, Ste R, Sheridan, WY 82801.</p>
+    {{else}}
     <p class="section-paragraph">All notices under this Agreement, including notices of cancellation, non-renewal, and other formal communications, must be sent to memberships@alphasourceai.com. Notices to alphaSource may also be sent by mail to alphaSource Network, LLC, 30 N. Gould St, Ste R, Sheridan, WY 82801.</p>
+    {{/if}}
 
     <h2 class="accept-title">Acceptance and Signatures</h2>
     <p class="section-paragraph">Acceptance. This Agreement may be executed electronically. Client’s electronic signature constitutes Client’s acceptance of this Agreement and all terms incorporated herein. This Agreement becomes effective upon Client’s electronic acceptance and alphaSource’s activation of Client’s account and provision of access to the Services.</p>

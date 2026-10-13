@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const Handlebars = require('handlebars');
 const {readEnterprisePoolSnapshot,enterprisePoolCheckoutQuote}=require('../services/enterprisePoolSnapshot');
+const {readRetailPackageOffer}=require('../services/membershipPackageCompatibility');
 
 const templatePath = path.join(__dirname, '..', '..', 'templates', 'pdf', 'membership-agreement.hbs');
 const templateSrc = fs.readFileSync(templatePath, 'utf8');
@@ -226,13 +227,62 @@ function readLogoAsDataUri() {
   return '';
 }
 
-function normalizeMembershipAgreementInput(input = {}) {
+function retailAgreementMismatch() { const e=new Error('retail_agreement_terms_mismatch');e.code=e.message;e.status=409;throw e; }
+
+function normalizeRetailAgreementInput(input, offer, normalized) {
+  const supplied=(keys, expected, convert=value=>value)=>{
+    for(const key of keys) if(Object.hasOwn(input,key) && input[key]!==undefined && convert(input[key])!==expected) retailAgreementMismatch();
+  };
+  const number=value=>typeof value==='number'?value:(typeof value==='string' && value.trim()!==''?Number(value.replace(/[$,\s]/g,'')):NaN);
+  const cadence=offer.payment_option==='prepaid'?'prepaid':'monthly';
+  supplied(['membership_tier','membershipTier'],offer.plan_key,value=>{
+    const tier=normalizeText(value).toLowerCase();return tier==='essential'?'basic':tier;
+  });
+  supplied(['billing_option','billingOption'],cadence);
+  supplied(['commitment_months'],offer.commitment_months,number);
+  supplied(['payment_option'],offer.payment_option);
+  supplied(['pricing_version'],offer.offer_version);
+  supplied(['term_start_basis','termStartBasis'],'successful_payment',value=>value==='first_payment_success'?'successful_payment':value);
+  supplied(['auto_renew','autoRenew'],true,value=>typeof value==='boolean'?value:
+    (typeof value==='string' && ['1','true','yes','y'].includes(value.trim().toLowerCase())));
+  for(const [keys,expected] of [
+    [['platform_fee','platformFee','membership_fee','membershipFee'],offer.platform_payment_cents/100],
+    [['per_role_fee','perRoleFee'],offer.per_role_fee_cents/100],
+    [['additional_interview_fee','additionalInterviewFee'],offer.additional_interview_fee_cents/100],
+    [['included_interviews_per_role','includedInterviewsPerRole'],offer.included_interviews_per_role],
+    [['max_interview_minutes','maxInterviewMinutes','interview_duration_minutes','interviewDurationMinutes'],offer.max_interview_minutes],
+    [['scored_question_count','scoredQuestionCount'],offer.scored_question_count]]) supplied(keys,expected,number);
+  supplied(['billing_model','billingModel'],offer.billing_model);
+  supplied(['rollover_days','rolloverDays'],offer.rollover_days,value=>value===null?null:number(value));
+  for(const key of ['first_role_prepay','firstRolePrepay']) if(Object.hasOwn(input,key) && input[key]!==undefined) {
+    const role=input[key];if(!role || typeof role!=='object')retailAgreementMismatch();
+    const check=(keys,expected,convert=value=>value)=>{
+      for(const field of keys)if(Object.hasOwn(role,field)&&convert(role[field])!==expected)retailAgreementMismatch();
+    };
+    check(['selected'],offer.first_role_prepay.selected);
+    check(['normal_role_fee_cents','normalRoleFeeCents'],offer.per_role_fee_cents,number);
+    check(['discounted_credit_amount_cents','discountedCreditAmountCents','amount_cents','amountCents'],offer.first_role_prepay.amount_cents,number);
+    check(['credit_type','creditType'],'first_role_prepay');check(['non_refundable','nonRefundable'],true);check(['expires'],false);
+  }
+  return {...normalized,membership_tier:offer.plan_key,billing_option:cadence,commitment_months:offer.commitment_months,
+    payment_option:offer.payment_option,pricing_version:offer.offer_version,platform_fee:String(offer.platform_payment_cents/100),
+    per_role_fee:String(offer.per_role_fee_cents/100),additional_interview_fee:String(offer.additional_interview_fee_cents/100),
+    included_interviews_per_role:String(offer.included_interviews_per_role),max_interview_minutes:String(offer.max_interview_minutes),
+    scored_question_count:String(offer.scored_question_count),billing_model:offer.billing_model,rollover_days:offer.rollover_days,
+    initial_term_start:'',initial_renewal_date:'',term_start_basis:'successful_payment',auto_renew:offer.renewal.default_auto_renew,
+    first_role_prepay:{present:true,selected:offer.first_role_prepay.selected,credit_type:'first_role_prepay',
+      normal_role_fee_cents:offer.per_role_fee_cents,discounted_credit_amount_cents:offer.first_role_prepay.amount_cents,
+      discount_percent:10,non_refundable:true,expires:false}};
+}
+
+function normalizeMembershipAgreementInput(input = {}, options = {}) {
+  const retailOffer=readRetailPackageOffer(options.packageSnapshot);
   const poolOffer=readEnterprisePoolSnapshot(input);
   if(poolOffer){
     if(normalizeTier(input.membership_tier||input.membershipTier)!=='enterprise')throw new Error('invalid_enterprise_pool_snapshot');
     enterprisePoolCheckoutQuote(input);
   }
-  return {
+  const normalized = {
     client_id: normalizeText(input.client_id || input.clientId),
     client_legal_name: normalizeText(input.client_legal_name || input.clientLegalName),
     dba_trade_name: normalizeText(input.dba_trade_name || input.dbaTradeName),
@@ -282,6 +332,7 @@ function normalizeMembershipAgreementInput(input = {}) {
     auto_renew: normalizeAutoRenew(input.auto_renew ?? input.autoRenew),
     notice_deadline_days: normalizeNoticeDays(input.notice_deadline_days || input.noticeDeadlineDays)
   };
+  return retailOffer?normalizeRetailAgreementInput(input,retailOffer,normalized):normalized;
 }
 
 const ENTERPRISE_BILLING_MODEL_WORDS = Object.freeze({
@@ -426,9 +477,10 @@ function shouldShowPackageTerms(payload, options) {
 }
 
 function buildMembershipAgreementHtml(payload = {}, options = {}) {
-  const normalized = normalizeMembershipAgreementInput(payload);
+  const retailOffer=readRetailPackageOffer(options.packageSnapshot);
+  const normalized = normalizeMembershipAgreementInput(payload,options);
   const execution = normalizeExecutionInput(options.execution || payload.execution || {});
-  const showPackageTerms = shouldShowPackageTerms(payload, options);
+  const showPackageTerms = !!retailOffer || shouldShowPackageTerms(payload, options);
   const now = options.generatedAt ? new Date(options.generatedAt) : new Date();
   const displayTimeZone = normalizeText(options.timeZone || options.time_zone) || undefined;
   const generatedAtIso = now.toISOString();
@@ -448,6 +500,11 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
 
   const enterpriseTerms = buildEnterpriseCommercialTerms(normalized);
   const renderData = {
+    retail_terms:retailOffer?{commitment_months:retailOffer.commitment_months,
+      is_installments:retailOffer.payment_option==='monthly_installments',installment_count:retailOffer.installment_count,
+      platform_payment:formatUsdCents(retailOffer.platform_payment_cents),commitment_total:formatUsdCents(retailOffer.platform_commitment_total_cents),
+      initial_amount:formatUsdCents(retailOffer.initial_payment_cents),scored_question_count:retailOffer.scored_question_count,
+      reminder_days:retailOffer.renewal.reminder_days,rollover_days:retailOffer.rollover_days}:null,
     logo_src: readLogoAsDataUri(),
     generated_at: generatedAtIso,
     generated_at_label: generatedAtLabel,
@@ -469,7 +526,8 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
     package_additional_interview_fee: formatUsd(normalized.additional_interview_fee),
     package_included_interviews_per_role: normalized.included_interviews_per_role || '—',
     package_max_interview_minutes: normalized.max_interview_minutes || '—',
-    package_fee_period_label: normalized.billing_option === 'annual' ? 'per year' : 'per month',
+    package_fee_period_label: retailOffer?(retailOffer.payment_option==='prepaid'?`full ${retailOffer.commitment_months}-month term`:'per monthly installment'):
+      normalized.billing_option === 'annual' ? 'per year' : 'per month',
     show_first_role_prepay_terms: showPackageTerms && normalized.first_role_prepay.present,
     first_role_prepay_selected: normalized.first_role_prepay.selected,
     first_role_prepay_amount: formatUsdCents(normalized.first_role_prepay.discounted_credit_amount_cents),
@@ -478,7 +536,8 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
     initial_term_start_display: formatDateShort(normalized.initial_term_start),
     initial_renewal_date_display: formatDateShort(normalized.initial_renewal_date),
     term_starts_on_payment: normalized.term_start_basis === 'successful_payment',
-    billing_option: normalized.billing_option === 'annual' ? 'Annual' : 'Monthly',
+    billing_option: retailOffer?(retailOffer.payment_option==='prepaid'?'Prepaid':`${retailOffer.installment_count} Monthly Installments`):
+      normalized.billing_option === 'annual' ? 'Annual' : 'Monthly',
     auto_renew: normalized.auto_renew ? 'Yes' : 'No',
     notice_deadline_days: `${normalized.notice_deadline_days} Days`,
     notice_deadline_plain: `${normalized.notice_deadline_days}`,
