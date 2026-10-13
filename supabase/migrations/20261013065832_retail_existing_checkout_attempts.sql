@@ -12,8 +12,8 @@ begin
     array['retail_existing_closed_object(jsonb,text[])','db187b3a1816eff7f3c2bac7b739fb60']] loop
     select * into p from pg_proc where oid=to_regprocedure('public.'||spec[1]);
     if not found or p.prosecdef or p.provolatile<>'i' or md5(p.prosrc)<>spec[2]
-      or p.proconfig is distinct from case when spec[1]='retail_existing_closed_object(jsonb,text[])'
-        then array['search_path=pg_catalog'] else array['search_path=pg_catalog, public'] end
+      or p.proconfig is distinct from (case when spec[1]='retail_existing_closed_object(jsonb,text[])'
+        then array['search_path=pg_catalog'] else array['search_path=pg_catalog, public'] end)
       or has_function_privilege('anon',p.oid,'EXECUTE') or has_function_privilege('authenticated',p.oid,'EXECUTE')
       or not has_function_privilege('service_role',p.oid,'EXECUTE') then
       raise exception 'retail_checkout_prerequisite_drift';
