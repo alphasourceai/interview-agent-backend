@@ -32,18 +32,29 @@ test('nullable CS invoice requires complete unique initial discovery, not latest
   await assert.rejects(read(x.args),{code:'enterprise_funding_initial_invoice_ambiguous'});
  }
 });
+test('real creation ordering: native B precedes two Price requests then actual CS creation',async()=>{
+ const f=fixture();f.p.checkout.created+=5;f.p.subscription.created=f.p.checkout.created+2;
+ f.p.invoice.created=f.p.checkout.created+2;f.p.paymentIntent.created=f.p.invoice.created;f.p.charge.created=f.p.invoice.created;
+ const proof=await read(f.args);assert.equal(proof.payment_success_at,'2026-10-01T13:00:00.000Z');
+ assert.equal(proof.sourceCheckout.created_at,'2026-10-01T12:00:00.000Z');
+});
 test('reverse event identities select same invoice/cash clock; conflicts held',async()=>{
  const f=fixture(),one=await read({...f.args,eventSessionId:'cs_synthetic',eventLivemode:false}),two=await read({...f.args,eventSubscriptionId:'sub_synthetic',eventInvoiceId:'in_initial',eventLivemode:false});
  assert.deepEqual(one,two);
  for(const event of [{eventSessionId:'cs_OTHER'},{eventSubscriptionId:'sub_OTHER'},{eventInvoiceId:'in_OTHER'},{eventLivemode:true},{eventLivemode:'false'}])await assert.rejects(read({...f.args,...event}));
 });
 for(const change of [f=>{f.p.checkout.created--;},f=>{f.p.checkout.expires_at++;},f=>{f.p.checkout.metadata.extra='OTHER';},
+ f=>{f.p.checkout.created=f.p.checkout.expires_at;},f=>{f.p.subscription.created=f.p.checkout.created-1;},
+ f=>{f.p.checkout.return_url='https://other.example.invalid/return';},
  f=>{f.p.checkout.ui_mode='custom';},f=>{f.p.subscription.metadata.client_id='OTHER';},f=>{f.p.subscription.billing_cycle_anchor++;},
  f=>{f.prices.price_pool.metadata.pool_offer_digest='OTHER';},f=>{f.p.invoice.lines.data[0].price.unit_amount--;},
  f=>{f.p.paymentIntent.amount_received--;},f=>{f.p.charge.disputed=true;},f=>{f.p.refunds.data=[{id:'re_PENDING'}];},
  f=>{f.p.invoice.status_transitions.paid_at=Date.parse(f.a.agreement_expires_at)/1000;},f=>{f.p.invoice.status_transitions.paid_at=f.p.checkout.created-1;},
  f=>{f.p.invoice.discounts=['di_OTHER'];},f=>{f.p.checkout.invoice=undefined;},f=>{f.stripe.getApiField=()=> '2026-08-26.dahlia';}])
  test('corrupt native provider graph cannot be called paid',async()=>{const f=fixture();change(f);await assert.rejects(read(f.args));assert.equal(f.db.updates.length,0);});
+test('embedded paid read rejects conflicting hosted destinations',async()=>{
+ for(const key of ['success_url','cancel_url']){const f=fixture({embedded:true});f.p.checkout[key]='https://other.example.invalid/return';await assert.rejects(read(f.args));}
+});
 test('source/profile/pool changed during provider reads fail final native readback',async()=>{
  for(const change of [f=>{f.a.is_current=false;},f=>{f.pool.stripe_checkout_session_id='cs_OTHER';},f=>{f.client.stripe_customer_id='cus_OTHER';},
   f=>{f.db.tables.billing_customers=[];},f=>{f.a.enterprise_checkout_source.replacement_id='sub_OTHER';}]){

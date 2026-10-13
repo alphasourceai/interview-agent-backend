@@ -107,11 +107,13 @@ async function readExistingEnterpriseCheckoutFunding({db,stripe,agreementId,even
  check(checkout?.object==='checkout.session'&&checkout.id===a.checkout_session_id&&checkout.status==='complete'
   &&checkout.payment_status==='paid'&&checkout.mode==='subscription'&&checkout.livemode===customer.livemode
   &&id(checkout.customer)===client.stripe_customer_id&&nativeId(id(checkout.subscription),'sub')
-  &&epoch(checkout.created)&&checkout.created===Math.floor(n.b/1000)&&checkout.expires_at===Math.floor(n.expiry/1000)
+  &&epoch(checkout.created)&&checkout.created>=Math.floor(n.b/1000)&&checkout.created<checkout.expires_at
+  &&checkout.expires_at===Math.floor(n.expiry/1000)
   &&checkout.ui_mode===(s.embedded?'embedded':'hosted')&&checkout.allow_promotion_codes===false
   &&mapsEqual(checkout.metadata,metadata.session),'enterprise_funding_session_mismatch');
  const success=`${s.config.public_backend_base}/checkout/subscription-success?session_id={CHECKOUT_SESSION_ID}&client_id=${encodeURIComponent(client.id)}`;
  check(s.embedded?checkout.return_url===success:checkout.success_url===success,'enterprise_funding_session_mismatch');
+ check(s.embedded?checkout.success_url==null&&checkout.cancel_url==null:checkout.return_url==null,'enterprise_funding_session_mismatch');
  if(!s.embedded){let cancel;try{cancel=new URL(checkout.cancel_url);}catch(_){}
   check(cancel&&checkout.cancel_url.startsWith(`${s.config.public_sign_base}/membership-agreement/sign/`)
    &&!cancel.username&&!cancel.password&&!cancel.search&&!cancel.hash,'enterprise_funding_session_mismatch');
@@ -122,7 +124,8 @@ async function readExistingEnterpriseCheckoutFunding({db,stripe,agreementId,even
  check(eventSessionId==null||eventSessionId===checkout.id,'enterprise_funding_event_mismatch');
  check(eventLivemode==null||typeof eventLivemode==='boolean'&&eventLivemode===checkout.livemode,'enterprise_funding_event_mismatch');
  const subscription=await read(()=>stripe.subscriptions.retrieve(id(checkout.subscription)));
- check(subscription?.id===id(checkout.subscription)&&subscription.billing_cycle_anchor===n.anchor
+ check(subscription?.id===id(checkout.subscription)&&epoch(subscription.created)&&subscription.created>=checkout.created
+  &&subscription.billing_cycle_anchor===n.anchor
   &&mapsEqual(subscription.metadata,metadata.session),'enterprise_funding_subscription_mismatch');
  check(eventSubscriptionId==null||eventSubscriptionId===subscription.id,'enterprise_funding_event_mismatch');
  const subscriptionItems=await pages(after=>stripe.subscriptionItems.list({subscription:subscription.id,limit:100,...(after?{starting_after:after}:{})}));
