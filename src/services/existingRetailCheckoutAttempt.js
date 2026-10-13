@@ -103,10 +103,10 @@ function priceMatches(price, amount, recurring) {
     && (recurring ? price.recurring?.interval === 'month' && price.recurring.interval_count === recurring.interval_count
       && price.recurring.usage_type === 'licensed' : price.recurring === null);
 }
-async function readOpenRetailSession({ stripe, sessionId, attempt, offer, metadata, successUrl, cancelUrl }) {
+async function readOpenRetailSession({ stripe, sessionId, attempt, offer, promotion = null, metadata, successUrl, cancelUrl }) {
   assertWindow(attempt);
   check(/^cs_[A-Za-z0-9_]+$/.test(sessionId || ''), 'retail_checkout_ack_unknown', 503);
-  const session = await stripe.checkout.sessions.retrieve(sessionId);
+  const session = await stripe.checkout.sessions.retrieve(sessionId, {expand:['total_details.breakdown']});
   check(session?.id === sessionId && session.object === 'checkout.session' && session.mode === 'subscription'
     && id(session.customer) === attempt.source.customer_id && session.currency === 'usd'
     && typeof session.livemode === 'boolean' && session.expires_at === attempt.expires_at,
@@ -143,6 +143,40 @@ async function readOpenRetailSession({ stripe, sessionId, attempt, offer, metada
     && integer(session.total_details?.amount_tax)
     && session.amount_total === offer.initial_payment_cents + session.total_details.amount_tax,
   'retail_checkout_session_prices_mismatch');
+  // API2023 has total_details.breakdown.discounts, NOT session.discounts.
+  // The URL is withheld on unknown/zero/mismatched net amounts; no replacement
+  // session/key is minted. Webhook cash proof is still independently required.
+  const details = session.total_details, expectedPromo = attempt.source.intent?.promotion_code_id || '';
+  check(data.every(line => integer(line.amount_discount) && integer(line.amount_tax) && integer(line.amount_total)
+      && line.amount_discount <= line.amount_subtotal
+      && line.amount_total === line.amount_subtotal - line.amount_discount + line.amount_tax)
+    && data.reduce((sum,line) => sum + line.amount_discount,0) === details?.amount_discount
+    && data.reduce((sum,line) => sum + line.amount_tax,0) === details?.amount_tax
+    && data.reduce((sum,line) => sum + line.amount_total,0) === session.amount_total,
+  'retail_checkout_session_prices_mismatch');
+  check((session.allow_promotion_codes === false || session.allow_promotion_codes === null)
+    && integer(details?.amount_discount) && integer(details?.amount_tax) && details.amount_shipping === 0
+    && details.amount_discount < offer.initial_payment_cents
+    && session.amount_total === offer.initial_payment_cents - details.amount_discount + details.amount_tax,
+  'retail_checkout_session_prices_mismatch');
+  const discountRows = details.breakdown?.discounts;
+  if (!expectedPromo) check(!promotion && details.amount_discount === 0
+    && (discountRows === undefined || Array.isArray(discountRows) && discountRows.length === 0),
+  'retail_checkout_session_promotion_mismatch');
+  else {
+    check(promotion?.promotionId === expectedPromo && promotion.livemode === session.livemode
+      && Array.isArray(discountRows) && discountRows.length === 1,
+    'retail_checkout_session_promotion_mismatch');
+    const row = discountRows[0], discount = row?.discount, coupon = discount?.coupon;
+    check(integer(row?.amount) && row.amount === details.amount_discount
+      && details.amount_discount <= promotion.maximumDiscountCents
+      && offer.initial_payment_cents - details.amount_discount >= promotion.minimumNetCents
+      && discount?.object === 'discount' && /^di_[A-Za-z0-9_]+$/.test(discount.id || '') && discount.deleted !== true
+      && id(discount.promotion_code) === expectedPromo && id(discount.customer) === attempt.source.customer_id
+      && coupon?.object === 'coupon' && coupon.id === promotion.couponId && coupon.livemode === session.livemode
+      && Object.entries(promotion.coupon).every(([key,value]) => coupon[key] === value),
+    'retail_checkout_session_promotion_mismatch');
+  }
   if (attempt.embedded) check(typeof session.client_secret === 'string' && session.client_secret.trim(), 'retail_checkout_ack_unknown', 503);
   else {
     let u;try { u = new URL(session.url); }catch (_) { /* safe refusal */ }

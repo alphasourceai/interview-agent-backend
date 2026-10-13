@@ -200,10 +200,13 @@ async function resolveStripeCustomerId({
   client,
   billingCustomerList,
   exactPrepaid = false,
+  strictRetailCredits = false,
   pinnedCustomerId = '',
   skipCustomerUpdate = false,
   preferCurrentCustomer = false
 }) {
+  const zeroCurrencies = value => value && typeof value === 'object' && !Array.isArray(value)
+    && Object.entries(value).every(([currency,amount]) => /^[a-z]{3}$/.test(currency) && amount === 0);
   const candidateStripeCustomerIds = []
   const customerRows = Array.isArray(billingCustomerList) ? billingCustomerList : []
   for (const row of customerRows) {
@@ -229,16 +232,20 @@ async function resolveStripeCustomerId({
   for (const candidateId of candidateStripeCustomerIds) {
     try {
       const customer = await stripe.customers.retrieve(candidateId)
-      // New prepaid commercial totals must not inherit old customer discounts
+      // New retail commercial totals must not inherit old customer discounts
       // or account credits. Refuse, never clear/change the customer's balance.
       // Actual paid-invoice proof is still independently required at fulfillment.
       if (exactPrepaid && (customer.deleted === true || customer.discount !== null
         || !Number.isSafeInteger(customer.balance) || customer.balance !== 0
         || (customer.discounts != null && (!Array.isArray(customer.discounts) || customer.discounts.length > 0))
-        || (customer.invoice_credit_balance != null && Object.values(customer.invoice_credit_balance).some(value => value !== 0))
-        || (customer.cash_balance != null && (typeof customer.cash_balance !== 'object'
-          || Object.values(customer.cash_balance.available || {}).some(value => value !== 0))))) {
-        throw makeError(409, 'retail_customer_adjustment_denied', 'This prepaid checkout requires review of existing customer discounts or credits.')
+        || (customer.invoice_credit_balance != null && (strictRetailCredits ? !zeroCurrencies(customer.invoice_credit_balance)
+          : Object.values(customer.invoice_credit_balance).some(value => value !== 0)))
+        || (customer.cash_balance != null && (strictRetailCredits ? customer.cash_balance.object !== 'cash_balance'
+          || customer.cash_balance.available !== null && !zeroCurrencies(customer.cash_balance.available)
+          : typeof customer.cash_balance !== 'object' || Object.values(customer.cash_balance.available || {}).some(value => value !== 0))))) {
+        throw makeError(409, 'retail_customer_adjustment_denied', strictRetailCredits
+          ? 'This checkout requires review of existing customer discounts or credits.'
+          : 'This prepaid checkout requires review of existing customer discounts or credits.')
       }
       resolvedStripeCustomerId = candidateId
       break
@@ -368,6 +375,14 @@ async function createSubscriptionCheckoutSession({
     throw makeError(409,'enterprise_checkout_source_required','The existing signed Enterprise agreement is required.')
   }
 
+  // A positive accepted initial payment is required for the existing paid_at
+  // activation path. Validate a saved monthly promo before any writer runs.
+  // No current price lookup, new payment engine or changed legacy promo flow.
+  const retailStripe = retailOffer ? new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion:'2023-10-16' }) : null
+  const retailPromotion = retailOffer ? await require('./retailInitialPromotion').readInitialPromotion({
+    stripe:retailStripe, promotionId:normalizedPromotionCodeId, offer:retailOffer
+  }) : null
+
   const parentGuard = await requireParentClient(supabaseAdmin, normalizedClientId, {
     source: normalizedMetadataSource
   })
@@ -406,7 +421,7 @@ async function createSubscriptionCheckoutSession({
   const billingCustomerList = Array.isArray(billingCustomerRows) ? billingCustomerRows : []
   const billingCustomer = billingCustomerList[0] || null
 
-  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion:'2023-10-16' })
+  const stripe = retailStripe || new Stripe(process.env.STRIPE_SECRET_KEY || '', { apiVersion:'2023-10-16' })
 
   let resolvedStripeCustomerId = null
   try {
@@ -414,7 +429,8 @@ async function createSubscriptionCheckoutSession({
       stripe,
       client,
       billingCustomerList,
-      exactPrepaid,
+      exactPrepaid: !!retailOffer,
+      strictRetailCredits: !!retailOffer,
       pinnedCustomerId:retailOffer ? String(retailAgreement.checkout_attempt_source?.customer_id || '') : ''
     })
   } catch (e) {
@@ -665,7 +681,7 @@ async function createSubscriptionCheckoutSession({
     mode: 'subscription',
     customer: resolvedStripeCustomerId,
     line_items: lineItems,
-    ...(exactPrepaid ? { allow_promotion_codes: false } : enterpriseTerms?.acceptedPoolQuote?{}:normalizedPromotionCodeId
+    ...(exactPrepaid || retailOffer && !normalizedPromotionCodeId ? { allow_promotion_codes: false } : enterpriseTerms?.acceptedPoolQuote?{}:normalizedPromotionCodeId
       ? { discounts: [{ promotion_code: normalizedPromotionCodeId }] }
       : { allow_promotion_codes: true }),
     metadata: checkoutMetadata,
@@ -699,7 +715,7 @@ async function createSubscriptionCheckoutSession({
 
   if (retailAttempt?.checkout_session_id) {
     primaryCheckoutSession = await readOpenRetailSession({ stripe, sessionId:retailAttempt.checkout_session_id,
-      attempt:retailAttempt, offer:retailOffer, metadata:checkoutMetadata,successUrl:checkoutSuccessUrl,cancelUrl:normalizedCancelUrl })
+      attempt:retailAttempt, offer:retailOffer, promotion:retailPromotion, metadata:checkoutMetadata,successUrl:checkoutSuccessUrl,cancelUrl:normalizedCancelUrl })
     checkoutClientSecret = retailAttempt.embedded ? primaryCheckoutSession.client_secret : null
   }
 
@@ -751,7 +767,7 @@ async function createSubscriptionCheckoutSession({
   if (retailAttempt) {
     assertWindow(retailAttempt)
     if (!retailAttempt.checkout_session_id) primaryCheckoutSession = await readOpenRetailSession({ stripe,
-      sessionId:primaryCheckoutSession?.id,attempt:retailAttempt,offer:retailOffer,metadata:checkoutMetadata,
+      sessionId:primaryCheckoutSession?.id,attempt:retailAttempt,offer:retailOffer,promotion:retailPromotion,metadata:checkoutMetadata,
       successUrl:checkoutSuccessUrl,cancelUrl:normalizedCancelUrl })
     await pinExistingRetailSession({ db:supabaseAdmin,agreement:retailAgreement,customerId:resolvedStripeCustomerId,
       attempt:retailAttempt,sessionId:primaryCheckoutSession.id })
