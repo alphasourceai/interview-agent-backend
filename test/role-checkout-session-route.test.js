@@ -411,6 +411,32 @@ test('role checkout consumes unused first-role credit without Stripe checkout or
   assert.deepEqual(db.rubricCalls, [response.body.role_id])
 })
 
+test('Enterprise usage role creation finalizes without a role fee or Stripe checkout', async () => {
+  const db = makeDb({
+    planSettings: [{ client_id: 'parent-client', plan_tier: 'enterprise', billing_model: 'usage', billing_interval: 'monthly', per_role_fee: 0 }],
+    clientRoleCredits: [{
+      id: 'legacy-credit', billing_client_id: 'parent-client', source_client_id: 'parent-client',
+      credit_type: 'first_role_prepay', status: 'unused', used_at: null, used_by_role_id: null
+    }]
+  })
+  const response = await postRoleCheckout(buildApp(db), 'parent-client')
+
+  assert.equal(response.status, 200)
+  assert.equal(response.body.role_created, true)
+  assert.equal(response.body.no_charge, true)
+  assert.equal(response.body.role_id, 'role-1')
+  assert.match(response.body.message, /accepted Enterprise usage rate/)
+  assert.equal(db.stripeConstructs.length, 0)
+  assert.equal(db.stripeCalls.pricesCreate.length, 0)
+  assert.equal(db.stripeCalls.sessionsCreate.length, 0)
+  assert.equal(db.clientRoleCredits[0].status, 'unused')
+  assert.equal(db.pendingRolePurchases[0].status, 'finalized')
+  assert.equal(db.pendingRolePurchases[0].stripe_checkout_session_id, undefined)
+  assert.equal(db.roles[0].pending_role_purchase_id, db.pendingRolePurchases[0].id)
+  assert.match(db.roles[0].job_description_url, /job-descriptions\/pending\/parent-client\/pending-1\/jd\.pdf$/)
+  assert.deepEqual(db.rubricCalls, ['role-1'])
+})
+
 test('role checkout under child entity consumes parent billing client credit', async () => {
   const db = makeDb({
     clientRoleCredits: [{

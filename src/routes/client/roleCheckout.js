@@ -11,7 +11,8 @@ const { buildClientDashboardReturnUrl } = require('../../config/urlConfig');
 const { generateRubricAndKBForRole } = require('../../services/generateRubric');
 const { resolveBillingOwnerForScope } = require('../../services/clientBillingScope');
 const { normalizeInterviewType } = require('../../services/interviewTypes');
-const { finalizePrepaidRoleCredit, findUnusedFirstRolePrepayCredit } = require('../../services/rolePurchaseFinalizer');
+const { finalizePendingRolePurchase, finalizePrepaidRoleCredit, findUnusedFirstRolePrepayCredit } = require('../../services/rolePurchaseFinalizer');
+const { normalizeBillingModel } = require('../../services/billingModel');
 const { supabaseAdmin } = require('../../clients/supabase');
 const { requireAuth, withClientScope } = require('../../middleware/auth');
 const {
@@ -86,23 +87,24 @@ router.post('/clients/roles/checkout-session', requireAuth, withClientScope, rol
 
     const { data: planSettings, error: planSettingsErr } = await supabaseAdmin
       .from('client_plan_settings')
-      .select('plan_tier,billing_interval,per_role_fee')
+      .select('plan_tier,billing_model,billing_interval,per_role_fee')
       .eq('client_id', billingClientId)
       .maybeSingle()
     if (planSettingsErr) return res.status(500).json({ error: 'plan_settings_lookup_failed', detail: planSettingsErr.message })
     if (!planSettings) return res.status(400).json({ error: 'missing_plan_settings' })
 
+    const billingModel = normalizeBillingModel(planSettings.billing_model, planSettings.plan_tier)
     const perRoleFee = Number(planSettings.per_role_fee)
-    if (!Number.isFinite(perRoleFee) || perRoleFee <= 0) {
+    if (billingModel !== 'usage' && (!Number.isFinite(perRoleFee) || perRoleFee <= 0)) {
       return res.status(400).json({ error: 'invalid_per_role_fee' })
     }
-    const perRoleCents = Math.round(perRoleFee * 100)
-    if (!Number.isFinite(perRoleCents) || perRoleCents <= 0) {
+    const perRoleCents = billingModel === 'usage' ? 0 : Math.round(perRoleFee * 100)
+    if (billingModel !== 'usage' && (!Number.isFinite(perRoleCents) || perRoleCents <= 0)) {
       return res.status(400).json({ error: 'invalid_per_role_fee' })
     }
 
     let prepayAttemptJdStoragePath = ''
-    const unusedFirstRoleCredit = await findUnusedFirstRolePrepayCredit({
+    const unusedFirstRoleCredit = billingModel === 'usage' ? null : await findUnusedFirstRolePrepayCredit({
       db: supabaseAdmin,
       billingClientId
     })
@@ -139,6 +141,83 @@ router.post('/clients/roles/checkout-session', requireAuth, withClientScope, rol
         billing_client_id: billingClientId,
         client_id: clientId,
         status: prepaidFinalization.status || 'credit_not_available'
+      })
+    }
+
+    if (billingModel === 'usage') {
+      const { data: pendingRolePurchase, error: pendingRolePurchaseErr } = await supabaseAdmin
+        .from('pending_role_purchases')
+        .insert({
+          client_id: clientId,
+          status: 'finalizing',
+          role_title: roleTitle,
+          interview_type: interviewType,
+          plan_tier: String(planSettings.plan_tier || '').trim() || null,
+          billing_interval: String(planSettings.billing_interval || '').trim() || null
+        })
+        .select('id')
+        .single()
+      if (pendingRolePurchaseErr || !pendingRolePurchase?.id) {
+        return res.status(500).json({ error: 'create_pending_role_purchase_failed', detail: pendingRolePurchaseErr?.message || null })
+      }
+
+      const pendingJdObjectKey = `pending/${clientId}/${pendingRolePurchase.id}/${safeFilename}`
+      const pendingJdUpload = await supabaseAdmin.storage
+        .from(ROLE_CHECKOUT_JD_BUCKET)
+        .upload(pendingJdObjectKey, jdFile.buffer, { contentType, upsert: true })
+      if (pendingJdUpload.error) {
+        await supabaseAdmin.from('pending_role_purchases').update({ status: 'failed' })
+          .eq('id', pendingRolePurchase.id).eq('status', 'finalizing').is('finalized_role_id', null)
+        return res.status(500).json({ error: 'pending_jd_upload_failed', detail: pendingJdUpload.error.message })
+      }
+
+      const pendingJdStoragePath = `${ROLE_CHECKOUT_JD_BUCKET}/${pendingJdObjectKey}`
+      const { error: pendingRolePurchaseJdUpdateErr } = await supabaseAdmin
+        .from('pending_role_purchases')
+        .update({ jd_storage_path: pendingJdStoragePath })
+        .eq('id', pendingRolePurchase.id)
+        .eq('status', 'finalizing')
+        .is('finalized_role_id', null)
+      if (pendingRolePurchaseJdUpdateErr) {
+        await supabaseAdmin.from('pending_role_purchases').update({ status: 'failed' })
+          .eq('id', pendingRolePurchase.id).eq('status', 'finalizing').is('finalized_role_id', null)
+        return res.status(500).json({ error: 'update_pending_role_purchase_failed', detail: pendingRolePurchaseJdUpdateErr.message })
+      }
+
+      const pendingForFinalization = {
+        id: pendingRolePurchase.id,
+        client_id: clientId,
+        role_title: roleTitle,
+        interview_type: interviewType,
+        jd_storage_path: pendingJdStoragePath,
+        status: 'finalizing'
+      }
+      let finalizedRole = null
+      let finalizationError = null
+      // The existing finalizer recovers a role linked to this pending ID if an
+      // earlier attempt committed the role but lost its acknowledgement.
+      for (let attempt = 0; attempt < 2 && !finalizedRole; attempt += 1) {
+        try {
+          finalizedRole = await finalizePendingRolePurchase({ db: supabaseAdmin, pendingRolePurchase: pendingForFinalization })
+        } catch (error) {
+          finalizationError = error
+        }
+      }
+      if (!finalizedRole?.role?.id) {
+        console.error('[role-checkout] usage_role_finalization_pending', {
+          pending_role_purchase_id: pendingRolePurchase.id,
+          client_id: clientId,
+          error: finalizationError?.message || 'role_finalization_failed'
+        })
+        return res.status(503).json({ error: 'usage_role_finalization_pending', pending_role_purchase_id: pendingRolePurchase.id })
+      }
+
+      return res.json({
+        ok: true,
+        role_created: true,
+        no_charge: true,
+        role_id: finalizedRole.role.id,
+        message: 'Role created. Interview usage is billed at your accepted Enterprise usage rate.'
       })
     }
 
