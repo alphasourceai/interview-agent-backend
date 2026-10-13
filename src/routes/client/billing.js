@@ -204,7 +204,8 @@ router.post('/clients/billing/portal-session', requireAuth, withClientScope, asy
       .select('id,stripe_customer_id')
       .eq('id', clientId)
       .maybeSingle()
-    if (clientErr) return res.status(500).json({ error: 'client_lookup_failed', detail: clientErr.message })
+    if (clientErr) return res.status(503).json({ error: 'RETAIL_PORTAL_UNAVAILABLE', code: 'RETAIL_PORTAL_UNAVAILABLE',
+      detail: 'Billing portal is temporarily unavailable.' })
     if (!client) return res.status(404).json({ error: 'client_not_found' })
 
     const stripeCustomerId = String(client.stripe_customer_id || '').trim()
@@ -230,7 +231,8 @@ router.post('/clients/billing/portal-session', requireAuth, withClientScope, asy
     if (e?.code === 'RETAIL_PORTAL_UNAVAILABLE' || e?.code === 'RETAIL_PORTAL_FORBIDDEN') {
       return res.status(e.status).json({ error: e.code, code: e.code, detail: e.message });
     }
-    return res.status(500).json({ error: 'create_portal_session_failed', detail: e?.message || 'create_portal_session_failed' })
+    return res.status(503).json({ error: 'RETAIL_PORTAL_UNAVAILABLE', code: 'RETAIL_PORTAL_UNAVAILABLE',
+      detail: 'Billing portal is temporarily unavailable.' })
   }
 })
 

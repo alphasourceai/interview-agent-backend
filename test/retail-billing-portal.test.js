@@ -202,6 +202,21 @@ test('mounted missing/unsafe config returns safe503 without returning private pr
  assert.equal(r.status,503);assert.equal(r.body.code,'RETAIL_PORTAL_UNAVAILABLE');assert.deepEqual(f.calls,[]);
  assert.equal(JSON.stringify(r.body).includes(CUSTOMER),false);delete process.env.STRIPE_SECRET_KEY;
 });
+test('the route first client lookup and SDK construction errors also have stable safe responses',async()=>{
+ const f=fixture();f.db=createFakeSupabase(f.tables,{failOn:{clients:{op:'select',error:{message:'PRIVATE_DATABASE_DETAILS'}}}});
+ const r=await request(appFor(f)).post('/clients/billing/portal-session').send({client_id:C});
+ assert.equal(r.status,503);assert.equal(r.body.code,'RETAIL_PORTAL_UNAVAILABLE');
+ assert.equal(JSON.stringify(r.body).includes('PRIVATE_DATABASE_DETAILS'),false);
+ const g=fixture(),app=appFor(g);
+ const stripeId=require.resolve('../src/clients/stripe');
+ require.cache[stripeId]=Object.defineProperty({id:stripeId,filename:stripeId,loaded:true},'exports',{
+  get(){throw new Error('PRIVATE_CONSTRUCTOR_DETAILS');}});
+ try{
+  const response=await request(app).post('/clients/billing/portal-session').send({client_id:C});
+  assert.equal(response.status,503);assert.equal(response.body.code,'RETAIL_PORTAL_UNAVAILABLE');
+  assert.equal(JSON.stringify(response.body).includes('PRIVATE_CONSTRUCTOR_DETAILS'),false);
+ }finally{require.cache[stripeId]={id:stripeId,filename:stripeId,loaded:true,exports:g.stripe};}
+});
 test('global/isAdmin use the restricted server configuration; owner-only role is not granted new write access',async()=>{
  process.env.STRIPE_RETAIL_PORTAL_CONFIGURATION_ID=CONFIG;process.env.STRIPE_SECRET_KEY=KEY;
  try{
