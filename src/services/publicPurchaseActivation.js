@@ -1158,15 +1158,19 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
 
   // An Enterprise agreement may state a billing model; it is split off so it is
   // never upserted (see below).
-  const { billing_model: explicitBillingModel = null, ...enterpriseColumns } = enterprisePlanSettings || {};
-  const planSettingsPayload = enterprisePlanSettings
-    ? { ...enterpriseColumns, client_id: clientId }
+  const canonicalPlanSettings = enterprisePlanSettings
+    ? { ...enterprisePlanSettings, client_id: clientId }
     : buildAlphaScreenPlanSettingsPayload({
       clientId,
       planKey,
       billingInterval,
       packageSnapshot
     });
+  const { billing_model: explicitBillingModel = null, ...planSettingsPayload } = canonicalPlanSettings || {};
+  // Canonical retail features are initial settings, not permission to replace
+  // an administrator's sticky model on an unfenced retry. As for Enterprise,
+  // recordExplicitBillingModel sets it only where the existing column is null.
+  // Fixed retail projections omit rollover_days, whose DB column is NOT NULL.
   // billing_model is not upserted: left empty, it follows plan_tier, and a
   // value already stored is an explicit choice this activation must not undo.
   await assertFence();

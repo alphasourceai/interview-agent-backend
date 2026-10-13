@@ -477,6 +477,23 @@ test('public purchase webhook activation provisions Essential and Pro monthly/an
   }
 })
 
+test('unfenced new retail initial features never upsert or overwrite a sticky admin model', async () => {
+  for (const plan of ['basic','pro']) for (const existingModel of [null,'usage']) {
+    const db=makeDb(plan,'monthly');db.purchaseIntents=[];
+    const s=revisedSnapshot(plan,3,'prepaid'),a=db.membershipAgreements[0];a.billing_option='prepaid';
+    a.template_snapshot={source:'admin',package_snapshot:s};
+    db.clientPlanSettings=[{client_id:CLIENT_ID,plan_tier:plan,billing_interval:'prepaid',billing_model:existingModel,rollover_days:270}];
+    const {result}=await activateCase(plan,'monthly',{db});assert.equal(result.ok,true);
+    const p=db.clientPlanSettings[0];assert.equal(p.scored_question_count,plan==='basic'?5:6);
+    assert.equal(p.billing_model,existingModel || (plan==='basic'?'fixed':'rollover'));
+    assert.equal(p.rollover_days,plan==='basic'?270:90);
+    for(const write of db.upserts.filter(x=>x.table==='client_plan_settings')){
+      assert.equal(Object.hasOwn(write.payload,'billing_model'),false);
+      if(plan==='basic')assert.equal(Object.hasOwn(write.payload,'rollover_days'),false);
+    }
+  }
+});
+
 test('fenced purchase uses only transactional tail RPCs and does not resend welcome', async () => {
   const db = makeDb('basic', 'monthly')
   db.purchaseIntents[0].protocol = 'fenced_v2'

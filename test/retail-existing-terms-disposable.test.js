@@ -12,6 +12,8 @@ const enabled = process.env.RETAIL_EXISTING_TERMS_DISPOSABLE === 'true';
 const options = { skip: !enabled };
 const root = path.resolve(__dirname, '..');
 const migration = path.join(root, 'supabase/migrations/20261012230107_retail_existing_flow_pricing_terms.sql');
+const featuresMigration = path.join(root, 'supabase/migrations/20261013032659_retail_existing_initial_plan_features.sql');
+const featureSql = () => fs.readFileSync(featuresMigration, 'utf8');
 const psql = '/opt/homebrew/opt/postgresql@17/bin/psql';
 const paidAt = '2026-01-31T15:45:00.000Z';
 if (enabled) {
@@ -22,7 +24,7 @@ if (enabled) {
   assert.equal(process.env.PGPASSWORD, undefined);
 }
 function sql(text, database = 'postgres') {
-  assert.ok(['postgres', 'retail_pricing_drift_test'].includes(database));
+  assert.ok(['postgres', 'retail_pricing_drift_test', 'retail_features_baseline_test'].includes(database));
   return execFileSync(psql, ['-X', '-A', '-t', '-d', database, '-v', 'ON_ERROR_STOP=1'], { input: text, encoding: 'utf8' }).trim();
 }
 const quote = value => value == null ? 'null' : `'${String(value).replaceAll("'", "''")}'`;
@@ -92,10 +94,13 @@ function prepareDatabase(database = 'postgres') {
     create table public.retail_signup_email_verifications (billing_cadence text constraint retail_signup_email_verifications_billing_cadence_check check(billing_cadence in ('monthly','annual')));
     create table private_auth.retail_signup_sms_verifications (billing_cadence text constraint retail_signup_sms_verifications_billing_cadence_check check(billing_cadence in ('monthly','annual')));`, database);
   sql(fs.readFileSync(path.join(root, 'supabase/migrations/20261001131612_qa_public_purchase_activation_fences.sql'), 'utf8'), database);
+  for (const name of ['20261009120000_billing_models.sql', '20261011130000_client_plan_settings_interview_settings.sql'])
+    sql(fs.readFileSync(path.join(root, 'supabase/migrations', name), 'utf8'), database);
 }
 test('setup actual activation fences and pricing compatibility in disposable PG only', options, () => {
   prepareDatabase();
   sql(fs.readFileSync(migration, 'utf8'));
+  sql(featureSql());
 });
 test('original native legacy completion/billing/member/welcome assertions remain unchanged', options, () => {
   const read = name => fs.readFileSync(path.join(__dirname, `fixtures/qa-activation-fence-disposable-${name}-assertions.sql`), 'utf8');
@@ -115,7 +120,8 @@ for (const plan of ['basic', 'pro']) for (const months of [3, 6, 12])
       assert.equal(JSON.parse(sql(`select ${billing(r)};`)).status, 'applied');
       const record = JSON.parse(sql(`select jsonb_build_object('start',c.contract_start_at,'end',c.contract_end_at,
         'cadence',c.billing_interval,'fee',p.platform_fee,'start_date',a.initial_term_start,'renewal',a.initial_renewal_date,'paid',a.checkout_paid_at,
-        'intent_paid',i.activated_at,'credits',(select count(*) from public.client_role_credits where source_public_purchase_intent_id=i.id))
+        'intent_paid',i.activated_at,'questions',p.scored_question_count,'model',p.billing_model,'rollover',p.rollover_days,
+        'credits',(select count(*) from public.client_role_credits where source_public_purchase_intent_id=i.id))
         from public.clients c join public.client_plan_settings p on p.client_id=c.id
         join public.membership_agreements a on a.client_id=c.id join public.public_purchase_intents i on i.agreement_id=a.id where c.id=${quote(r.client)};`));
       assert.equal(new Date(record.start).toISOString(), paidAt);
@@ -125,9 +131,16 @@ for (const plan of ['basic', 'pro']) for (const months of [3, 6, 12])
       assert.equal(record.renewal, retailTermWindow({ originalStart: paidAt, commitmentMonths: months }).term_end_at.slice(0,10));
       assert.equal(new Date(record.paid).toISOString(), new Date(record.intent_paid).toISOString());
       assert.equal(record.credits, role ? 1 : 0);
+      assert.equal(record.questions,r.s.scored_question_count);assert.equal(record.model,r.s.membership_terms.billing_model);
+      assert.equal(record.rollover,plan==='basic'?90:r.s.membership_terms.rollover_days);
       // Replay leaves original clocks/fees/credit unchanged and returns the
       // existing billing identity, not another receipt or a provider charge.
       assert.equal(JSON.parse(sql(`select ${billing(r)};`)).status, 'already_applied');
+      sql(`update public.client_plan_settings set scored_question_count=7,billing_model='usage',rollover_days=180 where client_id=${quote(r.client)};
+        update public.client_role_credits set status='claimed' where source_public_purchase_intent_id=${quote(r.i.id)};`);
+      const beforeReplay=sql(`select to_jsonb(p) from public.client_plan_settings p where client_id=${quote(r.client)};`);
+      assert.equal(JSON.parse(sql(`select ${billing(r)};`)).status,'already_applied');
+      assert.equal(sql(`select to_jsonb(p) from public.client_plan_settings p where client_id=${quote(r.client)};`),beforeReplay);
     });
   }
 // Staff may sell BOTH prepaid and monthly installments. Public checkout is
@@ -217,6 +230,91 @@ test('browser roles have no native pricing helper or activation writer execute p
     assert.equal(sql(`select has_function_privilege(${quote(role)},'public.complete_public_purchase_activation(uuid,text,timestamptz,text,uuid,boolean,text,text,date,date)','EXECUTE');`), 'f');
   }
   assert.equal(sql("select has_function_privilege('service_role','public.retail_existing_terms_months(jsonb,jsonb)','EXECUTE');"), 't');
+});
+test('native fixed insert uses real default and fixed conflict preserves unused positive duration', options, () => {
+  const r=rows('basic',6,'prepaid');setup(r);sql(`select ${complete(r)};`);
+  sql(`insert into public.client_plan_settings(client_id,plan_tier,billing_interval,platform_fee,per_role_fee,
+    included_interviews_per_role,additional_interview_fee,max_interview_minutes,rollover_days,billing_model,scored_question_count)
+    values(${quote(r.client)},'basic','prepaid',1,1,1,1,10,270,'usage',7);`);
+  assert.equal(JSON.parse(sql(`select ${billing(r)};`)).status,'applied');
+  const p=JSON.parse(sql(`select to_jsonb(p) from public.client_plan_settings p where client_id=${quote(r.client)};`));
+  assert.equal(p.rollover_days,270);assert.equal(p.billing_model,'fixed');assert.equal(p.scored_question_count,5);
+});
+test('native accepted historical Pro rollover duration does not reprice from current catalog', options, () => {
+  const r=rows('pro',6,'monthly_installments');r.s.membership_terms.rollover_days=135;
+  r.s.pricing_version=r.s.membership_terms.offer_version='accepted-historical';
+  r.i.package_snapshot=structuredClone(r.s);r.a.template_snapshot.package_snapshot=structuredClone(r.s);
+  r.a.template_snapshot.values.pricing_version=r.s.pricing_version;setup(r);
+  sql(`select ${complete(r)};select ${billing(r)};`);
+  assert.equal(sql(`select rollover_days from public.client_plan_settings where client_id=${quote(r.client)};`),'135');
+});
+test('native replay digest binds accepted question count model and nullable fixed rollover', options, () => {
+  for(const field of ['scored_question_count','billing_model','rollover_days']){
+    const r=rows('pro',3,'prepaid');setup(r);sql(`select ${complete(r)};select ${billing(r)};`);
+    const before=sql(`select to_jsonb(p) from public.client_plan_settings p where client_id=${quote(r.client)};`);
+    if(field==='scored_question_count'){r.s.scored_question_count=7;r.s.membership_terms.scored_question_count=7;}
+    if(field==='rollover_days')r.s.membership_terms.rollover_days=120;
+    if(field==='billing_model'){r.s.membership_terms.billing_model='fixed';r.s.membership_terms.rollover_days=null;}
+    sql(`update public.public_purchase_intents set package_snapshot=${json(r.s)} where id=${quote(r.i.id)};
+      update public.membership_agreements set template_snapshot=jsonb_set(template_snapshot,'{package_snapshot}',${json(r.s)}) where id=${quote(r.a.id)};`);
+    sql(`do $$ begin begin perform ${billing(r)};raise exception 'expected digest conflict';
+      exception when sqlstate 'P0001' then if sqlerrm<>'billing_payload_conflict' then raise;end if;end;end $$;`);
+    assert.equal(sql(`select to_jsonb(p) from public.client_plan_settings p where client_id=${quote(r.client)};`),before);
+  }
+});
+test('native initial features cannot bypass malformed source with plan or billing DML', options, () => {
+  const r=rows('pro');setup(r);sql(`select ${complete(r)};`);
+  const before=sql(`select to_jsonb(c) from public.clients c where id=${quote(r.client)};`);
+  sql(`update public.public_purchase_intents set package_snapshot=jsonb_set(package_snapshot,'{membership_terms,scored_question_count}','9') where id=${quote(r.i.id)};`);
+  assert.throws(()=>sql(`select ${billing(r)};`),/retail_terms_source_mismatch/);
+  assert.equal(sql(`select to_jsonb(c) from public.clients c where id=${quote(r.client)};`),before);
+  assert.equal(sql(`select count(*) from public.client_plan_settings where client_id=${quote(r.client)};`),'0');
+  assert.equal(sql(`select billing_applied_at is null from public.public_purchase_intents where id=${quote(r.i.id)};`),'t');
+});
+test('native initial migration rejects schema privilege source drift and earlier applied new cohort without DML', options, () => {
+  const database='retail_features_baseline_test';sql(`create database ${database} template template0;`);
+  prepareDatabase(database);sql(fs.readFileSync(migration,'utf8'),database);
+  const sig='public.apply_public_purchase_billing(uuid,text,uuid,uuid,text,text,text,text,text,text,timestamptz,boolean,boolean,timestamptz,timestamptz,timestamptz,numeric,numeric,integer,numeric,integer,boolean,text,integer,integer,integer,boolean,boolean)';
+  const original=sql(`select pg_get_functiondef(${quote(sig)}::regprocedure);`,database);
+  const before=()=>sql(`select pg_get_functiondef(${quote(sig)}::regprocedure);`,database);
+  for(const [edit,repair] of [
+    ["alter table public.client_plan_settings alter column billing_model set default 'fixed';","alter table public.client_plan_settings alter column billing_model drop default;"],
+    ["alter table public.client_plan_settings alter column rollover_days drop not null;","alter table public.client_plan_settings alter column rollover_days set not null;"],
+    ["alter table public.client_plan_settings alter column rollover_days set default 120;","alter table public.client_plan_settings alter column rollover_days set default 90;"],
+    ["alter table public.client_plan_settings drop constraint client_plan_settings_rollover_days_check;","alter table public.client_plan_settings add constraint client_plan_settings_rollover_days_check check(rollover_days>0);"],
+    ["alter table public.client_plan_settings drop column scored_question_count;",fs.readFileSync(path.join(root,'supabase/migrations/20261011130000_client_plan_settings_interview_settings.sql'),'utf8')]
+  ]){
+    sql(edit,database);assert.throws(()=>sql(featureSql(),database),/retail_initial_features_schema_prerequisite/);
+    assert.equal(before(),original);sql(repair,database);
+  }
+  sql(`grant execute on function ${sig} to anon;`,database);
+  assert.throws(()=>sql(featureSql(),database),/retail_initial_features_writer_source_drift/);
+  sql(`revoke all on function ${sig} from anon;`,database);
+  sql(`alter function ${sig} set search_path=public;`,database);
+  assert.throws(()=>sql(featureSql(),database),/retail_initial_features_writer_source_drift/);
+  sql(`alter function ${sig} set search_path='';`,database);
+  sql(original.replace('    p_max_interview_minutes\n  ) on conflict','    p_max_interview_minutes+0\n  ) on conflict'),database);
+  assert.throws(()=>sql(featureSql(),database),/retail_initial_features_writer_source_drift/);sql(original,database);
+  for(const marker of ['pricing_protocol','membership_terms','pricing_version']){
+    const id='55555555-5555-4555-8555-555555555555';
+    sql(`insert into public.public_purchase_intents(id,billing_applied_at,package_snapshot) values(${quote(id)},clock_timestamp(),${json({[marker]:'synthetic'})});`,database);
+    const rowBefore=sql(`select to_jsonb(i) from public.public_purchase_intents i where id=${quote(id)};`,database);
+    assert.throws(()=>sql(featureSql(),database),/retail_initial_features_already_applied_manual_review/);
+    assert.equal(before(),original);assert.equal(sql(`select to_jsonb(i) from public.public_purchase_intents i where id=${quote(id)};`,database),rowBefore);
+    sql(`delete from public.public_purchase_intents where id=${quote(id)};`,database);
+  }
+  // Run the exact old native fixture before patch, capture real old digest and
+  // data. Applied legacy data must not block migration or be rewritten by it.
+  sql(fs.readFileSync(path.join(__dirname,'fixtures/qa-activation-fence-disposable-billing-assertions.sql'),'utf8'),database);
+  const id='30000000-0000-4000-8000-000000000001';
+  const legacyBefore=sql(`select to_jsonb(i) from public.public_purchase_intents i where id=${quote(id)};`,database);
+  const digestBefore=sql(`select billing_apply_digest from public.public_purchase_intents where id=${quote(id)};`,database);
+  const acl=sql(`select jsonb_build_array(proowner,proacl,proconfig,prosecdef) from pg_proc where oid=${quote(sig)}::regprocedure;`,database);
+  sql(featureSql(),database);
+  assert.equal(sql(`select to_jsonb(i) from public.public_purchase_intents i where id=${quote(id)};`,database),legacyBefore);
+  assert.equal(sql(`select jsonb_build_array(proowner,proacl,proconfig,prosecdef) from pg_proc where oid=${quote(sig)}::regprocedure;`,database),acl);
+  assert.equal(sql(`select billing_apply_digest from public.public_purchase_intents where id=${quote(id)};`),digestBefore);
+  assert.equal(JSON.parse(sql('select public.synthetic_apply_qa_billing();',database)).status,'already_applied');
 });
 test('writer assignment source drift rolls back all compatibility DDL in a second isolated database', options, () => {
   sql('create database retail_pricing_drift_test template template0;');

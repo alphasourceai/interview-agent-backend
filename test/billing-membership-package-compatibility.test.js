@@ -17,7 +17,22 @@ test('all 24 pricing/role variants adapt to the existing package shape with no a
     assert.ok(Object.isFrozen(s)&&Object.isFrozen(o));const p=settings({clientId:'existing-client',planKey:plan,billingInterval:s.billing_cadence,packageSnapshot:s});
     assert.equal(p.platform_fee,amount/100);assert.equal(p.per_role_fee,plan==='basic'?399:699);assert.equal(p.included_interviews_per_role,plan==='basic'?20:30);
     assert.equal(p.max_interview_minutes,plan==='basic'?10:12);assert.equal(p.additional_interview_fee,plan==='basic'?25:30);
+    assert.equal(p.scored_question_count,plan==='basic'?5:6);assert.equal(p.billing_model,plan==='basic'?'fixed':'rollover');
+    assert.equal(Object.hasOwn(p,'rollover_days'),plan==='pro');if(plan==='pro')assert.equal(p.rollover_days,90);
   }
+});
+test('legacy plan projection remains deep-equal to the exact prior working source',()=>{
+  const fs=require('node:fs'),vm=require('node:vm'),{createRequire}=require('node:module'),{execFileSync}=require('node:child_process');
+  const file=require.resolve('../src/services/alphaScreenPackages');
+  const prior=execFileSync('git',['show','af7fe71bbc61881b1b6e9b6032938c91e8b79669:src/services/alphaScreenPackages.js'],{encoding:'utf8'});
+  const module={exports:{}};vm.runInNewContext(prior,{module,exports:module.exports,require:createRequire(file),process,console});
+  for(const plan of ['basic','pro'])for(const cadence of ['monthly','annual'])for(const snapshot of [undefined,build(plan,cadence)]){
+    const input={clientId:'synthetic',planKey:plan,billingInterval:cadence,packageSnapshot:snapshot};
+    assert.deepEqual(settings(input),JSON.parse(JSON.stringify(module.exports.buildAlphaScreenPlanSettingsPayload(input))));
+  }
+  const activation=fs.readFileSync(require.resolve('../src/services/publicPurchaseActivation'),'utf8');
+  assert.match(activation,/const \{ billing_model: explicitBillingModel = null, \.\.\.planSettingsPayload \} = canonicalPlanSettings/);
+  assert.match(activation,/recordExplicitBillingModel\(\{ db, clientId, billingModel: explicitBillingModel \}\)/);
 });
 test('public remains prepaid only; existing monthly and annual builders remain byte-compatible',()=>{
   for(const months of [3,6,12])assert.equal(read(fixture('basic',months,'prepaid',false,'public')).commitment_months,months);

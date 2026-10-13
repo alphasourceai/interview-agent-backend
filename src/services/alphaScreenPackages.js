@@ -121,7 +121,9 @@ function buildAlphaScreenPlanSettingsPayload({ clientId, planKey, billingInterva
     return { client_id:String(clientId).trim(), plan_tier:accepted.plan_key, billing_interval:interval,
       platform_fee:accepted.platform_payment_cents / 100, per_role_fee:accepted.per_role_fee_cents / 100,
       included_interviews_per_role:accepted.included_interviews_per_role,
-      additional_interview_fee:accepted.additional_interview_fee_cents / 100, max_interview_minutes:accepted.max_interview_minutes }
+      additional_interview_fee:accepted.additional_interview_fee_cents / 100, max_interview_minutes:accepted.max_interview_minutes,
+      scored_question_count:accepted.scored_question_count, billing_model:accepted.billing_model,
+      ...(accepted.billing_model === 'rollover' ? { rollover_days:accepted.rollover_days } : {}) }
   }
   const client_id = String(clientId || '').trim()
   const plan_tier = normalizeAlphaScreenPlanKey(planKey)
