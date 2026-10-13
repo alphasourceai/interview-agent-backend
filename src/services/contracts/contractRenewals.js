@@ -1,10 +1,43 @@
 'use strict';
 
-// Contract renewal processing, moved out of app.js unchanged. Two callers share it:
+// Existing contract renewal processing. Two callers share it:
 // the admin route and the internal cron route, which is why it is a service rather
 // than living with either router.
 
 const { supabaseAdmin } = require('../../clients/supabase');
+const { readRetailPackageOffer } = require('../membershipPackageCompatibility');
+const { retailTermWindow } = require('../membershipOffers');
+
+function invalidRetailRenewal() {
+  throw new Error('retail_renewal_terms_mismatch');
+}
+
+function getRetailRenewalWindow(client, agreement) {
+  const snapshot = agreement?.template_snapshot;
+  const offer = readRetailPackageOffer(snapshot?.package_snapshot);
+  const marker = 'membership_agreement_retail_terms_v2';
+  if (!offer) {
+    if (client?.billing_interval === 'prepaid' || agreement?.billing_option === 'prepaid'
+      || agreement?.template_version === marker || snapshot?.template_version === marker) invalidRetailRenewal();
+    return null; // Legacy contracts keep their original twelve-month behavior.
+  }
+  const original = new Date(agreement?.checkout_paid_at || NaN);
+  const start = new Date(client?.contract_start_at || NaN);
+  const end = new Date(client?.contract_end_at || NaN);
+  if (agreement.client_id !== client.id || agreement.is_current !== true || agreement.status !== 'signed'
+    || agreement.checkout_status !== 'paid' || agreement.superseded_by_agreement_id
+    || agreement.template_version !== marker || snapshot.template_version !== marker
+    || client.plan_tier !== offer.plan_key || agreement.membership_tier !== offer.plan_key
+    || client.billing_interval !== (offer.payment_option === 'prepaid' ? 'prepaid' : 'monthly')
+    || agreement.billing_option !== client.billing_interval
+    || !Number.isFinite(original.getTime()) || !Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) invalidRetailRenewal();
+  const offset = (start.getUTCFullYear() - original.getUTCFullYear()) * 12 + start.getUTCMonth() - original.getUTCMonth();
+  if (offset < 0 || offset % offer.commitment_months !== 0) invalidRetailRenewal();
+  const termIndex = offset / offer.commitment_months;
+  const current = retailTermWindow({originalStart:original.toISOString(), commitmentMonths:offer.commitment_months, termIndex});
+  if (Date.parse(current.term_start_at) !== start.getTime() || Date.parse(current.term_end_at) !== end.getTime()) invalidRetailRenewal();
+  return retailTermWindow({originalStart:original.toISOString(), commitmentMonths:offer.commitment_months, termIndex:termIndex + 1});
+}
 
 function addMonthsToIso(isoString, monthsToAdd = 12) {
   const base = new Date(isoString)
@@ -14,18 +47,19 @@ function addMonthsToIso(isoString, monthsToAdd = 12) {
   return next.toISOString()
 }
 
-async function processContractRenewals(context = {}) {
+async function processContractRenewals(context = {}, dependencies = {}) {
+  const db = dependencies.db || supabaseAdmin;
   const triggerSource = String(context?.triggerSource || 'admin')
   const requestId = context?.requestId || null
   const triggeredByUserId = context?.triggeredByUserId || null
   const triggeredByEmail = context?.triggeredByEmail || null
-  const now = new Date()
+  const now = dependencies.now || new Date()
   const nowMs = now.getTime()
   const startedAt = now.toISOString()
   let runId = null
 
   try {
-    const { data: startedRun, error: startedRunError } = await supabaseAdmin
+    const { data: startedRun, error: startedRunError } = await db
       .from('contract_processing_runs')
       .insert({
         trigger_source: triggerSource,
@@ -42,17 +76,17 @@ async function processContractRenewals(context = {}) {
   } catch (_) {}
 
   try {
-    let stripe = null
+    let stripe = dependencies.stripe || null
     try {
       const stripeKey = String(process.env.STRIPE_SECRET_KEY || '')
-      if (stripeKey) {
+      if (!stripe && stripeKey) {
         stripe = require('../../clients/stripe')
       }
     } catch (_) {}
 
-    const { data: clients, error } = await supabaseAdmin
+    const { data: clients, error } = await db
       .from('clients')
-      .select('id,name,billing_status,manual_active_override,contract_start_at,contract_end_at,auto_renew,cancel_effective_at,stripe_subscription_id,subscription_status,cancel_at_term_end')
+      .select('id,name,plan_tier,billing_interval,billing_status,manual_active_override,contract_start_at,contract_end_at,auto_renew,cancel_effective_at,stripe_subscription_id,subscription_status,cancel_at_term_end')
 
     if (error) {
       const e = new Error(error.message || 'process_contracts_failed')
@@ -92,9 +126,25 @@ async function processContractRenewals(context = {}) {
         continue
       }
 
+      let retailWindow = null;
+      try {
+        // Inspect the current row before filtering by payment/signature status:
+        // an unpaid/malformed new agreement must not disappear into legacy.
+        const {data:agreement, error:agreementError} = await db.from('membership_agreements')
+          .select('id,client_id,status,is_current,checkout_status,checkout_paid_at,membership_tier,billing_option,template_version,template_snapshot,superseded_by_agreement_id')
+          .eq('client_id', client.id).eq('is_current', true).maybeSingle();
+        if (agreementError) throw new Error(agreementError.message || 'renewal_agreement_read_failed');
+        retailWindow = getRetailRenewalWindow(client, agreement);
+      } catch (e) {
+        summary.errors += 1;
+        items.push({id:client.id, name:client.name || null, action:'error', contract_end_at_before:oldContractEnd,
+          detail:e.message || 'renewal_terms_failed'});
+        continue;
+      }
+
       if (client?.auto_renew === true) {
-        const newContractStart = oldEndDate.toISOString()
-        const newContractEnd = addMonthsToIso(newContractStart, 12)
+        const newContractStart = retailWindow?.term_start_at || oldEndDate.toISOString()
+        const newContractEnd = retailWindow?.term_end_at || addMonthsToIso(newContractStart, 12)
         if (!newContractEnd) {
           summary.errors += 1
           items.push({
@@ -109,7 +159,7 @@ async function processContractRenewals(context = {}) {
 
         // Conditional on the value this run read, so two concurrent runs cannot both
         // renew the same client and advance the term twice. The loser matches no rows.
-        const { error: renewError } = await supabaseAdmin
+        let renewalQuery = db
           .from('clients')
           .update({
             contract_start_at: newContractStart,
@@ -117,6 +167,9 @@ async function processContractRenewals(context = {}) {
           })
           .eq('id', client.id)
           .eq('contract_end_at', oldContractEnd)
+        if (retailWindow) renewalQuery = renewalQuery.eq('contract_start_at', client.contract_start_at)
+          .eq('auto_renew', true).select('id').maybeSingle();
+        const {data:renewedClient, error:renewError} = await renewalQuery;
 
         if (renewError) {
           summary.errors += 1
@@ -128,6 +181,13 @@ async function processContractRenewals(context = {}) {
             detail: renewError.message || 'renew_update_failed'
           })
           continue
+        }
+
+        if (retailWindow && !renewedClient?.id) {
+          summary.skipped_no_action += 1;
+          items.push({id:client.id, name:client.name || null, action:'skipped_no_action',
+            contract_end_at_before:oldContractEnd, detail:'renewal_guard_changed'});
+          continue;
         }
 
         summary.renewed += 1
@@ -164,13 +224,16 @@ async function processContractRenewals(context = {}) {
 
       if (!alreadyInactiveProcessed) {
         const cancelEffectiveAt = oldEndDate.toISOString()
-        const { error: deactivateError } = await supabaseAdmin
+        let deactivationQuery = db
           .from('clients')
           .update({
             billing_status: 'inactive',
             cancel_effective_at: cancelEffectiveAt
           })
           .eq('id', client.id)
+        if (retailWindow) deactivationQuery = deactivationQuery.eq('contract_end_at', oldContractEnd)
+          .eq('contract_start_at', client.contract_start_at).eq('auto_renew', false).select('id').maybeSingle();
+        const {data:deactivatedClient, error:deactivateError} = await deactivationQuery;
 
         if (deactivateError) {
           summary.errors += 1
@@ -183,6 +246,12 @@ async function processContractRenewals(context = {}) {
           })
           continue
         }
+        if (retailWindow && !deactivatedClient?.id) {
+          summary.skipped_no_action += 1;
+          items.push({id:client.id, name:client.name || null, action:'skipped_no_action',
+            contract_end_at_before:oldContractEnd, detail:'deactivation_guard_changed'});
+          continue;
+        }
       }
 
       let stripeAlignmentError = null
@@ -194,7 +263,7 @@ async function processContractRenewals(context = {}) {
         } else {
           try {
             await stripe.subscriptions.update(client.stripe_subscription_id, { cancel_at_period_end: true })
-            const { error: localStripeFlagError } = await supabaseAdmin
+            const { error: localStripeFlagError } = await db
               .from('clients')
               .update({ cancel_at_term_end: true })
               .eq('id', client.id)
@@ -241,7 +310,7 @@ async function processContractRenewals(context = {}) {
     const completedAt = new Date().toISOString()
     try {
       if (runId) {
-        await supabaseAdmin
+        await db
           .from('contract_processing_runs')
           .update({
             completed_at: completedAt,
@@ -251,7 +320,7 @@ async function processContractRenewals(context = {}) {
           })
           .eq('id', runId)
       } else {
-        await supabaseAdmin
+        await db
           .from('contract_processing_runs')
           .insert({
             trigger_source: triggerSource,
@@ -273,7 +342,7 @@ async function processContractRenewals(context = {}) {
     const detail = e?.detail || e?.message || 'process_contracts_failed'
     try {
       if (runId) {
-        await supabaseAdmin
+        await db
           .from('contract_processing_runs')
           .update({
             completed_at: completedAt,
@@ -282,7 +351,7 @@ async function processContractRenewals(context = {}) {
           })
           .eq('id', runId)
       } else {
-        await supabaseAdmin
+        await db
           .from('contract_processing_runs')
           .insert({
             trigger_source: triggerSource,
@@ -300,4 +369,4 @@ async function processContractRenewals(context = {}) {
   }
 }
 
-module.exports = { addMonthsToIso, processContractRenewals };
+module.exports = { addMonthsToIso, processContractRenewals, getRetailRenewalWindow };
