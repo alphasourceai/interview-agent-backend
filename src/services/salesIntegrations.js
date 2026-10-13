@@ -364,6 +364,7 @@ async function reconcileSalesWonDeliveries(options = {}) {
 }
 
 async function postSlackMessage(delivery, options = {}) {
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
   const env = options.env || process.env;
   const fetchImpl = options.fetchImpl || global.fetch;
   const config = slackConfiguration(env);
@@ -567,6 +568,7 @@ async function markGhlDeliveryFailure(db, delivery, error) {
 }
 
 async function processSalesIntegrationDeliveries(options = {}) {
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
   const db = options.db || supabaseAdmin;
   const logger = options.logger || console;
   const env = options.env || process.env;

@@ -4,7 +4,7 @@ const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const crypto = require('crypto');
-const sg = require('@sendgrid/mail');
+const sg = require('../../clients/sendgridFactory')();
 const { supabaseAdmin } = require('../../clients/supabase');
 const { buildBrandedEmailShell, escapeHtml } = require('../../clients/sendgrid');
 

@@ -105,6 +105,7 @@
   "GET /membership-agreements/latest-signed",
   "GET /membership-agreements/latest-signed-url",
   "GET /public/interview-status",
+  "GET /pricing/capabilities",
   "GET /reports/:id/download",
   "GET /reports/:id/url",
   "GET /reports/interviews/:interviewId/url",

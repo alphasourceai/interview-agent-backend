@@ -35,6 +35,7 @@ function normalizeTelnyxLineType(payload) {
 }
 
 function requestTelnyxNumberLookup({ toE164, apiKey, timeoutMs, httpsModule = https }) {
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
   return new Promise((resolve, reject) => {
     const path = `/v2/number_lookup/${encodeURIComponent(toE164)}?type=carrier`;
     let completed = false;
@@ -97,6 +98,7 @@ async function lookupSmsLineType({
   transport = requestTelnyxNumberLookup,
   now = () => new Date(),
 } = {}) {
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
   const config = readTelnyxLookupConfig(env);
   if (!config.valid || !/^\+1\d{10}$/.test(String(toE164 || ''))
       || !/^[0-9a-f]{64}$/.test(String(destinationFingerprint || ''))) {

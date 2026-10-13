@@ -1,7 +1,7 @@
 'use strict';
 
 const express = require('express');
-const sg = require('@sendgrid/mail');
+const sg = require('../../clients/sendgridFactory')();
 const { supabaseAdmin } = require('../../clients/supabase');
 const { buildBrandedEmailShell, escapeHtml } = require('../../clients/sendgrid');
 const { authenticateSendgridWebhook } = require('../../services/sendgridWebhookAuth');

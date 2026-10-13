@@ -105,6 +105,7 @@ function createSupportVoiceProviderCanary(options = {}) {
   }
 
   function probe() {
+    require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
     if (state.stopped || !configured()) {
       return Promise.resolve(false);
     }
@@ -177,6 +178,7 @@ function createSupportVoiceProviderCanary(options = {}) {
   }
 
   function start() {
+    require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
     if (state.started || !configured()) return;
     state.started = true;
     state.stopped = false;

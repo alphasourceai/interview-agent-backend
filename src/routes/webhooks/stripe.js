@@ -777,6 +777,10 @@ router.post('/', async (req, res) => {
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET || '';
 
   let event;
+  const devGuard = require('../../config/guardedPricingDev');
+  if (devGuard.isGuardedPricingDev() && !webhookSecret) {
+    return res.status(400).json({ error: 'bad_request', code: 'STRIPE_SIGNATURE_VERIFICATION_FAILED', request_id });
+  }
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
   } catch (err) {
@@ -795,6 +799,9 @@ router.post('/', async (req, res) => {
     });
   }
 
+  if (devGuard.isGuardedPricingDev()) {
+    return res.status(503).json({ error: 'billing_unavailable', code: devGuard.CODE, detail: devGuard.DETAIL, request_id });
+  }
   const eventObject = event?.data?.object || null;
   // Fence marked usage owners before agreement classification can make any
   // provider read. This also follows markers after mutable model edits.

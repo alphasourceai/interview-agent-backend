@@ -48,6 +48,7 @@ function addMonthsToIso(isoString, monthsToAdd = 12) {
 }
 
 async function processContractRenewals(context = {}, dependencies = {}) {
+  require('../../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
   const db = dependencies.db || supabaseAdmin;
   const triggerSource = String(context?.triggerSource || 'admin')
   const requestId = context?.requestId || null

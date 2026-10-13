@@ -1,6 +1,6 @@
 'use strict';
 
-const sg = require('@sendgrid/mail');
+const sg = require('../clients/sendgridFactory')();
 const { buildBrandedEmailShell, escapeHtml } = require('../clients/sendgrid');
 const { markOtpChallengeDelivery } = require('./otpChallenge');
 

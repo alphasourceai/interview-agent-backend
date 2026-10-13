@@ -84,6 +84,7 @@ function providerError(status, body = {}) {
 }
 
 async function ghlRequest(path, options = {}) {
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
   const env = options.env || process.env;
   const fetchImpl = options.fetchImpl || global.fetch;
   const config = options.config || ghlSalesConfiguration(env);

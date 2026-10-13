@@ -272,6 +272,7 @@ function createTavusHttpClient(options = {}) {
   }
 
   async function execute(operation, request = {}) {
+    require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
     const config = OPERATION_CONFIG[operation];
     if (!config) throw new Error(`unknown_tavus_operation:${operation}`);
     const apiKey = String(apiKeyProvider() || '').trim();

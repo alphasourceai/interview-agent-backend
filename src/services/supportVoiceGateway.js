@@ -607,6 +607,7 @@ function createSupportVoiceGateway(options = {}) {
   }
 
   function connectUpstream(entry) {
+    require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
     const handoff = supportHandoff.enabled();
     const built = buildSupportVoicePrompt({ handoff });
     entry.phase = 'upstream_connecting';
@@ -844,6 +845,7 @@ function createSupportVoiceGateway(options = {}) {
   });
 
   function attach(server) {
+    require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
     if (attachedServer === server) return;
     if (attachedServer) throw new Error('SUPPORT_VOICE_ALREADY_ATTACHED');
     attachedServer = server;

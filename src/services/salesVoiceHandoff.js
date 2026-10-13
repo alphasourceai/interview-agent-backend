@@ -355,6 +355,7 @@ function slackMessage(input, route) {
 }
 
 async function postJson(url, body, headers, fetchImpl, timeoutMs = 8000) {
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
   const response = await fetchImpl(url, {
     method: 'POST',
     redirect: 'error',
@@ -384,6 +385,7 @@ function createSalesVoiceHandoff(options = {}) {
   }
 
   async function send(input, route) {
+    require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
     if (!routeModeEnabled || !route) return { status: 'unavailable' };
     if (route.notifyEmail === false || route.notifySlack === false) return { status: 'unavailable' };
     const reference = hash(`${route.routeKey}:${JSON.stringify(input)}`).slice(0, 32);

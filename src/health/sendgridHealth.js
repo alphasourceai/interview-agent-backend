@@ -91,6 +91,7 @@ function statusMetricValue(count, singular, plural = `${singular}s`) {
 }
 
 async function fetchSendGridAccountCheck(context) {
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
   const data = await fetchJson(context, 'https://api.sendgrid.com/v3/scopes', {
     headers: {
       Authorization: `Bearer ${envValue(context.env, ['SENDGRID_API_KEY'])}`,

@@ -1,6 +1,6 @@
 require('dotenv').config();
 
-const Stripe = require('stripe');
+const Stripe = require('../src/clients/stripeFactory')();
 const { supabaseAdmin } = require('../src/clients/supabase');
 const { requirePlanCapacity } = require('../src/services/planCapacity');
 

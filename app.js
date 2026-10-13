@@ -1,5 +1,7 @@
 // app.js (drop-in)
 require('dotenv').config()
+const guardedPricingDev = require('./src/config/guardedPricingDev');
+guardedPricingDev.assertGuardedPricingDevConfiguration();
 
 // Loaded explicitly so serverless bundlers include the native canvas pdf-parse needs.
 try { require('@napi-rs/canvas') } catch (_) {}
@@ -88,6 +90,8 @@ const {
   isInterviewPrettyLinkHost,
 } = require('./src/config/urlConfig')
 const app = express()
+// Must precede the pre-CORS voice/GHL mounts and every body parser/router.
+app.use(guardedPricingDev.guardedPricingDevFence);
 const configuredTrustProxyHops = Number(process.env.TRUST_PROXY_HOPS || 1)
 app.set('trust proxy', Number.isInteger(configuredTrustProxyHops) && configuredTrustProxyHops >= 0
   ? configuredTrustProxyHops
@@ -158,6 +162,11 @@ app.use(cors({
   ],
   exposedHeaders: ['Content-Range', 'Range-Unit']
 }))
+
+app.get('/pricing/capabilities', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(guardedPricingDev.guardedPricingCapabilities());
+});
 
 app.use('/webhook/stripe', express.raw({ type: 'application/json' }), require('./src/routes/webhooks/stripe'))
 app.use('/webhook/telnyx/sms', express.raw({ type: 'application/json', limit: '256kb' }), require('./src/routes/webhooks/telnyx'))
@@ -511,7 +520,9 @@ function start() {
     console.log(`Server running on http://localhost:${PORT}`)
   })
   // WebSocket gateway needs a live server to attach to.
-  if (server && typeof server.on === 'function') {
+  if (guardedPricingDev.isGuardedPricingDev()) {
+    server.on('upgrade', (_req, socket) => socket.destroy());
+  } else if (server && typeof server.on === 'function') {
     supportVoiceGateway.attach(server)
   }
   app.supportVoiceServer = server

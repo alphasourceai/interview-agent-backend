@@ -56,6 +56,7 @@ function createSupportHandoff(options = {}) {
     } finally { clearTimeout(timer); }
   }
   async function send(value, { channel, requestKey } = {}) {
+    require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
     if (!handoffEnabled(env)) return { status: 'unavailable' };
     const input = validateHandoff(value);
     if (!input || !['phone', 'dashboard'].includes(channel) || typeof requestKey !== 'string' || !requestKey || requestKey.length > 200) return { status: 'invalid_request' };

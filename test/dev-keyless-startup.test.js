@@ -24,7 +24,7 @@ test('application boots without outbound vendor keys and rubric generation is ex
       NODE_ENV: 'production', APP_ENV: 'development',
       FRONTEND_URL: 'https://interview-agent-frontend-qa.onrender.com',
       CORS_ORIGINS: 'https://interview-agent-frontend-qa.onrender.com',
-      SUPABASE_URL: 'https://example.supabase.co',
+      SUPABASE_URL: 'https://hjombgfusdgsqipimhnc.supabase.co',
       SUPABASE_SERVICE_ROLE_KEY: 'test-service-key',
       SUPABASE_ANON_KEY: 'test-anon-key'
     },

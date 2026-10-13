@@ -1,6 +1,6 @@
 'use strict'
 
-const Stripe = require('stripe')
+const Stripe = require('../clients/stripeFactory')()
 const { supabaseAdmin } = require('../clients/supabase')
 const { requireParentClient } = require('./clientBillingScope')
 const {
@@ -292,6 +292,7 @@ async function createSubscriptionCheckoutSession({
   enterpriseAgreement = null,
   now = null
 }) {
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed()
   const normalizedClientId = String(clientId || '').trim()
   const normalizedPlanTier = normalizePlanTier(planTier)
   const retailOffer = readRetailPackageOffer(packageSnapshot)

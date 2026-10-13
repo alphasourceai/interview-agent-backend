@@ -1,6 +1,6 @@
 'use strict';
 
-const Stripe = require('stripe');
+const Stripe = require('../clients/stripeFactory')();
 const {
   cachedLiveCall,
   costSummary,

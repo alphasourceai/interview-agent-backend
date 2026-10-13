@@ -1,7 +1,7 @@
 // src/clients/sendgrid.js
 const fs = require('fs')
 const path = require('path')
-const sg = require('@sendgrid/mail')
+const sg = require('./sendgridFactory')()
 
 const { TIMEOUT_PROFILES } = require('./http')
 

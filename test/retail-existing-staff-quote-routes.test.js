@@ -142,3 +142,35 @@ test('admin catalog uses existing authentication and no hosted or persistent act
   assert.deepEqual(r.body.first_role_prepay_prices,{basic:35900,pro:62900});
   assert.equal(d.writes.length,0);assert.equal(d.emails.length,0);assert.equal(d.uploads.length,0);
 }));
+
+async function guardedPreview(fn) {
+  const old=process.env.APP_ENV;process.env.APP_ENV='development';
+  try { return await gate(fn); }
+  finally { if(old==null)delete process.env.APP_ENV;else process.env.APP_ENV=old; }
+}
+test('guarded dev plain sales previews retain all12 term/payment choices with no provider/mail effects',async()=>guardedPreview(async()=>{
+  for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])for(const plan of ['basic','pro']) {
+    const d=db(),app=salesApp(d);
+    const r=await request(app).post('/sales/deals/preview').set('Idempotency-Key',`dev-preview-${months}-${payment}-${plan}`).send({...salesBody,plan_key:plan,...keys(months,payment)});
+    assert.equal(r.status,201,JSON.stringify(r.body));assert.equal(d.emails.length,0);
+    assert.equal(d.rows.sales_deal_previews.length,1);assert.equal(d.rows.public_purchase_intents?.length||0,0);
+    assert.equal(d.rows.membership_agreements?.length||0,0);
+  }
+}));
+test('guarded dev sales promo and GHL-import branches hold before native reads or provider validation',async()=>guardedPreview(async()=>{
+  for(const extra of [{promotion_code:'SYNTHETIC'},{ghl_import_id:'synthetic-binding'}]) {
+    const d=db(),app=salesApp(d);let nativeReads=0;
+    d.from=()=>{nativeReads++;throw Error('native read must not occur');};
+    const r=await request(app).post('/sales/deals/preview').set('Idempotency-Key','dev-held-preview').send({...salesBody,...keys(),...extra});
+    assert.equal(r.status,503);assert.equal(r.body.code,'GUARDED_DEV_BILLING_HOLD');
+    assert.equal(nativeReads,0);assert.equal(d.writes.length,0);assert.equal(d.uploads.length,0);assert.equal(d.emails.length,0);
+  }
+}));
+test('guarded dev authenticated admin preview HTML/PDF remains usable without agreement or email creation',async()=>guardedPreview(async()=>{
+  for(const endpoint of ['preview-html','preview-pdf','preview']) {
+    const d=db(),app=adminApp(d),body={client_id:client,client_legal_name:'Synthetic Client',primary_admin_name:'QA Buyer',admin_email:'buyer@example.invalid',membership_tier:'basic',...keys()};
+    const r=await request(app).post(`/billing/agreements/${endpoint}`).set('Authorization','Bearer synthetic').send(body);
+    assert.equal(r.status,200,JSON.stringify(r.body));assert.equal(d.emails.length,0);
+    assert.equal(d.rows.membership_agreements?.length||0,0);
+  }
+}));

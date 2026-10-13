@@ -105,6 +105,7 @@ function normalizeTelnyxAcceptedResponse(payload) {
 }
 
 function requestTelnyxMessage({ apiKey, body, timeoutMs, httpsModule = https }) {
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
   return new Promise((resolve, reject) => {
     const encoded = Buffer.from(JSON.stringify(body), 'utf8');
     let dispatched = false;
@@ -171,6 +172,7 @@ function createTelnyxSmsProvider({ env = process.env, transport = requestTelnyxM
     network: 'https',
     getCallCount: () => calls,
     async sendOtpSms(request) {
+      require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
       calls += 1;
       assertSmsProviderRequest(request);
       const config = readTelnyxConfig(env);

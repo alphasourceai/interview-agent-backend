@@ -606,6 +606,8 @@ function createSalesRouter(options = {}) {
 
   router.post('/deals/preview', async (req, res) => {
     try {
+      const devGuard = require('../../config/guardedPricingDev');
+      if (devGuard.isGuardedPricingDev() && (String(req.body?.promotion_code || '').trim() || String(req.body?.ghl_import_id || '').trim())) throw devGuard.hold();
       normalizeIdempotencyKey(req)
       const draft = validateSalesDraft(await resolveSalesDraft(req, req.body))
       const promotion = draft.promotion_code ? await validatePromotion(draft.promotion_code, draft) : null

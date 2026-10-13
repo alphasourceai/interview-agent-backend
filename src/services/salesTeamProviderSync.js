@@ -8,6 +8,7 @@ function clean(value, max = 500) {
 }
 
 async function jsonRequest(url, options, fetchImpl) {
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
   const response = await fetchImpl(url, { ...options, redirect: 'error', signal: AbortSignal.timeout(8000) });
   let body = {};
   try { body = await response.json(); } catch { body = {}; }
@@ -236,6 +237,7 @@ async function recordProviderResults(db, memberId, results) {
 }
 
 async function syncSalesTeamProviders({ db, record, env = process.env, fetchImpl = global.fetch }) {
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
   const results = await checkSalesTeamProviders({ record, env, fetchImpl });
   await recordProviderResults(db, record.member.id, results);
   return results;

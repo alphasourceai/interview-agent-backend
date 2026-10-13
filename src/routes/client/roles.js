@@ -20,7 +20,7 @@ const { requireAuth, withClientScope } = require('../../middleware/auth');
 const { createRoleJdReplacementRouter } = require('./roleJdReplacement');
 
 // SendGrid setup for rubric change notification
-const sg = require('@sendgrid/mail');
+const sg = require('../../clients/sendgridFactory')();
 
 const SENDGRID_KEY = process.env.SENDGRID_API_KEY || '';
 const RUBRIC_CHANGE_TO = process.env.RUBRIC_CHANGE_TO || 'info@alphasourceai.com';

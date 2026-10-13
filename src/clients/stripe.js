@@ -1,6 +1,6 @@
 'use strict';
 
-const Stripe = require('stripe');
+const Stripe = require('./stripeFactory')();
 
 if (!process.env.STRIPE_SECRET_KEY) {
   console.error('Missing STRIPE_SECRET_KEY environment variable.');

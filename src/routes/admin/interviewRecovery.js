@@ -2,7 +2,7 @@
 
 const crypto = require('crypto');
 const express = require('express');
-const sg = require('@sendgrid/mail');
+const sg = require('../../clients/sendgridFactory')();
 const { supabaseAdmin } = require('../../clients/supabase');
 const {
   authorizeReplacement,
