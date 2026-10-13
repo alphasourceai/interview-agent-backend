@@ -61,13 +61,29 @@ test('installment total is a commitment total, not the initial amount due',()=>{
 
 test('mismatched supplied new selections and malformed snapshots cannot render a relabeled old agreement',()=>{
   const s=pkg('basic',3,'prepaid');
-  for(const change of [{membership_tier:'pro'},{commitment_months:6},{payment_option:'monthly_installments'},
+  for(const change of [{membership_tier:'pro'},{commitment_months:6},{commitmentMonths:12},
+    {payment_option:'monthly_installments'},{paymentOption:'monthly_installments'},
+    {pricingVersion:'different'},{offer_version:'different'},{offerVersion:'different'},
     {pricing_version:'different'},{auto_renew:false},{auto_renew:null},{billing_option:'annual'},{platform_fee:'0.01'},
     {per_role_fee:'0.01'},{included_interviews_per_role:999},{max_interview_minutes:99},{scored_question_count:7},
-    {billing_model:'usage'},{rollover_days:90},{first_role_prepay:{selected:true,amount_cents:1}}])
+    {billing_model:'usage'},{rollover_days:90},{first_role_prepay:{selected:true,amount_cents:1}},
+    {first_role_prepay:{discount_percent:99}},{firstRolePrepay:{discountPercent:0}}])
     assert.throws(()=>buildMembershipAgreementHtml({...payload,billing_option:'prepaid',...change},{...options,packageSnapshot:s}),/retail_agreement_terms_mismatch/);
   const bad=structuredClone(s);bad.membership_terms.commitment_months=9;
   assert.throws(()=>buildMembershipAgreementHtml(payload,{...options,packageSnapshot:bad}),/invalid_retail_package_terms/);
+});
+
+test('matching camelCase selections and role-credit compatibility fields round-trip without a displayed percentage',()=>{
+  const s=pkg('basic',3,'prepaid',true);
+  const input={membershipTier:'essential',billingOption:'prepaid',commitmentMonths:3,paymentOption:'prepaid',
+    pricingVersion:OFFER_VERSION,offerVersion:OFFER_VERSION,termStartBasis:'first_payment_success',autoRenew:true,
+    platformFee:1200,perRoleFee:399,additionalInterviewFee:25,includedInterviewsPerRole:20,maxInterviewMinutes:10,
+    scoredQuestionCount:5,billingModel:'fixed',rolloverDays:null,
+    firstRolePrepay:{selected:true,normalRoleFeeCents:39900,amountCents:35900,discountPercent:10,
+      nonRefundable:true,expires:false,creditType:'first_role_prepay'}};
+  const {html,normalized}=buildMembershipAgreementHtml(input,{...options,packageSnapshot:s});
+  assert.equal(normalized.commitment_months,3);assert.equal(normalized.first_role_prepay.discount_percent,10);
+  assert.match(html,/\$359\.00/);assert.doesNotMatch(plain(html),/10%|10 percent/);
 });
 
 test('raw payload cannot select the new legal variant, and party data stays HTML escaped',()=>{

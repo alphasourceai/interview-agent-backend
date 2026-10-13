@@ -239,9 +239,9 @@ function normalizeRetailAgreementInput(input, offer, normalized) {
     const tier=normalizeText(value).toLowerCase();return tier==='essential'?'basic':tier;
   });
   supplied(['billing_option','billingOption'],cadence);
-  supplied(['commitment_months'],offer.commitment_months,number);
-  supplied(['payment_option'],offer.payment_option);
-  supplied(['pricing_version'],offer.offer_version);
+  supplied(['commitment_months','commitmentMonths'],offer.commitment_months,number);
+  supplied(['payment_option','paymentOption'],offer.payment_option);
+  supplied(['pricing_version','pricingVersion','offer_version','offerVersion'],offer.offer_version);
   supplied(['term_start_basis','termStartBasis'],'successful_payment',value=>value==='first_payment_success'?'successful_payment':value);
   supplied(['auto_renew','autoRenew'],true,value=>typeof value==='boolean'?value:
     (typeof value==='string' && ['1','true','yes','y'].includes(value.trim().toLowerCase())));
@@ -263,6 +263,9 @@ function normalizeRetailAgreementInput(input, offer, normalized) {
     check(['normal_role_fee_cents','normalRoleFeeCents'],offer.per_role_fee_cents,number);
     check(['discounted_credit_amount_cents','discountedCreditAmountCents','amount_cents','amountCents'],offer.first_role_prepay.amount_cents,number);
     check(['credit_type','creditType'],'first_role_prepay');check(['non_refundable','nonRefundable'],true);check(['expires'],false);
+    // Existing role-credit storage uses this compatibility constant. It is not
+    // displayed as a historical discount calculation or used to price a role.
+    check(['discount_percent','discountPercent'],10,number);
   }
   return {...normalized,membership_tier:offer.plan_key,billing_option:cadence,commitment_months:offer.commitment_months,
     payment_option:offer.payment_option,pricing_version:offer.offer_version,platform_fee:String(offer.platform_payment_cents/100),
