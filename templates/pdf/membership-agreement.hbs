@@ -497,7 +497,6 @@
     <h2 class="ack-title">Membership Acknowledgments</h2>
     <ul class="ack-list">
       {{#if retail_terms}}
-      <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges an initial term of {{retail_terms.commitment_months}} calendar months, starting with successful initial payment.</li>
       {{#if retail_terms.is_installments}}
       <li class="ack-item"><span class="box">{{ack_checkbox_symbol}}</span>Client acknowledges {{retail_terms.installment_count}} monthly platform installments of {{retail_terms.platform_payment}}, totaling {{retail_terms.commitment_total}}. This is not a month-to-month term; remaining installment payments are still owed if renewal is turned off.</li>
       {{else}}
@@ -558,7 +557,7 @@
     {{#if retail_terms.is_installments}}
     <p class="section-paragraph">Turning off renewal does not terminate or reduce Client's remaining installment payments for the then-current term. Access continues through that term while payments remain current. No additional cancellation fee applies.</p>
     {{else}}
-    <p class="section-paragraph">Turning off renewal leaves Client's Membership available for the full prepaid term. No ordinary refund or partial-term credit is provided for early cancellation, non-use, or reduced usage.</p>
+    <p class="section-paragraph">Client may cancel at any time before renewal. For a prepaid Membership, cancellation means turning off automatic renewal, not ending the current term: access remains available for the full {{retail_terms.commitment_months}}-month prepaid term. No refund or partial-term credit is provided for early cancellation, non-use, or reduced usage, except under the applicable refund policy, as expressly provided in this Agreement, or as required by law.</p>
     {{/if}}
     <p class="section-paragraph">Fees for the then-current term are non-refundable except as expressly provided in this Agreement or required by law. Any other exception requires alphaSource's written approval.</p>
     {{else}}

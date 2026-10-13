@@ -22,6 +22,12 @@ test('public catalog prepaid only and staff catalog both payment choices from sa
   assert.equal(retailQuoteCatalog('sales',on).offers.length,12);
   assert.equal(retailQuoteCatalog('admin',on).pricing_version,OFFER_VERSION);
   assert.ok(retailQuoteCatalog('public',on).offers.every(o=>o.payment_option==='prepaid'));
+  const publicCatalog=retailQuoteCatalog('public',on);
+  const {RETAIL_PRICES_CENTS}=require('../src/services/membershipOffers');
+  for(const plan of ['basic','pro'])for(const months of [3,6,12])
+    assert.equal(publicCatalog.monthly_payment_references[plan][months],RETAIL_PRICES_CENTS[plan][months].monthly_installments);
+  assert.equal(publicCatalog.offers.some(o=>o.payment_option==='monthly_installments'),false);
+  assert.equal(Object.hasOwn(retailQuoteCatalog('sales',on),'monthly_payment_references'),false);
 });
 test('enabled selection refuses missing stale forbidden or conflicting keys',()=>{
   const bad=[{},keys(4),{...keys(),offer_version:'old'},keys(3,'monthly_installments'),

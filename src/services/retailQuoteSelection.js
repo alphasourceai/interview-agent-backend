@@ -1,7 +1,7 @@
 'use strict';
 
 // Selection adapter for the current quote paths, not a second checkout system.
-const { OFFER_VERSION, listRetailOffers, buildRetailOffer } = require('./membershipOffers');
+const { OFFER_VERSION, listRetailOffers, buildRetailOffer, RETAIL_PRICES_CENTS } = require('./membershipOffers');
 const { buildRetailPackageSnapshot, readRetailPackageOffer } = require('./membershipPackageCompatibility');
 const RETAIL_TEMPLATE = 'membership_agreement_retail_terms_v2';
 const enabled = (env = process.env) => env.MEMBERSHIP_PRICING_TERMS_ENABLED === 'true';
@@ -71,6 +71,11 @@ function validateRetailIntentSource(intent) {
 function retailQuoteCatalog(channel, env = process.env) {
   if (!enabled(env)) return null;
   return { pricing_version: OFFER_VERSION, offers: listRetailOffers({ channel }),
+    // Display-only comparison, not an authorized public installment offer.
+    // Keep checkout authority in the six public PREPAID selection keys.
+    ...(channel === 'public' ? { monthly_payment_references: Object.fromEntries(
+      ['basic','pro'].map(plan => [plan, Object.fromEntries([3,6,12].map(months =>
+        [months, RETAIL_PRICES_CENTS[plan][months].monthly_installments]))])) } : {}),
     first_role_prepay_prices: Object.fromEntries(['basic','pro'].map(planKey => [planKey,
       buildRetailOffer({planKey,channel,commitmentMonths:3,paymentOption:'prepaid',offerVersion:OFFER_VERSION,
         firstRolePrepaySelected:true}).first_role_prepay.amount_cents])) };
