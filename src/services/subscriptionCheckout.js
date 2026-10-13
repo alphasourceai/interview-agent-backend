@@ -245,7 +245,7 @@ async function resolveStripeCustomerId({
         || (customer.invoice_credit_balance != null && (strictRetailCredits ? !zeroCurrencies(customer.invoice_credit_balance)
           : Object.values(customer.invoice_credit_balance).some(value => value !== 0)))
         || (customer.cash_balance != null && (strictRetailCredits ? customer.cash_balance.object !== 'cash_balance'
-          || customer.cash_balance.available !== null && !zeroCurrencies(customer.cash_balance.available)
+          || !zeroCurrencies(customer.cash_balance.available)
           : typeof customer.cash_balance !== 'object' || Object.values(customer.cash_balance.available || {}).some(value => value !== 0))))) {
         throw makeError(409, 'retail_customer_adjustment_denied', strictRetailCredits
           ? 'This checkout requires review of existing customer discounts or credits.'

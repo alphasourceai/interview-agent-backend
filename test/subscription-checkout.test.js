@@ -512,6 +512,28 @@ test('API2023 discount expansion accepts a real promotion object, rejects null/d
     await assert.rejects(fn(retailArgs(retailSnapshot('basic',3,'monthly_installments'),'promo_validated')),
       {code:'retail_checkout_session_promotion_mismatch'});assert.equal(dark.sessions.length,1);}
 });
+test('documented nullable discount customer and shipping amounts pass, live owner binds and foreign/deleted owner refuses',async()=>{
+  for(const customer of [null,{object:'customer',id:'cus_existing'}]){
+    const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,
+      sessionMutation:s=>{s.total_details.amount_shipping=null;s.total_details.breakdown.discounts[0].discount.customer=customer;return s;}});
+    await create(retailArgs(retailSnapshot('basic',3,'monthly_installments'),'promo_validated'));assert.equal(calls.sessions.length,1);
+  }
+  for(const customer of ['cus_OTHER',{object:'customer',id:'cus_existing',deleted:true},{object:'other',id:'cus_existing'},undefined]){
+    const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,
+      sessionMutation:s=>{s.total_details.breakdown.discounts[0].discount.customer=customer;return s;}});
+    await assert.rejects(create(retailArgs(retailSnapshot('basic',3,'monthly_installments'),'promo_validated')),
+      {code:'retail_checkout_session_promotion_mismatch'});assert.equal(calls.sessions.length,1);
+  }
+  for(const payment of ['prepaid','monthly_installments']) {
+    const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,
+      sessionMutation:s=>{s.total_details.amount_shipping=null;return s;}});
+    await create(retailArgs(retailSnapshot('basic',3,payment)));assert.equal(calls.sessions.length,1);
+    const dark=retailCalls(),{createSubscriptionCheckoutSession:fn}=loadCheckout({stripeCalls:dark,
+      sessionMutation:s=>{s.total_details.amount_shipping=1;s.amount_total++;return s;}});
+    await assert.rejects(fn(retailArgs(retailSnapshot('basic',3,payment))),{code:'retail_checkout_session_prices_mismatch'});
+    assert.equal(dark.sessions.length,1);
+  }
+});
 test('missing expanded no-promo breakdown or truncated/incomplete priced lines withhold the URL',async()=>{
   for(const kind of ['breakdown','lineMoney','listMissing','truncated']){
     const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,
@@ -543,6 +565,7 @@ test('new monthly zero/unknown/restricted promotion refuses before every DB and 
 test('new installment customer credits/unknown shapes refuse before all writers without clearing anything',async()=>{
   for(const customerOverride of [{balance:-1},{balance:1},{discount:{id:'di_OTHER'}},{invoice_credit_balance:[]},
     {invoice_credit_balance:{usd:1}},{invoice_credit_balance:{usd:'0'}},{cash_balance:{}},{cash_balance:{object:'cash_balance'}},
+    {cash_balance:{object:'cash_balance',available:null}},
     {cash_balance:{object:'cash_balance',available:{usd:1}}}]){
     const db=makeDb(),calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({db,stripeCalls:calls,customerOverride});
     await assert.rejects(create(retailArgs(retailSnapshot('basic',6,'monthly_installments'))),{code:'retail_customer_adjustment_denied'});

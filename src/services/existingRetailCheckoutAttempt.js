@@ -139,7 +139,8 @@ async function readOpenRetailSession({ stripe, sessionId, attempt, offer, promot
     && session.amount_subtotal === offer.initial_payment_cents && integer(session.amount_total) && session.amount_total > 0,
   'retail_checkout_session_prices_mismatch');
   if (offer.payment_option === 'prepaid') check(session.allow_promotion_codes === false
-    && session.total_details?.amount_discount === 0 && session.total_details?.amount_shipping === 0
+    && session.total_details?.amount_discount === 0
+    && (session.total_details?.amount_shipping === 0 || session.total_details?.amount_shipping === null)
     && integer(session.total_details?.amount_tax)
     && session.amount_total === offer.initial_payment_cents + session.total_details.amount_tax,
   'retail_checkout_session_prices_mismatch');
@@ -155,7 +156,8 @@ async function readOpenRetailSession({ stripe, sessionId, attempt, offer, promot
     && data.reduce((sum,line) => sum + line.amount_total,0) === session.amount_total,
   'retail_checkout_session_prices_mismatch');
   check((session.allow_promotion_codes === false || session.allow_promotion_codes === null)
-    && integer(details?.amount_discount) && integer(details?.amount_tax) && details.amount_shipping === 0
+    && integer(details?.amount_discount) && integer(details?.amount_tax)
+    && (details.amount_shipping === 0 || details.amount_shipping === null)
     && details.amount_discount < offer.initial_payment_cents
     && session.amount_total === offer.initial_payment_cents - details.amount_discount + details.amount_tax,
   'retail_checkout_session_prices_mismatch');
@@ -175,7 +177,8 @@ async function readOpenRetailSession({ stripe, sessionId, attempt, offer, promot
       && id(discount.promotion_code) === expectedPromo
       && (typeof discount.promotion_code === 'string'
         || discount.promotion_code?.object === 'promotion_code' && discount.promotion_code.deleted !== true)
-      && id(discount.customer) === attempt.source.customer_id
+      && (discount.customer === null || id(discount.customer) === attempt.source.customer_id
+        && (typeof discount.customer === 'string' || discount.customer?.object === 'customer' && discount.customer.deleted !== true))
       && coupon?.object === 'coupon' && coupon.deleted !== true && coupon.id === promotion.couponId && coupon.livemode === session.livemode
       && Object.entries(promotion.coupon).every(([key,value]) => isDeepStrictEqual(coupon[key],value)),
     'retail_checkout_session_promotion_mismatch');
