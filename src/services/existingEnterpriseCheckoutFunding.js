@@ -9,6 +9,7 @@ const {enterprisePoolCheckoutQuote}=require('./enterprisePoolSnapshot');
 const {validateEnterpriseSettings}=require('./enterpriseSettings');
 const {proveEnterprisePoolPayment,snapshotStripeSdkData}=require('./enterprisePoolPaymentProof');
 const {readVerifiedEnterpriseBillingReceipt}=require('./existingEnterpriseBillingReceipt');
+const {verifyEnterprisePaymentRows}=require('./existingEnterprisePaymentRows');
 const id=v=>typeof v==='string'?v:v?.id;
 const uuid=v=>typeof v==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
 const nativeId=(v,p)=>typeof v==='string'&&new RegExp(`^${p}_[A-Za-z0-9_]+$`).test(v);
@@ -36,7 +37,8 @@ async function nativeScope(db,agreementId){
   &&s.version==='enterprise_existing_pending_v1'&&typeof s.embedded==='boolean'
   &&uuid(s.pool_id)&&a.enterprise_checkout_pool_id===s.pool_id&&a.id===agreementId&&uuid(a.client_id)
   &&a.status==='signed'&&a.is_current===true&&!a.superseded_at&&!a.superseded_by_agreement_id
-  &&a.checkout_status==='pending_payment'&&a.checkout_paid_at==null&&a.checkout_attempt_source==null&&a.checkout_embedded==null
+  &&((a.checkout_status==='pending_payment'&&a.checkout_paid_at==null)||a.checkout_status==='paid')
+  &&a.checkout_attempt_source==null&&a.checkout_embedded==null
   &&a.membership_tier==='enterprise'&&a.signer_accepted===true&&nativeId(a.checkout_session_id,'cs')
   &&(s.replacement_id===null||nativeId(s.replacement_id,'sub'))&&a.replaces_stripe_subscription_id===s.replacement_id
   &&(a.replacement_policy??null)===(s.replacement_id?'immediate_cancel':null));
@@ -77,8 +79,13 @@ async function nativeScope(db,agreementId){
   &&expiry>b,'enterprise_funding_clock_mismatch');
  check(exactKeys(s.config,['public_backend_base','public_sign_base'])&&Object.values(s.config).every(x=>
   typeof x==='string'&&x.length<=2048&&/^https:\/\/[A-Za-z0-9.-]+(:[0-9]{1,5})?(\/[A-Za-z0-9._~/-]+)?$/.test(x)));
- check(pool.id===s.pool_id&&pool.agreement_id===a.id&&pool.client_id===client.id&&pool.status==='pending'
-  &&pool.paid_at==null&&pool.stripe_payment_intent_id==null&&pool.stripe_checkout_session_id===a.checkout_session_id
+ if(a.checkout_status==='paid'){
+  check(billingReceipt!==null,'enterprise_funding_paid_receipt_missing');
+  verifyEnterprisePaymentRows({agreement:a,pool,billingReceipt});
+ }
+ check(pool.id===s.pool_id&&pool.agreement_id===a.id&&pool.client_id===client.id
+  &&(a.checkout_status==='paid'||pool.status==='pending'&&pool.paid_at==null&&pool.stripe_payment_intent_id==null)
+  &&pool.stripe_checkout_session_id===a.checkout_session_id
   &&isDeepStrictEqual(pool.offer_snapshot,v.pool_offer_snapshot)&&pool.offer_digest===v.pool_offer_digest
   &&pool.quantity_purchased===quote.quantity&&pool.unit_price_cents===quote.unit_price_cents
   &&pool.discount_pct===quote.discount_pct&&pool.total_cents===quote.total_cents,'enterprise_funding_pool_mismatch');

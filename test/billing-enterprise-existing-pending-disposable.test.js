@@ -3,7 +3,8 @@
 const {test,before,after}=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),cp=require('node:child_process');
 const {prepareEnterprisePoolTerms}=require('../src/services/enterprisePoolSnapshot');
-const readbackEnabled=process.env.ENTERPRISE_READBACK_DISPOSABLE==='true',readbackOpts={skip:!readbackEnabled};
+const paymentEnabled=process.env.ENTERPRISE_PAYMENT_DISPOSABLE==='true',paymentOpts={skip:!paymentEnabled};
+const readbackEnabled=process.env.ENTERPRISE_READBACK_DISPOSABLE==='true'||paymentEnabled,readbackOpts={skip:!readbackEnabled};
 const billingEnabled=process.env.ENTERPRISE_BILLING_DISPOSABLE==='true'||readbackEnabled,billingOpts={skip:!billingEnabled};
 const fundingEnabled=process.env.ENTERPRISE_FUNDING_DISPOSABLE==='true'||billingEnabled;
 const traceEnabled=process.env.ENTERPRISE_TRACE_DISPOSABLE==='true'||fundingEnabled;
@@ -151,6 +152,18 @@ before(()=>{if(!enabled)return;assert.match(socket,/^\/private\/tmp\/alphascreen
       "drop index clients_stripe_subscription_id_uniq"])
       denied('begin;'+change+';'+body,/enterprise_billing_readback_.*drift/);
      apply(file);denied(body,/enterprise_billing_readback_schema_drift/);
+     if(paymentEnabled){
+      const next='20261013153013_enterprise_existing_paid_pair.sql',body=fs.readFileSync(path.join(root,next),'utf8');
+      for(const change of ["alter table membership_agreements disable trigger enterprise_existing_pending_agreement_pair",
+       "alter table client_interview_pools disable trigger enterprise_existing_pending_pool_guard",
+       "drop index enterprise_funding_one_pi;create unique index enterprise_funding_one_pi on membership_agreements(id)",
+       "create or replace function read_enterprise_existing_billing(p_agreement uuid) returns jsonb language plpgsql security invoker set search_path=pg_catalog set lock_timeout='10s' as $$begin return '{}'::jsonb;end$$",
+       "revoke update on billing_customers from service_role",
+       "drop index clients_stripe_subscription_id_uniq","drop index enterprise_pool_one_initial_agreement",
+       "alter table membership_agreements disable trigger enterprise_existing_funding_guard"])
+       denied('begin;'+change+';'+body,/enterprise_payment_.*drift/);
+      apply(next);denied(body,/enterprise_payment_.*drift/);
+     }
     }
    }
   }
@@ -184,6 +197,95 @@ function billingCall(n,{subscription=billingSub(n),funding=n.funding,source=n.r.
  return 'select apply_enterprise_existing_billing('+[n.s.id,n.s.client,source,prices,funding,subscription].map(lit).join(',')+');';
 }
 async function readyBilling(options){const n=await fundingSource(options);n.funding=JSON.parse(sql('set role service_role;'+receiptCall(n)));return n;}
+async function readyPayment(options){const n=await readyBilling(options);n.billing=JSON.parse(sql('set role service_role;'+billingCall(n)));return n;}
+function paymentCall(n,w=n.billing){return 'select complete_enterprise_existing_payment('+[n.s.id,n.s.client,w].map(lit).join(',')+');';}
+function paymentUpdates(n){return `update membership_agreements set checkout_status='paid',checkout_paid_at=${lit(n.proof.payment_success_at)} where id=${lit(n.s.id)};
+ update client_interview_pools set status='paid',paid_at=${lit(n.proof.payment_success_at)},stripe_payment_intent_id=${lit(n.proof.payment_intent_id)} where id=${lit(n.proof.pool_id)};`;}
+test('native existing payment records paired original A/PI once and preserves mutable admin billing on replay',paymentOpts,async()=>{
+ const n=await readyPayment(),beforeA=row(n.s),beforeP=pool(n.s),client=clientRow(n.s),plan=planRow(n.s);
+ const w=JSON.parse(sql('set role service_role;'+paymentCall(n)));assert.deepEqual(w,n.billing);
+ const a=row(n.s),p=pool(n.s);assert.equal(a.checkout_status,'paid');assert.equal(p.status,'paid');
+ assert.equal(Date.parse(a.checkout_paid_at),Date.parse(n.proof.payment_success_at));assert.equal(a.checkout_paid_at,p.paid_at);
+ assert.equal(p.stripe_payment_intent_id,n.proof.payment_intent_id);
+ delete a.checkout_status;delete a.checkout_paid_at;delete beforeA.checkout_status;delete beforeA.checkout_paid_at;assert.deepEqual(a,beforeA);
+ delete p.status;delete p.paid_at;delete p.stripe_payment_intent_id;delete beforeP.status;delete beforeP.paid_at;delete beforeP.stripe_payment_intent_id;assert.deepEqual(p,beforeP);
+ assert.deepEqual(clientRow(n.s),client);assert.deepEqual(planRow(n.s),plan);
+ sql(`update clients set billing_status='inactive',subscription_status='past_due',auto_renew=false where id=${lit(n.s.client)};
+  update client_plan_settings set billing_model='fixed',platform_fee=12.34,rollover_days=77 where client_id=${lit(n.s.client)}`);
+ const admin=clientRow(n.s),settings=planRow(n.s),paidA=row(n.s),paidP=pool(n.s);
+ assert.deepEqual(JSON.parse(sql('set role service_role;'+paymentCall(n))),w);
+ assert.deepEqual(row(n.s),paidA);assert.deepEqual(pool(n.s),paidP);assert.deepEqual(clientRow(n.s),admin);assert.deepEqual(planRow(n.s),settings);
+});
+test('native one-sided agreement/pool financial writes cannot commit; wrong A/PI and pool-first held',paymentOpts,async()=>{
+ const n=await readyPayment(),a=row(n.s),p=pool(n.s),statements=paymentUpdates(n).split(';').filter(x=>x.trim());
+ denied('set role service_role;'+statements[0]+';',/enterprise_payment_pair_denied/);
+ denied('set role service_role;'+statements[1]+';',/enterprise_payment_pool_denied/);
+ denied('begin;set role service_role;'+paymentUpdates(n).replace(n.proof.payment_success_at,'2026-01-01T00:00:00.000Z')+'commit;',/enterprise_payment_agreement_denied/);
+ denied('begin;set role service_role;'+paymentUpdates(n).replace(n.proof.payment_intent_id,'pi_WRONG')+'commit;',/enterprise_payment_pool_denied/);
+ assert.deepEqual(row(n.s),a);assert.deepEqual(pool(n.s),p);
+});
+test('native deferred payment checks detect later owner/customer/sub/source drift within the same transaction',paymentOpts,async()=>{
+ const n=await readyPayment(),other=source(),a=row(n.s),p=pool(n.s);
+ for(const mutate of [
+  `update clients set stripe_customer_id='cus_OTHER' where id=${lit(n.s.client)};`,
+  `update clients set stripe_subscription_id='sub_OTHER' where id=${lit(n.s.client)};`,
+  `update billing_customers set client_id=${lit(other.client)} where stripe_customer_id=${lit(n.s.customer)};`,
+  `update membership_agreements set is_current=false where id=${lit(n.s.id)};`]){
+  denied('begin;set role service_role;'+paymentUpdates(n)+mutate+'commit;',/enterprise_billing_|enterprise_binding_|enterprise_payment_/);
+  assert.deepEqual(row(n.s),a);assert.deepEqual(pool(n.s),p);
+ }
+});
+test('native paid tuple is immutable; later unchanged historical supersession and allocator read remain usable',paymentOpts,async()=>{
+ const n=await readyPayment();sql('set role service_role;'+paymentCall(n));const a=row(n.s),p=pool(n.s);
+ for(const change of ["checkout_status='pending_payment',checkout_paid_at=null","checkout_paid_at=checkout_paid_at+interval '1 microsecond'"])
+  denied('set role service_role;update membership_agreements set '+change+' where id='+lit(n.s.id),/enterprise_payment_immutable/);
+ for(const change of ["status='refunded'","status='pending',paid_at=null,stripe_payment_intent_id=null","stripe_payment_intent_id='pi_OTHER'","paid_at=paid_at+interval '1 microsecond'"])
+  denied('set role service_role;update client_interview_pools set '+change+' where id='+lit(n.proof.pool_id),/enterprise_payment_|ENTERPRISE_POOL_V2/);
+ assert.deepEqual(row(n.s),a);assert.deepEqual(pool(n.s),p);
+ sql(`set role service_role;update membership_agreements set status='superseded',is_current=false where id=${lit(n.s.id)};
+  update client_interview_pools set status=status where id=${lit(n.proof.pool_id)}`);
+ assert.equal(sql('set role service_role;select count(*) from client_interview_pools where client_id='+lit(n.s.client)+" and status='paid'"),'1');
+ assert.equal(pool(n.s).quantity_purchased,p.quantity_purchased);
+ denied('set role service_role;'+paymentCall(n),/enterprise_billing_source_denied/);
+});
+test('native payment concurrent identical calls return one immutable winner, late failure rolls BOTH rows back',paymentOpts,async()=>{
+ const n=await readyPayment(),a=row(n.s),p=pool(n.s);
+ denied(`begin;create function synthetic_paid_failure() returns trigger language plpgsql as $$begin raise exception 'SYNTHETIC paid rollback';end$$;
+  create trigger synthetic_paid_failure after update on client_interview_pools for each row execute function synthetic_paid_failure();
+  set role service_role;${paymentCall(n)}commit;`,/SYNTHETIC paid rollback/);
+ assert.deepEqual(row(n.s),a);assert.deepEqual(pool(n.s),p);
+ const results=await Promise.all([asyncSql('set role service_role;'+paymentCall(n)),asyncSql('set role service_role;'+paymentCall(n))]);
+ for(const r of results){assert.equal(r.code,0,r.err);assert.deepEqual(JSON.parse(r.out.trim()),n.billing);}
+ assert.equal(pool(n.s).status,'paid');assert.deepEqual(row(n.s).enterprise_billing_receipt,n.billing);
+});
+test('native payment rejects missing/foreign receipt, foreign customer/owner/Sub and browser calls, no legacy changes',paymentOpts,async()=>{
+ const n=await readyPayment(),a=row(n.s),p=pool(n.s),other=source();
+ for(const w of [null,{}, {...n.billing,applied_at:'2026-01-01T00:00:00.000000Z'}])denied('set role service_role;'+paymentCall(n,w),/receipt_denied/);
+ for(const role of ['anon','authenticated'])denied('set role '+role+';'+paymentCall(n),/permission denied/);
+ for(const mutate of [
+  `update clients set stripe_customer_id='cus_OTHER' where id=${lit(n.s.client)};`,
+  `update clients set stripe_subscription_id='sub_OTHER' where id=${lit(n.s.client)};`,
+  `update billing_customers set client_id=${lit(other.client)} where stripe_customer_id=${lit(n.s.customer)};`])
+  denied('begin;'+mutate+'set role service_role;'+paymentCall(n)+'commit;',/enterprise_billing_|enterprise_payment_/);
+ assert.deepEqual(row(n.s),a);assert.deepEqual(pool(n.s),p);assert.equal(acl(),permissions);
+ assert.equal(sql("select prosecdef from pg_proc where proname='complete_enterprise_existing_payment'"),'f');
+ assert.equal(sql("select proconfig::text from pg_proc where proname='complete_enterprise_existing_payment'"),'{search_path=pg_catalog,lock_timeout=10s}');
+});
+test('native global pool PI uniqueness prevents reuse by a legacy unmarked pool, no cleanup/backfill',paymentOpts,async()=>{
+ const n=await readyPayment();sql('set role service_role;'+paymentCall(n));
+ denied(`set role service_role;insert into client_interview_pools(client_id,quantity_purchased,unit_price_cents,total_cents,status,stripe_payment_intent_id,paid_at)
+  values(${lit(legacy.client)},1,100,100,'paid',${lit(n.proof.payment_intent_id)},clock_timestamp())`,/enterprise_pool_one_payment_intent/);
+ const legacyPool=JSON.parse(sql('select to_jsonb(p) from client_interview_pools p where id='+lit(oldPool)));
+ assert.equal(legacyPool.agreement_id,null);
+ assert.deepEqual(Object.fromEntries(Object.keys(oldPoolRow).map(k=>[k,legacyPool[k]])),oldPoolRow);
+});
+test('native preexisting legacy pool PI conflict rolls paid agreement/pool back without undoing saved billing',paymentOpts,async()=>{
+ const n=await readyPayment(),a=row(n.s),p=pool(n.s),c=clientRow(n.s),plan=planRow(n.s);
+ sql(`set role service_role;insert into client_interview_pools(client_id,quantity_purchased,unit_price_cents,total_cents,status,stripe_payment_intent_id,paid_at)
+  values(${lit(legacy.client)},1,100,100,'paid',${lit(n.proof.payment_intent_id)},clock_timestamp())`);
+ denied('set role service_role;'+paymentCall(n),/enterprise_pool_one_payment_intent/);
+ assert.deepEqual(row(n.s),a);assert.deepEqual(pool(n.s),p);assert.deepEqual(clientRow(n.s),c);assert.deepEqual(planRow(n.s),plan);
+});
 const clientRow=s=>JSON.parse(sql("select to_jsonb(c) from clients c where id="+lit(s.client)));
 const planRow=s=>JSON.parse(sql("select to_jsonb(p) from client_plan_settings p where client_id="+lit(s.client))||'null');
 test('native billing applies existing client/settings once, keeps signed custom dates, no paid pool/agreement/Auth',billingOpts,async()=>{
@@ -303,8 +405,8 @@ test('native billing browser/stamp/foreign funding/immutable receipt/source chec
  const w=JSON.parse(sql('set role service_role;'+billingCall(n)));
  for(const expression of ['null',"jsonb_set(enterprise_billing_receipt,'{applied_at}','null')","jsonb_set(enterprise_billing_receipt,'{client_initial,auto_renew}','false')"])
   denied("set role service_role;update membership_agreements set enterprise_billing_receipt="+expression+" where id="+lit(n.s.id),/immutable/);
- denied("set role service_role;update membership_agreements set checkout_status='paid',checkout_paid_at=clock_timestamp() where id="+lit(n.s.id),/pending_only/);
- denied("set role service_role;update client_interview_pools set status='paid',paid_at=clock_timestamp() where id="+lit(n.proof.pool_id),/pending_only|paid.*hold/);
+ denied("set role service_role;update membership_agreements set checkout_status='paid',checkout_paid_at=clock_timestamp() where id="+lit(n.s.id),paymentEnabled?/enterprise_payment_agreement_denied/:/pending_only/);
+ denied("set role service_role;update client_interview_pools set status='paid',paid_at=clock_timestamp() where id="+lit(n.proof.pool_id),paymentEnabled?/enterprise_payment_pool_denied/:/pending_only|paid.*hold/);
  assert.deepEqual(row(n.s).enterprise_billing_receipt,w);
  sql("set role service_role;update membership_agreements set status='voided',is_current=false where id="+lit(n.s.id));
  denied('set role service_role;'+billingCall(n),/source_denied/);
@@ -448,7 +550,7 @@ test('native receipt browser/RLS denied, invoker locks bounded and all original 
  denied(receiptCall(n),/server_only/);assert.equal(sql("select proconfig::text from pg_proc where proname='record_enterprise_existing_funding'"),'{search_path=pg_catalog,lock_timeout=10s}');
  assert.equal(sql("select count(*) from pg_proc where proname like 'enterprise_existing_funding_%' and prosecdef"),'0');
  sql('set role service_role;'+receiptCall(n));const a=row(n.s),p=pool(n.s);
- denied(`set role service_role;update membership_agreements set checkout_status='paid',checkout_paid_at=clock_timestamp() where id='${n.s.id}'`,/enterprise_binding_pending_only/);
+ denied(`set role service_role;update membership_agreements set checkout_status='paid',checkout_paid_at=clock_timestamp() where id='${n.s.id}'`,paymentEnabled?/enterprise_payment_agreement_denied/:/enterprise_binding_pending_only/);
  denied(`set role service_role;update client_interview_pools set status='paid',paid_at=clock_timestamp() where id='${p.id}'`,/enterprise_/);
  assert.deepEqual(row(n.s),a);assert.deepEqual(pool(n.s),p);assert.equal(acl(),permissions);
 });
@@ -671,7 +773,7 @@ class NativeQuery{
 }
 const nativeDb={from:table=>new NativeQuery(table),async rpc(name,args){
  assert.ok(['prepare_enterprise_existing_checkout','pin_enterprise_existing_checkout_prices','pin_enterprise_existing_checkout_session',
-  'record_enterprise_existing_funding','read_enterprise_existing_billing','apply_enterprise_existing_billing'].includes(name));
+  'record_enterprise_existing_funding','read_enterprise_existing_billing','apply_enterprise_existing_billing','complete_enterprise_existing_payment'].includes(name));
  const r=run(`set role service_role;select public.${name}(${Object.entries(args).map(([k,v])=>`${k} := ${lit(v)}`).join(',')});`);
  if(r.status!==0){if(fundingEnabled)console.error('SYNTHETIC native RPC failure:',r.stderr);return{data:null,error:{message:r.stderr}};}return{data:JSON.parse(r.stdout.trim()||'null'),error:null};
 }};
@@ -766,7 +868,36 @@ for(const cadence of ['monthly','annual'])for(const embedded of [true,false])tes
   assert.equal(names.filter(name=>name==='record_enterprise_existing_funding').length,fundingCalls);
   assert.deepEqual(clientRow(s),adminClient);assert.deepEqual(planRow(s),adminPlan);
   assert.equal(row(s).checkout_paid_at,null);assert.equal(row(s).checkout_status,'pending_payment');assert.deepEqual(pool(s),p);
-  paid.charge.amount_refunded=1;await assert.rejects(applyExistingEnterpriseBilling(paymentArgs));
+  if(paymentEnabled){
+   const {completeExistingEnterprisePayment}=require('../src/services/existingEnterprisePaymentCompletion');
+   const completionBridge={from:table=>nativeDb.from(table),async rpc(name,params){names.push(name);const response=await nativeDb.rpc(name,params);
+    if(name==='complete_enterprise_existing_payment'&&!completionBridge.lost){completionBridge.lost=true;return{data:null,error:{message:'SYNTHETIC lost completion ACK AFTER native commit'}};}
+    return response;
+   }};
+   const completionArgs={...paymentArgs,db:completionBridge};
+   paid.charge.amount_refunded=1;
+   await assert.rejects(completeExistingEnterprisePayment(completionArgs),{status:503});
+   assert.equal(names.includes('complete_enterprise_existing_payment'),false);
+   assert.equal(row(s).checkout_paid_at,null);assert.equal(pool(s).status,'pending');
+   paid.charge.amount_refunded=0;
+   await assert.rejects(completeExistingEnterprisePayment(completionArgs),{status:503,code:'enterprise_payment_ack_unknown'});
+   const completedA=row(s),completedP=pool(s);assert.equal(completedA.checkout_status,'paid');assert.equal(completedP.status,'paid');
+   assert.equal(completedP.stripe_payment_intent_id,paid.paymentIntent.id);
+   assert.equal(Date.parse(completedP.paid_at),paidClock*1000);assert.equal(completedP.paid_at,completedA.checkout_paid_at);
+   const confirmed=await completeExistingEnterprisePayment({...completionArgs,eventInvoiceId:paid.invoice.id,eventSubscriptionId:paid.subscription.id});
+   assert.equal(confirmed.paid_pool_recorded,true);assert.equal(confirmed.agreement_payment_recorded,true);
+   assert.equal(confirmed.membership_activation_required,true);assert.equal(Object.hasOwn(confirmed,'credits_spendable'),false);
+   assert.equal(names.filter(name=>name==='record_enterprise_existing_funding').length,fundingCalls);
+   assert.deepEqual(row(s),completedA);assert.deepEqual(pool(s),completedP);
+   assert.deepEqual(clientRow(s),adminClient);assert.deepEqual(planRow(s),adminPlan);
+   paid.charge.amount_refunded=1;await assert.rejects(completeExistingEnterprisePayment(completionArgs));
+   assert.deepEqual(row(s),completedA);assert.deepEqual(pool(s),completedP);
+  }else{
+   const {completeExistingEnterprisePayment}=require('../src/services/existingEnterprisePaymentCompletion');
+   await assert.rejects(completeExistingEnterprisePayment(paymentArgs),{status:503,code:'enterprise_payment_ack_unknown'});
+   assert.equal(row(s).checkout_paid_at,null);assert.equal(pool(s).status,'pending');
+   paid.charge.amount_refunded=1;await assert.rejects(applyExistingEnterpriseBilling(paymentArgs));
+  }
   assert.deepEqual(clientRow(s),adminClient);assert.deepEqual(planRow(s),adminPlan);
  }
 });
