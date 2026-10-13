@@ -67,7 +67,10 @@ function calculateReceiptCommission(input = {}) {
   if (!PAYMENT_KINDS.has(input.payment_kind)) throw policyError('invalid_payment_kind');
   const paid = instant(input.payment_success_at, 'payment_success_at');
   const received = instant(input.funds_received_at, 'funds_received_at', true);
-  const v2 = input.membership_terms_protocol === 'retail_terms_v2';
+  // Both server-qualified sources share first-year arithmetic. The existing-flow
+  // source uses a real agreement qualification, never a fabricated contract ID.
+  // This calculator is not receipt authentication; native/API source checks own it.
+  const v2 = ['retail_terms_v2', 'retail_existing_terms_v2'].includes(input.membership_terms_protocol);
   if (input.membership_terms_protocol != null && !v2) throw policyError('unsupported_membership_terms_protocol');
   // These prospective fields must come from the immutable accepted contract and
   // original sale qualification, not renewal metadata or browser receipt input.
