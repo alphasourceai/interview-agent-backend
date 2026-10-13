@@ -118,6 +118,12 @@ begin
     return old;
   end if;
   if old.checkout_attempt_source is not null then
+    -- First trace linking is the service's job. Do not add a current_user
+    -- restriction to paid bookkeeping: existing service-only SECURITY DEFINER
+    -- completion RPCs execute as their owner, not as service_role.
+    if current_user<>'service_role' and old.checkout_session_id is null and new.checkout_session_id is not null then
+      raise exception 'retail_checkout_session_server_only';
+    end if;
     if (new.checkout_attempt_source,new.checkout_embedded,new.checkout_created_at,new.replaces_stripe_subscription_id)
       is distinct from(old.checkout_attempt_source,old.checkout_embedded,old.checkout_created_at,old.replaces_stripe_subscription_id)
       or jsonb_build_array(new.id,new.client_id,new.template_snapshot,new.template_version,new.membership_tier,new.billing_option,

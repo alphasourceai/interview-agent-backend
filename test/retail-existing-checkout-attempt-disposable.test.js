@@ -263,8 +263,8 @@ test('native pin rejects invented attempt, conflicting intent, changed source/cu
     const r = fixture({ source: 'sales_assisted', payment: 'monthly_installments' }), attempt = claimed(r);
     if (kind === 'intent') sql(`update public_purchase_intents set stripe_checkout_session_id='cs_OTHER' where id='${r.intent}';`);
     if (kind === 'customer') sql(`update clients set stripe_customer_id='cus_CHANGED' where id='${r.client}';`);
-    if (kind === 'paid') sql(`update membership_agreements set checkout_paid_at=clock_timestamp() where id='${r.id}';`);
-    if (kind === 'superseded') sql(`update membership_agreements set is_current=false where id='${r.id}';`);
+    if (kind === 'paid') sql(`set role service_role;update membership_agreements set checkout_paid_at=clock_timestamp() where id='${r.id}';`);
+    if (kind === 'superseded') sql(`set role service_role;update membership_agreements set is_current=false where id='${r.id}';`);
     if (kind === 'promo') sql(`update public_purchase_intents set promotion_code_id='promo_OTHER' where id='${r.intent}';`);
     const before = row(r), intentBefore = sql(`select to_jsonb(t) from public_purchase_intents t where id='${r.intent}';`);
     const candidate = kind === 'fake' ? { ...attempt, expires_at: attempt.expires_at + 1 } : attempt;
@@ -320,6 +320,28 @@ test('native early linked expiry refuses a request even if the signed agreement 
   const r=fixture({source:'public_purchase_intent'});
   sql(`update public_purchase_intents set expires_at=clock_timestamp()+interval '29 minutes' where id='${r.intent}';`);
   const before=row(r);denied(`set role service_role;${claim(r)}`,/window_closed/);assert.deepEqual(row(r),before);
+});
+test('native non-service writer cannot invent first Session; existing service-only definer completion bookkeeping remains compatible', opts, () => {
+  const r=fixture();claimed(r);
+  // Fixture-only authorization for this one row, not a product policy change.
+  sql(`create policy synthetic_claim_select on membership_agreements for select to synthetic_legacy_writer using(id='${r.id}'::uuid);
+    create policy synthetic_claim_update on membership_agreements for update to synthetic_legacy_writer using(id='${r.id}'::uuid) with check(id='${r.id}'::uuid);`);
+  sql(`set role synthetic_legacy_writer;begin;update membership_agreements set updated_at=clock_timestamp() where id='${r.id}';rollback;`);
+  const before=row(r);
+  denied(`set role synthetic_legacy_writer;update membership_agreements set checkout_session_id='cs_FORGED' where id='${r.id}';`,/session_server_only/);
+  assert.deepEqual(row(r),before);
+  const attempt=claimed(r);sql(`set role service_role;${pin(r,attempt,'cs_COMPLETION')}`);
+  // Compatibility probe only, not a fabricated actual activation/cash proof.
+  sql(`create function synthetic_existing_completion(p_id uuid) returns void language sql security definer set search_path=pg_catalog as $$
+      update public.membership_agreements set checkout_status='paid',checkout_paid_at=clock_timestamp(),
+        initial_term_start=current_date,initial_renewal_date=current_date+90 where id=p_id;
+    $$;revoke all on function synthetic_existing_completion(uuid) from public,anon,authenticated;
+    grant execute on function synthetic_existing_completion(uuid) to service_role;
+    set role service_role;select synthetic_existing_completion('${r.id}');`);
+  assert.equal(row(r).checkout_status,'paid');assert.equal(row(r).checkout_session_id,'cs_COMPLETION');
+  sql(`drop function synthetic_existing_completion(uuid);`);
+  sql(`drop policy synthetic_claim_select on membership_agreements;drop policy synthetic_claim_update on membership_agreements;`);
+  assert.equal(acl(),permissions);
 });
 test('actual existing Checkout service executes real native claim/pin and retrieves the same SDK-fake Session on retry', opts, async () => {
   // Real PostgreSQL row/RPC bridge; SDK and billing-customer lookup are injected
