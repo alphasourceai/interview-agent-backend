@@ -1212,7 +1212,8 @@ router.get('/invoices', async (_req, res) => {
     const stripeInvoiceIds = Array.from(
       new Set(invoices.map((inv) => String(inv?.stripe_invoice_id || '').trim()).filter(Boolean))
     );
-    if (stripeInvoiceIds.length) {
+    // Read-only DEV uses its native history, not a provider-backed refresh.
+    if (stripeInvoiceIds.length && !require('../../config/guardedPricingDev').isGuardedPricingDev()) {
       await syncBillingInvoicesByStripeIds(stripeInvoiceIds, { request_id, logPrefix: '[billing/invoices:list]' });
       const { data: refreshed, error: refreshErr } = await supabaseAdmin
         .from('billing_invoices')
