@@ -129,9 +129,8 @@ async function readBillingForClient({ db, clientId, asOf, invoiceLimit = 12 } = 
   const mine = allCredits.items.filter((item) => String(item.client_id) === String(clientId));
 
   const isUsage = allocation.billing_model === USAGE_BILLING_MODEL;
-  const usage = isUsage
-    ? await computeUnbilledUsage({ db, clientId: billingClientId, asOf, allocation, window: ALL_UNBILLED_WINDOW })
-    : { lines: [], total_cents: 0, reason: 'billing_model' };
+  // Marker detection cannot be bypassed by a later billing-model edit.
+  const usage = await computeUnbilledUsage({ db, clientId: billingClientId, asOf, allocation, window: ALL_UNBILLED_WINDOW });
   const billedInvoices = isUsage
     ? await listBilledUsageInvoices({ db, clientId: billingClientId, limit: invoiceLimit })
     : [];

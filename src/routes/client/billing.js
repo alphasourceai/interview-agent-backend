@@ -162,7 +162,7 @@ router.get('/clients/billing/usage', requireAuth, withClientScope, async (req, r
       billed_invoices: billing.billed_usage.invoices
     })
   } catch (e) {
-    return res.status(500).json({ error: 'read_usage_failed', detail: e?.message || 'read_usage_failed' })
+    return res.status(e?.status === 503 ? 503 : 500).json({ error: 'read_usage_failed', detail: e?.message || 'read_usage_failed' })
   }
 })
 

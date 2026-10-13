@@ -12,6 +12,9 @@
 //
 // The period is the prior calendar month, decided by interviews.completed_at.
 // The ledger's unique interview_id is what prevents double billing.
+// Prospective receipt-backed Enterprise uses accepted source rates for display;
+// its writers are held until the separate calendar-month executor is reviewed.
+// Mutable allocations are not immutable invoice authorization for that cohort.
 //
 // A child client has no subscription of its own, so interviews run under a
 // child's roles are billed on the parent's invoice, tagged with the child's
@@ -21,6 +24,7 @@
 
 const { SOURCE_USAGE } = require('./interviewAllocation');
 const { createHash } = require('node:crypto');
+const { loadAcceptedEnterpriseUsageTerms, fenceAcceptedEnterpriseUsageWriter, hold } = require('./acceptedEnterpriseUsageTerms');
 
 const USAGE_BILLING_MODEL = 'usage';
 
@@ -85,17 +89,23 @@ function normalizeRoleStatus(value) {
 async function computeUnbilledUsage({ db, clientId, asOf, allocation = null, window = PRIOR_MONTH_WINDOW } = {}) {
   if (!db || !clientId) return emptyUsage('invalid_request');
 
+  const accepted = await loadAcceptedEnterpriseUsageTerms({ db, clientId });
+  const billingClientId = accepted?.billingClientId || clientId;
+
   const resolved = allocation
-    || await require('./interviewAllocation').allocateInterviews({ db, billingClientId: clientId });
+    || await require('./interviewAllocation').allocateInterviews({ db, billingClientId });
+  if (accepted && (resolved.billing_model !== USAGE_BILLING_MODEL || resolved.included_per_role !== 0
+    || !(resolved.allowance_by_role instanceof Map) || [...resolved.allowance_by_role.values()].some(n => n !== 0)
+    || !(resolved.entity_label_by_client instanceof Map) || !Array.isArray(resolved.entries))) hold();
   if (resolved.billing_model !== USAGE_BILLING_MODEL) return emptyUsage('billing_model');
 
-  const unitPriceCents = parseWholeNonNegative(resolved.usage_interview_fee_cents);
+  const unitPriceCents = accepted?.unitPriceCents ?? parseWholeNonNegative(resolved.usage_interview_fee_cents);
   if (unitPriceCents == null) return emptyUsage('no_usage_price');
 
   const wholeHistory = window === ALL_UNBILLED_WINDOW;
   const { start, end } = priorMonthBounds(asOf);
 
-  const familyIds = [String(clientId), ...[...resolved.entity_label_by_client.keys()]];
+  const familyIds = [String(billingClientId), ...[...resolved.entity_label_by_client.keys()]];
   const { data: ledgerRows, error: ledgerError } = await db
     .from('usage_billing_ledger')
     .select('interview_id')
@@ -104,6 +114,20 @@ async function computeUnbilledUsage({ db, clientId, asOf, allocation = null, win
   const ledgered = new Set((ledgerRows || []).map((row) => String(row?.interview_id ?? '')));
 
   const roleById = new Map((resolved.roles || []).map((role) => [String(role.id), role]));
+  if (accepted) {
+    const seen = new Set();
+    for (const entry of resolved.entries) {
+      const completed = typeof entry.completed_at === 'string' ? Date.parse(entry.completed_at) : NaN;
+      const role = roleById.get(String(entry.role_id));
+      if (!entry.interview_id || seen.has(String(entry.interview_id)) || !role
+        || String(role.client_id) !== String(entry.client_id) || !familyIds.includes(String(entry.client_id))
+        || !Number.isFinite(completed) || completed < accepted.start || completed >= accepted.end
+        || !['usage', 'pool'].includes(entry.source)
+        || (entry.source === 'pool' && String(entry.source_id) !== String(accepted.poolId))
+        || (entry.source === 'usage' && entry.source_id != null)) hold();
+      seen.add(String(entry.interview_id));
+    }
+  }
 
   const byRole = new Map();
   const missingCompletedAt = [];
@@ -115,7 +139,9 @@ async function computeUnbilledUsage({ db, clientId, asOf, allocation = null, win
 
     const completedAt = entry.completed_at;
     const isMissing = !completedAt;
-    if (!wholeHistory && !isMissing && !(completedAt >= start && completedAt < end)) continue;
+    if (!wholeHistory && !isMissing && !(accepted
+      ? Date.parse(completedAt) >= Date.parse(start) && Date.parse(completedAt) < Date.parse(end)
+      : completedAt >= start && completedAt < end)) continue;
     if (isMissing) missingCompletedAt.push(entry);
 
     const roleId = String(entry.role_id);
@@ -137,6 +163,7 @@ async function computeUnbilledUsage({ db, clientId, asOf, allocation = null, win
     line.amount_cents = line.quantity * unitPriceCents;
     line.interview_ids.push(String(entry.interview_id));
     totalCents += unitPriceCents;
+    if (accepted && (!Number.isSafeInteger(line.amount_cents) || !Number.isSafeInteger(totalCents))) hold();
   }
 
   const lines = [...byRole.values()];
@@ -463,6 +490,8 @@ async function applyUsageToInvoice({
     return { applied: false, reason: 'invalid_request', items: 0, total_cents: 0 };
   }
 
+  await fenceAcceptedEnterpriseUsageWriter({ db, clientId });
+
   const existing = await listLedgerRowsForInvoice({ db, stripeInvoiceId: invoiceId });
   if (existing.length && existing.every((row) => row.billed_at != null)) {
     return { applied: false, reason: 'already_billed', items: 0, total_cents: 0 };
@@ -592,6 +621,8 @@ async function createImmediateUsageInvoice({
   db, stripe, clientId, customerId, asOf, requestId, reason, now
 } = {}) {
   if (!db || !stripe || !clientId) return { skipped: true, reason: 'invalid_request' };
+
+  await fenceAcceptedEnterpriseUsageWriter({ db, clientId });
 
   const { data: client, error: clientError } = await db
     .from('clients')
