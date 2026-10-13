@@ -1,5 +1,5 @@
 'use strict';
-// Actual local PostgreSQL and real native signing-seal trigger. No Auth/SDK.
+// Actual local PostgreSQL/seals/pins + injected SDK data. No Auth/provider access.
 const {test,before,after}=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),cp=require('node:child_process');
 const {prepareEnterprisePoolTerms}=require('../src/services/enterprisePoolSnapshot');
@@ -92,7 +92,7 @@ before(()=>{if(!enabled)return;assert.match(socket,/^\/private\/tmp\/alphascreen
    denied(`begin;${change};${newSql}`,/enterprise_trace_.*drift/);
   apply('20261013105137_enterprise_existing_checkout_trace_pins.sql');
   denied(newSql,/enterprise_trace_prerequisite_drift|enterprise_trace_schema_acl_drift/);
-  sql(`alter table clients add column name text not null default 'SYNTHETIC ONLY',add column email text not null default 'owner@example.invalid',add column client_admin_name text;
+  sql(`alter table clients add column name text not null default 'SYNTHETIC ONLY',add column email text not null default 'owner@example.invalid',add column client_admin_name text,add column stripe_subscription_id text;
    create table billing_customers(id uuid primary key default gen_random_uuid(),client_id uuid references clients(id) on delete set null,name text not null,
     primary_contact_name text,primary_contact_email text not null,notes text,stripe_customer_id text,created_at timestamptz not null default now(),updated_at timestamptz not null default now());
    create unique index billing_customers_stripe_customer_id_uniq on billing_customers(stripe_customer_id) where stripe_customer_id is not null;
@@ -267,7 +267,7 @@ test('actual native trace still denies paid/PI/credit release and retains legacy
 // hosted PostgREST: SQL, constraints, guards, seals and pins are real PG17;
 // provider objects remain injected synthetic SDK data.
 class NativeQuery{
- constructor(table){assert.ok(['membership_agreements','enterprise_v2_execution_seals','public_purchase_intents','clients','billing_customers'].includes(table));this.table=table;this.fields='*';this.filters=[];}
+ constructor(table){assert.ok(['membership_agreements','enterprise_v2_execution_seals','public_purchase_intents','clients','billing_customers','client_interview_pools'].includes(table));this.table=table;this.fields='*';this.filters=[];}
  select(fields='*'){assert.match(fields,/^(\*|[a-z_]+(,[a-z_]+)*)$/);this.fields=fields;return this;}
  eq(k,v){assert.match(k,/^[a-z_]+$/);this.filters.push(`${k}${v==null?' is null':'='+lit(v)}`);return this;}
  is(k,v){return this.eq(k,v);}order(){return this;}update(p){this.change=p;return this;}insert(p){this.add=p;return this;}
@@ -303,4 +303,37 @@ for(const cadence of ['monthly','annual'])for(const embedded of [true,false])tes
  const retry=await createExistingEnterpriseCheckout(args);assert.equal(retry.session.id,result.session.id);
  assert.equal(mock.calls.filter(c=>c.kind==='priceCreate').length,2);assert.equal(mock.calls.filter(c=>c.kind==='sessionCreate').length,1);
  assert.equal(row(s).enterprise_checkout_source.created_at,r.enterprise_checkout_source.created_at);
+ // Read the payment graph against these REAL native rows and signing seals,
+ // not the in-process source mock. Provider cash is still explicitly injected.
+ const {readExistingEnterpriseCheckoutFunding}=require('../src/services/existingEnterpriseCheckoutFunding');
+ const paid=require('./helpers/enterprise-pool-payment-fixture')({platformAmount:0,platformCents:99999,platformInterval:cadence==='annual'?'year':'month'});
+ const b=Math.floor(Date.parse(r.enterprise_checkout_source.created_at)/1000),actualPrice=mock.priceStore;
+ for(const price of actualPrice.values())Object.assign(price,{created:b,custom_unit_amount:null,transform_quantity:null,tiers_mode:null});
+ const platform=actualPrice.get(r.enterprise_checkout_prices.platform_price_id),oneTime=actualPrice.get(r.enterprise_checkout_prices.pool_price_id);
+ for(const object of [paid.checkout,paid.subscription,paid.invoice,paid.paymentIntent,paid.charge])Object.assign(object,{customer:s.customer,created:b+3});
+ paid.checkout.created=b+2;paid.invoice.status_transitions.paid_at=b+10;
+ for(const line of [...paid.subscription.items.data,...paid.invoice.lines.data,...paid.checkoutLines.data])
+  line.price=structuredClone(line.price.type==='recurring'?platform:oneTime);
+ paid.subscription.items.data[0].object='subscription_item';delete paid.subscription.items.data[0].discounts;delete paid.subscription.discounts;
+ for(const line of paid.invoice.lines.data){delete line.invoice;line.discounts=null;line.discount_amounts=null;}
+ paid.invoice.discounts=null;paid.invoice.total_discount_amounts=null;paid.charge.refunds=null;delete paid.charge.dispute;
+ const saved=mock.sessionStore.get(r.checkout_session_id).cs;
+ Object.assign(saved,{created:b+2,status:'complete',payment_status:'paid',subscription:paid.subscription.id,invoice:paid.invoice.id,payment_intent:null});
+ paid.subscription.metadata=structuredClone(saved.metadata);
+ const originalBody=mock.calls.find(c=>c.kind==='sessionCreate').body;
+ paid.subscription.billing_cycle_anchor=originalBody.subscription_data.billing_cycle_anchor;
+ mock.stripe.getApiField=k=>k==='version'?'2023-10-16':undefined;
+ mock.stripe.accounts={retrieve:async()=>structuredClone(paid.account)};
+ mock.stripe.subscriptions.retrieve=async()=>structuredClone(paid.subscription);
+ mock.stripe.subscriptionItems={list:async()=>structuredClone(paid.subscription.items)};
+ mock.stripe.checkout.sessions.listLineItems=async()=>structuredClone(paid.checkoutLines);
+ mock.stripe.invoices={retrieve:async()=>structuredClone(paid.invoice),listLineItems:async()=>structuredClone(paid.invoice.lines)};
+ mock.stripe.paymentIntents={retrieve:async()=>structuredClone(paid.paymentIntent)};
+ mock.stripe.charges={retrieve:async()=>structuredClone(paid.charge)};
+ mock.stripe.refunds={list:async()=>structuredClone(paid.refunds)};
+ const proof=await readExistingEnterpriseCheckoutFunding({db:nativeDb,stripe:mock.stripe,agreementId:s.id,now:()=> (b+20)*1000});
+ assert.equal(proof.agreementId,s.id);assert.equal(proof.pool_id,p.id);assert.equal(proof.pool_paid_cents,p.total_cents);
+ assert.equal(proof.checkout_session_id,r.checkout_session_id);assert.equal(proof.payment_success_at,new Date((b+10)*1000).toISOString());
+ assert.equal(proof.credits_spendable,false);assert.equal(proof.membership_activation_required,true);assert.equal(proof.native_receipt_required,true);
+ assert.deepEqual(row(s),r);assert.deepEqual(pool(s),p); // no billing or credit write
 });
