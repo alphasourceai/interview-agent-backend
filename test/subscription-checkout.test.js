@@ -152,9 +152,10 @@ function makeDb() {
 }
 
 function positivePromotion(id='promo_validated') { return {object:'promotion_code',id,active:true,livemode:false,customer:null,expires_at:null,
+  max_redemptions:null,times_redeemed:0,
   restrictions:{first_time_transaction:false,minimum_amount:null,minimum_amount_currency:null},
   coupon:{object:'coupon',id:'SYNTHETIC',valid:true,livemode:false,percent_off:10,amount_off:null,currency:null,
-    duration:'once',duration_in_months:null,redeem_by:null}}; }
+    duration:'once',duration_in_months:null,redeem_by:null,max_redemptions:null,times_redeemed:0}}; }
 function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder, customerOverride = {},db = makeDb(),sessionMutation,lineMutation,subscriptions=[],promotionResponder=positivePromotion }) {
   delete require.cache[checkoutPath]
   delete require.cache[supabaseClientPath]
@@ -176,10 +177,18 @@ function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder, custom
       return `https://qa.alphasourceai.com/dashboard?${params.toString()}`
     }
   })
-  let lastPayload,lastSession;
+  let lastPayload,lastSession,lastPromotion;
+  const lineDiscounts = () => {
+    const amounts=lastPayload.line_items.map(line=>line.price_data.unit_amount);
+    if(!lastPayload.discounts?.length)return amounts.map(()=>0);
+    const c=lastPromotion.coupon;
+    if(c.percent_off!=null)return amounts.map(amount=>Math.round(amount*c.percent_off/100));
+    const fixed=c.currency_options?.usd?.amount_off??c.amount_off,total=amounts.reduce((a,b)=>a+b,0);
+    let allocated=0;return amounts.map((amount,n)=>{const value=n===amounts.length-1?fixed-allocated:Math.floor(fixed*amount/total);allocated+=value;return value});
+  };
   injectModule(stripePath, stripeConstructor || function Stripe() {
     return {
-      promotionCodes:{retrieve:async id=>promotionResponder(id)},
+      promotionCodes:{retrieve:async id=>{lastPromotion=promotionResponder(id);return structuredClone(lastPromotion)}},
       customers: {
         retrieve: async (id) => ({ id, discount: null, balance: 0, ...customerOverride }),
         update: async (id, payload) => {
@@ -214,21 +223,21 @@ function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder, custom
           retrieve:async sessionId=>{
             const total=lastPayload.line_items.reduce((sum,l)=>sum+l.price_data.unit_amount,0);
             const promoId=lastPayload.discounts?.[0]?.promotion_code;
-            const discount=promoId?lastPayload.line_items.reduce((sum,l)=>sum+Math.round(l.price_data.unit_amount*.1),0):0;
+            const discount=lineDiscounts().reduce((sum,amount)=>sum+amount,0);
             const s={object:'checkout.session',id:sessionId,mode:'subscription',status:'open',payment_status:'unpaid',
               currency:'usd',livemode:false,customer:lastPayload.customer,subscription:null,expires_at:lastPayload.expires_at,
               ui_mode:lastPayload.ui_mode||'hosted',metadata:lastPayload.metadata,amount_subtotal:total,amount_total:total-discount,
               return_url:lastPayload.return_url,success_url:lastPayload.success_url,cancel_url:lastPayload.cancel_url,
               allow_promotion_codes:lastPayload.allow_promotion_codes??null,total_details:{amount_discount:discount,amount_shipping:0,amount_tax:0,
                 breakdown:{discounts:promoId?[{amount:discount,discount:{object:'discount',id:'di_SYNTHETIC',promotion_code:promoId,
-                  customer:lastPayload.customer,coupon:positivePromotion(promoId).coupon}}]:[]}},
+                  customer:lastPayload.customer,coupon:structuredClone(lastPromotion.coupon)}}]:[]}},
               ...lastSession};
             return sessionMutation?sessionMutation(s):s;
           },
           listLineItems:async()=>{ const lines={object:'list',has_more:false,data:lastPayload.line_items.map((l,n)=>({
             id:`li_SYNTHETIC_${n}`,quantity:l.quantity,currency:'usd',amount_subtotal:l.price_data.unit_amount,
-            amount_discount:lastPayload.discounts?.length?Math.round(l.price_data.unit_amount*.1):0,amount_tax:0,
-            amount_total:l.price_data.unit_amount-(lastPayload.discounts?.length?Math.round(l.price_data.unit_amount*.1):0),
+            amount_discount:lineDiscounts()[n],amount_tax:0,
+            amount_total:l.price_data.unit_amount-lineDiscounts()[n],
             price:{object:'price',id:`price_SYNTHETIC_${n}`,currency:'usd',unit_amount:l.price_data.unit_amount,
               type:l.price_data.recurring?'recurring':'one_time',recurring:l.price_data.recurring?{...l.price_data.recurring,usage_type:'licensed'}:null}
           }))};return lineMutation?lineMutation(lines):lines; }
@@ -467,6 +476,51 @@ test('monthly retail installments preserve the existing validated promotion-code
   assert.deepEqual(calls.sessions[0].payload.discounts,[{promotion_code:'promo_validated'}]);
   assert.equal('allow_promotion_codes' in calls.sessions[0].payload,false);
 });
+test('fixed monthly promotions with real role allocation preserve the accepted price and return only a confirmed Session',async()=>{
+  for(const role of [false,true]){
+    const calls=retailCalls(),promotionResponder=id=>{const p=positivePromotion(id);p.coupon.percent_off=null;
+      p.coupon.currency='eur';p.coupon.amount_off=1;p.coupon.currency_options={usd:{amount_off:100}};return p;};
+    const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,promotionResponder});
+    const snapshot=retailSnapshot('basic',3,'monthly_installments',role),result=await create(retailArgs(snapshot,'promo_validated'));
+    assert.equal(result.session.amount_total,snapshot.membership_terms.initial_payment_cents-100);
+    assert.deepEqual(calls.sessions[0].payload.discounts,[{promotion_code:'promo_validated'}]);
+  }
+});
+test('customer-scoped promotions match a live existing owner before any writer or hold without customer creation',async()=>{
+  const promotionResponder=id=>({...positivePromotion(id),customer:'cus_existing'});
+  const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,promotionResponder});
+  await create(retailArgs(retailSnapshot('basic',3,'monthly_installments'),'promo_validated'));assert.equal(calls.sessions.length,1);
+  for(const kind of ['other','missing','deleted']){
+    const db=makeDb(),dark=retailCalls();
+    if(kind==='missing'){db.clients[0].stripe_customer_id=null;db.billingCustomers=[]}
+    const {createSubscriptionCheckoutSession:fn}=loadCheckout({db,stripeCalls:dark,
+      customerOverride:kind==='deleted'?{deleted:true}:{},
+      promotionResponder:id=>({...positivePromotion(id),customer:kind==='other'?'cus_OTHER':'cus_existing'})});
+    await assert.rejects(fn(retailArgs(retailSnapshot('basic',3,'monthly_installments'),'promo_validated')),
+      {code:'retail_checkout_promotion_customer_mismatch'});
+    assert.deepEqual(dark,retailCalls());assert.deepEqual(db.updates,[]);assert.deepEqual(db.inserts,[]);assert.deepEqual(db.rpcCalls,[]);
+  }
+});
+test('API2023 discount expansion accepts a real promotion object, rejects null/deleted/wrong-object ids',async()=>{
+  const mutations=[d=>d.promotion_code=null,d=>d.promotion_code={object:'other',id:'promo_validated'},
+    d=>d.promotion_code={object:'promotion_code',id:'promo_validated',deleted:true},d=>d.coupon='SYNTHETIC',d=>d.coupon.deleted=true];
+  const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,
+    sessionMutation:s=>{s.total_details.breakdown.discounts[0].discount.promotion_code={object:'promotion_code',id:'promo_validated'};return s;}});
+  await create(retailArgs(retailSnapshot('basic',3,'monthly_installments'),'promo_validated'));assert.equal(calls.sessions.length,1);
+  for(const mutate of mutations){const dark=retailCalls(),{createSubscriptionCheckoutSession:fn}=loadCheckout({stripeCalls:dark,
+    sessionMutation:s=>{mutate(s.total_details.breakdown.discounts[0].discount);return s;}});
+    await assert.rejects(fn(retailArgs(retailSnapshot('basic',3,'monthly_installments'),'promo_validated')),
+      {code:'retail_checkout_session_promotion_mismatch'});assert.equal(dark.sessions.length,1);}
+});
+test('missing expanded no-promo breakdown or truncated/incomplete priced lines withhold the URL',async()=>{
+  for(const kind of ['breakdown','lineMoney','listMissing','truncated']){
+    const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,
+      sessionMutation:s=>{if(kind==='breakdown')delete s.total_details.breakdown;return s;},
+      lineMutation:rows=>{if(kind==='lineMoney')delete rows.data[0].amount_tax;
+        if(kind==='listMissing')rows.data=null;if(kind==='truncated')rows.has_more=true;return rows;}});
+    await assert.rejects(create(retailArgs(retailSnapshot('basic',3,'monthly_installments'))));assert.equal(calls.sessions.length,1);
+  }
+});
 test('new monthly zero/unknown/restricted promotion refuses before every DB and provider write',async()=>{
   for(const kind of ['percent100','covering','unavailable','wrongId','modern','expired','restricted']){
     const db=makeDb(),calls=retailCalls();
@@ -532,19 +586,24 @@ test('installed Stripe16 SDK serializes and retrieves new retail terms through t
     let body='';for await(const b of req)body+=b;const p=new URLSearchParams(body);
     requests.push({method:req.method,path:req.url,body:p,version:req.headers['stripe-version'],key:req.headers['idempotency-key']});
     let data;if(req.method==='GET'&&req.url==='/v1/customers/cus_existing')data={object:'customer',id:'cus_existing',discount:null,balance:0};
+    else if(req.method==='GET'&&req.url==='/v1/promotion_codes/promo_SDK_SYNTHETIC')data=positivePromotion('promo_SDK_SYNTHETIC');
     else if(req.method==='POST'&&req.url==='/v1/customers/cus_existing')data={object:'customer',id:'cus_existing'};
     else if(req.method==='GET'&&req.url.startsWith('/v1/subscriptions?'))data={object:'list',data:[],has_more:false};
     else if(req.method==='POST'&&req.url==='/v1/checkout/sessions'){
       const metadata=Object.fromEntries([...p].filter(([k])=>/^metadata\[[^\]]+\]$/.test(k)).map(([k,v])=>[k.slice(9,-1),v]));
       const amounts=[0,1].map(n=>Number(p.get(`line_items[${n}][price_data][unit_amount]`)));
       const total=amounts.reduce((a,b)=>a+b,0);
+      const promoId=p.get('discounts[0][promotion_code]'),discounts=amounts.map(amount=>promoId?Math.round(amount*.1):0);
+      const discount=discounts.reduce((a,b)=>a+b,0);
       sdkSession={object:'checkout.session',id:'cs_SYNTHETIC',url:'https://checkout.stripe.test/SYNTHETIC',
         customer:p.get('customer'),mode:'subscription',status:'open',payment_status:'unpaid',currency:'usd',livemode:false,
-        subscription:null,metadata,expires_at:Number(p.get('expires_at')),ui_mode:'hosted',amount_subtotal:total,amount_total:total,
+        subscription:null,metadata,expires_at:Number(p.get('expires_at')),ui_mode:'hosted',amount_subtotal:total,amount_total:total-discount,
         success_url:p.get('success_url'),cancel_url:p.get('cancel_url'),allow_promotion_codes:p.get('allow_promotion_codes')==='true',
-        total_details:{amount_discount:0,amount_shipping:0,amount_tax:0}};
+        total_details:{amount_discount:discount,amount_shipping:0,amount_tax:0,breakdown:{discounts:promoId?
+          [{amount:discount,discount:{object:'discount',id:'di_SDK_SYNTHETIC',promotion_code:promoId,
+            customer:p.get('customer'),coupon:positivePromotion(promoId).coupon}}]:[]}}};
       sdkLines={object:'list',has_more:false,data:amounts.map((amount,n)=>({id:`li_SDK_${n}`,quantity:1,currency:'usd',amount_subtotal:amount,
-        amount_discount:0,amount_tax:0,amount_total:amount,
+        amount_discount:discounts[n],amount_tax:0,amount_total:amount-discounts[n],
         price:{object:'price',id:`price_SDK_${n}`,currency:'usd',unit_amount:amount,type:n?'one_time':'recurring',
           recurring:n?null:{interval:'month',interval_count:Number(p.get('line_items[0][price_data][recurring][interval_count]')),usage_type:'licensed'}}}))};
       data=sdkSession;
@@ -571,6 +630,17 @@ test('installed Stripe16 SDK serializes and retrieves new retail terms through t
     assert.equal(p.has('subscription_data[trial_end]'),false);assert.equal(p.has('payment_method_types[0]'),false);
   }
   assert.equal(requests.filter(r=>r.path==='/v1/checkout/sessions').length,12);
+  const before=requests.length,calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,stripeConstructor});
+  const args=retailArgs(retailSnapshot('basic',3,'monthly_installments',true),'promo_SDK_SYNTHETIC');
+  const result=await create(args);assert.equal(result.session.amount_total,72720);
+  const writes=requests.slice(before),posted=writes.find(r=>r.method==='POST'&&r.path==='/v1/checkout/sessions');
+  assert.equal(writes[0].path,'/v1/promotion_codes/promo_SDK_SYNTHETIC');
+  assert.equal(posted.body.get('discounts[0][promotion_code]'),'promo_SDK_SYNTHETIC');
+  assert.equal(posted.body.has('allow_promotion_codes'),false);
+  const fetched=writes.find(r=>r.method==='GET'&&r.path.split('?')[0]==='/v1/checkout/sessions/cs_SYNTHETIC');
+  assert.equal(new URL(fetched.path,'http://127.0.0.1').searchParams.get('expand[0]'),'total_details.breakdown');
+  assert.equal(posted.version,'2023-10-16');assert.equal(posted.key,args.idempotencyKey);
+  assert.equal(requests.filter(r=>r.path==='/v1/checkout/sessions').length,13);
 });
 
 test('new retail direct service requires existing signed source and exact key before any SDK effects',async()=>{

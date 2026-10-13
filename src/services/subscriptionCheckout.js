@@ -201,6 +201,7 @@ async function resolveStripeCustomerId({
   billingCustomerList,
   exactPrepaid = false,
   strictRetailCredits = false,
+  requiredPromotionCustomerId = null,
   pinnedCustomerId = '',
   skipCustomerUpdate = false,
   preferCurrentCustomer = false
@@ -232,6 +233,9 @@ async function resolveStripeCustomerId({
   for (const candidateId of candidateStripeCustomerIds) {
     try {
       const customer = await stripe.customers.retrieve(candidateId)
+      if (requiredPromotionCustomerId && (customer.deleted === true || customer.id !== requiredPromotionCustomerId)) {
+        throw makeError(409,'retail_checkout_promotion_customer_mismatch','The approved promotion does not match this billing customer.')
+      }
       // New retail commercial totals must not inherit old customer discounts
       // or account credits. Refuse, never clear/change the customer's balance.
       // Actual paid-invoice proof is still independently required at fulfillment.
@@ -259,6 +263,7 @@ async function resolveStripeCustomerId({
 
   const clientEmail = String(client?.email || '').trim()
   if (!resolvedStripeCustomerId) {
+    if (requiredPromotionCustomerId) throw makeError(409,'retail_checkout_promotion_customer_mismatch','This promotion requires an existing matching billing customer.')
     if (pinnedCustomerId) throw makeError(409, 'retail_checkout_customer_changed', 'The original checkout customer is unavailable.')
     const createdCustomer = await stripe.customers.create({
       name: client?.name || undefined,
@@ -431,10 +436,12 @@ async function createSubscriptionCheckoutSession({
       billingCustomerList,
       exactPrepaid: !!retailOffer,
       strictRetailCredits: !!retailOffer,
+      requiredPromotionCustomerId:retailPromotion?.customerId || null,
       pinnedCustomerId:retailOffer ? String(retailAgreement.checkout_attempt_source?.customer_id || '') : ''
     })
   } catch (e) {
-    if (e?.code === 'retail_customer_adjustment_denied' || e?.code === 'retail_checkout_customer_changed') throw e
+    if (e?.code === 'retail_customer_adjustment_denied' || e?.code === 'retail_checkout_customer_changed'
+      || e?.code === 'retail_checkout_promotion_customer_mismatch') throw e
     throw makeError(500, 'stripe_customer_failed', e?.message || 'Stripe customer resolution failed.')
   }
   if (!resolvedStripeCustomerId) throw makeError(400, 'missing_billing_customer', 'Missing billing customer.')

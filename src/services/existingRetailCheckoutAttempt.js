@@ -161,7 +161,7 @@ async function readOpenRetailSession({ stripe, sessionId, attempt, offer, promot
   'retail_checkout_session_prices_mismatch');
   const discountRows = details.breakdown?.discounts;
   if (!expectedPromo) check(!promotion && details.amount_discount === 0
-    && (discountRows === undefined || Array.isArray(discountRows) && discountRows.length === 0),
+    && Array.isArray(discountRows) && discountRows.length === 0,
   'retail_checkout_session_promotion_mismatch');
   else {
     check(promotion?.promotionId === expectedPromo && promotion.livemode === session.livemode
@@ -172,9 +172,12 @@ async function readOpenRetailSession({ stripe, sessionId, attempt, offer, promot
       && details.amount_discount <= promotion.maximumDiscountCents
       && offer.initial_payment_cents - details.amount_discount >= promotion.minimumNetCents
       && discount?.object === 'discount' && /^di_[A-Za-z0-9_]+$/.test(discount.id || '') && discount.deleted !== true
-      && id(discount.promotion_code) === expectedPromo && id(discount.customer) === attempt.source.customer_id
-      && coupon?.object === 'coupon' && coupon.id === promotion.couponId && coupon.livemode === session.livemode
-      && Object.entries(promotion.coupon).every(([key,value]) => coupon[key] === value),
+      && id(discount.promotion_code) === expectedPromo
+      && (typeof discount.promotion_code === 'string'
+        || discount.promotion_code?.object === 'promotion_code' && discount.promotion_code.deleted !== true)
+      && id(discount.customer) === attempt.source.customer_id
+      && coupon?.object === 'coupon' && coupon.deleted !== true && coupon.id === promotion.couponId && coupon.livemode === session.livemode
+      && Object.entries(promotion.coupon).every(([key,value]) => isDeepStrictEqual(coupon[key],value)),
     'retail_checkout_session_promotion_mismatch');
   }
   if (attempt.embedded) check(typeof session.client_secret === 'string' && session.client_secret.trim(), 'retail_checkout_ack_unknown', 503);
