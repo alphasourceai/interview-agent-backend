@@ -66,16 +66,37 @@ The subscription state of each client the caller can see. Not about interviews.
 | `name` | string | yes | Client name. |
 | `plan_tier` | string | yes | `basic`, `pro` or `enterprise`. Display only. |
 | `billing_status` | string | yes | Free text from the client record. |
-| `billing_interval` | string | yes | `monthly` or `annual`. |
+| `billing_interval` | string | yes | `monthly`, `annual`, or `prepaid`. Use `membership_terms` for an accepted retail commitment. |
 | `auto_renew` | boolean | yes | Whether the subscription renews. |
-| `current_term_end` | string (ISO 8601) | yes | End of the current paid term. |
+| `current_term_end` | string (ISO 8601) | yes | End of the current provider billing period. This alone is not a funded-access or membership-commitment proof. |
 | `contract_end_at` | string (ISO 8601) | yes | End of the contract, if one is set. |
 | `subscription_status` | string | yes | Stripe's subscription status. |
 | `cancel_at_term_end` | boolean | yes | Set when a cancellation is scheduled. |
 | `access_override_mode` | string | yes | An administrative override on access. |
 | `has_stripe_customer` | boolean | no | Whether a Stripe customer exists. **The id itself is never sent.** |
+| `membership_terms` | object | yes | Read-only accepted retail terms for a current signed, paid agreement. Null for legacy or pending agreements. |
 
 Response: `{ "items": [ … ] }`. An empty array is a normal answer.
+
+The accepted terms come from the existing signed agreement snapshot, preserving
+historical prices. Malformed marked agreements and a client binding that changes
+during the read cause an error. This projection does not consult today's price
+catalog, count received installments, calculate an unpaid balance, or change
+renewal settings. Parent billing permissions apply to child scopes.
+
+<!-- fields: GET /clients/billing/summary items[].membership_terms -->
+
+| Field | Type | Null? | Meaning |
+| --- | --- | --- | --- |
+| `commitment_months` | integer | no | Accepted membership commitment: 3, 6, or 12 months. |
+| `payment_option` | string | no | `prepaid` or `monthly_installments`. |
+| `currency` | string | no | `usd`. |
+| `platform_payment_cents` | integer | no | Accepted platform fee per scheduled payment, excluding roles, interviews, and tax. |
+| `platform_commitment_total_cents` | integer | no | Full platform commitment; not a paid amount or remaining balance. |
+| `installment_count` | integer | no | One prepaid payment or the accepted number of monthly payments. |
+| `current_term_start_at` | string (ISO 8601) | no | Current membership commitment start, validated against the original first-payment anchor. |
+| `current_term_end_at` | string (ISO 8601) | no | Current membership commitment end; use this instead of the provider's individual payment-cycle end. |
+| `auto_renew` | boolean | no | Current next-term renewal preference; remaining monthly payments still belong to the current commitment. |
 
 ### GET /clients/billing/credits
 

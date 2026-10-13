@@ -10,6 +10,7 @@ const { canViewLegalBillingForClient } = require('../../services/clientScope');
 const { supabaseAdmin } = require('../../clients/supabase');
 const { resolveBillingModel } = require('../../services/billingModel');
 const { readBillingForClient } = require('../../services/billingReadModel');
+const { readClientRetailBillingSummary } = require('../../services/clientRetailBillingSummary');
 const { requireAuth, withClientScope } = require('../../middleware/auth');
 const {
   hasClientWriteAccess,
@@ -46,14 +47,14 @@ router.get('/clients/billing/summary', requireAuth, withClientScope, async (req,
 
     let q = supabaseAdmin
       .from('clients')
-      .select('id,name,plan_tier,billing_status,billing_interval,auto_renew,current_term_end,contract_end_at,subscription_status,cancel_at_term_end,access_override_mode,stripe_customer_id')
+      .select('id,name,plan_tier,billing_status,billing_interval,auto_renew,current_term_end,contract_start_at,contract_end_at,subscription_status,cancel_at_term_end,access_override_mode,stripe_customer_id,stripe_subscription_id')
       .in('id', Array.from(new Set(queryIds)))
       .order('name', { ascending: true })
 
     const { data, error } = await q
     if (error) return res.status(500).json({ error: 'list_billing_summary_failed', detail: error.message })
 
-    const items = (data || []).map((client) => ({
+    const items = await Promise.all((data || []).map(async (client) => ({
       id: client.id,
       name: client.name,
       plan_tier: client.plan_tier,
@@ -65,8 +66,9 @@ router.get('/clients/billing/summary', requireAuth, withClientScope, async (req,
       subscription_status: client.subscription_status,
       cancel_at_term_end: client.cancel_at_term_end,
       access_override_mode: client.access_override_mode,
-      has_stripe_customer: !!client.stripe_customer_id
-    }))
+      has_stripe_customer: !!client.stripe_customer_id,
+      membership_terms: await readClientRetailBillingSummary({ db: supabaseAdmin, client })
+    })))
     return res.json({ items })
   } catch (e) {
     return res.status(500).json({ error: 'server_error' })
