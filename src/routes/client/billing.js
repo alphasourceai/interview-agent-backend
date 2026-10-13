@@ -11,6 +11,7 @@ const { supabaseAdmin } = require('../../clients/supabase');
 const { resolveBillingModel } = require('../../services/billingModel');
 const { readBillingForClient } = require('../../services/billingReadModel');
 const { readClientRetailBillingSummary } = require('../../services/clientRetailBillingSummary');
+const { createClientBillingPortalSession } = require('../../services/retailBillingPortal');
 const { requireAuth, withClientScope } = require('../../middleware/auth');
 const {
   hasClientWriteAccess,
@@ -214,12 +215,21 @@ router.post('/clients/billing/portal-session', requireAuth, withClientScope, asy
       client_id: clientId,
       tab
     })
-    const session = await stripe.billingPortal.sessions.create({
-      customer: stripeCustomerId,
-      return_url: buildClientDashboardReturnUrl(returnParams)
+    const session = await createClientBillingPortalSession({
+      db: supabaseAdmin,
+      stripe,
+      clientId,
+      customerId: stripeCustomerId,
+      returnUrl: buildClientDashboardReturnUrl(returnParams),
+      authorizeRetail: req.isGlobalAdmin === true || req.isAdmin === true || canViewLegalBillingForClient(req.clientScope, clientId),
+      configurationId: process.env.STRIPE_RETAIL_PORTAL_CONFIGURATION_ID,
+      stripeKey: process.env.STRIPE_SECRET_KEY
     })
     return res.json({ ok: true, url: session?.url || null })
   } catch (e) {
+    if (e?.code === 'RETAIL_PORTAL_UNAVAILABLE' || e?.code === 'RETAIL_PORTAL_FORBIDDEN') {
+      return res.status(e.status).json({ error: e.code, code: e.code, detail: e.message });
+    }
     return res.status(500).json({ error: 'create_portal_session_failed', detail: e?.message || 'create_portal_session_failed' })
   }
 })
