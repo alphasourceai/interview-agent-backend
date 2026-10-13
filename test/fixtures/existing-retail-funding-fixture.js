@@ -2,7 +2,7 @@
 const assert=require('node:assert/strict');
 const {createFakeSupabase}=require('../helpers/fakeSupabase');
 const {buildRetailPackageSnapshot}=require('../../src/services/membershipPackageCompatibility');
-const {OFFER_VERSION}=require('../../src/services/membershipOffers');
+const {OFFER_VERSION,anchoredMonthInstant}=require('../../src/services/membershipOffers');
 const {normalizeSalesDraft,agreementInputFromDraft}=require('../../src/services/salesWorkspace');
 const {buildMembershipAgreementHtml}=require('../../src/render/membershipAgreement');
 const PAID='2026-01-31T12:13:14.000Z',A=Date.parse(PAID)/1000,C='44444444-4444-4444-8444-444444444444',G='33333333-3333-4333-8333-333333333333',I='11111111-1111-4111-8111-111111111111';
@@ -27,8 +27,12 @@ function fixture(plan='basic',months=3,payment='prepaid',role=false,{admin=false
     recurring:{interval:'month',interval_count:pkg.membership_terms.stripe_recurrence.interval_count,usage_type:'licensed'}};
   const rolePrice={id:'price_ROLE',object:'price',currency:'usd',type:'one_time',unit_amount:pkg.first_role_prepay.discounted_credit_amount_cents,recurring:null};
   const entries=[{id:'li_PLATFORM',price,amount:price.unit_amount},...(role?[{id:'li_ROLE',price:rolePrice,amount:rolePrice.unit_amount}]:[])];
+  // Authored provider fixture, not runtime inference: initial invoice starts ten
+  // seconds before first captured cash; its price interval determines its span.
+  const periodStart=A-10,periodEnd=Date.parse(anchoredMonthInstant(new Date(periodStart*1000).toISOString(),price.recurring.interval_count))/1000;
   const il=entries.map((e,n)=>({id:n?'il_ROLE':'il_PLATFORM',object:'line_item',price:e.price,currency:'usd',quantity:1,proration:false,
     type:n?'invoiceitem':'subscription',subscription:'sub_SYNTHETIC',subscription_item:n?null:'si_SYNTHETIC',amount:e.amount,
+    period:{start:periodStart,end:n?periodStart:periodEnd},
     discount_amounts:promo?[{discount:'di_SYNTHETIC',amount:Math.round(e.amount/10)}]:[],
     tax_amounts:tax?[{tax_rate:'txr_SYNTHETIC',inclusive:false,amount:100}]:[]}));
   const cl=entries.map((e,n)=>({id:e.id,object:'item',currency:'usd',quantity:1,price:e.price,amount_subtotal:e.amount,

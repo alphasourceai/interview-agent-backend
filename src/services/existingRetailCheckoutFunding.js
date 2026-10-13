@@ -9,6 +9,7 @@ function check(value, code = 'retail_funding_mismatch') { if (!value) fail(code)
 const id = value => typeof value === 'string' ? value : value?.id;
 const cents = value => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const epoch = value => Number.isSafeInteger(value) && value > 0 && value <= 253402300799;
+const providerId = (value,prefix) => typeof value==='string' && value.startsWith(prefix) && value.length>prefix.length;
 function sum(values) { const n=values.reduce((a,b)=>a+b,0);check(cents(n),'retail_funding_amount_invalid');return n; }
 function list(value) { check(value?.object==='list' && value.has_more===false && Array.isArray(value.data),'retail_funding_list_incomplete');return value.data; }
 async function collect(fetch, assertFence) {
@@ -68,7 +69,7 @@ function verifyExistingRetailFunding({offer,checkout,checkoutLines,subscription,
   const item=subItems[0];
   check(item.quantity===1 && id(item.subscription)===subscription.id && id(item.price)===platform[0].price.id
     && priceMatches(item.price,offer.platform_payment_cents,offer.stripe_recurrence),'retail_funding_price_mismatch');
-  const totals=[];let platformNet,roleNet=0,platformDiscount,roleDiscount=0,lineTaxes=0;
+  const totals=[];let platformLine,platformNet,roleNet=0,platformDiscount,roleDiscount=0,lineTaxes=0;
   for(const l of lines) {
     const isPlatform=id(l.price)===platform[0].price.id,isRole=role[0] && id(l.price)===role[0].price.id;
     check((isPlatform||isRole) && l.quantity===1 && l.currency==='usd' && l.proration===false
@@ -80,7 +81,7 @@ function verifyExistingRetailFunding({offer,checkout,checkoutLines,subscription,
     check(csLine.amount_discount===d && csLine.amount_tax===t && csLine.amount_total===l.amount-d+t,'retail_funding_checkout_line_mismatch');
     check(d<=l.amount && (offer.payment_option!=='prepaid' || d===0),'retail_funding_discount_mismatch');
     totals.push(d);lineTaxes+=t;
-    if(isPlatform){check(platformNet===undefined,'retail_funding_unexpected_lines');platformNet=l.amount-d;platformDiscount=d;}
+    if(isPlatform){check(platformNet===undefined,'retail_funding_unexpected_lines');platformLine=l;platformNet=l.amount-d;platformDiscount=d;}
     else{check(roleNet===0,'retail_funding_unexpected_lines');roleNet=l.amount-d;roleDiscount=d;}
   }
   check(platformNet!==undefined,'retail_funding_unexpected_lines');
@@ -103,9 +104,25 @@ function verifyExistingRetailFunding({offer,checkout,checkoutLines,subscription,
     && charge.status==='succeeded' && charge.paid===true && charge.captured===true
     && charge.amount===invoice.total && charge.amount_captured===invoice.total
     && charge.amount_refunded===0 && charge.refunded===false && charge.disputed===false,'retail_funding_cash_mismatch');
+  // Preserve the ORIGINAL platform invoice-line period B, separately from real
+  // first cash A. Current subscription dates and role-line periods are not an
+  // original-period receipt. Raw Stripe inclusive endpoints are not converted
+  // into contract/access/collection dates here. Persistence is a separate step.
+  const period=platformLine.period;
+  check(platformLine.object==='line_item' && providerId(platformLine.id,'il_')
+    && providerId(invoice.id,'in_') && providerId(platform[0].price.id,'price_')
+    && providerId(subscription.id,'sub_') && providerId(item.id,'si_')
+    && providerId(expected.customerId,'cus_') && providerId(checkout.id,'cs_')
+    && epoch(period?.start) && epoch(period?.end) && period.end>period.start
+    && period.start<=invoice.created && period.start<=paid,'retail_funding_initial_period_invalid');
+  const initialProviderPeriod=Object.freeze({version:'retail_initial_provider_period_v1',api_version:'2023-10-16',
+    invoice_id:invoice.id,platform_invoice_line_id:platformLine.id,price_id:platform[0].price.id,
+    subscription_id:subscription.id,subscription_item_id:item.id,customer_id:expected.customerId,
+    checkout_session_id:checkout.id,livemode:checkout.livemode,paid_at:new Date(paid*1000).toISOString(),
+    provider_period_start:period.start,provider_period_end:period.end});
   return {paidAt:new Date(paid*1000).toISOString(),invoiceId:invoice.id,paymentIntentId:paymentIntent.id,chargeId:charge.id,
     platformGrossCents:offer.platform_payment_cents,platformDiscountCents:platformDiscount,platformNetCents:platformNet,
-    roleGrossCents:offer.first_role_prepay.amount_cents,roleDiscountCents:roleDiscount,roleNetCents:roleNet,taxCents:tax,cashCents:invoice.total};
+    roleGrossCents:offer.first_role_prepay.amount_cents,roleDiscountCents:roleDiscount,roleNetCents:roleNet,taxCents:tax,cashCents:invoice.total,initialProviderPeriod};
 }
 async function readExistingRetailCheckoutFunding({db,stripe,agreementId,intentId,eventSessionId,eventSubscriptionId,eventInvoiceId,eventLivemode,assertFence=async()=>{}}) {
   await assertFence();
