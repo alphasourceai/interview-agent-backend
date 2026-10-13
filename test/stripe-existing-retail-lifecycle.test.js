@@ -65,6 +65,9 @@ function load(f,eventType='customer.subscription.updated',options={}) {
     subscriptions:{retrieve:async id=>{calls.push(id);if(options.providerError)throw Error('synthetic provider unavailable');return structuredClone(f.subscription);}}};
   inject('src/clients/supabase.js',{supabaseAdmin:db,supabase:db,supabaseAnon:db});
   inject('src/clients/stripe.js',sdk);
+  inject('src/services/existingEnterprisePaymentWebhook.js',{
+    classifyExistingEnterprisePaymentEvent:async()=>null
+  });
   const routePath=require('node:path').join(root,'src/routes/webhooks/stripe.js'); delete require.cache[routePath];
   const app=express(); app.use('/webhook/stripe',express.raw({type:'application/json'}),require(routePath));
   return{app,db,calls};
@@ -140,7 +143,7 @@ test('wrong new subscription or accepted-source details refuse without commercia
     f=>{f.tables.membership_agreements.push(structuredClone(f.tables.membership_agreements[0]));}];
   for(const change of changes){const f=fixture();change(f);const {app,db}=load(f,'customer.subscription.updated',{
     eventOverride:{id:'sub_SYNTHETIC',customer:'cus_SYNTHETIC'}});
-    const result=await post(app);assert.equal(result.status,500);assert.equal(commercialWrites(db).length,0);}
+    const result=await post(app);assert.equal(result.status,500,JSON.stringify(result.body));assert.equal(commercialWrites(db).length,0);}
 });
 
 test('new lifecycle provider failure stays retryable with no price/contract writes',async()=>{

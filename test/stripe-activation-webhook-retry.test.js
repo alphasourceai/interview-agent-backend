@@ -50,9 +50,14 @@ const fakeDb = {
   }
 }
 const supabaseClientPath = path.join(__dirname, '..', 'src', 'clients', 'supabase.js')
+const enterpriseWebhookPath = path.join(__dirname, '..', 'src', 'services', 'existingEnterprisePaymentWebhook.js')
 require.cache[supabaseClientPath] = {
   id: supabaseClientPath, filename: supabaseClientPath, loaded: true,
   exports: { supabaseAdmin: fakeDb }
+}
+require.cache[enterpriseWebhookPath] = {
+  id: enterpriseWebhookPath, filename: enterpriseWebhookPath, loaded: true,
+  exports: { classifyExistingEnterprisePaymentEvent: async () => null }
 }
 
 const router = require('../src/routes/webhooks/stripe')

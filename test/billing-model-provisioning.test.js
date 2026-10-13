@@ -29,6 +29,7 @@ function assertFollowsTier(upsert, expectedModel) {
 const stripeClientPath = path.join(ROOT, 'src', 'clients', 'stripe.js');
 const supabasePath = path.join(ROOT, 'src', 'clients', 'supabase.js');
 const activationPath = path.join(ROOT, 'src', 'services', 'publicPurchaseActivation.js');
+const enterpriseWebhookPath = path.join(ROOT, 'src', 'services', 'existingEnterprisePaymentWebhook.js');
 
 function injectModule(filename, exports) {
   require.cache[filename] = { id: filename, filename, loaded: true, exports };
@@ -98,9 +99,10 @@ function subscriptionEvent(metadata, { interval = 'month' } = {}) {
 }
 
 function loadApp(event) {
-  for (const p of [routerPath, stripeClientPath, supabasePath, activationPath]) delete require.cache[p];
+  for (const p of [routerPath, stripeClientPath, supabasePath, activationPath, enterpriseWebhookPath]) delete require.cache[p];
 
   injectModule(activationPath, { activatePublicPurchaseAgreementCheckout: async () => ({ ok: true }) });
+  injectModule(enterpriseWebhookPath, { classifyExistingEnterprisePaymentEvent: async () => null });
   injectModule(stripeClientPath, {
     webhooks: { constructEvent: () => event },
     subscriptions: { retrieve: async () => event.data.object }

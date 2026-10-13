@@ -154,6 +154,9 @@ function loadApp(event, db, { subscription = liveSubscription() } = {}) {
     recoveryHelperPath, salesIntegrationsPath, clientBillingScopePath]) {
     delete require.cache[p];
   }
+  injectModule(require.resolve('../src/services/existingEnterprisePaymentWebhook'), {
+    classifyExistingEnterprisePaymentEvent: async () => null
+  });
   const subscriptionRetrievals = [];
   injectModule(supabasePath, { supabaseAdmin: db, supabase: db, supabaseAnon: db });
   injectModule(stripeClientPath, {

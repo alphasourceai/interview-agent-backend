@@ -24,6 +24,7 @@ const routerPath = path.join(ROOT, 'src', 'routes', 'webhooks', 'stripe.js');
 const stripeClientPath = path.join(ROOT, 'src', 'clients', 'stripe.js');
 const supabasePath = path.join(ROOT, 'src', 'clients', 'supabase.js');
 const activationPath = path.join(ROOT, 'src', 'services', 'publicPurchaseActivation.js');
+const enterpriseWebhookPath = path.join(ROOT, 'src', 'services', 'existingEnterprisePaymentWebhook.js');
 const FENCE_MIGRATION = path.join(ROOT, 'supabase', 'migrations', '20261001131612_qa_public_purchase_activation_fences.sql');
 
 const MINUTE = 60 * 1000;
@@ -94,7 +95,7 @@ function makeDb(intentRow) {
 }
 
 function loadApp(intentRow, { type = 'checkout.session.completed' } = {}) {
-  for (const p of [routerPath, stripeClientPath, supabasePath, activationPath]) delete require.cache[p];
+  for (const p of [routerPath, stripeClientPath, supabasePath, activationPath, enterpriseWebhookPath]) delete require.cache[p];
 
   const activationCalls = [];
   injectModule(activationPath, {
@@ -103,6 +104,7 @@ function loadApp(intentRow, { type = 'checkout.session.completed' } = {}) {
       return { ok: true, status: 'activated' };
     },
   });
+  injectModule(enterpriseWebhookPath, { classifyExistingEnterprisePaymentEvent: async () => null });
   injectModule(stripeClientPath, {
     webhooks: {
       constructEvent: () => ({

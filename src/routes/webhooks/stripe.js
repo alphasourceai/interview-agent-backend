@@ -617,15 +617,16 @@ async function markAgreementCheckoutPaid(agreementId, options = {}) {
   }
   try {
     const activate = options.activate || activatePublicPurchaseAgreementCheckout;
-    const enterprisePayment = await completeExistingEnterprisePayment({
+    const expectedEnterpriseEvent = options.existingEnterprisePaymentEvent;
+    const markedEnterpriseDispatch = expectedEnterpriseEvent?.cohort === 'existing_enterprise'
+      && expectedEnterpriseEvent.agreementId === normalizedAgreementId;
+    const enterprisePayment = markedEnterpriseDispatch ? await completeExistingEnterprisePayment({
       db: fencedDb, stripe: options.stripe || stripe, agreementId: normalizedAgreementId,
       eventSessionId: options.checkoutSessionId || null,
       eventSubscriptionId: options.eventSubscriptionId || pickId(options.subscription?.id) || options.fallbackSubscriptionId || null,
       eventInvoiceId: options.invoiceId || null, eventLivemode: options.eventLivemode, assertFence
-    });
-    const expectedEnterpriseEvent = options.existingEnterprisePaymentEvent;
-    if (expectedEnterpriseEvent?.cohort === 'existing_enterprise'
-      && expectedEnterpriseEvent.agreementId === normalizedAgreementId && !enterprisePayment) {
+    }) : null;
+    if (markedEnterpriseDispatch && !enterprisePayment) {
       const error = new Error('enterprise_payment_completion_missing');
       error.code = error.message;
       error.status = 503;
