@@ -329,6 +329,10 @@ async function createSubscriptionCheckoutSession({
   if(normalizedPlanTier!=='enterprise' && (enterpriseFees?.pool_offer_snapshot!=null || enterpriseFees?.pool_offer_digest!=null))throw makeError(409,'invalid_enterprise_pool_snapshot','Enterprise pool terms do not apply to this plan.')
   const enterpriseTerms = normalizedPlanTier === 'enterprise' ? parseEnterpriseCheckoutTerms(enterpriseFees) : null
   if(enterpriseTerms?.acceptedPoolQuote && normalizedPromotionCodeId)throw makeError(409,'enterprise_pool_extra_discount_denied','The accepted pool total cannot be changed by an additional checkout discount.')
+  if (enterpriseTerms?.acceptedPoolQuote && normalizedMetadataSource !== 'agreement_checkout') {
+    throw makeError(409, 'enterprise_pool_signed_agreement_required',
+      'Use the existing Admin Billing signed-agreement flow for these interview pool terms.')
+  }
 
   const parentGuard = await requireParentClient(supabaseAdmin, normalizedClientId, {
     source: normalizedMetadataSource

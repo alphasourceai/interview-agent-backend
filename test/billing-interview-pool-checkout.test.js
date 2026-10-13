@@ -68,6 +68,7 @@ function loadCheckout(db, stripeCalls) {
     buildClientDashboardReturnUrl: () => 'https://dash.test/return'
   });
   injectModule(stripePackagePath, function Stripe() {
+    stripeCalls.constructed = true;
     return {
       customers: {
         retrieve: async (id) => ({ id }),
@@ -100,6 +101,22 @@ const ENTERPRISE_FEES = Object.freeze({
   included_interviews_per_role: 0,
   additional_interview_fee: 0,
   usage_interview_fee_cents: 2500
+});
+
+test('new prospective pool on admin direct checkout is refused before DB or provider effects, not silently repriced', async () => {
+  const db = makeDb(), calls = { prices: [], sessions: [] };
+  const { createSubscriptionCheckoutSession } = loadCheckout(db, calls);
+  const original = db.from.bind(db); let reads = 0;
+  db.from = table => { reads++; return original(table); };
+  const { prepareEnterprisePoolTerms } = require('../src/services/enterprisePoolSnapshot');
+  const terms = prepareEnterprisePoolTerms({ membership_tier: 'enterprise', billing_model: 'usage',
+    ...ENTERPRISE_FEES, pool_quantity: 30 });
+  await assert.rejects(createSubscriptionCheckoutSession({ clientId: CLIENT, planTier: 'enterprise',
+    billingInterval: 'monthly', metadataSource: 'admin_subscription_checkout', enterpriseFees: terms }),
+    { code: 'enterprise_pool_signed_agreement_required', status: 409 });
+  assert.equal(reads, 0); assert.equal(calls.constructed, undefined);
+  assert.deepEqual(calls.prices, []); assert.deepEqual(calls.sessions, []);
+  assert.equal(db.tables.client_interview_pools.length, 0);
 });
 
 async function buy(db, enterpriseFees) {
@@ -368,7 +385,7 @@ test('a pool id that does not exist is acknowledged', async () => {
 
 test('the pool is checked before the purchase branches and settled after them', () => {
   const source = fs.readFileSync(webhookPath, 'utf8');
-  const loaded = source.indexOf("purchaseType === 'interview_pool'\n        ? await loadInterviewPoolForCheckout(metadata)");
+  const loaded = source.indexOf("purchaseType === 'interview_pool'\n        ? await loadInterviewPoolForCheckout(metadata, { retryableAgreementEvent })");
   const poolOnly = source.indexOf('if (interviewPool && !isSubscriptionSession) {');
   const additional = source.indexOf("} else if (purchaseType === 'additional_interviews') {");
   const settled = source.indexOf('await settleInterviewPoolFromCheckout(interviewPool');

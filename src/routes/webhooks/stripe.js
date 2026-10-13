@@ -19,6 +19,7 @@ const { applyUsageToInvoice } = require('../../services/usageBilling');
 const { markPoolFailed, markPoolPaid } = require('../../services/interviewPool');
 const { loadExistingRetailSubscriptionTerms, assertExistingRetailSubscription } = require('../../services/contracts/subscriptionPricingTerms');
 const { readExistingRetailCheckoutFunding, assertExistingRetailFundingSource } = require('../../services/existingRetailCheckoutFunding');
+const { enterprisePoolProofRequired, assertExistingEnterprisePoolActivationAvailableFromDb } = require('../../services/existingEnterprisePoolActivationHold');
 const router = express.Router();
 
 const SETTLED_PAYMENT_STATUSES = new Set(['paid', 'no_payment_required']);
@@ -475,7 +476,7 @@ function shouldIgnoreStaleSubscriptionUpdate(client, incomingSubscriptionId, eve
 // Metadata that disagrees with the row means the session is not describing this
 // pool, the same cross-checks the additional-interviews branch makes, and no
 // retry will change that.
-async function loadInterviewPoolForCheckout(metadata = {}) {
+async function loadInterviewPoolForCheckout(metadata = {}, { retryableAgreementEvent = false } = {}) {
   const poolId = String(metadata?.client_interview_pool_id || '').trim();
   if (!poolId) throw permanentFailure('Interview pool id missing from checkout metadata');
 
@@ -486,10 +487,6 @@ async function loadInterviewPoolForCheckout(metadata = {}) {
     .maybeSingle();
   if (poolLookupErr) throw new Error(poolLookupErr.message || 'Interview pool lookup failed');
   if (!pool) throw permanentFailure('Interview pool not found');
-  // Prospective native price proof is required BEFORE any client activation;
-  // old metadata-only settlement must never grant new-protocol pool credits.
-  if(pool.offer_snapshot!==null || pool.offer_digest!==null)throw permanentFailure('ENTERPRISE_POOL_V2_PAYMENT_PROOF_REQUIRED');
-
   const metadataClientId = String(metadata?.client_id || '').trim();
   if (metadataClientId && String(pool.client_id) !== metadataClientId) {
     throw permanentFailure('Interview pool client mismatch');
@@ -498,6 +495,13 @@ async function loadInterviewPoolForCheckout(metadata = {}) {
   if (Number.isInteger(metadataPoolQuantity) && metadataPoolQuantity > 0
     && Number(pool.quantity_purchased) !== metadataPoolQuantity) {
     throw permanentFailure('Interview pool quantity mismatch');
+  }
+  // A real mismatch above remains permanent. A prospective proof hold on a
+  // settled agreement is incomplete, not successfully processed: keep Stripe
+  // redelivery available while the trusted existing-path adapter is unfinished.
+  if (pool.offer_snapshot !== null || pool.offer_digest !== null) {
+    if (retryableAgreementEvent) throw enterprisePoolProofRequired();
+    throw permanentFailure('ENTERPRISE_POOL_V2_PAYMENT_PROOF_REQUIRED');
   }
   return pool;
 }
@@ -818,6 +822,14 @@ router.post('/', async (req, res) => {
   };
 
   try {
+    if (event.type === 'invoice.payment_succeeded' && retryableAgreementEvent) {
+      let metadata = eventObject?.metadata || {};
+      if ((!metadata.source || !metadata.agreement_id) && pickId(eventObject?.subscription)) {
+        const subscription = await stripe.subscriptions.retrieve(pickId(eventObject.subscription));
+        metadata = { ...(subscription?.metadata || {}), ...metadata };
+      }
+      await assertExistingEnterprisePoolActivationAvailableFromDb(supabaseAdmin, String(metadata.agreement_id || '').trim());
+    }
     if (String(event.type || '').startsWith('invoice.')) {
       await syncBillingInvoiceFromStripeEvent(eventObject, request_id);
     }
@@ -835,6 +847,8 @@ router.post('/', async (req, res) => {
       const subscriptionMetadata = eventObject?.metadata && typeof eventObject.metadata === 'object'
         ? eventObject.metadata
         : {};
+      const sourceAgreementId = String(subscriptionMetadata.agreement_id || '').trim();
+      if (sourceAgreementId) await assertExistingEnterprisePoolActivationAvailableFromDb(supabaseAdmin, sourceAgreementId);
       const allowGenericSubscriptionUpdate = await shouldApplyGenericSubscriptionUpdate(subscriptionMetadata);
       if (customerId) {
         const incomingSubscriptionId = pickId(eventObject?.id) || pickId(eventObject?.subscription) || null;
@@ -918,7 +932,7 @@ router.post('/', async (req, res) => {
       // half-done. It is settled last, once activation has succeeded, so a pool is
       // never spendable for a membership whose activation failed.
       const interviewPool = purchaseType === 'interview_pool'
-        ? await loadInterviewPoolForCheckout(metadata)
+        ? await loadInterviewPoolForCheckout(metadata, { retryableAgreementEvent })
         : null;
 
       if (interviewPool && !isSubscriptionSession) {
@@ -1360,6 +1374,8 @@ router.post('/', async (req, res) => {
               subscription_id: subscriptionId
             });
             const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+            const sourceAgreementId = String(subscription?.metadata?.agreement_id || metadataAgreementId || '').trim();
+            if (sourceAgreementId) await assertExistingEnterprisePoolActivationAvailableFromDb(supabaseAdmin, sourceAgreementId);
             const retailTerms = await loadExistingRetailSubscriptionTerms({db:supabaseAdmin,clientId:client.id,subscription});
             if (retailTerms?.pending) {
               await markProcessed(true, null);

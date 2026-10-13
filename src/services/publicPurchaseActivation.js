@@ -16,6 +16,7 @@ const { buildClientPwResetUrl } = require('../config/urlConfig');
 const { enqueueSalesWonDelivery } = require('./salesIntegrations');
 const { readRetailPackageOffer } = require('./membershipPackageCompatibility');
 const { retailTermWindow } = require('./membershipOffers');
+const { assertExistingEnterprisePoolActivationAvailable } = require('./existingEnterprisePoolActivationHold');
 
 const LIVE_SUBSCRIPTION_STATUSES = new Set(['active', 'trialing']);
 const PRIVILEGED_MEMBER_ROLES = new Set(['manager', 'admin', 'owner', 'super_admin']);
@@ -856,6 +857,7 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     .maybeSingle();
   if (agreementErr) throw new Error(agreementErr.message || 'Agreement lookup failed');
   if (!agreement) return { ok: false, status: 'agreement_not_found' };
+  assertExistingEnterprisePoolActivationAvailable(agreement);
 
   const intent = await loadPublicPurchaseIntent(db, agreement);
   if (intent?.id && cleanText(intent.protocol) === 'legacy_complete') {
