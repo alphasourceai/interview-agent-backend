@@ -10,10 +10,13 @@ const { buildRetailPackageSnapshot } = require('../src/services/membershipPackag
 const { OFFER_VERSION, retailTermWindow } = require('../src/services/membershipOffers');
 const enabled = process.env.RETAIL_EXISTING_TERMS_DISPOSABLE === 'true';
 const options = { skip: !enabled };
+const qualificationEnabled = enabled && process.env.RETAIL_EXISTING_SALES_QUALIFICATION_DISPOSABLE === 'true';
+const qualificationOptions = { skip: !qualificationEnabled };
 const root = path.resolve(__dirname, '..');
 const migration = path.join(root, 'supabase/migrations/20261012230107_retail_existing_flow_pricing_terms.sql');
 const featuresMigration = path.join(root, 'supabase/migrations/20261013032659_retail_existing_initial_plan_features.sql');
 const featureSql = () => fs.readFileSync(featuresMigration, 'utf8');
+const qualificationSql = () => fs.readFileSync(path.join(root, 'supabase/migrations/20261013044440_retail_existing_sales_qualification.sql'), 'utf8');
 const psql = '/opt/homebrew/opt/postgresql@17/bin/psql';
 const paidAt = '2026-01-31T15:45:00.000Z';
 if (enabled) {
@@ -24,7 +27,7 @@ if (enabled) {
   assert.equal(process.env.PGPASSWORD, undefined);
 }
 function sql(text, database = 'postgres') {
-  assert.ok(['postgres', 'retail_pricing_drift_test', 'retail_features_baseline_test'].includes(database));
+  assert.ok(['postgres', 'retail_pricing_drift_test', 'retail_features_baseline_test', 'retail_sales_qualification_drift_test'].includes(database));
   return execFileSync(psql, ['-X', '-A', '-t', '-d', database, '-v', 'ON_ERROR_STOP=1'], { input: text, encoding: 'utf8' }).trim();
 }
 const quote = value => value == null ? 'null' : `'${String(value).replaceAll("'", "''")}'`;
@@ -88,7 +91,9 @@ function prepareDatabase(database = 'postgres') {
     alter table public.membership_agreements add column membership_tier text, add column billing_option text,
       add column auto_renew boolean, add column signer_accepted boolean, add column template_version text,
       add column template_snapshot jsonb, add column signed_at timestamptz, add column agreement_expires_at timestamptz;
-    alter table public.public_purchase_intents add column expires_at timestamptz;
+    alter table public.public_purchase_intents add column expires_at timestamptz,
+      add column channel text, add column created_by_user_id uuid;
+    create table public.sales_reps(user_id uuid primary key);
     alter table public.client_plan_settings add constraint client_plan_settings_billing_interval_check check(billing_interval in ('monthly','annual'));
     alter table public.membership_agreements add constraint membership_agreements_billing_option_check check(billing_option in ('monthly','annual'));
     create table public.retail_signup_email_verifications (billing_cadence text constraint retail_signup_email_verifications_billing_cadence_check check(billing_cadence in ('monthly','annual')));
@@ -101,6 +106,7 @@ test('setup actual activation fences and pricing compatibility in disposable PG 
   prepareDatabase();
   sql(fs.readFileSync(migration, 'utf8'));
   sql(featureSql());
+  if (qualificationEnabled) sql(qualificationSql());
 });
 test('original native legacy completion/billing/member/welcome assertions remain unchanged', options, () => {
   const read = name => fs.readFileSync(path.join(__dirname, `fixtures/qa-activation-fence-disposable-${name}-assertions.sql`), 'utf8');
@@ -329,4 +335,107 @@ test('writer assignment source drift rolls back all compatibility DDL in a secon
     'client_plan_settings_billing_interval_check','membership_agreements_billing_option_check',
     'retail_signup_email_verifications_billing_cadence_check','retail_signup_sms_verifications_billing_cadence_check')
     and pg_get_constraintdef(oid) like '%prepaid%';`, 'retail_pricing_drift_test'), '0');
+});
+
+const salesRep='77777777-7777-4777-8777-777777777777';
+const otherRep='88888888-8888-4888-8888-888888888888';
+function setupSales(r,rep=salesRep) {
+  r.a.template_snapshot.source='sales_assisted';
+  setup(r);
+  sql(`insert into public.sales_reps(user_id) values(${quote(salesRep)}),(${quote(otherRep)}) on conflict do nothing;
+    update public.public_purchase_intents set channel='sales_assisted',created_by_user_id=${quote(rep)} where id=${quote(r.i.id)};`);
+}
+test('native original sales qualification binds real source paid A not signing, gross excludes role',qualificationOptions,()=>{
+  for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments']) {
+    const r=rows('pro',months,payment,true);setupSales(r);
+    assert.equal(JSON.parse(sql(`select ${complete(r)};`)).status,'completed');
+    const q=JSON.parse(sql(`select to_jsonb(q) from public.retail_existing_sales_qualifications q where purchase_intent_id=${quote(r.i.id)};`));
+    assert.equal(q.agreement_id,r.a.id);assert.equal(q.client_id,r.client);assert.equal(q.rep_user_id,salesRep);
+    assert.equal(q.platform_cap_cents,r.s.membership_terms.platform_payment_cents);
+    assert.notEqual(q.platform_cap_cents,r.s.membership_terms.initial_payment_cents);
+    assert.equal(q.payment_kind,payment==='prepaid'?'paid_in_full':'monthly');
+    assert.equal(new Date(q.original_start_at).toISOString(),paidAt);
+    assert.equal(new Date(q.qualification_closed_at).toISOString(),paidAt);
+    assert.equal(new Date(q.original_term_end_at).toISOString(),retailTermWindow({originalStart:paidAt,commitmentMonths:months}).term_end_at);
+    assert.equal(new Date(q.commission_window_end_at).toISOString(),retailTermWindow({originalStart:paidAt,commitmentMonths:12}).term_end_at);
+    assert.match(q.terms_digest,/^[a-f0-9]{64}$/);
+    // Completion is not native billing proof or commission admission.
+    assert.equal(sql(`select billing_applied_at is null from public.public_purchase_intents where id=${quote(r.i.id)};`),'t');
+    assert.equal(sql(`select billing_status from public.clients where id=${quote(r.client)};`),'inactive');
+    assert.equal(JSON.parse(sql(`select ${billing(r)};`)).status,'applied');
+  }
+});
+test('native original sales qualification matching replay no-op and reassignment cannot rewrite original rep',qualificationOptions,()=>{
+  const r=rows('basic',3,'monthly_installments');setupSales(r);sql(`select ${complete(r)};`);
+  const before=sql(`select to_jsonb(q) from public.retail_existing_sales_qualifications q where purchase_intent_id=${quote(r.i.id)};`);
+  sql(`select ${complete(r)};`);
+  assert.equal(sql(`select to_jsonb(q) from public.retail_existing_sales_qualifications q where purchase_intent_id=${quote(r.i.id)};`),before);
+  sql(`update public.public_purchase_intents set created_by_user_id=${quote(otherRep)} where id=${quote(r.i.id)};`);
+  assert.throws(()=>sql(`select ${complete(r)};`),/retail_sales_qualification_replay_mismatch/);
+  assert.equal(sql(`select to_jsonb(q) from public.retail_existing_sales_qualifications q where purchase_intent_id=${quote(r.i.id)};`),before);
+});
+test('native missing original sales rep rolls back existing completion and client creation',qualificationOptions,()=>{
+  const r=rows('pro',6,'monthly_installments');setupSales(r,'99999999-9999-4999-8999-999999999999');
+  assert.throws(()=>sql(`select ${complete(r)};`),/retail_sales_qualification_original_rep_required/);
+  assert.equal(sql(`select count(*) from public.clients where id=${quote(r.client)};`),'0');
+  assert.equal(sql(`select status from public.public_purchase_intents where id=${quote(r.i.id)};`),'checkout_pending');
+  assert.equal(sql(`select checkout_paid_at is null from public.membership_agreements where id=${quote(r.a.id)};`),'t');
+});
+test('native public and non-sales completion requires no rep or sales qualification',qualificationOptions,()=>{
+  for(const channel of ['self_service','admin',null]) {
+    const r=rows();setup(r);
+    sql(`update public.public_purchase_intents set channel=${quote(channel)} where id=${quote(r.i.id)};select ${complete(r)};`);
+    assert.equal(sql(`select count(*) from public.retail_existing_sales_qualifications where purchase_intent_id=${quote(r.i.id)};`),'0');
+  }
+});
+test('native qualification immutable, browser denied, service only select/insert and FK links retained',qualificationOptions,()=>{
+  const r=rows('pro',3,'monthly_installments');setupSales(r);sql(`select ${complete(r)};`);
+  for(const command of [
+    `update public.retail_existing_sales_qualifications set platform_cap_cents=1 where purchase_intent_id=${quote(r.i.id)}`,
+    `delete from public.retail_existing_sales_qualifications where purchase_intent_id=${quote(r.i.id)}`,
+    'truncate public.retail_existing_sales_qualifications'
+  ])assert.throws(()=>sql(command),/retail_sales_qualification_immutable/);
+  for(const role of ['anon','authenticated'])assert.throws(()=>sql(`set role ${role};select * from public.retail_existing_sales_qualifications;`),/permission denied/);
+  assert.equal(sql(`select has_table_privilege('service_role','public.retail_existing_sales_qualifications','SELECT')
+    and has_table_privilege('service_role','public.retail_existing_sales_qualifications','INSERT')
+    and not has_table_privilege('service_role','public.retail_existing_sales_qualifications','UPDATE')
+    and not has_table_privilege('service_role','public.retail_existing_sales_qualifications','DELETE')
+    and not has_table_privilege('service_role','public.retail_existing_sales_qualifications','TRUNCATE');`),'t');
+  assert.equal(sql(`select relrowsecurity from pg_class where oid='public.retail_existing_sales_qualifications'::regclass;`),'t');
+  assert.throws(()=>sql(`delete from public.sales_reps where user_id=${quote(salesRep)};`),/foreign key constraint/);
+});
+test('native direct qualification insert cannot alter platform cap, close, digest or kind',qualificationOptions,()=>{
+  const r=rows('basic',3,'monthly_installments',true);setupSales(r);sql(`select ${complete(r)};`);
+  const q=JSON.parse(sql(`select to_jsonb(q) from public.retail_existing_sales_qualifications q where purchase_intent_id=${quote(r.i.id)};`));
+  const before=JSON.stringify(q);
+  for(const changes of [{platform_cap_cents:q.platform_cap_cents+1},{qualification_closed_at:'2026-01-01T00:00:00Z'},
+    {terms_digest:'0'.repeat(64)},{payment_kind:'paid_in_full'},{commission_window_end_at:q.original_term_end_at}]) {
+    const altered={...q,...changes};
+    assert.throws(()=>sql(`insert into public.retail_existing_sales_qualifications select *
+      from jsonb_populate_record(null::public.retail_existing_sales_qualifications,${json(altered)});`),/retail_sales_qualification_source_mismatch/);
+    assert.equal(JSON.stringify(JSON.parse(sql(`select to_jsonb(q) from public.retail_existing_sales_qualifications q where purchase_intent_id=${quote(r.i.id)};`))),before);
+  }
+});
+test('native qualification migration refuses privilege/source drift and completed new sales without partial DDL',qualificationOptions,()=>{
+  const database='retail_sales_qualification_drift_test';sql(`create database ${database} template template0;`);
+  prepareDatabase(database);sql(fs.readFileSync(migration,'utf8'),database);sql(featureSql(),database);
+  const sig='public.complete_public_purchase_activation(uuid,text,timestamptz,text,uuid,boolean,text,text,date,date)';
+  const original=sql(`select pg_get_functiondef(${quote(sig)}::regprocedure);`,database);
+  const privileges=sql(`select jsonb_build_array(proowner,proacl,proconfig,prosecdef) from pg_proc where oid=${quote(sig)}::regprocedure;`,database);
+  sql(`grant execute on function ${sig} to anon;`,database);
+  assert.throws(()=>sql(qualificationSql(),database),/retail_sales_qualification_writer_source_drift/);
+  assert.equal(sql("select to_regclass('public.retail_existing_sales_qualifications') is null;",database),'t');
+  sql(`revoke all on function ${sig} from anon;`,database);
+  sql(original.replace('activated_at = coalesce(activated_at, v_agreement.checkout_paid_at, p_paid_at),','activated_at = clock_timestamp(),'),database);
+  assert.throws(()=>sql(qualificationSql(),database),/retail_sales_qualification_writer_source_drift/);
+  assert.equal(sql("select to_regprocedure('public.retail_existing_sales_terms_digest(jsonb)') is null;",database),'t');
+  sql(original,database);
+  const id='99999999-9999-4999-8999-999999999998';
+  sql(`insert into public.public_purchase_intents(id,channel,activated_at,package_snapshot)
+    values(${quote(id)},'sales_assisted',clock_timestamp(),'{}'::jsonb||jsonb_build_object('pricing_protocol','synthetic'));`,database);
+  assert.throws(()=>sql(qualificationSql(),database),/retail_sales_qualification_existing_cohort_review_required/);
+  sql(`delete from public.public_purchase_intents where id=${quote(id)};`,database);
+  sql(qualificationSql(),database);
+  assert.equal(sql(`select jsonb_build_array(proowner,proacl,proconfig,prosecdef) from pg_proc where oid=${quote(sig)}::regprocedure;`,database),privileges);
+  assert.throws(()=>sql(qualificationSql(),database),/retail_sales_qualification_schema_drift/);
 });
