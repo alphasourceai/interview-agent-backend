@@ -226,7 +226,7 @@ router.post('/clients/billing/portal-session', requireAuth, withClientScope, asy
       configurationId: process.env.STRIPE_RETAIL_PORTAL_CONFIGURATION_ID,
       stripeKey: process.env.STRIPE_SECRET_KEY
     })
-    return res.json({ ok: true, url: session?.url || null })
+    return res.json({ ok: true, url: session.url })
   } catch (e) {
     if (e?.code === 'RETAIL_PORTAL_UNAVAILABLE' || e?.code === 'RETAIL_PORTAL_FORBIDDEN') {
       return res.status(e.status).json({ error: e.code, code: e.code, detail: e.message });

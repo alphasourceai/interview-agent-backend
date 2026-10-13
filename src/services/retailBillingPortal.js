@@ -44,13 +44,16 @@ async function readCustomerSubscriptions(stripe, customerId) {
 async function readState({db,stripe,clientId,customerId,authorizeRetail}) {
   const scope=await resolveBillingOwnerForScope(db,clientId);
   requireFact(scope.ok && scope.billingClientId && scope.billingClient?.id === scope.billingClientId
-    && scope.billingClient?.stripe_customer_id === customerId);
-  const subscriptionId=scope.billingClient.stripe_subscription_id;
-  const subscription=subscriptionId ? await stripe.subscriptions.retrieve(subscriptionId) : null;
-  const identity=subscription ? subscriptionIdentity(subscription,customerId) : null;
-  requireFact(!subscriptionId || identity?.id === subscriptionId);
+    && scope.scopeClient?.id === clientId && scope.scopeClient?.stripe_customer_id === customerId);
+  // Classify the parent's agreement on the parent's own provider binding, but
+  // never replace the requested customer's portal identity. An unmarked legacy
+  // child may already have its own unique customer; that path must be preserved.
+  const ownerSubscriptionId=scope.billingClient.stripe_subscription_id;
+  const ownerSubscription=ownerSubscriptionId ? await stripe.subscriptions.retrieve(ownerSubscriptionId) : null;
+  const ownerIdentity=ownerSubscription ? subscriptionIdentity(ownerSubscription,scope.billingClient.stripe_customer_id) : null;
+  requireFact(!ownerSubscriptionId || ownerIdentity?.id === ownerSubscriptionId);
   let context;
-  try { context=await loadExistingRetailSubscriptionTerms({db,clientId:scope.billingClientId,subscription}); }
+  try { context=await loadExistingRetailSubscriptionTerms({db,clientId:scope.billingClientId,subscription:ownerSubscription}); }
   catch (error) { if (scope.isChildClient) throw hold(true); throw error; }
   if (scope.isChildClient && context) throw hold(true);
   requireFact(!context?.pending);
@@ -62,12 +65,16 @@ async function readState({db,stripe,clientId,customerId,authorizeRetail}) {
     .eq('stripe_customer_id',customerId).limit(2);
   requireFact(!error && count === 1 && Array.isArray(owners) && owners.length === 1
     && owners[0].id === clientId);
+  const subscriptionId=scope.scopeClient.stripe_subscription_id;
+  const subscription=subscriptionId ? (subscriptionId === ownerSubscriptionId ? ownerSubscription : await stripe.subscriptions.retrieve(subscriptionId)) : null;
+  const identity=subscription ? subscriptionIdentity(subscription,customerId) : null;
+  requireFact(!subscriptionId || identity?.id === subscriptionId);
   const census=await readCustomerSubscriptions(stripe,customerId);
   requireFact(!identity || census.some(sub=>isDeepStrictEqual(sub,identity)));
-  requireFact(census.every(sub=>sub.metadata.membership_pricing_version == null || sub.id === subscriptionId));
+  requireFact(census.every(sub=>sub.metadata.membership_pricing_version == null || !!context && sub.id === subscriptionId));
   requireFact(!context || context.client.stripe_customer_id === customerId
     && context.client.stripe_subscription_id === subscriptionId);
-  return {scope,context,identity,census};
+  return {scope,context,ownerIdentity,identity,census};
 }
 function assertConfiguration(config, configurationId, livemode) {
   requireFact(config?.object === 'billing_portal.configuration' && config.id === configurationId

@@ -322,7 +322,8 @@ test('the money-spending responses are documented exactly', () => {
 
   // Asserted against the literal the route returns rather than a live call, so
   // that no test here can create a Stripe session.
-  assert.match(source, /return res\.json\(\{ ok: true, url: session\?\.url \|\| null \}\)/);
+  assert.match(source, /return res\.json\(\{ ok: true, url: session\.url \}\)/);
+  assert.match(doc, /\| `url` \| string \| no \| Verified short-lived Stripe portal URL\./);
   assert.deepEqual(
     documentedFields('POST /clients/billing/portal-session'),
     ['ok', 'url'].sort()

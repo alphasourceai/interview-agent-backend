@@ -214,10 +214,19 @@ Opens the Stripe billing portal. Body: `{ "client_id": "…", "tab": "billing" }
 | Field | Type | Null? | Meaning |
 | --- | --- | --- | --- |
 | `ok` | boolean | no | Always `true` on success. |
-| `url` | string | yes | Where to send the browser. Null means Stripe returned no URL; treat as a failure. |
+| `url` | string | no | Verified short-lived Stripe portal URL. Never log it or reuse it as a permanent link. |
 
 Requires write access to the client and an existing Stripe customer, otherwise
 `400 missing_stripe_customer`.
+
+Accepted retail 3/6/12-month agreements require the authorized parent billing
+client and a server-configured, nondefault portal with invoice history and
+payment-method updates only. Subscription cancellation/price changes are not
+available there; renewal preferences belong in alphaScreen. Browser-supplied
+configuration, return URLs and deep-link flows are ignored. Unmarked verified
+legacy and Enterprise customers keep the existing default portal payload.
+An ambiguous shared customer, unsafe/missing configuration or unverifiable
+provider/source response returns a stable safe error, never a fallback URL.
 
 ### POST /clients/billing/additional-interviews/checkout-session
 
@@ -425,7 +434,8 @@ upper-case `code`. Match on `error`; `detail` is for logs, not for users.
 | 500 | `read_usage_failed` | |
 | 500 | `read_pool_failed` | |
 | 500 | `list_billing_summary_failed` | |
-| 500 | `create_portal_session_failed` | |
+| 503 | `RETAIL_PORTAL_UNAVAILABLE` | Portal source/configuration could not be verified safely. No fallback session URL is returned. |
+| 403 | `RETAIL_PORTAL_FORBIDDEN` | Accepted retail portal requires the authorized parent billing client. |
 | 500 | `create_additional_interviews_checkout_session_failed` | |
 | 500 | `create_role_interview_purchase_failed` | |
 | 500 | `update_role_interview_purchase_failed` | |

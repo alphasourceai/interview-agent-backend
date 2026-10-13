@@ -131,6 +131,24 @@ test('a child with an unmarked row cannot use the accepted parent customer throu
  f.tables.clients.push({id:child,parent_client_id:C,stripe_customer_id:CUSTOMER,billing_interval:'monthly'});
  await assert.rejects(service(f,{clientId:child}));assert.equal(f.calls.some(x=>x.op==='create'),false);
 });
+test('unmarked legacy parent preserves child portal with its own unique customer and clean census',async()=>{
+ const f=fixture(),child='55555555-5555-4555-8555-555555555555',customer='cus_CHILD';
+ f.client.billing_interval='monthly';f.tables.membership_agreements=[];f.subscription.metadata={};
+ f.tables.clients.push({id:child,parent_client_id:C,stripe_customer_id:customer,billing_interval:'monthly',stripe_subscription_id:null});
+ f.subscriptions=[{id:'sub_CHILD_HISTORY',object:'subscription',customer,livemode:false,metadata:{}}];
+ f.session.customer=customer;
+ assert.equal((await service(f,{clientId:child,customerId:customer})).url,f.session.url);
+ assert.deepEqual(f.calls.find(x=>x.op==='create').payload,{customer,return_url:RETURN});
+ assert.equal(f.calls.filter(x=>x.op==='create').length,1);
+});
+test('the same unique legacy child with a marked provider subscription cannot create a default portal',async()=>{
+ const f=fixture(),child='55555555-5555-4555-8555-555555555555',customer='cus_CHILD';
+ f.client.billing_interval='monthly';f.tables.membership_agreements=[];f.subscription.metadata={};
+ f.tables.clients.push({id:child,parent_client_id:C,stripe_customer_id:customer,billing_interval:'monthly',stripe_subscription_id:null});
+ f.subscriptions=[{id:'sub_CHILD_HISTORY',object:'subscription',customer,livemode:false,metadata:{membership_pricing_version:'marked'}}];
+ await assert.rejects(service(f,{clientId:child,customerId:customer}),{code:'RETAIL_PORTAL_UNAVAILABLE'});
+ assert.equal(f.calls.some(x=>x.op==='create'),false);
+});
 test('legacy-null to retail transition between reads refuses the default session',async()=>{
  const f=fixture(),accepted=structuredClone(f.agreement);f.client.billing_interval='monthly';f.tables.membership_agreements=[];f.subscription.metadata={};
  const originalList=f.stripe.subscriptions.list;let reads=0;
