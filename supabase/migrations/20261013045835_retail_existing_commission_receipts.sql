@@ -41,6 +41,7 @@ create temporary table retail_expected_baseline_receipts (
 -- Validate only two known ledger shapes. No retired contract stack installation.
 do $schema$
 declare old_v2 boolean; names text[]; expected text; actual text; key text; p record; expected_checks text[]; actual_checks text[];
+  balance_guard record; paid_helper record; bank record; bank_attr smallint; receipt_attr smallint; bank_id_attr smallint;
 begin
   if to_regclass('public.retail_existing_sales_qualifications') is null
     or to_regprocedure('public.retail_existing_sales_terms_digest(jsonb)') is null
@@ -63,11 +64,84 @@ begin
   for p in select * from (values
     ('reject_sales_commission_ledger_mutation','60e25f1abc2aff6f5a02d1ed0b1c40c9'),
     ('check_sales_commission_departure_cutoff','030f985df12a23358849d9343cf70b80'),
-    ('check_sales_commission_week_unlocked','10ef36caf48a5cb65f777328d1393767'),
-    ('check_sales_commission_receipt_balance','c09edf8ee2a7e017179ceaeb36bcac05')) as v(name,hash) loop
+    ('check_sales_commission_week_unlocked','10ef36caf48a5cb65f777328d1393767')) as v(name,hash) loop
     if not exists(select 1 from pg_proc where oid=to_regprocedure('public.'||p.name||'()') and md5(prosrc)=p.hash and not prosecdef)
     then raise exception 'retail_commission_existing_guard_drift'; end if;
   end loop;
+  -- Preserve either known payroll baseline, including the existing Mercury
+  -- reversal-aware successor. Never reinstall the older balance function.
+  select * into balance_guard from pg_proc
+    where oid=to_regprocedure('public.check_sales_commission_receipt_balance()');
+  if balance_guard.oid is null or balance_guard.prosecdef
+    or md5(balance_guard.prosrc) not in('c09edf8ee2a7e017179ceaeb36bcac05','9076bbf8ad26c2a27a09e8efef9c584f')
+  then raise exception 'retail_commission_existing_guard_drift'; end if;
+  if md5(balance_guard.prosrc)='c09edf8ee2a7e017179ceaeb36bcac05' then
+    if to_regprocedure('public.sales_commission_effective_paid(uuid)') is not null
+      or to_regclass('public.sales_commission_bank_transactions') is not null
+      or to_regclass('public.sales_commission_bank_reversals') is not null
+      or to_regclass('public.sales_commission_bank_api_bindings') is not null
+      or exists(select 1 from pg_attribute where attrelid='public.sales_commission_payouts'::regclass
+        and attname='bank_transaction_id' and not attisdropped)
+    then raise exception 'retail_commission_existing_guard_drift'; end if;
+  else
+    if balance_guard.prolang is distinct from(select oid from pg_language where lanname='plpgsql')
+      or balance_guard.prorettype<>'trigger'::regtype or balance_guard.provolatile<>'v'
+      or balance_guard.proconfig is distinct from array['search_path=""']::text[]
+    then raise exception 'retail_commission_existing_guard_drift'; end if;
+    select * into paid_helper from pg_proc where oid=to_regprocedure('public.sales_commission_effective_paid(uuid)');
+    if paid_helper.oid is null or md5(paid_helper.prosrc) is distinct from '246336636dd04aabc37bbf44e9a8b143'
+      or paid_helper.prosecdef or paid_helper.prorettype<>'bigint'::regtype or paid_helper.proretset
+      or paid_helper.prolang is distinct from(select oid from pg_language where lanname='sql')
+      or paid_helper.provolatile<>'s' or paid_helper.pronargs<>1 or paid_helper.proargtypes[0]<>'uuid'::regtype
+      or paid_helper.proargnames is distinct from array['p_receipt_id']::text[]
+      or paid_helper.proconfig is distinct from array['search_path=""']::text[]
+      or has_function_privilege('anon',paid_helper.oid,'EXECUTE')
+      or has_function_privilege('authenticated',paid_helper.oid,'EXECUTE')
+      or not has_function_privilege('service_role',paid_helper.oid,'EXECUTE')
+      or to_regclass('public.sales_commission_bank_transactions') is null
+      or to_regclass('public.sales_commission_bank_reversals') is null
+      or to_regclass('public.sales_commission_bank_api_bindings') is null
+    then raise exception 'retail_commission_existing_guard_drift'; end if;
+    select attnum into bank_id_attr from pg_attribute where attrelid='public.sales_commission_bank_transactions'::regclass
+      and attname='id' and not attisdropped and atttypid='uuid'::regtype and attnotnull;
+    select attnum into bank_attr from pg_attribute where attrelid='public.sales_commission_payouts'::regclass
+      and attname='bank_transaction_id' and not attisdropped and atttypid='uuid'::regtype and not attnotnull;
+    select attnum into receipt_attr from pg_attribute where attrelid='public.sales_commission_payouts'::regclass
+      and attname='receipt_id' and not attisdropped;
+    if bank_id_attr is null or bank_attr is null or receipt_attr is null
+      or not exists(select 1 from pg_constraint where conrelid='public.sales_commission_payouts'::regclass and contype='f'
+        and convalidated and conkey=array[bank_attr] and confkey=array[bank_id_attr]
+        and confrelid='public.sales_commission_bank_transactions'::regclass and confdeltype='r')
+      or not exists(select 1 from pg_index where indexrelid=to_regclass('public.sales_commission_payout_bank_receipt_uniq')
+        and indrelid='public.sales_commission_payouts'::regclass and indisunique and indisvalid and indisready
+        and indnatts=2 and indnkeyatts=2 and indkey[0]=bank_attr and indkey[1]=receipt_attr and indexprs is null
+        and pg_get_expr(indpred,indrelid)='(bank_transaction_id IS NOT NULL)')
+    then raise exception 'retail_commission_existing_guard_drift'; end if;
+    for bank in select * from(values
+      ('sales_commission_bank_transactions','sales_commission_bank_transactions_immutable'),
+      ('sales_commission_bank_reversals','sales_commission_bank_reversals_immutable'),
+      ('sales_commission_bank_api_bindings','sales_commission_bank_api_bindings_immutable')) v(tbl,trg) loop
+      if not exists(select 1 from pg_trigger where tgrelid=to_regclass('public.'||bank.tbl)
+        and tgname=bank.trg and tgenabled='O' and tgtype=27
+        and tgfoid=to_regprocedure('public.reject_sales_commission_ledger_mutation()'))
+      then raise exception 'retail_commission_existing_guard_drift'; end if;
+      if bank.tbl<>'sales_commission_bank_transactions' then
+        select attnum into bank_attr from pg_attribute where attrelid=to_regclass('public.'||bank.tbl)
+          and attname='bank_transaction_id' and not attisdropped and atttypid='uuid'::regtype and attnotnull;
+        if bank_attr is null or not exists(select 1 from pg_constraint where conrelid=to_regclass('public.'||bank.tbl)
+          and contype='p' and convalidated and conkey=array[bank_attr])
+          or not exists(select 1 from pg_constraint where conrelid=to_regclass('public.'||bank.tbl)
+            and contype='f' and convalidated and conkey=array[bank_attr] and confkey=array[bank_id_attr]
+            and confrelid='public.sales_commission_bank_transactions'::regclass and confdeltype='r')
+        then raise exception 'retail_commission_existing_guard_drift'; end if;
+      end if;
+    end loop;
+    select attnum into bank_attr from pg_attribute where attrelid='public.sales_commission_bank_api_bindings'::regclass
+      and attname='mercury_transaction_id' and not attisdropped and atttypid='uuid'::regtype and attnotnull;
+    if bank_attr is null or not exists(select 1 from pg_constraint where conrelid='public.sales_commission_bank_api_bindings'::regclass
+      and contype='u' and convalidated and conkey=array[bank_attr])
+    then raise exception 'retail_commission_existing_guard_drift'; end if;
+  end if;
   if not exists(select 1 from pg_trigger where tgrelid='public.sales_commission_receipts'::regclass
     and tgname='sales_commission_receipts_immutable' and tgenabled='O'
     and tgfoid=to_regprocedure('public.reject_sales_commission_ledger_mutation()'))

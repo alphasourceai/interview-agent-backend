@@ -8,7 +8,7 @@ const enabled=process.env.RETAIL_EXISTING_COMMISSION_DISPOSABLE==='true';const o
 const root=path.resolve(__dirname,'..'),pg='/opt/homebrew/opt/postgresql@17/bin/psql';
 const A='2026-01-31T15:45:00.000Z',rep='77777777-7777-4777-8777-777777777777',other='88888888-8888-4888-8888-888888888888';
 const owner='99999999-9999-4999-8999-999999999999';let sequence=1000;
-const databases=['retail_commission_legacy_test','retail_commission_versioned_test','retail_commission_drift_test'];
+const databases=['retail_commission_legacy_test','retail_commission_versioned_test','retail_commission_drift_test','retail_commission_mercury_test'];
 const literal=v=>v==null?'null':typeof v==='boolean'||typeof v==='number'?String(v):`'${String(v).replaceAll("'","''")}'`;
 const json=v=>`${literal(JSON.stringify(v))}::jsonb`;
 const migration='20261013045835_retail_existing_commission_receipts.sql';
@@ -26,7 +26,8 @@ function bootstrap(db,versioned=false){
       add column signer_accepted boolean,add column template_version text,add column template_snapshot jsonb,
       add column signed_at timestamptz,add column agreement_expires_at timestamptz;
     alter table public.public_purchase_intents add column expires_at timestamptz,add column channel text,add column created_by_user_id uuid;
-    create table public.sales_reps(user_id uuid primary key,active boolean);insert into public.sales_reps values('${rep}',true),('${other}',true);
+    create table public.sales_reps(user_id uuid primary key,active boolean,display_name text,email text);
+    insert into public.sales_reps(user_id,active) values('${rep}',true),('${other}',true);
     create table public.sales_commission_adjustments(id uuid primary key);
     create schema private_auth;
     create table public.retail_signup_email_verifications(billing_cadence text constraint retail_signup_email_verifications_billing_cadence_check check(billing_cadence in('monthly','annual')));
@@ -78,9 +79,54 @@ function receipt(r,changes={}){const id=uid();return {id,purchase_intent_id:r.id
 before(()=>{if(!enabled)return;
   assert.match(process.env.PGHOST||'',/^\/private\/tmp\/alphascreen-retail-commission-pg\.[A-Za-z0-9]+$/);
   assert.equal(process.env.PGPORT,'55450');assert.equal(process.env.PGUSER,'postgres');assert.equal(process.env.PGPASSWORD,undefined);
-  for(const [db,versioned] of [[databases[0],false],[databases[1],true],[databases[2],false]]){bootstrap(db,versioned);if(db!==databases[2])file(migration,db);}
+  for(const [db,versioned] of [[databases[0],false],[databases[1],true],[databases[2],false],[databases[3],false]]){
+    bootstrap(db,versioned);
+    if(db===databases[3]){
+      file('20261003113321_qa_sales_mercury_import.sql',db);
+      assert.equal(sql("select md5(prosrc) from pg_proc where oid='public.check_sales_commission_receipt_balance()'::regprocedure;",db),'9076bbf8ad26c2a27a09e8efef9c584f');
+      assert.equal(sql("select md5(prosrc) from pg_proc where oid='public.sales_commission_effective_paid(uuid)'::regprocedure;",db),'246336636dd04aabc37bbf44e9a8b143');
+      const candidate=fs.readFileSync(path.join(root,'supabase/migrations',migration),'utf8');
+      const helperDefinition=sql("select pg_get_functiondef('public.sales_commission_effective_paid(uuid)'::regprocedure);",db)+';';
+      const legacyGuard=fs.readFileSync(path.join(root,'supabase/migrations/20261003113317_qa_sales_receipt_ledger.sql'),'utf8')
+        .match(/create or replace function public.check_sales_commission_receipt_balance\(\)[\s\S]*?\n\$\$;/)[0];
+      const mutations=[
+        "create or replace function public.check_sales_commission_receipt_balance() returns trigger language plpgsql as $$begin return new;end;$$;",
+        "create or replace function public.sales_commission_effective_paid(p_receipt_id uuid) returns bigint language sql as $$select 0::bigint$$;",
+        "drop function public.sales_commission_effective_paid(uuid) cascade;",
+        "alter function public.sales_commission_effective_paid(uuid) security definer;",
+        "alter function public.sales_commission_effective_paid(uuid) set search_path=public;",
+        "alter function public.sales_commission_effective_paid(uuid) volatile;",
+        "grant execute on function public.sales_commission_effective_paid(uuid) to anon;",
+        "grant execute on function public.sales_commission_effective_paid(uuid) to authenticated;",
+        "revoke execute on function public.sales_commission_effective_paid(uuid) from service_role;",
+        "drop index public.sales_commission_payout_bank_receipt_uniq;",
+        "alter table public.sales_commission_payouts alter column bank_transaction_id set not null;",
+        "drop table public.sales_commission_bank_reversals cascade;",
+        "drop table public.sales_commission_bank_api_bindings cascade;",
+        "alter table public.sales_commission_bank_reversals disable trigger sales_commission_bank_reversals_immutable;",
+        "alter table public.sales_commission_bank_transactions disable trigger sales_commission_bank_transactions_immutable;",
+        "alter table public.sales_commission_bank_api_bindings disable trigger sales_commission_bank_api_bindings_immutable;",
+        "alter table public.sales_commission_payouts drop constraint sales_commission_payouts_bank_transaction_id_fkey;",
+        "alter table public.sales_commission_bank_reversals drop constraint sales_commission_bank_reversals_pkey;",
+        "alter table public.sales_commission_bank_api_bindings drop constraint sales_commission_bank_api_bindings_mercury_transaction_id_key;",
+        "set local check_function_bodies=false;"+helperDefinition.replace('LANGUAGE sql','LANGUAGE plpgsql'),
+        "set local check_function_bodies=false;drop function public.sales_commission_effective_paid(uuid) cascade;"+
+          helperDefinition.replace('p_receipt_id uuid','p_receipt_id text'),
+        "set local check_function_bodies=false;drop function public.sales_commission_effective_paid(uuid) cascade;"+
+          helperDefinition.replace('RETURNS bigint','RETURNS integer'),
+        legacyGuard
+      ];
+      // Mutations must be valid catalog changes: each expected failure comes
+      // from the recognition gate, not invalid fixture DDL. All roll back.
+      for(const change of mutations){
+        assert.throws(()=>sql(`begin;${change}\n${candidate}`,db),/retail_commission_existing_guard_drift/,change);
+        assert.equal(sql("select count(*) from pg_attribute where attrelid='public.sales_commission_receipts'::regclass and attname='sales_qualification_id' and not attisdropped;",db),'0');
+      }
+    }
+    if(db!==databases[2])file(migration,db);
+  }
 });
-for(const db of databases.slice(0,2)){
+for(const db of [...databases.slice(0,2),databases[3]]){
   test(`${db}: all3/6/12 bothoptions actual receipt commissions exclude role and preserve original first year`,options,()=>{
     for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments']){
       const r=setup(db,months,payment),row=receipt(r);sql(`set role service_role;${insert('sales_commission_receipts',row)}`,db);
@@ -135,6 +181,75 @@ for(const db of databases.slice(0,2)){
       funds_received_at:'2026-02-02T00:00:00Z',statement_week_start:'2026-02-02'}))}`,db),/retail_commission_receipt_source_conflict/);
   });
 }
+test('Mercury reversal-aware guard preserves unpaid balance, locks and overpayment refusal after pricing migration',options,()=>{
+  const db=databases[3],r=setup(db),row=receipt(r,{gross_membership_cents:20000,discount_cents:0,provider_fee_cents:0,
+    payment_success_at:'2026-10-01T00:00:00Z',funds_received_at:'2026-10-02T00:00:00Z',statement_week_start:'2026-10-05'});
+  sql(`set role service_role;${insert('sales_commission_receipts',row)}
+    ${insert('sales_commission_adjustments',{receipt_id:row.id,adjustment_type:'refund',provider_event_id:`evt_${row.id}`,
+      net_membership_delta_cents:-2000,commission_delta_cents:0,effective_at:'2026-10-03T00:00:00Z',statement_week_start:'2026-10-05',
+      evidence_reference:'synthetic source-linked adjustment',reviewed_by_user_id:owner})}`,db);
+  const payout=(amount,bank=null)=>insert('sales_commission_payouts',{receipt_id:row.id,amount_cents:amount,
+    bank_transaction_id:bank,ach_reference:`synthetic_ach_${uid()}`,paid_at:'2026-10-13T12:00:00Z',
+    evidence_reference:'synthetic verified payment allocation',recorded_by_user_id:owner});
+  assert.throws(()=>sql(`set role service_role;${payout(3000)}`,db),/source_statement_not_locked/);
+  sql(`set role service_role;select public.lock_sales_commission_statement('${rep}','2026-10-05','${owner}');`,db);
+  assert.throws(()=>sql(`set role service_role;${insert('sales_commission_receipts',receipt(r,{statement_week_start:'2026-10-05'}))}`,db),/sales_commission_statement_week_locked/);
+  assert.throws(()=>sql(`set role service_role;${insert('sales_commission_payouts',{receipt_id:row.id,amount_cents:1,
+    ach_reference:'synthetic_before_tuesday',paid_at:'2026-10-13T05:00:00Z',
+    evidence_reference:'synthetic early payment refusal',recorded_by_user_id:owner})}`,db),/ach_before_following_tuesday/);
+  // Existing bank writes use the reviewed definer RPC, not table grants.
+  assert.throws(()=>sql(`set role service_role;insert into public.sales_commission_bank_transactions(id) values('${uid()}');`,db),/permission denied/);
+  const bank=sql(`set role service_role;select (public.import_sales_commission_bank_transaction(
+    '${'a'.repeat(64)}','${String(sequence).padStart(15,'0')}','2026-10-13','2026-10-13T12:00:00Z',4000,'${rep}',
+    'Synthetic Rep','Synthetic local Mercury bank evidence only','${owner}',${json([{receipt_id:row.id,amount_cents:4000}])})).id;`,db);
+  sql(`set role service_role;${payout(3000)}`,db);
+  assert.equal(sql(`select public.sales_commission_effective_paid('${row.id}');`,db),'7000');
+  assert.throws(()=>sql(`set role service_role;${payout(6000)}`,db),/commission_payout_exceeds_unpaid_verified_source/);
+  sql(`set role service_role;select public.reverse_sales_commission_bank_transaction('${bank}',
+    '2026-10-13T13:00:00Z','synthetic bank reversal','${owner}');`,db);
+  assert.equal(sql(`select public.sales_commission_effective_paid('${row.id}');`,db),'3000');
+  sql(`set role service_role;${payout(6000)}`,db);
+  assert.equal(sql(`select public.sales_commission_effective_paid('${row.id}');`,db),'9000');
+  assert.throws(()=>sql(`set role service_role;${payout(1)}`,db),/commission_payout_exceeds_unpaid_verified_source/);
+  assert.equal(sql("select md5(prosrc) from pg_proc where oid='public.check_sales_commission_receipt_balance()'::regprocedure;",db),'9076bbf8ad26c2a27a09e8efef9c584f');
+  assert.equal(sql("select md5(prosrc) from pg_proc where oid='public.sales_commission_effective_paid(uuid)'::regprocedure;",db),'246336636dd04aabc37bbf44e9a8b143');
+});
+test('Mercury bank reversal clears cross-receipt debit and departed refund gate without changing adjustment caps',options,()=>{
+  const db=databases[3],r=setup(db),r2=setup(db);
+  const source=receipt(r,{gross_membership_cents:20000,discount_cents:0,provider_fee_cents:0,
+    payment_success_at:'2026-09-17T00:00:00Z',funds_received_at:'2026-09-18T00:00:00Z',statement_week_start:'2026-09-21'});
+  const target=receipt(r2,{...source,id:uid(),purchase_intent_id:r2.id,sales_qualification_id:r2.id,provider_payment_id:`pi_${uid()}`});
+  sql(`set role service_role;${insert('sales_commission_receipts',source)}${insert('sales_commission_receipts',target)}
+    select public.lock_sales_commission_statement('${rep}','2026-09-21','${owner}');`,db);
+  const importBank=()=>sql(`set role service_role;select (public.import_sales_commission_bank_transaction(
+    '${'b'.repeat(64)}','${String(++sequence).padStart(15,'0')}','2026-09-29','2026-09-29T12:00:00Z',9000,'${rep}',
+    'Synthetic Rep','Synthetic local Mercury evidence only','${owner}',${json([{receipt_id:source.id,amount_cents:9000}])})).id;`,db);
+  const reverse=bank=>sql(`set role service_role;select public.reverse_sales_commission_bank_transaction('${bank}',
+    '2026-10-07T12:00:00Z','synthetic bank reversal','${owner}');`,db);
+  const adjust=(amount,week='2026-09-28')=>insert('sales_commission_adjustments',{receipt_id:source.id,adjustment_type:'refund',
+    provider_event_id:`evt_${uid()}`,net_membership_delta_cents:amount,commission_delta_cents:0,
+    effective_at:'2026-10-01T00:00:00Z',statement_week_start:week,
+    evidence_reference:'synthetic source-linked debit/refund',reviewed_by_user_id:owner});
+  const payout=()=>insert('sales_commission_payouts',{receipt_id:target.id,amount_cents:1,ach_reference:`ach_${uid()}`,
+    paid_at:'2026-10-06T12:00:00Z',evidence_reference:'synthetic debit gate payment',recorded_by_user_id:owner});
+  const bank1=importBank();
+  sql(`set role service_role;${adjust(-4000)}`,db);
+  assert.throws(()=>sql(`set role service_role;${payout()}`,db),/representative_has_unrecovered_commission_debit/);
+  reverse(bank1);
+  sql(`set role service_role;${payout()}`,db);
+  assert.throws(()=>sql(`set role service_role;${adjust(-20000)}`,db),/commission_adjustments_outside_source_balance/);
+  sql(`set role service_role;select public.lock_sales_commission_statement('${rep}','2026-09-28','${owner}');`,db);
+  // A new bank payout up to the adjusted cap is valid, but a departed
+  // refund cannot reverse amounts already effectively paid.
+  const bank2=sql(`set role service_role;select (public.import_sales_commission_bank_transaction(
+    '${'c'.repeat(64)}','${String(++sequence).padStart(15,'0')}','2026-10-06','2026-10-06T12:00:00Z',8000,'${rep}',
+    'Synthetic Rep','Synthetic local Mercury evidence only','${owner}',${json([{receipt_id:source.id,amount_cents:8000}])})).id;`,db);
+  sql(`insert into public.sales_commission_departures(rep_user_id,final_day,reviewed_by_user_id,evidence_reference)
+    values('${rep}','2026-09-29','${owner}','synthetic departure cutoff');`,db);
+  assert.throws(()=>sql(`set role service_role;${adjust(-2000,'2026-10-12')}`,db),/post_departure_reversal_exceeds_unpaid_source/);
+  reverse(bank2);
+  sql(`set role service_role;${adjust(-2000,'2026-10-12')}`,db);
+});
 test('native older real-contract cohort still qualifies and persists without using new qualification IDs',options,()=>{
   const db=databases[1],id=uid(),intent=uid(),client=uid(),offer=buildRetailOffer({planKey:'basic',commitmentMonths:3,
     paymentOption:'prepaid',channel:'sales',offerVersion:OFFER_VERSION,firstRolePrepaySelected:false});
