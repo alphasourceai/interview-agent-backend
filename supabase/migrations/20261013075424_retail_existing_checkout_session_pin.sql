@@ -6,10 +6,10 @@ do $baseline$
 declare spec text[]; p record;
 begin
   foreach spec slice 1 in array array[
-    array['retail_existing_checkout_material(jsonb,jsonb,text)','c0974667308a8645033031b3c8a607cc','i'],
+    array['retail_existing_checkout_material(jsonb,jsonb,text)','67699a36b8267739c5655764a7c0203f','i'],
     array['retail_existing_checkout_config_valid(jsonb)','c433714eff703c41b1590f890dc8ba7d','i'],
-    array['retail_existing_checkout_attempt_guard()','7c274b08e2cbaa5372aa026817966771','v'],
-    array['claim_retail_existing_checkout_attempt(uuid,uuid,jsonb,text,boolean,text,jsonb)','8814f088dbb510eca1e41adeda78ac7a','v']] loop
+    array['retail_existing_checkout_attempt_guard()','f09fb704d56369d695e578f527ecc42f','v'],
+    array['claim_retail_existing_checkout_attempt(uuid,uuid,jsonb,text,boolean,text,jsonb)','223daa3cbb35b96bd23120500e56a7a5','v']] loop
     select * into p from pg_proc where oid=to_regprocedure('public.'||spec[1]);
     if not found or p.prosecdef or p.provolatile::text<>spec[3] or md5(p.prosrc)<>spec[2]
       or p.proconfig is distinct from array['search_path=pg_catalog']

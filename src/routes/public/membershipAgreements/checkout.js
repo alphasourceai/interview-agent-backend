@@ -201,7 +201,8 @@ router.post('/checkout-session', publicAgreementTokenRateLimit, async (req, res)
       fallbackSession,
       checkoutClientSecret,
       replacesStripeSubscriptionId,
-      replacementPolicy
+      replacementPolicy,
+      retailAttemptLinked
     } = await createSubscriptionCheckoutSession({
       clientId,
       planTier,
@@ -216,6 +217,7 @@ router.post('/checkout-session', publicAgreementTokenRateLimit, async (req, res)
       cancelUrl,
       idempotencyKey,
       checkoutExpiresAt: explicitAgreementDeadline || null,
+      retailAgreement: retailOffer ? agreement : null,
       requestContext: {
         forwardedProto: req.headers?.['x-forwarded-proto'],
         forwardedHost: req.headers?.['x-forwarded-host'],
@@ -234,6 +236,17 @@ router.post('/checkout-session', publicAgreementTokenRateLimit, async (req, res)
         detail: 'Checkout session was created without a valid URL.',
         request_id
       });
+    }
+
+    if (retailOffer) {
+      if (retailAttemptLinked !== true || fallbackSession) {
+        return res.status(503).json({ error:'retail_checkout_pin_ack_unknown',code:'retail_checkout_pin_ack_unknown',request_id })
+      }
+      // Native pin already links BOTH rows atomically. Never overwrite the
+      // original request B with this response time or run independent writes.
+      return res.json({ ok:true,url:checkoutUrl || null,session_id:checkoutSessionId,
+        checkout_client_secret:resolvedCheckoutClientSecret || null,
+        embedded_checkout:!!resolvedCheckoutClientSecret,request_id })
     }
 
     const nowIso = new Date().toISOString();

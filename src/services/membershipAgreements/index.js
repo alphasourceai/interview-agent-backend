@@ -624,7 +624,7 @@ async function createAgreementSignedUrl(path, expiresInSeconds) {
 async function loadAgreementByTokenHash(tokenHash) {
   const { data, error } = await supabaseAdmin
     .from('membership_agreements')
-    .select('id,client_id,status,is_current,checkout_status,checkout_session_id,checkout_created_at,client_legal_name,dba_trade_name,primary_admin_name,admin_email,membership_tier,initial_term_start,initial_renewal_date,billing_option,auto_renew,notice_deadline_days,template_version,template_snapshot,draft_pdf_path,executed_pdf_path,signer_token_hash,signer_token_expires_at,agreement_expires_at,opened_at,sent_at,signed_at,signer_typed_name,signer_accepted,signature_image_path,signature_sha256,signer_ip,signer_user_agent,superseded_by_agreement_id')
+    .select('id,client_id,status,is_current,checkout_status,checkout_session_id,checkout_created_at,checkout_attempt_source,checkout_embedded,replaces_stripe_subscription_id,client_legal_name,dba_trade_name,primary_admin_name,admin_email,membership_tier,initial_term_start,initial_renewal_date,billing_option,auto_renew,notice_deadline_days,template_version,template_snapshot,draft_pdf_path,executed_pdf_path,signer_token_hash,signer_token_expires_at,agreement_expires_at,opened_at,sent_at,signed_at,signer_typed_name,signer_accepted,signature_image_path,signature_sha256,signer_ip,signer_user_agent,superseded_by_agreement_id')
     .eq('signer_token_hash', tokenHash)
     .maybeSingle();
 

@@ -306,3 +306,76 @@ test('native pin waits for concurrent customer write and rejects the newly commi
   assert.equal(await done, 0);assert.notEqual(result.code, 0);assert.match(result.err, /customer_changed/);
   assert.deepEqual(row(r), before);
 });
+test('native Checkout expiry respects earlier linked intent deadline; later deadline edits cannot move the existing request', opts, () => {
+  const r=fixture({source:'sales_assisted'});
+  sql(`update public_purchase_intents set expires_at=clock_timestamp()+interval '2 hours' where id='${r.intent}';`);
+  const attempt=claimed(r),deadline=Number(sql(`select floor(extract(epoch from expires_at)) from public_purchase_intents where id='${r.intent}';`));
+  assert.equal(attempt.expires_at,deadline);assert.equal(Date.parse(attempt.source.intent.expires_at),
+    Date.parse(sql(`select expires_at from public_purchase_intents where id='${r.intent}';`)));
+  sql(`update public_purchase_intents set expires_at=expires_at+interval '1 hour' where id='${r.intent}';`);
+  const before=row(r);denied(`set role service_role;${claim(r)}`,/attempt_changed/);
+  denied(`set role service_role;${pin(r,attempt,'cs_MOVED_DEADLINE')}`,/attempt_changed/);assert.deepEqual(row(r),before);
+});
+test('native early linked expiry refuses a request even if the signed agreement remains open for days', opts, () => {
+  const r=fixture({source:'public_purchase_intent'});
+  sql(`update public_purchase_intents set expires_at=clock_timestamp()+interval '29 minutes' where id='${r.intent}';`);
+  const before=row(r);denied(`set role service_role;${claim(r)}`,/window_closed/);assert.deepEqual(row(r),before);
+});
+test('actual existing Checkout service executes real native claim/pin and retrieves the same SDK-fake Session on retry', opts, async () => {
+  // Real PostgreSQL row/RPC bridge; SDK and billing-customer lookup are injected
+  // synthetic boundaries, NOT provider funding or hosted PostgREST acceptance.
+  const paths=['../src/services/subscriptionCheckout','../src/clients/supabase','../src/services/clientBillingScope',
+    '../src/config/urlConfig'].map(p=>require.resolve(p));paths.push(require.resolve('stripe'));
+  const saved=new Map(paths.map(p=>[p,require.cache[p]]));
+  const inject=(p,exports)=>{require.cache[p]={id:p,filename:p,loaded:true,exports};};
+  const token='SYNTHETIC_NATIVE_CHECKOUT_TOKEN';
+  try {
+    for(const source of ['admin','sales_assisted']) {
+      const r=fixture({source,plan:'pro',months:6,payment:'monthly_installments',role:true});
+      sql(`update membership_agreements set signer_token_hash='${crypto.createHash('sha256').update(token).digest('hex')}' where id='${r.id}';`);
+      let payload,session,creates=0;const sdk={
+        customers:{retrieve:async id=>({object:'customer',id,discount:null,balance:0}),update:async id=>({id})},
+        subscriptions:{list:async()=>({data:[],has_more:false})},
+        checkout:{sessions:{create:async p=>{
+          creates++;payload=structuredClone(p);const total=p.line_items.reduce((a,l)=>a+l.price_data.unit_amount,0);
+          session={object:'checkout.session',id:'cs_NATIVE_BRIDGE',mode:'subscription',status:'open',payment_status:'unpaid',
+            customer,currency:'usd',livemode:false,subscription:null,ui_mode:'hosted',expires_at:p.expires_at,metadata:p.metadata,
+            amount_subtotal:total,amount_total:total,url:'https://checkout.stripe.test/NATIVE_BRIDGE',
+            success_url:p.success_url,cancel_url:p.cancel_url,allow_promotion_codes:p.allow_promotion_codes,
+            total_details:{amount_discount:0,amount_tax:0,amount_shipping:0}};return session;
+        },retrieve:async id=>{assert.equal(id,session.id);return session;},
+        listLineItems:async()=>({object:'list',has_more:false,data:payload.line_items.map((l,n)=>({id:`li_NATIVE_${n}`,
+          quantity:1,currency:'usd',amount_subtotal:l.price_data.unit_amount,price:{object:'price',id:`price_NATIVE_${n}`,
+            currency:'usd',unit_amount:l.price_data.unit_amount,type:l.price_data.recurring?'recurring':'one_time',
+            recurring:l.price_data.recurring?{...l.price_data.recurring,usage_type:'licensed'}:null}}))})}}
+      };
+      const db={from(table){return{select(){return this},eq(_k,value){this.value=value;return this},order(){return this},
+        async maybeSingle(){assert.equal(table,'clients');return{data:JSON.parse(sql(`select to_jsonb(t) from clients t where id=${lit(this.value)};`)),error:null};},
+        then(resolve,reject){assert.equal(table,'billing_customers');return Promise.resolve({data:[{id:'SYNTHETIC_BILLING',stripe_customer_id:customer}],error:null}).then(resolve,reject)}
+      }},async rpc(name,args){
+        assert.ok(['claim_retail_existing_checkout_attempt','pin_retail_existing_checkout_session'].includes(name));
+        const values=name==='claim_retail_existing_checkout_attempt'
+          ?[args.p_agreement,args.p_client,args.p_expected_template,args.p_customer,args.p_embedded,args.p_replacement,args.p_config]
+          :[args.p_agreement,args.p_client,args.p_attempt,args.p_session];
+        const result=run(`set role service_role;select public.${name}(${values.map(lit).join(',')});`);
+        return result.status===0?{data:JSON.parse(result.stdout.trim()),error:null}:{data:null,error:{message:result.stderr}};
+      }};
+      delete require.cache[paths[0]];inject(paths[1],{supabaseAdmin:db});inject(paths[2],{requireParentClient:async()=>({ok:true})});
+      inject(paths[3],{resolvePublicBackendBase:()=>config.public_backend_base,
+        buildMembershipAgreementSignUrl:t=>`${config.public_sign_base}/membership-agreement/sign/${t}`,
+        buildClientDashboardReturnUrl:()=>`${config.public_sign_base}/dashboard`});
+      inject(paths[4],function Stripe(_key,options){assert.equal(options.apiVersion,'2023-10-16');return sdk;});
+      const {createSubscriptionCheckoutSession:create}=require(paths[0]);
+      const args={clientId:r.client,planTier:'pro',billingInterval:'monthly',packageSnapshot:r.p,metadataSource:'agreement_checkout',
+        idempotencyKey:`agreement_checkout:${r.id}:pro:monthly`,retailAgreement:row(r),
+        cancelUrl:`${config.public_sign_base}/membership-agreement/sign/${token}`};
+      const first=await create(args),b=row(r).checkout_created_at;
+      assert.equal(first.retailAttemptLinked,true);assert.equal(row(r).checkout_session_id,'cs_NATIVE_BRIDGE');
+      if(source==='sales_assisted')assert.equal(sql(`select stripe_checkout_session_id from public_purchase_intents where id='${r.intent}';`),'cs_NATIVE_BRIDGE');
+      const second=await create({...args,retailAgreement:row(r),embedded:true,
+        requestContext:{forwardedHost:'untrusted.example.invalid',forwardedProto:'http'}});
+      assert.equal(second.session.id,first.session.id);assert.equal(creates,1);assert.equal(row(r).checkout_created_at,b);
+      assert.equal(second.checkoutClientSecret,null);
+    }
+  } finally { for(const p of paths){const original=saved.get(p);if(original)require.cache[p]=original;else delete require.cache[p];} }
+});

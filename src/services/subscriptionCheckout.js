@@ -7,11 +7,14 @@ const {
   getAlphaScreenStripePriceId,
   getAlphaScreenFirstRolePrepayStripePriceId
 } = require('./alphaScreenPackages')
-const { resolvePublicBackendBase, buildClientDashboardReturnUrl } = require('../config/urlConfig')
+const { resolvePublicBackendBase, buildClientDashboardReturnUrl, buildMembershipAgreementSignUrl } = require('../config/urlConfig')
 const { priceEnterprisePool, quoteEnterprisePool } = require('./enterprisePoolPricing')
 const {enterprisePoolCheckoutQuote}=require('./enterprisePoolSnapshot')
 const { enterpriseSettingsMetadata, validateEnterpriseSettings } = require('./enterpriseSettings')
 const { readRetailPackageOffer } = require('./membershipPackageCompatibility')
+const { isDeepStrictEqual } = require('node:util')
+const { claimExistingRetailAttempt, assertWindow, frozenRetailCancelUrl, readOpenRetailSession,
+  pinExistingRetailSession } = require('./existingRetailCheckoutAttempt')
 
 function makeError(status, code, detail) {
   const err = new Error(detail || code || 'checkout_failed')
@@ -195,7 +198,8 @@ async function resolveStripeCustomerId({
   stripe,
   client,
   billingCustomerList,
-  exactPrepaid = false
+  exactPrepaid = false,
+  pinnedCustomerId = ''
 }) {
   const candidateStripeCustomerIds = []
   const customerRows = Array.isArray(billingCustomerList) ? billingCustomerList : []
@@ -207,6 +211,10 @@ async function resolveStripeCustomerId({
   const fallbackCustomerId = String(client?.stripe_customer_id || '').trim()
   if (fallbackCustomerId && !candidateStripeCustomerIds.includes(fallbackCustomerId)) {
     candidateStripeCustomerIds.push(fallbackCustomerId)
+  }
+  if (pinnedCustomerId && (fallbackCustomerId !== pinnedCustomerId
+    || candidateStripeCustomerIds.some(id => id !== pinnedCustomerId))) {
+    throw makeError(409, 'retail_checkout_customer_changed', 'The original checkout customer needs review.')
   }
 
   let resolvedStripeCustomerId = null
@@ -236,13 +244,14 @@ async function resolveStripeCustomerId({
 
   const clientEmail = String(client?.email || '').trim()
   if (!resolvedStripeCustomerId) {
+    if (pinnedCustomerId) throw makeError(409, 'retail_checkout_customer_changed', 'The original checkout customer is unavailable.')
     const createdCustomer = await stripe.customers.create({
       name: client?.name || undefined,
       email: clientEmail || undefined,
       metadata: { client_id: client.id }
     })
     resolvedStripeCustomerId = createdCustomer?.id || null
-  } else {
+  } else if (!pinnedCustomerId) {
     try {
       await stripe.customers.update(resolvedStripeCustomerId, {
         name: client?.name || undefined,
@@ -271,6 +280,7 @@ async function createSubscriptionCheckoutSession({
   requestContext = null,
   idempotencyKey = '',
   checkoutExpiresAt = null,
+  retailAgreement = null,
   now = null
 }) {
   const normalizedClientId = String(clientId || '').trim()
@@ -283,7 +293,7 @@ async function createSubscriptionCheckoutSession({
   }
   const normalizedMetadataSource = String(metadataSource || '').trim().toLowerCase()
   const normalizedReturnTab = String(returnTab || '').trim().toLowerCase()
-  const embeddedCheckoutRequested = wantsEmbeddedCheckout(embedded)
+  let embeddedCheckoutRequested = wantsEmbeddedCheckout(embedded)
   const normalizedIdempotencyKey = normalizeIdempotencyKey(idempotencyKey)
   const normalizedPromotionCodeId = String(promotionCodeId || '').trim().slice(0, 255)
   const exactPrepaid = retailOffer?.payment_option === 'prepaid'
@@ -305,9 +315,15 @@ async function createSubscriptionCheckoutSession({
     || !/^[A-Za-z0-9_.:-]{1,255}$/.test(idempotencyKey) || normalizedIdempotencyKey !== idempotencyKey)) {
     throw makeError(409, 'retail_checkout_key_required', 'The existing agreement checkout identity is required.')
   }
+  if (retailOffer && (normalizedMetadataSource !== 'agreement_checkout' || normalizedReturnTab
+    || !retailAgreement?.id || retailAgreement.client_id !== normalizedClientId
+    || !isDeepStrictEqual(retailAgreement.template_snapshot?.package_snapshot, packageSnapshot)
+    || normalizedIdempotencyKey !== `agreement_checkout:${retailAgreement.id}:${normalizedPlanTier}:${normalizedBillingInterval}`)) {
+    throw makeError(409, 'retail_checkout_source_required', 'The existing signed agreement checkout source is required.')
+  }
   const nowMs = now ? new Date(now).getTime() : Date.now()
   let checkoutExpiresAtEpoch = null
-  if (checkoutExpiresAt) {
+  if (checkoutExpiresAt && !retailOffer) {
     const requestedExpiryMs = new Date(checkoutExpiresAt).getTime()
     if (!Number.isFinite(nowMs) || !Number.isFinite(requestedExpiryMs)) {
       throw makeError(400, 'invalid_checkout_expiration', 'Checkout expiration is invalid.')
@@ -374,22 +390,30 @@ async function createSubscriptionCheckoutSession({
       stripe,
       client,
       billingCustomerList,
-      exactPrepaid
+      exactPrepaid,
+      pinnedCustomerId:retailOffer ? String(retailAgreement.checkout_attempt_source?.customer_id || '') : ''
     })
   } catch (e) {
-    if (e?.code === 'retail_customer_adjustment_denied') throw e
+    if (e?.code === 'retail_customer_adjustment_denied' || e?.code === 'retail_checkout_customer_changed') throw e
     throw makeError(500, 'stripe_customer_failed', e?.message || 'Stripe customer resolution failed.')
   }
   if (!resolvedStripeCustomerId) throw makeError(400, 'missing_billing_customer', 'Missing billing customer.')
 
   if (String(client?.stripe_customer_id || '').trim() !== resolvedStripeCustomerId) {
+    if (retailOffer) {
+      const { data, error } = await supabaseAdmin.from('clients').update({ stripe_customer_id: resolvedStripeCustomerId })
+        .eq('id', client.id).select('id,stripe_customer_id').maybeSingle()
+      if (error || data?.stripe_customer_id !== resolvedStripeCustomerId) throw makeError(503, 'retail_checkout_customer_save_failed')
+    } else {
     try {
       await supabaseAdmin
         .from('clients')
         .update({ stripe_customer_id: resolvedStripeCustomerId })
         .eq('id', client.id)
     } catch (_) {}
+    }
   }
+
   if (billingCustomer?.id && String(billingCustomer?.stripe_customer_id || '').trim() !== resolvedStripeCustomerId) {
     try {
       await supabaseAdmin
@@ -422,6 +446,22 @@ async function createSubscriptionCheckoutSession({
         }
       }
     }
+  }
+
+  let retailAttempt = null
+  if (retailOffer) {
+    const signBase = buildMembershipAgreementSignUrl('').replace(/\/membership-agreement\/sign\/$/, '')
+    retailAttempt = await claimExistingRetailAttempt({ db:supabaseAdmin, agreement:retailAgreement,
+      customerId:resolvedStripeCustomerId, embedded:embeddedCheckoutRequested, replacementId:replacesStripeSubscriptionId,
+      config:{ public_backend_base:resolvePublicBackendBase(''), public_sign_base:signBase } })
+    if (normalizedPromotionCodeId !== String(retailAttempt.source.intent?.promotion_code_id || '')) {
+      throw makeError(409, 'retail_checkout_promotion_changed', 'Promotion does not match the existing signed checkout source.')
+    }
+    embeddedCheckoutRequested = retailAttempt.embedded
+    replacesStripeSubscriptionId = retailAttempt.replacement_id
+    replacementMetadata = replacesStripeSubscriptionId ? { replaces_stripe_subscription_id:replacesStripeSubscriptionId,
+      replacement_policy:'immediate_cancel' } : null
+    checkoutExpiresAtEpoch = retailAttempt.expires_at
   }
 
   const lineItems = []
@@ -550,7 +590,7 @@ async function createSubscriptionCheckoutSession({
   const forwardedProto = String(requestContext?.forwardedProto || requestContext?.protocol || 'https').split(',')[0].trim()
   const forwardedHost = String(requestContext?.forwardedHost || requestContext?.host || '').split(',')[0].trim()
   const computedBackendBase = forwardedHost ? `${forwardedProto || 'https'}://${forwardedHost}` : ''
-  const publicBackendBase = resolvePublicBackendBase(computedBackendBase || '')
+  const publicBackendBase = retailAttempt?.source.config.public_backend_base || resolvePublicBackendBase(computedBackendBase || '')
 
   const successParams = normalizedReturnTab
     ? { checkout: 'success', client_id: client.id, tab: normalizedReturnTab }
@@ -558,13 +598,13 @@ async function createSubscriptionCheckoutSession({
   const cancelParams = normalizedReturnTab
     ? { checkout: 'cancel', client_id: client.id, tab: normalizedReturnTab }
     : { checkout: 'cancel', client_id: client.id }
-  const normalizedCancelUrl = String(cancelUrl || '').trim()
+  const normalizedCancelUrl = retailAttempt ? frozenRetailCancelUrl(retailAttempt, cancelUrl) : String(cancelUrl || '').trim()
 
   const checkoutSuccessUrl = publicBackendBase
     ? `${publicBackendBase}/checkout/subscription-success?session_id={CHECKOUT_SESSION_ID}&client_id=${encodeURIComponent(client.id)}${normalizedReturnTab ? `&tab=${encodeURIComponent(normalizedReturnTab)}` : ''}`
     : buildClientDashboardReturnUrl(successParams)
 
-  const checkoutMetadata = {
+  let checkoutMetadata = {
     source: normalizedMetadataSource,
     client_id: client.id,
     plan_tier: normalizedPlanTier,
@@ -572,10 +612,17 @@ async function createSubscriptionCheckoutSession({
     ...normalizeMetadataObject(enterpriseCheckoutMetadata || {}),
     ...normalizeMetadataObject(firstRolePrepayMetadata || {}),
     ...normalizeMetadataObject(poolMetadata || {}),
-    ...normalizeMetadataObject(metadata),
+    ...normalizeMetadataObject(retailAttempt ? {} : metadata),
     ...normalizeMetadataObject(replacementMetadata || {}),
     ...(enterpriseTerms?.acceptedPoolQuote?normalizeMetadataObject(poolMetadata||{}):{}),
-    ...(retailOffer ? { ...retailMetadata, source:normalizedMetadataSource, client_id:client.id,
+    ...(retailOffer ? { ...retailMetadata, agreement_id:retailAttempt.agreement_id,
+      ...(retailAttempt.source.intent ? { purchase_intent_id:retailAttempt.source.intent.id,
+        public_purchase_intent_id:retailAttempt.source.intent.id,membership_agreement_id:retailAttempt.agreement_id,
+        agreement_checkout:'true',checkout_status:'pending_payment',package_plan_key:retailOffer.plan_key,
+        package_billing_cadence:normalizedBillingInterval,platform_fee:String(packageSnapshot.platform_fee),
+        per_role_fee:String(packageSnapshot.per_role_fee),included_interviews_per_role:String(packageSnapshot.included_interviews_per_role),
+        additional_interview_fee:String(packageSnapshot.additional_interview_fee),max_interview_minutes:String(packageSnapshot.max_interview_minutes) } : {}),
+      source:normalizedMetadataSource, client_id:client.id,
       plan_tier:retailOffer.plan_key, billing_interval:normalizedBillingInterval,
       first_role_prepay_selected:String(retailOffer.first_role_prepay.selected),
       first_role_prepay_amount_cents:String(retailOffer.first_role_prepay.amount_cents),
@@ -583,6 +630,7 @@ async function createSubscriptionCheckoutSession({
       first_role_prepay_normal_role_fee_cents:String(retailOffer.first_role_prepay.normal_role_fee_cents),
       first_role_prepay_discount_percent:String(packageSnapshot.first_role_prepay.discount_percent) } : {})
   }
+  if (retailAttempt) checkoutMetadata = normalizeMetadataObject(checkoutMetadata)
 
   const checkoutBasePayload = {
     mode: 'subscription',
@@ -620,8 +668,15 @@ async function createSubscriptionCheckoutSession({
     return { idempotencyKey: key.slice(0, 255) }
   }
 
-  if (embeddedCheckoutRequested) {
+  if (retailAttempt?.checkout_session_id) {
+    primaryCheckoutSession = await readOpenRetailSession({ stripe, sessionId:retailAttempt.checkout_session_id,
+      attempt:retailAttempt, offer:retailOffer, metadata:checkoutMetadata,successUrl:checkoutSuccessUrl,cancelUrl:normalizedCancelUrl })
+    checkoutClientSecret = retailAttempt.embedded ? primaryCheckoutSession.client_secret : null
+  }
+
+  if (embeddedCheckoutRequested && !primaryCheckoutSession) {
     try {
+      if (retailAttempt) assertWindow(retailAttempt)
       primaryCheckoutSession = await stripe.checkout.sessions.create({
         ...checkoutBasePayload,
         ui_mode: 'embedded',
@@ -641,11 +696,17 @@ async function createSubscriptionCheckoutSession({
   }
 
   if (!primaryCheckoutSession) {
+    if (retailAttempt) assertWindow(retailAttempt)
+    try {
     primaryCheckoutSession = await stripe.checkout.sessions.create({
       ...checkoutBasePayload,
       success_url: checkoutSuccessUrl,
       cancel_url: normalizedCancelUrl || buildClientDashboardReturnUrl(cancelParams)
     }, createOptions())
+    } catch (e) {
+      if (retailAttempt) throw makeError(503, 'retail_checkout_ack_unknown', 'Checkout could not be confirmed. Retry only the existing attempt.')
+      throw e
+    }
   } else if (!retailOffer) {
     try {
       hostedFallbackSession = await stripe.checkout.sessions.create({
@@ -656,6 +717,16 @@ async function createSubscriptionCheckoutSession({
     } catch (hostedFallbackErr) {
       console.error('create_subscription_hosted_fallback_checkout_session_failed:', hostedFallbackErr?.message || hostedFallbackErr)
     }
+  }
+
+  if (retailAttempt) {
+    assertWindow(retailAttempt)
+    if (!retailAttempt.checkout_session_id) primaryCheckoutSession = await readOpenRetailSession({ stripe,
+      sessionId:primaryCheckoutSession?.id,attempt:retailAttempt,offer:retailOffer,metadata:checkoutMetadata,
+      successUrl:checkoutSuccessUrl,cancelUrl:normalizedCancelUrl })
+    await pinExistingRetailSession({ db:supabaseAdmin,agreement:retailAgreement,customerId:resolvedStripeCustomerId,
+      attempt:retailAttempt,sessionId:primaryCheckoutSession.id })
+    checkoutClientSecret = retailAttempt.embedded ? primaryCheckoutSession.client_secret : null
   }
 
   // Recorded for support: the webhook finds the pool by its id in metadata, not
@@ -685,7 +756,8 @@ async function createSubscriptionCheckoutSession({
     checkoutMetadata,
     interviewPoolId: poolPoolId,
     replacesStripeSubscriptionId,
-    replacementPolicy: replacesStripeSubscriptionId ? 'immediate_cancel' : null
+    replacementPolicy: replacesStripeSubscriptionId ? 'immediate_cancel' : null,
+    retailAttemptLinked:!!retailAttempt
   }
 }
 

@@ -326,7 +326,9 @@ function buildApp(db) {
         fallbackSession: null,
         checkoutClientSecret: '',
         replacesStripeSubscriptionId: null,
-        replacementPolicy: null
+        replacementPolicy: null,
+        // Route isolation only: real native RPC linkage is exercised separately.
+        retailAttemptLinked: !!args.retailAgreement
       }
     }
   })
@@ -566,6 +568,8 @@ test('existing signed sales checkout carries frozen 3/6/12 prices for all 24 var
       assert.equal(call.metadata.package_billing_cadence, snapshot.billing_cadence);
       assert.equal(call.metadata.platform_fee, snapshot.platform_fee);
       assert.equal(call.idempotencyKey, `agreement_checkout:${AGREEMENT_ID}:${plan}:${snapshot.billing_cadence}`);
+      assert.equal(call.retailAgreement.id, AGREEMENT_ID);
+      assert.equal(db.updates.some(u => Object.hasOwn(u.payload, 'checkout_created_at')), false);
       assert.equal(call.firstRolePrepay?.amount_cents || 0, role ? (plan === 'basic' ? 35900 : 62900) : 0);
       assert.equal(db.clients.length, 1); assert.equal(db.clients[0].billing_status, 'inactive');
       assert.equal(db.clientMembers.length, 0);

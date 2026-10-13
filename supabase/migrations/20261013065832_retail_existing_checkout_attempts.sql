@@ -37,7 +37,7 @@ create function public.retail_existing_checkout_material(a jsonb,i jsonb,custome
 returns jsonb language plpgsql immutable security invoker set search_path=pg_catalog as $$
 declare s jsonb:=a->'template_snapshot'; v jsonb:=s->'values'; p jsonb:=s->'package_snapshot';
   o jsonb:=p->'membership_terms'; b text; n text; signature_time timestamptz; deadline timestamptz;
-  original_intent jsonb;
+  original_intent jsonb; intent_deadline timestamptz;
 begin
   if customer is null or customer !~ '^cus_[A-Za-z0-9_]+$' or a->>'client_id' is null
     or p is distinct from public.retail_existing_package(o)
@@ -72,8 +72,11 @@ begin
   if s->>'source' in('public_purchase_intent','sales_assisted') then
     perform public.retail_existing_terms_months(a,i);
     if i->>'client_id' is distinct from a->>'client_id' then raise exception 'retail_checkout_source_mismatch';end if;
+    intent_deadline:=(i->>'expires_at')::timestamptz;
+    if not coalesce(isfinite(intent_deadline),false) then raise exception 'retail_checkout_source_mismatch';end if;
     original_intent:=jsonb_build_object('id',i->'id','agreement_id',i->'agreement_id','client_id',i->'client_id',
-      'protocol',i->'protocol','package_snapshot',i->'package_snapshot','promotion_code_id',i->'promotion_code_id');
+      'protocol',i->'protocol','package_snapshot',i->'package_snapshot','promotion_code_id',i->'promotion_code_id',
+      'expires_at',to_char(intent_deadline at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"'));
     if o->>'payment_option'='prepaid' and coalesce(length(btrim(i->>'promotion_code_id')),0)>0 then
       raise exception 'retail_checkout_discount_denied';
     end if;
@@ -154,7 +157,7 @@ begin
       or (i is not null and (i->>'stripe_checkout_session_id' is not null
         or coalesce(i->>'status','') not in('agreement_pending','checkout_pending')
         or i->>'canceled_at' is not null or not coalesce(isfinite((i->>'expires_at')::timestamptz),false)
-        or (i->>'expires_at')::timestamptz<=clock)) then raise exception 'retail_checkout_claim_denied';end if;
+        or (i->>'expires_at')::timestamptz-clock<interval '30 minutes')) then raise exception 'retail_checkout_claim_denied';end if;
     material:=public.retail_existing_checkout_material(to_jsonb(old),i,c->>'stripe_customer_id');
     if new.checkout_attempt_source is distinct from material||jsonb_build_object('config',config) then
       raise exception 'retail_checkout_source_mismatch';
@@ -206,13 +209,13 @@ begin
       or (had_intent and i.stripe_checkout_session_id is not null) then
       raise exception 'retail_checkout_untracked_attempt';
     end if;
-    expiry:=least(a.agreement_expires_at,clock+interval '24 hours'-interval '1 second');
+    expiry:=least(a.agreement_expires_at,case when had_intent then i.expires_at end,clock+interval '24 hours'-interval '1 second');
     if expiry-clock<interval '30 minutes' then raise exception 'retail_checkout_window_closed';end if;
     update public.membership_agreements set checkout_created_at=clock,checkout_embedded=p_embedded,
       replaces_stripe_subscription_id=p_replacement,
       checkout_attempt_source=material||jsonb_build_object('config',p_config)
       where id=a.id returning * into a;
-    expiry:=least(a.agreement_expires_at,a.checkout_created_at+interval '24 hours'-interval '1 second');
+    expiry:=least(a.agreement_expires_at,case when had_intent then i.expires_at end,a.checkout_created_at+interval '24 hours'-interval '1 second');
     if expiry-clock_timestamp()<interval '30 minutes' then raise exception 'retail_checkout_window_closed';end if;
   else
     if a.checkout_attempt_source-'config' is distinct from material or a.checkout_embedded is null
@@ -220,7 +223,7 @@ begin
       or a.replaces_stripe_subscription_id is distinct from p_replacement then
       raise exception 'retail_checkout_attempt_changed';
     end if;
-    expiry:=least(a.agreement_expires_at,a.checkout_created_at+interval '24 hours'-interval '1 second');
+    expiry:=least(a.agreement_expires_at,case when had_intent then i.expires_at end,a.checkout_created_at+interval '24 hours'-interval '1 second');
     if clock>=a.checkout_created_at+interval '24 hours' or expiry-clock<interval '30 minutes' then
       raise exception 'retail_checkout_window_closed';
     end if;

@@ -4,6 +4,7 @@ const assert = require('node:assert/strict')
 const path = require('node:path')
 const http = require('node:http')
 const InstalledStripe = require('stripe')
+const crypto = require('node:crypto')
 const { test } = require('node:test')
 
 const checkoutPath = path.join(__dirname, '..', 'src', 'services', 'subscriptionCheckout.js')
@@ -11,6 +12,19 @@ const supabaseClientPath = path.join(__dirname, '..', 'src', 'clients', 'supabas
 const clientBillingScopePath = path.join(__dirname, '..', 'src', 'services', 'clientBillingScope.js')
 const urlConfigPath = path.join(__dirname, '..', 'src', 'config', 'urlConfig.js')
 const stripePath = require.resolve('stripe')
+const retailRows = new Map(), TOKEN = 'SYNTHETIC_CHECKOUT_SIGNER_TOKEN';
+function retailArgs(snapshot, promotionCodeId = '') {
+  const id = crypto.randomUUID(), intent = promotionCodeId ? { id:crypto.randomUUID(),promotion_code_id:promotionCodeId } : null;
+  const row = { id,client_id:'client-1',agreement_expires_at:new Date(Date.now()+7*86400000).toISOString(),
+    signer_token_hash:crypto.createHash('sha256').update(TOKEN).digest('hex'),
+    template_snapshot:{ source:intent?'sales_assisted':'admin',package_snapshot:structuredClone(snapshot) } };
+  if (intent) intent.expires_at=row.agreement_expires_at;
+  retailRows.set(id,{ row,intent });
+  return { clientId:'client-1',planTier:snapshot.plan_key,billingInterval:snapshot.billing_cadence,
+    packageSnapshot:snapshot,retailAgreement:row,metadataSource:'agreement_checkout',promotionCodeId,
+    idempotencyKey:`agreement_checkout:${id}:${snapshot.plan_key}:${snapshot.billing_cadence}`,
+    cancelUrl:`https://qa.alphasourceai.com/membership-agreement/sign/${TOKEN}` };
+}
 
 function injectModule(filename, exports) {
   require.cache[filename] = {
@@ -91,6 +105,36 @@ function makeDb() {
       stripe_customer_id: 'cus_existing'
     }],
     updates: [],
+    attempts:new Map(),rpcCalls:[],
+    // Explicit injected native boundary for JS orchestration only. These are
+    // NOT SQL proofs; the disposable PostgreSQL suite exercises real RPCs.
+    async rpc(name,args) {
+      this.rpcCalls.push({name,args:structuredClone(args)});
+      if (name === 'claim_retail_existing_checkout_attempt') {
+        const persisted = retailRows.get(args.p_agreement);assert.ok(persisted);
+        assert.deepEqual(args.p_expected_template,persisted.row.template_snapshot);
+        let attempt = this.attempts.get(args.p_agreement);
+        if (!attempt) {
+          const row=persisted.row,b=Date.now();
+          attempt={agreement_id:row.id,client_id:row.client_id,created_at:new Date(b).toISOString(),
+            source:{version:'retail_existing_checkout_attempt_v1',agreement_id:row.id,client_id:row.client_id,
+              customer_id:args.p_customer,template_snapshot:structuredClone(row.template_snapshot),
+              agreement_expires_at:row.agreement_expires_at,signer_token_hash:row.signer_token_hash,
+              intent:persisted.intent,config:structuredClone(args.p_config)},
+            expires_at:Math.floor(Math.min(Date.parse(row.agreement_expires_at),
+              persisted.intent?Date.parse(persisted.intent.expires_at):Infinity,b+86400000-1000)/1000),
+            embedded:args.p_embedded,replacement_id:args.p_replacement,checkout_session_id:null};
+          this.attempts.set(row.id,attempt);
+          row.checkout_attempt_source=structuredClone(attempt.source);
+        }
+        if (attempt.replacement_id !== args.p_replacement) return{data:null,error:{message:'retail_checkout_attempt_changed'}};
+        return{data:structuredClone(attempt),error:null};
+      }
+      assert.equal(name,'pin_retail_existing_checkout_session');
+      const actual=this.attempts.get(args.p_agreement);assert.deepEqual(args.p_attempt,{...actual,checkout_session_id:args.p_attempt.checkout_session_id});
+      assert.ok(!actual.checkout_session_id||actual.checkout_session_id===args.p_session);
+      actual.checkout_session_id=args.p_session;return{data:structuredClone(actual),error:null};
+    },
     from(table) {
       return new FakeQuery(this, table)
     }
@@ -98,14 +142,14 @@ function makeDb() {
   return db
 }
 
-function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder, customerOverride = {} }) {
+function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder, customerOverride = {},db = makeDb(),sessionMutation,lineMutation }) {
   delete require.cache[checkoutPath]
   delete require.cache[supabaseClientPath]
   delete require.cache[clientBillingScopePath]
   delete require.cache[urlConfigPath]
   delete require.cache[stripePath]
 
-  injectModule(supabaseClientPath, { supabaseAdmin: makeDb() })
+  injectModule(supabaseClientPath, { supabaseAdmin: db })
   injectModule(clientBillingScopePath, {
     requireParentClient: async () => ({ ok: true, clientId: 'client-1' })
   })
@@ -113,11 +157,13 @@ function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder, custom
     resolvePublicBackendBase(value) {
       return value || 'https://api.qa.alphasourceai.com'
     },
+    buildMembershipAgreementSignUrl(token) { return `https://qa.alphasourceai.com/membership-agreement/sign/${token}` },
     buildClientDashboardReturnUrl(query = {}) {
       const params = new URLSearchParams(query)
       return `https://qa.alphasourceai.com/dashboard?${params.toString()}`
     }
   })
+  let lastPayload,lastSession;
   injectModule(stripePath, stripeConstructor || function Stripe() {
     return {
       customers: {
@@ -141,9 +187,26 @@ function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder, custom
         sessions: {
           create: async (payload, options) => {
             stripeCalls.sessions.push({ payload, options })
-            if (sessionResponder) return sessionResponder(payload, options)
-            return { id: 'cs_test_subscription', url: 'https://checkout.stripe.test/cs_test_subscription' }
-          }
+            lastPayload=payload;
+            lastSession=sessionResponder ? sessionResponder(payload, options)
+              : { id:'cs_test_subscription',url:'https://checkout.stripe.test/cs_test_subscription' };
+            return lastSession;
+          },
+          retrieve:async sessionId=>{
+            const total=lastPayload.line_items.reduce((sum,l)=>sum+l.price_data.unit_amount,0);
+            const s={object:'checkout.session',id:sessionId,mode:'subscription',status:'open',payment_status:'unpaid',
+              currency:'usd',livemode:false,customer:lastPayload.customer,subscription:null,expires_at:lastPayload.expires_at,
+              ui_mode:lastPayload.ui_mode||'hosted',metadata:lastPayload.metadata,amount_subtotal:total,amount_total:total,
+              return_url:lastPayload.return_url,success_url:lastPayload.success_url,cancel_url:lastPayload.cancel_url,
+              allow_promotion_codes:lastPayload.allow_promotion_codes,total_details:{amount_discount:0,amount_shipping:0,amount_tax:0},
+              ...lastSession};
+            return sessionMutation?sessionMutation(s):s;
+          },
+          listLineItems:async()=>{ const lines={object:'list',has_more:false,data:lastPayload.line_items.map((l,n)=>({
+            id:`li_SYNTHETIC_${n}`,quantity:l.quantity,currency:'usd',amount_subtotal:l.price_data.unit_amount,
+            price:{object:'price',id:`price_SYNTHETIC_${n}`,currency:'usd',unit_amount:l.price_data.unit_amount,
+              type:l.price_data.recurring?'recurring':'one_time',recurring:l.price_data.recurring?{...l.price_data.recurring,usage_type:'licensed'}:null}
+          }))};return lineMutation?lineMutation(lines):lines; }
         }
       }
     }
@@ -338,8 +401,7 @@ test('existing subscription checkout prices all24 retail variants from frozen pa
   for(const planKey of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])for(const role of [false,true]){
     const calls=retailCalls(),snapshot=retailSnapshot(planKey,months,payment,role),offer=snapshot.membership_terms;
     const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls});
-    await create({clientId:'client-1',planTier:planKey,billingInterval:snapshot.billing_cadence,packageSnapshot:snapshot,
-      metadataSource:'agreement_checkout',idempotencyKey:`existing-agreement:${planKey}:${months}:${payment}:${role}`,
+    await create({...retailArgs(snapshot),
       metadata:{client_id:'wrong-client',plan_tier:'enterprise',billing_interval:'annual',membership_commitment_months:'99',first_role_prepay_selected:'wrong'}});
     assert.equal(calls.sessions.length,1);const {payload:p,options}=calls.sessions[0];assert.equal(p.mode,'subscription');
     assert.equal(p.customer,'cus_existing');assert.equal(p.line_items.length,role?2:1);
@@ -349,7 +411,7 @@ test('existing subscription checkout prices all24 retail variants from frozen pa
     assert.equal(p.metadata.billing_interval,snapshot.billing_cadence);assert.equal(p.metadata.membership_commitment_months,String(months));
     assert.equal(p.metadata.first_role_prepay_selected,String(role));assert.equal(p.metadata.first_role_prepay_amount_cents,String(offer.first_role_prepay.amount_cents));
     assert.deepEqual(p.subscription_data.metadata,p.metadata);assert.equal('trial_end' in p.subscription_data,false);
-    assert.equal('billing_cycle_anchor' in p.subscription_data,false);assert.ok(options.idempotencyKey.startsWith('existing-agreement:'));
+    assert.equal('billing_cycle_anchor' in p.subscription_data,false);assert.ok(options.idempotencyKey.startsWith('agreement_checkout:'));
     if(role){assert.equal(p.line_items[1].price_data.unit_amount,planKey==='basic'?35900:62900);assert.equal('recurring' in p.line_items[1].price_data,false)}
   }
 });
@@ -359,34 +421,29 @@ test('new retail checkout rejects mismatched plan/cadence/role, malformed source
     {firstRolePrepay:{selected:true,credit_type:'first_role_prepay',amount_cents:35900,normal_role_fee_cents:39900,discount_percent:10}},
     {packageSnapshot:{pricing_protocol:'retail_package_terms_v2'}}];
   for(const change of cases){const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls});
-    await assert.rejects(create({clientId:'client-1',planTier:'basic',billingInterval:'prepaid',packageSnapshot:snapshot,
-      idempotencyKey:'existing-agreement:synthetic',metadataSource:'agreement_checkout',...change}));
+    await assert.rejects(create({...retailArgs(snapshot),...change}));
     assert.equal(calls.sessions.length,0);assert.equal(calls.customerCreates.length,0);assert.equal(calls.customerUpdates.length,0);assert.equal(calls.subscriptionLists.length,0)}
 });
 test('new retail Checkout does not create a second hosted session after an ambiguous embedded result',async()=>{
   const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls});
-  await assert.rejects(create({clientId:'client-1',planTier:'basic',billingInterval:'prepaid',packageSnapshot:retailSnapshot(),
-    idempotencyKey:'existing-agreement:embedded',metadataSource:'agreement_checkout',embedded:true}),e=>e.code==='retail_checkout_ack_unknown');
+  await assert.rejects(create({...retailArgs(retailSnapshot()),embedded:true}),e=>e.code==='retail_checkout_ack_unknown');
   assert.equal(calls.sessions.length,1);assert.equal(calls.sessions[0].payload.ui_mode,'embedded');
 });
 test('confirmed new retail embedded checkout retains its primary session without a second payable fallback',async()=>{
   const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,
     sessionResponder:()=>({id:'cs_SYNTHETIC_EMBEDDED',url:null,client_secret:'SYNTHETIC_NOT_A_REAL_SECRET'})});
-  const result=await create({clientId:'client-1',planTier:'basic',billingInterval:'prepaid',packageSnapshot:retailSnapshot(),
-    idempotencyKey:'existing-agreement:embedded-confirmed',metadataSource:'agreement_checkout',embedded:true});
+  const result=await create({...retailArgs(retailSnapshot()),embedded:true});
   assert.equal(calls.sessions.length,1);assert.equal(result.session.id,'cs_SYNTHETIC_EMBEDDED');assert.equal(result.fallbackSession,null);
   assert.equal(result.checkoutClientSecret,'SYNTHETIC_NOT_A_REAL_SECRET');
 });
 test('monthly retail installments preserve the existing validated promotion-code behavior',async()=>{
   const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls});
-  await create({clientId:'client-1',planTier:'basic',billingInterval:'monthly',packageSnapshot:retailSnapshot('basic',3,'monthly_installments'),
-    idempotencyKey:'existing-agreement:promotion',metadataSource:'agreement_checkout',promotionCodeId:'promo_validated'});
+  await create(retailArgs(retailSnapshot('basic',3,'monthly_installments'),'promo_validated'));
   assert.deepEqual(calls.sessions[0].payload.discounts,[{promotion_code:'promo_validated'}]);
   assert.equal('allow_promotion_codes' in calls.sessions[0].payload,false);
 });
 test('new prepaid refuses extra promotions before provider effects and customer discounts/credits before updates or checkout',async()=>{
-  const base={clientId:'client-1',planTier:'basic',billingInterval:'prepaid',packageSnapshot:retailSnapshot(),
-    idempotencyKey:'existing-agreement:exact-prepaid',metadataSource:'agreement_checkout'};
+  const base=retailArgs(retailSnapshot());
   const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls});
   await assert.rejects(create({...base,promotionCodeId:'promo_synthetic'}),e=>e.code==='retail_prepaid_discount_denied');
   assert.equal(calls.sessions.length,0);assert.equal(calls.customerCreates.length,0);assert.equal(calls.customerUpdates.length,0);
@@ -397,14 +454,30 @@ test('new prepaid refuses extra promotions before provider effects and customer 
     assert.equal(c.sessions.length,0);assert.equal(c.customerCreates.length,0);assert.equal(c.customerUpdates.length,0);assert.equal(c.subscriptionLists.length,0);
   }
 });
-test('installed Stripe16 SDK serializes new retail terms through the existing Checkout function on loopback only',async t=>{
+test('installed Stripe16 SDK serializes and retrieves new retail terms through the existing Checkout function on loopback only',async t=>{
+  let sdkSession,sdkLines;
   const requests=[],server=http.createServer(async(req,res)=>{
     let body='';for await(const b of req)body+=b;const p=new URLSearchParams(body);
     requests.push({method:req.method,path:req.url,body:p,version:req.headers['stripe-version'],key:req.headers['idempotency-key']});
     let data;if(req.method==='GET'&&req.url==='/v1/customers/cus_existing')data={object:'customer',id:'cus_existing',discount:null,balance:0};
     else if(req.method==='POST'&&req.url==='/v1/customers/cus_existing')data={object:'customer',id:'cus_existing'};
     else if(req.method==='GET'&&req.url.startsWith('/v1/subscriptions?'))data={object:'list',data:[],has_more:false};
-    else if(req.method==='POST'&&req.url==='/v1/checkout/sessions')data={object:'checkout.session',id:'cs_SYNTHETIC',url:'https://checkout.stripe.test/SYNTHETIC'};
+    else if(req.method==='POST'&&req.url==='/v1/checkout/sessions'){
+      const metadata=Object.fromEntries([...p].filter(([k])=>/^metadata\[[^\]]+\]$/.test(k)).map(([k,v])=>[k.slice(9,-1),v]));
+      const amounts=[0,1].map(n=>Number(p.get(`line_items[${n}][price_data][unit_amount]`)));
+      const total=amounts.reduce((a,b)=>a+b,0);
+      sdkSession={object:'checkout.session',id:'cs_SYNTHETIC',url:'https://checkout.stripe.test/SYNTHETIC',
+        customer:p.get('customer'),mode:'subscription',status:'open',payment_status:'unpaid',currency:'usd',livemode:false,
+        subscription:null,metadata,expires_at:Number(p.get('expires_at')),ui_mode:'hosted',amount_subtotal:total,amount_total:total,
+        success_url:p.get('success_url'),cancel_url:p.get('cancel_url'),allow_promotion_codes:p.get('allow_promotion_codes')==='true',
+        total_details:{amount_discount:0,amount_shipping:0,amount_tax:0}};
+      sdkLines={object:'list',has_more:false,data:amounts.map((amount,n)=>({id:`li_SDK_${n}`,quantity:1,currency:'usd',amount_subtotal:amount,
+        price:{object:'price',id:`price_SDK_${n}`,currency:'usd',unit_amount:amount,type:n?'one_time':'recurring',
+          recurring:n?null:{interval:'month',interval_count:Number(p.get('line_items[0][price_data][recurring][interval_count]')),usage_type:'licensed'}}}))};
+      data=sdkSession;
+    }
+    else if(req.method==='GET'&&req.url==='/v1/checkout/sessions/cs_SYNTHETIC')data=sdkSession;
+    else if(req.method==='GET'&&req.url.startsWith('/v1/checkout/sessions/cs_SYNTHETIC/line_items?'))data=sdkLines;
     else{res.writeHead(400,{'Content-Type':'application/json'});return res.end(JSON.stringify({error:{type:'invalid_request_error',message:'unexpected synthetic request'}}))}
     res.writeHead(200,{'Content-Type':'application/json','Stripe-Version':'2023-10-16'});res.end(JSON.stringify(data));
   });
@@ -413,10 +486,10 @@ test('installed Stripe16 SDK serializes new retail terms through the existing Ch
     apiVersion:opts.apiVersion,host:'127.0.0.1',port:server.address().port,protocol:'http',maxNetworkRetries:0})};
   for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments']){
     const calls=retailCalls(),s=retailSnapshot(plan,months,payment,true),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,stripeConstructor});
-    await create({clientId:'client-1',planTier:plan,billingInterval:s.billing_cadence,packageSnapshot:s,
-      metadataSource:'agreement_checkout',idempotencyKey:`existing-agreement:${plan}:${months}:${payment}:sdk`});
-    const request=requests.at(-1),p=request.body;assert.equal(request.path,'/v1/checkout/sessions');assert.equal(request.method,'POST');
-    assert.equal(request.version,'2023-10-16');assert.equal(request.key,`existing-agreement:${plan}:${months}:${payment}:sdk`);
+    const args=retailArgs(s);await create(args);
+    const request=requests.findLast(r=>r.method==='POST'&&r.path==='/v1/checkout/sessions'),p=request.body;
+    assert.equal(request.path,'/v1/checkout/sessions');assert.equal(request.method,'POST');
+    assert.equal(request.version,'2023-10-16');assert.equal(request.key,args.idempotencyKey);
     assert.equal(p.get('mode'),'subscription');assert.equal(p.get('line_items[0][price_data][unit_amount]'),String(s.platform_fee_cents));
     assert.equal(p.get('allow_promotion_codes'),String(payment!=='prepaid'));assert.equal(p.has('discounts[0][promotion_code]'),false);
     assert.equal(p.get('line_items[0][price_data][recurring][interval_count]'),String(payment==='prepaid'?months:1));
@@ -425,4 +498,79 @@ test('installed Stripe16 SDK serializes new retail terms through the existing Ch
     assert.equal(p.has('subscription_data[trial_end]'),false);assert.equal(p.has('payment_method_types[0]'),false);
   }
   assert.equal(requests.filter(r=>r.path==='/v1/checkout/sessions').length,12);
+});
+
+test('new retail direct service requires existing signed source and exact key before any SDK effects',async()=>{
+  for(const override of [{retailAgreement:null},{idempotencyKey:'unbound_key'},{returnTab:'other'},
+    {metadataSource:'admin_subscription_checkout'}]) {
+    const calls=retailCalls(),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls});
+    await assert.rejects(create({...retailArgs(retailSnapshot()),...override}),{code:'retail_checkout_source_required'});
+    assert.equal(calls.sessions.length,0);assert.equal(calls.customerUpdates.length,0);assert.equal(calls.customerCreates.length,0);
+    assert.equal(calls.subscriptionLists.length,0);
+  }
+});
+test('known Session is retrieved and re-pinned without creating again; transport/forwarded URL changes cannot change the frozen attempt',async()=>{
+  const calls=retailCalls(),db=makeDb(),args=retailArgs(retailSnapshot()),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,db});
+  const first=await create(args),attempt=structuredClone(db.attempts.get(args.retailAgreement.id));
+  const second=await create({...args,embedded:true,requestContext:{forwardedHost:'untrusted.example.invalid',forwardedProto:'http'},now:'2099-01-01'});
+  assert.equal(calls.sessions.length,1);assert.equal(first.session.id,second.session.id);assert.equal(second.checkoutClientSecret,null);
+  assert.deepEqual(db.attempts.get(args.retailAgreement.id),attempt);
+  assert.match(calls.sessions[0].payload.success_url,/^https:\/\/api\.qa\.alphasourceai\.com\//);
+  assert.match(calls.sessions[0].payload.cancel_url,/^https:\/\/qa\.alphasourceai\.com\//);
+  assert.equal(db.rpcCalls.filter(c=>c.name==='pin_retail_existing_checkout_session').length,2);
+});
+test('hosted unknown acknowledgment retries the same existing key and exact body, not a new mode or clock',async()=>{
+  const calls=retailCalls(),db=makeDb(),args=retailArgs(retailSnapshot());let count=0;
+  const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,db,sessionResponder:()=>{
+    if(++count===1) throw new Error('SYNTHETIC lost acknowledgment');return{id:'cs_RECOVERED',url:'https://checkout.stripe.test/RECOVERED'};
+  }});
+  await assert.rejects(create(args),{code:'retail_checkout_ack_unknown'});
+  const initial=structuredClone(calls.sessions[0]),b=db.attempts.get(args.retailAgreement.id).created_at;
+  const second=await create({...args,embedded:true,now:'2099-01-01',requestContext:{forwardedHost:'untrusted.example.invalid'}});
+  assert.equal(second.session.id,'cs_RECOVERED');assert.equal(calls.sessions.length,2);
+  assert.deepEqual(calls.sessions[1],initial);assert.equal(db.attempts.get(args.retailAgreement.id).created_at,b);
+});
+test('unknown native pin acknowledgment exposes no result; retry retrieves the already-linked Session without another create',async()=>{
+  const calls=retailCalls(),db=makeDb(),args=retailArgs(retailSnapshot()),original=db.rpc.bind(db);let lost=true;
+  db.rpc=async(name,params)=>{const r=await original(name,params);if(name==='pin_retail_existing_checkout_session'&&lost){lost=false;return{data:null,error:null}}return r};
+  const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,db});
+  await assert.rejects(create(args),{code:'retail_checkout_store_unavailable'});
+  assert.equal(calls.sessions.length,1);const result=await create(args);assert.equal(result.retailAttemptLinked,true);
+  assert.equal(calls.sessions.length,1);
+});
+test('known terminal or source/price-mismatched Session never falls back to a fresh payable checkout',async()=>{
+  for(const mutate of [s=>({...s,status:'complete',payment_status:'paid'}),s=>({...s,status:'expired'}),
+    s=>({...s,customer:'cus_OTHER'}),s=>({...s,expires_at:s.expires_at+1}),s=>({...s,ui_mode:'embedded'}),
+    s=>({...s,metadata:{...s.metadata,agreement_id:'OTHER'}}),s=>({...s,amount_total:0}),
+    s=>({...s,success_url:'https://OTHER.example.invalid'}),s=>({...s,cancel_url:'https://OTHER.example.invalid'}),
+    s=>({...s,allow_promotion_codes:true}),s=>({...s,total_details:{...s.total_details,amount_discount:1}})]) {
+    const calls=retailCalls(),db=makeDb(),args=retailArgs(retailSnapshot());let change=false;
+    const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,db,sessionMutation:s=>change?mutate(s):s});
+    await create(args);change=true;await assert.rejects(create(args));assert.equal(calls.sessions.length,1);
+    assert.equal(db.rpcCalls.filter(c=>c.name==='pin_retail_existing_checkout_session').length,1);
+  }
+  const calls=retailCalls(),db=makeDb(),args=retailArgs(retailSnapshot());let change=false;
+  const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,db,lineMutation:ls=>{
+    if(change)ls.data[0].price.recurring.interval_count=99;return ls;
+  }});
+  await create(args);change=true;await assert.rejects(create(args),{code:'retail_checkout_session_prices_mismatch'});
+  assert.equal(calls.sessions.length,1);
+});
+test('existing attempted customer drift is held, never silently restored from stale billing mapping or replaced',async()=>{
+  const calls=retailCalls(),db=makeDb(),args=retailArgs(retailSnapshot()),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,db});
+  await create(args);const updates=calls.customerUpdates.length;db.clients[0].stripe_customer_id='cus_CHANGED';
+  await assert.rejects(create(args),{code:'retail_checkout_customer_changed'});
+  assert.equal(db.clients[0].stripe_customer_id,'cus_CHANGED');assert.equal(calls.sessions.length,1);
+  assert.equal(calls.customerUpdates.length,updates);assert.equal(calls.customerCreates.length,0);
+});
+test('native closed/unknown store, corrupt claim acknowledgment and a wrong signing token stop before Session creation',async()=>{
+  for(const mode of ['missing','closed','corrupt','token']) {
+    const calls=retailCalls(),db=makeDb(),args=retailArgs(retailSnapshot()),original=db.rpc.bind(db);
+    if(mode==='missing')db.rpc=undefined;
+    if(mode==='closed')db.rpc=async()=>({data:null,error:{message:'retail_checkout_window_closed'}});
+    if(mode==='corrupt')db.rpc=async(n,p)=>{const r=await original(n,p);r.data.expires_at++;return r};
+    if(mode==='token')args.cancelUrl='https://qa.alphasourceai.com/membership-agreement/sign/WRONG_SYNTHETIC_TOKEN';
+    const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,db});
+    await assert.rejects(create(args));assert.equal(calls.sessions.length,0);
+  }
 });
