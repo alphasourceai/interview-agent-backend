@@ -623,6 +623,14 @@ async function markAgreementCheckoutPaid(agreementId, options = {}) {
       eventSubscriptionId: options.eventSubscriptionId || pickId(options.subscription?.id) || options.fallbackSubscriptionId || null,
       eventInvoiceId: options.invoiceId || null, eventLivemode: options.eventLivemode, assertFence
     });
+    const expectedEnterpriseEvent = options.existingEnterprisePaymentEvent;
+    if (expectedEnterpriseEvent?.cohort === 'existing_enterprise'
+      && expectedEnterpriseEvent.agreementId === normalizedAgreementId && !enterprisePayment) {
+      const error = new Error('enterprise_payment_completion_missing');
+      error.code = error.message;
+      error.status = 503;
+      throw error;
+    }
     if (enterprisePayment) {
       const result = await finishExistingEnterpriseAccountSetup({
         db: fencedDb, agreementId: normalizedAgreementId, requestId: options.requestId || null,
@@ -861,6 +869,7 @@ router.post('/', async (req, res) => {
         fallbackCustomerId: existingEnterprisePaymentEvent.customerId,
         fallbackSubscriptionId: existingEnterprisePaymentEvent.subscriptionId,
         fallbackClientId: existingEnterprisePaymentEvent.clientId,
+        existingEnterprisePaymentEvent,
         requestId: request_id
       });
       requireAgreementActivationResult(activation);

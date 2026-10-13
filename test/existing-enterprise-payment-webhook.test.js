@@ -11,11 +11,26 @@ function ready(){
  f.stripe.subscriptions.retrieve=async id=>{assert.equal(id,sub.id);return structuredClone(sub);};
  return f;
 }
+function checkoutEvent(f,{eventStatus='complete',eventPayment='paid'}={}){return event(f,'checkout.session.completed',{
+ id:f.a.checkout_session_id,object:'checkout.session',mode:'subscription',status:eventStatus,payment_status:eventPayment,
+ customer:f.client.stripe_customer_id,subscription:f.p.subscription.id,metadata:structuredClone(f.p.checkout.metadata)});}
 test('classifies settled existing agreement Checkout from native pin and fresh provider graph',async()=>{
- const f=ready(),r=await classify({db:f.db,stripe:f.stripe,event:event(f,'checkout.session.completed',{
-  id:f.a.checkout_session_id,object:'checkout.session',mode:'subscription',status:'complete',payment_status:'paid',
-  customer:f.client.stripe_customer_id,subscription:f.p.subscription.id,metadata:structuredClone(f.p.checkout.metadata)})});
+ const f=ready(),r=await classify({db:f.db,stripe:f.stripe,event:checkoutEvent(f)});
  assert.equal(r.action,'initial_paid');assert.equal(r.agreementId,f.a.id);assert.equal(r.requiresReentry,true);
+});
+test('holds conflicting stale event-unpaid versus fresh SDK-paid Checkout for retry',async()=>{
+ const f=ready(),r=await classify({db:f.db,stripe:f.stripe,event:checkoutEvent(f,{eventPayment:'unpaid'})});
+ assert.equal(r.action,'held');assert.equal(r.requiresReentry,true);
+});
+test('holds conflicting event-paid versus fresh SDK-unpaid Checkout for retry',async()=>{
+ const f=ready();f.p.checkout.payment_status='unpaid';
+ const r=await classify({db:f.db,stripe:f.stripe,event:checkoutEvent(f)});
+ assert.equal(r.action,'held');assert.equal(r.requiresReentry,true);
+});
+test('holds conflicting completed event versus non-complete fresh Checkout for retry',async()=>{
+ const f=ready();f.p.checkout.status='open';
+ const r=await classify({db:f.db,stripe:f.stripe,event:checkoutEvent(f)});
+ assert.equal(r.action,'held');assert.equal(r.requiresReentry,true);
 });
 test('classifies initial invoice.created with missing metadata through unique customer and pinned Checkout',async()=>{
  const f=ready(),r=await classify({db:f.db,stripe:f.stripe,event:event(f,'invoice.created',{

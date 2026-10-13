@@ -90,13 +90,22 @@ async function matchCandidate({db,stripe,event,eventObject,eventSub,eventCustome
 function actionFor(event,checkout){
  const type=event.type,o=event.data?.object||{};
  if(type==='checkout.session.completed'||type==='checkout.session.async_payment_succeeded'){
-  if(o.status!=='complete'&&checkout.status!=='complete')return'held';
-  if(o.payment_status==='paid'&&checkout.payment_status==='paid')return'initial_paid';
-  if(type==='checkout.session.completed'&&['unpaid','no_payment_required'].includes(String(o.payment_status||checkout.payment_status)))return'pending_noop';
+  const eventStatus=String(o.status||''),sdkStatus=String(checkout.status||'');
+  const eventPayment=String(o.payment_status||''),sdkPayment=String(checkout.payment_status||'');
+  // The signed event and fresh SDK snapshot are independent facts. Any
+  // disagreement is retryable; never let a stale unpaid event ACK a paid SDK
+  // Checkout (or let a paid event authorize an unpaid SDK Checkout).
+  if(!eventStatus||!sdkStatus||eventStatus!==sdkStatus||!eventPayment||!sdkPayment||eventPayment!==sdkPayment)return'held';
+  if(eventStatus!=='complete')return'held';
+  if(eventPayment==='paid')return'initial_paid';
+  if(type==='checkout.session.completed'&&['unpaid','no_payment_required'].includes(eventPayment))return'pending_noop';
   return'held';
  }
  if(type==='checkout.session.async_payment_failed'){
-  if(checkout.payment_status==='paid'||o.payment_status==='paid')return'held';
+  const eventStatus=String(o.status||''),sdkStatus=String(checkout.status||'');
+  const eventPayment=String(o.payment_status||''),sdkPayment=String(checkout.payment_status||'');
+  if(!eventStatus||!sdkStatus||eventStatus!==sdkStatus||!eventPayment||!sdkPayment||eventPayment!==sdkPayment)return'held';
+  if(eventPayment==='paid')return'held';
   return'pending_noop';
  }
  if(type==='invoice.created'&&o.billing_reason==='subscription_create')return'initial_noop';

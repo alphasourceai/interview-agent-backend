@@ -28,7 +28,7 @@ function memoryDb({duplicate=false,priorProcessed=false}={}){
   throw Error('Unexpected RPC '+name);
  }};
 }
-function load({action,duplicate=false,priorProcessed=false,activationFails=false}={}){
+function load({action,duplicate=false,priorProcessed=false,activationFails=false,completionMissing=false}={}){
  const db=memoryDb({duplicate,priorProcessed}),calls=[];let current;
  inject('../src/clients/supabase',{supabaseAdmin:db});
  inject('../src/clients/stripe',{webhooks:{constructEvent:()=>current},subscriptions:{retrieve:async id=>({id})}});
@@ -38,6 +38,7 @@ function load({action,duplicate=false,priorProcessed=false,activationFails=false
  });
  inject('../src/services/existingEnterprisePaymentCompletion',{completeExistingEnterprisePayment:async x=>{
   calls.push({complete:x.agreementId,session:x.eventSessionId,subscription:x.eventSubscriptionId,invoice:x.eventInvoiceId});
+  if(completionMissing)return null;
   return{billing_applied:true,paid_pool_recorded:true};
  }});
  inject('../src/services/existingRetailCheckoutFunding',{readExistingRetailCheckoutFunding:async()=>{calls.push('retailReader');return null;},
@@ -69,6 +70,11 @@ test('marked lifecycle failure keeps the dedupe row false and returns retryable 
 test('account-tail failure leaves marked event retryable after payment completion',async()=>{
  const f=load({action:'initial_paid',activationFails:true}),r=await f.post();assert.equal(r.status,503);
  assert.equal(f.db.events[0].processed_ok,false);assert.equal(f.calls.length,2);
+});
+test('marked payment completion returning null cannot fall through to legacy retail activation',async()=>{
+ const f=load({action:'initial_paid',completionMissing:true}),r=await f.post();assert.equal(r.status,503);
+ assert.equal(f.db.events[0].processed_ok,false);assert.equal(f.calls.length,1);
+ assert.equal(f.calls.some(call=>call==='retailReader'||call==='legacyActivation'),false);
 });
 test('processed duplicate is acknowledged only after the native marked classifier reenters',async()=>{
  const f=load({action:'held',duplicate:true,priorProcessed:true}),r=await f.post('customer.subscription.updated');
