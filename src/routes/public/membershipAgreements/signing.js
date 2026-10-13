@@ -1,4 +1,5 @@
 'use strict';
+const { validateRetailAgreementSource } = require('../../../services/retailQuoteSelection');
 
 // Opening a signing session and recording the signature.
 
@@ -191,6 +192,12 @@ router.post('/sign', publicAgreementTokenRateLimit, async (req, res) => {
     }
     const parentGuard = await requireAgreementClientWhenPresent(agreement, { route: 'membership_agreements_sign', agreement_id: agreement.id });
     if (!parentGuard.ok) return respondWithAgreementClientGuard(res, parentGuard, request_id);
+    const retail = validateRetailAgreementSource(agreement);
+    if (retail && ['public_purchase_intent', 'sales_assisted'].includes(agreement.template_snapshot.source)) {
+      const source = await supabaseAdmin.from('public_purchase_intents').select('*').eq('agreement_id', agreement.id).maybeSingle();
+      if (source.error) { const e = new Error('retail_quote_source_unavailable'); e.code = e.message; e.status = 503; throw e; }
+      validateRetailAgreementSource(agreement, source.data);
+    }
 
     let signedAt = new Date().toISOString();
     const clientSlug = slugify(agreement.client_legal_name);
@@ -211,6 +218,14 @@ router.post('/sign', publicAgreementTokenRateLimit, async (req, res) => {
       signedAt=result.execution.signed_at;
       notify=result.notify;
     }else{
+    // Validate/render the saved accepted source BEFORE uploading a permanent
+    // signature artifact. Keep the existing signing RPC and delivery path.
+    const { html } = buildExecutedMembershipAgreementHtml(agreement, {
+      accepted: true,
+      signer_typed_name: typedName,
+      signature_image_src: signaturePayload.dataUrl,
+      signed_at: signedAt
+    });
     const signatureSha256 = crypto.createHash('sha256').update(signaturePayload.buffer).digest('hex');
     const signaturePath = `membership-agreements/${agreement.id}/signature.${signaturePayload.ext}`;
 
@@ -236,13 +251,6 @@ router.post('/sign', publicAgreementTokenRateLimit, async (req, res) => {
         request_id
       });
     }
-
-    const { html } = buildExecutedMembershipAgreementHtml(agreement, {
-      accepted: true,
-      signer_typed_name: typedName,
-      signature_image_src: signaturePayload.dataUrl,
-      signed_at: signedAt
-    });
 
     executedPdf = await htmlToPdf(html, {
       format: 'Letter',
@@ -411,7 +419,7 @@ router.post('/sign', publicAgreementTokenRateLimit, async (req, res) => {
       return res.status(e.status||503).json({error:e.code,code:e.code,detail:'This agreement could not be safely signed. Please try again or contact support.',request_id});
     }
     console.error('[membership-agreements/sign] unexpected', { request_id, error: e?.message || e, code: e?.code || null });
-    return res.status(500).json({
+    return res.status(Number(e?.status) || 500).json({
       error: 'server_error',
       code: e?.code || 'server_error',
       detail: extractErrorMessage(e?.message || '', 'Server error.'),

@@ -8,6 +8,7 @@ const { salesHubMetrics } = require('../../services/salesHubMetrics')
 const { verifyReadyGhlBinding } = require('../../services/ghlSalesIntegration')
 const { htmlToPdf } = require('../../render/pdfRenderer')
 const { buildMembershipAgreementHtml } = require('../../render/membershipAgreement')
+const { RETAIL_TEMPLATE, retailAgreementTerms, validateRetailIntentSource, validateRetailAgreementSource } = require('../../services/retailQuoteSelection')
 const {
   sendMembershipAgreementEmail,
   sendSubscriptionCheckoutEmail
@@ -39,7 +40,9 @@ const SALES_RATE_LIMITS = Object.freeze({
   send_payment_reminder: 10
 })
 const INTENT_COLUMNS = [
-  'id', 'status', 'selected_plan_key', 'selected_billing_cadence', 'package_snapshot',
+  'id', 'status', 'protocol', 'selected_plan_key', 'selected_billing_cadence', 'package_snapshot',
+  'first_role_prepay_selected', 'first_role_prepay_amount_cents', 'first_role_normal_role_fee_cents',
+  'first_role_prepay_discount_percent', 'first_role_prepay_credit_type',
   'company_legal_name', 'company_dba', 'buyer_first_name', 'buyer_last_name',
   'buyer_email', 'buyer_phone', 'buyer_title', 'agreement_id',
   'stripe_checkout_session_id', 'client_id', 'created_at', 'updated_at', 'expires_at',
@@ -55,7 +58,8 @@ const AGREEMENT_COLUMNS = [
   'id', 'status', 'is_current', 'checkout_status', 'checkout_session_id',
   'client_id', 'sent_at', 'opened_at', 'signed_at', 'signer_token_expires_at',
   'agreement_expires_at', 'checkout_created_at', 'template_snapshot', 'draft_pdf_path',
-  'initial_term_start', 'initial_renewal_date', 'superseded_by_agreement_id'
+  'initial_term_start', 'initial_renewal_date', 'superseded_by_agreement_id',
+  'template_version', 'membership_tier', 'billing_option', 'auto_renew', 'notice_deadline_days'
 ].join(',')
 const GHL_BINDING_COLUMNS = [
   'id', 'location_id', 'contact_id', 'opportunity_id', 'pipeline_id', 'ready_stage_id',
@@ -252,6 +256,13 @@ function createSalesRouter(options = {}) {
   }
 
   async function replaceExpiredAgreement(intent, agreement, rep) {
+    const retail = validateRetailIntentSource(intent)
+    // A replacement token cannot renew an expired commercial quote. A new
+    // quote uses the ordinary preview path; legacy replacement is unchanged.
+    if (retail && (!Number.isFinite(Date.parse(agreement.agreement_expires_at))
+      || Date.parse(agreement.agreement_expires_at) <= Date.now())) {
+      throw makeSalesError(409, 'agreement_expired', 'Generate a new pricing preview for this expired quote.')
+    }
     const checkoutSessionId = String(intent.stripe_checkout_session_id || agreement.checkout_session_id || '').trim()
     if (checkoutSessionId) {
       let session = null
@@ -268,6 +279,7 @@ function createSalesRouter(options = {}) {
     }
 
     const schedule = agreementSchedule()
+    if (retail) schedule.expires_at = agreement.agreement_expires_at
     const draft = validateSalesDraft(normalizeSalesDraft({
       company_legal_name: intent.company_legal_name,
       company_dba: intent.company_dba,
@@ -285,9 +297,11 @@ function createSalesRouter(options = {}) {
       billing_cadence: intent.selected_billing_cadence,
       first_role_prepay_selected: intent.package_snapshot?.first_role_prepay?.selected === true,
       promotion_code: intent.promotion_code
-    }))
+    }, { savedPackageSnapshot: intent.package_snapshot }))
     const agreementInput = agreementInputFromDraft(draft, intent.package_snapshot, schedule)
-    const { html, normalized } = renderAgreement(agreementInput, { showPackageTerms: true, generatedAt: nowIso(), timeZone: 'America/Denver' })
+    const templateVersion = retail ? RETAIL_TEMPLATE : 'membership_agreement_v3_sales_assisted'
+    const { html, normalized } = renderAgreement(agreementInput, { showPackageTerms: true, generatedAt: nowIso(), timeZone: 'America/Denver',
+      ...(retail ? { packageSnapshot: intent.package_snapshot } : {}) })
     const pdf = await renderPdf(html, {
       format: 'Letter',
       margin: { top: '0.75in', right: '0.75in', bottom: '0.75in', left: '0.75in' }
@@ -305,10 +319,10 @@ function createSalesRouter(options = {}) {
     const generatedAt = nowIso()
     const templateSnapshot = {
       template_name: 'membership-agreement',
-      template_version: 'membership_agreement_v3_sales_assisted',
+      template_version: templateVersion,
       source: 'sales_assisted',
       generated_at: generatedAt,
-      term_start_basis: 'agreement_date',
+      term_start_basis: retail ? 'successful_payment' : 'agreement_date',
       agreement_expires_at: schedule.expires_at,
       purchase_intent: { id: intent.id, channel: 'sales_assisted' },
       package_snapshot: intent.package_snapshot,
@@ -326,13 +340,13 @@ function createSalesRouter(options = {}) {
       primary_admin_name: normalized.primary_admin_name,
       admin_email: normalized.admin_email,
       membership_tier: normalized.membership_tier,
-      initial_term_start: normalized.initial_term_start,
-      initial_renewal_date: normalized.initial_renewal_date,
+      initial_term_start: retail ? null : normalized.initial_term_start,
+      initial_renewal_date: retail ? null : normalized.initial_renewal_date,
       agreement_expires_at: schedule.expires_at,
       billing_option: normalized.billing_option,
       auto_renew: normalized.auto_renew,
       notice_deadline_days: normalized.notice_deadline_days,
-      template_version: 'membership_agreement_v3_sales_assisted',
+      template_version: templateVersion,
       template_snapshot: templateSnapshot,
       draft_pdf_path: draftPdfPath,
       signer_token_hash: signerTokenHash,
@@ -428,8 +442,8 @@ function createSalesRouter(options = {}) {
     return data
   }
 
-  async function resolveSalesDraft(req, input) {
-    const draft = normalizeSalesDraft(input)
+  async function resolveSalesDraft(req, input, options = {}) {
+    const draft = normalizeSalesDraft(input, options)
     const importId = String(draft.ghl_import_id || '').trim()
     draft.ghl_contact_id = ''
     draft.ghl_opportunity_id = ''
@@ -581,7 +595,8 @@ function createSalesRouter(options = {}) {
       const { package_snapshot: packageSnapshot, pricing } = calculatePricing(draft, promotion)
       const schedule = agreementSchedule()
       const agreementInput = agreementInputFromDraft(draft, packageSnapshot, schedule)
-      const { html } = renderAgreement(agreementInput, { showPackageTerms: true, generatedAt: nowIso(), timeZone: 'America/Denver' })
+      const { html } = renderAgreement(agreementInput, { showPackageTerms: true, generatedAt: nowIso(), timeZone: 'America/Denver',
+        ...(retailAgreementTerms(packageSnapshot) ? { packageSnapshot } : {}) })
       const pdf = await renderPdf(html, {
         format: 'Letter',
         margin: { top: '0.75in', right: '0.75in', bottom: '0.75in', left: '0.75in' }
@@ -638,15 +653,8 @@ function createSalesRouter(options = {}) {
     let draft = null
     try {
       key = normalizeIdempotencyKey(req)
-      draft = validateSalesDraft(await resolveSalesDraft(req, req.body))
       const previewId = String(req.body?.preview_id || '').trim()
       if (!previewId) throw makeSalesError(409, 'preview_required', 'Preview the agreement before sending it.')
-      const idem = await idempotentResult(req.salesRep.user_id, routeKey, key, { ...draft, preview_id: previewId })
-      if (idem.replay) return res.status(idem.replay.status).json(idem.replay.body)
-      if (!await enforceSalesRateLimit(req, res, 'create')) return
-      await reserveIdempotency(req.salesRep.user_id, routeKey, key, idem.requestFingerprint)
-      reserved = true
-
       const { data: preview, error: previewError } = await db
         .from('sales_deal_previews')
         .select('id,normalized_draft,package_snapshot,pricing_snapshot,draft_fingerprint,expires_at,consumed_at,agreement_effective_date,agreement_renewal_date,agreement_expires_at')
@@ -655,14 +663,22 @@ function createSalesRouter(options = {}) {
         .maybeSingle()
       if (previewError) throw makeSalesError(503, 'preview_lookup_failed', 'The agreement preview could not be loaded.')
       if (!preview) throw makeSalesError(404, 'preview_not_found', 'The agreement preview was not found.')
+      draft = validateSalesDraft(await resolveSalesDraft(req, req.body, { savedPackageSnapshot: preview.package_snapshot }))
+      const idem = await idempotentResult(req.salesRep.user_id, routeKey, key, { ...draft, preview_id: previewId })
+      if (idem.replay) return res.status(idem.replay.status).json(idem.replay.body)
+      if (!await enforceSalesRateLimit(req, res, 'create')) return
+      await reserveIdempotency(req.salesRep.user_id, routeKey, key, idem.requestFingerprint)
+      reserved = true
+
       if (preview.consumed_at) throw makeSalesError(409, 'preview_already_used', 'This agreement preview was already used.')
-      if (new Date(preview.expires_at).getTime() <= Date.now()) throw makeSalesError(409, 'preview_expired', 'The agreement preview expired. Generate a new preview.')
+      if (!Number.isFinite(Date.parse(preview.expires_at)) || Date.parse(preview.expires_at) <= Date.now()) throw makeSalesError(409, 'preview_expired', 'The agreement preview expired. Generate a new preview.')
       const currentSchedule = agreementSchedule()
+      const retailPreview = retailAgreementTerms(preview.package_snapshot)
       if (
-        !preview.agreement_effective_date ||
-        !preview.agreement_renewal_date ||
+        (!retailPreview && (!preview.agreement_effective_date || !preview.agreement_renewal_date ||
+          preview.agreement_effective_date !== currentSchedule.effective_date)) ||
         !preview.agreement_expires_at ||
-        preview.agreement_effective_date !== currentSchedule.effective_date ||
+        !Number.isFinite(Date.parse(preview.agreement_expires_at)) ||
         Date.parse(preview.agreement_expires_at) <= Date.now()
       ) {
         throw makeSalesError(409, 'preview_expired', 'The agreement date changed. Generate a new preview.')
@@ -717,6 +733,12 @@ function createSalesRouter(options = {}) {
       const agreementId = crypto.randomUUID()
       const now = nowIso()
       const intentPayload = {
+        ...(retailAgreementTerms(preview.package_snapshot) ? { protocol: 'fenced_v2',
+          first_role_prepay_selected: preview.package_snapshot.first_role_prepay.selected,
+          first_role_prepay_amount_cents: preview.package_snapshot.first_role_prepay.selected ? preview.package_snapshot.first_role_prepay.discounted_credit_amount_cents : null,
+          first_role_normal_role_fee_cents: preview.package_snapshot.first_role_prepay.selected ? preview.package_snapshot.first_role_prepay.normal_role_fee_cents : null,
+          first_role_prepay_discount_percent: preview.package_snapshot.first_role_prepay.selected ? preview.package_snapshot.first_role_prepay.discount_percent : null,
+          first_role_prepay_credit_type: preview.package_snapshot.first_role_prepay.selected ? preview.package_snapshot.first_role_prepay.credit_type : null } : {}),
         id: intentId,
         status: 'pending',
         selected_plan_key: draft.plan_key,
@@ -748,7 +770,7 @@ function createSalesRouter(options = {}) {
         promotion_discount_cents: Number(preview.pricing_snapshot?.promotion_discount_cents || 0),
         platform_fee_cents: Number(preview.pricing_snapshot?.platform_fee_cents || 0),
         initial_payment_cents: Number(preview.pricing_snapshot?.initial_payment_cents || 0),
-        term_start_basis: 'agreement_date',
+        term_start_basis: retailAgreementTerms(preview.package_snapshot) ? 'successful_payment' : 'agreement_date',
         sales_preview_id: previewId,
         created_at: now,
         updated_at: now
@@ -787,7 +809,10 @@ function createSalesRouter(options = {}) {
         expires_at: preview.agreement_expires_at
       }
       const agreementInput = agreementInputFromDraft(draft, preview.package_snapshot, agreementScheduleSnapshot)
-      const { html, normalized } = renderAgreement(agreementInput, { showPackageTerms: true, generatedAt: now, timeZone: 'America/Denver' })
+      const retail = retailAgreementTerms(preview.package_snapshot)
+      const templateVersion = retail ? RETAIL_TEMPLATE : 'membership_agreement_v3_sales_assisted'
+      const { html, normalized } = renderAgreement(agreementInput, { showPackageTerms: true, generatedAt: now, timeZone: 'America/Denver',
+        ...(retail ? { packageSnapshot: preview.package_snapshot } : {}) })
       const pdf = await renderPdf(html, {
         format: 'Letter',
         margin: { top: '0.75in', right: '0.75in', bottom: '0.75in', left: '0.75in' }
@@ -806,10 +831,10 @@ function createSalesRouter(options = {}) {
       const signingUrl = buildSignUrl(signerToken)
       const templateSnapshot = {
         template_name: 'membership-agreement',
-        template_version: 'membership_agreement_v3_sales_assisted',
+        template_version: templateVersion,
         source: 'sales_assisted',
         generated_at: now,
-        term_start_basis: 'agreement_date',
+        term_start_basis: retail ? 'successful_payment' : 'agreement_date',
         agreement_expires_at: signerTokenExpiresAt,
         purchase_intent: { id: intentId, channel: 'sales_assisted' },
         package_snapshot: preview.package_snapshot,
@@ -826,12 +851,12 @@ function createSalesRouter(options = {}) {
         primary_admin_name: normalized.primary_admin_name,
         admin_email: normalized.admin_email,
         membership_tier: normalized.membership_tier,
-        initial_term_start: normalized.initial_term_start,
-        initial_renewal_date: normalized.initial_renewal_date,
+        initial_term_start: retail ? null : normalized.initial_term_start,
+        initial_renewal_date: retail ? null : normalized.initial_renewal_date,
         billing_option: normalized.billing_option,
         auto_renew: normalized.auto_renew,
         notice_deadline_days: normalized.notice_deadline_days,
-        template_version: 'membership_agreement_v3_sales_assisted',
+        template_version: templateVersion,
         template_snapshot: templateSnapshot,
         draft_pdf_path: draftPdfPath,
         signer_token_hash: signerTokenHash,
@@ -990,6 +1015,7 @@ function createSalesRouter(options = {}) {
       if (!agreement || !['sent', 'signed'].includes(agreement.status) || agreement.checkout_status === 'paid') {
         throw makeSalesError(409, 'agreement_not_resendable', 'This agreement cannot be resent.')
       }
+      if (retailAgreementTerms(intent.package_snapshot)) validateRetailAgreementSource(agreement, intent)
       const explicitDeadline = Date.parse(String(agreement.agreement_expires_at || ''))
       if (Number.isFinite(explicitDeadline) && explicitDeadline <= Date.now()) {
         const body = await replaceExpiredAgreement(intent, agreement, req.salesRep)

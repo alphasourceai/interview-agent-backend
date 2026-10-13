@@ -574,3 +574,35 @@ test('purchase intent agreement response is safe and creates no Stripe, client, 
   assert.equal(db.inserts[0].row.checkout_status, undefined)
   assert.equal(db.inserts[0].row.checkout_session_id, undefined)
 })
+
+function retailIntent(months=3,role=false){
+  const s=buildAlphaScreenPackageSnapshot('basic','prepaid',{commitmentMonths:months,paymentOption:'prepaid',
+    offerVersion:'retail-terms-2026-10-11-v1',channel:'public',firstRolePrepaySelected:role});
+  return intent({protocol:'fenced_v2',selected_billing_cadence:'prepaid',package_snapshot:s,first_role_prepay_selected:role,
+    first_role_prepay_amount_cents:role?35900:null,first_role_normal_role_fee_cents:role?39900:null,
+    first_role_prepay_discount_percent:role?10:null,first_role_prepay_credit_type:role?'first_role_prepay':null,
+    expires_at:new Date(Date.now()+3600000).toISOString()});
+}
+test('existing public writer stores new legal markers null dates and saved capped deadline',async()=>{
+  for(const months of [3,6,12])for(const role of [false,true]){
+    const source=retailIntent(months,role),db=makeDb({purchaseIntents:[source]});
+    const r=await postAgreement(buildApp(db),BASIC_INTENT_ID);assert.equal(r.status,201,JSON.stringify(r.body));
+    const a=db.membershipAgreements[0];assert.equal(a.template_version,'membership_agreement_retail_terms_v2');
+    assert.equal(a.template_snapshot.template_version,a.template_version);
+    assert.equal(a.initial_term_start,null);assert.equal(a.initial_renewal_date,null);
+    assert.equal(a.template_snapshot.values.term_start_basis,'successful_payment');
+    assert.equal(a.agreement_expires_at,source.expires_at);assert.equal(a.signer_token_expires_at,source.expires_at);
+    assert.match(a.template_snapshot.rendered_html,new RegExp(`initial term of ${months} calendar months`));
+    assert.equal(a.template_snapshot.package_snapshot.commitment_months,months);
+    assert.equal(a.auto_renew,true);
+    const refresh=await postAgreement(buildApp(db),BASIC_INTENT_ID);assert.equal(refresh.status,200);
+    assert.equal(a.signer_token_expires_at,source.expires_at);assert.equal(db.membershipAgreements.length,1);
+  }
+});
+test('retail saved source mismatches refused before PDF Storage or agreement writes',async()=>{
+  for(const override of [{protocol:'legacy_complete'},{selected_plan_key:'pro'},{first_role_prepay_amount_cents:0},{selected_billing_cadence:'annual'}]){
+    const db=makeDb({purchaseIntents:[{...retailIntent(),...override}]});
+    const r=await postAgreement(buildApp(db),BASIC_INTENT_ID);assert.equal(r.status,409);
+    assert.equal(r.body.code,'retail_quote_source_mismatch');assert.equal(db.uploads.length,0);assert.equal(db.inserts.length,0);
+  }
+});

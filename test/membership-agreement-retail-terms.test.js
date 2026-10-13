@@ -122,11 +122,13 @@ test('executed new agreement loads the saved trusted snapshot and refuses confli
   const supabasePath=require.resolve('../src/clients/supabase');
   require.cache[supabasePath]={id:supabasePath,filename:supabasePath,loaded:true,exports:{supabaseAdmin:{}}};
   const {buildExecutedMembershipAgreementHtml}=require('../src/services/membershipAgreements');
-  const s=pkg('pro',6,'prepaid'),row={membership_tier:'pro',billing_option:'prepaid',template_version:MARKER,
+  const s=pkg('pro',6,'prepaid'),row={membership_tier:'pro',billing_option:'prepaid',auto_renew:true,notice_deadline_days:30,template_version:MARKER,
     template_snapshot:{template_version:MARKER,generated_at:options.generatedAt,package_snapshot:s,
       values:normalizeMembershipAgreementInput({...payload,membership_tier:'pro',billing_option:'prepaid'}, {packageSnapshot:s})}};
   const {html}=buildExecutedMembershipAgreementHtml(row,{accepted:true,signer_typed_name:'Synthetic Buyer',signed_at:options.generatedAt});
   assert.match(plain(html),/initial term of 6 calendar months/);assert.match(html,/Signed on/);
   assert.throws(()=>buildExecutedMembershipAgreementHtml({...row,template_version:'legacy'},{}),/retail_agreement_terms_mismatch/);
   assert.throws(()=>buildExecutedMembershipAgreementHtml({...row,template_snapshot:{...row.template_snapshot,package_snapshot:null}},{}),/retail_agreement_terms_mismatch/);
+  assert.throws(()=>buildExecutedMembershipAgreementHtml({...row,billing_option:'annual'},{}),/retail_agreement_terms_mismatch/);
+  assert.throws(()=>buildExecutedMembershipAgreementHtml({...row,auto_renew:false},{}),/retail_agreement_terms_mismatch/);
 });

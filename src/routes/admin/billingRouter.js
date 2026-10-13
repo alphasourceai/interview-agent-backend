@@ -9,6 +9,8 @@ const { validateEnterpriseSettings } = require('../../services/enterpriseSetting
 const { prepareEnterprisePoolTerms } = require('../../services/enterprisePoolSnapshot');
 const { htmlToPdf } = require('../../render/pdfRenderer');
 const { buildMembershipAgreementHtml, normalizeMembershipAgreementInput } = require('../../render/membershipAgreement');
+const { RETAIL_TEMPLATE, normalizeRetailQuoteSelection, quotePackageOptions, retailAgreementTerms } = require('../../services/retailQuoteSelection');
+const { buildAlphaScreenPackageSnapshot } = require('../../services/alphaScreenPackages');
 const { sendMembershipAgreementEmail, sendMembershipAgreementInternalNotification } = require('../../clients/sendgrid');
 const { buildMembershipAgreementSignUrl } = require('../../config/urlConfig');
 
@@ -73,8 +75,28 @@ function normalizeAgreementClientMode(value) {
 
 function normalizeAgreementPayload(raw) {
   const body = raw || {};
+  const tier = String(body.membership_tier || body.membershipTier || '').trim().toLowerCase();
+  const selection = tier === 'enterprise' ? null : normalizeRetailQuoteSelection(body, { channel: 'admin' });
+  let retailPackage = null;
+  let retailInput = null;
+  if (selection) {
+    retailPackage = buildAlphaScreenPackageSnapshot(tier, selection.billing_cadence,
+      quotePackageOptions(selection, 'admin', body.first_role_prepay_selected === true));
+    // Identity and client association use the same existing form. All commercial
+    // values for a new retail quote are owned by the server catalog.
+    const identity = Object.fromEntries(['client_id','clientId','client_legal_name','clientLegalName',
+      'dba_trade_name','dbaTradeName','primary_admin_name','primaryAdminName','admin_email','adminEmail',
+      'agreement_expires_at','agreementExpiresAt'].filter(k => Object.hasOwn(body,k)).map(k => [k,body[k]]));
+    retailInput = { ...identity, membership_tier: retailPackage.plan_key,
+      platform_fee: retailPackage.platform_fee, per_role_fee: retailPackage.per_role_fee,
+      additional_interview_fee: retailPackage.additional_interview_fee,
+      included_interviews_per_role: retailPackage.included_interviews_per_role,
+      max_interview_minutes: retailPackage.max_interview_minutes, first_role_prepay: retailPackage.first_role_prepay,
+      ...retailAgreementTerms(retailPackage) };
+  }
   // Draft pricing is server-owned, never a browser-supplied accepted snapshot.
-  const normalized = normalizeMembershipAgreementInput({...body,pool_offer_snapshot:null,pool_offer_digest:null});
+  const normalized = normalizeMembershipAgreementInput(retailInput || {...body,pool_offer_snapshot:null,pool_offer_digest:null},
+    retailPackage ? { packageSnapshot: retailPackage } : {});
   const normalizedClientId = UUID_RE.test(normalized.client_id || '') ? normalized.client_id : null;
   const attachedClientIdRaw = String(
     body.attached_client_id ||
@@ -86,6 +108,7 @@ function normalizeAgreementPayload(raw) {
 
   return {
     ...normalized,
+    ...(retailPackage ? { retail_package_snapshot: retailPackage } : {}),
     client_id: attachedClientId,
     attached_client_id: attachedClientId,
     client_mode: normalizeAgreementClientMode(body.client_mode || body.clientMode),
@@ -99,8 +122,8 @@ function validateAgreementPayload(payload) {
   if (!payload.client_legal_name) missing.push('client_legal_name');
   if (!payload.primary_admin_name) missing.push('primary_admin_name');
   if (!payload.admin_email) missing.push('admin_email');
-  if (!payload.initial_term_start) missing.push('initial_term_start');
-  if (!payload.initial_renewal_date) missing.push('initial_renewal_date');
+  if (!payload.retail_package_snapshot && !payload.initial_term_start) missing.push('initial_term_start');
+  if (!payload.retail_package_snapshot && !payload.initial_renewal_date) missing.push('initial_renewal_date');
 
   if (missing.length) {
     return {
@@ -768,12 +791,13 @@ router.post('/agreements/preview-html', async (req, res) => {
       if (!parentGuard.ok) return respondWithParentClientGuard(res, parentGuard, request_id);
     }
 
-    const { html } = buildMembershipAgreementHtml(await withPricedPool(payload));
+    const { html } = buildMembershipAgreementHtml(await withPricedPool(payload),
+      payload.retail_package_snapshot ? { packageSnapshot: payload.retail_package_snapshot } : {});
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(200).send(html);
   } catch (e) {
     console.error('[billing/agreements/preview-html] unexpected', { request_id, error: e?.message || e });
-    return res.status(500).json({ error: 'server_error', code: 'server_error', detail: e?.message || 'Server error', request_id });
+    return res.status(Number(e?.status) || 500).json({ error: 'server_error', code: e?.code || 'server_error', detail: e?.message || 'Server error', request_id });
   }
 });
 
@@ -817,7 +841,8 @@ async function renderAgreementPreviewPdf(req, res) {
       }
     }
 
-    const { html } = buildMembershipAgreementHtml(await withPricedPool(payload));
+    const { html } = buildMembershipAgreementHtml(await withPricedPool(payload),
+      payload.retail_package_snapshot ? { packageSnapshot: payload.retail_package_snapshot } : {});
     const pdf = await htmlToPdf(html, {
       format: 'Letter',
       margin: { top: '0.75in', right: '0.75in', bottom: '0.75in', left: '0.75in' }
@@ -828,7 +853,7 @@ async function renderAgreementPreviewPdf(req, res) {
     return res.send(pdf);
   } catch (e) {
     console.error('[billing/agreements/preview-pdf] unexpected', { request_id, error: e?.message || e });
-    return res.status(500).json({ error: 'pdf_render_failed', code: 'pdf_render_failed', detail: e?.message || 'PDF render failed', request_id });
+    return res.status(Number(e?.status) || 500).json({ error: 'pdf_render_failed', code: e?.code || 'pdf_render_failed', detail: e?.message || 'PDF render failed', request_id });
   }
 }
 
@@ -869,8 +894,10 @@ router.post('/agreements/send', async (req, res) => {
     // existing seven-day signing window when none was explicitly chosen; legacy
     // drafts/accepted agreements and later resend-token rotations are untouched.
     const markedPool = pricedPayload.pool_offer_snapshot != null;
+    const retailPackage = pricedPayload.retail_package_snapshot;
+    const templateVersion = retailPackage ? RETAIL_TEMPLATE : 'membership_agreement_v2_phase1';
     const initialSigningExpiry = new Date(Date.now() + SIGNING_LINK_TTL_MS).toISOString();
-    if (markedPool) {
+    if (markedPool || retailPackage) {
       const deadline = pricedPayload.agreement_expires_at || initialSigningExpiry;
       const epoch = Date.parse(deadline);
       if (!Number.isFinite(epoch) || epoch <= Date.now()) {
@@ -933,7 +960,8 @@ router.post('/agreements/send', async (req, res) => {
       attached_client_id: resolvedClientId
     };
 
-    const { html, normalized } = buildMembershipAgreementHtml(payloadWithClient);
+    const { html, normalized } = buildMembershipAgreementHtml(payloadWithClient,
+      retailPackage ? { packageSnapshot: retailPackage } : {});
     const pdf = await htmlToPdf(html, {
       format: 'Letter',
       margin: { top: '0.75in', right: '0.75in', bottom: '0.75in', left: '0.75in' }
@@ -967,14 +995,15 @@ router.post('/agreements/send', async (req, res) => {
 
     const signerToken = crypto.randomBytes(32).toString('hex');
     const signerTokenHash = crypto.createHash('sha256').update(signerToken).digest('hex');
-    const signerTokenExpiresAt = markedPool
+    const signerTokenExpiresAt = markedPool || retailPackage
       ? new Date(Math.min(Date.parse(initialSigningExpiry), Date.parse(normalized.agreement_expires_at))).toISOString()
       : new Date(Date.now() + SIGNING_LINK_TTL_MS).toISOString();
     const signingUrl = buildMembershipAgreementSignUrl(signerToken);
 
     const templateSnapshot = {
       template_name: 'membership-agreement',
-      template_version: 'membership_agreement_v2_phase1',
+      template_version: templateVersion,
+      ...(retailPackage ? { package_snapshot: retailPackage, term_start_basis: 'successful_payment' } : {}),
       source_document: 'alphaScreen Membership Agreementv2.docx',
       generated_at: new Date().toISOString(),
       client_association: {
@@ -1001,17 +1030,17 @@ router.post('/agreements/send', async (req, res) => {
         primary_admin_name: normalized.primary_admin_name,
         admin_email: normalized.admin_email,
         membership_tier: normalized.membership_tier,
-        initial_term_start: normalized.initial_term_start,
-        initial_renewal_date: normalized.initial_renewal_date,
+        initial_term_start: retailPackage ? null : normalized.initial_term_start,
+        initial_renewal_date: retailPackage ? null : normalized.initial_renewal_date,
         billing_option: normalized.billing_option,
         auto_renew: normalized.auto_renew,
         notice_deadline_days: normalized.notice_deadline_days,
-        template_version: 'membership_agreement_v2_phase1',
+        template_version: templateVersion,
         template_snapshot: templateSnapshot,
         draft_pdf_path: draftPdfPath,
         signer_token_hash: signerTokenHash,
         signer_token_expires_at: signerTokenExpiresAt,
-        ...(markedPool ? { agreement_expires_at: normalized.agreement_expires_at } : {}),
+        ...(markedPool || retailPackage ? { agreement_expires_at: normalized.agreement_expires_at } : {}),
         created_by_user_id: req.user?.id || null,
         created_by_email: req.user?.email || null
       })
@@ -1099,7 +1128,7 @@ router.post('/agreements/send', async (req, res) => {
       });
     }
     console.error('[billing/agreements/send] unexpected', { request_id, error: e?.message || e });
-    return res.status(500).json({
+    return res.status(Number(e?.status) || 500).json({
       error: 'server_error',
       code: e?.code || 'server_error',
       detail: e?.message || 'Server error',

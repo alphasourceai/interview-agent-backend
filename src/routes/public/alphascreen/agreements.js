@@ -3,6 +3,7 @@
 // Agreement creation for a verified purchase intent.
 
 const express = require('express');
+const { RETAIL_TEMPLATE, retailAgreementTerms, validateRetailAgreementSource } = require('../../../services/retailQuoteSelection');
 const {
   AGREEMENTS_BUCKET,
   RETAIL_AGREEMENT_RATE_MAX,
@@ -49,7 +50,7 @@ router.post('/purchase-intents/:id/agreement', async (req, res) => {
   try {
     const { data: intent, error: intentErr } = await supabaseAdmin
       .from('public_purchase_intents')
-      .select('id,status,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,company_legal_name,company_dba,buyer_first_name,buyer_last_name,buyer_email,buyer_phone,buyer_title,source_path,agreement_id,stripe_checkout_session_id,client_id,email_verified_at,email_verified_address,email_verification_method,email_verification_version,phone_verified_at,phone_verified_destination_fingerprint,phone_verification_method,phone_verification_version,expires_at,created_at')
+      .select('id,status,protocol,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,company_legal_name,company_dba,buyer_first_name,buyer_last_name,buyer_email,buyer_phone,buyer_title,source_path,agreement_id,stripe_checkout_session_id,client_id,email_verified_at,email_verified_address,email_verification_method,email_verification_version,phone_verified_at,phone_verified_destination_fingerprint,phone_verification_method,phone_verification_version,expires_at,created_at')
       .eq('id', intentId)
       .maybeSingle()
 
@@ -76,7 +77,7 @@ router.post('/purchase-intents/:id/agreement', async (req, res) => {
     if (intent.agreement_id) {
       const { data, error: existingErr } = await supabaseAdmin
         .from('membership_agreements')
-        .select('id,status,signer_token_expires_at,draft_pdf_path,sent_at')
+        .select('id,status,signer_token_expires_at,draft_pdf_path,sent_at,agreement_expires_at,template_version,template_snapshot,membership_tier,billing_option,auto_renew,notice_deadline_days')
         .eq('id', intent.agreement_id)
         .maybeSingle()
 
@@ -120,6 +121,7 @@ router.post('/purchase-intents/:id/agreement', async (req, res) => {
     }
 
     if (existingAgreement) {
+      validateRetailAgreementSource(existingAgreement, retailAgreementTerms(intent.package_snapshot) ? intent : undefined)
       if (existingAgreement && String(existingAgreement.status || '').trim().toLowerCase() === 'sent') {
         const refreshed = await refreshAgreementSigningUrl(existingAgreement)
         const responseIntent = { ...intent, status: 'agreement_pending' }
@@ -150,7 +152,16 @@ router.post('/purchase-intents/:id/agreement', async (req, res) => {
       })
     }
 
-    const { html, normalized } = buildMembershipAgreementHtml(agreementInput, { showPackageTerms: true })
+    const retail = retailAgreementTerms(intentValidation.snapshot)
+    const deadline = retail ? Math.min(Date.parse(intent.expires_at), Date.now() + SIGNING_LINK_TTL_MS) : null
+    if (retail && (!Number.isFinite(deadline) || deadline <= Date.now())) {
+      const e = new Error('invalid_agreement_expiry'); e.code = e.message; e.status = 409; throw e
+    }
+    if (retail) agreementInput.agreement_expires_at = new Date(deadline).toISOString()
+    const templateVersion = retail ? RETAIL_TEMPLATE : 'membership_agreement_v2_phase1'
+    const { html, normalized } = buildMembershipAgreementHtml(agreementInput, {
+      showPackageTerms: true, ...(retail ? { packageSnapshot: intentValidation.snapshot } : {})
+    })
     const pdf = await htmlToPdf(html, {
       format: 'Letter',
       margin: { top: '0.75in', right: '0.75in', bottom: '0.75in', left: '0.75in' }
@@ -180,12 +191,12 @@ router.post('/purchase-intents/:id/agreement', async (req, res) => {
 
     const signerToken = crypto.randomBytes(32).toString('hex')
     const signerTokenHash = crypto.createHash('sha256').update(signerToken).digest('hex')
-    const signerTokenExpiresAt = new Date(Date.now() + SIGNING_LINK_TTL_MS).toISOString()
+    const signerTokenExpiresAt = new Date(deadline || Date.now() + SIGNING_LINK_TTL_MS).toISOString()
     const signingUrl = buildMembershipAgreementSignUrl(signerToken)
     const nowIso = new Date().toISOString()
     const templateSnapshot = {
       template_name: 'membership-agreement',
-      template_version: 'membership_agreement_v2_phase1',
+      template_version: templateVersion,
       source: 'public_purchase_intent',
       source_document: 'alphaScreen Membership Agreementv2.docx',
       generated_at: nowIso,
@@ -212,12 +223,13 @@ router.post('/purchase-intents/:id/agreement', async (req, res) => {
         primary_admin_name: normalized.primary_admin_name,
         admin_email: normalized.admin_email,
         membership_tier: normalized.membership_tier,
-        initial_term_start: normalized.initial_term_start,
-        initial_renewal_date: normalized.initial_renewal_date,
+        initial_term_start: retail ? null : normalized.initial_term_start,
+        initial_renewal_date: retail ? null : normalized.initial_renewal_date,
         billing_option: normalized.billing_option,
         auto_renew: normalized.auto_renew,
         notice_deadline_days: normalized.notice_deadline_days,
-        template_version: 'membership_agreement_v2_phase1',
+        template_version: templateVersion,
+        ...(retail ? { agreement_expires_at: signerTokenExpiresAt } : {}),
         template_snapshot: templateSnapshot,
         draft_pdf_path: draftPdfPath,
         signer_token_hash: signerTokenHash,

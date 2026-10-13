@@ -3,6 +3,7 @@
 // Package listing, checkout status and purchase intent creation.
 
 const express = require('express');
+const { quotePackageOptions, retailQuoteCatalog, validateRetailIntentSource } = require('../../../services/retailQuoteSelection');
 const {
   DUPLICATE_WINDOW_MS,
   INTENT_EXPIRATION_MS,
@@ -32,6 +33,7 @@ router.get('/packages', (req, res) => {
   res.setHeader('Cache-Control', 'no-store')
   return res.json({
     packages: listPublicAlphaScreenPackages(),
+    ...(retailQuoteCatalog('public') || {}),
     request_id: req.request_id || null
   })
 })
@@ -102,9 +104,8 @@ router.post('/purchase-intents', async (req, res) => {
     })
     if (!allowed) return
 
-    const packageSnapshot = buildAlphaScreenPackageSnapshot(input.selected_plan_key, input.selected_billing_cadence, {
-      firstRolePrepaySelected: input.first_role_prepay_selected
-    })
+    const packageSnapshot = buildAlphaScreenPackageSnapshot(input.selected_plan_key, input.selected_billing_cadence,
+      quotePackageOptions(input.retail_selection, 'public', input.first_role_prepay_selected))
     if (!packageSnapshot) {
       return validationError(
         res,
@@ -116,9 +117,9 @@ router.post('/purchase-intents', async (req, res) => {
     }
 
     const duplicateCutoff = new Date(Date.now() - DUPLICATE_WINDOW_MS).toISOString()
-    const { data: existingIntent, error: duplicateErr } = await supabaseAdmin
+    let duplicateQuery = supabaseAdmin
       .from('public_purchase_intents')
-      .select('id,status,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,buyer_phone,email_verified_at,email_verified_address,email_verification_method,email_verification_version,phone_verified_at,phone_verified_destination_fingerprint,phone_verification_method,phone_verification_version,created_at')
+      .select('id,status,protocol,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,buyer_phone,email_verified_at,email_verified_address,email_verification_method,email_verification_version,phone_verified_at,phone_verified_destination_fingerprint,phone_verification_method,phone_verification_version,created_at')
       .eq('buyer_email', input.buyer_email)
       .eq('company_legal_name', input.company_legal_name)
       .eq('selected_plan_key', input.selected_plan_key)
@@ -128,7 +129,12 @@ router.post('/purchase-intents', async (req, res) => {
       .gte('created_at', duplicateCutoff)
       .order('created_at', { ascending: false })
       .limit(1)
-      .maybeSingle()
+    if (input.retail_selection) {
+      duplicateQuery = duplicateQuery.eq('package_snapshot->>commitment_months', String(input.retail_selection.commitment_months))
+        .eq('package_snapshot->>payment_option', input.retail_selection.payment_option)
+        .eq('package_snapshot->>pricing_version', input.retail_selection.offer_version)
+    } else duplicateQuery = duplicateQuery.is('package_snapshot->>pricing_protocol', null)
+    const { data: existingIntent, error: duplicateErr } = await duplicateQuery.maybeSingle()
 
     if (duplicateErr) {
       console.error('[alphascreen/purchase-intents] duplicate_lookup_failed:', duplicateErr.message || duplicateErr)
@@ -140,6 +146,7 @@ router.post('/purchase-intents', async (req, res) => {
     }
 
     if (existingIntent?.id) {
+      validateRetailIntentSource(existingIntent)
       let reusableIntent = existingIntent
       if (trimText(existingIntent.buyer_phone, 40) !== input.buyer_phone) {
         const { data: updatedIntent, error: updateErr } = await supabaseAdmin
@@ -186,6 +193,7 @@ router.post('/purchase-intents', async (req, res) => {
     const nowIso = new Date().toISOString()
     const prepayColumns = purchaseIntentPrepayColumns(packageSnapshot)
     const insertPayload = {
+      ...(input.retail_selection ? { protocol: 'fenced_v2' } : {}),
       status: 'pending',
       selected_plan_key: input.selected_plan_key,
       selected_billing_cadence: input.selected_billing_cadence,
@@ -227,9 +235,9 @@ router.post('/purchase-intents', async (req, res) => {
     return res.status(201).json(body)
   } catch (e) {
     console.error('[alphascreen/purchase-intents] unexpected:', e?.message || e)
-    return res.status(500).json({
-      error: 'server_error',
-      code: 'SERVER_ERROR',
+    return res.status(Number(e?.status) || 500).json({
+      error: e?.code || 'server_error',
+      code: e?.code || 'SERVER_ERROR',
       request_id
     })
   }

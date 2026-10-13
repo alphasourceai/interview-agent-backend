@@ -12,6 +12,7 @@ const {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const SALES_BUSINESS_TIME_ZONE = 'America/Denver'
+const { normalizeRetailQuoteSelection, quotePackageOptions, retailAgreementTerms, retailQuoteCatalog } = require('./retailQuoteSelection')
 
 function makeSalesError(status, code, detail, fields = null) {
   const error = new Error(detail || code || 'sales_workspace_error')
@@ -30,7 +31,8 @@ function normalizePhone(value) {
   return raw.replace(/[^\d+().\-\s]/g, '').trim()
 }
 
-function normalizeSalesDraft(input = {}) {
+function normalizeSalesDraft(input = {}, options = {}) {
+  const selection = normalizeRetailQuoteSelection(input, { ...options, channel: 'sales' })
   return {
     company_legal_name: trimText(input.company_legal_name, 160),
     company_dba: trimText(input.company_dba, 160),
@@ -46,7 +48,9 @@ function normalizeSalesDraft(input = {}) {
     ghl_opportunity_id: trimText(input.ghl_opportunity_id, 160),
     sales_note: trimText(input.sales_note, 1200),
     plan_key: normalizeAlphaScreenPlanKey(input.plan_key),
-    billing_cadence: normalizeBillingInterval(input.billing_cadence),
+    billing_cadence: selection?.billing_cadence || normalizeBillingInterval(input.billing_cadence),
+    ...(selection ? { commitment_months: selection.commitment_months, payment_option: selection.payment_option,
+      offer_version: selection.offer_version } : {}),
     first_role_prepay_selected: input.first_role_prepay_selected === true,
     promotion_code: trimText(input.promotion_code, 80).toUpperCase()
   }
@@ -102,9 +106,9 @@ function safePromotionSummary(promotion = null) {
 }
 
 function calculatePricing(draft, promotion = null) {
-  const packageSnapshot = buildAlphaScreenPackageSnapshot(draft.plan_key, draft.billing_cadence, {
-    firstRolePrepaySelected: draft.first_role_prepay_selected
-  })
+  const selection = draft.commitment_months !== undefined ? draft : null
+  const packageSnapshot = buildAlphaScreenPackageSnapshot(draft.plan_key, draft.billing_cadence,
+    quotePackageOptions(selection, 'sales', draft.first_role_prepay_selected))
   if (!packageSnapshot) throw makeSalesError(400, 'invalid_package', 'Select an available membership and billing cadence.')
 
   const platformFeeCents = Number(packageSnapshot.platform_fee_cents || 0)
@@ -113,6 +117,9 @@ function calculatePricing(draft, promotion = null) {
     ? Number(firstRole?.discounted_credit_amount_cents || 0)
     : 0
   const safePromotion = safePromotionSummary(promotion)
+  if (selection?.payment_option === 'prepaid' && (promotion || draft.promotion_code)) {
+    throw makeSalesError(409, 'retail_prepaid_promotions_not_supported', 'Prepaid membership prices cannot be combined with a promotion.')
+  }
   let promotionDiscountCents = 0
   if (safePromotion?.percent_off) {
     promotionDiscountCents = Math.round(platformFeeCents * (safePromotion.percent_off / 100))
@@ -130,12 +137,17 @@ function calculatePricing(draft, promotion = null) {
       initial_payment_cents: Math.max(0, platformFeeCents + firstRolePrepayCents - promotionDiscountCents),
       recurring_platform_fee_cents: platformFeeCents,
       per_role_fee_cents: Math.round(Number(packageSnapshot.per_role_fee || 0) * 100),
-      promotion: safePromotion
+      promotion: safePromotion,
+      ...(selection ? { commitment_months: packageSnapshot.commitment_months,
+        payment_option: packageSnapshot.payment_option, pricing_version: packageSnapshot.pricing_version,
+        platform_commitment_total_cents: packageSnapshot.platform_commitment_total_cents } : {})
     }
   }
 }
 
 function listSalesPackages(options = {}) {
+  const catalog = retailQuoteCatalog('sales', options.env)
+  if (catalog) return catalog.offers
   return listPublicAlphaScreenPackages(options).map((item) => ({
     plan_key: item.plan_key,
     display_name: item.display_name,
@@ -195,7 +207,8 @@ function agreementInputFromDraft(draft, packageSnapshot, schedule = agreementSch
     term_start_basis: 'agreement_date',
     billing_option: draft.billing_cadence,
     auto_renew: true,
-    notice_deadline_days: 30
+    notice_deadline_days: 30,
+    ...(retailAgreementTerms(packageSnapshot) || {})
   }
 }
 

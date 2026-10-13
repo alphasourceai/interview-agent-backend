@@ -22,6 +22,7 @@ const {
 } = require('../../clients/sendgrid');
 const { createSubscriptionCheckoutSession } = require('../subscriptionCheckout');
 const { readRetailPackageOffer } = require('../membershipPackageCompatibility');
+const { validateRetailAgreementSource } = require('../retailQuoteSelection');
 const { readSavedRetailCheckoutTerms } = require('../savedMembershipCheckoutTerms');
 const {
   normalizeAlphaScreenPlanKey,
@@ -585,6 +586,7 @@ function buildAgreementInputFromRow(row) {
 }
 
 function buildExecutedMembershipAgreementHtml(agreement, execution) {
+  validateRetailAgreementSource(agreement);
   const snapshot=agreement?.template_snapshot;
   const retailOffer=readRetailPackageOffer(snapshot?.package_snapshot);
   const marker='membership_agreement_retail_terms_v2';

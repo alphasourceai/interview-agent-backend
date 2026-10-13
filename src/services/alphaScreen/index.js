@@ -13,6 +13,7 @@ const {
 const { buildMembershipAgreementSignUrl } = require('../../config/urlConfig')
 const { htmlToPdf } = require('../../render/pdfRenderer')
 const { buildMembershipAgreementHtml } = require('../../render/membershipAgreement')
+const { normalizeRetailQuoteSelection, retailAgreementTerms, validateRetailIntentSource } = require('../retailQuoteSelection')
 const { resolvePublicCheckoutReturnState } = require('../publicPurchaseActivation')
 const { getRequestSubjectKey, hashRateLimitSubject, checkAndIncrementRateLimit } = require('../rateLimit')
 const { sendRetailSignupEmailVerificationCode } = require('../../clients/sendgrid')
@@ -385,6 +386,7 @@ function validationError(res, req, code, detail, fields = []) {
 }
 
 function normalizePurchaseIntentInput(body = {}) {
+  const selection = normalizeRetailQuoteSelection(body, { channel: 'public' })
   const rawPlanKey = trimText(body.plan_key || body.plan || body.selected_plan_key, 40).toLowerCase()
   const rawBillingCadence = trimText(body.billing_cadence || body.billing_interval || body.selected_billing_cadence, 40).toLowerCase()
   const planKey = normalizeAlphaScreenPlanKey(rawPlanKey)
@@ -396,9 +398,10 @@ function normalizePurchaseIntentInput(body = {}) {
 
   return {
     raw_plan_key: rawPlanKey,
-    raw_billing_cadence: rawBillingCadence,
+    raw_billing_cadence: selection?.billing_cadence || rawBillingCadence,
     selected_plan_key: planKey,
-    selected_billing_cadence: billingCadence,
+    selected_billing_cadence: selection?.billing_cadence || billingCadence,
+    ...(selection ? { retail_selection: selection } : {}),
     company_legal_name: trimText(body.company_legal_name || body.companyLegalName, 160),
     company_dba: trimText(body.company_dba || body.companyDba, 160),
     buyer_first_name: trimText(body.buyer_first_name || body.first_name || body.firstName, 80),
@@ -448,7 +451,7 @@ function validatePurchaseIntentInput(input) {
       fields: ['billing_cadence']
     }
   }
-  if (!isAlphaScreenBillingCadenceSupported(input.selected_plan_key, input.selected_billing_cadence)) {
+  if (!input.retail_selection && !isAlphaScreenBillingCadenceSupported(input.selected_plan_key, input.selected_billing_cadence)) {
     return {
       ok: false,
       code: 'invalid_billing_cadence',
@@ -463,7 +466,12 @@ function validatePurchaseIntentInput(input) {
 }
 
 function safePackageSummary(snapshot = {}) {
+  const retail = retailAgreementTerms(snapshot)
   return {
+    ...(retail ? { commitment_months: retail.commitment_months, payment_option: retail.payment_option,
+      pricing_version: retail.pricing_version, platform_commitment_total_cents: snapshot.platform_commitment_total_cents,
+      billing_cadence_display_name: snapshot.billing_cadence_display_name, billing_model: retail.billing_model,
+      rollover_days: retail.rollover_days } : {}),
     plan_key: snapshot.plan_key || null,
     display_name: snapshot.display_name || null,
     billing_cadence: snapshot.billing_cadence || null,
@@ -677,6 +685,8 @@ function validatePurchaseIntentForAgreement(intent) {
     return { ok: false, status: 409, code: 'package_snapshot_missing', detail: 'Signup request package snapshot is missing.' }
   }
   const planKey = normalizeAlphaScreenPlanKey(snapshot.plan_key)
+  const offer = validateRetailIntentSource(intent)
+  if (offer) return { ok: true, planKey, billingCadence: snapshot.billing_cadence, snapshot }
   const billingCadence = normalizeBillingInterval(snapshot.billing_cadence)
   if (!['basic', 'pro'].includes(planKey) || !billingCadence) {
     return { ok: false, status: 409, code: 'package_snapshot_invalid', detail: 'Signup request package snapshot is invalid.' }
@@ -686,6 +696,7 @@ function validatePurchaseIntentForAgreement(intent) {
 
 function buildAgreementInputFromPurchaseIntent(intent) {
   const snapshot = intent?.package_snapshot && typeof intent.package_snapshot === 'object' ? intent.package_snapshot : {}
+  const retail = retailAgreementTerms(snapshot)
   const now = new Date()
   const firstName = trimText(intent?.buyer_first_name, 80)
   const lastName = trimText(intent?.buyer_last_name, 80)
@@ -719,7 +730,8 @@ function buildAgreementInputFromPurchaseIntent(intent) {
     initial_renewal_date: addOneYearDateOnly(now),
     billing_option: billingOption,
     auto_renew: true,
-    notice_deadline_days: 30
+    notice_deadline_days: 30,
+    ...(retail || {})
   }
 }
 
@@ -750,7 +762,12 @@ function validateAgreementInput(input) {
 async function refreshAgreementSigningUrl(agreement) {
   const signerToken = crypto.randomBytes(32).toString('hex')
   const signerTokenHash = crypto.createHash('sha256').update(signerToken).digest('hex')
-  const signerTokenExpiresAt = new Date(Date.now() + SIGNING_LINK_TTL_MS).toISOString()
+  const retail = retailAgreementTerms(agreement.template_snapshot?.package_snapshot)
+  const deadline = retail ? Math.min(Date.parse(agreement.agreement_expires_at), Date.now() + SIGNING_LINK_TTL_MS) : Date.now() + SIGNING_LINK_TTL_MS
+  if (!Number.isFinite(deadline) || deadline <= Date.now()) {
+    const e = new Error('agreement_expired'); e.code = e.message; e.status = 410; throw e
+  }
+  const signerTokenExpiresAt = new Date(deadline).toISOString()
   const signingUrl = buildMembershipAgreementSignUrl(signerToken)
 
   const { data, error } = await supabaseAdmin

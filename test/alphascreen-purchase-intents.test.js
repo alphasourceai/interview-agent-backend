@@ -56,6 +56,8 @@ class FakeQuery {
     return this
   }
 
+  is(column, value) { this.filters.push({ column, value }); return this }
+
   in(column, values) {
     this.inFilters.push({ column, values: new Set((values || []).map(String)) })
     return this
@@ -99,7 +101,9 @@ class FakeQuery {
 
   rowMatches(row) {
     for (const { column, value } of this.filters) {
-      if (row?.[column] !== value && String(row?.[column]) !== String(value)) return false
+      const [base, jsonKey] = column.split('->>')
+      const actual = jsonKey ? row?.[base]?.[jsonKey] ?? null : row?.[column]
+      if (actual !== value && String(actual) !== String(value)) return false
     }
     for (const { column, values } of this.inFilters) {
       if (!values.has(String(row?.[column]))) return false
@@ -631,3 +635,56 @@ test('purchase intent endpoint rate limits repeated requests', async () => {
   assert.equal(second.body.code, 'RETAIL_SIGNUP_RATE_LIMITED')
   assert.equal(second.body.retry_after_seconds, 60)
 })
+
+test('new public quote matrix persists server prices and explicit fenced source', async () => {
+  const prior=process.env.MEMBERSHIP_PRICING_TERMS_ENABLED;
+  process.env.MEMBERSHIP_PRICING_TERMS_ENABLED='true';
+  try {
+    for(const plan_key of ['basic','pro'])for(const months of [3,6,12])for(const selected of [false,true]){
+      const db=makeDb(),app=buildApp(db);
+      const response=await request(app,validBody({plan_key,billing_cadence:'prepaid',commitment_months:months,
+        payment_option:'prepaid',offer_version:'retail-terms-2026-10-11-v1',first_role_prepay_selected:selected,
+        platform_fee_cents:1,package_snapshot:{platform_fee_cents:1}}));
+      assert.equal(response.status,201,JSON.stringify(response.body));
+      const row=db.inserts[0].row;
+      assert.equal(row.protocol,'fenced_v2');assert.equal(row.package_snapshot.commitment_months,months);
+      assert.equal(row.selected_billing_cadence,'prepaid');
+      assert.equal(row.first_role_prepay_amount_cents,selected?(plan_key==='basic'?35900:62900):null);
+      assert.ok(row.package_snapshot.platform_fee_cents>=120000);
+      assert.equal(response.body.selected_package.commitment_months,months);
+    }
+  } finally {if(prior===undefined)delete process.env.MEMBERSHIP_PRICING_TERMS_ENABLED;else process.env.MEMBERSHIP_PRICING_TERMS_ENABLED=prior}
+});
+
+test('new public duplicate binds term and offer version rather than cadence alone', async () => {
+  const prior=process.env.MEMBERSHIP_PRICING_TERMS_ENABLED;
+  process.env.MEMBERSHIP_PRICING_TERMS_ENABLED='true';
+  try {
+    const body=validBody({billing_cadence:'prepaid',commitment_months:3,payment_option:'prepaid',offer_version:'retail-terms-2026-10-11-v1'});
+    const first=makeDb();assert.equal((await request(buildApp(first),body)).status,201);
+    const saved=first.inserts[0].row,db=makeDb({purchaseIntents:[saved]});
+    const repeated=await request(buildApp(db),body);
+    assert.equal(repeated.status,200);assert.equal(repeated.body.duplicate,true);assert.equal(db.inserts.length,0);
+    const different=await request(buildApp(db),{...body,commitment_months:6});
+    assert.equal(different.status,409);assert.equal(different.body.code,'SIGNUP_ALREADY_EXISTS');
+    assert.equal(db.inserts.length,0); // conflict retained, wrong quote never reused
+    const historical=structuredClone(saved);
+    historical.package_snapshot.pricing_version='historical';
+    historical.package_snapshot.membership_terms.offer_version='historical';
+    const oldVersion=await request(buildApp(makeDb({purchaseIntents:[historical]})),body);
+    assert.equal(oldVersion.status,409);assert.equal(oldVersion.body.code,'SIGNUP_ALREADY_EXISTS');
+  } finally {if(prior===undefined)delete process.env.MEMBERSHIP_PRICING_TERMS_ENABLED;else process.env.MEMBERSHIP_PRICING_TERMS_ENABLED=prior}
+});
+
+test('new quote gate refuses legacy price bypass and missing stale conflicting selectors before writes',async()=>{
+  const prior=process.env.MEMBERSHIP_PRICING_TERMS_ENABLED;
+  process.env.MEMBERSHIP_PRICING_TERMS_ENABLED='true';
+  try{
+    const keys={billing_cadence:'prepaid',commitment_months:3,payment_option:'prepaid',offer_version:'retail-terms-2026-10-11-v1'};
+    for(const input of [validBody(),validBody({...keys,offer_version:'old'}),validBody({...keys,payment_option:'monthly_installments'}),
+      validBody({...keys,commitmentMonths:6}),validBody({...keys,billing_cadence:'annual'})]){
+      const db=makeDb(),r=await request(buildApp(db),input);assert.ok([400,409].includes(r.status));
+      assert.equal(db.inserts.length,0);assert.equal(db.touchedTables.length,0);
+    }
+  }finally{if(prior===undefined)delete process.env.MEMBERSHIP_PRICING_TERMS_ENABLED;else process.env.MEMBERSHIP_PRICING_TERMS_ENABLED=prior}
+});
