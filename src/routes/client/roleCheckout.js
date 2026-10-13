@@ -12,7 +12,7 @@ const { generateRubricAndKBForRole } = require('../../services/generateRubric');
 const { resolveBillingOwnerForScope } = require('../../services/clientBillingScope');
 const { normalizeInterviewType } = require('../../services/interviewTypes');
 const { finalizePendingRolePurchase, finalizePrepaidRoleCredit, findUnusedFirstRolePrepayCredit } = require('../../services/rolePurchaseFinalizer');
-const { normalizeBillingModel } = require('../../services/billingModel');
+const { normalizeBillingModel, normalizePlanTier } = require('../../services/billingModel');
 const { supabaseAdmin } = require('../../clients/supabase');
 const { requireAuth, withClientScope } = require('../../middleware/auth');
 const {
@@ -93,18 +93,20 @@ router.post('/clients/roles/checkout-session', requireAuth, withClientScope, rol
     if (planSettingsErr) return res.status(500).json({ error: 'plan_settings_lookup_failed', detail: planSettingsErr.message })
     if (!planSettings) return res.status(400).json({ error: 'missing_plan_settings' })
 
-    const billingModel = normalizeBillingModel(planSettings.billing_model, planSettings.plan_tier)
+    const planTier = normalizePlanTier(planSettings.plan_tier)
+    const billingModel = normalizeBillingModel(planSettings.billing_model, planTier)
+    const enterpriseUsage = planTier === 'enterprise' && billingModel === 'usage'
     const perRoleFee = Number(planSettings.per_role_fee)
-    if (billingModel !== 'usage' && (!Number.isFinite(perRoleFee) || perRoleFee <= 0)) {
+    if (!enterpriseUsage && (!Number.isFinite(perRoleFee) || perRoleFee <= 0)) {
       return res.status(400).json({ error: 'invalid_per_role_fee' })
     }
-    const perRoleCents = billingModel === 'usage' ? 0 : Math.round(perRoleFee * 100)
-    if (billingModel !== 'usage' && (!Number.isFinite(perRoleCents) || perRoleCents <= 0)) {
+    const perRoleCents = enterpriseUsage ? 0 : Math.round(perRoleFee * 100)
+    if (!enterpriseUsage && (!Number.isFinite(perRoleCents) || perRoleCents <= 0)) {
       return res.status(400).json({ error: 'invalid_per_role_fee' })
     }
 
     let prepayAttemptJdStoragePath = ''
-    const unusedFirstRoleCredit = billingModel === 'usage' ? null : await findUnusedFirstRolePrepayCredit({
+    const unusedFirstRoleCredit = enterpriseUsage ? null : await findUnusedFirstRolePrepayCredit({
       db: supabaseAdmin,
       billingClientId
     })
@@ -144,7 +146,7 @@ router.post('/clients/roles/checkout-session', requireAuth, withClientScope, rol
       })
     }
 
-    if (billingModel === 'usage') {
+    if (enterpriseUsage) {
       const { data: pendingRolePurchase, error: pendingRolePurchaseErr } = await supabaseAdmin
         .from('pending_role_purchases')
         .insert({

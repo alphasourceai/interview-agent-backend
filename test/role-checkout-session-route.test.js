@@ -437,6 +437,18 @@ test('Enterprise usage role creation finalizes without a role fee or Stripe chec
   assert.deepEqual(db.rubricCalls, ['role-1'])
 })
 
+test('usage flag outside Enterprise does not bypass the configured role fee', async () => {
+  const db = makeDb({
+    planSettings: [{ client_id: 'parent-client', plan_tier: 'pro', billing_model: 'usage', billing_interval: 'monthly', per_role_fee: 699 }]
+  })
+  const response = await postRoleCheckout(buildApp(db), 'parent-client')
+
+  assert.equal(response.status, 200)
+  assert.equal(response.body.role_created, undefined)
+  assert.equal(response.body.session_id, 'cs_role_1')
+  assert.equal(db.stripeCalls.pricesCreate[0].unit_amount, 69900)
+})
+
 test('role checkout under child entity consumes parent billing client credit', async () => {
   const db = makeDb({
     clientRoleCredits: [{
