@@ -127,8 +127,8 @@ function creditIsLiveAt(credit, completedAtIso) {
  *   credits: Array, pools: Array, entity_label_by_client: Map
  * }}
  */
-async function allocateInterviews({ db, billingClientId, asOf } = {}) {
-  const empty = {
+function emptyAllocation() {
+  return {
     billing_model: null,
     entries: [],
     by_role: new Map(),
@@ -141,10 +141,12 @@ async function allocateInterviews({ db, billingClientId, asOf } = {}) {
     roles: [],
     entity_label_by_client: new Map()
   };
-  if (!db || !billingClientId) return empty;
+}
+async function allocateInterviews({ db, billingClientId, asOf } = {}) {
+  if (!db || !billingClientId) return emptyAllocation();
 
   const billing = await resolveBillingModel({ db, clientId: billingClientId });
-  if (!billing.billing_model) return empty;
+  if (!billing.billing_model) return emptyAllocation();
 
   const { familyIds, entityLabelById } = await loadFamily({ db, billingClientId });
   // Every model has a per-role included count, Enterprise included: on usage the
@@ -189,6 +191,16 @@ async function allocateInterviews({ db, billingClientId, asOf } = {}) {
   if (poolsError) throw new Error(poolsError.message || 'Allocation pool lookup failed');
 
   const asOfIso = toIso(asOf) || new Date().toISOString();
+  return allocateInterviewRows({ billingModel: billing.billing_model, includedPerRole,
+    usageInterviewFeeCents: parseWholeNonNegative(billing.usage_interview_fee_cents), asOfIso,
+    roleRows, interviewRows, purchaseRows, creditRows, poolRows, entityLabelById });
+}
+
+// Trusted server reuse of the SAME calculation. Caller supplies resolved mode,
+// coerced count/fee and explicit time. This does not prove complete DB census,
+// immutable allocation, reservation, invoicing or paid access.
+function allocateInterviewRows({ billingModel, includedPerRole, usageInterviewFeeCents, asOfIso,
+  roleRows, interviewRows, purchaseRows, creditRows, poolRows, entityLabelById }) {
 
   // Per-role allowance: the included count plus anything bought for that role.
   const allowanceByRole = new Map();
@@ -272,7 +284,7 @@ async function allocateInterviews({ db, billingClientId, asOf } = {}) {
 
     // 2. A credit that was live when this interview completed, earliest expiry
     //    first. Credits belong to the client that earned them.
-    if (billing.billing_model === ROLLOVER_BILLING_MODEL) {
+    if (billingModel === ROLLOVER_BILLING_MODEL) {
       const credit = credits.find((candidate) => (
         String(candidate.client_id) === clientId
         && candidate.allocated < candidate.quantity
@@ -291,7 +303,7 @@ async function allocateInterviews({ db, billingClientId, asOf } = {}) {
     }
 
     // 3. The Enterprise pool, oldest first, across the whole family.
-    if (billing.billing_model === USAGE_BILLING_MODEL) {
+    if (billingModel === USAGE_BILLING_MODEL) {
       const pool = pools.find((candidate) => candidate.allocated < candidate.quantity_purchased);
       if (pool) {
         pool.allocated += 1;
@@ -355,7 +367,7 @@ async function allocateInterviews({ db, billingClientId, asOf } = {}) {
   for (const entry of entries) totals[entry.source] += 1;
 
   return {
-    billing_model: billing.billing_model,
+    billing_model: billingModel,
     entries,
     by_role: roleUsage,
     // The per-role figures availability reports: the included count is the same
@@ -363,7 +375,7 @@ async function allocateInterviews({ db, billingClientId, asOf } = {}) {
     included_per_role: includedPerRole,
     allowance_by_role: allowanceByRole,
     // What a metered interview costs, for the billing path.
-    usage_interview_fee_cents: parseWholeNonNegative(billing.usage_interview_fee_cents),
+    usage_interview_fee_cents: usageInterviewFeeCents,
     totals,
     credit_balance_by_client: creditBalanceByClient,
     credits,
@@ -378,5 +390,6 @@ module.exports = {
   SOURCE_OWN,
   SOURCE_POOL,
   SOURCE_USAGE,
-  allocateInterviews
+  allocateInterviews,
+  allocateInterviewRows
 };
