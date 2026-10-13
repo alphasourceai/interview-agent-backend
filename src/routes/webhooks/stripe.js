@@ -17,6 +17,7 @@ const {
 const { resolveBillingModel } = require('../../services/billingModel');
 const { applyUsageToInvoice } = require('../../services/usageBilling');
 const { markPoolFailed, markPoolPaid } = require('../../services/interviewPool');
+const { loadExistingRetailSubscriptionTerms, assertExistingRetailSubscription } = require('../../services/contracts/subscriptionPricingTerms');
 const router = express.Router();
 
 const SETTLED_PAYMENT_STATUSES = new Set(['paid', 'no_payment_required']);
@@ -332,6 +333,18 @@ function buildClientSubscriptionUpdatesFromStripe(subscription, options = {}) {
     subscription?.items?.data?.[0]?.current_period_end ??
     null
   );
+  if (options.retailTerms) {
+    assertExistingRetailSubscription(options.retailTerms, subscription);
+    // A provider billing period is not the accepted commitment window. Keep
+    // its existing status sync, but never reset contract dates, accepted fees,
+    // prepaid cadence or the customer's saved renewal preference on an event.
+    return {
+      stripe_subscription_schedule_id: pickId(subscription.schedule) || null,
+      subscription_status: subStatus || null,
+      current_term_end: currentTermEnd,
+      billing_status: LIVE_SUB_STATUSES.has(subStatus) ? 'active' : 'inactive'
+    };
+  }
   const cancelAtTermEnd = subscription?.cancel_at_period_end === true;
   const isLive = LIVE_SUB_STATUSES.has(subStatus);
   const contractStartAt = toIsoFromUnixSeconds(subscription?.start_date) || null;
@@ -358,6 +371,14 @@ function buildClientSubscriptionUpdatesFromStripe(subscription, options = {}) {
     updates.plan_tier = metadataPlanTier;
   }
   return updates;
+}
+
+function guardRetailSubscriptionUpdate(query, context) {
+  const client=context.client;
+  return query.eq('stripe_subscription_id',client.stripe_subscription_id)
+    .eq('stripe_customer_id',client.stripe_customer_id).eq('plan_tier',client.plan_tier)
+    .eq('billing_interval',client.billing_interval).eq('contract_start_at',client.contract_start_at)
+    .eq('contract_end_at',client.contract_end_at);
 }
 
 // Usage billing rides the platform-fee invoice: when Stripe opens the next
@@ -822,17 +843,33 @@ router.post('/', async (req, res) => {
             customer_id: customerId,
             subscription_id: incomingSubscriptionId
           });
-          const updates = buildClientSubscriptionUpdatesFromStripe(eventObject, {
+          const retailTerms = await loadExistingRetailSubscriptionTerms({db:supabaseAdmin, clientId:client.id, subscription:eventObject});
+          if (retailTerms?.pending) {
+            await markProcessed(true, null);
+            return res.status(200).json({ok:true});
+          }
+          // Replayed/out-of-order lifecycle events must not regress the new
+          // cohort's status from an older snapshot. Legacy behavior is unchanged.
+          const currentSubscription = retailTerms ? await stripe.subscriptions.retrieve(incomingSubscriptionId) : eventObject;
+          const updates = buildClientSubscriptionUpdatesFromStripe(currentSubscription, {
             fallbackCustomerId: customerId,
-            fallbackSubscriptionId: incomingSubscriptionId
+            fallbackSubscriptionId: incomingSubscriptionId,
+            retailTerms
           });
-          const { error: updateErr } = await supabaseAdmin
+          let updateQuery = supabaseAdmin
             .from('clients')
             .update(updates)
             .eq('id', client.id);
+          if(retailTerms) updateQuery = guardRetailSubscriptionUpdate(updateQuery,retailTerms).select('id').maybeSingle();
+          const {data:updatedClient,error:updateErr} = await updateQuery;
           if (updateErr) throw new Error(updateErr.message || 'Client update failed');
-          if (event.type !== 'customer.subscription.deleted') {
-            await upsertClientPlanSettingsFromSubscription(eventObject, client.id, {
+          if(retailTerms && !updatedClient?.id) throw new Error('retail_subscription_update_guard_changed');
+          // Accepted retail fees/capacity are already persisted by existing
+          // first-payment activation. Lifecycle events sync provider status,
+          // not commercial settings; avoiding a second upsert also prevents
+          // an old subscription event racing a new accepted agreement.
+          if (event.type !== 'customer.subscription.deleted' && !retailTerms) {
+            await upsertClientPlanSettingsFromSubscription(currentSubscription, client.id, {
               fallbackPlanTier: updates?.plan_tier || null,
               fallbackBillingInterval: updates?.billing_interval || null
             });
@@ -1311,15 +1348,24 @@ router.post('/', async (req, res) => {
               subscription_id: subscriptionId
             });
             const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+            const retailTerms = await loadExistingRetailSubscriptionTerms({db:supabaseAdmin,clientId:client.id,subscription});
+            if (retailTerms?.pending) {
+              await markProcessed(true, null);
+              return res.status(200).json({ok:true});
+            }
             const updates = buildClientSubscriptionUpdatesFromStripe(subscription, {
               fallbackCustomerId: customerId,
-              fallbackSubscriptionId: subscriptionId
+              fallbackSubscriptionId: subscriptionId,
+              retailTerms
             });
-            const { error: updateErr } = await supabaseAdmin
+            let updateQuery = supabaseAdmin
               .from('clients')
               .update(updates)
               .eq('id', client.id);
+            if(retailTerms) updateQuery = guardRetailSubscriptionUpdate(updateQuery,retailTerms).select('id').maybeSingle();
+            const {data:updatedClient,error:updateErr} = await updateQuery;
             if (updateErr) throw new Error(updateErr.message || 'Client update failed');
+            if(retailTerms && !updatedClient?.id) throw new Error('retail_subscription_update_guard_changed');
           }
         }
       }
