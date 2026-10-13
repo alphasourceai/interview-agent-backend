@@ -449,6 +449,18 @@ test('usage flag outside Enterprise does not bypass the configured role fee', as
   assert.equal(db.stripeCalls.pricesCreate[0].unit_amount, 69900)
 })
 
+test('Enterprise with a missing billing model keeps a configured role fee', async () => {
+  const db = makeDb({
+    planSettings: [{ client_id: 'parent-client', plan_tier: 'enterprise', billing_model: null, billing_interval: 'monthly', per_role_fee: 399 }]
+  })
+  const response = await postRoleCheckout(buildApp(db), 'parent-client')
+
+  assert.equal(response.status, 200)
+  assert.equal(response.body.role_created, undefined)
+  assert.equal(response.body.session_id, 'cs_role_1')
+  assert.equal(db.stripeCalls.pricesCreate[0].unit_amount, 39900)
+})
+
 test('role checkout under child entity consumes parent billing client credit', async () => {
   const db = makeDb({
     clientRoleCredits: [{

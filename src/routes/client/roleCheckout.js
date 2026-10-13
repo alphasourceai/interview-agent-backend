@@ -12,7 +12,7 @@ const { generateRubricAndKBForRole } = require('../../services/generateRubric');
 const { resolveBillingOwnerForScope } = require('../../services/clientBillingScope');
 const { normalizeInterviewType } = require('../../services/interviewTypes');
 const { finalizePendingRolePurchase, finalizePrepaidRoleCredit, findUnusedFirstRolePrepayCredit } = require('../../services/rolePurchaseFinalizer');
-const { normalizeBillingModel, normalizePlanTier } = require('../../services/billingModel');
+const { normalizePlanTier } = require('../../services/billingModel');
 const { supabaseAdmin } = require('../../clients/supabase');
 const { requireAuth, withClientScope } = require('../../middleware/auth');
 const {
@@ -94,7 +94,7 @@ router.post('/clients/roles/checkout-session', requireAuth, withClientScope, rol
     if (!planSettings) return res.status(400).json({ error: 'missing_plan_settings' })
 
     const planTier = normalizePlanTier(planSettings.plan_tier)
-    const billingModel = normalizeBillingModel(planSettings.billing_model, planTier)
+    const billingModel = String(planSettings.billing_model || '').trim().toLowerCase()
     const enterpriseUsage = planTier === 'enterprise' && billingModel === 'usage'
     const perRoleFee = Number(planSettings.per_role_fee)
     if (!enterpriseUsage && (!Number.isFinite(perRoleFee) || perRoleFee <= 0)) {
