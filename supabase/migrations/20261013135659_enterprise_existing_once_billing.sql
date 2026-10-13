@@ -208,6 +208,7 @@ begin
  select * into seal from public.enterprise_v2_execution_seals where agreement_id=a.id;
  src:=a.enterprise_checkout_source;
  if c.id is null or p.id is null or seal.agreement_id is null
+  or c.stripe_customer_id is distinct from a.enterprise_funding_receipt->'proof'->>'customer_id'
   or public.enterprise_existing_pending_material(to_jsonb(a),to_jsonb(c),to_jsonb(seal)) is distinct from src->'material'
   or src->>'pool_id' is distinct from p.id::text or p.client_id is distinct from c.id or p.agreement_id is distinct from a.id
   or p.status is distinct from 'pending' or p.paid_at is not null or p.stripe_payment_intent_id is not null

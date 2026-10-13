@@ -340,6 +340,15 @@ test('native billing concurrent sibling signing serializes client-first, no stal
  assert.equal(row(n.s).status,'superseded');assert.equal(row(sibling).status,'signed');
  assert.equal(pool(n.s).status,'pending');denied('set role service_role;'+billingCall(n),/source_denied/);
 });
+test('native billing replay cannot launder proof customer through a different currently owned billing profile',billingOpts,async()=>{
+ const n=await readyBilling(),w=JSON.parse(sql('set role service_role;'+billingCall(n))),before=clientRow(n.s);
+ const newCustomer='cus_DIFFERENT_'+n.s.id.replaceAll('-','');
+ denied(`begin;set role service_role;update clients set stripe_customer_id='${newCustomer}' where id='${n.s.client}';
+  insert into billing_customers(client_id,name,primary_contact_email,stripe_customer_id)
+  values('${n.s.client}','SYNTHETIC','owner@example.invalid','${newCustomer}');
+  ${billingCall(n)}commit;`,/binding_denied/);
+ assert.deepEqual(clientRow(n.s),before);assert.deepEqual(row(n.s).enterprise_billing_receipt,w);
+});
 test('native receipt firstrecord/same replay has29 fields, original A and one native stamp, no paid state',fundingOpts,async()=>{
  const n=await fundingSource(),p=pool(n.s),before=row(n.s),w=JSON.parse(sql('set role service_role;'+receiptCall(n)));
  assert.equal(Object.keys(w.proof).length,29);assert.equal(w.proof.payment_success_at,n.proof.payment_success_at);
