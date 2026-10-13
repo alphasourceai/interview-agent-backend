@@ -16,6 +16,7 @@ class Query{
   update(v){this.mode='update';this.payload=v;return this}
   delete(){this.mode='delete';return this}
   run(){
+    if(this.table==='sales_reps' && this.db.repLookupError)throw Error('private fake lookup failure');
     const all=this.db.rows[this.table]??(this.db.rows[this.table]=[]);
     let matches=all.filter(r=>this.predicates.every(p=>p(r)));
     if(this.mode==='insert'){const row={id:require('node:crypto').randomUUID(),...this.payload};all.push(row);matches=[row];this.db.writes.push({table:this.table,payload:this.payload});}
@@ -27,7 +28,7 @@ class Query{
   async single(){return this.maybeSingle()}
   then(resolve,reject){return Promise.resolve(this.run()).then(resolve,reject)}
 }
-function db(){return {rows:{admins:[{id:'admin',email:'owner@example.invalid',is_active:true}],clients:[{id:client,name:'Synthetic Client',email:'other@example.invalid',parent_client_id:null}]},
+function db(){return {rows:{sales_reps:[{user_id:'rep',active:true}],admins:[{id:'admin',email:'owner@example.invalid',is_active:true}],clients:[{id:client,name:'Synthetic Client',email:'other@example.invalid',parent_client_id:null}]},
   writes:[],uploads:[],emails:[],from(table){return new Query(this,table)},storage:{from(){return {upload:async()=>({error:null}),
     createSignedUrl:async()=>({data:{signedUrl:'https://example.invalid/preview'},error:null}),remove:async()=>({error:null})}}}};}
 const keys=(months=3,payment='prepaid')=>({commitment_months:months,payment_option:payment,offer_version:version});
@@ -35,10 +36,10 @@ const salesBody={company_legal_name:'Synthetic Company',buyer_first_name:'QA',bu
   buyer_phone:'5555550100',buyer_title:'Owner',candidate_assistance_name:'QA Buyer',candidate_assistance_email:'buyer@example.invalid',plan_key:'basic'};
 async function gate(fn){const prior=process.env.MEMBERSHIP_PRICING_TERMS_ENABLED;process.env.MEMBERSHIP_PRICING_TERMS_ENABLED='true';
   try{return await fn()}finally{if(prior===undefined)delete process.env.MEMBERSHIP_PRICING_TERMS_ENABLED;else process.env.MEMBERSHIP_PRICING_TERMS_ENABLED=prior}}
-function salesApp(d){stub('src/clients/supabase.js',{supabaseAdmin:d});
+function salesApp(d,accessRole='sales_rep'){stub('src/clients/supabase.js',{supabaseAdmin:d});
   const {createSalesRouter}=require('../src/routes/sales');const app=express();app.use(express.json());
-  app.use((req,res,next)=>{req.salesRep={user_id:'rep',email:'rep@example.invalid',access_role:'sales_rep'};next()});
-  app.use('/sales',createSalesRouter({db:d,rateLimit:async()=>({allowed:true}),renderPdf:async()=>Buffer.from('synthetic'),
+  app.use((req,res,next)=>{req.salesRep={user_id:'rep',email:'rep@example.invalid',access_role:accessRole};next()});
+  app.use('/sales',createSalesRouter({db:d,rateLimit:async()=>({allowed:true}),renderPdf:async()=>{d.uploads.push('render');return Buffer.from('synthetic')},
     sendAgreementEmail:async(...args)=>{d.emails.push(args);return {skipped:false}},buildSignUrl:()=> 'https://example.invalid/sign'}));return app;}
 function adminApp(d){
   stub('src/clients/supabase.js',{supabaseAdmin:d,supabaseAnon:{auth:{getUser:async()=>({data:{user:{id:'admin',email:'owner@example.invalid'}},error:null})}}});
@@ -47,6 +48,43 @@ function adminApp(d){
   delete require.cache[require.resolve('../src/routes/admin/billingRouter')];
   const app=express();app.use(express.json());app.use('/billing',require('../src/routes/admin/billingRouter'));return app;
 }
+test('unmapped global admin cannot issue a new assisted quote; mapped actor remains eligible regardless role label',async()=>gate(async()=>{
+  const d=db();d.rows.sales_reps=[];const app=salesApp(d,'global_admin');
+  const response=await request(app).post('/sales/deals/preview').set('Idempotency-Key','synthetic-no-rep').send({...salesBody,...keys(),access_role:'sales_rep'});
+  assert.equal(response.status,409);assert.equal(response.body.code,'retail_sales_attribution_required');
+  assert.match(response.body.detail,/Admin Billing/);assert.equal(d.writes.length,0);assert.equal(d.uploads.length,0);assert.equal(d.emails.length,0);
+  d.rows.sales_reps.push({user_id:'rep',active:true});
+  assert.equal((await request(app).post('/sales/deals/preview').set('Idempotency-Key','synthetic-mapped-admin').send({...salesBody,...keys()})).status,201);
+}));
+test('create rechecks stored new preview before any durable work and does not poison idempotency on409',async()=>gate(async()=>{
+  const d=db(),app=salesApp(d),body={...salesBody,...keys()};
+  const preview=await request(app).post('/sales/deals/preview').set('Idempotency-Key','synthetic-preview-recheck').send(body);
+  assert.equal(preview.status,201);const writes=d.writes.length,uploads=d.uploads.length;
+  d.rows.sales_reps=[];
+  const payload={...body,preview_id:preview.body.preview_id};
+  const denied=await request(app).post('/sales/deals').set('Idempotency-Key','synthetic-retry-same-key').send(payload);
+  assert.equal(denied.status,409);assert.equal(d.writes.length,writes);assert.equal(d.uploads.length,uploads);assert.equal(d.emails.length,0);
+  assert.equal(d.rows.sales_idempotency_keys?.length||0,0);assert.equal(d.rows.public_purchase_intents?.length||0,0);
+  d.rows.sales_reps.push({user_id:'rep',active:true});
+  assert.equal((await request(app).post('/sales/deals').set('Idempotency-Key','synthetic-retry-same-key').send(payload)).status,201);
+  assert.equal(d.emails.length,1);
+}));
+test('new assisted attribution read errors503 and inactive409 produce no artifact or email',async()=>gate(async()=>{
+  for(const error of [true,false]){
+    const d=db();d.repLookupError=error;d.rows.sales_reps[0].active=false;
+    const response=await request(salesApp(d)).post('/sales/deals/preview').set('Idempotency-Key','synthetic-failed-rep').send({...salesBody,...keys()});
+    assert.equal(response.status,error?503:409);assert.equal(d.writes.length,0);assert.equal(d.uploads.length,0);assert.equal(d.emails.length,0);
+    assert.ok(!JSON.stringify(response.body).includes('private'));
+  }
+}));
+test('legacy global-admin quote preview remains available without sales attribution row',async()=>{
+  const prior=process.env.MEMBERSHIP_PRICING_TERMS_ENABLED;process.env.MEMBERSHIP_PRICING_TERMS_ENABLED='false';
+  try{const d=db();d.rows.sales_reps=[];d.repLookupError=true;
+    const response=await request(salesApp(d,'global_admin')).post('/sales/deals/preview').set('Idempotency-Key','synthetic-legacy-admin')
+      .send({...salesBody,billing_cadence:'monthly'});
+    assert.equal(response.status,201,JSON.stringify(response.body));
+  }finally{if(prior===undefined)delete process.env.MEMBERSHIP_PRICING_TERMS_ENABLED;else process.env.MEMBERSHIP_PRICING_TERMS_ENABLED=prior;}
+});
 test('existing staff preview and idempotent send persist new terms and markers; no actual email',async()=>gate(async()=>{
   for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments']){
     const d=db(),app=salesApp(d),body={...salesBody,...keys(months,payment)};

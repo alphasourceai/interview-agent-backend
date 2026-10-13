@@ -587,12 +587,30 @@ function createSalesRouter(options = {}) {
     }
   })
 
+  async function requireRetailSalesAttribution(req, packageSnapshot) {
+    if (!retailAgreementTerms(packageSnapshot)) return;
+    const actorId = String(req.salesRep?.user_id || '').trim();
+    let result;
+    try {
+      result = await db.from('sales_reps').select('user_id,active')
+        .eq('user_id', actorId).eq('active', true).maybeSingle();
+    } catch (_) {
+      throw makeSalesError(503, 'sales_access_unavailable', 'Sales access could not be verified.');
+    }
+    if (!result || result.error) throw makeSalesError(503, 'sales_access_unavailable', 'Sales access could not be verified.');
+    if (!result.data || result.data.user_id !== actorId || result.data.active !== true) {
+      throw makeSalesError(409, 'retail_sales_attribution_required',
+        'New sales-assisted pricing requires a configured active salesperson. Use the existing Admin Billing agreement quote flow or a configured salesperson.');
+    }
+  }
+
   router.post('/deals/preview', async (req, res) => {
     try {
       normalizeIdempotencyKey(req)
       const draft = validateSalesDraft(await resolveSalesDraft(req, req.body))
       const promotion = draft.promotion_code ? await validatePromotion(draft.promotion_code, draft) : null
       const { package_snapshot: packageSnapshot, pricing } = calculatePricing(draft, promotion)
+      await requireRetailSalesAttribution(req, packageSnapshot)
       const schedule = agreementSchedule()
       const agreementInput = agreementInputFromDraft(draft, packageSnapshot, schedule)
       const { html } = renderAgreement(agreementInput, { showPackageTerms: true, generatedAt: nowIso(), timeZone: 'America/Denver',
@@ -664,6 +682,7 @@ function createSalesRouter(options = {}) {
       if (previewError) throw makeSalesError(503, 'preview_lookup_failed', 'The agreement preview could not be loaded.')
       if (!preview) throw makeSalesError(404, 'preview_not_found', 'The agreement preview was not found.')
       draft = validateSalesDraft(await resolveSalesDraft(req, req.body, { savedPackageSnapshot: preview.package_snapshot }))
+      await requireRetailSalesAttribution(req, preview.package_snapshot)
       const idem = await idempotentResult(req.salesRep.user_id, routeKey, key, { ...draft, preview_id: previewId })
       if (idem.replay) return res.status(idem.replay.status).json(idem.replay.body)
       if (!await enforceSalesRateLimit(req, res, 'create')) return
