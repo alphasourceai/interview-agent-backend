@@ -630,6 +630,34 @@ test('new buyer creates exactly one existing billing profile before Checkout, wi
   assert.equal(calls.sessions.length,1);
   await create(args);assert.equal(db.billingCustomers.length,1);assert.equal(calls.sessions.length,1);
 });
+test('mounted existing Enterprise service dispatches real helper for all cadences/modes, then pinned retry',async()=>{
+ const {fixture}=require('./helpers/enterprise-existing-checkout-fixture');
+ for(const cadence of ['monthly','annual'])for(const embedded of [true,false]){
+  const f=fixture({cadence,embedded,platformSubtotal:0});
+  const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:{},db:f.db,stripeConstructor:function Stripe(_key,options){assert.equal(options.apiVersion,'2023-10-16');return f.stripe;}});
+  const args={clientId:f.client.id,planTier:'enterprise',billingInterval:cadence,metadataSource:'agreement_checkout',enterpriseFees:f.args.fees,
+   enterpriseAgreement:f.args.agreement,embedded,cancelUrl:f.args.cancelUrl,idempotencyKey:f.args.key};
+  const a=await create(args),b=await create(args);assert.equal(a.enterpriseAttemptLinked,true);assert.equal(a.session.id,b.session.id);assert.equal(a.fallbackSession,null);
+  assert.equal(f.calls.filter(c=>c.kind==='priceCreate').length,2);assert.equal(f.calls.filter(c=>c.kind==='sessionCreate').length,1);
+ }
+});
+test('mounted marked Enterprise fee payload without native agreement/exact key refuses before Stripe constructor',async()=>{
+ const {fixture}=require('./helpers/enterprise-existing-checkout-fixture');const f=fixture();let factories=0;
+ const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:{},db:f.db,stripeConstructor:function Stripe(){factories++;return f.stripe;}});
+ for(const override of [{enterpriseAgreement:null},{idempotencyKey:'bad'},{metadataSource:'admin_subscription_checkout'}])
+  await assert.rejects(create({clientId:f.client.id,planTier:'enterprise',billingInterval:'monthly',metadataSource:'agreement_checkout',enterpriseFees:f.args.fees,
+   enterpriseAgreement:f.args.agreement,idempotencyKey:f.args.key,...override}));
+ assert.equal(factories,0);assert.equal(f.calls.length,0);
+});
+test('first marked Enterprise checkout prefers native current customer over a newer historical profile without rewriting it',async()=>{
+ const {fixture}=require('./helpers/enterprise-existing-checkout-fixture');const f=fixture();
+ const history={id:crypto.randomUUID(),client_id:f.client.id,stripe_customer_id:'cus_HISTORICAL'};f.db.tables.billing_customers.unshift(history);
+ const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:{},db:f.db,stripeConstructor:function Stripe(){return f.stripe;}});
+ await create({clientId:f.client.id,planTier:'enterprise',billingInterval:'monthly',metadataSource:'agreement_checkout',enterpriseFees:f.args.fees,
+  enterpriseAgreement:f.args.agreement,idempotencyKey:f.args.key,cancelUrl:f.args.cancelUrl});
+ assert.equal(f.a.enterprise_checkout_source.material.customer_id,'cus_SYNTHETIC');assert.equal(history.stripe_customer_id,'cus_HISTORICAL');
+ assert.equal(f.calls.filter(c=>c.kind==='customer'&&c.id==='cus_HISTORICAL').length,0);
+});
 test('wrong, null or truncated global billing profile ownership is held before any payable Session',async()=>{
   for(const mode of ['owner','null','truncated','readerror','insertfailure']){
     const calls=retailCalls(),db=makeDb(),args=retailArgs(retailSnapshot());

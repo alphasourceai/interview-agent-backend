@@ -28,7 +28,7 @@ async function rpc(db, name, args) {
   check(result?.data && !Array.isArray(result.data), 'retail_checkout_store_unavailable', 503);
   return result.data;
 }
-async function ensureRetailBillingProfile({ db, client, customerId }) {
+async function ensureRetailBillingProfile({ db, client, customerId, requireExisting = false }) {
   check(typeof client?.id === 'string' && client.id && /^cus_[A-Za-z0-9_]+$/.test(customerId || ''),
     'retail_billing_profile_source_required');
   const read = async () => {
@@ -43,6 +43,7 @@ async function ensureRetailBillingProfile({ db, client, customerId }) {
     return r.data[0] || null;
   };
   const existing = await read();if (existing) return existing;
+  check(!requireExisting,'retail_billing_profile_owner_missing');
   const name = typeof client.name === 'string' ? client.name.trim() : '';
   const email = typeof client.email === 'string' ? client.email.trim().toLowerCase() : '';
   check(name && email,'retail_billing_profile_contact_required');

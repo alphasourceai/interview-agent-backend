@@ -11,6 +11,7 @@ const { resolvePublicBackendBase, buildClientDashboardReturnUrl, buildMembership
 const { priceEnterprisePool, quoteEnterprisePool } = require('./enterprisePoolPricing')
 const {enterprisePoolCheckoutQuote}=require('./enterprisePoolSnapshot')
 const { enterpriseSettingsMetadata, validateEnterpriseSettings } = require('./enterpriseSettings')
+const {createExistingEnterpriseCheckout}=require('./existingEnterpriseCheckoutAttempt')
 const { readRetailPackageOffer } = require('./membershipPackageCompatibility')
 const { isDeepStrictEqual } = require('node:util')
 const { claimExistingRetailAttempt, assertWindow, frozenRetailCancelUrl, readOpenRetailSession,
@@ -199,7 +200,9 @@ async function resolveStripeCustomerId({
   client,
   billingCustomerList,
   exactPrepaid = false,
-  pinnedCustomerId = ''
+  pinnedCustomerId = '',
+  skipCustomerUpdate = false,
+  preferCurrentCustomer = false
 }) {
   const candidateStripeCustomerIds = []
   const customerRows = Array.isArray(billingCustomerList) ? billingCustomerList : []
@@ -211,6 +214,11 @@ async function resolveStripeCustomerId({
   const fallbackCustomerId = String(client?.stripe_customer_id || '').trim()
   if (fallbackCustomerId && !candidateStripeCustomerIds.includes(fallbackCustomerId)) {
     candidateStripeCustomerIds.push(fallbackCustomerId)
+  }
+  if (preferCurrentCustomer && fallbackCustomerId) {
+    const at = candidateStripeCustomerIds.indexOf(fallbackCustomerId)
+    if (at >= 0) candidateStripeCustomerIds.splice(at, 1)
+    candidateStripeCustomerIds.unshift(fallbackCustomerId)
   }
   if (pinnedCustomerId && fallbackCustomerId !== pinnedCustomerId) {
     throw makeError(409, 'retail_checkout_customer_changed', 'The original checkout customer needs review.')
@@ -251,7 +259,7 @@ async function resolveStripeCustomerId({
       metadata: { client_id: client.id }
     })
     resolvedStripeCustomerId = createdCustomer?.id || null
-  } else if (!pinnedCustomerId) {
+  } else if (!pinnedCustomerId && !skipCustomerUpdate) {
     try {
       await stripe.customers.update(resolvedStripeCustomerId, {
         name: client?.name || undefined,
@@ -281,6 +289,7 @@ async function createSubscriptionCheckoutSession({
   idempotencyKey = '',
   checkoutExpiresAt = null,
   retailAgreement = null,
+  enterpriseAgreement = null,
   now = null
 }) {
   const normalizedClientId = String(clientId || '').trim()
@@ -349,6 +358,14 @@ async function createSubscriptionCheckoutSession({
     throw makeError(409, 'enterprise_pool_signed_agreement_required',
       'Use the existing Admin Billing signed-agreement flow for these interview pool terms.')
   }
+  const markedEnterprise = normalizedPlanTier === 'enterprise' && (enterpriseTerms?.acceptedPoolQuote
+    || enterpriseAgreement?.enterprise_checkout_source != null || enterpriseAgreement?.enterprise_checkout_pool_id != null
+    || enterpriseAgreement?.enterprise_checkout_prices != null)
+  if (markedEnterprise && (!enterpriseAgreement?.id || normalizedMetadataSource !== 'agreement_checkout'
+    || normalizedReturnTab || !enterpriseTerms?.acceptedPoolQuote || normalizedPromotionCodeId
+    || firstRolePrepayCheckout || normalizedIdempotencyKey !== `agreement_checkout:${enterpriseAgreement.id}:enterprise:${normalizedBillingInterval}`)) {
+    throw makeError(409,'enterprise_checkout_source_required','The existing signed Enterprise agreement is required.')
+  }
 
   const parentGuard = await requireParentClient(supabaseAdmin, normalizedClientId, {
     source: normalizedMetadataSource
@@ -372,6 +389,12 @@ async function createSubscriptionCheckoutSession({
 
   const clientEmail = String(client.email || '').trim()
   if (!clientEmail) throw makeError(400, 'missing_client_email', 'Client email is required.')
+
+  if (markedEnterprise) return createExistingEnterpriseCheckout({db:supabaseAdmin,
+    stripeFactory:()=>new Stripe(process.env.STRIPE_SECRET_KEY||'',{apiVersion:'2023-10-16'}),resolveCustomer:resolveStripeCustomerId,
+    client,agreement:enterpriseAgreement,fees:enterpriseFees,billingInterval:normalizedBillingInterval,embedded:embeddedCheckoutRequested,
+    cancelUrl,key:normalizedIdempotencyKey,config:{public_backend_base:resolvePublicBackendBase(''),
+      public_sign_base:buildMembershipAgreementSignUrl('').replace(/\/membership-agreement\/sign\/$/,'')}})
 
   const { data: billingCustomerRows, error: billingCustomerError } = await supabaseAdmin
     .from('billing_customers')

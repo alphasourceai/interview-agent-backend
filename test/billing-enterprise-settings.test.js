@@ -673,8 +673,34 @@ async function agreementAndCharge(settings, { changeBandsBeforeCheckout = false,
     }
     if (beforeCheckout) beforeCheckout(db.tables.membership_agreements[0]);
 
-    const checkout = await request(system.app).post('/membership-agreements/checkout-session').send({ token });
-    assert.equal(checkout.status, 200, JSON.stringify(checkout.body));
+    let sdkCalls=system.stripe.calls;
+    const actual=db.tables.membership_agreements[0];
+    if(actual.template_snapshot.values.pool_offer_snapshot!=null){
+      // This older send/terms harness used an unsealed direct status mutation.
+      // Feed its actual server-produced quote into the explicit injected seal/
+      // native boundary fixture instead. Native sealing/pins are separately
+      // verified in real PG17, and the actual route dispatch has its own tests.
+      const {fixture}=require('./helpers/enterprise-existing-checkout-fixture');
+      const {createExistingEnterpriseCheckout}=require('../src/services/existingEnterpriseCheckoutAttempt');
+      const mock=fixture({cadence:actual.billing_option,emptyProfile:true});
+      const execution={...mock.seal.execution,signed_at:new Date(Date.now()-1000).toISOString()};
+      const unsigned=structuredClone(actual.template_snapshot);delete unsigned.execution;
+      Object.assign(mock.a,structuredClone(actual),{signed_at:execution.signed_at,signer_accepted:true,template_version:actual.template_version,
+        template_snapshot:{...unsigned,execution}});
+      for(const k of ['signer_typed_name','signature_image_path','signature_sha256','executed_pdf_path','signer_ip','signer_user_agent'])mock.a[k]=execution[k];
+      Object.assign(mock.seal,{agreement_id:mock.a.id,token_hash:mock.a.signer_token_hash,source_snapshot:unsigned,execution,signed_at:execution.signed_at});
+      Object.assign(mock.client,db.tables.clients[0]);mock.db.tables.clients=[mock.client];mock.customer.id=mock.client.stripe_customer_id;
+      const nativeArgs={db:mock.db,client:db.tables.clients[0],agreement:structuredClone(mock.a),fees:mock.a.template_snapshot.values,billingInterval:mock.a.billing_option,
+        embedded:false,cancelUrl:`${mock.args.config.public_sign_base}/membership-agreement/sign/${encodeURIComponent(token)}`,
+        key:`agreement_checkout:${mock.a.id}:enterprise:${mock.a.billing_option}`,config:mock.args.config,stripeFactory:()=>mock.stripe,
+        resolveCustomer:async()=>db.tables.clients[0].stripe_customer_id};
+      await createExistingEnterpriseCheckout(nativeArgs);
+      db.tables.membership_agreements[0]=mock.a;db.tables.client_interview_pools=mock.db.tables.client_interview_pools;
+      sdkCalls={prices:mock.calls.filter(c=>c.kind==='priceCreate').map(c=>c.body),sessions:mock.calls.filter(c=>c.kind==='sessionCreate').map(c=>c.body)};
+    }else{
+      const checkout = await request(system.app).post('/membership-agreements/checkout-session').send({ token });
+      assert.equal(checkout.status, 200, JSON.stringify(checkout.body));
+    }
 
     const agreement = db.tables.membership_agreements[0];
     const { buildExecutedMembershipAgreementHtml } = require(PATHS.agreementsService);
@@ -684,7 +710,7 @@ async function agreementAndCharge(settings, { changeBandsBeforeCheckout = false,
       draftHtml: agreement.template_snapshot.rendered_html,
       executedHtml: executed.html,
       pendingPools:db.tables.client_interview_pools,
-      stripe: system.stripe.calls
+      stripe: sdkCalls
     };
   } finally {
     if (previous === undefined) delete process.env.STRIPE_SECRET_KEY;
@@ -774,7 +800,7 @@ test('v2 accepted snapshot matches pending row/price, protected metadata and no 
   assert.equal(p.total_cents,229);assert.equal(p.offer_snapshot.net_cents,229);assert.equal(poolPrice.unit_amount,229);
   assert.equal(p.offer_digest,poolPrice.metadata.pool_offer_digest);assert.equal(p.offer_digest,session.metadata.pool_offer_digest);
   assert.equal(session.metadata.pool_offer_version,'enterprise-pool-v2-2026-10-11');
-  assert.equal(Object.hasOwn(session,'allow_promotion_codes'),false);assert.equal(Object.hasOwn(session,'discounts'),false);
+  assert.equal(session.allow_promotion_codes,false);assert.equal(Object.hasOwn(session,'discounts'),false);
   assert.equal(p.status,'pending');assertAgreementMatchesCharge(r);
 });
 

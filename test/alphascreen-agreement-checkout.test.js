@@ -323,12 +323,13 @@ function buildApp(db) {
       const sessionId = `cs_test_${String(args.planTier)}_${String(args.billingInterval)}`
       return {
         session: { id: sessionId, url: `https://checkout.stripe.test/${sessionId}` },
-        fallbackSession: null,
+        fallbackSession: db.enterpriseFallback || null,
         checkoutClientSecret: '',
         replacesStripeSubscriptionId: null,
         replacementPolicy: null,
         // Route isolation only: real native RPC linkage is exercised separately.
-        retailAttemptLinked: !!args.retailAgreement
+        retailAttemptLinked: !!args.retailAgreement,
+        enterpriseAttemptLinked: !!args.enterpriseAgreement && db.enterprisePinAck !== false
       }
     }
   })
@@ -682,6 +683,24 @@ test('selected first-role amounts must match signed values AND saved public inte
   }
 });
 
+test('marked Enterprise route carries native row/exact key and skips independent trace ONLY after pin ACK',async()=>{
+ const {prepareEnterprisePoolTerms}=require('../src/services/enterprisePoolSnapshot');
+ for(const cadence of ['monthly','annual'])for(const mode of ['ok','unknown','fallback']){
+  const a=agreement({plan:'enterprise',cadence,source:'admin',client_id:CLIENT_ID,packageSnapshot:null,agreement_expires_at:new Date(Date.now()+86400000).toISOString()});
+  delete a.template_snapshot.purchase_intent;
+  a.template_snapshot.values=prepareEnterprisePoolTerms({...a.template_snapshot.values,platform_fee:'999.99',per_role_fee:'0',included_interviews_per_role:'0',additional_interview_fee:'0',
+   billing_model:'usage',usage_interview_fee_cents:2500,pool_quantity:30,max_interview_minutes:'20',scored_question_count:'5'});
+  a.enterprise_checkout_source=null;a.enterprise_checkout_pool_id=null;a.enterprise_checkout_prices=null;
+  const db=makeDb({membershipAgreements:[a],clients:[{id:CLIENT_ID}],projectSelectedColumns:true});db.enterprisePinAck=mode!=='unknown';
+  if(mode==='fallback')db.enterpriseFallback={id:'cs_UNEXPECTED',url:'https://checkout.stripe.test/unexpected'};
+  const r=await postCheckout(buildApp(db));assert.equal(r.status,mode==='ok'?200:503,JSON.stringify(r.body));
+  assert.equal(db.checkoutCalls.length,1);const call=db.checkoutCalls[0];assert.equal(call.enterpriseAgreement.id,a.id);
+  assert.equal(call.idempotencyKey,`agreement_checkout:${a.id}:enterprise:${cadence}`);assert.equal(call.enterpriseFees.pool_offer_digest,a.template_snapshot.values.pool_offer_digest);
+  assert.equal(call.enterpriseAgreement.enterprise_checkout_source,null);assert.equal(call.enterpriseAgreement.enterprise_checkout_prices,null);
+  assert.equal(db.updates.length,0);assert.equal(db.inserts.length,0);assert.equal(db.clientMembers.length,0);
+  if(mode!=='ok')assert.equal(r.body.url,undefined);
+ }
+});
 test('real loader-shaped selects include the legal template version and public intent protocol for new checkout', async () => {
   for (const payment of ['prepaid', 'monthly_installments']) {
     const { a, i } = retailRows({ payment });

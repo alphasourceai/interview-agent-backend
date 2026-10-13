@@ -189,7 +189,9 @@ router.post('/checkout-session', publicAgreementTokenRateLimit, async (req, res)
     const firstRolePrepay = publicAgreement || retailOffer
       ? buildFirstRolePrepayCheckout(publicPackageSnapshot)
       : null;
-    const idempotencyKey = publicAgreement || retailOffer
+    const enterpriseMarked = planTier === 'enterprise' && (enterpriseFees?.pool_offer_snapshot != null || enterpriseFees?.pool_offer_digest != null
+      || agreement.enterprise_checkout_source != null || agreement.enterprise_checkout_pool_id != null || agreement.enterprise_checkout_prices != null);
+    const idempotencyKey = publicAgreement || retailOffer || enterpriseMarked
       ? `agreement_checkout:${agreement.id}:${planTier}:${billingInterval}`
       : '';
     const cancelUrl = publicAgreement
@@ -202,7 +204,8 @@ router.post('/checkout-session', publicAgreementTokenRateLimit, async (req, res)
       checkoutClientSecret,
       replacesStripeSubscriptionId,
       replacementPolicy,
-      retailAttemptLinked
+      retailAttemptLinked,
+      enterpriseAttemptLinked
     } = await createSubscriptionCheckoutSession({
       clientId,
       planTier,
@@ -218,6 +221,7 @@ router.post('/checkout-session', publicAgreementTokenRateLimit, async (req, res)
       idempotencyKey,
       checkoutExpiresAt: explicitAgreementDeadline || null,
       retailAgreement: retailOffer ? agreement : null,
+      enterpriseAgreement: enterpriseMarked ? agreement : null,
       requestContext: {
         forwardedProto: req.headers?.['x-forwarded-proto'],
         forwardedHost: req.headers?.['x-forwarded-host'],
@@ -247,6 +251,11 @@ router.post('/checkout-session', publicAgreementTokenRateLimit, async (req, res)
       return res.json({ ok:true,url:checkoutUrl || null,session_id:checkoutSessionId,
         checkout_client_secret:resolvedCheckoutClientSecret || null,
         embedded_checkout:!!resolvedCheckoutClientSecret,request_id })
+    }
+    if (enterpriseMarked) {
+      if (enterpriseAttemptLinked !== true || fallbackSession) return res.status(503).json({error:'enterprise_checkout_pin_ack_unknown',code:'enterprise_checkout_pin_ack_unknown',request_id});
+      return res.json({ok:true,url:checkoutUrl||null,session_id:checkoutSessionId,checkout_client_secret:resolvedCheckoutClientSecret||null,
+        embedded_checkout:!!resolvedCheckoutClientSecret,request_id});
     }
 
     const nowIso = new Date().toISOString();
