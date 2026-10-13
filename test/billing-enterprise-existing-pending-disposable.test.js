@@ -3,7 +3,8 @@
 const {test,before,after}=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),cp=require('node:child_process');
 const {prepareEnterprisePoolTerms}=require('../src/services/enterprisePoolSnapshot');
-const fundingEnabled=process.env.ENTERPRISE_FUNDING_DISPOSABLE==='true';
+const billingEnabled=process.env.ENTERPRISE_BILLING_DISPOSABLE==='true',billingOpts={skip:!billingEnabled};
+const fundingEnabled=process.env.ENTERPRISE_FUNDING_DISPOSABLE==='true'||billingEnabled;
 const traceEnabled=process.env.ENTERPRISE_TRACE_DISPOSABLE==='true'||fundingEnabled;
 const fundingOpts={skip:!fundingEnabled};
 const enabled=process.env.ENTERPRISE_PENDING_DISPOSABLE==='true'||traceEnabled,opts={skip:!enabled||traceEnabled},traceOpts={skip:!traceEnabled},socket=process.env.PGHOST||'',port='55452';
@@ -18,17 +19,21 @@ function denied(q,re=/enterprise_binding|enterprise_pool|permission denied/){con
 function apply(n=migration){sql(fs.readFileSync(path.join(root,n),'utf8'));}
 const row=s=>JSON.parse(sql(`select to_jsonb(a) from membership_agreements a where id='${s.id}'`));
 const pool=s=>JSON.parse(sql(`select to_jsonb(p) from client_interview_pools p where agreement_id='${s.id}'`));
-function source({cadence='monthly',fees={},signed=true,deadline='1 day',marked=true,parent,rawToken=crypto.randomBytes(32).toString('hex')}={}){
+function source({cadence='monthly',fees={},signed=true,deadline='1 day',marked=true,parent,rowDates,rawToken=crypto.randomBytes(32).toString('hex')}={}){
  const id=crypto.randomUUID(),client=parent?.client||crypto.randomUUID(),token=crypto.createHash('sha256').update(rawToken).digest('hex'),customer=parent?.customer||`cus_SYNTHETIC_${client.replaceAll('-','')}`;
+ const civil=billingEnabled?sql("select to_char(current_date,'YYYY-MM-DD')"):null;
  const values=prepareEnterprisePoolTerms({membership_tier:'enterprise',billing_model:'usage',billing_option:cadence,platform_fee:'999.99',
   per_role_fee:'0',additional_interview_fee:'0',included_interviews_per_role:'0',pool_quantity:30,usage_interview_fee_cents:2500,
-  max_interview_minutes:'20',scored_question_count:'5',...fees});
+  max_interview_minutes:'20',scored_question_count:'5',...(billingEnabled?{term_start_basis:'agreement_date',initial_term_start:civil,
+   initial_renewal_date:sql("select to_char(current_date+365,'YYYY-MM-DD')")} : {}),...fees});
  if(!marked){delete values.pool_offer_snapshot;delete values.pool_offer_digest;}
  const snapshot={values,rendered_html:'SYNTHETIC ONLY'};
  sql(`set role service_role;${parent?'':`insert into clients(id,stripe_customer_id) values('${client}','${customer}');`}
  insert into membership_agreements(id,client_id,status,client_legal_name,primary_admin_name,admin_email,membership_tier,
  initial_term_start,initial_renewal_date,billing_option,template_snapshot,signer_token_hash,signer_token_expires_at,agreement_expires_at,draft_pdf_path)
- values('${id}','${client}','draft','SYNTHETIC','SYNTHETIC OWNER','owner@example.invalid','enterprise',current_date,current_date+365,
+ values('${id}','${client}','draft','SYNTHETIC','SYNTHETIC OWNER','owner@example.invalid','enterprise',
+ ${billingEnabled?lit(rowDates?rowDates.start:values.initial_term_start||null):'current_date'},
+ ${billingEnabled?lit(rowDates?rowDates.end:values.initial_renewal_date||null):'current_date+365'},
  ${lit(cadence)},${lit(snapshot)},'${token}',clock_timestamp()+interval '1 day',clock_timestamp()+interval '${deadline}','synthetic/${id}/preview.pdf');
  update membership_agreements set status='sent' where id='${id}'`);
  const s={id,client,customer,token,rawToken,snapshot};
@@ -111,14 +116,42 @@ before(()=>{if(!enabled)return;assert.match(socket,/^\/private\/tmp\/alphascreen
     denied(`begin;${change};${newSql}`,/enterprise_funding_.*drift/);
    apply('20261013125114_enterprise_existing_funding_receipts.sql');
    denied(newSql,/enterprise_funding_schema_acl_drift|enterprise_funding_owner_schema_drift/);
+   if(billingEnabled){
+    // Real Oct10 QA column/default/check definitions, plus Mihran's additive
+    // capacity migration. No hosted data is loaded; service grants fixture-only.
+    const schema=fs.readFileSync(path.join(__dirname,'../../../output/pricing/2026-10-10-dev-schema-candidate.sql'),'utf8');
+    const ddl=schema.match(/CREATE TABLE "public"\."client_plan_settings" \([\s\S]*?\n\);/)[0];
+    sql(ddl);
+    for(const line of schema.split('\n').filter(x=>x.startsWith('ALTER TABLE "public"."client_plan_settings" ADD CONSTRAINT')))sql(line);
+    sql("alter table client_plan_settings enable row level security;grant select,insert,update on client_plan_settings to service_role");
+    apply('20261011130000_client_plan_settings_interview_settings.sql');
+    sql(`alter table clients add column billing_status text not null default 'active',add column subscription_status text,
+     add column plan_tier text default 'basic',add column billing_interval text,add column current_term_end timestamptz,
+     add column contract_start_at timestamptz,add column contract_end_at timestamptz,add column auto_renew boolean default true,
+     add column cancel_at_term_end boolean not null default false,add column cancel_effective_at timestamptz;
+     alter table membership_agreements alter column initial_term_start drop not null,alter column initial_renewal_date drop not null;`);
+    const next='20261013135659_enterprise_existing_once_billing.sql',candidate=fs.readFileSync(path.join(root,next),'utf8');
+    for(const change of ["alter table client_plan_settings alter column rollover_days drop not null",
+     "alter table client_plan_settings alter column rollover_days set default 91","revoke update on client_plan_settings from service_role",
+     "revoke insert on client_plan_settings from service_role","alter table client_plan_settings disable row level security",
+     "alter table membership_agreements disable trigger enterprise_existing_funding_guard",
+     "alter table membership_agreements disable trigger enterprise_existing_pending_agreement_pair",
+     "alter table client_interview_pools disable trigger enterprise_pool_v2_guard_pool",
+     "drop index enterprise_funding_one_charge",
+     "drop index enterprise_funding_one_pi;create unique index enterprise_funding_one_pi on membership_agreements(id)",
+     "alter table client_plan_settings alter column platform_fee type numeric(11,2)",
+     "alter table client_plan_settings drop constraint client_plan_settings_client_id_key"])
+     denied('begin;'+change+';'+candidate,/enterprise_billing_.*drift/);
+    apply(next);denied(candidate,/enterprise_billing_schema_drift/);
+   }
   }
  }
 });
 
 // Receipt-only native checks use real-clock A and actual sealed/pinned rows.
 // Direct scalar proof fixtures do not authenticate Stripe or prove bank cash.
-async function fundingSource({cs,replacement=null,cadence='monthly'}={}){
- const s=source({cadence}),suffix=s.id.replaceAll('-',''),a=prepared(s,{replacement}),p=priced(s,a);
+async function fundingSource({cs,replacement=null,cadence='monthly',fees={},rowDates}={}){
+ const s=source({cadence,fees,rowDates}),suffix=s.id.replaceAll('-',''),a=prepared(s,{replacement}),p=priced(s,a);
  sql(`set role service_role;${pinSession(s,p,cs||'cs_RECEIPT_'+suffix)}
   insert into billing_customers(client_id,name,primary_contact_email,stripe_customer_id) values('${s.client}','SYNTHETIC','owner@example.invalid','${s.customer}');`);
  if(replacement)sql(`update clients set stripe_subscription_id='${replacement}' where id='${s.client}'`);
@@ -136,6 +169,177 @@ function receiptCall(n,proof=n.proof,patch={}){
  return `select record_enterprise_existing_funding(${[n.s.id,n.s.client,patch.source||n.r.enterprise_checkout_source,
   patch.prices||n.r.enterprise_checkout_prices,proof].map(lit).join(',')});`;
 }
+function billingSub(n,patch={}){return {id:n.proof.subscription_id,customer:n.proof.customer_id,status:'active',
+ current_period_end:Math.floor(Date.parse(n.proof.payment_success_at)/1000)+86400,cancel_at_period_end:false,...patch};}
+function billingCall(n,{subscription=billingSub(n),funding=n.funding,source=n.r.enterprise_checkout_source,prices=n.r.enterprise_checkout_prices}={}){
+ return 'select apply_enterprise_existing_billing('+[n.s.id,n.s.client,source,prices,funding,subscription].map(lit).join(',')+');';
+}
+async function readyBilling(options){const n=await fundingSource(options);n.funding=JSON.parse(sql('set role service_role;'+receiptCall(n)));return n;}
+const clientRow=s=>JSON.parse(sql("select to_jsonb(c) from clients c where id="+lit(s.client)));
+const planRow=s=>JSON.parse(sql("select to_jsonb(p) from client_plan_settings p where client_id="+lit(s.client))||'null');
+test('native billing applies existing client/settings once, keeps signed custom dates, no paid pool/agreement/Auth',billingOpts,async()=>{
+ for(const cadence of ['monthly','annual']){
+  const n=await readyBilling({cadence,fees:{initial_term_start:'2026-01-31',initial_renewal_date:'2027-04-15'}});
+  const previous=row(n.s),p=pool(n.s),w=JSON.parse(sql("set role service_role;"+billingCall(n)));
+  assert.equal(w.version,'enterprise_existing_billing_v1');assert.equal(Object.keys(w).length,6);assert.match(w.applied_at,/\.\d{6}Z$/);
+  assert.equal(w.client_initial.contract_start_at,'2026-01-31T00:00:00.000000Z');
+  assert.equal(w.client_initial.contract_end_at,'2027-04-15T00:00:00.000000Z');
+  const c=clientRow(n.s),plan=planRow(n.s);assert.equal(c.stripe_subscription_id,n.proof.subscription_id);
+  assert.equal(c.billing_interval,cadence);assert.equal(c.subscription_status,'active');assert.equal(plan.billing_model,'usage');
+  assert.equal(plan.platform_fee,999.99);assert.equal(plan.usage_interview_fee_cents,2500);assert.equal(plan.rollover_days,90);
+  assert.equal(plan.max_interview_minutes,20);assert.equal(plan.scored_question_count,5);
+  const a=row(n.s);delete a.enterprise_billing_receipt;delete previous.enterprise_billing_receipt;
+  assert.deepEqual(a,previous);assert.deepEqual(pool(n.s),p);assert.equal(a.checkout_status,'pending_payment');assert.equal(a.checkout_paid_at,null);
+  assert.equal(sql("select count(*) from pg_proc where proname like 'enterprise_existing_billing_%' and prosecdef"),'0');
+ }
+});
+test('native billing paymentA and UTC clamped anniversary, not subscription/request clock; empty capacity defaults',billingOpts,async()=>{
+ const n=await readyBilling({fees:{term_start_basis:'successful_payment',initial_term_start:'',initial_renewal_date:'',
+  max_interview_minutes:'',scored_question_count:''}});
+ const w=JSON.parse(sql("set role service_role;set timezone='America/Denver';"+billingCall(n)));
+ assert.equal(Date.parse(w.client_initial.contract_start_at),Date.parse(n.proof.payment_success_at));
+ assert.equal(w.client_initial.contract_end_at,require('../src/services/membershipOffers').anchoredMonthInstant(n.proof.payment_success_at,12).replace('.000Z','.000000Z'));
+ assert.equal(w.plan_initial.max_interview_minutes,15);assert.equal(w.plan_initial.scored_question_count,null);
+ // Pure projection vectors use stored sealed material copies ONLY; not writes
+ // or provider claims. Native funding proof time fences stay satisfied.
+ for(const instant of ['2024-02-29T23:59:59.000Z','2026-01-31T22:45:00.000Z']){
+  const src=structuredClone(n.r.enterprise_checkout_source),funding=structuredClone(n.funding),sub=billingSub(n);
+  src.created_at=new Date(Date.parse(instant)-1000).toISOString();src.material.agreement_expires_at=new Date(Date.parse(instant)+86400000).toISOString();
+  src.material.template_snapshot.execution.signed_at=src.created_at;
+  funding.proof.payment_success_at=instant;funding.recorded_at=instant.replace('.000Z','.000000Z');sub.current_period_end=Date.parse(instant)/1000+3600;
+  for(const tz of ['Pacific/Honolulu','America/Denver','UTC']){
+   const actual=JSON.parse(sql("set role service_role;set timezone="+lit(tz)+";select enterprise_existing_billing_initial("+[src,n.r.enterprise_checkout_prices,funding,sub].map(lit).join(',')+');'));
+   assert.equal(actual.client_initial.contract_end_at,require('../src/services/membershipOffers').anchoredMonthInstant(instant,12).replace('.000Z','.000000Z'));
+  }
+ }
+});
+test('native billing replay is locked READ with original stamp, preserves all later admin client/settings choices',billingOpts,async()=>{
+ const n=await readyBilling(),sub=billingSub(n),w=JSON.parse(sql('set role service_role;'+billingCall(n,{subscription:sub})));
+ sql(`set role service_role;update clients set subscription_status='past_due',billing_status='inactive',auto_renew=false,
+  cancel_at_term_end=true,contract_end_at='2030-01-01Z',cancel_effective_at=clock_timestamp() where id='${n.s.client}';
+  update client_plan_settings set platform_fee=123.45,billing_model='fixed',rollover_days=77,max_interview_minutes=30,
+  scored_question_count=7,usage_interview_fee_cents=999 where client_id='${n.s.client}'`);
+ const c=clientRow(n.s),p=planRow(n.s);assert.deepEqual(JSON.parse(sql('set role service_role;'+billingCall(n,{subscription:sub}))),w);
+ assert.deepEqual(clientRow(n.s),c);assert.deepEqual(planRow(n.s),p);
+ denied('set role service_role;'+billingCall(n,{subscription:{...sub,current_period_end:sub.current_period_end+1}}),/replay_conflict/);
+ denied('set role service_role;'+billingCall(n,{subscription:{...sub,status:'trialing'}}),/projection_denied/);
+ denied('set role service_role;'+billingCall(n,{subscription:{...sub,cancel_at_period_end:true}}),/renewal_denied/);
+ // The old pending-only funding context MUST still reject the changed newSub.
+ denied("set role service_role;select enterprise_existing_funding_context(a) from membership_agreements a where id="+lit(n.s.id),/binding_denied/);
+ sql("set role service_role;update clients set stripe_subscription_id='sub_ADMIN_REPLACEMENT_"+n.s.id.replaceAll('-','')+"' where id="+lit(n.s.client));
+ denied('set role service_role;'+billingCall(n),/replay_conflict/);
+});
+test('native billing concurrent identical retries commit single receipt and original initial rows',billingOpts,async()=>{
+ const n=await readyBilling(),results=await Promise.all([asyncSql('set role service_role;'+billingCall(n)),asyncSql('set role service_role;'+billingCall(n))]);
+ for(const r of results)assert.equal(r.code,0,r.err);assert.deepEqual(JSON.parse(results[0].out),JSON.parse(results[1].out));
+ assert.deepEqual(row(n.s).enterprise_billing_receipt,JSON.parse(results[0].out));
+});
+test('native billing late same-transaction client/plan mutations rollback all writes, native saved funding survives',billingOpts,async()=>{
+ const n=await readyBilling(),before=clientRow(n.s);
+ for(const change of ["update clients set subscription_status='past_due' where id="+lit(n.s.client),
+  "update client_plan_settings set max_interview_minutes=30 where client_id="+lit(n.s.client)]){
+  denied('begin;set role service_role;'+billingCall(n)+change+';commit;',/commit_state_denied/);
+  assert.deepEqual(clientRow(n.s),before);assert.equal(planRow(n.s),null);assert.equal(row(n.s).enterprise_billing_receipt,null);
+  assert.deepEqual(row(n.s).enterprise_funding_receipt,n.funding);
+ }
+ const w=JSON.parse(sql('set role service_role;'+billingCall(n)));
+ // Unknown caller acknowledgment does not justify rerunning the initial DML.
+ assert.deepEqual(JSON.parse(sql('set role service_role;'+billingCall(n))),w);
+});
+test('native billing missing/coerced basis and mismatched/blank/custom dates all hold without client/settings writes',billingOpts,async()=>{
+ for(const [fees,rowDates] of [
+  [{term_start_basis:''}], [{term_start_basis:'first_payment_success'}], [{term_start_basis:'AGREEMENT_DATE'}], [{term_start_basis:null}],
+  [{initial_term_start:'',initial_renewal_date:''}],
+  [{initial_term_start:'2026-01-31',initial_renewal_date:'2026-01-01'}],
+  [{initial_term_start:'2026-01-31',initial_renewal_date:'2027-01-31'},{start:'2026-02-01',end:'2027-01-31'}],
+  [{term_start_basis:'successful_payment',initial_term_start:'',initial_renewal_date:''},{start:'2026-01-31',end:'2027-01-31'}]
+ ]){
+  const n=await readyBilling({fees,rowDates}),before=clientRow(n.s);
+  denied('set role service_role;'+billingCall(n),/term_denied/);assert.deepEqual(clientRow(n.s),before);assert.equal(planRow(n.s),null);
+ }
+});
+test('native billing strict five-key provider projection/renewal/period and stored explicit nonusage model hold',billingOpts,async()=>{
+ const n=await readyBilling(),before=clientRow(n.s),sub=billingSub(n);
+ for(const invalid of [{...sub,extra:true},{...sub,status:'trialing'},{...sub,status:'past_due'},{...sub,cancel_at_period_end:true},
+  {...sub,current_period_end:String(sub.current_period_end)},{...sub,current_period_end:0},{...sub,current_period_end:sub.current_period_end+0.5},
+  {...sub,current_period_end:Date.parse(n.proof.payment_success_at)/1000},{...sub,id:'sub_OTHER'},{...sub,customer:'cus_OTHER'}]){
+  denied('set role service_role;'+billingCall(n,{subscription:invalid}),/projection_denied|renewal_denied|period_denied/);
+  assert.deepEqual(clientRow(n.s),before);assert.equal(planRow(n.s),null);
+ }
+ sql(`set role service_role;insert into client_plan_settings(client_id,plan_tier,billing_interval,platform_fee,per_role_fee,
+  included_interviews_per_role,additional_interview_fee,max_interview_minutes,billing_model,rollover_days)
+  values('${n.s.client}','enterprise','monthly',100,0,0,0,15,'fixed',77)`);
+ denied('set role service_role;'+billingCall(n),/first_state_denied/);
+ sql("set role service_role;update client_plan_settings set billing_model='usage' where client_id="+lit(n.s.client));
+ sql('set role service_role;'+billingCall(n));assert.equal(planRow(n.s).rollover_days,77);
+});
+test('native billing unique current subscription rejects foreign owner and concurrent two-client writers',billingOpts,async()=>{
+ const first=await readyBilling(),second=await fundingSource();
+ second.proof.subscription_id=first.proof.subscription_id;second.proof.provider_account_id='acct_SECOND_SYNTHETIC';
+ second.funding=JSON.parse(sql('set role service_role;'+receiptCall(second)));
+ const r=await Promise.all([asyncSql('set role service_role;'+billingCall(first)),asyncSql('set role service_role;'+billingCall(second))]);
+ assert.equal(r.filter(x=>x.code===0).length,1);assert.equal(r.filter(x=>x.code!==0).length,1);
+ assert.match(r.find(x=>x.code!==0).err,/unique constraint|first_state_denied/);
+ const loser=r[0].code===0?second:first;assert.equal(clientRow(loser.s).stripe_subscription_id,null);
+ assert.equal(row(loser.s).enterprise_billing_receipt,null);assert.equal(planRow(loser.s),null);
+});
+test('native billing browser/stamp/foreign funding/immutable receipt/source checks; original paid holds remain',billingOpts,async()=>{
+ const n=await readyBilling(),sub=billingSub(n);
+ for(const role of ['anon','authenticated'])denied('set role '+role+';'+billingCall(n),/permission denied/);
+ denied(billingCall(n),/server_only/);
+ const projection=JSON.parse(sql('set role service_role;select enterprise_existing_billing_initial('+[n.r.enterprise_checkout_source,n.r.enterprise_checkout_prices,n.funding,sub].map(lit).join(',')+');'));
+ const forged={version:'enterprise_existing_billing_v1',funding_receipt:n.funding,subscription:sub,...projection,applied_at:null};
+ denied("set role service_role;update membership_agreements set enterprise_billing_receipt="+lit(forged)+" where id="+lit(n.s.id),/first_state_denied/);
+ denied('set role service_role;'+billingCall(n,{funding:{...n.funding,proof:{...n.funding.proof,invoice_id:'in_OTHER'}}}),/source_denied/);
+ const w=JSON.parse(sql('set role service_role;'+billingCall(n)));
+ for(const expression of ['null',"jsonb_set(enterprise_billing_receipt,'{applied_at}','null')","jsonb_set(enterprise_billing_receipt,'{client_initial,auto_renew}','false')"])
+  denied("set role service_role;update membership_agreements set enterprise_billing_receipt="+expression+" where id="+lit(n.s.id),/immutable/);
+ denied("set role service_role;update membership_agreements set checkout_status='paid',checkout_paid_at=clock_timestamp() where id="+lit(n.s.id),/pending_only/);
+ denied("set role service_role;update client_interview_pools set status='paid',paid_at=clock_timestamp() where id="+lit(n.proof.pool_id),/pending_only|paid.*hold/);
+ assert.deepEqual(row(n.s).enterprise_billing_receipt,w);
+ sql("set role service_role;update membership_agreements set status='voided',is_current=false where id="+lit(n.s.id));
+ denied('set role service_role;'+billingCall(n),/source_denied/);
+});
+test('native billing initial source shape rejects root basis/capacity/currency overrides without coercion',billingOpts,async()=>{
+ const n=await readyBilling(),src=structuredClone(n.r.enterprise_checkout_source),sub=billingSub(n);
+ for(const mutate of [
+  x=>{x.material.template_snapshot.term_start_basis='successful_payment';},
+  x=>{x.material.template_snapshot.values.initial_term_start='2026-02-31';},
+  x=>{x.material.template_snapshot.values.max_interview_minutes='';},
+  x=>{x.material.template_snapshot.values.scored_question_count='8';},
+  x=>{x.material.template_snapshot.values.usage_interview_fee_cents='25.00';},
+  x=>{x.material.template_snapshot.values.rollover_days=90;},
+  x=>{x.material.template_snapshot.values.per_role_fee='1';},
+  x=>{x.material.auto_renew=null;}
+ ]){
+  const changed=structuredClone(src);mutate(changed);
+  denied('set role service_role;select enterprise_existing_billing_initial('+[changed,n.r.enterprise_checkout_prices,n.funding,sub].map(lit).join(',')+');',
+   /term_denied|settings_denied|projection_denied|date\/time/);
+ }
+});
+test('native billing first future period fence is not repeated on exact read-only replay',billingOpts,async()=>{
+ const n=await readyBilling(),sub=billingSub(n,{current_period_end:Math.floor(Date.now()/1000)+3});
+ const w=JSON.parse(sql('set role service_role;'+billingCall(n,{subscription:sub})));
+ await new Promise(resolve=>setTimeout(resolve,3500));
+ assert.deepEqual(JSON.parse(sql('set role service_role;'+billingCall(n,{subscription:sub}))),w);
+});
+test('native billing owner reassignment is blocked until atomic first stamp commits, replay denies foreign owner',billingOpts,async()=>{
+ const n=await readyBilling(),other=source(),holderName='SYNTHETIC_BILLING_HOLDER',updateName='SYNTHETIC_BILLING_OWNER_UPDATE';
+ const holder=asyncSql('begin;set application_name='+lit(holderName)+';set role service_role;'+billingCall(n)+'select pg_sleep(2);commit;');
+ await waitNativeState(holderName,"wait_event='PgSleep'");
+ const change=asyncSql('set application_name='+lit(updateName)+';update billing_customers set client_id='+lit(other.client)+' where stripe_customer_id='+lit(n.s.customer));
+ await waitNativeState(updateName,"wait_event_type='Lock' and cardinality(pg_blocking_pids(pid))>0");
+ const [h,u]=await Promise.all([holder,change]);assert.equal(h.code,0,h.err);assert.equal(u.code,0,u.err);
+ assert.ok(row(n.s).enterprise_billing_receipt);denied('set role service_role;'+billingCall(n),/binding_denied/);
+});
+test('native billing concurrent sibling signing serializes client-first, no stale reactivation or paid credits',billingOpts,async()=>{
+ const n=await readyBilling(),sibling=source({signed:false,parent:n.s});
+ const [billing,sign]=await Promise.all([asyncSql('set role service_role;'+billingCall(n)),asyncSql('set role service_role;'+sealSql(sibling))]);
+ assert.equal(sign.code,0,sign.err);assert.ok([0,1].includes(billing.code));
+ if(billing.code===1)assert.match(billing.err,/source_denied|binding_denied/);
+ assert.equal(row(n.s).status,'superseded');assert.equal(row(sibling).status,'signed');
+ assert.equal(pool(n.s).status,'pending');denied('set role service_role;'+billingCall(n),/source_denied/);
+});
 test('native receipt firstrecord/same replay has29 fields, original A and one native stamp, no paid state',fundingOpts,async()=>{
  const n=await fundingSource(),p=pool(n.s),before=row(n.s),w=JSON.parse(sql('set role service_role;'+receiptCall(n)));
  assert.equal(Object.keys(w.proof).length,29);assert.equal(w.proof.payment_success_at,n.proof.payment_success_at);
@@ -398,7 +602,7 @@ test('actual native trace still denies paid/PI/credit release and retains legacy
  assert.deepEqual(row(s),before);assert.deepEqual(pool(s),p);
  assert.equal(sql("select md5(prosrc) from pg_proc where oid='claim_enterprise_existing_pending_checkout(uuid,uuid,jsonb,text,boolean,text,jsonb)'::regprocedure"),'081cb824284105a582d792f24eb453aa');
  for(const role of ['anon','authenticated'])for(const q of [prepare(s),pinPrices(s,a),pinSession(s,a)])denied(`set role ${role};${q}`,/permission denied/);
- const l=row(legacy);delete l.enterprise_checkout_source;delete l.enterprise_checkout_pool_id;delete l.enterprise_checkout_prices;if(fundingEnabled)delete l.enterprise_funding_receipt;assert.deepEqual(l,legacyRow);
+ const l=row(legacy);delete l.enterprise_checkout_source;delete l.enterprise_checkout_pool_id;delete l.enterprise_checkout_prices;if(fundingEnabled)delete l.enterprise_funding_receipt;if(billingEnabled)delete l.enterprise_billing_receipt;assert.deepEqual(l,legacyRow);
 });
 // Small explicit native query adapter for the existing JS helper. This is not
 // hosted PostgREST: SQL, constraints, guards, seals and pins are real PG17;
