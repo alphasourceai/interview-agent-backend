@@ -12,12 +12,13 @@ function matchesNumber(value, expected) {
   return (typeof value === 'number' || (typeof value === 'string' && /^\d+(?:\.\d{1,2})?$/.test(value)))
     && Number.isFinite(Number(value)) && Number(value) === expected;
 }
-function validDeadline(value, code) {
+function validDeadline(value, code, storedOnly = false) {
   const time = typeof value === 'string' && value.trim() ? Date.parse(value) : NaN;
   check(Number.isFinite(time), code);
-  if (time <= Date.now()) { const e = new Error(code); e.code = code; e.status = 410; throw e; }
+  if (!storedOnly && time <= Date.now()) { const e = new Error(code); e.code = code; e.status = 410; throw e; }
 }
-function readSavedRetailCheckoutTerms({ agreement, intent } = {}) {
+function readSavedRetailCheckoutTerms({ agreement, intent, deadlineMode = 'checkout' } = {}) {
+  check(['checkout','stored'].includes(deadlineMode), 'invalid_retail_deadline_mode');
   const saved = agreement?.template_snapshot;
   // Inspect BOTH raw saved snapshots, including malformed/mixed discriminators,
   // BEFORE falling back to legacy. A prepaid label alone is never sufficient.
@@ -25,7 +26,8 @@ function readSavedRetailCheckoutTerms({ agreement, intent } = {}) {
   const intentOffer = readRetailPackageOffer(intent?.package_snapshot);
   const prepaid = [agreement?.billing_option, saved?.values?.billing_option, intent?.selected_billing_cadence]
     .some(value => typeof value === 'string' && value.trim().toLowerCase() === 'prepaid');
-  if (!offer && !intentOffer && !prepaid) return null;
+  const retailTemplate = agreement?.template_version === TEMPLATE_VERSION || saved?.template_version === TEMPLATE_VERSION;
+  if (!offer && !intentOffer && !prepaid && !retailTemplate) return null;
   check(offer, 'package_snapshot_missing');
   const values = saved?.values;
   const cadence = offer.payment_option === 'prepaid' ? 'prepaid' : 'monthly';
@@ -50,7 +52,9 @@ function readSavedRetailCheckoutTerms({ agreement, intent } = {}) {
   }
   check(!agreement.superseded_by_agreement_id && agreement.signer_accepted === true,
     'agreement_not_checkout_eligible');
-  validDeadline(agreement.agreement_expires_at, 'agreement_expired');
+  // Delayed webhook validation uses stored deadlines; its authenticated paid_at
+  // is checked against them by funding proof, never against today's wall clock.
+  validDeadline(agreement.agreement_expires_at, 'agreement_expired', deadlineMode === 'stored');
   const linked = ['public_purchase_intent', 'sales_assisted'].includes(saved.source);
   if (linked) {
     check(intent && intentOffer && isDeepStrictEqual(offer, intentOffer));
@@ -62,7 +66,7 @@ function readSavedRetailCheckoutTerms({ agreement, intent } = {}) {
         && intent.first_role_normal_role_fee_cents === offer.per_role_fee_cents
         && intent.first_role_prepay_discount_percent === 10 && intent.first_role_prepay_credit_type === 'first_role_prepay');
     }
-    validDeadline(intent.expires_at, 'purchase_intent_expired');
+    validDeadline(intent.expires_at, 'purchase_intent_expired', deadlineMode === 'stored');
     if (offer.payment_option === 'prepaid') check(!String(intent.promotion_code_id || '').trim(), 'retail_prepaid_discount_denied');
     if (saved.source === 'public_purchase_intent') check(offer.payment_option === 'prepaid', 'public_installments_not_available');
   } else check(!intent && !intentOffer);

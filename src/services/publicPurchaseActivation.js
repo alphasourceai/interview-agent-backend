@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const { isDeepStrictEqual } = require('node:util');
 const { supabaseAdmin } = require('../clients/supabase');
 const { requireParentClient } = require('./clientBillingScope');
 const {
@@ -72,7 +73,9 @@ function getPackageSnapshot({ agreement, intent }) {
   // agreement can hide a v2 intent (or malformed v2 discriminator) and activate
   // at old fees/12 months. Saved source disagreement is never a fallback.
   const agreementOffer = readRetailPackageOffer(snapshot), intentOffer = readRetailPackageOffer(intentSnapshot);
-  if (agreementOffer || intentOffer || agreement?.billing_option === 'prepaid' || intent?.selected_billing_cadence === 'prepaid') {
+  if (agreementOffer || intentOffer || agreement?.billing_option === 'prepaid' || intent?.selected_billing_cadence === 'prepaid'
+    || agreement?.template_version === 'membership_agreement_retail_terms_v2'
+    || agreementSnapshot.template_version === 'membership_agreement_retail_terms_v2') {
     if (!agreementOffer || ((intent?.id || intentSnapshot !== null) && (!intentOffer || JSON.stringify(intentOffer) !== JSON.stringify(agreementOffer)))
       || (intent?.id && cleanText(intent.protocol) !== 'fenced_v2')) {
       const e = new Error('retail_terms_source_mismatch'); e.code = e.message; throw e;
@@ -877,6 +880,17 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
   const packageSnapshot = getPackageSnapshot({ agreement, intent });
   const retailOffer = readRetailPackageOffer(packageSnapshot);
   if (retailOffer) {
+    // Prevent a cohort/source change between the webhook's proof read and this
+    // existing side-effect boundary from falling back to event.created. This
+    // is an in-memory server readback binding, not a browser receipt or store.
+    const funding = options.retailFunding;
+    if (!funding || funding.agreementId !== agreement.id || funding.clientId !== agreement.client_id
+      || funding.checkoutSessionId !== agreement.checkout_session_id
+      || !isDeepStrictEqual(funding.packageSnapshot, packageSnapshot)
+      || funding.paidAt !== options.paidAt || funding.subscription?.id !== options.subscription?.id
+      || funding.customerId !== options.fallbackCustomerId) {
+      const e = new Error('retail_funding_source_required'); e.code = e.message; throw e;
+    }
     const original = cleanText(agreement.checkout_paid_at || intent?.activated_at || options.paidAt);
     if (!original) { const e = new Error('retail_original_payment_time_required'); e.code = e.message; throw e; }
     retailTermWindow({ originalStart:original, commitmentMonths:retailOffer.commitment_months });
@@ -1099,11 +1113,35 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
   }
   if (checkoutSessionId && !agreement.checkout_session_id) agreementPaidPayload.checkout_session_id = checkoutSessionId;
   if (!claimKey) {
+    if(retailOffer && !intent?.id) {
+      if(!agreement.checkout_paid_at) {
+        const {data:marked,error:markError}=await db.from('membership_agreements').update(agreementPaidPayload)
+          .eq('id',agreementId).eq('checkout_session_id',options.retailFunding.checkoutSessionId)
+          .eq('client_id',options.retailFunding.clientId).eq('is_current',true)
+          .is('superseded_by_agreement_id',null).is('checkout_paid_at',null)
+          .select('id,checkout_paid_at').maybeSingle();
+        if(markError)throw new Error(markError.message||'Agreement checkout status update failed');
+        if(!marked) {
+          const {data:current,error:readError}=await db.from('membership_agreements')
+            .select('id,client_id,checkout_status,checkout_session_id,checkout_paid_at,is_current,superseded_by_agreement_id').eq('id',agreementId).maybeSingle();
+          const {data:currentClient,error:clientError}=await db.from('clients').select('id,stripe_subscription_id')
+            .eq('id',clientId).maybeSingle();
+          if(readError||clientError||!current||current.is_current!==true||current.superseded_by_agreement_id
+            ||current.client_id!==clientId||current.checkout_session_id!==options.retailFunding.checkoutSessionId
+            ||current.checkout_status!=='paid'||!Number.isFinite(Date.parse(current.checkout_paid_at))
+            ||new Date(current.checkout_paid_at).toISOString()!==activationPaidAt
+            ||currentClient?.stripe_subscription_id!==options.subscription?.id) {
+            const e=new Error('retail_funding_source_changed');e.code=e.message;throw e;
+          }
+        }
+      }
+    } else {
     const { error: agreementUpdateErr } = await db
       .from('membership_agreements')
       .update(agreementPaidPayload)
       .eq('id', agreementId);
     if (agreementUpdateErr) throw new Error(agreementUpdateErr.message || 'Agreement checkout status update failed');
+    }
   }
 
   if (intent?.id && !claimKey) {

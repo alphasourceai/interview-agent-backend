@@ -84,11 +84,16 @@ test('new pricing uses existing fenced activation and password-email behavior; r
     const options={db,agreementId:AGREEMENT_ID,checkoutSessionId:'cs_test_public',paidAt:paid,activationClaimKey:'synthetic-fence',
       assertActivationFence:async()=>{},requireParentClient:async()=>({ok:true,clientId:CLIENT_ID}),
       subscription:{id:'sub_SYNTHETIC',customer:'cus_SYNTHETIC',status:'active',start_date:1769644800,current_period_end:1777550400},
+      fallbackCustomerId:'cus_SYNTHETIC',
+      retailFunding:{agreementId:AGREEMENT_ID,clientId:CLIENT_ID,checkoutSessionId:'cs_test_public',paidAt:paid,
+        subscription:{id:'sub_SYNTHETIC'},customerId:'cus_SYNTHETIC',packageSnapshot:s},
       authAdmin:{listUsers:async()=>({data:{users},error:null})},
       ensureRecovery:async()=>{recovery++;users.push({id:'synthetic-new-user',email:BUYER_EMAIL});return{userId:'synthetic-new-user',method:'recovery',actionLink:'https://setup.example/SYNTHETIC'}},
       sendRecoveryEmail:async()=>{setupEmails++;return{statusCode:202}},sendWelcomeEmail:async()=>{throw Error('No duplicate welcome')},
       logger:{info(){},warn(){},error(){}}};
-    const first=await activatePublicPurchaseAgreementCheckout(options),second=await activatePublicPurchaseAgreementCheckout({...options,paidAt:'2026-02-02T12:00:00.000Z'});
+    const first=await activatePublicPurchaseAgreementCheckout(options);
+    await assert.rejects(activatePublicPurchaseAgreementCheckout({...options,paidAt:'2026-02-02T12:00:00.000Z'}),{code:'retail_funding_source_required'});
+    const second=await activatePublicPurchaseAgreementCheckout(options);
     assert.equal(first.ok,true);assert.equal(second.ok,true);assert.equal(first.plan_settings.platform_fee,1200);
     assert.equal(recovery,existing?0:1);assert.equal(setupEmails,existing?0:1);
     assert.equal(calls.filter(x=>x==='apply_public_purchase_billing').length,2);
@@ -379,6 +384,8 @@ async function activateCase(plan, cadence, extra = {}) {
     paidAt: extra.paidAt || '2026-06-23T12:00:00.000Z',
     subscription: makeSubscription(cadence),
     requireParentClient: async () => ({ ok: true }),
+    retailFunding: extra.retailFunding || null,
+    fallbackCustomerId: extra.fallbackCustomerId || null,
     ensureRecovery: async () => {
       recoveryCalls += 1
       return { userId: 'user-new-buyer', method: 'createUser', actionLink: 'https://setup.example/recovery-token' }
@@ -483,7 +490,10 @@ test('unfenced new retail initial features never upsert or overwrite a sticky ad
     const s=revisedSnapshot(plan,3,'prepaid'),a=db.membershipAgreements[0];a.billing_option='prepaid';
     a.template_snapshot={source:'admin',package_snapshot:s};
     db.clientPlanSettings=[{client_id:CLIENT_ID,plan_tier:plan,billing_interval:'prepaid',billing_model:existingModel,rollover_days:270}];
-    const {result}=await activateCase(plan,'monthly',{db});assert.equal(result.ok,true);
+    const paidAt='2026-06-23T12:00:00.000Z';
+    const {result}=await activateCase(plan,'monthly',{db,fallbackCustomerId:'cus_test_public',
+      retailFunding:{agreementId:AGREEMENT_ID,clientId:CLIENT_ID,checkoutSessionId:'cs_test_public',paidAt,
+        subscription:{id:'sub_test_public'},customerId:'cus_test_public',packageSnapshot:s}});assert.equal(result.ok,true);
     const p=db.clientPlanSettings[0];assert.equal(p.scored_question_count,plan==='basic'?5:6);
     assert.equal(p.billing_model,existingModel || (plan==='basic'?'fixed':'rollover'));
     assert.equal(p.rollover_days,plan==='basic'?270:90);
@@ -492,6 +502,37 @@ test('unfenced new retail initial features never upsert or overwrite a sticky ad
       if(plan==='basic')assert.equal(Object.hasOwn(write.payload,'rollover_days'),false);
     }
   }
+});
+
+test('admin retail paid compare-and-set refuses a changed Session/client/current/supersession before plan or account effects',async()=>{
+  for(const mutate of [a=>a.checkout_session_id='cs_CHANGED',a=>a.client_id='changed-client',a=>a.is_current=false,
+    a=>a.superseded_by_agreement_id='superseded']){
+    const db=makeDb(),s=revisedSnapshot();db.purchaseIntents=[];const a=db.membershipAgreements[0];
+    a.billing_option='prepaid';a.template_snapshot={package_snapshot:s};let staged=false;
+    const original=db.from.bind(db);db.from=table=>{
+      const q=original(table);
+      for(const method of ['execute','maybeSingle']){const run=q[method].bind(q);q[method]=async()=>{
+        if(table==='membership_agreements'&&q.updatePayload?.checkout_status==='paid'&&!staged){staged=true;mutate(a);}
+        return run();};}return q;};
+    let accountEffects=0;const paid='2026-01-31T12:13:14.000Z';
+    await assert.rejects(activatePublicPurchaseAgreementCheckout({db,agreementId:AGREEMENT_ID,checkoutSessionId:'cs_test_public',paidAt:paid,
+      subscription:{id:'sub_QA',customer:'cus_QA',status:'active'},fallbackCustomerId:'cus_QA',requireParentClient:async()=>({ok:true}),
+      retailFunding:{agreementId:AGREEMENT_ID,clientId:CLIENT_ID,checkoutSessionId:'cs_test_public',paidAt:paid,
+        subscription:{id:'sub_QA'},customerId:'cus_QA',packageSnapshot:s},
+      ensureRecovery:async()=>{accountEffects++;throw Error('Must not reach account setup')},logger:{info(){},warn(){},error(){}}}),
+      {code:'retail_funding_source_changed'});
+    assert.equal(accountEffects,0);assert.equal(db.upserts.length,0);assert.equal(db.clientMembers.length,0);
+    assert.equal(db.updates.some(u=>u.table==='clients'),false);assert.equal(a.checkout_status,'pending_payment');
+  }
+});
+
+test('new retail activation refuses an event-clock-only call with no readback binding',async()=>{
+  const db=makeDb(),s=revisedSnapshot();db.membershipAgreements[0].template_snapshot.package_snapshot=s;
+  db.membershipAgreements[0].billing_option='prepaid';db.purchaseIntents[0].package_snapshot=s;
+  db.purchaseIntents[0].selected_billing_cadence='prepaid';db.purchaseIntents[0].protocol='fenced_v2';
+  await assert.rejects(activatePublicPurchaseAgreementCheckout({db,agreementId:AGREEMENT_ID,paidAt:'2026-01-31T12:13:14.000Z',
+    activationClaimKey:'synthetic',logger:{info(){},warn(){},error(){}}}),{code:'retail_funding_source_required'});
+  assert.equal(db.updates.length+db.upserts.length+db.inserts.length,0);
 });
 
 test('fenced purchase uses only transactional tail RPCs and does not resend welcome', async () => {

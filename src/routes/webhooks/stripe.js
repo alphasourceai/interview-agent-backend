@@ -18,6 +18,7 @@ const { resolveBillingModel } = require('../../services/billingModel');
 const { applyUsageToInvoice } = require('../../services/usageBilling');
 const { markPoolFailed, markPoolPaid } = require('../../services/interviewPool');
 const { loadExistingRetailSubscriptionTerms, assertExistingRetailSubscription } = require('../../services/contracts/subscriptionPricingTerms');
+const { readExistingRetailCheckoutFunding, assertExistingRetailFundingSource } = require('../../services/existingRetailCheckoutFunding');
 const router = express.Router();
 
 const SETTLED_PAYMENT_STATUSES = new Set(['paid', 'no_payment_required']);
@@ -610,22 +611,30 @@ async function markAgreementCheckoutPaid(agreementId, options = {}) {
   }
   try {
     const activate = options.activate || activatePublicPurchaseAgreementCheckout;
+    const funding = await readExistingRetailCheckoutFunding({
+      db: fencedDb, stripe: options.stripe || stripe, agreementId: normalizedAgreementId,
+      intentId: claim.intentId || null, eventSessionId: options.checkoutSessionId || null,
+      eventSubscriptionId: pickId(options.subscription?.id) || options.fallbackSubscriptionId || null,
+      eventInvoiceId: options.invoiceId || null, eventLivemode: options.eventLivemode, assertFence
+    });
     // Enterprise prices are per client and travel on the subscription, so they are
     // read here with the same builder the subscription events use. Null for any
     // other tier, which takes its package defaults.
     const enterprisePlanSettings = buildEnterprisePlanSettingsForActivation(options);
+    if(funding){await assertFence();await assertExistingRetailFundingSource({db:fencedDb,funding});}
     const result = await activate({
       agreementId: normalizedAgreementId,
-      checkoutSessionId: options.checkoutSessionId || null,
-      paidAt: options.paidAt || null,
-      subscription: options.subscription || null,
-      fallbackCustomerId: options.fallbackCustomerId || null,
-      fallbackSubscriptionId: options.fallbackSubscriptionId || null,
+      checkoutSessionId: funding?.checkoutSessionId || options.checkoutSessionId || null,
+      paidAt: funding?.paidAt || options.paidAt || null,
+      subscription: funding?.subscription || options.subscription || null,
+      fallbackCustomerId: funding?.customerId || options.fallbackCustomerId || null,
+      fallbackSubscriptionId: funding?.subscription?.id || options.fallbackSubscriptionId || null,
       fallbackClientId: options.fallbackClientId || null,
       fallbackPlanTier: options.fallbackPlanTier || null,
       fallbackBillingInterval: options.fallbackBillingInterval || null,
       requestId: options.requestId || null,
       enterprisePlanSettings,
+      retailFunding: funding || null,
       activationClaimKey: claim.claimed ? claim.key : null,
       activationIntentId: claim.claimed ? claim.intentId : null,
       assertActivationFence: assertFence,
@@ -1212,6 +1221,7 @@ router.post('/', async (req, res) => {
 
         if (isPaidAgreementCheckout) {
           const activation = await markAgreementCheckoutPaid(metadataAgreementId, {
+            eventLivemode: event?.livemode,
             checkoutSessionId: pickId(eventObject?.id) || null,
             paidAt: toIsoFromUnixSeconds(event?.created) || new Date().toISOString(),
             subscription: checkoutSubscription || (subscriptionId ? await stripe.subscriptions.retrieve(subscriptionId) : null),
@@ -1319,6 +1329,8 @@ router.post('/', async (req, res) => {
           invoiceSubscription = await stripe.subscriptions.retrieve(subscriptionId);
         }
         const activation = await markAgreementCheckoutPaid(metadataAgreementId, {
+          eventLivemode: event?.livemode,
+          invoiceId: pickId(eventObject?.id) || null,
           paidAt: toIsoFromUnixSeconds(event?.created) || new Date().toISOString(),
           subscription: invoiceSubscription || null,
           fallbackCustomerId: customerId,
