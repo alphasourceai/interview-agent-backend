@@ -98,6 +98,11 @@ async function nativeScope(db,agreementId){
  return {a,seal,pool,client,owner:structuredClone(owners.data[0]),t,anchor,b,deadline,expiry,billingReceipt};
 }
 
+async function readExistingEnterpriseCheckoutScope({db,agreementId}){
+ check(uuid(agreementId),'enterprise_funding_agreement_invalid',503);
+ return nativeScope(db,agreementId);
+}
+
 async function readExistingEnterpriseCheckoutFunding({db,stripe,agreementId,eventSessionId,eventSubscriptionId,eventInvoiceId,
  eventLivemode,assertFence=async()=>{},now=Date.now}){
  await assertFence();const n=await nativeScope(db,agreementId);if(!n)return null;
@@ -182,4 +187,4 @@ async function readExistingEnterpriseCheckoutFunding({db,stripe,agreementId,even
   sourceBillingReceipt:n.billingReceipt,sourceFundingReceipt:a.enterprise_funding_receipt??null});
 }
 
-module.exports={readExistingEnterpriseCheckoutFunding};
+module.exports={readExistingEnterpriseCheckoutFunding,readExistingEnterpriseCheckoutScope};

@@ -20,6 +20,8 @@ const routerPath = path.join(ROOT, 'src', 'routes', 'webhooks', 'stripe.js');
 const stripeClientPath = path.join(ROOT, 'src', 'clients', 'stripe.js');
 const supabasePath = path.join(ROOT, 'src', 'clients', 'supabase.js');
 const activationPath = path.join(ROOT, 'src', 'services', 'publicPurchaseActivation.js');
+const enterpriseWebhookPath = path.join(ROOT, 'src', 'services', 'existingEnterprisePaymentWebhook.js');
+const enterpriseCompletionPath = path.join(ROOT, 'src', 'services', 'existingEnterprisePaymentCompletion.js');
 
 function injectModule(filename, exports) {
   require.cache[filename] = { id: filename, filename, loaded: true, exports };
@@ -71,7 +73,7 @@ function makeDb(rows) {
 }
 
 function loadApp(event, { intent } = {}) {
-  for (const p of [routerPath, stripeClientPath, supabasePath, activationPath]) delete require.cache[p];
+  for (const p of [routerPath, stripeClientPath, supabasePath, activationPath, enterpriseWebhookPath, enterpriseCompletionPath]) delete require.cache[p];
 
   const activationCalls = [];
   injectModule(activationPath, {
@@ -79,6 +81,14 @@ function loadApp(event, { intent } = {}) {
       activationCalls.push(args);
       return { ok: true, status: 'activated' };
     },
+  });
+  // These legacy cohort fixtures intentionally contain no marked native
+  // Enterprise source. Preserve the established agreement-checkout behavior.
+  injectModule(enterpriseWebhookPath, {
+    classifyExistingEnterprisePaymentEvent: async () => null,
+  });
+  injectModule(enterpriseCompletionPath, {
+    completeExistingEnterprisePayment: async () => null,
   });
   injectModule(stripeClientPath, {
     webhooks: { constructEvent: () => event },

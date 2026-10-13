@@ -6,7 +6,9 @@ const { supabaseAdmin } = require('../../clients/supabase');
 const { requireParentClient } = require('../../services/clientBillingScope');
 const { getRoleInterviewAvailability } = require('../../services/roleInterviewAvailability');
 const { buildAlphaScreenPlanSettingsPayload } = require('../../services/alphaScreenPackages');
-const { activatePublicPurchaseAgreementCheckout } = require('../../services/publicPurchaseActivation');
+const { activatePublicPurchaseAgreementCheckout, finishExistingEnterpriseAccountSetup } = require('../../services/publicPurchaseActivation');
+const { classifyExistingEnterprisePaymentEvent } = require('../../services/existingEnterprisePaymentWebhook');
+const { completeExistingEnterprisePayment } = require('../../services/existingEnterprisePaymentCompletion');
 const { finalizePendingRolePurchase } = require('../../services/rolePurchaseFinalizer');
 const { getPlanCapacity } = require('../../services/planCapacity');
 const {
@@ -615,6 +617,19 @@ async function markAgreementCheckoutPaid(agreementId, options = {}) {
   }
   try {
     const activate = options.activate || activatePublicPurchaseAgreementCheckout;
+    const enterprisePayment = await completeExistingEnterprisePayment({
+      db: fencedDb, stripe: options.stripe || stripe, agreementId: normalizedAgreementId,
+      eventSessionId: options.checkoutSessionId || null,
+      eventSubscriptionId: options.eventSubscriptionId || pickId(options.subscription?.id) || options.fallbackSubscriptionId || null,
+      eventInvoiceId: options.invoiceId || null, eventLivemode: options.eventLivemode, assertFence
+    });
+    if (enterprisePayment) {
+      const result = await finishExistingEnterpriseAccountSetup({
+        db: fencedDb, agreementId: normalizedAgreementId, requestId: options.requestId || null,
+        assertActivationFence: assertFence, logger: options.logger
+      });
+      return { ...result, financial_completion: enterprisePayment };
+    }
     const funding = await readExistingRetailCheckoutFunding({
       db: fencedDb, stripe: options.stripe || stripe, agreementId: normalizedAgreementId,
       intentId: claim.intentId || null, eventSessionId: options.checkoutSessionId || null,
@@ -767,8 +782,11 @@ router.post('/', async (req, res) => {
 
   const eventObject = event?.data?.object || null;
   let retryableAgreementEvent = false;
+  let existingEnterprisePaymentEvent = null;
   try {
     retryableAgreementEvent = await isRetryableAgreementActivationEvent(event);
+    existingEnterprisePaymentEvent = await classifyExistingEnterprisePaymentEvent({ db: supabaseAdmin, stripe, event });
+    if (existingEnterprisePaymentEvent?.requiresReentry === true) retryableAgreementEvent = true;
   } catch (error) {
     return res.status(503).json({ error: 'server_error', code: 'AGREEMENT_EVENT_CLASSIFICATION_FAILED', request_id });
   }
@@ -822,6 +840,33 @@ router.post('/', async (req, res) => {
   };
 
   try {
+    if (existingEnterprisePaymentEvent?.action === 'held') {
+      const error = new Error('enterprise_payment_lifecycle_review_required');
+      error.code = error.message;
+      throw error;
+    }
+    if (existingEnterprisePaymentEvent?.action === 'initial_noop'
+      || existingEnterprisePaymentEvent?.action === 'pending_noop') {
+      await markProcessed(true, null);
+      return res.status(200).json({ ok: true });
+    }
+    if (existingEnterprisePaymentEvent?.action === 'initial_paid') {
+      const isCheckoutEvent = event.type.startsWith('checkout.session.');
+      const activation = await markAgreementCheckoutPaid(existingEnterprisePaymentEvent.agreementId, {
+        eventLivemode: event?.livemode,
+        checkoutSessionId: isCheckoutEvent ? pickId(eventObject?.id) : null,
+        invoiceId: event.type.startsWith('invoice.') ? pickId(eventObject?.id) : null,
+        subscription: existingEnterprisePaymentEvent.subscription,
+        eventSubscriptionId: pickId(eventObject?.subscription) || (event.type.startsWith('customer.subscription.') ? pickId(eventObject?.id) : null),
+        fallbackCustomerId: existingEnterprisePaymentEvent.customerId,
+        fallbackSubscriptionId: existingEnterprisePaymentEvent.subscriptionId,
+        fallbackClientId: existingEnterprisePaymentEvent.clientId,
+        requestId: request_id
+      });
+      requireAgreementActivationResult(activation);
+      await markProcessed(true, null);
+      return res.status(200).json({ ok: true });
+    }
     if (event.type === 'invoice.payment_succeeded' && retryableAgreementEvent) {
       let metadata = eventObject?.metadata || {};
       if ((!metadata.source || !metadata.agreement_id) && pickId(eventObject?.subscription)) {

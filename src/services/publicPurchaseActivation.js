@@ -17,6 +17,8 @@ const { enqueueSalesWonDelivery } = require('./salesIntegrations');
 const { readRetailPackageOffer } = require('./membershipPackageCompatibility');
 const { retailTermWindow } = require('./membershipOffers');
 const { assertExistingEnterprisePoolActivationAvailable } = require('./existingEnterprisePoolActivationHold');
+const { readVerifiedEnterpriseBillingReceipt } = require('./existingEnterpriseBillingReceipt');
+const { verifyEnterprisePaymentRows } = require('./existingEnterprisePaymentRows');
 
 const LIVE_SUBSCRIPTION_STATUSES = new Set(['active', 'trialing']);
 const PRIVILEGED_MEMBER_ROLES = new Set(['manager', 'admin', 'owner', 'super_admin']);
@@ -1327,6 +1329,68 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
   };
 }
 
+async function finishExistingEnterpriseAccountSetup(options = {}) {
+  const db = options.db || supabaseAdmin;
+  const authAdmin = options.authAdmin || supabaseAdmin.auth?.admin;
+  const logger = options.logger || console;
+  const assertFence = options.assertActivationFence || (async () => {});
+  const ensureRecovery = options.ensureRecovery || ensureUserAndSendRecovery;
+  const sendRecoveryEmail = options.sendRecoveryEmail || sendMemberRecoveryEmail;
+  const agreementId = cleanText(options.agreementId);
+  if (!agreementId) throw new Error('enterprise_payment_agreement_missing');
+
+  const { data: agreement, error: agreementError } = await db.from('membership_agreements')
+    .select('id,client_id,status,is_current,checkout_status,checkout_session_id,checkout_paid_at,primary_admin_name,admin_email,client_legal_name,dba_trade_name,membership_tier,billing_option,auto_renew,template_snapshot,superseded_at,superseded_by_agreement_id,enterprise_checkout_source,enterprise_checkout_prices,enterprise_funding_receipt,enterprise_billing_receipt')
+    .eq('id', agreementId).maybeSingle();
+  if (agreementError || !agreement) throw new Error('enterprise_payment_agreement_read_failed');
+  const billingReceipt = await readVerifiedEnterpriseBillingReceipt({ db, agreement });
+  if (!billingReceipt) throw new Error('enterprise_payment_billing_receipt_missing');
+  const [poolResult, clientResult, ownerResult] = await Promise.all([
+    db.from('client_interview_pools').select('*').eq('agreement_id', agreementId).maybeSingle(),
+    db.from('clients').select('id,parent_client_id,archived_at,stripe_customer_id,stripe_subscription_id,billing_status,subscription_status,manual_active_override,access_override_mode')
+      .eq('id', agreement.client_id).maybeSingle(),
+    db.from('billing_customers').select('id,client_id,stripe_customer_id', { count: 'exact' })
+      .eq('stripe_customer_id', billingReceipt.funding_receipt.proof.customer_id)
+  ]);
+  if (poolResult.error || clientResult.error || ownerResult.error || !poolResult.data || !clientResult.data
+    || !Array.isArray(ownerResult.data) || ownerResult.count !== 1 || ownerResult.data.length !== 1) {
+    throw new Error('enterprise_payment_scope_read_failed');
+  }
+  const pool = poolResult.data, client = clientResult.data, proof = billingReceipt.funding_receipt.proof;
+  if (agreement.status !== 'signed' || agreement.is_current !== true || agreement.superseded_at
+    || agreement.superseded_by_agreement_id || agreement.checkout_status !== 'paid'
+    || agreement.checkout_paid_at !== proof.payment_success_at || agreement.client_id !== proof.client_id
+    || agreement.membership_tier !== 'enterprise' || client.id !== agreement.client_id
+    || client.parent_client_id || client.archived_at || client.stripe_customer_id !== proof.customer_id
+    || client.stripe_subscription_id !== proof.subscription_id || ownerResult.data[0].client_id !== client.id
+    || ownerResult.data[0].stripe_customer_id !== client.stripe_customer_id) {
+    throw new Error('enterprise_payment_scope_changed');
+  }
+  verifyEnterprisePaymentRows({ agreement, pool, billingReceipt });
+  await assertFence();
+  const requireParent = options.requireParentClient || requireParentClient;
+  const parentGuard = await requireParent(db, client.id, {
+    route: 'existing_enterprise_checkout_account_setup', agreement_id: agreementId, client_id: client.id
+  });
+  if (!parentGuard?.ok || parentGuard.clientId !== client.id) {
+    const body = parentGuard?.body || {};
+    const error = new Error(body.detail || body.error || 'enterprise_payment_parent_scope_denied');
+    error.code = body.code || body.error || 'enterprise_payment_parent_scope_denied';
+    throw error;
+  }
+  await assertFence();
+  const setup = await ensureBuyerAccountSetup({ db, authAdmin, clientId: client.id, agreement, intent: null,
+    requestId: options.requestId || null, logger, ensureRecovery, sendRecoveryEmail, assertFence });
+  return {
+    ok: true, status: 'activated_existing_enterprise', agreement_id: agreementId, purchase_intent_id: null,
+    client_id: client.id, plan_key: 'enterprise', billing_interval: agreement.billing_option,
+    member_status: setup.member_status, member_role: setup.member_role, auth_status: setup.auth_status,
+    setup_email_status: setup.setup_email_status, welcome_email_status: agreement.admin_email
+      ? 'not_sent_not_public_purchase' : 'not_sent_missing_buyer_email',
+    first_role_credit_status: 'not_applicable', sales_won_delivery_status: 'not_applicable'
+  };
+}
+
 async function resolvePublicCheckoutReturnState(options = {}) {
   const db = options.db || supabaseAdmin;
   const authAdmin = options.authAdmin || supabaseAdmin.auth?.admin;
@@ -1417,6 +1481,7 @@ async function resolvePublicCheckoutReturnState(options = {}) {
 
 module.exports = {
   activatePublicPurchaseAgreementCheckout,
+  finishExistingEnterpriseAccountSetup,
   resolvePublicCheckoutReturnState,
   buildClientActivationPayload,
   findAuthUserByEmail,
