@@ -12,7 +12,7 @@ const {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const SALES_BUSINESS_TIME_ZONE = 'America/Denver'
-const { normalizeRetailQuoteSelection, quotePackageOptions, retailAgreementTerms, retailQuoteCatalog } = require('./retailQuoteSelection')
+const { normalizeRetailQuoteSelection, quotePackageOptions, retailAgreementTerms } = require('./retailQuoteSelection')
 
 function makeSalesError(status, code, detail, fields = null) {
   const error = new Error(detail || code || 'sales_workspace_error')
@@ -146,8 +146,6 @@ function calculatePricing(draft, promotion = null) {
 }
 
 function listSalesPackages(options = {}) {
-  const catalog = retailQuoteCatalog('sales', options.env)
-  if (catalog) return catalog.offers
   return listPublicAlphaScreenPackages(options).map((item) => ({
     plan_key: item.plan_key,
     display_name: item.display_name,

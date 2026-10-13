@@ -20,6 +20,7 @@
   "GET /admin/billing/agreements/pending",
   "GET /admin/billing/customers",
   "GET /admin/billing/invoices",
+  "GET /admin/billing/membership-options",
   "GET /admin/candidates",
   "GET /admin/client-members",
   "GET /admin/clients",

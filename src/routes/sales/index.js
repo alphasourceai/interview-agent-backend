@@ -8,7 +8,7 @@ const { salesHubMetrics } = require('../../services/salesHubMetrics')
 const { verifyReadyGhlBinding } = require('../../services/ghlSalesIntegration')
 const { htmlToPdf } = require('../../render/pdfRenderer')
 const { buildMembershipAgreementHtml } = require('../../render/membershipAgreement')
-const { RETAIL_TEMPLATE, retailAgreementTerms, validateRetailIntentSource, validateRetailAgreementSource } = require('../../services/retailQuoteSelection')
+const { RETAIL_TEMPLATE, retailAgreementTerms, validateRetailIntentSource, validateRetailAgreementSource, retailQuoteCatalog } = require('../../services/retailQuoteSelection')
 const {
   sendMembershipAgreementEmail,
   sendSubscriptionCheckoutEmail
@@ -543,7 +543,7 @@ function createSalesRouter(options = {}) {
   })
 
   router.get('/packages', (_req, res) => {
-    return res.json({ items: listSalesPackages({ env: process.env }) })
+    return res.json({ items: listSalesPackages({ env: process.env }), ...(retailQuoteCatalog('sales') || {}) })
   })
 
   router.get('/imports', async (req, res) => {

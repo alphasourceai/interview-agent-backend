@@ -1,7 +1,7 @@
 'use strict';
 
 // Selection adapter for the current quote paths, not a second checkout system.
-const { OFFER_VERSION, listRetailOffers } = require('./membershipOffers');
+const { OFFER_VERSION, listRetailOffers, buildRetailOffer } = require('./membershipOffers');
 const { buildRetailPackageSnapshot, readRetailPackageOffer } = require('./membershipPackageCompatibility');
 const RETAIL_TEMPLATE = 'membership_agreement_retail_terms_v2';
 const enabled = (env = process.env) => env.MEMBERSHIP_PRICING_TERMS_ENABLED === 'true';
@@ -69,7 +69,11 @@ function validateRetailIntentSource(intent) {
   return offer;
 }
 function retailQuoteCatalog(channel, env = process.env) {
-  return enabled(env) ? { pricing_version: OFFER_VERSION, offers: listRetailOffers({ channel }) } : null;
+  if (!enabled(env)) return null;
+  return { pricing_version: OFFER_VERSION, offers: listRetailOffers({ channel }),
+    first_role_prepay_prices: Object.fromEntries(['basic','pro'].map(planKey => [planKey,
+      buildRetailOffer({planKey,channel,commitmentMonths:3,paymentOption:'prepaid',offerVersion:OFFER_VERSION,
+        firstRolePrepaySelected:true}).first_role_prepay.amount_cents])) };
 }
 function validateRetailAgreementSource(agreement, intent) {
   const snapshot = agreement?.template_snapshot;

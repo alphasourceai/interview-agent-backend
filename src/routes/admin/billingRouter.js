@@ -9,7 +9,7 @@ const { validateEnterpriseSettings } = require('../../services/enterpriseSetting
 const { prepareEnterprisePoolTerms } = require('../../services/enterprisePoolSnapshot');
 const { htmlToPdf } = require('../../render/pdfRenderer');
 const { buildMembershipAgreementHtml, normalizeMembershipAgreementInput } = require('../../render/membershipAgreement');
-const { RETAIL_TEMPLATE, normalizeRetailQuoteSelection, quotePackageOptions, retailAgreementTerms } = require('../../services/retailQuoteSelection');
+const { RETAIL_TEMPLATE, normalizeRetailQuoteSelection, quotePackageOptions, retailAgreementTerms, retailQuoteCatalog } = require('../../services/retailQuoteSelection');
 const { buildAlphaScreenPackageSnapshot } = require('../../services/alphaScreenPackages');
 const { sendMembershipAgreementEmail, sendMembershipAgreementInternalNotification } = require('../../clients/sendgrid');
 const { buildMembershipAgreementSignUrl } = require('../../config/urlConfig');
@@ -66,6 +66,9 @@ async function requireAdmin(req, res, next) {
 }
 
 router.use(requireAuth, requireAdmin);
+
+// Same factory as public/staff quotes, protected by the existing admin guard.
+router.get('/membership-options', (req,res) => res.json(retailQuoteCatalog('admin') || {}));
 
 function normalizeAgreementClientMode(value) {
   const normalized = String(value || '').trim().toLowerCase();

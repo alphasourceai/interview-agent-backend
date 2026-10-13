@@ -88,3 +88,19 @@ test('admin stale selector refuses before client or PDF/storage/mail side effect
   const r=await request(app).post('/billing/agreements/send').set('Authorization','Bearer synthetic').send({membership_tier:'basic',...keys(),offer_version:'old'});
   assert.equal(r.status,400);assert.equal(r.body.code,'stale_offer_version');assert.equal(d.writes.length,0);assert.equal(d.uploads.length,0);assert.equal(d.emails.length,0);
 }));
+test('sales catalog preserves package rows and adds complete keyed offers and optional role prices',async()=>gate(async()=>{
+  const d=db(),app=salesApp(d),r=await request(app).get('/sales/packages');
+  assert.equal(r.status,200);assert.equal(r.body.items.length,2);
+  assert.equal(r.body.items[0].platform_monthly_fee_cents,29900);
+  assert.equal(r.body.pricing_version,version);assert.equal(r.body.offers.length,12);
+  assert.deepEqual(r.body.first_role_prepay_prices,{basic:35900,pro:62900});
+  assert.ok(r.body.offers.every(o=>o.scored_question_count>0 && o.per_role_fee_cents>0));
+}));
+test('admin catalog uses existing authentication and no hosted or persistent actions',async()=>gate(async()=>{
+  const d=db(),app=adminApp(d);
+  assert.equal((await request(app).get('/billing/membership-options')).status,401);
+  const r=await request(app).get('/billing/membership-options').set('Authorization','Bearer synthetic');
+  assert.equal(r.status,200);assert.equal(r.body.offers.length,12);
+  assert.deepEqual(r.body.first_role_prepay_prices,{basic:35900,pro:62900});
+  assert.equal(d.writes.length,0);assert.equal(d.emails.length,0);assert.equal(d.uploads.length,0);
+}));
