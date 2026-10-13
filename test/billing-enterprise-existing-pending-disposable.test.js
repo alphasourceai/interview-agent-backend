@@ -3,7 +3,9 @@
 const {test,before,after}=require('node:test'),assert=require('node:assert/strict');
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),cp=require('node:child_process');
 const {prepareEnterprisePoolTerms}=require('../src/services/enterprisePoolSnapshot');
-const traceEnabled=process.env.ENTERPRISE_TRACE_DISPOSABLE==='true';
+const fundingEnabled=process.env.ENTERPRISE_FUNDING_DISPOSABLE==='true';
+const traceEnabled=process.env.ENTERPRISE_TRACE_DISPOSABLE==='true'||fundingEnabled;
+const fundingOpts={skip:!fundingEnabled};
 const enabled=process.env.ENTERPRISE_PENDING_DISPOSABLE==='true'||traceEnabled,opts={skip:!enabled||traceEnabled},traceOpts={skip:!traceEnabled},socket=process.env.PGHOST||'',port='55452';
 const bin='/opt/homebrew/opt/postgresql@17/bin/',database=`enterprise_pending_${process.pid}`,root=path.join(__dirname,'../supabase/migrations');
 const migration='20261013100736_enterprise_existing_pending_checkout_binding.sql';
@@ -97,6 +99,141 @@ before(()=>{if(!enabled)return;assert.match(socket,/^\/private\/tmp\/alphascreen
     primary_contact_name text,primary_contact_email text not null,notes text,stripe_customer_id text,created_at timestamptz not null default now(),updated_at timestamptz not null default now());
    create unique index billing_customers_stripe_customer_id_uniq on billing_customers(stripe_customer_id) where stripe_customer_id is not null;
    alter table billing_customers enable row level security;grant select,insert on billing_customers to service_role;`);
+  if(fundingEnabled){
+   // Existing QA schema grants service_role UPDATE; row locking needs it even
+   // though the receipt RPC never updates the owner profile. Fixture only.
+   sql('grant update on billing_customers to service_role');
+   const newSql=fs.readFileSync(path.join(root,'20261013125114_enterprise_existing_funding_receipts.sql'),'utf8');
+   for(const change of ["alter table membership_agreements disable trigger enterprise_existing_pending_agreement_guard",
+    "alter table billing_customers disable row level security","revoke update on billing_customers from service_role","drop index billing_customers_stripe_customer_id_uniq",
+    "alter table clients alter column stripe_subscription_id type varchar",
+    "create or replace function enterprise_existing_pending_expiry(b timestamptz,legal_deadline timestamptz) returns timestamptz language sql as $$select legal_deadline$$"])
+    denied(`begin;${change};${newSql}`,/enterprise_funding_.*drift/);
+   apply('20261013125114_enterprise_existing_funding_receipts.sql');
+   denied(newSql,/enterprise_funding_schema_acl_drift|enterprise_funding_owner_schema_drift/);
+  }
+ }
+});
+
+// Receipt-only native checks use real-clock A and actual sealed/pinned rows.
+// Direct scalar proof fixtures do not authenticate Stripe or prove bank cash.
+async function fundingSource({cs,replacement=null,cadence='monthly'}={}){
+ const s=source({cadence}),suffix=s.id.replaceAll('-',''),a=prepared(s,{replacement}),p=priced(s,a);
+ sql(`set role service_role;${pinSession(s,p,cs||'cs_RECEIPT_'+suffix)}
+  insert into billing_customers(client_id,name,primary_contact_email,stripe_customer_id) values('${s.client}','SYNTHETIC','owner@example.invalid','${s.customer}');`);
+ if(replacement)sql(`update clients set stripe_subscription_id='${replacement}' where id='${s.client}'`);
+ await new Promise(resolve=>setTimeout(resolve,1100));
+ const r=row(s),poolRow=pool(s),clock=Number(sql('select floor(extract(epoch from clock_timestamp()))'));
+ const pure=require('./helpers/enterprise-pool-payment-fixture')({platformCents:99999,platformInterval:cadence==='annual'?'year':'month'});
+ const proof={...require('../src/services/enterprisePoolPaymentProof').proveEnterprisePoolPayment(pure),pool_id:poolRow.id,client_id:s.client,
+  provider_account_id:'acct_RECEIPT',customer_id:s.customer,checkout_session_id:r.checkout_session_id,
+  subscription_id:'sub_RECEIPT_'+suffix,invoice_id:'in_RECEIPT_'+suffix,payment_intent_id:'pi_RECEIPT_'+suffix,charge_id:'ch_RECEIPT_'+suffix,
+  platform_price_id:r.enterprise_checkout_prices.platform_price_id,pool_price_id:r.enterprise_checkout_prices.pool_price_id,
+  payment_success_at:new Date(clock*1000).toISOString()};
+ return {s,r,proof};
+}
+function receiptCall(n,proof=n.proof,patch={}){
+ return `select record_enterprise_existing_funding(${[n.s.id,n.s.client,patch.source||n.r.enterprise_checkout_source,
+  patch.prices||n.r.enterprise_checkout_prices,proof].map(lit).join(',')});`;
+}
+test('native receipt firstrecord/same replay has29 fields, original A and one native stamp, no paid state',fundingOpts,async()=>{
+ const n=await fundingSource(),p=pool(n.s),before=row(n.s),w=JSON.parse(sql('set role service_role;'+receiptCall(n)));
+ assert.equal(Object.keys(w.proof).length,29);assert.equal(w.proof.payment_success_at,n.proof.payment_success_at);
+ assert.match(w.recorded_at,/\.\d{6}Z$/);assert.deepEqual(JSON.parse(sql('set role service_role;'+receiptCall(n))),w);
+ const after=row(n.s);delete after.enterprise_funding_receipt;delete before.enterprise_funding_receipt;assert.deepEqual(after,before);assert.deepEqual(pool(n.s),p);
+ for(const change of ['enterprise_funding_receipt=null',"enterprise_funding_receipt=jsonb_set(enterprise_funding_receipt,'{proof,collected_cents}','1')"])
+  denied(`set role service_role;update membership_agreements set ${change} where id='${n.s.id}'`,/enterprise_funding_immutable/);
+ denied(`delete from membership_agreements where id='${n.s.id}'`,/enterprise_funding_immutable/);
+});
+test('native receipt distinct proof/source/caller stamp cannot overwrite or backfill legacy',fundingOpts,async()=>{
+ const n=await fundingSource(),before=row(n.s);
+ const wrapper={version:'enterprise_existing_funding_v1',proof:n.proof,recorded_at:'2026-01-01T00:00:00.000000Z'};
+ denied(`set role service_role;update membership_agreements set enterprise_funding_receipt=${lit(wrapper)} where id='${n.s.id}'`,/stamp_required/);
+ denied(`set role service_role;update membership_agreements set enterprise_funding_receipt=${lit({...wrapper,recorded_at:null})} where id='${legacy.id}'`,/source_denied/);
+ assert.deepEqual(row(n.s),before);sql('set role service_role;'+receiptCall(n));const stored=row(n.s).enterprise_funding_receipt;
+ denied('set role service_role;'+receiptCall(n,{...n.proof,invoice_id:'in_OTHER'}),/receipt_conflict/);
+ denied('set role service_role;'+receiptCall(n,n.proof,{source:{}}),/source_denied/);
+ assert.deepEqual(row(n.s).enterprise_funding_receipt,stored);
+});
+test('native receipt strict shape/cents/types/identity/clock cases refuse independently before any record',fundingOpts,async()=>{
+ const n=await fundingSource(),before=row(n.s);
+ const changes=[p=>{p.extra=true;},p=>{delete p.invoice_id;},p=>{p.invoice_id=null;},p=>{p.quantity=0;},p=>{p.pool_paid_cents=0;},
+  p=>{p.platform_nominal_cents='99999';},p=>{p.platform_line_cents=1.5;},p=>{p.collected_cents=2147483648;},p=>{p.pool_tax_cents=1;},
+  p=>{p.collected_cents--;},p=>{p.credits_spendable=true;},p=>{p.membership_activation_required=false;},p=>{p.native_receipt_required=false;},
+  p=>{p.livemode='false';},p=>{p.currency='eur';},p=>{p.offer_digest='0'.repeat(64);},p=>{p.customer_id='cus_OTHER';},
+  p=>{p.pool_id=crypto.randomUUID();},p=>{p.client_id=crypto.randomUUID();},p=>{p.checkout_session_id='cs_OTHER';},
+  p=>{p.platform_price_id='price_OTHER';},p=>{p.platform_interval='week';},p=>{p.platform_nominal_cents--;},
+  p=>{p.payment_success_at=p.payment_success_at.replace('.000Z','Z');},p=>{p.payment_success_at='infinity';},
+  p=>{p.payment_success_at=new Date(Date.now()+100000).toISOString().replace(/\.\d{3}Z$/,'.000Z');},
+  p=>{p.payment_success_at=new Date(Math.floor(Date.parse(n.r.enterprise_checkout_source.created_at)/1000)*1000-1000).toISOString();}];
+ for(const change of changes){const p=structuredClone(n.proof);change(p);denied('set role service_role;'+receiptCall(n,p),/proof_denied/);assert.deepEqual(row(n.s),before);}
+ const legalProof={...n.proof,payment_success_at:new Date(Math.ceil(Date.parse(n.r.agreement_expires_at)/1000)*1000).toISOString()};
+ const futureWrapper={version:'enterprise_existing_funding_v1',proof:legalProof,recorded_at:new Date(Date.parse(legalProof.payment_success_at)+1000).toISOString().replace('.000Z','.000000Z')};
+ assert.equal(sql(`set role service_role;select enterprise_existing_funding_receipt_valid(${lit(futureWrapper)},${lit(n.r.enterprise_checkout_source)},${lit(n.r.enterprise_checkout_prices)})`),'f');
+});
+test('native receipt replacement subscription may not substitute for new Checkout subscription',fundingOpts,async()=>{
+ const n=await fundingSource({replacement:'sub_ORIGINAL'});denied('set role service_role;'+receiptCall(n,{...n.proof,subscription_id:'sub_ORIGINAL'}),/proof_denied/);
+ assert.equal(row(n.s).enterprise_funding_receipt,null);sql('set role service_role;'+receiptCall(n));
+});
+test('native receipt concurrency matches one original stamp and conflicts rollback',fundingOpts,async()=>{
+ const n=await fundingSource(),r=await Promise.all([asyncSql('set role service_role;'+receiptCall(n)),asyncSql('set role service_role;'+receiptCall(n))]);
+ for(const x of r)assert.equal(x.code,0,x.err);assert.deepEqual(JSON.parse(r[0].out),JSON.parse(r[1].out));
+});
+test('native receipt late failure rolls ledger write back; retry records once',fundingOpts,async()=>{
+ const n=await fundingSource(),before=row(n.s);
+ denied(`begin;create function synthetic_receipt_failure() returns trigger language plpgsql as $$begin
+ if new.id='${n.s.id}'::uuid and new.enterprise_funding_receipt is not null then raise exception 'SYNTHETIC receipt late failure';end if;return new;end$$;
+ create trigger synthetic_receipt_failure after update on membership_agreements for each row execute function synthetic_receipt_failure();
+ set role service_role;${receiptCall(n)};commit;`,/SYNTHETIC receipt late failure/);
+ assert.deepEqual(row(n.s),before);sql('set role service_role;'+receiptCall(n));
+});
+for(const [field,index]of [['checkout_session_id','checkout'],['subscription_id','subscription'],['invoice_id','invoice'],['payment_intent_id','pi'],['charge_id','charge']])
+ test(`native one account/mode/${field} cash graph cannot record on another source`,fundingOpts,async()=>{
+  const first=await fundingSource();sql('set role service_role;'+receiptCall(first));
+  const second=await fundingSource(field==='checkout_session_id'?{cs:first.proof.checkout_session_id}:{}),before=row(second.s);
+  const p={...second.proof,[field]:first.proof[field]};
+  denied('set role service_role;'+receiptCall(second,p),new RegExp('enterprise_funding_one_'+index));assert.deepEqual(row(second.s),before);
+ });
+test('native receipt browser/RLS denied, invoker locks bounded and all original paid guards remain',fundingOpts,async()=>{
+ const n=await fundingSource();for(const role of ['anon','authenticated'])denied('set role '+role+';'+receiptCall(n),/permission denied/);
+ denied(receiptCall(n),/server_only/);assert.equal(sql("select proconfig::text from pg_proc where proname='record_enterprise_existing_funding'"),'{search_path=pg_catalog,lock_timeout=10s}');
+ assert.equal(sql("select count(*) from pg_proc where proname like 'enterprise_existing_funding_%' and prosecdef"),'0');
+ sql('set role service_role;'+receiptCall(n));const a=row(n.s),p=pool(n.s);
+ denied(`set role service_role;update membership_agreements set checkout_status='paid',checkout_paid_at=clock_timestamp() where id='${n.s.id}'`,/enterprise_binding_pending_only/);
+ denied(`set role service_role;update client_interview_pools set status='paid',paid_at=clock_timestamp() where id='${p.id}'`,/enterprise_/);
+ assert.deepEqual(row(n.s),a);assert.deepEqual(pool(n.s),p);assert.equal(acl(),permissions);
+});
+async function waitNativeState(name,predicate){
+ for(let attempt=0;attempt<35;attempt++){
+  if(sql(`select count(*) from pg_stat_activity where application_name=${lit(name)} and ${predicate}`)==='1')return;
+  await new Promise(resolve=>setTimeout(resolve,25));
+ }assert.fail('SYNTHETIC expected native state '+name);
+}
+test('real owner reassignment blocks behind receipt FOR SHARE until commit, then replay refuses foreign owner',fundingOpts,async()=>{
+ const n=await fundingSource(),other=source(),holderName='SYNTHETIC_RECEIPT_HOLDER',updateName='SYNTHETIC_RECEIPT_OWNER_UPDATE';
+ const holder=asyncSql(`begin;set application_name=${lit(holderName)};set role service_role;${receiptCall(n)}select pg_sleep(2);commit;`);
+ await waitNativeState(holderName,"wait_event='PgSleep'");
+ const change=asyncSql(`set application_name=${lit(updateName)};update billing_customers set client_id='${other.client}' where stripe_customer_id='${n.s.customer}'`);
+ await waitNativeState(updateName,"wait_event_type='Lock' and cardinality(pg_blocking_pids(pid))>0");
+ const [h,u]=await Promise.all([holder,change]);assert.equal(h.code,0,h.err);assert.equal(u.code,0,u.err);
+ assert.equal(row(n.s).enterprise_funding_receipt.proof.client_id,n.s.client);
+ denied('set role service_role;'+receiptCall(n),/binding_denied/);assert.equal(pool(n.s).status,'pending');
+});
+test('real receipt/signing race uses client-first order, retains inert historical receipt without reactivation',fundingOpts,async()=>{
+ const n=await fundingSource(),sibling=source({signed:false,parent:n.s});
+ const [receipt,sign]=await Promise.all([asyncSql('set role service_role;'+receiptCall(n)),asyncSql('set role service_role;'+sealSql(sibling))]);
+ assert.equal(sign.code,0,sign.err);assert.ok([0,1].includes(receipt.code));
+ if(receipt.code===1)assert.match(receipt.err,/source_denied/);
+ assert.equal(row(n.s).status,'superseded');assert.equal(pool(n.s).status,'pending');
+ denied('set role service_role;'+receiptCall(n),/source_denied/);
+});
+test('native current source/globalowner/parent/intent failures do not record funding',fundingOpts,async()=>{
+ const n=await fundingSource(),before=row(n.s),other=source();
+ for(const change of [`update clients set parent_client_id='${other.client}' where id='${n.s.client}'`,
+  `update clients set stripe_subscription_id='sub_OTHER' where id='${n.s.client}'`,
+  `update billing_customers set client_id='${other.client}' where stripe_customer_id='${n.s.customer}'`,
+  `insert into public_purchase_intents(agreement_id) values('${n.s.id}')`]){
+  denied(`begin;${change};set role service_role;${receiptCall(n)}commit;`,/source_denied|binding_denied|enterprise_binding/);assert.deepEqual(row(n.s),before);
  }
 });
 after(()=>{if(!enabled)return;const r=cp.spawnSync(`${bin}dropdb`,['-h',socket,'-p',port,'-U','postgres',database],{encoding:'utf8'});assert.equal(r.status,0,r.stderr);});
@@ -261,7 +398,7 @@ test('actual native trace still denies paid/PI/credit release and retains legacy
  assert.deepEqual(row(s),before);assert.deepEqual(pool(s),p);
  assert.equal(sql("select md5(prosrc) from pg_proc where oid='claim_enterprise_existing_pending_checkout(uuid,uuid,jsonb,text,boolean,text,jsonb)'::regprocedure"),'081cb824284105a582d792f24eb453aa');
  for(const role of ['anon','authenticated'])for(const q of [prepare(s),pinPrices(s,a),pinSession(s,a)])denied(`set role ${role};${q}`,/permission denied/);
- const l=row(legacy);delete l.enterprise_checkout_source;delete l.enterprise_checkout_pool_id;delete l.enterprise_checkout_prices;assert.deepEqual(l,legacyRow);
+ const l=row(legacy);delete l.enterprise_checkout_source;delete l.enterprise_checkout_pool_id;delete l.enterprise_checkout_prices;if(fundingEnabled)delete l.enterprise_funding_receipt;assert.deepEqual(l,legacyRow);
 });
 // Small explicit native query adapter for the existing JS helper. This is not
 // hosted PostgREST: SQL, constraints, guards, seals and pins are real PG17;
@@ -284,14 +421,19 @@ class NativeQuery{
  then(resolve,reject){return this.execute().then(resolve,reject);}async maybeSingle(){const r=await this.execute();return{data:r.data?.[0]||null,error:r.error};}async single(){return this.maybeSingle();}
 }
 const nativeDb={from:table=>new NativeQuery(table),async rpc(name,args){
- assert.ok(['prepare_enterprise_existing_checkout','pin_enterprise_existing_checkout_prices','pin_enterprise_existing_checkout_session'].includes(name));
+ assert.ok(['prepare_enterprise_existing_checkout','pin_enterprise_existing_checkout_prices','pin_enterprise_existing_checkout_session','record_enterprise_existing_funding'].includes(name));
  const r=run(`set role service_role;select public.${name}(${Object.entries(args).map(([k,v])=>`${k} := ${lit(v)}`).join(',')});`);
- if(r.status!==0)return{data:null,error:{message:r.stderr}};return{data:JSON.parse(r.stdout.trim()),error:null};
+ if(r.status!==0){if(fundingEnabled)console.error('SYNTHETIC native RPC failure:',r.stderr);return{data:null,error:{message:r.stderr}};}return{data:JSON.parse(r.stdout.trim()),error:null};
 }};
 for(const cadence of ['monthly','annual'])for(const embedded of [true,false])test(`actual existing JS Checkout -> real sealed PG price+CS pins ${cadence}/${embedded}`,traceOpts,async()=>{
  const {createExistingEnterpriseCheckout}=require('../src/services/existingEnterpriseCheckoutAttempt');
  const {fixture}=require('./helpers/enterprise-existing-checkout-fixture');
  const s=source({cadence}),a=row(s),mock=fixture({cadence,embedded,platformSubtotal:0});
+ if(fundingEnabled){
+  const original=mock.stripe.checkout.sessions.create,unique='cs_NATIVE_'+s.id.replaceAll('-','');
+  mock.stripe.checkout.sessions.create=async(...args)=>{const cs=await original(...args);if(cs.id!==unique){const saved=mock.sessionStore.get(cs.id);
+   saved.cs.id=unique;mock.sessionStore.set(unique,saved);mock.sessionStore.delete(cs.id);}return{...cs,id:unique};};
+ }
  const args={db:nativeDb,client:JSON.parse(sql(`select to_jsonb(c) from clients c where id='${s.client}'`)),agreement:a,fees:s.snapshot.values,billingInterval:cadence,embedded,
   cancelUrl:`${config.public_sign_base}/membership-agreement/sign/${s.rawToken}`,key:`agreement_checkout:${s.id}:enterprise:${cadence}`,config,
   stripeFactory:()=>mock.stripe,resolveCustomer:async()=>s.customer};
@@ -307,18 +449,27 @@ for(const cadence of ['monthly','annual'])for(const embedded of [true,false])tes
  // not the in-process source mock. Provider cash is still explicitly injected.
  const {readExistingEnterpriseCheckoutFunding}=require('../src/services/existingEnterpriseCheckoutFunding');
  const paid=require('./helpers/enterprise-pool-payment-fixture')({platformAmount:0,platformCents:99999,platformInterval:cadence==='annual'?'year':'month'});
- const b=Math.floor(Date.parse(r.enterprise_checkout_source.created_at)/1000),actualPrice=mock.priceStore;
+ const b=Math.floor(Date.parse(r.enterprise_checkout_source.created_at)/1000),actualPrice=mock.priceStore,suffix=s.id.replaceAll('-','');
  for(const price of actualPrice.values())Object.assign(price,{created:b,custom_unit_amount:null,transform_quantity:null,tiers_mode:null});
  const platform=actualPrice.get(r.enterprise_checkout_prices.platform_price_id),oneTime=actualPrice.get(r.enterprise_checkout_prices.pool_price_id);
- for(const object of [paid.checkout,paid.subscription,paid.invoice,paid.paymentIntent,paid.charge])Object.assign(object,{customer:s.customer,created:b+3});
- paid.checkout.created=b+2;paid.invoice.status_transitions.paid_at=b+10;
+ for(const object of [paid.checkout,paid.subscription,paid.invoice,paid.paymentIntent,paid.charge])Object.assign(object,{customer:s.customer,created:b+(fundingEnabled?0:3)});
+ let paidClock=b+10;
+ if(fundingEnabled){
+  await new Promise(resolve=>setTimeout(resolve,1100));paidClock=Number(sql('select floor(extract(epoch from clock_timestamp()))'));
+  paid.subscription.id='sub_NATIVE_'+suffix;paid.invoice.id='in_NATIVE_'+suffix;paid.paymentIntent.id='pi_NATIVE_'+suffix;paid.charge.id='ch_NATIVE_'+suffix;
+  paid.subscription.items.data[0].subscription=paid.subscription.id;paid.subscription.items.data[0].id='si_NATIVE_'+suffix;
+  paid.invoice.subscription=paid.subscription.id;paid.invoice.payment_intent=paid.paymentIntent.id;paid.invoice.charge=paid.charge.id;
+  paid.invoice.lines.data[0].subscription=paid.subscription.id;paid.invoice.lines.data[0].subscription_item=paid.subscription.items.data[0].id;
+  paid.paymentIntent.invoice=paid.invoice.id;paid.paymentIntent.latest_charge=paid.charge.id;paid.charge.invoice=paid.invoice.id;paid.charge.payment_intent=paid.paymentIntent.id;
+ }
+ paid.checkout.created=b+(fundingEnabled?0:2);paid.invoice.status_transitions.paid_at=paidClock;
  for(const line of [...paid.subscription.items.data,...paid.invoice.lines.data,...paid.checkoutLines.data])
   line.price=structuredClone(line.price.type==='recurring'?platform:oneTime);
  paid.subscription.items.data[0].object='subscription_item';delete paid.subscription.items.data[0].discounts;delete paid.subscription.discounts;
  for(const line of paid.invoice.lines.data){delete line.invoice;line.discounts=null;line.discount_amounts=null;}
  paid.invoice.discounts=null;paid.invoice.total_discount_amounts=null;paid.charge.refunds=null;delete paid.charge.dispute;
  const saved=mock.sessionStore.get(r.checkout_session_id).cs;
- Object.assign(saved,{created:b+2,status:'complete',payment_status:'paid',subscription:paid.subscription.id,invoice:paid.invoice.id,payment_intent:null});
+ Object.assign(saved,{created:b+(fundingEnabled?0:2),status:'complete',payment_status:'paid',subscription:paid.subscription.id,invoice:paid.invoice.id,payment_intent:null});
  paid.subscription.metadata=structuredClone(saved.metadata);
  const originalBody=mock.calls.find(c=>c.kind==='sessionCreate').body;
  paid.subscription.billing_cycle_anchor=originalBody.subscription_data.billing_cycle_anchor;
@@ -333,7 +484,14 @@ for(const cadence of ['monthly','annual'])for(const embedded of [true,false])tes
  mock.stripe.refunds={list:async()=>structuredClone(paid.refunds)};
  const proof=await readExistingEnterpriseCheckoutFunding({db:nativeDb,stripe:mock.stripe,agreementId:s.id,now:()=> (b+20)*1000});
  assert.equal(proof.agreementId,s.id);assert.equal(proof.pool_id,p.id);assert.equal(proof.pool_paid_cents,p.total_cents);
- assert.equal(proof.checkout_session_id,r.checkout_session_id);assert.equal(proof.payment_success_at,new Date((b+10)*1000).toISOString());
+ assert.equal(proof.checkout_session_id,r.checkout_session_id);assert.equal(proof.payment_success_at,new Date(paidClock*1000).toISOString());
  assert.equal(proof.credits_spendable,false);assert.equal(proof.membership_activation_required,true);assert.equal(proof.native_receipt_required,true);
  assert.deepEqual(row(s),r);assert.deepEqual(pool(s),p); // no billing or credit write
+ if(fundingEnabled){
+  const {recordExistingEnterpriseFunding}=require('../src/services/existingEnterpriseFundingReceipt');
+  const record=await recordExistingEnterpriseFunding({db:nativeDb,stripe:mock.stripe,agreementId:s.id,now:()=>Date.now()});
+  assert.equal(record.receipt.proof.payment_success_at,proof.payment_success_at);assert.deepEqual(row(s).enterprise_funding_receipt,structuredClone(record.receipt));
+  const replay=await recordExistingEnterpriseFunding({db:nativeDb,stripe:mock.stripe,agreementId:s.id});assert.deepEqual(replay.receipt,record.receipt);
+  assert.equal(row(s).checkout_paid_at,null);assert.equal(row(s).checkout_status,'pending_payment');assert.deepEqual(pool(s),p);
+ }
 });
