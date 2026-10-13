@@ -13,13 +13,16 @@ const epoch = n => Number.isSafeInteger(n) && n > 0 && n <= 253402300799;
 const nativeId = (v, prefix) => typeof v === 'string' && new RegExp(`^${prefix}_[A-Za-z0-9_]+$`).test(v);
 const id = value => typeof value === 'string' ? value : value?.id;
 const empty = value => Array.isArray(value) && value.length === 0;
+// Schema2023 nullable arrays are explicitly null or []; missing is NOT null.
+const nullableEmpty = value => value === null || empty(value);
+const optionalEmpty = (object, key) => !Object.hasOwn(object, key) || nullableEmpty(object[key]);
 function fail(code) { const e = new Error(code); e.code = code; e.status = 409; throw e; }
 function check(value, code) { if (!value) fail(code); }
 
 // Snapshot plain own-data JSON without invoking accessors, proxies or toJSON.
 // Shared ordinary object references are fine; cycles, holes and oversized graphs
 // are not. A caller cannot alter the graph between successive proof predicates.
-function safeSnapshot(input) {
+function safeSnapshot(input, sdkRoot = false) {
   let count = 0;
   const active = new Set();
   function copy(v, depth) {
@@ -33,7 +36,12 @@ function safeSnapshot(input) {
     const array = Array.isArray(v);
     check(array || [Object.prototype, null].includes(Object.getPrototypeOf(v)), 'pool_proof_invalid_graph');
     const descriptors = Object.getOwnPropertyDescriptors(v), keys = Reflect.ownKeys(descriptors);
-    const dataKeys = array ? keys.filter(k => k !== 'length') : keys;
+    check(!(sdkRoot && depth > 0 && Object.hasOwn(descriptors, 'lastResponse')), 'pool_proof_invalid_graph');
+    const rootMetadata = sdkRoot && depth === 0 && !array && descriptors.lastResponse;
+    if (rootMetadata) check(rootMetadata.enumerable === false && rootMetadata.writable === false
+      && rootMetadata.configurable === false && Object.hasOwn(rootMetadata, 'value'), 'pool_proof_invalid_graph');
+    // Never traverse the SDK raw response, its headers, or its value graph.
+    const dataKeys = keys.filter(k => !(array && k === 'length') && !(rootMetadata && k === 'lastResponse'));
     check(dataKeys.every(k => typeof k === 'string' && descriptors[k].enumerable
       && Object.hasOwn(descriptors[k], 'value')), 'pool_proof_invalid_graph');
     if (array) check(dataKeys.length === v.length && dataKeys.every(k => /^(0|[1-9][0-9]*)$/.test(k)
@@ -46,6 +54,10 @@ function safeSnapshot(input) {
   }
   return copy(input, 0);
 }
+
+// Trusted SDK adapter boundary only; projection is NOT provider authentication.
+// The pure policy below still rejects hidden properties on its entire input.
+function snapshotStripeSdkData(input) { return safeSnapshot(input, true); }
 
 function list(value, prefix, length) {
   check(value?.object === 'list' && value.has_more === false && Array.isArray(value.data)
@@ -84,7 +96,7 @@ function proveEnterprisePoolPayment(raw = {}) {
   const input = safeSnapshot(raw);
   check(input && typeof input === 'object' && !Array.isArray(input), 'pool_proof_invalid_graph');
   const { binding: b, account, checkout, checkoutLines, subscription, invoice,
-    paymentIntent: pi, charge, observedAt } = input;
+    paymentIntent: pi, charge, refunds, observedAt } = input;
   check(b && UUID.test(b.poolId || '') && UUID.test(b.clientId || '')
     && nativeId(b.providerAccountId, 'acct') && typeof b.livemode === 'boolean'
     && nativeId(b.customerId, 'cus') && nativeId(b.checkoutSessionId, 'cs')
@@ -103,7 +115,8 @@ function proveEnterprisePoolPayment(raw = {}) {
     && o.livemode === b.livemode && id(o.customer) === b.customerId && o.currency === 'usd'),
     'pool_proof_object_identity_mismatch');
   check(nativeId(invoice.id, 'in') && nativeId(pi.id, 'pi') && nativeId(charge.id, 'ch')
-    && id(checkout.subscription) === b.subscriptionId && id(checkout.invoice) === invoice.id
+    && id(checkout.subscription) === b.subscriptionId
+    && (checkout.invoice === null || id(checkout.invoice) === invoice.id)
     && id(invoice.subscription) === b.subscriptionId && id(invoice.payment_intent) === pi.id
     && id(invoice.charge) === charge.id && id(pi.invoice) === invoice.id
     && id(pi.latest_charge) === charge.id && id(charge.invoice) === invoice.id
@@ -113,7 +126,7 @@ function proveEnterprisePoolPayment(raw = {}) {
     && objects.every(([o]) => epoch(o.created) && o.created <= paidAt), 'pool_proof_time_unverified');
   check(checkout.mode === 'subscription' && checkout.status === 'complete' && checkout.payment_status === 'paid'
     && checkout.payment_intent === null && subscription.status === 'active', 'pool_proof_checkout_not_paid');
-  check(subscription.discount === null && empty(subscription.discounts), 'pool_proof_provider_discount');
+  check(subscription.discount === null && optionalEmpty(subscription, 'discounts'), 'pool_proof_provider_discount');
   const collected = invoice.total;
   check(cents(collected) && collected > 0 && collected >= offer.net_cents
     && [checkout.amount_total, invoice.amount_due, invoice.amount_paid, pi.amount,
@@ -126,18 +139,21 @@ function proveEnterprisePoolPayment(raw = {}) {
     && invoice.amount_remaining === 0 && invoice.amount_paid === invoice.total
     && invoice.starting_balance === 0 && invoice.ending_balance === 0
     && invoice.pre_payment_credit_notes_amount === 0 && invoice.post_payment_credit_notes_amount === 0
-    && empty(invoice.discounts) && empty(invoice.total_discount_amounts), 'pool_proof_invoice_not_collected');
-  list(charge.refunds, 're', 0);
+    && nullableEmpty(invoice.discounts) && nullableEmpty(invoice.total_discount_amounts), 'pool_proof_invoice_not_collected');
+  // Fresh, completely paginated refunds from the actual charge collection. An
+  // absent/null embedded list is not a fabricated empty provider read.
+  list(refunds, 're', 0);
+  if (charge.refunds !== null) list(charge.refunds, 're', 0);
   check(pi.status === 'succeeded' && pi.amount === invoice.total && pi.amount_received === invoice.total
     && charge.status === 'succeeded' && charge.paid === true && charge.captured === true
     && charge.amount === invoice.total && charge.amount_captured === invoice.total
     && charge.amount_refunded === 0 && charge.refunded === false
-    && charge.disputed === false && charge.dispute == null, 'pool_proof_payment_not_succeeded');
+    && charge.disputed === false && (!Object.hasOwn(charge, 'dispute') || charge.dispute === null), 'pool_proof_payment_not_succeeded');
 
   const item = list(subscription.items, 'si', 1)[0];
   check(item.id === b.platformItemId && item.quantity === 1 && id(item.subscription) === b.subscriptionId,
     'pool_proof_subscription_item_mismatch');
-  check(empty(item.discounts), 'pool_proof_provider_discount');
+  check(optionalEmpty(item, 'discounts'), 'pool_proof_provider_discount');
   // The trusted adapter must supply the frozen native nominal/cadence. Never
   // infer annual as monthly, multiply by12, or reuse present-day client pricing.
   price(item.price, b.platformPriceId, b.platformCents, b.platformInterval, b.livemode, paidAt);
@@ -147,9 +163,13 @@ function proveEnterprisePoolPayment(raw = {}) {
   check(poolLines.length === 1 && platformLines.length === 1, 'pool_proof_mixed_lines');
   const pool = poolLines[0], platform = platformLines[0];
   for (const line of nativeLines) {
-    check(line.object === 'line_item' && line.livemode === b.livemode && id(line.invoice) === invoice.id
-      && line.quantity === 1 && line.currency === 'usd' && empty(line.discount_amounts)
-      && empty(line.discounts) && cents(line.amount), 'pool_proof_invoice_line_mismatch');
+    // API2023 has no line.invoice. Only the trusted adapter's authenticated
+    // invoices.listLineItems(invoice.id) can establish the collection parent;
+    // a caller JSON graph cannot. Optional conflicting synthetic links fail.
+    check(line.object === 'line_item' && line.livemode === b.livemode
+      && (!Object.hasOwn(line, 'invoice') || line.invoice === null || id(line.invoice) === invoice.id)
+      && line.quantity === 1 && line.currency === 'usd' && nullableEmpty(line.discount_amounts)
+      && nullableEmpty(line.discounts) && cents(line.amount), 'pool_proof_invoice_line_mismatch');
   }
   check(pool.type === 'invoiceitem' && pool.subscription_item == null && pool.proration === false
     && (pool.subscription == null || id(pool.subscription) === b.subscriptionId)
@@ -176,7 +196,7 @@ function proveEnterprisePoolPayment(raw = {}) {
     const isPool = line === checkoutPools[0], amount = isPool ? pool.amount : platform.amount;
     const tax = isPool ? poolTax : platformTax;
     check(line.object === 'item' && line.quantity === 1 && line.currency === 'usd'
-      && line.amount_discount === 0 && (line.discounts == null || empty(line.discounts))
+      && line.amount_discount === 0 && nullableEmpty(line.discounts)
       && line.amount_subtotal === amount && line.amount_tax === tax
       && line.amount_total === amount + tax, 'pool_proof_checkout_line_mismatch');
     price(line.price, isPool ? b.poolPriceId : b.platformPriceId,
@@ -200,4 +220,4 @@ function proveEnterprisePoolPayment(raw = {}) {
     membership_activation_required: true, native_receipt_required: true });
 }
 
-module.exports = { proveEnterprisePoolPayment };
+module.exports = { proveEnterprisePoolPayment, snapshotStripeSdkData };

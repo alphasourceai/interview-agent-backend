@@ -1,6 +1,6 @@
 'use strict';
 
-// Entirely synthetic pinned-API shape, NOT Stripe Sandbox acceptance.
+// Entirely synthetic provider fixture, NOT Stripe Sandbox acceptance.
 const { prepareEnterprisePoolTerms } = require('../../src/services/enterprisePoolSnapshot');
 module.exports = function fixture({ platformAmount = 7000, tax = 0, poolTax = 0,
   quantity = 30, unit = 2500, proration = true, platformCents = 10000, platformInterval = 'month' } = {}) {
@@ -32,6 +32,7 @@ module.exports = function fixture({ platformAmount = 7000, tax = 0, poolTax = 0,
     amount_subtotal: line.amount, amount_tax: index ? poolTax : tax,
     amount_total: line.amount + (index ? poolTax : tax), discounts: [] }));
   const subtotal = net + platformAmount, totalTax = tax + poolTax, amount = subtotal + totalTax;
+  const refunds = { object: 'list', has_more: false, data: [] };
   return {
     binding: { poolId: '10000000-0000-0000-0000-000000000001',
       clientId: '20000000-0000-0000-0000-000000000001',
@@ -64,7 +65,8 @@ module.exports = function fixture({ platformAmount = 7000, tax = 0, poolTax = 0,
     charge: { ...common, object: 'charge', id: 'ch_initial', invoice: 'in_initial', payment_intent: 'pi_initial',
       currency: 'usd', status: 'succeeded', paid: true, captured: true, amount, amount_captured: amount,
       amount_refunded: 0, refunded: false, disputed: false, dispute: null,
-      refunds: { object: 'list', has_more: false, data: [] } },
+      refunds },
+    refunds,
     observedAt: paidAt + 86400
   };
 };
