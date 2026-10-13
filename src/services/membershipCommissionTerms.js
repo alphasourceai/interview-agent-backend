@@ -3,6 +3,8 @@
 // Admin-reviewed receipts only. Resolve policy/linkage from immutable server
 // records. Missing migrations or qualification hold, never fall back to legacy.
 const { anchoredMonthInstant } = require('./membershipOffers');
+const { readSavedRetailCheckoutTerms } = require('./savedMembershipCheckoutTerms');
+const { isDeepStrictEqual } = require('node:util');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function fail(code,status=422) { throw Object.assign(new Error(code),{code,status}); }
 function canonical(value) {
@@ -28,6 +30,14 @@ async function loadMembershipCommissionTerms(db,intent) {
   if (!UUID.test(intent?.id || '') || !UUID.test(intent?.agreement_id || '') || !UUID.test(intent?.client_id || '')) {
     fail('unverified_qualifying_sale');
   }
+  let classified;
+  try { classified=await db.rpc('retail_existing_commission_source',{p_intent:intent.id}); }
+  catch { fail('membership_commission_read_failed',503); }
+  if (!classified || classified.error || !['legacy_receipt_v1','retail_terms_v2','retail_existing_terms_v2'].includes(classified.data)) {
+    fail('membership_commission_read_failed',503);
+  }
+  if (classified.data==='legacy_receipt_v1') return null;
+  if (classified.data==='retail_existing_terms_v2') return loadExistingRetailCommissionTerms(db,intent);
   const q=await read(db,'membership_v2_sales_qualifications',
     'contract_id,contract_version,purchase_intent_id,rep_user_id,original_start_at,original_term_end_at,commission_window_end_at,qualification_closed_at',
     'purchase_intent_id',intent.id);
@@ -74,6 +84,50 @@ async function loadMembershipCommissionTerms(db,intent) {
       sales_rep_user_id:q.rep_user_id,original_qualification_closed_at:close,original_qualification_verified:true},
     ledgerFields:{membership_terms_protocol:'retail_terms_v2',membership_contract_id:contract.id,
       membership_contract_version:contract.contract_version,policy_version:'retail-terms-v2-commission-v1'},
+  };
+}
+
+async function loadExistingRetailCommissionTerms(db, supplied) {
+  const q=await read(db,'retail_existing_sales_qualifications',
+    'purchase_intent_id,agreement_id,client_id,rep_user_id,terms_digest,platform_cap_cents,payment_kind,original_start_at,original_term_end_at,commission_window_end_at,qualification_closed_at',
+    'purchase_intent_id',supplied.id);
+  if (!q) fail('membership_sales_qualification_required',409);
+  const intent=await read(db,'public_purchase_intents',
+    'id,status,protocol,agreement_id,client_id,activated_at,billing_applied_at,selected_plan_key,selected_billing_cadence,package_snapshot,expires_at,promotion_code_id,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type',
+    'id',supplied.id);
+  const agreement=await read(db,'membership_agreements',
+    'id,client_id,status,is_current,checkout_status,checkout_paid_at,signed_at,signer_accepted,membership_tier,billing_option,auto_renew,template_version,template_snapshot,agreement_expires_at,superseded_by_agreement_id',
+    'id',q.agreement_id);
+  if (!intent || !agreement || intent.status!=='completed' || !intent.billing_applied_at
+    || !Number.isFinite(Date.parse(intent.billing_applied_at)) || agreement.status!=='signed' || agreement.checkout_status!=='paid'
+    || !agreement.signed_at || !agreement.checkout_paid_at) fail('membership_sales_activation_incomplete',409);
+  if (!UUID.test(q.rep_user_id || '') || q.purchase_intent_id!==supplied.id || intent.id!==supplied.id
+    || q.agreement_id!==supplied.agreement_id || q.client_id!==supplied.client_id
+    || intent.agreement_id!==q.agreement_id || intent.client_id!==q.client_id || agreement.client_id!==q.client_id
+    || agreement.template_snapshot?.source!=='sales_assisted') fail('invalid_membership_commission_snapshot');
+  const terms=readSavedRetailCheckoutTerms({agreement,intent,deadlineMode:'stored'});
+  const offer=terms?.offer;
+  if (!offer || !isDeepStrictEqual(intent.package_snapshot,agreement.template_snapshot.package_snapshot)) fail('invalid_membership_commission_snapshot');
+  const start=canonical(q.original_start_at),end=canonical(q.original_term_end_at),close=canonical(q.qualification_closed_at);
+  let digest;
+  try { digest=await db.rpc('retail_existing_sales_terms_digest',{p_terms:offer}); }
+  catch { fail('membership_commission_read_failed',503); }
+  if (!digest || digest.error) fail('membership_commission_read_failed',503);
+  if (typeof q.terms_digest!=='string' || !/^[a-f0-9]{64}$/.test(q.terms_digest) || digest.data!==q.terms_digest
+    || start!==canonical(intent.activated_at) || start!==canonical(agreement.checkout_paid_at) || close!==start
+    || Date.parse(agreement.signed_at)>Date.parse(start) || Date.parse(intent.billing_applied_at)<Date.parse(start)
+    || end!==anchoredMonthInstant(start,offer.commitment_months)
+    || canonical(q.commission_window_end_at)!==anchoredMonthInstant(start,12)
+    || q.platform_cap_cents!==offer.platform_payment_cents
+    || q.payment_kind!==(offer.payment_option==='prepaid'?'paid_in_full':'monthly')) fail('invalid_membership_commission_snapshot');
+  return {
+    repUserId:q.rep_user_id,paymentKind:q.payment_kind,platformPaymentCents:q.platform_cap_cents,
+    qualificationClosedAt:close,firstTermStartAt:start,firstTermEndAt:end,
+    policyInput:{membership_terms_protocol:'retail_existing_terms_v2',original_membership_start_at:start,
+      original_commitment_months:offer.commitment_months,original_salesperson_user_id:q.rep_user_id,sales_rep_user_id:q.rep_user_id,
+      original_qualification_closed_at:close,original_qualification_verified:true},
+    ledgerFields:{membership_terms_protocol:'retail_existing_terms_v2',sales_qualification_id:q.purchase_intent_id,
+      membership_contract_id:null,membership_contract_version:null,policy_version:'retail-existing-terms-v2-commission-v1'},
   };
 }
 module.exports={loadMembershipCommissionTerms};

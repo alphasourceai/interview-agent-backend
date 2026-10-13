@@ -63,7 +63,7 @@ async function matchingIds(db, table, columns, ids, idColumn = 'id') {
   return rows;
 }
 
-const RECEIPT_COLUMNS = 'id,purchase_intent_id,rep_user_id,funds_received_at,payment_kind,gross_membership_cents,discount_cents,provider_fee_cents,net_membership_cents,commission_cents,membership_terms_protocol,membership_contract_id,membership_contract_version';
+const RECEIPT_COLUMNS = 'id,purchase_intent_id,rep_user_id,funds_received_at,payment_kind,gross_membership_cents,discount_cents,provider_fee_cents,net_membership_cents,commission_cents,membership_terms_protocol,membership_contract_id,membership_contract_version,sales_qualification_id';
 
 async function loadSalesPayrollReport(db, query, generatedAt = new Date().toISOString()) {
   const bounds = reportBounds(query);
@@ -83,7 +83,11 @@ async function loadSalesPayrollReport(db, query, generatedAt = new Date().toISOS
     .filter(row=>row.membership_terms_protocol==='retail_terms_v2').map(row=>row.membership_contract_id))];
   const qualifications = await matchingIds(db,'membership_v2_sales_qualifications',
     'contract_id,contract_version,purchase_intent_id,rep_user_id',v2Contracts,'contract_id');
-  return buildSalesPayrollReport({ ...bounds, representatives, receipts, adjustments, linkedReceipts, intents, qualifications, generatedAt });
+  const existingKeys=[...new Set([...receipts,...linkedReceipts]
+    .filter(row=>row.membership_terms_protocol==='retail_existing_terms_v2').map(row=>row.sales_qualification_id))];
+  const existingQualifications=await matchingIds(db,'retail_existing_sales_qualifications',
+    'purchase_intent_id,agreement_id,client_id,rep_user_id',existingKeys,'purchase_intent_id');
+  return buildSalesPayrollReport({ ...bounds, representatives, receipts, adjustments, linkedReceipts, intents, qualifications, existingQualifications, generatedAt });
 }
 
 module.exports = { loadSalesPayrollReport, reportBounds, allRows };

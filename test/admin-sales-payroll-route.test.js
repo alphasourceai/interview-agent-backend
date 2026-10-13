@@ -119,7 +119,7 @@ test('reviewing one monthly receipt stores one net payment, not twelve annualize
     sales_commission_statement_locks: null,
   };
   let inserted;
-  const db = { from(table) { return {
+  const db = { async rpc(name) { assert.equal(name,'retail_existing_commission_source');return {data:'legacy_receipt_v1',error:null}; },from(table) { return {
     select() {
       const query = { eq() { return query; }, maybeSingle: async () => ({ data: records[table], error: null }) };
       return query;

@@ -27,7 +27,10 @@ function fixture(months=3,payment='monthly_installments') {
 }
 function database(records,errors={}) {
   const reads=[],writes=[];
-  return {reads,writes,from(table) {
+  return {reads,writes,async rpc(name) {
+    assert.equal(name,'retail_existing_commission_source');
+    reads.push({rpc:name});return {data:records.membership_v2_contracts?'retail_terms_v2':'legacy_receipt_v1',error:null};
+  },from(table) {
     return {
       select(columns) {
         const filters=[];const query={eq(key,value){filters.push([key,value]);return query;},async maybeSingle(){
@@ -66,13 +69,10 @@ async function withServer(db,callback) {
   }); } finally {await new Promise(resolve=>server.close(resolve));}
 }
 
-test('terms loader proves no v2 source through BOTH source lookups before legacy fallback',async()=>{
+test('terms loader uses trusted native legacy classification without querying retired contract tables',async()=>{
   const rows=fixture();rows.membership_v2_sales_qualifications=null;rows.membership_v2_contracts=null;
   const db=database(rows);assert.equal(await loadMembershipCommissionTerms(db,rows.public_purchase_intents),null);
-  assert.deepEqual(db.reads.map(r=>[r.table,...r.filters[0]]),[
-    ['membership_v2_sales_qualifications','purchase_intent_id',ids.intent],
-    ['membership_v2_contracts','purchase_intent_id',ids.intent],['membership_v2_contracts','agreement_id',ids.agreement],
-  ]);assert.equal(db.writes.length,0);
+  assert.deepEqual(db.reads,[{rpc:'retail_existing_commission_source'}]);assert.equal(db.writes.length,0);
 });
 test('terms loader uses accepted price and immutable original qualification, not mutable cadence/owner',async()=>{
   const rows=fixture(6,'prepaid');rows.public_purchase_intents.created_by_user_id=ids.otherRep;
