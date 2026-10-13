@@ -121,6 +121,7 @@ function verifyExistingRetailFunding({offer,checkout,checkoutLines,subscription,
     checkout_session_id:checkout.id,livemode:checkout.livemode,paid_at:new Date(paid*1000).toISOString(),
     provider_period_start:period.start,provider_period_end:period.end});
   return {paidAt:new Date(paid*1000).toISOString(),invoiceId:invoice.id,paymentIntentId:paymentIntent.id,chargeId:charge.id,
+    checkoutCreatedEpoch:checkout.created,invoiceCreatedEpoch:invoice.created,
     platformGrossCents:offer.platform_payment_cents,platformDiscountCents:platformDiscount,platformNetCents:platformNet,
     roleGrossCents:offer.first_role_prepay.amount_cents,roleDiscountCents:roleDiscount,roleNetCents:roleNet,taxCents:tax,cashCents:invoice.total,initialProviderPeriod};
 }
