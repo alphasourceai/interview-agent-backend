@@ -45,6 +45,7 @@ class FakeQuery {
     this.table = table
     this.filters = []
     this.updatePayload = null
+    this.insertPayload = null
   }
 
   select() {
@@ -64,6 +65,8 @@ class FakeQuery {
     this.updatePayload = payload
     return this
   }
+  insert(payload) { this.insertPayload=payload;return this }
+  async single() { const r=await this.execute();return{data:r.data[0]||null,error:r.error} }
 
   rows() {
     if (this.table === 'clients') return this.db.clients
@@ -72,17 +75,24 @@ class FakeQuery {
   }
 
   async maybeSingle() {
+    if(this.updatePayload){const r=await this.execute();return{data:r.data[0]||null,error:r.error}}
     return { data: this.rows().find((row) => matchesFilters(row, this.filters)) || null, error: null }
   }
 
   async execute() {
+    if(this.insertPayload) {
+      assert.equal(this.table,'billing_customers');
+      if(this.db.billingCustomers.some(r=>r.stripe_customer_id===this.insertPayload.stripe_customer_id))return{data:[],error:{code:'23505'}};
+      const row={id:crypto.randomUUID(),...this.insertPayload};this.db.billingCustomers.push(row);
+      this.db.inserts.push({table:this.table,payload:this.insertPayload});return{data:[row],error:null,count:1};
+    }
     if (this.updatePayload) {
       const rows = this.rows().filter((row) => matchesFilters(row, this.filters))
       for (const row of rows) Object.assign(row, this.updatePayload)
       this.db.updates.push({ table: this.table, payload: this.updatePayload, rows })
       return { data: rows, error: null }
     }
-    return { data: this.rows().filter((row) => matchesFilters(row, this.filters)), error: null }
+    const rows=this.rows().filter((row) => matchesFilters(row, this.filters));return { data: rows,error:null,count:rows.length }
   }
 
   then(resolve, reject) {
@@ -104,7 +114,7 @@ function makeDb() {
       client_id: 'client-1',
       stripe_customer_id: 'cus_existing'
     }],
-    updates: [],
+    updates: [],inserts:[],
     attempts:new Map(),rpcCalls:[],
     // Explicit injected native boundary for JS orchestration only. These are
     // NOT SQL proofs; the disposable PostgreSQL suite exercises real RPCs.
@@ -127,7 +137,6 @@ function makeDb() {
           this.attempts.set(row.id,attempt);
           row.checkout_attempt_source=structuredClone(attempt.source);
         }
-        if (attempt.replacement_id !== args.p_replacement) return{data:null,error:{message:'retail_checkout_attempt_changed'}};
         return{data:structuredClone(attempt),error:null};
       }
       assert.equal(name,'pin_retail_existing_checkout_session');
@@ -142,7 +151,7 @@ function makeDb() {
   return db
 }
 
-function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder, customerOverride = {},db = makeDb(),sessionMutation,lineMutation }) {
+function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder, customerOverride = {},db = makeDb(),sessionMutation,lineMutation,subscriptions=[] }) {
   delete require.cache[checkoutPath]
   delete require.cache[supabaseClientPath]
   delete require.cache[clientBillingScopePath]
@@ -180,9 +189,14 @@ function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder, custom
       subscriptions: {
         list: async (payload) => {
           stripeCalls.subscriptionLists.push(payload)
-          return { data: [] }
+          return { data: subscriptions }
         }
       },
+      prices:{retrieve:async key=>{
+        const n=Number(key.replace('price_SYNTHETIC_','')),l=lastPayload.line_items[n];
+        return{object:'price',id:key,currency:'usd',unit_amount:l.price_data.unit_amount,
+          type:l.price_data.recurring?'recurring':'one_time',recurring:l.price_data.recurring?{...l.price_data.recurring,usage_type:'licensed'}:null};
+      }},
       checkout: {
         sessions: {
           create: async (payload, options) => {
@@ -570,6 +584,68 @@ test('native closed/unknown store, corrupt claim acknowledgment and a wrong sign
     if(mode==='closed')db.rpc=async()=>({data:null,error:{message:'retail_checkout_window_closed'}});
     if(mode==='corrupt')db.rpc=async(n,p)=>{const r=await original(n,p);r.data.expires_at++;return r};
     if(mode==='token')args.cancelUrl='https://qa.alphasourceai.com/membership-agreement/sign/WRONG_SYNTHETIC_TOKEN';
+    const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,db});
+    await assert.rejects(create(args));assert.equal(calls.sessions.length,0);
+  }
+});
+test('native replay retains original replacement despite a changing live subscription list',async()=>{
+  const calls=retailCalls(),db=makeDb(),args=retailArgs(retailSnapshot()),subscriptions=[{id:'sub_ORIGINAL',status:'active'}];
+  const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,db,subscriptions});
+  const first=await create(args);assert.equal(first.replacesStripeSubscriptionId,'sub_ORIGINAL');
+  args.retailAgreement.replaces_stripe_subscription_id='sub_ORIGINAL';
+  subscriptions.splice(0,subscriptions.length,{id:'sub_NEW_LIVE_SELECTION',status:'active'});
+  const retry=await create(args);assert.equal(retry.replacesStripeSubscriptionId,'sub_ORIGINAL');
+  assert.equal(calls.subscriptionLists.length,1);assert.equal(calls.sessions.length,1);
+  assert.equal(retry.checkoutMetadata.replaces_stripe_subscription_id,'sub_ORIGINAL');
+});
+test('pinned native customer ignores unrelated historic billing rows and never rewrites them on retry',async()=>{
+  const calls=retailCalls(),db=makeDb(),args=retailArgs(retailSnapshot()),{createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,db});
+  await create(args);db.billingCustomers.unshift({id:'HISTORIC_PROFILE',client_id:'client-1',stripe_customer_id:'cus_HISTORIC'});
+  const before=structuredClone(db.billingCustomers),retry=await create(args);
+  assert.equal(retry.session.customer,'cus_existing');assert.equal(calls.sessions.length,1);
+  assert.deepEqual(db.billingCustomers,before);
+});
+test('real Node microsecond parsing truncates rather than rounds into the next second',()=>{
+  for (const fraction of ['999499','999500','999999','000999']) {
+    const text=`2026-10-14T01:00:00.${fraction}Z`,ms=Date.parse(text);
+    assert.equal(ms%1000,Number(fraction.slice(0,3)));
+    assert.equal(Math.floor(ms/1000),Date.parse('2026-10-14T01:00:00Z')/1000);
+  }
+});
+test('opaque SDK price id is verified through supported price readback, not fabricated fields or required expansion',async()=>{
+  const calls=retailCalls(),args=retailArgs(retailSnapshot());
+  const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,lineMutation:ls=>{
+    for(const l of ls.data)l.price=l.price.id;return ls;
+  }});
+  const result=await create(args);assert.equal(result.retailAttemptLinked,true);assert.equal(calls.sessions.length,1);
+});
+test('new buyer creates exactly one existing billing profile before Checkout, with no Auth table, invite or historic rewrite',async()=>{
+  const calls=retailCalls(),db=makeDb(),args=retailArgs(retailSnapshot());
+  db.clients[0].stripe_customer_id=null;db.billingCustomers.splice(0);
+  const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,db});
+  const result=await create(args);assert.equal(result.session.customer,'cus_created');
+  assert.equal(db.billingCustomers.length,1);assert.equal(db.billingCustomers[0].client_id,'client-1');
+  assert.equal(db.billingCustomers[0].stripe_customer_id,'cus_created');assert.equal(db.inserts.length,1);
+  assert.equal(db.inserts[0].table,'billing_customers');assert.equal(db.clients[0].stripe_customer_id,'cus_created');
+  assert.equal(calls.sessions.length,1);
+  await create(args);assert.equal(db.billingCustomers.length,1);assert.equal(calls.sessions.length,1);
+});
+test('wrong, null or truncated global billing profile ownership is held before any payable Session',async()=>{
+  for(const mode of ['owner','null','truncated','readerror','insertfailure']){
+    const calls=retailCalls(),db=makeDb(),args=retailArgs(retailSnapshot());
+    if(mode==='owner')db.billingCustomers[0].client_id='another_client';
+    if(mode==='null')db.billingCustomers[0].client_id=null;
+    if(mode==='truncated'||mode==='readerror'||mode==='insertfailure'){
+      const original=db.from.bind(db);
+      if(mode==='insertfailure')db.billingCustomers.splice(0);
+      db.from=table=>{const q=original(table),exec=q.execute.bind(q);q.execute=async()=>{
+        const r=await exec();if(table==='billing_customers'&&q.filters.some(f=>f.column==='stripe_customer_id')){
+          if(mode==='truncated')r.count=2;if(mode==='readerror')r.error={message:'SYNTHETIC read unavailable'};
+        }
+        if(table==='billing_customers'&&q.insertPayload&&mode==='insertfailure')return{data:[],error:{code:'XX000'}};
+        return r;
+      };return q;};
+    }
     const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,db});
     await assert.rejects(create(args));assert.equal(calls.sessions.length,0);
   }

@@ -14,7 +14,7 @@ const { enterpriseSettingsMetadata, validateEnterpriseSettings } = require('./en
 const { readRetailPackageOffer } = require('./membershipPackageCompatibility')
 const { isDeepStrictEqual } = require('node:util')
 const { claimExistingRetailAttempt, assertWindow, frozenRetailCancelUrl, readOpenRetailSession,
-  pinExistingRetailSession } = require('./existingRetailCheckoutAttempt')
+  pinExistingRetailSession,ensureRetailBillingProfile } = require('./existingRetailCheckoutAttempt')
 
 function makeError(status, code, detail) {
   const err = new Error(detail || code || 'checkout_failed')
@@ -212,10 +212,10 @@ async function resolveStripeCustomerId({
   if (fallbackCustomerId && !candidateStripeCustomerIds.includes(fallbackCustomerId)) {
     candidateStripeCustomerIds.push(fallbackCustomerId)
   }
-  if (pinnedCustomerId && (fallbackCustomerId !== pinnedCustomerId
-    || candidateStripeCustomerIds.some(id => id !== pinnedCustomerId))) {
+  if (pinnedCustomerId && fallbackCustomerId !== pinnedCustomerId) {
     throw makeError(409, 'retail_checkout_customer_changed', 'The original checkout customer needs review.')
   }
+  if (pinnedCustomerId) candidateStripeCustomerIds.splice(0,candidateStripeCustomerIds.length,pinnedCustomerId)
 
   let resolvedStripeCustomerId = null
   for (const candidateId of candidateStripeCustomerIds) {
@@ -414,7 +414,7 @@ async function createSubscriptionCheckoutSession({
     }
   }
 
-  if (billingCustomer?.id && String(billingCustomer?.stripe_customer_id || '').trim() !== resolvedStripeCustomerId) {
+  if (!retailOffer && billingCustomer?.id && String(billingCustomer?.stripe_customer_id || '').trim() !== resolvedStripeCustomerId) {
     try {
       await supabaseAdmin
         .from('billing_customers')
@@ -425,7 +425,11 @@ async function createSubscriptionCheckoutSession({
 
   let replacesStripeSubscriptionId = null
   let replacementMetadata = null
-  if (['admin_subscription_checkout', 'agreement_checkout'].includes(normalizedMetadataSource)) {
+  if (retailOffer && retailAgreement.checkout_attempt_source) {
+    // Native replay returns the original replacement even if subscriptions
+    // have appeared/disappeared. Do not turn a retry into a new live selection.
+    replacesStripeSubscriptionId = retailAgreement.replaces_stripe_subscription_id || null
+  } else if (['admin_subscription_checkout', 'agreement_checkout'].includes(normalizedMetadataSource)) {
     const existingSubscriptions = await stripe.subscriptions.list({
       customer: resolvedStripeCustomerId,
       status: 'all',
@@ -450,6 +454,7 @@ async function createSubscriptionCheckoutSession({
 
   let retailAttempt = null
   if (retailOffer) {
+    await ensureRetailBillingProfile({db:supabaseAdmin,client,customerId:resolvedStripeCustomerId})
     const signBase = buildMembershipAgreementSignUrl('').replace(/\/membership-agreement\/sign\/$/, '')
     retailAttempt = await claimExistingRetailAttempt({ db:supabaseAdmin, agreement:retailAgreement,
       customerId:resolvedStripeCustomerId, embedded:embeddedCheckoutRequested, replacementId:replacesStripeSubscriptionId,

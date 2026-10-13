@@ -28,6 +28,33 @@ async function rpc(db, name, args) {
   check(result?.data && !Array.isArray(result.data), 'retail_checkout_store_unavailable', 503);
   return result.data;
 }
+async function ensureRetailBillingProfile({ db, client, customerId }) {
+  check(typeof client?.id === 'string' && client.id && /^cus_[A-Za-z0-9_]+$/.test(customerId || ''),
+    'retail_billing_profile_source_required');
+  const read = async () => {
+    let r;try { r = await db.from('billing_customers').select('id,client_id,stripe_customer_id',{count:'exact'})
+      .eq('stripe_customer_id',customerId); }catch (_) { fail('retail_billing_profile_unavailable',503); }
+    check(r && !r.error && Array.isArray(r.data) && integer(r.count) && r.data.length === r.count,
+      'retail_billing_profile_unavailable',503);
+    check(r.count <= 1,'retail_billing_profile_owner_mismatch');
+    if (r.count === 1) check(typeof r.data[0].id === 'string' && r.data[0].id
+      && r.data[0].client_id === client.id && r.data[0].stripe_customer_id === customerId,
+    'retail_billing_profile_owner_mismatch');
+    return r.data[0] || null;
+  };
+  const existing = await read();if (existing) return existing;
+  const name = typeof client.name === 'string' ? client.name.trim() : '';
+  const email = typeof client.email === 'string' ? client.email.trim().toLowerCase() : '';
+  check(name && email,'retail_billing_profile_contact_required');
+  const payload = { client_id:client.id,name,primary_contact_name:typeof client.client_admin_name === 'string'
+    ? client.client_admin_name.trim() || null : null,primary_contact_email:email,stripe_customer_id:customerId };
+  let result;try { result = await db.from('billing_customers').insert(payload).select('id,client_id,stripe_customer_id').single(); }
+  catch (_) { fail('retail_billing_profile_unavailable',503); }
+  if (result?.error && result.error.code !== '23505') fail('retail_billing_profile_unavailable',503);
+  // Success and concurrent unique-index loser BOTH read the same global owner.
+  // Never upsert over the partial unique index or overwrite historic profiles.
+  const saved = await read();check(saved,'retail_billing_profile_unavailable',503);return saved;
+}
 function assertAttempt(attempt, { agreement, customerId }) {
   check(attempt?.agreement_id === agreement.id && attempt.client_id === agreement.client_id
     && attempt.source?.version === 'retail_existing_checkout_attempt_v1'
@@ -93,6 +120,16 @@ async function readOpenRetailSession({ stripe, sessionId, attempt, offer, metada
   const lines = await collect(after => stripe.checkout.sessions.listLineItems(sessionId,
     { limit: 100, ...(after ? { starting_after: after } : {}) }), async () => assertWindow(attempt));
   const data = lines.data;
+  // API/SDK16 line-item price is normally an object (not an expandable id).
+  // If a read genuinely supplies only an id, authenticate its actual Price
+  // through the existing SDK rather than inventing fields or changing params.
+  for (const line of data) if (typeof line.price === 'string') {
+    const priceId = line.price;check(/^price_[A-Za-z0-9_]+$/.test(priceId), 'retail_checkout_session_prices_mismatch');
+    check(typeof stripe.prices?.retrieve === 'function','retail_checkout_prices_unavailable',503);
+    assertWindow(attempt);const price = await stripe.prices.retrieve(priceId);
+    check(price?.id === priceId && price.object === 'price', 'retail_checkout_session_prices_mismatch');
+    line.price = price;
+  }
   check(data.length === (offer.first_role_prepay.selected ? 2 : 1)
     && data.every(l => l.quantity === 1 && l.currency === 'usd' && integer(l.amount_subtotal)
       && l.amount_subtotal === l.price?.unit_amount)
@@ -121,4 +158,4 @@ async function pinExistingRetailSession({ db, agreement, customerId, attempt, se
   return actual;
 }
 module.exports = { claimExistingRetailAttempt, assertAttempt, assertWindow, frozenRetailCancelUrl,
-  readOpenRetailSession, pinExistingRetailSession };
+  readOpenRetailSession, pinExistingRetailSession,ensureRetailBillingProfile };

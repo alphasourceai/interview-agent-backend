@@ -225,8 +225,7 @@ begin
     if expiry-clock_timestamp()<interval '30 minutes' then raise exception 'retail_checkout_window_closed';end if;
   else
     if a.checkout_attempt_source-'config' is distinct from material or a.checkout_embedded is null
-      or not coalesce(isfinite(a.checkout_created_at),false) or a.checkout_created_at>clock
-      or a.replaces_stripe_subscription_id is distinct from p_replacement then
+      or not coalesce(isfinite(a.checkout_created_at),false) or a.checkout_created_at>clock then
       raise exception 'retail_checkout_attempt_changed';
     end if;
     expiry:=least(a.agreement_expires_at,case when had_intent then i.expires_at end,a.checkout_created_at+interval '24 hours'-interval '1 second');

@@ -42,6 +42,12 @@ before(() => {
   const source = fs.readFileSync(path.join(root, '20261012230107_retail_existing_flow_pricing_terms.sql'), 'utf8');
   sql(source.slice(source.indexOf('create or replace function public.retail_existing_month_anchor'),
     source.indexOf('-- Assert known CHECK source')));
+  // Existing QA-derived billing profile shape, not an Auth/billing-owner store.
+  sql(`create table billing_customers(id uuid primary key default gen_random_uuid(),client_id uuid references clients(id) on delete set null,
+    name text not null,primary_contact_name text,primary_contact_email text not null,notes text,stripe_customer_id text,
+    created_at timestamptz not null default now(),updated_at timestamptz not null default now());
+    create unique index billing_customers_stripe_customer_id_uniq on billing_customers(stripe_customer_id) where stripe_customer_id is not null;
+    alter table billing_customers enable row level security;grant all on billing_customers to anon,authenticated,service_role;`);
   // Fixture-only pre-existing non-service writer, constrained by native RLS.
   // Capture these grants before the migration, which must not broaden them.
   sql(`create role synthetic_legacy_writer;
@@ -144,7 +150,8 @@ test('attempt fields/commercial source and first linked Session cannot be moved;
     "replaces_stripe_subscription_id='sub_OTHER'", "membership_tier='pro'", "template_snapshot=template_snapshot||'{\"extra\":1}'"]) {
     denied(`set role service_role;update membership_agreements set ${patch} where id='${r.id}';`, /immutable/);
   }
-  denied(`set role service_role;${claim(r)}`, /retail_checkout_attempt_changed/);
+  assert.equal(claimed(r).replacement_id,'sub_ORIGINAL');
+  assert.equal(claimed(r,{replacement:'sub_NEW_LIVE_SELECTION'}).replacement_id,'sub_ORIGINAL');
   sql(`set role service_role;update membership_agreements set checkout_session_id='cs_PINNED',checkout_status='pending_payment' where id='${r.id}';`);
   denied(`set role service_role;update membership_agreements set checkout_session_id='cs_OTHER' where id='${r.id}';`, /session_immutable/);
   sql(`set role service_role;update membership_agreements set checkout_status='paid',checkout_paid_at=clock_timestamp(),
@@ -321,6 +328,17 @@ test('native early linked expiry refuses a request even if the signed agreement 
   sql(`update public_purchase_intents set expires_at=clock_timestamp()+interval '29 minutes' where id='${r.intent}';`);
   const before=row(r);denied(`set role service_role;${claim(r)}`,/window_closed/);assert.deepEqual(row(r),before);
 });
+test('native microsecond deadline epoch and actual Node window recomputation agree at fractional rounding boundaries', opts, () => {
+  const {assertWindow}=require('../src/services/existingRetailCheckoutAttempt');
+  for(const fraction of ['999499','999500','999999','000999']) {
+    const r=fixture({source:'sales_assisted'});
+    sql(`update public_purchase_intents set expires_at=date_trunc('hour',clock_timestamp())+interval '2 hours'+interval '0.${fraction} seconds' where id='${r.intent}';`);
+    const attempt=claimed(r);
+    assert.equal(Date.parse(attempt.source.intent.expires_at)%1000,Number(fraction.slice(0,3)));
+    assert.doesNotThrow(()=>assertWindow(attempt));
+    assert.equal(attempt.expires_at,Math.floor(Date.parse(attempt.source.intent.expires_at)/1000));
+  }
+});
 test('native non-service writer cannot invent first Session; existing service-only definer completion bookkeeping remains compatible', opts, () => {
   const r=fixture();claimed(r);
   // Fixture-only authorization for this one row, not a product policy change.
@@ -354,14 +372,16 @@ test('actual existing Checkout service executes real native claim/pin and retrie
   try {
     for(const source of ['admin','sales_assisted']) {
       const r=fixture({source,plan:'pro',months:6,payment:'monthly_installments',role:true});
+      const nativeCustomerId=`cus_NATIVE_BRIDGE_${source.toUpperCase()}`;
       sql(`update membership_agreements set signer_token_hash='${crypto.createHash('sha256').update(token).digest('hex')}' where id='${r.id}';`);
+      sql(`update clients set stripe_customer_id=${lit(nativeCustomerId)} where id='${r.client}';`);
       let payload,session,creates=0;const sdk={
         customers:{retrieve:async id=>({object:'customer',id,discount:null,balance:0}),update:async id=>({id})},
         subscriptions:{list:async()=>({data:[],has_more:false})},
         checkout:{sessions:{create:async p=>{
           creates++;payload=structuredClone(p);const total=p.line_items.reduce((a,l)=>a+l.price_data.unit_amount,0);
           session={object:'checkout.session',id:'cs_NATIVE_BRIDGE',mode:'subscription',status:'open',payment_status:'unpaid',
-            customer,currency:'usd',livemode:false,subscription:null,ui_mode:'hosted',expires_at:p.expires_at,metadata:p.metadata,
+            customer:nativeCustomerId,currency:'usd',livemode:false,subscription:null,ui_mode:'hosted',expires_at:p.expires_at,metadata:p.metadata,
             amount_subtotal:total,amount_total:total,url:'https://checkout.stripe.test/NATIVE_BRIDGE',
             success_url:p.success_url,cancel_url:p.cancel_url,allow_promotion_codes:p.allow_promotion_codes,
             total_details:{amount_discount:0,amount_tax:0,amount_shipping:0}};return session;
@@ -371,9 +391,15 @@ test('actual existing Checkout service executes real native claim/pin and retrie
             currency:'usd',unit_amount:l.price_data.unit_amount,type:l.price_data.recurring?'recurring':'one_time',
             recurring:l.price_data.recurring?{...l.price_data.recurring,usage_type:'licensed'}:null}}))})}}
       };
-      const db={from(table){return{select(){return this},eq(_k,value){this.value=value;return this},order(){return this},
-        async maybeSingle(){assert.equal(table,'clients');return{data:JSON.parse(sql(`select to_jsonb(t) from clients t where id=${lit(this.value)};`)),error:null};},
-        then(resolve,reject){assert.equal(table,'billing_customers');return Promise.resolve({data:[{id:'SYNTHETIC_BILLING',stripe_customer_id:customer}],error:null}).then(resolve,reject)}
+      const db={from(table){return{filters:[],select(){return this},eq(k,value){this.filters.push([k,value]);return this},order(){return this},
+        insert(payload){this.payload=payload;return this},
+        where(){return this.filters.length?'where '+this.filters.map(([k,v])=>`${k}=${lit(v)}`).join(' and '):''},
+        async maybeSingle(){assert.equal(table,'clients');return{data:JSON.parse(sql(`set role service_role;select to_jsonb(t) from clients t ${this.where()};`)),error:null};},
+        async single(){assert.equal(table,'billing_customers');const keys=Object.keys(this.payload);
+          const result=run(`set role service_role;insert into billing_customers(${keys.join(',')}) values(${keys.map(k=>lit(this.payload[k])).join(',')}) returning jsonb_build_object('id',id,'client_id',client_id,'stripe_customer_id',stripe_customer_id);`);
+          return result.status===0?{data:JSON.parse(result.stdout.trim()),error:null}:{data:null,error:{code:/unique constraint/.test(result.stderr)?'23505':'XX000'}};},
+        then(resolve,reject){assert.equal(table,'billing_customers');const rows=JSON.parse(sql(`set role service_role;select coalesce(jsonb_agg(to_jsonb(t)),'[]') from billing_customers t ${this.where()};`));
+          return Promise.resolve({data:rows,error:null,count:rows.length}).then(resolve,reject)}
       }},async rpc(name,args){
         assert.ok(['claim_retail_existing_checkout_attempt','pin_retail_existing_checkout_session'].includes(name));
         const values=name==='claim_retail_existing_checkout_attempt'
@@ -392,6 +418,7 @@ test('actual existing Checkout service executes real native claim/pin and retrie
         idempotencyKey:`agreement_checkout:${r.id}:pro:monthly`,retailAgreement:row(r),
         cancelUrl:`${config.public_sign_base}/membership-agreement/sign/${token}`};
       const first=await create(args),b=row(r).checkout_created_at;
+      assert.equal(sql(`select count(*) from billing_customers where client_id='${r.client}' and stripe_customer_id=${lit(nativeCustomerId)};`),'1');
       assert.equal(first.retailAttemptLinked,true);assert.equal(row(r).checkout_session_id,'cs_NATIVE_BRIDGE');
       if(source==='sales_assisted')assert.equal(sql(`select stripe_checkout_session_id from public_purchase_intents where id='${r.intent}';`),'cs_NATIVE_BRIDGE');
       const second=await create({...args,retailAgreement:row(r),embedded:true,
@@ -400,4 +427,46 @@ test('actual existing Checkout service executes real native claim/pin and retrie
       assert.equal(second.checkoutClientSecret,null);
     }
   } finally { for(const p of paths){const original=saved.get(p);if(original)require.cache[p]=original;else delete require.cache[p];} }
+});
+function nativeProfileDb(barrier) {
+  let first=true;
+  return{from(table){assert.equal(table,'billing_customers');return{
+    select(){return this},eq(k,value){assert.equal(k,'stripe_customer_id');this.customer=value;return this},
+    insert(payload){this.payload=payload;return this},
+    async single(){const keys=Object.keys(this.payload),out=await parallel(`set role service_role;begin;
+      insert into billing_customers(${keys.join(',')}) values(${keys.map(k=>lit(this.payload[k])).join(',')})
+      returning jsonb_build_object('id',id,'client_id',client_id,'stripe_customer_id',stripe_customer_id);
+      select pg_sleep(0.1);commit;`);
+      return out.code===0?{data:JSON.parse(out.out.split('\n').find(l=>l.startsWith('{'))),error:null}
+        :{data:null,error:{code:/unique constraint/.test(out.err)?'23505':'XX000'}};},
+    then(resolve,reject){return Promise.resolve().then(async()=>{
+      const data=JSON.parse(sql(`set role service_role;select coalesce(jsonb_agg(to_jsonb(t)),'[]') from billing_customers t where stripe_customer_id=${lit(this.customer)};`));
+      if(first&&barrier){first=false;assert.equal(data.length,0);await barrier();}
+      return{data,count:data.length,error:null};
+    }).then(resolve,reject);}
+  }}};
+}
+test('real concurrent existing profile insertion has one global customer winner; both helpers read same native owner without Auth', opts, async()=>{
+  const {ensureRetailBillingProfile}=require('../src/services/existingRetailCheckoutAttempt');
+  const r=fixture(),cust='cus_NATIVE_PROFILE_RACE';
+  sql(`update clients set stripe_customer_id='${cust}' where id='${r.client}';`);
+  const client=JSON.parse(sql(`select to_jsonb(t) from clients t where id='${r.client}';`));
+  let arrivals=0,release;const waiting=new Promise(resolve=>release=resolve);
+  const barrier=async()=>{if(++arrivals===2)release();await waiting;};
+  const results=await Promise.all([1,2].map(()=>ensureRetailBillingProfile({db:nativeProfileDb(barrier),client,customerId:cust})));
+  assert.equal(results[0].id,results[1].id);assert.equal(results[0].client_id,r.client);
+  assert.equal(sql(`select count(*) from billing_customers where stripe_customer_id='${cust}';`),'1');
+  assert.equal(sql(`select to_regclass('auth.users') is null;`),'t');
+});
+test('real global customer profile ownership and browser RLS deny another client without mutating historic profiles', opts, async()=>{
+  const {ensureRetailBillingProfile}=require('../src/services/existingRetailCheckoutAttempt');
+  const a=fixture(),b=fixture(),cust='cus_NATIVE_PROFILE_OWNER';
+  sql(`update clients set stripe_customer_id='${cust}' where id in('${a.client}','${b.client}');`);
+  const client=rid=>JSON.parse(sql(`select to_jsonb(t) from clients t where id='${rid}';`));
+  await ensureRetailBillingProfile({db:nativeProfileDb(),client:client(a.client),customerId:cust});
+  const before=sql(`select to_jsonb(t) from billing_customers t where stripe_customer_id='${cust}';`);
+  await assert.rejects(ensureRetailBillingProfile({db:nativeProfileDb(),client:client(b.client),customerId:cust}),{code:'retail_billing_profile_owner_mismatch'});
+  assert.equal(sql(`select to_jsonb(t) from billing_customers t where stripe_customer_id='${cust}';`),before);
+  for(const role of ['anon','authenticated'])denied(`set role ${role};insert into billing_customers(client_id,name,primary_contact_email,stripe_customer_id)
+    values('${b.client}','SYNTHETIC','owner@example.invalid','cus_BROWSER_FORGED');`,/row-level security/);
 });

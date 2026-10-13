@@ -125,10 +125,11 @@ async function readExistingRetailCheckoutFunding({db,stripe,agreementId,intentId
   check(agreement.client_id && (!linked || agreement.client_id===intent.client_id),'retail_funding_client_mismatch');
   const {data:client,error:cError}=await db.from('clients').select('id,stripe_customer_id,stripe_subscription_id').eq('id',agreement.client_id).maybeSingle();
   if(cError)throw new Error(cError.message||'retail_funding_client_read_failed');
-  const {data:customers,error:bError,count:bCount}=await db.from('billing_customers').select('id,stripe_customer_id',{count:'exact'}).eq('client_id',agreement.client_id);
+  const {data:customers,error:bError,count:bCount}=await db.from('billing_customers').select('id,client_id,stripe_customer_id',{count:'exact'})
+    .eq('client_id',agreement.client_id).eq('stripe_customer_id',client?.stripe_customer_id || '');
   if(bError)throw new Error(bError.message||'retail_funding_customer_read_failed');
   check(typeof client?.stripe_customer_id==='string' && client.stripe_customer_id.startsWith('cus_') && Array.isArray(customers)
-    && customers.length>0 && customers.length===bCount && customers.every(c=>c.stripe_customer_id===client.stripe_customer_id),'retail_funding_customer_mismatch');
+    && customers.length===1 && bCount===1 && customers.every(c=>c.client_id===agreement.client_id && c.stripe_customer_id===client.stripe_customer_id),'retail_funding_customer_mismatch');
   const expected={checkoutId,customerId:client.stripe_customer_id,signedAt:agreement.signed_at,
     agreementDeadline:agreement.agreement_expires_at,intentDeadline:intent?.expires_at};
   const source={agreementId,clientId:agreement.client_id,packageSnapshot:structuredClone(terms.packageSnapshot),
@@ -188,10 +189,11 @@ async function assertExistingRetailFundingSource({db,funding}) {
     && (!a.checkout_paid_at || new Date(a.checkout_paid_at).toISOString()===funding.paidAt),'retail_funding_source_changed');
   const {data:c,error:ce}=await db.from('clients').select('id,stripe_customer_id,stripe_subscription_id').eq('id',funding.clientId).maybeSingle();
   if(ce)throw new Error(ce.message||'retail_funding_client_read_failed');
-  const {data:customers,error:be,count:bCount}=await db.from('billing_customers').select('id,stripe_customer_id',{count:'exact'}).eq('client_id',funding.clientId);
+  const {data:customers,error:be,count:bCount}=await db.from('billing_customers').select('id,client_id,stripe_customer_id',{count:'exact'})
+    .eq('client_id',funding.clientId).eq('stripe_customer_id',funding.customerId);
   if(be)throw new Error(be.message||'retail_funding_customer_read_failed');
-  check(c?.stripe_customer_id===funding.customerId && Array.isArray(customers) && customers.length>0 && customers.length===bCount
-    && customers.every(b=>b.stripe_customer_id===funding.customerId)
+  check(c?.stripe_customer_id===funding.customerId && Array.isArray(customers) && customers.length===1 && bCount===1
+    && customers.every(b=>b.client_id===funding.clientId && b.stripe_customer_id===funding.customerId)
     && (!funding.replay || funding.sourceIntentId || c.stripe_subscription_id===funding.subscription.id),'retail_funding_source_changed');
 }
 module.exports={readExistingRetailCheckoutFunding,verifyExistingRetailFunding,collect,assertExistingRetailFundingSource};

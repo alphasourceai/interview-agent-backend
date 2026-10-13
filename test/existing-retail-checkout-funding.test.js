@@ -71,7 +71,7 @@ test('identity, funding, tax, discounts, deadlines and truncation mutations all 
     f=>f.inv.total_discount_amounts=null,f=>f.il[0].discount_amounts=null,f=>f.il[0].tax_amounts=null,
     f=>f.inv.total_tax_amounts=[{amount:1,inclusive:true,tax_rate:'txr_QA'}],f=>f.inv.payment_intent=null,
     f=>f.inv.charge=null,f=>f.ch.disputed=true,f=>f.ch.refunded=true,f=>f.ch.amount_refunded=1,
-    f=>f.tables.billing_customers.push({id:'other',client_id:C,stripe_customer_id:'cus_OTHER'}),f=>f.i.stripe_checkout_session_id='cs_OTHER',
+    f=>f.tables.billing_customers.push({id:'other',client_id:C,stripe_customer_id:'cus_SYNTHETIC'}),f=>f.i.stripe_checkout_session_id='cs_OTHER',
     f=>f.sdk.subscriptionItems.list=async()=>({object:'list',data:[],has_more:true}),f=>f.sdk.charges.retrieve=async()=>{throw Error('synthetic provider unavailable')},
     f=>f.options.assertFence=async()=>{throw Error('synthetic fence lost')}];
   for(const mutate of mutations){const f=fixture();mutate(f);await assert.rejects(read(f.options),e=>
@@ -93,9 +93,24 @@ test('source reread rejects commercial, session or customer changes during readb
     const f=fixture(),r=await read(f.options);mutate(f);await assert.rejects(current({db:f.db,funding:r}));
   }
 });
-test('truncated billing-customer reads cannot hide a conflicting customer beyond the REST row cap',async()=>{
-  const f=fixture();f.tables.billing_customers.push({id:'hidden',client_id:C,stripe_customer_id:'cus_OTHER'});
+test('truncated matching billing-customer reads cannot hide an ambiguous current customer beyond the REST row cap',async()=>{
+  const f=fixture();f.tables.billing_customers.push({id:'hidden',client_id:C,stripe_customer_id:'cus_SYNTHETIC'});
   f.options.db=createFakeSupabase(f.tables,{maxRows:1});
   await assert.rejects(read(f.options),{code:'retail_funding_customer_mismatch'});
+});
+test('actual paid cash proof accepts current profile alongside historical profiles without rewriting them',async()=>{
+  const f=fixture();f.tables.billing_customers.push({id:'HISTORICAL',client_id:C,stripe_customer_id:'cus_OLD'});
+  const before=structuredClone(f.tables.billing_customers),result=await read(f.options);
+  assert.equal(result.paidAt,PAID);await current({db:f.db,funding:result});assert.deepEqual(f.tables.billing_customers,before);
+});
+test('funding current-profile correspondence holds for absent, duplicate, another owner and changed customer',async()=>{
+  for(const kind of ['absent','duplicate','owner','customer']) {
+    const f=fixture();
+    if(kind==='absent')f.tables.billing_customers.splice(0);
+    if(kind==='duplicate')f.tables.billing_customers.push({...f.tables.billing_customers[0],id:'DUPLICATE'});
+    if(kind==='owner')f.tables.billing_customers[0].client_id='OTHER';
+    if(kind==='customer')f.tables.billing_customers[0].stripe_customer_id='cus_OTHER';
+    await assert.rejects(read(f.options),{code:'retail_funding_customer_mismatch'});
+  }
 });
 module.exports={fixture,PAID};
