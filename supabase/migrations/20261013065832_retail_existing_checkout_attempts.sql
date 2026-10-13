@@ -129,10 +129,12 @@ begin
   elsif new.checkout_attempt_source is not null then
     -- A direct table write cannot inject invented request facts or a clock.
     -- The same native derivation applies even outside the dedicated RPC.
+    if current_user<>'service_role' then raise exception 'retail_checkout_claim_denied';end if;
     clock:=date_trunc('milliseconds',clock_timestamp());config:=new.checkout_attempt_source->'config';
-    if current_user<>'service_role' or old.checkout_created_at is not null or old.checkout_session_id is not null
+    if old.checkout_created_at is not null or old.checkout_session_id is not null
       or old.status is distinct from 'signed' or old.is_current is distinct from true
-      or old.superseded_by_agreement_id is not null or old.checkout_status='paid' or old.checkout_paid_at is not null
+      or old.superseded_by_agreement_id is not null
+      or (old.checkout_status is not null and old.checkout_status<>'pending_payment') or old.checkout_paid_at is not null
       or not coalesce(isfinite(old.signed_at),false) or old.signed_at>clock
       or not coalesce(isfinite(old.agreement_expires_at),false) or old.agreement_expires_at-clock<interval '30 minutes'
       or new.checkout_embedded is null or not public.retail_existing_checkout_config_valid(config)
@@ -149,7 +151,8 @@ begin
     exception when no_data_found then i:=null;
       when too_many_rows then raise exception 'retail_checkout_intent_ambiguous';end;
     if c is null or c->>'parent_client_id' is not null or c->>'archived_at' is not null
-      or (i is not null and (i->>'stripe_checkout_session_id' is not null or i->>'status' in('completed','canceled')
+      or (i is not null and (i->>'stripe_checkout_session_id' is not null
+        or coalesce(i->>'status','') not in('agreement_pending','checkout_pending')
         or i->>'canceled_at' is not null or not coalesce(isfinite((i->>'expires_at')::timestamptz),false)
         or (i->>'expires_at')::timestamptz<=clock)) then raise exception 'retail_checkout_claim_denied';end if;
     material:=public.retail_existing_checkout_material(to_jsonb(old),i,c->>'stripe_customer_id');
@@ -182,7 +185,7 @@ begin
   select * into a from public.membership_agreements where id=p_agreement for update;
   if not found or a.client_id is distinct from p_client or a.template_snapshot is distinct from p_expected_template
     or a.status is distinct from 'signed' or a.is_current is distinct from true or a.superseded_by_agreement_id is not null
-    or a.checkout_status='paid' or a.checkout_paid_at is not null or p_embedded is null
+    or (a.checkout_status is not null and a.checkout_status<>'pending_payment') or a.checkout_paid_at is not null or p_embedded is null
     or not public.retail_existing_checkout_config_valid(p_config)
     or (p_replacement is not null and p_replacement !~ '^sub_[A-Za-z0-9_]+$') then
     raise exception 'retail_checkout_claim_denied';
@@ -190,7 +193,7 @@ begin
   clock:=date_trunc('milliseconds',clock_timestamp());
   if not coalesce(isfinite(a.signed_at),false) or a.signed_at>clock
     or not coalesce(isfinite(a.agreement_expires_at),false) or a.agreement_expires_at<=clock
-    or (had_intent and (i.status in('completed','canceled') or i.canceled_at is not null
+    or (had_intent and (coalesce(i.status,'') not in('agreement_pending','checkout_pending') or i.canceled_at is not null
       or not coalesce(isfinite(i.expires_at),false) or i.expires_at<=clock)) then
     raise exception 'retail_checkout_claim_denied';
   end if;

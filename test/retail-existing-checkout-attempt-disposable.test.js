@@ -29,7 +29,8 @@ before(() => {
     alter table membership_agreements add column membership_tier text,add column billing_option text,
       add column auto_renew boolean,add column signer_accepted boolean,add column template_version text,
       add column template_snapshot jsonb,add column signed_at timestamptz,add column agreement_expires_at timestamptz,
-      add column checkout_created_at timestamptz,add column replaces_stripe_subscription_id text,add column signer_token_hash text;
+      add column checkout_created_at timestamptz,add column replaces_stripe_subscription_id text,add column signer_token_hash text,
+      add column replacement_policy text,add column replacement_error text;
     alter table public_purchase_intents add column protocol text,add column expires_at timestamptz,add column promotion_code_id text;
     grant usage on schema public to service_role;
     grant select,insert,update,delete on clients,membership_agreements,public_purchase_intents to service_role;
@@ -41,6 +42,15 @@ before(() => {
   const source = fs.readFileSync(path.join(root, '20261012230107_retail_existing_flow_pricing_terms.sql'), 'utf8');
   sql(source.slice(source.indexOf('create or replace function public.retail_existing_month_anchor'),
     source.indexOf('-- Assert known CHECK source')));
+  // Fixture-only pre-existing non-service writer, constrained by native RLS.
+  // Capture these grants before the migration, which must not broaden them.
+  sql(`create role synthetic_legacy_writer;
+    grant usage on schema public to synthetic_legacy_writer;
+    grant select,update on membership_agreements to synthetic_legacy_writer;
+    create policy synthetic_legacy_select on membership_agreements for select to synthetic_legacy_writer
+      using(id='${legacy}'::uuid);
+    create policy synthetic_legacy_update on membership_agreements for update to synthetic_legacy_writer
+      using(id='${legacy}'::uuid) with check(id='${legacy}'::uuid);`);
   baseline = sql(`select to_jsonb(t) from membership_agreements t where id='${legacy}';`);
   permissions = acl(); apply();
 });
@@ -202,4 +212,97 @@ test('ambiguous native intent association is refused before a clock or transport
   sql(`insert into public_purchase_intents(id,agreement_id,client_id,status,protocol,expires_at)
     values('${crypto.randomUUID()}','${r.id}','${r.client}','checkout_pending','fenced_v2',clock_timestamp()+interval '7 days');`);
   const before = row(r);denied(`set role service_role;${claim(r)}`, /intent_ambiguous/);assert.deepEqual(row(r), before);
+});
+test('native open-status allowlists refuse NULL, unknown and terminal intent statuses and unknown agreement Checkout statuses', opts, () => {
+  const nullRow = fixture({ source: 'sales_assisted' });
+  denied(`update public_purchase_intents set status=null where id='${nullRow.intent}';`, /not-null constraint/);
+  // NULL is natively impossible on this baseline; test the real constraint
+  // rather than weakening it for an invented admissible row.
+  for (const status of ['failed', 'expired', 'completed', 'canceled', 'unexpected_status']) {
+    const r = fixture({ source: 'sales_assisted' });sql(`update public_purchase_intents set status=${lit(status)} where id='${r.intent}';`);
+    const before = row(r);denied(`set role service_role;${claim(r)}`, /claim_denied/);assert.deepEqual(row(r), before);
+  }
+  for (const status of ['failed', 'unknown', 'expired']) {
+    const r = fixture();sql(`update membership_agreements set checkout_status=${lit(status)} where id='${r.id}';`);
+    const before = row(r);denied(`set role service_role;${claim(r)}`, /claim_denied/);assert.deepEqual(row(r), before);
+  }
+  const r = fixture({ source: 'sales_assisted' });sql(`update public_purchase_intents set status='agreement_pending' where id='${r.intent}';`);
+  assert.equal(claimed(r).agreement_id, r.id);
+});
+test('pre-existing non-service legacy writer retains native RLS-constrained DML without trigger EXECUTE; claims remain denied', opts, () => {
+  assert.equal(sql(`select has_function_privilege('synthetic_legacy_writer','retail_existing_checkout_attempt_guard()','EXECUTE');`), 'f');
+  sql(`set role synthetic_legacy_writer;begin;update membership_agreements set updated_at=clock_timestamp() where id='${legacy}';rollback;`);
+  denied(`set role synthetic_legacy_writer;update membership_agreements set checkout_embedded=false,
+    checkout_attempt_source='{}'::jsonb where id='${legacy}';`, /claim_denied/);
+  assert.equal(sql(`select to_jsonb(t)-'checkout_embedded'-'checkout_attempt_source' from membership_agreements t where id='${legacy}';`), baseline);
+  assert.equal(acl(), permissions);
+});
+
+const pinMigration = '20261013075424_retail_existing_checkout_session_pin.sql';
+const pin = (r, attempt, session) => `select pin_retail_existing_checkout_session(${[r.id, r.client, attempt, session].map(lit).join(',')});`;
+test('native Session pin writes both existing links atomically, replays same identity and never moves first request clock', opts, () => {
+  sql(fs.readFileSync(path.join(root, pinMigration), 'utf8'));
+  for (const source of ['admin', 'sales_assisted', 'public_purchase_intent']) {
+    const r = fixture({ source }), attempt = claimed(r, { replacement: 'sub_ORIGINAL' });
+    const result = JSON.parse(sql(`set role service_role;${pin(r, attempt, 'cs_PINNED')}`));
+    assert.deepEqual(result, { ...attempt, checkout_session_id: 'cs_PINNED' });
+    assert.deepEqual(JSON.parse(sql(`set role service_role;${pin(r, attempt, 'cs_PINNED')}`)), result);
+    assert.deepEqual(JSON.parse(sql(`set role service_role;${pin(r, result, 'cs_PINNED')}`)), result);
+    const final = row(r);
+    assert.equal(Date.parse(final.checkout_created_at), Date.parse(attempt.created_at));
+    assert.equal(final.checkout_status, 'pending_payment');assert.equal(final.replacement_policy, 'immediate_cancel');
+    if (source !== 'admin') assert.deepEqual(JSON.parse(sql(`select jsonb_build_array(stripe_checkout_session_id,status)
+      from public_purchase_intents where id='${r.intent}';`)), ['cs_PINNED', 'checkout_pending']);
+    denied(`set role service_role;${pin(r, attempt, 'cs_OTHER')}`, /pin_attempt_changed/);
+    assert.equal(row(r).checkout_session_id, 'cs_PINNED');
+  }
+  assert.equal(acl(), permissions);
+});
+test('native pin rejects invented attempt, conflicting intent, changed source/customer and paid rows without partial links', opts, () => {
+  for (const kind of ['fake', 'intent', 'customer', 'paid', 'superseded', 'promo']) {
+    const r = fixture({ source: 'sales_assisted', payment: 'monthly_installments' }), attempt = claimed(r);
+    if (kind === 'intent') sql(`update public_purchase_intents set stripe_checkout_session_id='cs_OTHER' where id='${r.intent}';`);
+    if (kind === 'customer') sql(`update clients set stripe_customer_id='cus_CHANGED' where id='${r.client}';`);
+    if (kind === 'paid') sql(`update membership_agreements set checkout_paid_at=clock_timestamp() where id='${r.id}';`);
+    if (kind === 'superseded') sql(`update membership_agreements set is_current=false where id='${r.id}';`);
+    if (kind === 'promo') sql(`update public_purchase_intents set promotion_code_id='promo_OTHER' where id='${r.intent}';`);
+    const before = row(r), intentBefore = sql(`select to_jsonb(t) from public_purchase_intents t where id='${r.intent}';`);
+    const candidate = kind === 'fake' ? { ...attempt, expires_at: attempt.expires_at + 1 } : attempt;
+    denied(`set role service_role;${pin(r, candidate, 'cs_NEW')}`, /retail_checkout_/);
+    assert.deepEqual(row(r), before);assert.equal(sql(`select to_jsonb(t) from public_purchase_intents t where id='${r.intent}';`), intentBefore);
+  }
+  const r = fixture(), attempt = claimed(r);
+  for (const role of ['anon', 'authenticated']) denied(`set role ${role};${pin(r, attempt, 'cs_NEW')}`, /permission denied/);
+});
+test('real concurrent native Session pins share same Session, and a competing different Session cannot replace it', opts, async () => {
+  const r = fixture({ source: 'sales_assisted' }), attempt = claimed(r);
+  const [a, b] = await Promise.all([
+    parallel(`set role service_role;begin;${pin(r, attempt, 'cs_SHARED')}select pg_sleep(0.1);commit;`),
+    parallel(`set role service_role;${pin(r, attempt, 'cs_SHARED')}`)
+  ]);
+  assert.equal(a.code, 0, a.err);assert.equal(b.code, 0, b.err);
+  denied(`set role service_role;${pin(r, attempt, 'cs_DIFFERENT')}`, /pin_attempt_changed/);
+  assert.equal(row(r).checkout_session_id, 'cs_SHARED');
+});
+test('failed native intent link rolls back the agreement link in the same transaction', opts, () => {
+  const r = fixture({ source: 'sales_assisted' }), attempt = claimed(r), before = row(r);
+  sql(`create function synthetic_reject_session_link() returns trigger language plpgsql as $$begin
+    if new.stripe_checkout_session_id='cs_ROLLBACK' then raise exception 'synthetic_link_failure';end if;return new;end$$;
+    create trigger synthetic_reject_session_link before update on public_purchase_intents
+    for each row execute function synthetic_reject_session_link();`);
+  denied(`set role service_role;${pin(r, attempt, 'cs_ROLLBACK')}`, /synthetic_link_failure/);
+  assert.deepEqual(row(r), before);
+  assert.equal(sql(`select stripe_checkout_session_id is null from public_purchase_intents where id='${r.intent}';`), 't');
+  sql(`drop trigger synthetic_reject_session_link on public_purchase_intents;drop function synthetic_reject_session_link();`);
+});
+test('native pin waits for concurrent customer write and rejects the newly committed different customer', opts, async () => {
+  const r = fixture({ source: 'sales_assisted' }), attempt = claimed(r), before = row(r);
+  const lock = cp.spawn(`${bin}psql`, ['-h', socket, '-p', port, '-U', 'postgres', '-X', '-q', '-At',
+    '-v', 'ON_ERROR_STOP=1', '-d', database, '-c', `begin;select id from clients where id='${r.client}' for update;
+      select pg_sleep(0.3);update clients set stripe_customer_id='cus_MOVED' where id='${r.client}';commit;`]);
+  await new Promise((resolve, reject) => { lock.stdout.once('data', resolve);lock.once('error', reject); });
+  const done = new Promise((resolve, reject) => { lock.once('close', resolve);lock.once('error', reject); });
+  const result = await parallel(`set role service_role;${pin(r, attempt, 'cs_RACED')}`);
+  assert.equal(await done, 0);assert.notEqual(result.code, 0);assert.match(result.err, /customer_changed/);
+  assert.deepEqual(row(r), before);
 });
