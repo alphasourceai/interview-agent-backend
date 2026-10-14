@@ -11,7 +11,7 @@ function run(q){return cp.spawnSync('/opt/homebrew/opt/postgresql@17/bin/psql',[
 function sql(q){const r=run(q);assert.equal(r.status,0,r.stderr);return r.stdout.trim();}
 function denied(q,pattern=/retail_funding_/){const r=run(q);assert.notEqual(r.status,0);assert.match(r.stderr,pattern);}
 const acl=()=>sql("select jsonb_agg(jsonb_build_array(relname,relacl::text,relrowsecurity) order by relname) from pg_class where oid in('clients'::regclass,'membership_agreements'::regclass,'public_purchase_intents'::regclass,'billing_customers'::regclass);");
-let priorAcl,legacyBefore,priorFunctions,historicalV2,historicalBefore,historicalIntentBefore;const legacyId=crypto.randomUUID();
+let priorAcl,legacyBefore,priorFunctions,historicalV2,historicalBillingV2,historicalBefore,historicalIntentBefore;const legacyId=crypto.randomUUID();
 const functionCatalog=()=>sql("select jsonb_agg(jsonb_build_array(proname,md5(prosrc),provolatile,prosecdef,proconfig,proowner::regrole::text,proacl::text) order by proname) from pg_proc where proname in ('retail_existing_funding_context','record_retail_existing_funding');");
 before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/tmp\/alphascreen-retail-funding-pg\.[A-Za-z0-9]+$/);
  assert.equal(process.env.PGPORT,'55456');assert.equal(process.env.PGUSER,'postgres');assert.equal(process.env.PGDATABASE,'postgres');assert.equal(process.env.PGPASSWORD,undefined);
@@ -45,9 +45,19 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
  // Explicit synthetic already-paid V2 cohort BEFORE the new admission gate,
  // using actual original completion. Never infer an original period/backfill.
  historicalV2=fixture('basic',3,'monthly_installments');nativeComplete(historicalV2);
+ historicalBillingV2=fixture('basic',3,'monthly_installments');nativeComplete(historicalBillingV2);
  historicalBefore=sql(`select to_jsonb(a) from membership_agreements a where id=${lit(historicalV2.id)};`);
  historicalIntentBefore=sql(`select to_jsonb(i) from public_purchase_intents i where id=${lit(historicalV2.intent)};`);
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014001920_retail_existing_receipt_activation_admission.sql'),'utf8'));
+ const billingMigration=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014004904_retail_existing_billing_receipt_fence.sql'),'utf8');
+ const billingCatalog=()=>sql("select jsonb_agg(jsonb_build_array(oid::regprocedure::text,md5(prosrc),prosecdef,provolatile,proconfig,proowner::regrole::text,proacl::text)) from pg_proc where proname='apply_public_purchase_billing';");
+ const originalBilling=billingCatalog(),definition=sql("select pg_get_functiondef(oid) from pg_proc where proname='apply_public_purchase_billing';");
+ try{sql(definition.replace('\nbegin\n','\nbegin\n -- disposable original writer drift sentinel\n'));
+  denied(billingMigration,/retail_funding_billing_prerequisite_drift/);
+  assert.equal(acl(),priorAcl);
+ }finally{sql(definition);}
+ assert.equal(billingCatalog(),originalBilling);
+ sql(billingMigration);
 });
 function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false){
  const id=crypto.randomUUID(),client=crypto.randomUUID(),intent=crypto.randomUUID(),key='SYNTHETIC_CLAIM_'+crypto.randomUUID(),suffix=id.replaceAll('-','');
@@ -57,7 +67,7 @@ function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,
    commitment_months:months,payment_option:payment,pricing_version:pkg.pricing_version,term_start_basis:'successful_payment',platform_fee:String(pkg.platform_fee),
    per_role_fee:String(pkg.per_role_fee),additional_interview_fee:String(pkg.additional_interview_fee),included_interviews_per_role:String(pkg.included_interviews_per_role),
    max_interview_minutes:String(pkg.max_interview_minutes),first_role_prepay:pkg.first_role_prepay}};
- sql(`set role service_role;insert into clients(id,name,email,stripe_customer_id) values(${lit(client)},'Synthetic Native Funding','buyer@example.invalid',${lit(customer)});
+ sql(`set role service_role;insert into clients(id,name,email,stripe_customer_id,plan_tier) values(${lit(client)},'Synthetic Native Funding','buyer@example.invalid',${lit(customer)},${lit(plan)});
   insert into billing_customers(client_id,name,primary_contact_email,stripe_customer_id) values(${lit(client)},'Synthetic Native Funding','buyer@example.invalid',${lit(customer)});
   insert into membership_agreements(id,client_id,status,is_current,client_legal_name,primary_admin_name,admin_email,membership_tier,billing_option,
    auto_renew,signer_accepted,template_version,template_snapshot,draft_pdf_path,signer_token_hash,signer_token_expires_at,signed_at,agreement_expires_at)
@@ -99,6 +109,121 @@ function completeCall(f){
  return 'select complete_public_purchase_activation('+[
   f.id,f.key,f.proof.period.paid_at,f.proof.period.checkout_session_id,f.client,false,f.pkg.plan_key,f.pkg.billing_cadence,start,end].map(lit).join(',')+');';
 }
+// Exercise the existing 28-argument writer, not a simulated billing callback.
+function billingCall(f,patch={}){
+ const p=f.pkg,c=p.first_role_prepay,a=f.proof.period;
+ const args={intent:f.intent,key:f.key,client:f.client,billingClient:f.client,customer:a.customer_id,subscription:a.subscription_id,
+  subscriptionStatus:'active',billingStatus:'active',cadence:p.billing_cadence,plan:p.plan_key,
+  currentEnd:new Date(a.provider_period_end*1000).toISOString(),cancel:false,renew:true,cancelAt:null,
+  start:a.paid_at,end:anchoredMonthInstant(a.paid_at,p.membership_terms.commitment_months),
+  platform:p.platform_fee,role:p.per_role_fee,included:p.included_interviews_per_role,extra:p.additional_interview_fee,minutes:p.max_interview_minutes,
+  credit:c.selected,type:c.selected?c.credit_type:null,normal:c.selected?c.normal_role_fee_cents:null,
+  discounted:c.selected?c.discounted_credit_amount_cents:null,discount:c.selected?c.discount_percent:null,
+  nonRefundable:c.selected?c.non_refundable:null,expires:c.selected?c.expires:null,...patch};
+ return 'select apply_public_purchase_billing('+Object.values(args).map(lit).join(',')+');';
+}
+const nativeBilling=(f,patch)=>JSON.parse(sql('set role service_role;'+billingCall(f,patch)));
+const billingState=f=>sql(`select jsonb_build_object('client',(select to_jsonb(c) from clients c where id=${lit(f.client)}),
+ 'intent',(select to_jsonb(i) from public_purchase_intents i where id=${lit(f.intent)}),
+ 'plan',(select to_jsonb(p) from client_plan_settings p where client_id=${lit(f.client)}),
+ 'credits',(select jsonb_agg(to_jsonb(r) order by id) from client_role_credits r where source_client_id=${lit(f.client)}));`);
+test('actual billing writer refuses a moved global owner after valid receipt and native completion',opts,()=>{
+ const f=fixture();record(f);nativeComplete(f);
+ sql(`update billing_customers set stripe_customer_id=null where client_id=${lit(f.client)};`);
+ const before=billingState(f);denied('set role service_role;'+billingCall(f),/retail_funding_billing_/);assert.equal(billingState(f),before);
+});
+for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])for(const role of [false,true])
+test(`actual native billing ${plan}/${months}/${payment}/role:${role}`,opts,()=>{
+ const f=fixture(plan,months,payment,role);record(f);nativeComplete(f);
+ const applied=nativeBilling(f);assert.equal(applied.status,'applied');assert.equal(nativeBilling(f).status,'already_applied');
+ const state=JSON.parse(billingState(f)),p=state.plan,c=state.client;
+ assert.equal(c.stripe_customer_id,f.proof.period.customer_id);assert.equal(c.stripe_subscription_id,f.proof.period.subscription_id);
+ assert.equal(Date.parse(c.contract_start_at),Date.parse(f.proof.period.paid_at));
+ assert.equal(Date.parse(c.contract_end_at),Date.parse(anchoredMonthInstant(f.proof.period.paid_at,months)));
+ for(const field of ['platform_fee','per_role_fee','included_interviews_per_role','additional_interview_fee','max_interview_minutes'])assert.equal(p[field],f.pkg[field]);
+ for(const field of ['scored_question_count','billing_model'])assert.equal(p[field],f.pkg.membership_terms[field]);
+ if(plan==='pro')assert.equal(p.rollover_days,90);
+ assert.equal((state.credits||[]).length,role?1:0);if(role){assert.equal(state.credits[0].status,'unused');assert.equal(state.credits[0].discounted_credit_amount_cents,f.pkg.first_role_prepay.discounted_credit_amount_cents);}
+ assert.equal(state.intent.billing_apply_digest,applied.digest);assert.ok(state.intent.billing_applied_at);
+});
+test('billing receipt identity cannot be replaced by plausible caller customer or subscription parameters',opts,()=>{
+ for(const patch of [{customer:'cus_CALLER_CHANGED'},{subscription:'sub_CALLER_CHANGED'}]){
+  const f=fixture();record(f);nativeComplete(f);const before=billingState(f);
+  denied('set role service_role;'+billingCall(f,patch),/retail_funding_billing_/);assert.equal(billingState(f),before);
+ }
+});
+test('native billing rejects post-completion archive, parent, profile, customer and unrelated subscription changes',opts,()=>{
+ for(const change of ['archive','parent','profile','customer','subscription']){
+  const f=fixture();record(f);nativeComplete(f);
+  if(change==='archive')sql(`update clients set archived_at=clock_timestamp() where id=${lit(f.client)};`);
+  if(change==='parent'){const parent=crypto.randomUUID();sql(`insert into clients(id,name,email) values(${lit(parent)},'Synthetic Parent','parent@example.invalid');update clients set parent_client_id=${lit(parent)} where id=${lit(f.client)};`);}
+  if(change==='profile')sql(`update billing_customers set stripe_customer_id=null where client_id=${lit(f.client)};`);
+  if(change==='customer')sql(`update clients set stripe_customer_id='cus_CHANGED' where id=${lit(f.client)};`);
+  if(change==='subscription')sql(`update clients set stripe_subscription_id='sub_CHANGED' where id=${lit(f.client)};`);
+  const before=billingState(f);denied('set role service_role;'+billingCall(f),/retail_funding_billing_/);assert.equal(billingState(f),before);
+ }
+});
+test('billing receipt replay after consumed credit is a true no-op; lost ACK cannot duplicate credit',opts,()=>{
+ const f=fixture('pro',6,'prepaid',true);record(f);nativeComplete(f);const first=nativeBilling(f);
+ const role=crypto.randomUUID();sql(`insert into roles(id,client_id,title,slug_or_token) values(${lit(role)},${lit(f.client)},'Synthetic Consumed Credit',${lit('synthetic-'+role)});
+  update client_role_credits set status='used',used_at=clock_timestamp(),used_by_role_id=${lit(role)} where source_client_id=${lit(f.client)};
+  update client_plan_settings set platform_fee=123 where client_id=${lit(f.client)};`);
+ const before=billingState(f),replay=nativeBilling(f);assert.equal(replay.status,'already_applied');assert.equal(replay.digest,first.digest);assert.equal(billingState(f),before);
+ sql(`update billing_customers set stripe_customer_id=null where client_id=${lit(f.client)};`);
+ const moved=billingState(f);denied('set role service_role;'+billingCall(f),/retail_funding_billing_/);assert.equal(billingState(f),moved);
+});
+test('historical V2 no-receipt billing remains on original writer and does not backfill evidence',opts,()=>{
+ assert.equal(row(historicalBillingV2).retail_funding_receipt,null);assert.equal(nativeBilling(historicalBillingV2).status,'applied');
+ const before=billingState(historicalBillingV2);assert.equal(nativeBilling(historicalBillingV2).status,'already_applied');assert.equal(billingState(historicalBillingV2),before);
+ assert.equal(row(historicalBillingV2).retail_funding_receipt,null);
+});
+test('accepted replacement receipt does not bypass existing first-apply billing identity conflict',opts,()=>{
+ const f=fixture('basic',3,'prepaid',false,true,true);record(f);nativeComplete(f);const before=billingState(f);
+ denied('set role service_role;'+billingCall(f),/billing_identity_conflict/);assert.equal(billingState(f),before);
+});
+test('billing migration preserves exact original security/ACL/signature; unknown/reapplied source refuses',opts,()=>{
+ const catalog=JSON.parse(sql("select jsonb_build_object('owner',proowner::regrole::text,'definer',prosecdef,'config',proconfig,'acl',proacl::text,'args',pronargs) from pg_proc where proname='apply_public_purchase_billing';"));
+ assert.deepEqual(catalog,{owner:'postgres',definer:true,config:['search_path=""'],acl:'{postgres=X/postgres,service_role=X/postgres}',args:28});
+ denied(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014004904_retail_existing_billing_receipt_fence.sql'),'utf8'),/retail_funding_billing_prerequisite_drift/);
+ assert.equal(acl(),priorAcl);
+ const f=fixture();record(f);nativeComplete(f);
+ for(const role of ['anon','authenticated'])denied('set role '+role+';'+billingCall(f),/permission denied/);
+});
+for(const target of ['client','profile','plan','credit'])
+test(`billing lease expiration during ${target} lock wait aborts before first write`,opts,async()=>{
+ const f=fixture('basic',3,'prepaid',target==='credit');record(f);nativeComplete(f);
+ if(target==='plan')sql(`insert into client_plan_settings(client_id,plan_tier,billing_interval,platform_fee,per_role_fee,
+  included_interviews_per_role,additional_interview_fee,max_interview_minutes) values(${[f.client,'basic','prepaid',f.pkg.platform_fee,f.pkg.per_role_fee,
+   f.pkg.included_interviews_per_role,f.pkg.additional_interview_fee,f.pkg.max_interview_minutes].map(lit).join(',')});`);
+ if(target==='credit'){const c=f.pkg.first_role_prepay;sql(`insert into client_role_credits(billing_client_id,source_client_id,source_public_purchase_intent_id,
+  source_membership_agreement_id,source_stripe_checkout_session_id,credit_type,membership_key,normal_role_fee_cents,discounted_credit_amount_cents,
+  discount_percent,status,metadata) values(${[f.client,f.client,f.intent,f.id,f.proof.period.checkout_session_id,'first_role_prepay','basic',c.normal_role_fee_cents,
+   c.discounted_credit_amount_cents,c.discount_percent,'unused',{non_refundable:c.non_refundable,expires:c.expires}].map(lit).join(',')});`);}
+ sql(`update public_purchase_intents set activation_claimed_at=clock_timestamp()-interval '299.7 seconds' where id=${lit(f.intent)};`);
+ const before=billingState(f),table={client:'clients',profile:'billing_customers',plan:'client_plan_settings',credit:'client_role_credits'}[target];
+ const predicate=target==='client'?`id=${lit(f.client)}`:`${target==='credit'?'source_client_id':'client_id'}=${lit(f.client)}`;
+ const [holder,writer]=await Promise.all([
+  parallel(`begin;select 1 from ${table} where ${predicate} for update;select pg_sleep(0.6);commit;`),
+  parallel('set role service_role;select pg_sleep(0.07);'+billingCall(f))]);
+ assert.equal(holder.code,0,holder.err);assert.notEqual(writer.code,0,writer.out);assert.match(writer.err,/retail_funding_billing_claim_denied/);
+ assert.equal(billingState(f),before);
+});
+test('owner profile move cannot acquire its lock during native billing transaction',opts,async()=>{
+ const f=fixture();record(f);nativeComplete(f);
+ const [writer,mover]=await Promise.all([
+  parallel('set role service_role;begin;'+billingCall(f)+'select pg_sleep(0.5);commit;'),
+  parallel(`select pg_sleep(0.1);set lock_timeout='150ms';update billing_customers set stripe_customer_id=null where client_id=${lit(f.client)};`)]);
+ assert.equal(writer.code,0,writer.err);assert.notEqual(mover.code,0);assert.match(mover.err,/lock timeout/);
+ assert.equal(nativeBilling(f).status,'already_applied');
+});
+test('same digest cannot hide cleared subscription or voided agreement at billing replay boundary',opts,()=>{
+ for(const change of ['subscription','void']){
+  const f=fixture();record(f);nativeComplete(f);nativeBilling(f);
+  if(change==='subscription')sql(`update clients set stripe_subscription_id=null where id=${lit(f.client)};`);
+  if(change==='void')sql(`update membership_agreements set voided_at=clock_timestamp() where id=${lit(f.id)};`);
+  const before=billingState(f);denied('set role service_role;'+billingCall(f),/retail_funding_billing_/);assert.equal(billingState(f),before);
+ }
+});
 test('fresh retail complete/direct paid/activated writes require a prior receipt and leave all state unchanged',opts,()=>{
  const f=fixture(),a=row(f),i=sql(`select to_jsonb(i) from public_purchase_intents i where id=${lit(f.intent)};`),c=sql(`select to_jsonb(c) from clients c where id=${lit(f.client)};`);
  denied('set role service_role;'+completeCall(f),/retail_funding_receipt_required/);
