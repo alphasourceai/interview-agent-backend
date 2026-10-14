@@ -108,6 +108,17 @@ test('fresh retail complete/direct paid/activated writes require a prior receipt
  assert.equal(sql(`select to_jsonb(c) from clients c where id=${lit(f.client)};`),c);
  record(f);assert.equal(nativeComplete(f).status,'completed');
 });
+test('native grant rechecks receipt owner and archived client after proof, not just presence of receipt',opts,()=>{
+ for(const change of ['customer','profile','archive']){
+  const f=fixture();record(f);
+  if(change==='customer')sql(`update clients set stripe_customer_id='cus_CHANGED_AFTER_PROOF' where id=${lit(f.client)};`);
+  if(change==='profile')sql(`update billing_customers set stripe_customer_id=null where client_id=${lit(f.client)};`);
+  if(change==='archive')sql(`update clients set archived_at=clock_timestamp() where id=${lit(f.client)};`);
+  const before=row(f),client=sql(`select to_jsonb(c) from clients c where id=${lit(f.client)};`);
+  denied('set role service_role;'+completeCall(f),/retail_funding_/);
+  assert.deepEqual(row(f),before);assert.equal(sql(`select to_jsonb(c) from clients c where id=${lit(f.client)};`),client);
+ }
+});
 test('migration preserves previously paid V2 without receipt; original completion replay changes only audit timestamps',opts,()=>{
  assert.equal(sql(`select to_jsonb(a) from membership_agreements a where id=${lit(historicalV2.id)};`),historicalBefore);
  assert.equal(sql(`select to_jsonb(i) from public_purchase_intents i where id=${lit(historicalV2.intent)};`),historicalIntentBefore);
@@ -328,8 +339,11 @@ test('browser roles and direct first service writes cannot bypass record RPC; re
 test('later agreement and linked activated clocks must be original A, and cannot be cleared or moved',opts,()=>{
  const f=fixture();record(f);denied(`set role service_role;update membership_agreements set checkout_paid_at='2099-01-01Z' where id=${lit(f.id)};`);
  denied(`set role service_role;update public_purchase_intents set activated_at='2099-01-01Z' where id=${lit(f.intent)};`);
- sql(`set role service_role;update membership_agreements set checkout_paid_at=${lit(f.proof.period.paid_at)} where id=${lit(f.id)};
-  update public_purchase_intents set activated_at=${lit(f.proof.period.paid_at)} where id=${lit(f.intent)};`);
+ // Inconsistent standalone timestamp-only bookkeeping now refuses; use the
+ // actual existing completion's paired paid status/clock transition as the
+ // positive case, retaining every original wrong/clear-clock refusal.
+ denied(`set role service_role;update membership_agreements set checkout_paid_at=${lit(f.proof.period.paid_at)} where id=${lit(f.id)};`,/retail_funding_admission_paid_status_required/);
+ nativeComplete(f);
  denied(`set role service_role;update membership_agreements set checkout_paid_at=null where id=${lit(f.id)};`);
  denied(`set role service_role;update public_purchase_intents set activated_at=null where id=${lit(f.intent)};`);
 });
