@@ -6,6 +6,7 @@ const DEV_DATABASE_URL = 'https://hjombgfusdgsqipimhnc.supabase.co';
 const DEV_FRONTEND_URL = 'https://interview-agent-frontend-qa.onrender.com';
 const DEV_BACKEND_URL = 'https://interview-agent-dev-backend.onrender.com';
 const DEV_STRIPE_ACCOUNT_ID = 'acct_1UPtmNHC5VkATVoE';
+const {ownerMailRecipients}=require('./devPricingTestMail');
 let verifiedSandboxFingerprint = null;
 const CODE = 'GUARDED_DEV_BILLING_HOLD';
 const DETAIL = 'This dev build supports pricing and agreement previews. Payments, renewals, usage collection, sending and signing are not available yet.';
@@ -45,13 +46,17 @@ function hold() {
 function sandboxRequested(env = process.env) { return env.DEV_PRICING_SANDBOX_ENABLED === 'true'; }
 function sandboxFingerprint(env) {
   const keys = [...new Set(['APP_ENV','RENDER_SERVICE_ID','RENDER_EXTERNAL_URL','SUPABASE_URL','FRONTEND_URL',
-    'DEV_PRICING_SANDBOX_ENABLED','DEV_STRIPE_ACCOUNT_ID',...OFF_FLAGS,...FORBIDDEN_CREDENTIALS,
+    'DEV_PRICING_SANDBOX_ENABLED','DEV_STRIPE_ACCOUNT_ID','DEV_PRICING_EMAIL_RECIPIENTS','SENDGRID_FROM',...OFF_FLAGS,...FORBIDDEN_CREDENTIALS,
     ...Object.keys(env).filter(k=>k.startsWith('STRIPE_'))])].sort();
   return require('node:crypto').createHash('sha256').update(JSON.stringify(keys.map(k=>[k,env[k]??null]))).digest('hex');
 }
 function isDevBillingSandbox(env = process.env) {
   return isGuardedPricingDev(env) && sandboxRequested(env)
     && verifiedSandboxFingerprint !== null && verifiedSandboxFingerprint === sandboxFingerprint(env);
+}
+function isDevPricingTestMail(env=process.env){
+  if(!isDevBillingSandbox(env))return false;
+  try{return ownerMailRecipients(env.DEV_PRICING_EMAIL_RECIPIENTS).length>0;}catch(_){return false;}
 }
 function assertGuardedDevOutboundAllowed(kind) {
   if (isGuardedPricingDev() && !(kind === 'billing' && isDevBillingSandbox())) throw hold();
@@ -61,6 +66,10 @@ function assertGuardedPricingDevConfiguration(env = process.env) {
   if (!['','false','0','true'].includes(String(env.DEV_PRICING_SANDBOX_ENABLED??''))) throw new Error('guarded_dev_sandbox_mode_invalid');
   if (sandboxRequested(env) && !isGuardedPricingDev(env)) throw new Error('guarded_dev_environment_pin_mismatch');
   if (!isGuardedPricingDev(env)) return;
+  const mailRecipients=ownerMailRecipients(env.DEV_PRICING_EMAIL_RECIPIENTS);
+  const ownerMail=mailRecipients.length>0;
+  if(ownerMail&&(!sandboxRequested(env)||!/^SG\.[A-Za-z0-9_.-]{20,}$/.test(env.SENDGRID_API_KEY||'')
+    ||env.SENDGRID_FROM!=='info@alphasourceai.com'))throw new Error('guarded_dev_owner_mail_configuration_invalid');
   const url = value => String(value || '').replace(/\/$/, '');
   if (env.APP_ENV !== 'development'
     || (env.RENDER_SERVICE_ID && env.RENDER_SERVICE_ID !== DEV_SERVICE_ID)
@@ -71,7 +80,7 @@ function assertGuardedPricingDevConfiguration(env = process.env) {
   if (OFF_FLAGS.some(key => !['', 'false', '0', ...(allowedFlags.includes(key)?['true']:[])].includes(String(env[key] ?? '')))) {
     throw new Error('guarded_dev_external_operation_flag_refused');
   }
-  if (FORBIDDEN_CREDENTIALS.some(key => String(env[key] || '').trim())) {
+  if (FORBIDDEN_CREDENTIALS.some(key => !(ownerMail&&key==='SENDGRID_API_KEY')&&String(env[key] || '').trim())) {
     throw new Error('guarded_dev_external_credential_refused');
   }
   if (Object.entries(env).some(([key, value]) => key.startsWith('STRIPE_') && /^(?:sk|rk|pk)_live_/.test(String(value || '').trim()))) {
@@ -121,7 +130,7 @@ function guardedPricingCapabilities(env = process.env) {
   const guarded = isGuardedPricingDev(env),sandbox=isDevBillingSandbox(env);
   return { guarded_pricing_preview: guarded&&!sandbox, dev_billing_sandbox:sandbox, initial_checkout: !guarded||sandbox,
     renewal_actions: !guarded||sandbox, usage_collection: !guarded||sandbox,
-    agreement_sending: !guarded, agreement_signing: !guarded||sandbox, detail: guarded&&!sandbox ? DETAIL : null };
+    agreement_sending: !guarded||isDevPricingTestMail(env), agreement_signing: !guarded||sandbox, detail: guarded&&!sandbox ? DETAIL : null };
 }
 function guardedPricingDevFence(req, res, next) {
   if (!isGuardedPricingDev()) return next();
@@ -137,8 +146,12 @@ function guardedPricingDevFence(req, res, next) {
   const sandboxMutation=isDevBillingSandbox()&&((method==='POST'&&(sandboxPost.has(pathname)
     ||clientPost.test(pathname)||new RegExp('^/admin/billing/agreements/'+id+'/void$').test(pathname)))
     ||method==='PATCH'&&new RegExp('^/admin/clients/'+id+'/auto-renew$').test(pathname));
+  const mailMutation=isDevPricingTestMail()&&method==='POST'&&(
+    ['/api/alphascreen/purchase-intents','/admin/billing/agreements/send','/sales/deals'].includes(pathname)
+    ||new RegExp('^/api/alphascreen/purchase-intents/'+id+'/(agreement|email-verification/send|email-verification/verify)$').test(pathname)
+    ||new RegExp('^/sales/deals/'+id+'/(resend-agreement|send-payment-reminder|cancel)$').test(pathname));
   if (!override && (['GET', 'HEAD', 'OPTIONS'].includes(method)
-    ||sandboxMutation|| (method === 'POST' && (PREVIEW_POSTS.has(pathname) || pathname === '/webhook/stripe')))) return next();
+    ||sandboxMutation||mailMutation|| (method === 'POST' && (PREVIEW_POSTS.has(pathname) || pathname === '/webhook/stripe')))) return next();
   res.setHeader('Cache-Control', 'no-store');
   if (req.headers?.origin === DEV_FRONTEND_URL) {
     res.setHeader('Access-Control-Allow-Origin', DEV_FRONTEND_URL);
@@ -149,7 +162,7 @@ function guardedPricingDevFence(req, res, next) {
 }
 
 module.exports = { DEV_SERVICE_ID, DEV_DATABASE_URL, DEV_FRONTEND_URL, CODE, DETAIL,
-  DEV_BACKEND_URL, DEV_STRIPE_ACCOUNT_ID, sandboxRequested, isDevBillingSandbox, initializeDevBillingSandbox,
+  DEV_BACKEND_URL, DEV_STRIPE_ACCOUNT_ID, sandboxRequested, isDevBillingSandbox, isDevPricingTestMail, initializeDevBillingSandbox,
   OFF_FLAGS, FORBIDDEN_CREDENTIALS, isGuardedPricingDev, hold,
   assertGuardedDevOutboundAllowed, assertGuardedPricingDevConfiguration,
   guardedPricingCapabilities, guardedPricingDevFence };

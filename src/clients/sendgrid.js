@@ -475,6 +475,9 @@ async function sendRetailSignupEmailVerificationCode(to, code, details = {}) {
 }
 
 async function sendMembershipAgreementInternalNotification(to, details = {}) {
+  // Dev buyer mail is owner-only; an internal notification is deliberately not
+  // sent. Its skip must not turn an accepted buyer send into an unsent record.
+  if (require('../config/guardedPricingDev').isDevPricingTestMail()) return { skipped: true, reason: 'dev_internal_notification_disabled' }
   if (!API_KEY) return { skipped: true }
 
   const safeAgreementId = escapeHtml(details.agreementId || details.agreement_id || '')
