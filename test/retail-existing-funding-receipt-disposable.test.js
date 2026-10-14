@@ -1871,7 +1871,7 @@ test('linked member current native source/client/owner/paid clock/digest/claim r
     update membership_agreements set status='active' where id=${lit(f.id)};set role service_role;${linkedMemberCall(f)}commit;`,/retail_linked_member_source_denied/);
    assert.deepEqual(members(f),[]);assert.equal(billingState(f),before);continue;
   }
-  if(fields[mode])sql(`update clients set ${fields[mode]} where id=${lit(f.client)};`);
+  if(fields[mode])sql(`update clients set ${fields[mode].replace("'sub_OTHER'",lit('sub_OTHER_'+f.id.replaceAll('-',''))).replace("'cus_OTHER'",lit('cus_OTHER_'+f.id.replaceAll('-','')))} where id=${lit(f.client)};`);
   else if(mode==='profile')sql(`update billing_customers set stripe_customer_id=null where client_id=${lit(f.client)};`);
   else if(mode==='plan')sql(`delete from client_plan_settings where client_id=${lit(f.client)};`);
   else if(['active-agreement','voided','current'].includes(mode))sql(`update membership_agreements set ${mode==='active-agreement'?"status='active'":mode==='voided'?'voided_at=clock_timestamp()':'is_current=false'} where id=${lit(f.id)};`);
