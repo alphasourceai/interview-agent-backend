@@ -601,6 +601,28 @@ test('an exact client chunk may omit a requested id; the remaining real legacy i
     assert.equal(res.body.held_clients,undefined);assert.equal(stripe.calls.invoices.length,1);
   }));
 });
+test('missing marked owner is a terms hold, not a clean day1 result or an invalid exact chunk',async()=>{
+  const db=makeDb({clients:[],planSettings:[],roles:[],interviews:[]});
+  db.tables.membership_agreements=[{id:'a',client_id:'ghost',enterprise_checkout_pool_id:0}];
+  await withCronSecret(()=>onTheFirst(async()=>{
+    const app=loadCron(db,makeStripe());const imports=watchStripeImport();const res=await runCron(app);
+    assert.equal(res.status,503);assert.equal(res.body.code,'enterprise_usage_terms_unavailable');
+    assert.equal(res.body.ok,false);assert.equal(res.body.considered,1);assert.equal(res.body.held_clients,1);
+    assert.equal(res.body.failed,1);assert.equal(res.body.invoiced,0);assert.equal(res.body.total_cents,0);
+    assert.equal(res.body.results[0].client_id,'ghost');assert.equal(res.body.results[0].http_status,503);
+    assert.equal(res.body.results[0].code,'enterprise_usage_terms_unavailable');assert.equal(imports(),0);
+  }));
+});
+test('missing marked owner hold preserves an actually returned local legacy invoice',async()=>{
+  const db=makeDb();db.tables.membership_agreements=[{id:'a',client_id:'ghost',enterprise_funding_receipt:false}];
+  const stripe=makeStripe();
+  await withCronSecret(()=>onTheFirst(async()=>{
+    const res=await runCron(loadCron(db,stripe));assert.equal(res.status,503);assert.equal(res.body.held_clients,1);
+    assert.equal(res.body.considered,2);assert.equal(res.body.failed,1);assert.equal(res.body.invoiced,1);
+    assert.equal(res.body.total_cents,7500);assert.equal(stripe.calls.invoices.length,1);
+    assert.equal(res.body.results.filter(r=>r.status==='invoiced').length,1);
+  }));
+});
 test('day1 performs exactly one route census; existing scoped source reads remain separate',async()=>{
   const db=makeDb();const from=db.from;let scans=0;
   db.from=table=>{const q=from(table);if(table==='membership_agreements'){

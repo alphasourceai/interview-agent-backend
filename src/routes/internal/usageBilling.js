@@ -94,18 +94,25 @@ router.post('/billing/usage-invoices', async (req, res) => {
     }
 
     const due = clients
+    // Exact filtered client chunks may legitimately omit requested ids. Keep
+    // that census valid, but a known marker with no owner is still unavailable,
+    // never a clean zero/skip. This does not certify its agreement or receipt.
+    const presentIds = new Set(due.map(client => client.id))
+    const missingMarked = [...markedIds].filter(id => !presentIds.has(id))
+    const considered = due.length + missingMarked.length
 
     // Required here rather than at the top of the file so that mounting this
     // router does not construct the Stripe client, the way the other routes that
     // reach Stripe do it.
-    const stripe = require('../../clients/stripe')
+    const stripe = due.length ? require('../../clients/stripe') : null
 
-    const results = []
+    const results = missingMarked.map(clientId => ({ client_id: clientId, status: 'failed',
+      error: 'enterprise_usage_terms_unavailable', retryable: true, code: 'enterprise_usage_terms_unavailable', http_status: 503 }))
     let invoiced = 0
     let skipped = 0
-    let failed = 0
+    let failed = missingMarked.length
     let totalCents = 0
-    const heldClients = new Set()
+    const heldClients = new Set(missingMarked)
 
     for (const client of due) {
       // One client's failure must not stop the rest of the run.
@@ -143,7 +150,7 @@ router.post('/billing/usage-invoices', async (req, res) => {
 
     console.log('usage_billing_cron_summary', {
       request_id: requestId,
-      considered: due.length,
+      considered,
       invoiced,
       skipped,
       failed,
@@ -156,9 +163,9 @@ router.post('/billing/usage-invoices', async (req, res) => {
       // Actual legacy invoice results remain visible; an aggregate hold does
       // not roll back provider effects or turn those results into paid cash.
       return res.status(503).json({ ok: false, error: 'billing_unavailable', code,
-        considered: due.length, invoiced, skipped, failed, held_clients: heldClients.size, total_cents: totalCents, results })
+        considered, invoiced, skipped, failed, held_clients: heldClients.size, total_cents: totalCents, results })
     }
-    return res.json({ ok: true, considered: due.length, invoiced, skipped, failed, total_cents: totalCents, results })
+    return res.json({ ok: true, considered, invoiced, skipped, failed, total_cents: totalCents, results })
   } catch (e) {
     return res.status(500).json({ error: 'usage_invoices_failed', detail: e?.detail || e?.message || 'usage_invoices_failed' })
   }
