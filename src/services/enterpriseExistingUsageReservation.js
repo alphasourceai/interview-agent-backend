@@ -120,6 +120,8 @@ async function prepareAndReserveEnterpriseExistingUsage({ db, billingClientId })
   check(UUID.test(billingClientId || ''));
   let prepared;
   try { prepared = snapshot(await db.rpc('prepare_enterprise_existing_usage', { p_owner: billingClientId })); } catch (_) { hold(); }
+  if (prepared && !prepared.error && prepared.data?.phase === 'not_due')
+    return { phase: 'not_due', provider_effect_authorized: false, paid_access_authorized: false, payroll_authorized: false };
   check(prepared && !prepared.error && prepared.data?.phase === 'prepared'
     && UUID.test(prepared.data.batch_id) && whole(prepared.data.generation) && prepared.data.generation > 0
     && /^[a-f0-9]{64}$/.test(prepared.data.snapshot_digest || '') && prepared.data.snapshot?.owner_id === billingClientId);

@@ -89,3 +89,11 @@ test('unmounted bridge does only prepare, pure kernel, reserve and grants no eff
   assert.equal(result.provider_effect_authorized, false); assert.equal(result.paid_access_authorized, false);
   assert.equal(result.payroll_authorized, false); assert.equal(result.total_cents, 5000);
 });
+test('unmounted bridge skips an open service month without minting a no-usage or money claim',async()=>{
+ let calls=0;
+ const db={async rpc(name,args){calls++;assert.equal(name,'prepare_enterprise_existing_usage');assert.deepEqual(Object.keys(args),['p_owner']);
+  return {data:{phase:'not_due',provider_effect_authorized:false},error:null};}};
+ const result=await reserve({db,billingClientId:crypto.randomUUID()});
+ assert.equal(calls,1);assert.equal(result.phase,'not_due');assert.equal(Object.hasOwn(result,'total_cents'),false);
+ assert.equal(result.provider_effect_authorized,false);assert.equal(result.paid_access_authorized,false);assert.equal(result.payroll_authorized,false);
+});
