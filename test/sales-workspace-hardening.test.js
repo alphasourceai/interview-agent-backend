@@ -335,7 +335,7 @@ test('activation recovery migration fences every service-role function', () => {
 test('paid agreement webhook source leaves incomplete events retryable', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'routes', 'webhooks', 'stripe.js'), 'utf8')
   assert.match(source, /priorEvent\.processed_ok === true/)
-  assert.match(source, /if \(!retryableAgreementEvent\) return res\.status\(200\)/)
+  assert.match(source, /if \(!retryableAgreementEvent && !retailRecurringEvent\?\.requiresReentry\) return res\.status\(200\)/)
   assert.match(source, /if \(retryableAgreementEvent\) \{\s*return res\.status\(503\)/)
   assert.match(source, /requireAgreementActivationResult\(activation\)/)
 })

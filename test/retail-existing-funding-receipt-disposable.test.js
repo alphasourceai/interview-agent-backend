@@ -2,7 +2,7 @@
 // Opt-in real full empty QA schema + curated16 migrations, private Unix socket.
 const {test,before}=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),cp=require('node:child_process');
 const {buildRetailPackageSnapshot}=require('../src/services/membershipPackageCompatibility');
-const {OFFER_VERSION,anchoredMonthInstant}=require('../src/services/membershipOffers');
+const {OFFER_VERSION,STRIPE_RECURRING_OFFER_VERSION,anchoredMonthInstant}=require('../src/services/membershipOffers');
 const enabled=process.env.RETAIL_FUNDING_RECEIPT_DISPOSABLE==='true',opts={skip:!enabled};
 const migration=path.resolve(__dirname,'../supabase/migrations/20261013231615_retail_existing_initial_funding_receipt.sql');
 const linkedMemberMigrationPath=path.resolve(__dirname,'../supabase/migrations/20261014045836_retail_existing_linked_buyer_member.sql');
@@ -96,6 +96,7 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
  const originalFunctions=JSON.parse(linkedOriginalCatalog),oldGuard=sql("select prosrc from pg_proc where oid='public.retail_linked_existing_member_schema_guard()'::regprocedure;");
  sql(fs.readFileSync(replacementBillingMigrationPath,'utf8'));
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014165458_retail_existing_recurring_source_read.sql'),'utf8'));
+ sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014181400_retail_existing_recurring_invoice_receipts.sql'),'utf8'));
  const changedFunctions=JSON.parse(linkedOriginalFunctions()),actualHash=sql("select md5(prosrc) from pg_proc where proname='apply_public_purchase_billing';");
  assert.equal(actualHash,replacementBillingBodyHash);
  for(const [index,prior] of originalFunctions.entries()){
@@ -115,9 +116,9 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
  legacyBefore=sql(`select (${lit(JSON.parse(legacyBefore))}||jsonb_build_object('retail_admin_billing_receipt',null))::text;`);
  historicalBefore=sql(`select (${lit(JSON.parse(historicalBefore))}||jsonb_build_object('retail_admin_billing_receipt',null))::text;`);
 });
-function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false,adminSource='admin',linkedSource='sales_assisted',buyerEmail='buyer@example.invalid'){
+function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false,adminSource='admin',linkedSource='sales_assisted',buyerEmail='buyer@example.invalid',options={}){
  const id=crypto.randomUUID(),client=crypto.randomUUID(),intent=crypto.randomUUID(),key='SYNTHETIC_CLAIM_'+crypto.randomUUID(),suffix=id.replaceAll('-','');
- const customer='cus_'+suffix,session='cs_'+suffix,pkg=buildRetailPackageSnapshot({planKey:plan,commitmentMonths:months,paymentOption:payment,firstRolePrepaySelected:role,offerVersion:OFFER_VERSION,channel:linked&&linkedSource==='public_purchase_intent'?'public':'sales'});
+ const customer='cus_'+suffix,session='cs_'+suffix,pkg=buildRetailPackageSnapshot({planKey:plan,commitmentMonths:months,paymentOption:payment,firstRolePrepaySelected:role,offerVersion:options.offerVersion||OFFER_VERSION,channel:linked&&linkedSource==='public_purchase_intent'?'public':'sales'});
  const snapshot={template_version:'membership_agreement_retail_terms_v2',source:linked?linkedSource:adminSource,package_snapshot:pkg,
   ...(linked?{purchase_intent:{id:intent}}:{}),values:{membership_tier:plan,billing_option:pkg.billing_cadence,auto_renew:true,
    commitment_months:months,payment_option:payment,pricing_version:pkg.pricing_version,term_start_basis:'successful_payment',platform_fee:String(pkg.platform_fee),
@@ -150,6 +151,14 @@ function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,
   platform_gross_cents:pkg.platform_fee_cents,platform_discount_cents:0,platform_net_cents:pkg.platform_fee_cents,
   role_gross_cents:pkg.first_role_prepay.discounted_credit_amount_cents,role_discount_cents:0,role_net_cents:pkg.first_role_prepay.discounted_credit_amount_cents,
   tax_cents:0,cash_cents:pkg.membership_terms.initial_payment_cents};
+ if(options.nearCycle){
+  // Authored provider geometry only: original B's next boundary is shortly
+  // ahead of real current cash A. No clock override/backfill/trigger disabling.
+  const start=new Date(created*1000);start.setUTCMonth(start.getUTCMonth()-pkg.membership_terms.stripe_recurrence.interval_count);
+  start.setUTCSeconds(start.getUTCSeconds()+3);
+  proof.period.provider_period_start=start.getTime()/1000;
+  proof.period.provider_period_end=Date.parse(anchoredMonthInstant(start.toISOString(),pkg.membership_terms.stripe_recurrence.interval_count))/1000;
+ }
  return{id,client,intent,key:linked?key:null,proof,source,pkg,buyerEmail};
 }
 function call(f,proof=f.proof,source=f.source,key=f.key){return `select record_retail_existing_funding(${[f.id,f.client,key,source,proof].map(lit).join(',')});`;}
@@ -216,6 +225,96 @@ const nativeAdmin=f=>JSON.parse(sql('set role service_role;'+adminCall(f)));
 // Distinct read-instant historical provenance, NOT activation/member/access.
 const recurringSourceCall=f=>'select read_retail_existing_recurring_source('+[f.id,f.client].map(lit).join(',')+');';
 const nativeRecurringSource=f=>JSON.parse(sql('set role service_role;'+recurringSourceCall(f)));
+// Current A and a genuinely elapsed, authored B boundary. These fixtures
+// exercise native writers, NOT actual Stripe schedule geometry or time travel.
+async function paidCycleFixture(payment='monthly_installments',role=false){
+ const f=fixture('basic',3,payment,role,true,false,'admin','sales_assisted','buyer@example.invalid',
+  {offerVersion:STRIPE_RECURRING_OFFER_VERSION,nearCycle:true});
+ record(f);nativeComplete(f);nativeBilling(f);
+ await new Promise(resolve=>setTimeout(resolve,Math.max(0,f.proof.period.provider_period_end*1000-Date.now()+100)));
+ const s=nativeRecurringSource(f),b=s.original_period,span=f.pkg.membership_terms.stripe_recurrence.interval_count;
+ const paid=JSON.parse(sql("select to_jsonb(to_char(date_trunc('second',clock_timestamp()) at time zone 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'));"));
+ const p={version:'retail_existing_recurring_funding_proof_v1',agreement_id:f.id,client_id:f.client,
+  offer_version:STRIPE_RECURRING_OFFER_VERSION,provider_account_id:'acct_SYNTHETIC',livemode:false,currency:'usd',ordinal:1,
+  invoice_id:'in_CYCLE_'+f.id.replaceAll('-',''),line_id:'il_CYCLE_'+f.id.replaceAll('-',''),price_id:b.price_id,
+  subscription_id:b.subscription_id,subscription_item_id:b.subscription_item_id,customer_id:b.customer_id,
+  original_paid_at:b.paid_at,paid_at:paid,invoice_created:b.provider_period_end,provider_period_start:b.provider_period_end,
+  provider_period_end:Date.parse(anchoredMonthInstant(new Date(b.provider_period_start*1000).toISOString(),2*span))/1000,
+  platform_gross_cents:f.pkg.platform_fee_cents,platform_discount_cents:0,platform_net_cents:f.pkg.platform_fee_cents,
+  tax_cents:0,cash_cents:f.pkg.platform_fee_cents,payment_intent_id:'pi_CYCLE_'+f.id.replaceAll('-',''),charge_id:'ch_CYCLE_'+f.id.replaceAll('-','')};
+ return{f,s,p};
+}
+const cycleRecord=(x,p=x.p,s=x.s)=>'select record_retail_existing_paid_period('+[x.f.id,x.f.client,s,p].map(lit).join(',')+');';
+const coverageCall=f=>'select refresh_retail_existing_paid_coverage('+[f.id,f.client].map(lit).join(',')+');';
+test('NATIVE CYCLE actual original writer -> recurring receipt -> idempotent coverage preserves other records',opts,async()=>{
+ const x=await paidCycleFixture('monthly_installments',true),before=billingState(x.f),original=row(x.f).retail_funding_receipt;
+ const r=JSON.parse(sql('set role service_role;'+cycleRecord(x)));assert.equal(r.status,'recorded');
+ assert.deepEqual(r.receipt.proof,x.p);assert.equal(r.receipt.source_digest,sql(`select md5(${lit(x.s)}::text);`));
+ assert.equal(billingState(x.f),before);assert.deepEqual(row(x.f).retail_funding_receipt,original);
+ const again=JSON.parse(sql('set role service_role;'+cycleRecord(x)));assert.equal(again.status,'already_recorded');assert.deepEqual(again.receipt,r.receipt);
+ const c=JSON.parse(sql('set role service_role;'+coverageCall(x.f)));assert.equal(c.status,'refreshed');assert.equal(c.billing_status,'active');
+ assert.equal(c.contiguous_ordinal,1);assert.equal(Date.parse(c.contract_start_at),Date.parse(x.p.original_paid_at));
+ assert.equal(Date.parse(c.funded_through),Date.parse(anchoredMonthInstant(x.p.original_paid_at,2)));
+ assert.deepEqual(row(x.f).retail_funding_receipt,original);
+ denied('set role service_role;'+cycleRecord(x,{...x.p,platform_net_cents:x.p.platform_net_cents-1}),/retail_period_/);
+ denied(`set role service_role;update billing_invoices set retail_period_receipt=null where id=${lit(r.invoice_id)};`,/retail_period_receipt_immutable/);
+ denied(`set role service_role;delete from billing_invoices where id=${lit(r.invoice_id)};`,/retail_period_receipt_immutable/);
+ sql(`set role service_role;update billing_invoices set amount_total_cents=123,status='open' where id=${lit(r.invoice_id)};`);
+ const refreshed=JSON.parse(sql('set role service_role;'+coverageCall(x.f)));assert.equal(refreshed.billing_status,'active');
+ assert.equal(refreshed.contiguous_ordinal,1); // receipt, never mutable display cash.
+ sql(`update clients set manual_active_override=true,access_override_mode='force_inactive',billing_status='inactive' where id=${lit(x.f.client)};`);
+ const manualBefore=billingState(x.f),manual=JSON.parse(sql('set role service_role;'+coverageCall(x.f)));
+ assert.equal(manual.status,'manual_override');assert.equal(billingState(x.f),manualBefore);
+});
+test('NATIVE CYCLE zero invoices omit payment identity; existing row attach; foreign owner and replay conflicts hold',opts,async()=>{
+ const x=await paidCycleFixture('prepaid'),b=sql(`select id from billing_customers where client_id=${lit(x.f.client)};`);
+ const zero={...x.p,platform_discount_cents:x.p.platform_gross_cents,platform_net_cents:0,cash_cents:0,payment_intent_id:null,charge_id:null};
+ sql(`set role service_role;insert into billing_invoices(billing_customer_id,invoice_title,stripe_invoice_id,status)
+  values(${lit(b)},'Synthetic existing row',${lit(zero.invoice_id)},'draft');`);
+ const r=JSON.parse(sql('set role service_role;'+cycleRecord(x,zero)));assert.equal(r.status,'recorded');assert.equal(r.receipt.proof.cash_cents,0);
+ assert.equal(sql(`select count(*) from billing_invoices where stripe_invoice_id=${lit(zero.invoice_id)};`),'1');
+ assert.equal(JSON.parse(sql('set role service_role;'+cycleRecord(x,zero))).status,'already_recorded');
+ denied('set role service_role;'+cycleRecord(x,{...zero,line_id:'il_DIFFERENT'}),/retail_period_replay_conflict/);
+ const other=await paidCycleFixture('prepaid'),ob=sql(`select id from billing_customers where client_id=${lit(other.f.client)};`);
+ sql(`set role service_role;insert into billing_invoices(billing_customer_id,invoice_title,stripe_invoice_id)
+  values(${lit(b)},'Wrong synthetic owner',${lit(other.p.invoice_id)});`);
+ denied('set role service_role;'+cycleRecord(other),/retail_period_owner_conflict/);
+ sql(`set role service_role;update billing_invoices set billing_customer_id=${lit(ob)} where stripe_invoice_id=${lit(other.p.invoice_id)};`);
+ const otherZero={...other.p,platform_discount_cents:other.p.platform_gross_cents,platform_net_cents:0,cash_cents:0,payment_intent_id:null,charge_id:null};
+ assert.equal(JSON.parse(sql('set role service_role;'+cycleRecord(other,otherZero))).status,'recorded');
+ assert.equal(JSON.parse(sql('set role service_role;'+coverageCall(other.f))).contiguous_ordinal,1);
+});
+test('NATIVE CYCLE browser denial, future proof, old cohort and original identity refusal leave state unchanged',opts,async()=>{
+ const x=await paidCycleFixture(),before=billingState(x.f);
+ for(const role of ['anon','authenticated'])denied('set role '+role+';'+cycleRecord(x),/permission denied/);
+ for(const p of [{...x.p,paid_at:'2099-01-01T00:00:00.000Z'},
+  {...x.p,payment_intent_id:x.f.proof.payment_intent_id},{...x.p,charge_id:x.f.proof.charge_id},
+  {...x.p,invoice_id:x.f.proof.period.invoice_id},{...x.p,line_id:x.f.proof.period.platform_invoice_line_id}])
+  denied('set role service_role;'+cycleRecord(x,p),/retail_period_/);
+ const old=recurringSourceFixture();denied('set role service_role;'+coverageCall(old),/retail_period_source_denied/);
+ assert.equal(billingState(x.f),before);
+ assert.equal(sql(`select count(*) from billing_invoices where retail_period_receipt->'proof'->>'agreement_id'=${lit(x.f.id)};`),'0');
+});
+test('NATIVE CYCLE two real sessions serialize one identity and a changed proof rolls back after waiting',opts,async()=>{
+ const x=await paidCycleFixture(),q=cycleRecord(x),tag='cycle_'+x.f.id.replaceAll('-','');
+ const [a,b,blocked]=await Promise.all([
+  parallel(`set application_name=${lit(tag+'H')};set role service_role;begin;${q}select pg_sleep(0.8);commit;`),
+  parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;${q}`),
+  parallel(`select pg_sleep(0.35);select exists(select 1 from pg_stat_activity w join pg_stat_activity h on h.pid=any(pg_blocking_pids(w.pid))
+   where w.application_name=${lit(tag+'W')} and h.application_name=${lit(tag+'H')});`)
+ ]);
+ assert.equal(a.code,0,a.err);assert.equal(b.code,0,b.err);assert.ok(blocked.out.trim().endsWith('t'),blocked.out);
+ const parse=r=>JSON.parse(r.out.split('\n').find(s=>s.startsWith('{')));
+ assert.deepEqual(parse(a).receipt,parse(b).receipt);assert.deepEqual([parse(a).status,parse(b).status].sort(),['already_recorded','recorded']);
+ assert.equal(sql(`select count(*) from billing_invoices where retail_period_receipt->'proof'->>'agreement_id'=${lit(x.f.id)};`),'1');
+ const before=billingState(x.f),change={...x.p,line_id:'il_OTHER'};
+ const [holder,writer]=await Promise.all([
+  parallel('set role service_role;begin;'+q+'select pg_sleep(0.4);commit;'),
+  parallel('select pg_sleep(0.08);set role service_role;'+cycleRecord(x,change))
+ ]);
+ assert.equal(holder.code,0,holder.err);assert.notEqual(writer.code,0);assert.match(writer.err,/retail_period_replay_conflict/);
+ assert.equal(billingState(x.f),before);
+});
 const recurringSourceState=f=>sql(`select jsonb_build_object('agreement',(select to_jsonb(a) from membership_agreements a where id=${lit(f.id)}),
  'billing',(${billingStateQuery(f)}),'customer',(select to_jsonb(b) from billing_customers b where client_id=${lit(f.client)}));`);
 function billingStateQuery(f){return `select jsonb_build_object('client',(select to_jsonb(c) from clients c where id=${lit(f.client)}),

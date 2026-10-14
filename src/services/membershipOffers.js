@@ -4,6 +4,9 @@
 // legacy accepted agreements continue through their existing price contracts.
 // Quote creation is server-side; only selection keys come from a browser.
 const OFFER_VERSION = 'retail-terms-2026-10-11-v1';
+// The separate subscription policy retains Stripe's native billing schedule.
+// Do not change OFFER_VERSION: the older payment-mode executor pins that value.
+const STRIPE_RECURRING_OFFER_VERSION = 'retail-stripe-terms-2026-10-14-v2';
 const COMMITMENT_MONTHS = Object.freeze([3, 6, 12]);
 const PAYMENT_OPTIONS = Object.freeze(['prepaid', 'monthly_installments']);
 const CHANNELS = Object.freeze(['public', 'sales', 'admin']);
@@ -61,7 +64,7 @@ function whole(value, code) {
 
 function normalizeSelection({ planKey, commitmentMonths, paymentOption, channel, offerVersion } = {}) {
   if (!CHANNELS.includes(channel)) fail('invalid_offer_channel');
-  if (offerVersion !== OFFER_VERSION) fail('stale_offer_version');
+  if (![OFFER_VERSION,STRIPE_RECURRING_OFFER_VERSION].includes(offerVersion)) fail('stale_offer_version');
   const normalizedPlan = typeof planKey === 'string' ? planKey.trim().toLowerCase() : '';
   const plan = normalizedPlan === 'essential' ? 'basic' : normalizedPlan;
   if (!Object.hasOwn(RETAIL_TERMS, plan)) fail('invalid_retail_plan');
@@ -83,7 +86,7 @@ function buildRetailOffer(input = {}) {
   const firstRole = input.firstRolePrepaySelected === true ? pkg.first_role_prepay_price_cents : 0;
   return deepFreeze({
     schema_version: 2,
-    offer_version: OFFER_VERSION,
+    offer_version: input.offerVersion,
     offer_key: `${plan}-${months}-${paymentOption}`,
     plan_key: plan,
     display_name: pkg.display_name,
@@ -187,7 +190,7 @@ function assertRenewalPreferenceChange({ autoRenew, requestedAt, termStart, term
 }
 
 module.exports = {
-  OFFER_VERSION, COMMITMENT_MONTHS, PAYMENT_OPTIONS, RENEWAL_REMINDER_DAYS,
+  OFFER_VERSION, STRIPE_RECURRING_OFFER_VERSION, COMMITMENT_MONTHS, PAYMENT_OPTIONS, RENEWAL_REMINDER_DAYS,
   RETAIL_PRICES_CENTS, buildRetailOffer, listRetailOffers, anchoredMonthInstant,
   retailTermWindow, assertRenewalPreferenceChange
 };

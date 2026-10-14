@@ -4,6 +4,7 @@
 // agreement terms from our DB; provider metadata is never a price authority.
 const { readRetailPackageOffer } = require('../membershipPackageCompatibility');
 const { getRetailRenewalWindow } = require('./contractRenewals');
+const {STRIPE_RECURRING_OFFER_VERSION}=require('../membershipOffers');
 const TEMPLATE = 'membership_agreement_retail_terms_v2';
 function mismatch() { const e = new Error('retail_subscription_terms_mismatch'); e.code=e.message; throw e; }
 const id = value => typeof value === 'string' ? value : value?.id;
@@ -25,7 +26,8 @@ async function loadExistingRetailSubscriptionTerms({db, clientId, subscription} 
       || subscription?.metadata?.membership_pricing_version != null) mismatch();
     return null;
   }
-  if(agreement.client_id!==clientId || agreement.is_current!==true || agreement.status!=='signed'
+  if(agreement.client_id!==clientId || agreement.is_current!==true
+    || !(agreement.status==='signed'||offer.offer_version===STRIPE_RECURRING_OFFER_VERSION&&agreement.status==='active')
     || agreement.superseded_by_agreement_id || agreement.template_version!==TEMPLATE
     || agreement.template_snapshot.template_version!==TEMPLATE
     || agreement.membership_tier!==offer.plan_key

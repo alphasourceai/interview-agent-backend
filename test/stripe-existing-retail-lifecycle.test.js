@@ -143,7 +143,9 @@ test('wrong new subscription or accepted-source details refuse without commercia
     f=>{f.tables.membership_agreements.push(structuredClone(f.tables.membership_agreements[0]));}];
   for(const change of changes){const f=fixture();change(f);const {app,db}=load(f,'customer.subscription.updated',{
     eventOverride:{id:'sub_SYNTHETIC',customer:'cus_SYNTHETIC'}});
-    const result=await post(app);assert.equal(result.status,500,JSON.stringify(result.body));assert.equal(commercialWrites(db).length,0);}
+    const result=await post(app);
+    const duplicate=f.tables.membership_agreements.length>1;
+    assert.equal(result.status,duplicate?503:500,JSON.stringify(result.body));assert.equal(commercialWrites(db).length,0);}
 });
 
 test('new lifecycle provider failure stays retryable with no price/contract writes',async()=>{

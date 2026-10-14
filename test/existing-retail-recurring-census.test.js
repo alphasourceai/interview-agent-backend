@@ -163,5 +163,6 @@ test('installed SDK retains2023 read paths/query/header and all requests stay lo
 test('SDK census remains unmounted in every source extension', () => {
   function scan(dir) { return fs.readdirSync(dir, { withFileTypes: true }).flatMap(e => e.isDirectory() ? scan(path.join(dir, e.name)) : [path.join(dir, e.name)]); }
   assert.deepEqual(scan(path.join(__dirname, '../src')).filter(p => /\.(js|cjs|mjs|ts|tsx)$/.test(p)
-    && !p.endsWith('/existingRetailRecurringCensus.js') && fs.readFileSync(p, 'utf8').includes('existingRetailRecurringCensus')), []);
+    && !p.endsWith('/existingRetailRecurringCensus.js') && fs.readFileSync(p, 'utf8').includes('existingRetailRecurringCensus'))
+    .map(p=>path.basename(p)), ['existingRetailCheckoutFunding.js']);
 });

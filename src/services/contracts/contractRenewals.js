@@ -6,7 +6,8 @@
 
 const { supabaseAdmin } = require('../../clients/supabase');
 const { readRetailPackageOffer } = require('../membershipPackageCompatibility');
-const { retailTermWindow } = require('../membershipOffers');
+const { retailTermWindow,STRIPE_RECURRING_OFFER_VERSION } = require('../membershipOffers');
+const {refreshExistingRetailCoverage}=require('../existingRetailRecurringPayment');
 const { legacyContractAction } = require('./legacyContractActions');
 
 function invalidRetailRenewal() {
@@ -25,7 +26,8 @@ function getRetailRenewalWindow(client, agreement) {
   const original = new Date(agreement?.checkout_paid_at || NaN);
   const start = new Date(client?.contract_start_at || NaN);
   const end = new Date(client?.contract_end_at || NaN);
-  if (agreement.client_id !== client.id || agreement.is_current !== true || agreement.status !== 'signed'
+  if (agreement.client_id !== client.id || agreement.is_current !== true
+    || !(agreement.status==='signed'||offer.offer_version===STRIPE_RECURRING_OFFER_VERSION&&agreement.status==='active')
     || agreement.checkout_status !== 'paid' || agreement.superseded_by_agreement_id
     || agreement.template_version !== marker || snapshot.template_version !== marker
     || client.plan_tier !== offer.plan_key || agreement.membership_tier !== offer.plan_key
@@ -122,11 +124,11 @@ async function processContractRenewals(context = {}, dependencies = {}) {
 
       const oldEndDate = new Date(oldContractEnd)
       if (Number.isNaN(oldEndDate.getTime())) continue
-      if (oldEndDate.getTime() > nowMs) continue
-
-      summary.due += 1
+      const due=oldEndDate.getTime()<=nowMs;
+      if(due)summary.due += 1
 
       if (client?.manual_active_override === true) {
+        if(!due)continue;
         summary.skipped_manual_override += 1
         items.push({
           id: client.id,
@@ -145,6 +147,13 @@ async function processContractRenewals(context = {}, dependencies = {}) {
           .select('id,client_id,status,is_current,checkout_status,checkout_paid_at,membership_tier,billing_option,template_version,template_snapshot,superseded_by_agreement_id')
           .eq('client_id', client.id).eq('is_current', true).maybeSingle();
         if (agreementError) throw new Error(agreementError.message || 'renewal_agreement_read_failed');
+        if(agreement?.template_snapshot?.package_snapshot?.membership_terms?.offer_version===STRIPE_RECURRING_OFFER_VERSION){
+          const result=await refreshExistingRetailCoverage({db,agreementId:agreement.id,clientId:client.id});
+          summary.skipped_no_action+=1;
+          items.push({id:client.id,name:client.name||null,action:'paid_coverage_refreshed',detail:result.status,
+            contract_end_at_before:oldContractEnd});continue;
+        }
+        if(!due)continue;
         retailWindow = getRetailRenewalWindow(client, agreement);
       } catch (e) {
         summary.errors += 1;

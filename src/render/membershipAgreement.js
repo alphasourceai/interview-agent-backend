@@ -5,10 +5,15 @@ const path = require('path');
 const Handlebars = require('handlebars');
 const {readEnterprisePoolSnapshot,enterprisePoolCheckoutQuote}=require('../services/enterprisePoolSnapshot');
 const {readRetailPackageOffer}=require('../services/membershipPackageCompatibility');
+const {STRIPE_RECURRING_OFFER_VERSION}=require('../services/membershipOffers');
 
 const templatePath = path.join(__dirname, '..', '..', 'templates', 'pdf', 'membership-agreement.hbs');
 const templateSrc = fs.readFileSync(templatePath, 'utf8');
 const template = Handlebars.compile(templateSrc);
+// Regenerate earlier accepted agreements from their original body, never
+// silently move their cancellation deadline to a different billing policy.
+const nativeStripeTemplate=Handlebars.compile(fs.readFileSync(path.join(__dirname,'..','..','templates','pdf',
+  'membership-agreement-native-stripe.hbs'),'utf8'));
 
 const LOGO_FILENAME = 'No bg - color logo - dark text.png';
 
@@ -557,7 +562,7 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
   };
 
   return {
-    html: template(renderData),
+    html: (retailOffer?.offer_version===STRIPE_RECURRING_OFFER_VERSION?nativeStripeTemplate:template)(renderData),
     normalized,
     commercial_terms: enterpriseTerms
   };

@@ -21,6 +21,8 @@ const { applyUsageToInvoice } = require('../../services/usageBilling');
 const { fenceAcceptedEnterpriseUsageWriter } = require('../../services/acceptedEnterpriseUsageTerms');
 const { markPoolFailed, markPoolPaid } = require('../../services/interviewPool');
 const { loadExistingRetailSubscriptionTerms, assertExistingRetailSubscription } = require('../../services/contracts/subscriptionPricingTerms');
+const {STRIPE_RECURRING_OFFER_VERSION}=require('../../services/membershipOffers');
+const {completeExistingRetailRecurringPayment,refreshExistingRetailCoverage,classifyExistingRetailRecurringEvent}=require('../../services/existingRetailRecurringPayment');
 const { assertExistingRetailFundingSource } = require('../../services/existingRetailCheckoutFunding');
 const { readExistingRetailActivationFunding } = require('../../services/existingRetailActivationFunding');
 const { enterprisePoolProofRequired, assertExistingEnterprisePoolActivationAvailableFromDb } = require('../../services/existingEnterprisePoolActivationHold');
@@ -348,7 +350,8 @@ function buildClientSubscriptionUpdatesFromStripe(subscription, options = {}) {
       stripe_subscription_schedule_id: pickId(subscription.schedule) || null,
       subscription_status: subStatus || null,
       current_term_end: currentTermEnd,
-      billing_status: LIVE_SUB_STATUSES.has(subStatus) ? 'active' : 'inactive'
+      ...(options.retailTerms.offer.offer_version===STRIPE_RECURRING_OFFER_VERSION?{}:
+        {billing_status: LIVE_SUB_STATUSES.has(subStatus) ? 'active' : 'inactive'})
     };
   }
   const cancelAtTermEnd = subscription?.cancel_at_period_end === true;
@@ -820,10 +823,12 @@ router.post('/', async (req, res) => {
     }
   }
   let retryableAgreementEvent = false;
+  let retailRecurringEvent = null;
   let existingEnterprisePaymentEvent = null;
   try {
     retryableAgreementEvent = await isRetryableAgreementActivationEvent(event);
     existingEnterprisePaymentEvent = await classifyExistingEnterprisePaymentEvent({ db: supabaseAdmin, stripe, event });
+    if(!existingEnterprisePaymentEvent)retailRecurringEvent=await classifyExistingRetailRecurringEvent({db:supabaseAdmin,event});
     if (existingEnterprisePaymentEvent?.requiresReentry === true) retryableAgreementEvent = true;
   } catch (error) {
     return res.status(503).json({ error: 'server_error', code: 'AGREEMENT_EVENT_CLASSIFICATION_FAILED', request_id });
@@ -841,7 +846,7 @@ router.post('/', async (req, res) => {
 
   if (insertErr) {
     if (isUniqueViolation(insertErr)) {
-      if (!retryableAgreementEvent) return res.status(200).json({ ok: true });
+      if (!retryableAgreementEvent && !retailRecurringEvent?.requiresReentry) return res.status(200).json({ ok: true });
       const { data: priorEvent, error: priorEventError } = await supabaseAdmin
         .from('billing_events')
         .select('processed_ok')
@@ -878,6 +883,25 @@ router.post('/', async (req, res) => {
   };
 
   try {
+    if(retailRecurringEvent){
+      if(retailRecurringEvent.action==='held'){
+        const e=new Error('retail_recurring_event_held');e.code=e.message;throw e;
+      }
+      const {agreementId,clientId,subscriptionId,customerId}=retailRecurringEvent;
+      if(retailRecurringEvent.action==='paid'){
+        await completeExistingRetailRecurringPayment({db:supabaseAdmin,stripe,agreementId,clientId,invoiceId:pickId(eventObject.id)});
+      }else{
+        const context=await loadExistingRetailSubscriptionTerms({db:supabaseAdmin,clientId});
+        if(!context||context.pending||context.offer.offer_version!==STRIPE_RECURRING_OFFER_VERSION)throw new Error('retail_recurring_source_changed');
+        const current=await stripe.subscriptions.retrieve(subscriptionId);
+        const updates=buildClientSubscriptionUpdatesFromStripe(current,{fallbackCustomerId:customerId,fallbackSubscriptionId:subscriptionId,retailTerms:context});
+        const {data:updated,error:ue}=await guardRetailSubscriptionUpdate(supabaseAdmin.from('clients').update(updates).eq('id',clientId),context).select('id').maybeSingle();
+        if(ue||!updated?.id)throw new Error('retail_recurring_status_guard_changed');
+        await refreshExistingRetailCoverage({db:supabaseAdmin,agreementId,clientId});
+      }
+      if(event.type.startsWith('invoice.'))await syncBillingInvoiceFromStripeEvent(eventObject,request_id);
+      await markProcessed(true,null);return res.status(200).json({ok:true});
+    }
     if (existingEnterprisePaymentEvent?.action === 'held') {
       const error = new Error('enterprise_payment_lifecycle_review_required');
       error.code = error.message;
@@ -1496,7 +1520,7 @@ router.post('/', async (req, res) => {
       detail
     });
 
-    if (permanent || retryableAgreementEvent) {
+    if (permanent || retryableAgreementEvent || retailRecurringEvent?.requiresReentry) {
       try {
         await markProcessed(false, detail);
       } catch (markError) {
@@ -1505,6 +1529,7 @@ router.post('/', async (req, res) => {
     }
 
     // Redelivery cannot change a permanent failure, so its reason is recorded and acknowledged.
+    if (retailRecurringEvent?.requiresReentry) return res.status(503).json({error:'server_error',code:'RETAIL_RECURRING_RETRY_REQUIRED',request_id});
     if (permanent) return res.status(200).json({ ok: true });
 
     // A paid agreement that did not activate keeps its dedupe row, marked incomplete, and

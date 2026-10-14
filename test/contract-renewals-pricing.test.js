@@ -7,6 +7,7 @@ require.cache[clientPath] = { id:clientPath, filename:clientPath, loaded:true, e
 const { processContractRenewals, getRetailRenewalWindow } = require('../src/services/contracts/contractRenewals');
 const { buildRetailPackageSnapshot } = require('../src/services/membershipPackageCompatibility');
 const { OFFER_VERSION, retailTermWindow } = require('../src/services/membershipOffers');
+const {STRIPE_RECURRING_OFFER_VERSION}=require('../src/services/membershipOffers');
 
 const ORIGINAL = '2026-01-31T12:13:14.000Z';
 const TEMPLATE = 'membership_agreement_retail_terms_v2';
@@ -83,6 +84,19 @@ test('accepted 3/6/12 prepaid and installment renewals keep the original UTC anc
     assert.equal(next.term_end_at,retailTermWindow({originalStart:ORIGINAL,commitmentMonths:months,termIndex:index+1}).term_end_at);
   }
   const f=fixture(3); assert.equal(getRetailRenewalWindow(f.client,f.agreement).term_end_at,'2026-07-31T12:13:14.000Z');
+});
+
+test('new native billing coverage is refreshed before in-term monthly expiry; old scanner behavior is retained',async()=>{
+  const f=fixture(3,'monthly_installments'),s=f.agreement.template_snapshot.package_snapshot;
+  s.pricing_version=STRIPE_RECURRING_OFFER_VERSION;s.membership_terms.offer_version=STRIPE_RECURRING_OFFER_VERSION;
+  const db=makeDb(f),calls=[];
+  db.rpc=async(name,args)=>{calls.push({name,args});assert.equal(name,'refresh_retail_existing_paid_coverage');
+    return{data:{status:'refreshed',billing_status:'inactive',contiguous_ordinal:0},error:null};};
+  const result=await processContractRenewals({},deps(db,'2026-02-28T12:13:14.000Z'));
+  assert.equal(result.summary.due,0);assert.equal(calls.length,1);assert.equal(result.items[0].action,'paid_coverage_refreshed');
+  assert.deepEqual(db.subscriptionWrites,[]);assert.deepEqual(db.writes,[]);
+  const old=makeDb(fixture(3,'monthly_installments'));const prior=await processContractRenewals({},deps(old,'2026-02-28T12:13:14.000Z'));
+  assert.equal(prior.summary.due,0);assert.deepEqual(old.writes,[]);assert.deepEqual(old.subscriptionWrites,[]);
 });
 
 test('held retail renewal retains accepted historical prices without advancing dates',async()=>{
