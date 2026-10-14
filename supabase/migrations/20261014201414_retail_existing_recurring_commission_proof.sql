@@ -47,7 +47,7 @@ begin
       then raise exception 'native_commission_invoice_identity_required';end if;
     select id into strict owner_profile from public.billing_customers
       where client_id=q.client_id and stripe_customer_id=s->'original_period'->>'customer_id';
-    perform 1 from public.billing_invoices where stripe_invoice_id=lookup order by id for share;
+    perform 1 from public.billing_invoices where stripe_invoice_id=lookup order by id for share nowait;
     if lookup=s->'original_period'->>'invoice_id' then
       w:=a.retail_funding_receipt;
       if w->>'version' is distinct from 'retail_existing_funding_v1'

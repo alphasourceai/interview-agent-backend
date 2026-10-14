@@ -361,6 +361,19 @@ test('NATIVE COMMISSION proof census refuses concurrent writers without partial 
  sql('set role service_role;'+commissionInsert(r));
  assert.equal(sql(`select count(*) from sales_commission_receipts where purchase_intent_id=${lit(f.intent)};`),'1');
 });
+test('NATIVE COMMISSION matched invoice row FOR UPDATE cannot cause an unbounded wait or partial admission',commissionOpts,async()=>{
+ const f=fixture('basic',3,'prepaid',false,true,false,'admin','sales_assisted','native-commission-row-lock@example.invalid',{offerVersion:STRIPE_RECURRING_OFFER_VERSION});
+ commissionRep(f);record(f);nativeComplete(f);nativeBilling(f);const r=commissionRow(f),invoice=crypto.randomUUID();
+ sql(`insert into billing_invoices(id,billing_customer_id,invoice_title,stripe_invoice_id,status)
+  select ${lit(invoice)},id,'SYNTHETIC row-lock placeholder',${lit(f.proof.period.invoice_id)},'paid' from billing_customers where client_id=${lit(f.client)};`);
+ const [holder,writer]=await Promise.all([
+  parallel(`set role service_role;begin;select id from billing_invoices where id=${lit(invoice)} for update;select pg_sleep(0.7);commit;`),
+  parallel(`select pg_sleep(0.15);set role service_role;${commissionInsert(r)}`)]);
+ assert.equal(holder.code,0,holder.err);assert.notEqual(writer.code,0);assert.match(writer.err,/could not obtain lock on row/);
+ assert.equal(sql(`select count(*) from sales_commission_receipts where purchase_intent_id=${lit(f.intent)};`),'0');
+ sql('set role service_role;'+commissionInsert(r));
+ assert.equal(sql(`select count(*) from sales_commission_receipts where purchase_intent_id=${lit(f.intent)};`),'1');
+});
 const coverageCall=f=>'select refresh_retail_existing_paid_coverage('+[f.id,f.client].map(lit).join(',')+');';
 
 const renewalCall=(f,s,action,{auto=null,op=null,generation=null,observation=null}={})=>
