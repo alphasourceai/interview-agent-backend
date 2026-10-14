@@ -700,7 +700,7 @@ test('real SDK/native commit with lost ACK and subsequent refund replays origina
 // Real installed current SDK GET -> real native admin CLIENT-write seam. The
 // initial receipt/CAS here are actual previously-tested native synthetic paths,
 // not a live provider money claim. No historical money reproof on this retry.
-async function adminSdkBridge(plan='basic',months=3,payment='prepaid',role=false){
+async function adminSdkBridge(plan='basic',months=3,payment='prepaid',role=false,fullBilling=false){
  const http=require('node:http'),Stripe=require('stripe');
  const f=fixture(plan,months,payment,role,false);record(f);markAdminPaid(f);adminInitial(f);
  const p=f.proof,requests=[],writes=[],reads=[];
@@ -719,14 +719,14 @@ async function adminSdkBridge(plan='basic',months=3,payment='prepaid',role=false
    if(name==='read_retail_existing_funding'){
     reads.push(structuredClone(a));q='select read_retail_existing_funding('+[a.p_agreement,a.p_client,a.p_claim,a.p_source].map(lit).join(',')+');';
    }else{
-    assert.equal(name,'apply_retail_existing_admin_client');writes.push(structuredClone(a));
+    assert.equal(name,fullBilling?'apply_retail_existing_admin_billing':'apply_retail_existing_admin_client');writes.push(structuredClone(a));
     await hooks.beforeApply?.(a);
-    q='select apply_retail_existing_admin_client('+[a.p_agreement,a.p_client,a.p_source,a.p_funding,a.p_initial,a.p_subscription].map(lit).join(',')+');';
+    q='select '+name+'('+[a.p_agreement,a.p_client,a.p_source,a.p_funding,a.p_initial,a.p_subscription].map(lit).join(',')+');';
    }
    const r=run('set role service_role;'+q);
    if(r.status!==0)return{data:null,error:{message:(r.stderr.match(/ERROR:\s+([^\n]+)/)||[])[1]||'native synthetic error'}};
    const data=JSON.parse(r.stdout.trim());
-   if(name==='apply_retail_existing_admin_client')return hooks.afterApply?await hooks.afterApply(data):{data,error:null};
+   if(name==='apply_retail_existing_admin_client'||name==='apply_retail_existing_admin_billing')return hooks.afterApply?await hooks.afterApply(data,writes.length):{data,error:null};
    return hooks.afterRead?await hooks.afterRead(data,reads.length):{data,error:null};}};
  const server=http.createServer((req,res)=>{requests.push({method:req.method,path:req.url,version:req.headers['stripe-version']});let body;
   if(req.method==='GET'&&req.url==='/v1/account')body={object:'account',id:p.provider_account_id};
@@ -736,10 +736,11 @@ async function adminSdkBridge(plan='basic',months=3,payment='prepaid',role=false
   res.setHeader('content-type','application/json');res.end(JSON.stringify(body));});
  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
  const stripe=new Stripe('sk_test_SYNTHETIC_NO_PROVIDER',{apiVersion:'2023-10-16',host:'127.0.0.1',port:server.address().port,protocol:'http',maxNetworkRetries:0});
- const {applyExistingRetailAdminClient}=require('../src/services/existingRetailAdminClientAdapter');
+ const applyAdapter=fullBilling?require('../src/services/existingRetailAdminBillingAdapter').applyExistingRetailAdminBilling
+  :require('../src/services/existingRetailAdminClientAdapter').applyExistingRetailAdminClient;
  const options={db,stripe,agreementId:f.id,eventSessionId:checkout.id,eventLivemode:false};
  return{f,current,checkout,hooks,db,requests,writes,reads,options,
-  apply:patch=>applyExistingRetailAdminClient({...options,...patch}),close:()=>new Promise(resolve=>server.close(resolve))};
+  apply:patch=>applyAdapter({...options,...patch}),close:()=>new Promise(resolve=>server.close(resolve))};
 }
 for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])for(const role of [false,true])
 test(`admin current SDK -> native client ACK/readback ${plan}/${months}/${payment}/role:${role}`,opts,async()=>{
@@ -1049,4 +1050,184 @@ test('native JSONb numeric scale equivalence is exact, not an amount comparison 
 test('admin atomic native boundary refuses unknown non-admin source despite a valid native receipt',opts,()=>{
  const f=fixture('pro',6,'prepaid',true,false,false,'unknown_source');record(f);markAdminPaid(f);
  const before=adminOnceState(f);denied('set role service_role;'+adminOnceCall(f),/retail_admin_billing_source_denied/);assert.equal(adminOnceState(f),before);
+});
+
+// Full adapter uses the installed SDK16/API2023 and actual native atomic RPC,
+// never the earlier client-only adapter. No hosted/provider/Auth claim.
+const fullAdminBridge=(...args)=>adminSdkBridge(...args,true);
+for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])for(const role of [false,true])
+test(`admin full SDK/native billing ACK/readback ${plan}/${months}/${payment}/role:${role}`,opts,async()=>{
+ const b=await fullAdminBridge(plan,months,payment,role);
+ try{
+  const before=row(b.f),result=await b.apply();assert.equal(result.status,'applied');assert.equal(result.billing_applied,true);
+  assert.equal(result.membership_activation_required,true);assert.equal(result.credits_spendable,false);
+  assert.ok(Object.isFrozen(result)&&Object.isFrozen(result.receipt)&&Object.isFrozen(result.currentProviderSubscription));
+  assert.deepEqual(result.receipt,row(b.f).retail_admin_billing_receipt);assert.deepEqual(result.receipt.client_initial,adminInitial(b.f));
+  assert.equal(row(b.f).checkout_paid_at,before.checkout_paid_at);assert.deepEqual(row(b.f).retail_funding_receipt,before.retail_funding_receipt);
+  const data=JSON.parse(billingState(b.f));assert.equal(data.intent,null);assert.equal(data.plan.platform_fee,b.f.pkg.platform_fee);
+  assert.equal((data.credits||[]).length,role?1:0);const state=adminOnceState(b.f);
+  const retry=await b.apply();assert.equal(retry.status,'already_applied');assert.deepEqual(retry.receipt,result.receipt);
+  assert.equal(adminOnceState(b.f),state);assert.equal(b.writes.length,4);assert.equal(b.reads.length,6);
+  assert.equal(b.requests.length,8);assert.ok(b.requests.every(r=>r.method==='GET'&&r.version==='2023-10-16'));
+ }finally{await b.close();}
+});
+test('full SDK initial billing refuses current inactive/canceled/paused/newer state without financial DML',opts,async()=>{
+ for(const patch of [{status:'canceled'},{status:'trialing'},{status:'past_due'},{cancel_at_period_end:true},{cancel_at:2000000000},
+  {pause_collection:{behavior:'keep_as_draft'}},{current_period_end:1},{current_period_end:2000000000.5},{current_period_end:undefined}]){
+  const b=await fullAdminBridge('basic',3,'prepaid',false);try{
+   Object.assign(b.current,patch);const before=adminOnceState(b.f);await assert.rejects(b.apply(),{code:'retail_admin_billing_adapter_subscription_unknown'});
+   assert.equal(b.writes.length,0);assert.equal(adminOnceState(b.f),before);
+  }finally{await b.close();}
+ }
+ const b=await fullAdminBridge('basic',3,'prepaid',false);try{
+  b.current.current_period_end+=1;const before=adminOnceState(b.f);await assert.rejects(b.apply(),{code:'retail_admin_billing_adapter_subscription_unknown'});
+  assert.equal(b.writes.length,0);assert.equal(adminOnceState(b.f),before);
+ }finally{await b.close();}
+});
+test('full SDK historical replay keeps actual newer/inactive/cancel/pause subscription separate and never resets preferences/settings/used credit',opts,async()=>{
+ const b=await fullAdminBridge('pro',6,'monthly_installments',true);try{
+  const first=await b.apply(),w=first.receipt;
+  const usedRole=crypto.randomUUID();
+  sql(`set role service_role;insert into roles(id,client_id,title,slug_or_token) values(${lit(usedRole)},${lit(b.f.client)},'Synthetic full SDK credit use',${lit('SYNTHETIC_'+usedRole)});
+   update clients set auto_renew=false,cancel_at_term_end=true,current_term_end=current_term_end+interval '1 month' where id=${lit(b.f.client)};
+   update client_plan_settings set platform_fee=123,billing_model='usage' where client_id=${lit(b.f.client)};
+   update client_role_credits set status='used',used_at=clock_timestamp(),used_by_role_id=${lit(usedRole)} where id=${lit(w.credit_id)};`);
+  const state=adminOnceState(b.f);
+  for(const patch of [{current_period_end:b.current.current_period_end+90000},{status:'canceled',cancel_at_period_end:true,cancel_at:2000000000},
+   {status:'past_due',pause_collection:{behavior:'keep_as_draft'}}]){
+   Object.assign(b.current,patch);const r=await b.apply();assert.equal(r.status,'already_applied');assert.deepEqual(r.receipt,w);
+   assert.deepEqual(r.currentProviderSubscription,b.current);assert.equal(r.credits_spendable,false);assert.equal(r.membership_activation_required,true);
+   assert.equal(adminOnceState(b.f),state);
+  }
+  sql(`set role service_role;delete from client_role_credits where id=${lit(w.credit_id)};delete from client_plan_settings where client_id=${lit(b.f.client)};`);
+  const deleted=adminOnceState(b.f);assert.equal((await b.apply()).status,'already_applied');assert.equal(adminOnceState(b.f),deleted);
+ }finally{await b.close();}
+});
+test('full SDK historical expiry verifies billing without claiming current access; first write expiry is terminal',opts,async()=>{
+ const b=await fullAdminBridge('basic',3,'prepaid',false),now=Date.now;
+ try{
+  const first=await b.apply(),state=adminOnceState(b.f);Date.now=()=>b.current.current_period_end*1000+1000;
+  const r=await b.apply();assert.equal(r.status,'already_applied');assert.deepEqual(r.receipt,first.receipt);assert.equal(adminOnceState(b.f),state);
+  assert.equal(r.membership_activation_required,true);assert.equal(r.credits_spendable,false);
+ }finally{Date.now=now;await b.close();}
+ const p=await fullAdminBridge('basic',3,'prepaid',false);
+ try{Date.now=()=>p.current.current_period_end*1000+1000;const before=adminOnceState(p.f);
+  await assert.rejects(p.apply(),e=>e.code==='retail_admin_billing_adapter_period_ended'&&e.status===410&&e.permanentFailure===true);
+  assert.equal(p.writes.length,0);assert.equal(adminOnceState(p.f),before);
+ }finally{Date.now=now;await p.close();}
+});
+test('full SDK billing lost or malformed ACK preserves native commit and recovers once with no duplicate credit',opts,async()=>{
+ for(const bad of ['lost','extra','empty','status','receipt','plan','credit','timestamp']){
+  const b=await fullAdminBridge('pro',6,'prepaid',true);try{
+   b.hooks.afterApply=async data=>{
+    if(bad==='lost')throw Error('private provider details must not leak');
+    const r=structuredClone(data);
+    if(bad==='extra')r.extra=true;if(bad==='empty')return{data:null,error:null};if(bad==='status')r.status='unknown';
+    if(bad==='receipt')r.receipt.extra=true;if(bad==='plan')r.receipt.plan_initial.platform_fee+=1;
+    if(bad==='credit')r.receipt.credit_initial.metadata.expires=true;if(bad==='timestamp')r.receipt.applied_at='2099-01-01T00:00:00.000000Z';
+    return{data:r,error:null};};
+   await assert.rejects(b.apply(),e=>/^retail_admin_billing_adapter_/.test(e.code)&&e.status===503&&!e.message.includes('private'));
+   const state=adminOnceState(b.f);assert.ok(row(b.f).retail_admin_billing_receipt);assert.equal(JSON.parse(billingState(b.f)).credits.length,1);
+   delete b.hooks.afterApply;assert.equal((await b.apply()).status,'already_applied');assert.equal(adminOnceState(b.f),state);
+  }finally{await b.close();}
+ }
+});
+test('full SDK financial receipt strictness refuses tampered historical initial data before native replay',opts,async()=>{
+ for(const field of ['source','subscription','client','plan','credit','id','stamp','keys']){
+  const b=await fullAdminBridge('pro',6,'prepaid',true);try{
+   await b.apply();b.writes.length=0;
+   b.hooks.afterRows=(table,data)=>table!=='membership_agreements'?data:data.map(a=>{
+    const r=structuredClone(a.retail_admin_billing_receipt);
+    if(field==='source')r.source.customer_id='cus_OTHER';if(field==='subscription')r.subscription.status='canceled';
+    if(field==='client')r.client_initial.auto_renew=false;if(field==='plan')r.plan_initial.rollover_days=91;
+    if(field==='credit')r.credit_initial.discounted_credit_amount_cents+=1;if(field==='id')r.credit_id='wrong';
+    if(field==='stamp')r.applied_at='2026-02-30T00:00:00.000001Z';if(field==='keys')r.extra=true;
+    return{...a,retail_admin_billing_receipt:r};});
+   const state=adminOnceState(b.f);await assert.rejects(b.apply(),{code:'retail_admin_billing_adapter_receipt_unknown'});
+   assert.equal(b.writes.length,0);assert.equal(adminOnceState(b.f),state);
+  }finally{await b.close();}
+ }
+});
+test('full SDK financial receipt preserves original sticky model and omitted Basic rollover',opts,async()=>{
+ for(const plan of ['basic','pro'])for(const model of ['fixed','rollover','usage']){
+  const b=await fullAdminBridge(plan,3,'prepaid',false);try{
+   sql(`set role service_role;insert into client_plan_settings(client_id,plan_tier,billing_interval,platform_fee,per_role_fee,
+    included_interviews_per_role,additional_interview_fee,max_interview_minutes,billing_model,rollover_days,usage_interview_fee_cents)
+    values(${lit(b.f.client)},${lit(plan)},'monthly',123,699,30,30,12,${lit(model)},45,456);`);
+   const r=await b.apply();assert.equal(r.receipt.plan_initial.billing_model,model);assert.equal(r.receipt.plan_initial.rollover_days,plan==='pro'?90:45);
+   assert.equal(JSON.parse(billingState(b.f)).plan.usage_interview_fee_cents,456);
+   const state=adminOnceState(b.f);assert.equal((await b.apply()).status,'already_applied');assert.equal(adminOnceState(b.f),state);
+  }finally{await b.close();}
+ }
+});
+test('full SDK refuses unpaid Checkout or wrong invoice/session without native billing and preserves lost-fence sentinel',opts,async()=>{
+ const b=await fullAdminBridge('basic',3,'prepaid',false);try{
+  const before=adminOnceState(b.f);b.checkout.payment_status='unpaid';await assert.rejects(b.apply(),{code:'retail_admin_billing_adapter_checkout_unknown'});
+  b.checkout.payment_status='paid';b.checkout.invoice='in_OTHER';await assert.rejects(b.apply(),e=>/^retail_/.test(e.code));
+  b.checkout.invoice=b.f.proof.period.invoice_id;await assert.rejects(b.apply({eventSessionId:'cs_OTHER'}),{code:'retail_admin_billing_adapter_unknown'});
+  assert.equal(b.writes.length,0);assert.equal(adminOnceState(b.f),before);
+  const sentinel=Object.assign(Error('guard lost'),{code:'public_purchase_activation_guard_lost'});
+  await assert.rejects(b.apply({assertFence:async()=>{throw sentinel;}}),e=>e===sentinel);
+ }finally{await b.close();}
+});
+test('full SDK requires persisted exact marker before second native no-op and locked current owner readback',opts,async()=>{
+ for(const mode of ['marker-missing','marker-extra','archive','customer','second-applied','read-extra']){
+  const b=await fullAdminBridge('basic',3,'prepaid',false);try{
+   b.hooks.afterApply=async(data,count)=>{
+    if(count===1&&['archive','customer'].includes(mode))sql(`set role service_role;update clients set ${mode==='archive'?'archived_at=clock_timestamp()':"stripe_customer_id='cus_OTHER'"} where id=${lit(b.f.client)};`);
+    return{data:count===2&&mode==='second-applied'?{...data,status:'applied'}:data,error:null};};
+   b.hooks.afterRows=(table,data)=>table!=='membership_agreements'||!b.writes.length?data:data.map(a=>mode==='marker-missing'
+    ?{...a,retail_admin_billing_receipt:null}:mode==='marker-extra'?{...a,retail_admin_billing_receipt:{...a.retail_admin_billing_receipt,extra:true}}:a);
+   if(mode==='read-extra')b.hooks.afterRead=(data,count)=>({data:count===3?{...data,extra:true}:data,error:null});
+   await assert.rejects(b.apply(),e=>/^retail_admin_billing_adapter_/.test(e.code));
+   assert.equal(b.writes.length,mode==='second-applied'?2:1);assert.ok(row(b.f).retail_admin_billing_receipt);
+  }finally{await b.close();}
+ }
+});
+test('full SDK native source/owner/credit conflicts are terminal and prerequisite drift stays retryable without DML',opts,async()=>{
+ for(const mode of ['archive','credit','helper']){
+  const b=await fullAdminBridge('pro',3,'prepaid',false);let definition;
+  try{
+   b.hooks.beforeApply=()=>{
+    if(mode==='archive')sql(`set role service_role;update clients set archived_at=clock_timestamp() where id=${lit(b.f.client)};`);
+    if(mode==='credit')sql(`insert into client_role_credits(billing_client_id,source_client_id,source_membership_agreement_id,source_stripe_checkout_session_id,
+      credit_type,membership_key,normal_role_fee_cents,discounted_credit_amount_cents,discount_percent,status)
+      values(${[b.f.client,b.f.client,b.f.id,b.f.proof.period.checkout_session_id,'first_role_prepay','pro',69900,62900,10,'unused'].map(lit).join(',')});`);
+    if(mode==='helper'){definition=sql("select pg_get_functiondef('retail_existing_package(jsonb)'::regprocedure);");
+     sql(definition.replace(/\nAS \$function\$\n/,'\nAS $function$\n -- adapter drift\n'));}};
+   await assert.rejects(b.apply(),e=>e.code===(mode==='helper'?'retail_admin_billing_adapter_ack_unknown':'retail_admin_billing_adapter_conflict')
+    &&e.status===(mode==='helper'?503:409));assert.equal(row(b.f).retail_admin_billing_receipt,null);
+   assert.equal(JSON.parse(billingState(b.f)).client.contract_start_at,null);
+  }finally{if(definition)sql(definition);await b.close();}
+ }
+});
+test('full SDK adapter leaves legacy/linked/non-admin/missing cohorts untouched and requires paid CAS',opts,async()=>{
+ const b=await fullAdminBridge('basic',3,'prepaid',false);try{
+  const linked=fixture();record(linked);const other=fixture('pro',6,'prepaid',true,false,false,'unknown_source');record(other);markAdminPaid(other);
+  for(const agreementId of [legacyId,historicalV2.id,linked.id,other.id,crypto.randomUUID()])assert.equal(await b.apply({agreementId}),null);
+  assert.equal(b.requests.length,0);assert.equal(b.writes.length,0);
+  const pending=fixture('basic',3,'prepaid',false,false);record(pending);await assert.rejects(b.apply({agreementId:pending.id}),{code:'retail_admin_billing_adapter_source_unknown'});
+  assert.equal(b.requests.length,0);assert.equal(b.writes.length,0);
+ }finally{await b.close();}
+});
+test('full SDK completes an existing exact client-only partial tuple atomically without calling client-only SDK adapter',opts,async()=>{
+ const b=await fullAdminBridge('pro',12,'monthly_installments',true);try{
+  nativeAdmin(b.f);assert.equal(row(b.f).retail_admin_billing_receipt,null);assert.equal(JSON.parse(billingState(b.f)).plan,null);
+  const r=await b.apply();assert.equal(r.status,'applied');assert.equal(JSON.parse(billingState(b.f)).credits.length,1);
+  assert.equal(b.writes.length,2);const state=adminOnceState(b.f);assert.equal((await b.apply()).status,'already_applied');assert.equal(adminOnceState(b.f),state);
+ }finally{await b.close();}
+});
+test('full SDK second locked financial readback catches owner loss after the ordinary client read',opts,async()=>{
+ const b=await fullAdminBridge('basic',3,'prepaid',false);try{
+  b.hooks.beforeApply=()=>{if(b.writes.length===2)sql(`set role service_role;update clients set archived_at=clock_timestamp() where id=${lit(b.f.client)};`);};
+  await assert.rejects(b.apply(),e=>e.code==='retail_admin_billing_adapter_conflict'&&e.status===409&&e.permanentFailure===true);
+  assert.equal(b.writes.length,2);assert.ok(row(b.f).retail_admin_billing_receipt);
+  assert.equal(JSON.parse(billingState(b.f)).plan.platform_fee,b.f.pkg.platform_fee);
+ }finally{await b.close();}
+});
+test('full admin billing SDK adapter remains absent from mounted application imports',()=>{
+ const root=path.resolve(__dirname,'../src');function scan(dir){for(const entry of fs.readdirSync(dir,{withFileTypes:true})){
+  const file=path.join(dir,entry.name);if(entry.isDirectory())scan(file);
+  else if(file.endsWith('.js')&&!file.endsWith('/existingRetailAdminBillingAdapter.js'))assert.ok(!fs.readFileSync(file,'utf8').includes('existingRetailAdminBillingAdapter'),file);
+ }}scan(root);
 });
