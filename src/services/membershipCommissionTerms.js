@@ -122,6 +122,7 @@ async function loadExistingRetailCommissionTerms(db, supplied) {
     || q.payment_kind!==(offer.payment_option==='prepaid'?'paid_in_full':'monthly')) fail('invalid_membership_commission_snapshot');
   return {
     repUserId:q.rep_user_id,paymentKind:q.payment_kind,platformPaymentCents:q.platform_cap_cents,
+    offerVersion:offer.offer_version,
     qualificationClosedAt:close,firstTermStartAt:start,firstTermEndAt:end,
     policyInput:{membership_terms_protocol:'retail_existing_terms_v2',original_membership_start_at:start,
       original_commitment_months:offer.commitment_months,original_salesperson_user_id:q.rep_user_id,sales_rep_user_id:q.rep_user_id,

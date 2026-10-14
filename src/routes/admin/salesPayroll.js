@@ -4,6 +4,8 @@ const express = require('express');
 const { fromZonedTime } = require('date-fns-tz');
 const { calculateReceiptCommission, weekRangeForTimestamp } = require('../../services/salesCommissionPolicy');
 const { loadMembershipCommissionTerms } = require('../../services/membershipCommissionTerms');
+const { STRIPE_RECURRING_OFFER_VERSION } = require('../../services/membershipOffers');
+const { loadExistingRetailCommissionPayment, assertCommissionPaymentInput } = require('../../services/existingRetailCommissionPaymentProof');
 const { parseMercuryPayrollCsv } = require('../../services/mercuryPayrollCsv');
 const { loadSalesPayrollReport } = require('../../services/salesPayrollReportQuery');
 const { buildSalesPayrollWorkbook } = require('../../services/salesPayrollWorkbook');
@@ -80,6 +82,13 @@ function safeError(res, error) {
   if (error?.code === '23505') return res.status(409).json({ error: 'duplicate_ledger_record' });
   if (error?.code === '23514') return res.status(409).json({ error: 'commission_ledger_constraint' });
   if (error?.code === 'P0001') {
+    const native = String(error.message || '');
+    if (/^retail_recurring_source_(?:schema_|prerequisite_|trigger_|server_)/.test(native))
+      return res.status(503).json({ error: 'sales_payroll_unavailable' });
+    if (native === 'native_commission_proof_conflict' || native === 'outside_original_first_year')
+      return res.status(422).json({ error: native });
+    if (/^native_commission_(?:proof_|invoice_identity_|foreign_invoice)/.test(native) || /^retail_recurring_source_/.test(native))
+      return res.status(409).json({ error: 'native_commission_proof_unavailable' });
     const known = new Set(['ach_before_following_tuesday', 'source_statement_not_locked', 'adjustment_statement_not_locked',
       'commission_payout_exceeds_unpaid_verified_source', 'representative_has_unrecovered_commission_debit',
       'bank_import_collision', 'bank_allocation_rep_mismatch', 'invalid_bank_import', 'invalid_bank_allocations',
@@ -223,7 +232,7 @@ function createAdminSalesPayrollRouter({ db } = {}) {
       const provider = String(body.provider || '');
       const paymentKind = String(body.payment_kind || '');
       if (!PROVIDERS.has(provider) || !PAYMENT_KINDS.has(paymentKind)) throw failure('invalid_payment_source');
-      const paymentId = requiredText(body.provider_payment_id, 'provider_payment_id', 200);
+      let paymentId = requiredText(body.provider_payment_id, 'provider_payment_id', 200);
       const evidence = requiredText(body.evidence_reference, 'evidence_reference');
       const gross = nonnegativeCents(body.gross_membership_cents, 'gross_membership_cents');
       const discount = nonnegativeCents(body.discount_cents, 'discount_cents');
@@ -238,6 +247,11 @@ function createAdminSalesPayrollRouter({ db } = {}) {
       if (!membership && (intent.status !== 'completed' || intent.channel !== 'sales_assisted' || !intent.created_by_user_id || !intent.activated_at)) throw failure('unverified_qualifying_sale');
       const client = await one(db, 'clients', 'id,billing_status,subscription_status', 'id', intent.client_id);
       if (!isActiveClient(client)) throw failure('client_not_active');
+      if (membership?.offerVersion === STRIPE_RECURRING_OFFER_VERSION) {
+        const proof = await loadExistingRetailCommissionPayment(db, intent, paymentId);
+        assertCommissionPaymentInput(proof, { gross, discount, paymentAt });
+        paymentId = proof.provider_payment_id;
+      }
       const cadence = String(intent.selected_billing_cadence || '').toLowerCase();
       if (membership ? paymentKind !== membership.paymentKind || provider !== 'stripe' : !((cadence === 'monthly' && paymentKind === 'monthly') ||
         (cadence === 'annual' && (paymentKind === 'paid_in_full' || paymentKind === 'financed_checkout')))) {

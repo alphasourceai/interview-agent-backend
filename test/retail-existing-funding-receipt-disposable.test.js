@@ -98,6 +98,12 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014165458_retail_existing_recurring_source_read.sql'),'utf8'));
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014181400_retail_existing_recurring_invoice_receipts.sql'),'utf8'));
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014185906_retail_existing_renewal_preference.sql'),'utf8'));
+ if(process.env.RETAIL_NATIVE_COMMISSION_PROOF==='true'){
+  // Verified read-only on dev: existing Supabase extensions USAGE + digest
+  // EXECUTE. Schema-only export omits this external-schema baseline grant.
+  sql('grant usage on schema extensions to service_role;');
+  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014201414_retail_existing_recurring_commission_proof.sql'),'utf8'));
+ }
  const changedFunctions=JSON.parse(linkedOriginalFunctions()),actualHash=sql("select md5(prosrc) from pg_proc where proname='apply_public_purchase_billing';");
  assert.equal(actualHash,replacementBillingBodyHash);
  for(const [index,prior] of originalFunctions.entries()){
@@ -228,9 +234,10 @@ const recurringSourceCall=f=>'select read_retail_existing_recurring_source('+[f.
 const nativeRecurringSource=f=>JSON.parse(sql('set role service_role;'+recurringSourceCall(f)));
 // Current A and a genuinely elapsed, authored B boundary. These fixtures
 // exercise native writers, NOT actual Stripe schedule geometry or time travel.
-async function paidCycleFixture(payment='monthly_installments',role=false,{waitForB=true}={}){
- const f=fixture('basic',3,payment,role,true,false,'admin','sales_assisted','buyer@example.invalid',
+async function paidCycleFixture(payment='monthly_installments',role=false,{waitForB=true,beforeActivation=null,buyerEmail='buyer@example.invalid',months=3}={}){
+ const f=fixture('basic',months,payment,role,true,false,'admin','sales_assisted',buyerEmail,
   {offerVersion:STRIPE_RECURRING_OFFER_VERSION,nearCycle:true});
+ if(beforeActivation)beforeActivation(f);
  record(f);nativeComplete(f);nativeBilling(f);
  if(waitForB)await new Promise(resolve=>setTimeout(resolve,Math.max(0,f.proof.period.provider_period_end*1000-Date.now()+100)));
  const s=nativeRecurringSource(f),b=s.original_period,span=f.pkg.membership_terms.stripe_recurrence.interval_count;
@@ -246,6 +253,114 @@ async function paidCycleFixture(payment='monthly_installments',role=false,{waitF
  return{f,s,p};
 }
 const cycleRecord=(x,p=x.p,s=x.s)=>'select record_retail_existing_paid_period('+[x.f.id,x.f.client,s,p].map(lit).join(',')+');';
+const commissionOpts={skip:!enabled||process.env.RETAIL_NATIVE_COMMISSION_PROOF!=='true'};
+function commissionRep(f){
+ f.rep=crypto.randomUUID();f.reviewer=crypto.randomUUID();
+ sql(`insert into auth.users(id,email) values(${lit(f.rep)},'synthetic-rep@example.invalid'),(${lit(f.reviewer)},'synthetic-admin@example.invalid');
+ insert into sales_reps(user_id,email,display_name,active) values(${lit(f.rep)},${lit('rep-'+f.rep+'@example.invalid')},'Synthetic Rep',true);
+ update public_purchase_intents set channel='sales_assisted',created_by_user_id=${lit(f.rep)} where id=${lit(f.intent)};`);
+}
+function commissionRow(f,p=f.proof,patch={}){
+ const q=JSON.parse(sql(`select to_jsonb(q) from retail_existing_sales_qualifications q where purchase_intent_id=${lit(f.intent)};`));
+ const paid=p.period?.paid_at||p.paid_at;
+ const {weekRangeForTimestamp}=require('../src/services/salesCommissionPolicy');
+ return{id:crypto.randomUUID(),purchase_intent_id:f.intent,rep_user_id:f.rep,provider:'stripe',
+  provider_payment_id:p.period?.invoice_id||p.invoice_id,payment_kind:q.payment_kind,currency:'usd',payment_success_at:paid,
+  funds_received_at:paid,qualification_closed_at:q.qualification_closed_at,first_term_start_at:q.original_start_at,
+  first_term_end_at:q.original_term_end_at,gross_membership_cents:p.platform_gross_cents,discount_cents:p.platform_discount_cents,
+  provider_fee_cents:101,statement_week_start:weekRangeForTimestamp(new Date()).date_from,
+  evidence_reference:'SYNTHETIC admin reviewed bank funds, not real settlement',reviewed_by_user_id:f.reviewer,
+  membership_terms_protocol:'retail_existing_terms_v2',sales_qualification_id:f.intent,
+  policy_version:'retail-existing-terms-v2-commission-v1',...patch};
+}
+const commissionInsert=r=>`insert into sales_commission_receipts(${Object.keys(r).join(',')}) values(${Object.values(r).map(lit).join(',')});`;
+test('NATIVE COMMISSION initial native platform proof excludes role cash; aliases and conflicting browser amounts fail',commissionOpts,()=>{
+ const f=fixture('pro',6,'prepaid',true,true,false,'admin','sales_assisted','native-commission-initial@example.invalid',{offerVersion:STRIPE_RECURRING_OFFER_VERSION});
+ commissionRep(f);record(f);nativeComplete(f);nativeBilling(f);
+ const r=commissionRow(f);
+ for(const patch of [{provider_payment_id:f.proof.payment_intent_id},{provider_payment_id:f.proof.charge_id},
+  {provider_payment_id:'in_MISSING'}, {gross_membership_cents:r.gross_membership_cents-1},
+  {discount_cents:1},{payment_success_at:new Date(Date.parse(r.payment_success_at)+1).toISOString()}])
+  denied('set role service_role;'+commissionInsert({...r,id:crypto.randomUUID(),...patch}),/native_commission_|retail_commission_/);
+ assert.equal(sql(`select count(*) from sales_commission_receipts where purchase_intent_id=${lit(f.intent)};`),'0');
+ sql('set role service_role;'+commissionInsert(r));
+ assert.equal(sql(`select net_membership_cents||'|'||commission_cents from sales_commission_receipts where id=${lit(r.id)};`),
+  `${r.gross_membership_cents-101}|${Math.round((r.gross_membership_cents-101)/2)}`);
+ denied('set role service_role;'+commissionInsert({...r,id:crypto.randomUUID()}),/duplicate key/);
+ // Corrections to an admitted historical receipt retain the existing linked
+ // guard. Archiving a client does not rewrite or re-authorize its cash proof.
+ sql(`update clients set billing_status='inactive',archived_at=clock_timestamp() where id=${lit(f.client)};
+ set role service_role;insert into sales_commission_adjustments(receipt_id,adjustment_type,provider_event_id,
+ net_membership_delta_cents,commission_delta_cents,effective_at,statement_week_start,evidence_reference,reviewed_by_user_id)
+ values(${lit(r.id)},'refund',${lit('evt_'+r.id.replaceAll('-',''))},-100,0,clock_timestamp(),${lit(r.statement_week_start)},'SYNTHETIC reviewed refund',${lit(f.reviewer)});`);
+ assert.equal(sql(`select commission_delta_cents from sales_commission_adjustments where receipt_id=${lit(r.id)};`),'-50');
+});
+test('NATIVE COMMISSION actual recurring receipt admits one invoice and preserves original attribution and manual fee',commissionOpts,async()=>{
+ const x=await paidCycleFixture('monthly_installments',true,{beforeActivation:commissionRep,buyerEmail:'native-commission-cycle@example.invalid'});
+ assert.equal(JSON.parse(sql('set role service_role;'+cycleRecord(x))).status,'recorded');
+ const r=commissionRow(x.f,x.p);
+ sql('set role service_role;'+commissionInsert(r));
+ assert.equal(sql(`select provider_payment_id||'|'||provider_fee_cents||'|'||rep_user_id from sales_commission_receipts where id=${lit(r.id)};`),
+  `${x.p.invoice_id}|101|${x.f.rep}`);
+ denied('set role service_role;'+commissionInsert({...r,id:crypto.randomUUID(),provider_payment_id:x.p.charge_id}),/native_commission_invoice_identity_required/);
+ denied('set role service_role;'+commissionInsert({...r,id:crypto.randomUUID(),discount_cents:1}),/native_commission_proof_conflict/);
+ assert.equal(sql(`select count(*) from sales_commission_receipts where purchase_intent_id=${lit(x.f.intent)};`),'1');
+});
+test('NATIVE COMMISSION early B year-two prepay is excluded even before original A anniversary',commissionOpts,async()=>{
+ const x=await paidCycleFixture('prepaid',false,{beforeActivation:commissionRep,months:12,buyerEmail:'native-commission-year2@example.invalid'});
+ assert.ok(Date.parse(x.p.paid_at)<Date.parse(anchoredMonthInstant(x.p.original_paid_at,12)));
+ assert.equal(JSON.parse(sql('set role service_role;'+cycleRecord(x))).status,'recorded');
+ denied('set role service_role;'+commissionInsert(commissionRow(x.f,x.p)),/outside_original_first_year/);
+ assert.equal(sql(`select count(*) from sales_commission_receipts where purchase_intent_id=${lit(x.f.intent)};`),'0');
+});
+test('NATIVE COMMISSION global immutable PI or charge collision cannot qualify separate owners',commissionOpts,()=>{
+ for(const field of ['payment_intent_id','charge_id']){
+  const f=fixture('basic',3,'prepaid',false,true,false,'admin','sales_assisted',`native-collision-${field}@example.invalid`,{offerVersion:STRIPE_RECURRING_OFFER_VERSION});
+  commissionRep(f);record(f);nativeComplete(f);nativeBilling(f);
+  const other=fixture('basic',3,'prepaid',false,true,false,'admin','sales_assisted',`native-collision-other-${field}@example.invalid`,{offerVersion:STRIPE_RECURRING_OFFER_VERSION});
+  // Existing native indexes already refuse duplicate identities in one
+  // account/mode. Preserve them; the new guard also refuses a foreign-account
+  // alias collision instead of narrowing its census to the selected owner.
+  other.proof.provider_account_id='acct_SYNTHETIC_OTHER';
+  other.proof[field]=f.proof[field];record(other);nativeComplete(other);nativeBilling(other);
+  denied('set role service_role;'+commissionInsert(commissionRow(f)),/native_commission_proof_identity_ambiguous/);
+  assert.equal(sql(`select count(*) from sales_commission_receipts where purchase_intent_id=${lit(f.intent)};`),'0');
+ }
+});
+test('NATIVE COMMISSION zero-net native period proof does not create a commission receipt',commissionOpts,async()=>{
+ const x=await paidCycleFixture('monthly_installments',false,{beforeActivation:commissionRep,buyerEmail:'native-commission-zero@example.invalid'});
+ const p={...x.p,platform_discount_cents:x.p.platform_gross_cents,platform_net_cents:0,cash_cents:0,payment_intent_id:null,charge_id:null};
+ assert.equal(JSON.parse(sql('set role service_role;'+cycleRecord(x,p))).status,'recorded');
+ denied('set role service_role;'+commissionInsert(commissionRow(x.f,p,{provider_fee_cents:0})),/check constraint/);
+ assert.equal(sql(`select count(*) from sales_commission_receipts where purchase_intent_id=${lit(x.f.intent)};`),'0');
+});
+test('NATIVE COMMISSION initial placeholder is not a second proof, foreign customer invoice holds',commissionOpts,()=>{
+ const f=fixture('basic',3,'prepaid',false,true,false,'admin','sales_assisted','native-commission-placeholder@example.invalid',{offerVersion:STRIPE_RECURRING_OFFER_VERSION});
+ commissionRep(f);record(f);nativeComplete(f);nativeBilling(f);
+ const own=sql(`select id from billing_customers where client_id=${lit(f.client)};`),invoice=crypto.randomUUID();
+ sql(`insert into billing_invoices(id,billing_customer_id,invoice_title,stripe_invoice_id,status) values(${lit(invoice)},${lit(own)},'SYNTHETIC placeholder',${lit(f.proof.period.invoice_id)},'paid');`);
+ const other=fixture('basic',3,'prepaid',false,true,false,'admin','sales_assisted','native-placeholder-other@example.invalid',{offerVersion:STRIPE_RECURRING_OFFER_VERSION});
+ record(other);nativeComplete(other);nativeBilling(other);
+ const foreign=sql(`select id from billing_customers where client_id=${lit(other.client)};`);
+ sql(`update billing_invoices set billing_customer_id=${lit(foreign)} where id=${lit(invoice)};`);
+ denied('set role service_role;'+commissionInsert(commissionRow(f)),/native_commission_foreign_invoice/);
+ sql(`update billing_invoices set billing_customer_id=${lit(own)} where id=${lit(invoice)};`);
+ sql('set role service_role;'+commissionInsert(commissionRow(f)));
+ assert.equal(sql(`select count(*) from sales_commission_receipts where purchase_intent_id=${lit(f.intent)};`),'1');
+});
+test('NATIVE COMMISSION proof census refuses concurrent writers without partial receipt then retries normally',commissionOpts,async()=>{
+ const f=fixture('basic',3,'prepaid',false,true,false,'admin','sales_assisted','native-commission-lock@example.invalid',{offerVersion:STRIPE_RECURRING_OFFER_VERSION});
+ commissionRep(f);record(f);nativeComplete(f);nativeBilling(f);const r=commissionRow(f);
+ for(const table of ['membership_agreements','billing_invoices']){
+  const [holder,writer]=await Promise.all([
+   parallel(`set role service_role;begin;lock table public.${table} in row exclusive mode;select pg_sleep(0.7);commit;`),
+   parallel(`select pg_sleep(0.15);set role service_role;${commissionInsert(r)}`)]);
+  assert.equal(holder.code,0,holder.err);assert.notEqual(writer.code,0);assert.match(writer.err,/could not obtain lock/);
+  assert.equal(sql(`select count(*) from sales_commission_receipts where purchase_intent_id=${lit(f.intent)};`),'0');
+ }
+ sql('set role service_role;'+commissionInsert(r));
+ assert.equal(sql(`select count(*) from sales_commission_receipts where purchase_intent_id=${lit(f.intent)};`),'1');
+});
 const coverageCall=f=>'select refresh_retail_existing_paid_coverage('+[f.id,f.client].map(lit).join(',')+');';
 
 const renewalCall=(f,s,action,{auto=null,op=null,generation=null,observation=null}={})=>

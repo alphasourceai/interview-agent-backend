@@ -1,7 +1,7 @@
 'use strict';
 const assert=require('node:assert/strict');const {test}=require('node:test');const express=require('express');
 const {fixture,PAID,I,G,C}=require('./fixtures/existing-retail-funding-fixture');
-const {anchoredMonthInstant}=require('../src/services/membershipOffers');
+const {anchoredMonthInstant,STRIPE_RECURRING_OFFER_VERSION}=require('../src/services/membershipOffers');
 const {loadMembershipCommissionTerms}=require('../src/services/membershipCommissionTerms');
 const {createAdminSalesPayrollRouter}=require('../src/routes/admin/salesPayroll');
 const {loadSalesPayrollReport}=require('../src/services/salesPayrollReportQuery');
@@ -30,6 +30,25 @@ function setup(months=3,payment='monthly_installments',plan='basic'){
 function body(f,changes={}){return {purchase_intent_id:I,provider:'stripe',provider_payment_id:'pi_SYNTHETIC_RENEWAL',
   payment_kind:f.q.payment_kind,payment_success_at:'2026-08-01T00:00:00Z',funds_received_at:'2026-08-03T00:00:00Z',
   gross_membership_cents:f.q.platform_cap_cents,discount_cents:1500,provider_fee_cents:101,evidence_reference:'synthetic admin-reviewed platform receipt',...changes};}
+function nativeSetup(){
+ const f=setup();
+ f.pkg=structuredClone(f.pkg);f.i.package_snapshot=f.pkg;f.g.template_snapshot=structuredClone(f.g.template_snapshot);
+ f.g.template_snapshot.package_snapshot=f.pkg;
+ f.pkg.pricing_version=STRIPE_RECURRING_OFFER_VERSION;f.pkg.membership_terms.offer_version=STRIPE_RECURRING_OFFER_VERSION;
+ f.g.template_snapshot.values.pricing_version=STRIPE_RECURRING_OFFER_VERSION;
+ const {recurringFixture,proofInput}=require('./fixtures/existing-retail-recurring-funding-fixture');
+ const {verifyExistingRetailRecurringFunding}=require('../src/services/existingRetailCheckoutFunding');
+ const pfx=recurringFixture('basic',3,'monthly_installments',true),source=pfx.source,p=verifyExistingRetailRecurringFunding(proofInput(pfx));
+ f.g.retail_funding_receipt={version:'retail_existing_funding_v1',proof:{period:source.original_period,
+  provider_account_id:source.original_provider_account_id,platform_gross_cents:f.q.platform_cap_cents,
+  platform_discount_cents:0,payment_intent_id:'pi_INITIAL',charge_id:'ch_INITIAL'}};
+ const invoices=[{id:'local-invoice',stripe_invoice_id:p.invoice_id,
+  retail_period_receipt:{version:'retail_existing_paid_period_receipt_v1',source,proof:p}}];
+ const rpc=f.db.rpc,from=f.db.from;
+ f.db.rpc=async(name,args)=>name==='read_retail_existing_recurring_source'?{data:source,error:null}:rpc(name,args);
+ f.db.from=table=>table!=='billing_invoices'?from(table):{select(){return this;},or(){return this;},async limit(){return{data:invoices,error:null};}};
+ return{...f,p,source,invoices};
+}
 async function withServer(f,callback){const app=express();app.use(express.json());
   app.use('/payroll',(req,_res,next)=>{req.user={id:OWNER};next();},createAdminSalesPayrollRouter({db:f.db}));
   const server=await new Promise(resolve=>{const s=app.listen(0,'127.0.0.1',()=>resolve(s));});
@@ -103,4 +122,28 @@ test('new report and effective-date adjustment preserve original rep without tou
   assert.ok(!f.reads.some(t=>t.startsWith('membership_v2_')));
   f.tables.retail_existing_sales_qualifications=[];
   await assert.rejects(loadSalesPayrollReport(f.db,{date_from:'2026-09-01',date_to:'2026-09-02'}),/qualification.*join_failed/);
+});
+test('existing receipt API canonicalizes native invoice/PI/charge aliases and retains reviewed bank fee and date',async()=>{
+ for(const alias of ['invoice_id','payment_intent_id','charge_id']){
+  const f=nativeSetup();await withServer(f,async send=>{
+   const r=await send(body(f,{provider_payment_id:f.p[alias],payment_success_at:f.p.paid_at,discount_cents:0}));
+   assert.equal(r.status,201,JSON.stringify(r));const stored=f.tables.sales_commission_receipts[0];
+   assert.equal(stored.provider_payment_id,f.p.invoice_id);assert.equal(stored.provider_fee_cents,101);
+   assert.equal(stored.funds_received_at,'2026-08-03T00:00:00.000Z');assert.equal(stored.rep_user_id,REP);
+   assert.equal(stored.gross_membership_cents,f.p.platform_gross_cents);
+  });
+ }
+});
+test('native receipt API keeps inactive-client priority and holds conflicting or absent proof before insert',async()=>{
+ for(const [change,error,status] of [[f=>f.c.billing_status='inactive','client_not_active',422],
+  f=>f.invoices.length=0].map(v=>Array.isArray(v)?v:[v,'native_commission_proof_unavailable',409])){
+  const f=nativeSetup();change(f);await withServer(f,async send=>{
+   const r=await send(body(f,{provider_payment_id:f.p.invoice_id,payment_success_at:f.p.paid_at,discount_cents:0}));
+   assert.equal(r.status,status,JSON.stringify(r));assert.equal(r.body.error,error);assert.ok(!f.tables.sales_commission_receipts?.length);
+  });
+ }
+ const f=nativeSetup();await withServer(f,async send=>{
+  const r=await send(body(f,{provider_payment_id:f.p.invoice_id,payment_success_at:f.p.paid_at,discount_cents:1}));
+  assert.equal(r.status,422);assert.equal(r.body.error,'native_commission_proof_conflict');assert.ok(!f.tables.sales_commission_receipts?.length);
+ });
 });
