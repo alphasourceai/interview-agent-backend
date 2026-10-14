@@ -247,10 +247,11 @@ test('a failed discard is logged and still reports skipped rather than charging'
 
 // --- the cron route --------------------------------------------------------
 
-function loadCron(db, stripe) {
+function loadCron(db, stripe, { invoiceService } = {}) {
   for (const p of [internalUsagePath, usageBillingPath, supabasePath, stripeClientPath]) delete require.cache[p];
   injectModule(supabasePath, { supabaseAdmin: db, supabase: db, supabaseAnon: db });
   injectModule(stripeClientPath, stripe);
+  if (invoiceService) injectModule(usageBillingPath, { createImmediateUsageInvoice: invoiceService });
 
   const app = express();
   app.use(express.json());
@@ -516,7 +517,8 @@ for (const cadence of ['monthly','annual']) for (const partial of [false,true]) 
     let providerCalls=0;const stripe=new Proxy({}, {get(){providerCalls++;throw Error('provider must remain untouched');}});
     await withCronSecret(()=>onTheFirst(async()=>{
       const res=await runCron(loadCron(f.db,stripe));
-      assert.equal(res.status,200);assert.equal(res.body.considered,1);assert.equal(res.body.failed,1);
+      assert.equal(res.status,503);assert.equal(res.body.ok,false);assert.equal(res.body.held_clients,1);
+      assert.equal(res.body.considered,1);assert.equal(res.body.failed,1);assert.equal(res.body.invoiced,0);
       assert.equal(res.body.results[0].retryable,true);assert.equal(res.body.results[0].http_status,503);
       assert.equal(res.body.results[0].code,partial?'enterprise_usage_terms_unavailable':'enterprise_usage_invoice_executor_pending');
       assert.equal(providerCalls,0);
@@ -524,6 +526,116 @@ for (const cadence of ['monthly','annual']) for (const partial of [false,true]) 
     }));
   });
 }
+
+function watchedDb(db) {
+  const reads={};const from=db.from;
+  db.from=table=>{reads[table]=(reads[table]||0)+1;return from(table);};
+  return reads;
+}
+function watchStripeImport() {
+  let imports=0;const module=require.cache[stripeClientPath];const value=module.exports;
+  Object.defineProperty(module,'exports',{get(){imports++;return value;},configurable:true});
+  return()=>imports;
+}
+for(const marker of ['',0,false,{},'synthetic'])test(`day2 non-null ${JSON.stringify(marker)} marker is held without other reads or Stripe import`,async()=>{
+  const db=makeDb();db.tables.membership_agreements=[
+    {id:'a',client_id:CLIENT,enterprise_checkout_pool_id:marker},
+    {id:'b',client_id:CLIENT,enterprise_funding_receipt:marker},
+    {id:'c',client_id:'other',enterprise_billing_receipt:marker}];
+  const reads=watchedDb(db);
+  await withCronSecret(()=>onTheSecond(async()=>{
+    const app=loadCron(db,makeStripe());const imports=watchStripeImport();const res=await runCron(app);
+    assert.equal(res.status,503);assert.equal(res.body.ok,false);assert.equal(res.body.held_clients,2);
+    assert.equal(res.body.code,'enterprise_usage_invoice_executor_pending');
+    assert.equal(res.body.considered,2);assert.equal(res.body.failed,2);assert.equal(res.body.invoiced,0);
+    assert.deepEqual(res.body.results,[]);assert.deepEqual(reads,{membership_agreements:1});assert.equal(imports(),0);
+    assert.equal(JSON.stringify(res.body).includes('synthetic'),false);
+  }));
+});
+for(const column of ['id','client_id'])for(const bad of [null,0,'',' \t'])test(`day2 agreement ${column} ${JSON.stringify(bad)} refuses census before marker classification`,async()=>{
+  const db=makeDb();db.tables.membership_agreements=[{id:'a',client_id:CLIENT,[column]:bad}];
+  const reads=watchedDb(db);
+  await withCronSecret(()=>onTheSecond(async()=>{
+    const app=loadCron(db,makeStripe());const imports=watchStripeImport();const res=await runCron(app);
+    assert.equal(res.status,503);assert.deepEqual(res.body,{error:'billing_unavailable',code:'enterprise_usage_owner_census_unavailable'});
+    assert.deepEqual(reads,{membership_agreements:1});assert.equal(imports(),0);
+  }));
+});
+test('unmarked day2 preserves exact legacy skip and performs only one agreement census',async()=>{
+  const db=makeDb();db.tables.membership_agreements=[{id:'a',client_id:CLIENT,enterprise_checkout_source:null}];
+  const reads=watchedDb(db);
+  await withCronSecret(()=>onTheSecond(async()=>{
+    const app=loadCron(db,makeStripe());const imports=watchStripeImport();const res=await runCron(app);
+    assert.equal(res.status,200);assert.deepEqual(res.body,{ok:true,skipped:'not_first_of_month',considered:0,invoiced:0,skipped_clients:0,failed:0,total_cents:0,results:[]});
+    assert.deepEqual(reads,{membership_agreements:1});assert.equal(imports(),0);
+  }));
+});
+for(const table of ['membership_agreements','client_plan_settings','clients'])test(`${table} incomplete/thrown census bypasses 500 catch and prevents Stripe construction`,async()=>{
+  for(const throwing of [false,true]){
+    const db=makeDb();const from=db.from;
+    db.from=name=>{if(name!==table)return from(name);if(throwing)throw Error('private-token');
+      const q=from(name);q.range=()=>Promise.resolve({data:[],error:null,count:1});return q;};
+    await withCronSecret(()=>onTheFirst(async()=>{
+      const app=loadCron(db,makeStripe());const imports=watchStripeImport();const res=await runCron(app);
+      assert.equal(res.status,503);assert.deepEqual(res.body,{error:'billing_unavailable',code:'enterprise_usage_owner_census_unavailable'});
+      assert.equal(imports(),0);assert.equal(db.tables.usage_billing_ledger.length,0);
+    }));
+  }
+});
+test('later client chunk failure prevents every earlier client invoice',async()=>{
+  const clients=Array.from({length:201},(_,n)=>({id:`chunk_${String(n).padStart(3,'0')}`,billing_interval:'annual'}));
+  const db=makeDb({clients,planSettings:clients.map(c=>({client_id:c.id,plan_tier:'enterprise'}))});
+  const from=db.from;let chunks=0;
+  db.from=table=>{const q=from(table);if(table==='clients'&&++chunks===2)q.range=()=>Promise.resolve({data:null,error:{message:'secret'},count:null});return q;};
+  await withCronSecret(()=>onTheFirst(async()=>{
+    const app=loadCron(db,makeStripe(),{invoiceService:async()=>{assert.fail('no partial dispatch');}});const imports=watchStripeImport();
+    const res=await runCron(app);assert.equal(res.status,503);assert.equal(chunks,2);assert.equal(imports(),0);
+    assert.equal(res.body.code,'enterprise_usage_owner_census_unavailable');
+  }));
+});
+test('an exact client chunk may omit a requested id; the remaining real legacy invoice is retained',async()=>{
+  const db=makeDb();db.tables.client_plan_settings.push({client_id:'missing',plan_tier:'enterprise'});
+  const stripe=makeStripe();
+  await withCronSecret(()=>onTheFirst(async()=>{
+    const res=await runCron(loadCron(db,stripe));assert.equal(res.status,200);assert.equal(res.body.invoiced,1);
+    assert.equal(res.body.held_clients,undefined);assert.equal(stripe.calls.invoices.length,1);
+  }));
+});
+test('day1 performs exactly one route census; existing scoped source reads remain separate',async()=>{
+  const db=makeDb();const from=db.from;let scans=0;
+  db.from=table=>{const q=from(table);if(table==='membership_agreements'){
+    const range=q.range;q.range=(...args)=>{scans++;return range(...args);};}return q;};
+  await withCronSecret(()=>onTheFirst(async()=>{const res=await runCron(loadCron(db,makeStripe()));assert.equal(res.status,200);assert.equal(scans,1);}));
+});
+test('day1 mixed actual legacy invoice and both marked hold codes keep each outcome and do not imply rollback',async()=>{
+  const f=await require('./helpers/accepted-enterprise-usage-fixture')();const db=makeDb();
+  const second=structuredClone(f.client);second.id='other_marked';
+  db.tables.clients.push(f.client,second);db.tables.client_plan_settings.push(f.plan,{...f.plan,client_id:second.id});
+  db.tables.membership_agreements=[f.a,{...structuredClone(f.a),id:'other_agreement',client_id:second.id,enterprise_billing_receipt:null}];
+  db.rpc=f.db.rpc;const stripe=makeStripe();
+  await withCronSecret(()=>onTheFirst(async()=>{
+    const res=await runCron(loadCron(db,stripe));assert.equal(res.status,503);assert.equal(res.body.ok,false);
+    assert.equal(res.body.held_clients,2);assert.equal(res.body.invoiced,1);assert.equal(res.body.total_cents,7500);
+    assert.equal(res.body.code,'enterprise_usage_invoice_executor_pending');assert.equal(stripe.calls.invoices.length,1);
+    assert.equal(res.body.results.filter(r=>r.status==='invoiced').length,1);
+    assert.deepEqual(res.body.results.filter(r=>r.http_status===503).map(r=>r.code).sort(),
+      ['enterprise_usage_invoice_executor_pending','enterprise_usage_terms_unavailable']);
+    assert.equal(db.tables.usage_billing_ledger.length,3);
+  }));
+});
+test('other per-client 503 failures keep the old aggregate contract, not a pricing hold',async()=>{
+  await withCronSecret(()=>onTheFirst(async()=>{
+    const res=await runCron(loadCron(makeDb(),makeStripe(),{invoiceService:async()=>{
+      throw Object.assign(Error('different local failure'),{status:503,code:'unrelated_service_unavailable'});}}));
+    assert.equal(res.status,200);assert.equal(res.body.ok,true);assert.equal(res.body.held_clients,undefined);assert.equal(res.body.failed,1);
+  }));
+});
+test('unauthorized usage caller does no census read or Stripe construction',async()=>{
+  const db=makeDb();db.from=()=>assert.fail('unauthorized read');
+  await withCronSecret(async()=>{
+    const app=loadCron(db,makeStripe());const imports=watchStripeImport();assert.equal((await runCron(app,'wrong')).status,403);assert.equal(imports(),0);
+  });
+});
 test('the cron uses the same secret shape as the other internal routes', () => {
   const source = fs.readFileSync(internalUsagePath, 'utf8');
   assert.match(source, /process\.env\.USAGE_BILLING_CRON_SECRET/);
