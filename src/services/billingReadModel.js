@@ -114,23 +114,29 @@ function rolesFromAllocation(allocation) {
 function usageHistoryFromBatches(raw,accepted) {
   let batches;try{batches=snapshot(raw);}catch(_){hold();}
   if(!Array.isArray(batches))hold();
-  const result=[],seen=new Set();
+  const result=[],seen=new Set(),invoiceIds=new Set();
   const whole=n=>Number.isSafeInteger(n)&&n>=0&&n<=2147483647;
   for(const b of batches){
     if(!b||typeof b.id!=='string'||!b.id||seen.has(b.id)||b.owner_id!==accepted.billingClientId||b.agreement_id!==accepted.agreementId
       ||b.phase!=='reserved'||b.unit_price_cents!==accepted.unitPriceCents||!Array.isArray(b.groups)
       ||!b.groups.length||typeof b.service_month!=='string'||!/^\d{4}-\d{2}-01$/.test(b.service_month))hold();
-    seen.add(b.id);let interviews=0,amount=0;const roles=new Set();
+    seen.add(b.id);let interviews=0,amount=0;const roles=new Set(),interviewIds=new Set();
     for(const g of b.groups){
-      if(typeof g.role_id!=='string'||roles.has(g.role_id)||!whole(g.quantity)||g.quantity<1
+      if(!g||typeof g!=='object'||Array.isArray(g)||typeof g.role_id!=='string'||roles.has(g.role_id)||!whole(g.quantity)||g.quantity<1
        ||g.unit_price_cents!==b.unit_price_cents||!whole(g.amount_cents)
        ||g.amount_cents!==g.quantity*g.unit_price_cents||!Array.isArray(g.interview_ids)
        ||new Set(g.interview_ids).size!==g.quantity||g.interview_ids.length!==g.quantity)hold();
+      for(const iv of g.interview_ids){if(typeof iv!=='string'||!iv||interviewIds.has(iv))hold();interviewIds.add(iv);}
       roles.add(g.role_id);interviews+=g.quantity;amount+=g.amount_cents;
     }
     if(!whole(interviews)||!whole(amount))hold();
     const leaf=b.provider_operation,final=leaf?.operations?.finalize?.proof,paid=leaf?.operations?.pay?.proof;
     const finalized=final?.stage==='finalized'&&final.total_cents===amount&&final.invoice_id===leaf.invoice_id;
+    if(final!=null&&!finalized)hold();
+    if(leaf?.invoice_id!=null){
+      if(typeof leaf.invoice_id!=='string'||!/^in_[A-Za-z0-9_]+$/.test(leaf.invoice_id)||invoiceIds.has(leaf.invoice_id))hold();
+      invoiceIds.add(leaf.invoice_id);
+    }
     const collected=leaf?.status==='paid'&&finalized&&paid?.invoice_id===leaf.invoice_id&&paid.amount_cents===amount
       &&typeof paid.payment_intent_id==='string'&&/^pi_[A-Za-z0-9_]+$/.test(paid.payment_intent_id)
       &&typeof paid.charge_id==='string'&&/^ch_[A-Za-z0-9_]+$/.test(paid.charge_id)
@@ -145,6 +151,17 @@ function usageHistoryFromBatches(raw,accepted) {
       paid_at:collected?new Date(paid.paid_at*1000).toISOString():null});
   }
   return result;
+}
+function mergeUsageHistory(nativeHistory,billedInvoices,invoiceLimit){
+  const byInvoice=new Map(billedInvoices.map(i=>[i.stripe_invoice_id,i]));
+  for(const i of nativeHistory){
+    const old=i.stripe_invoice_id?byInvoice.get(i.stripe_invoice_id):null;
+    if(old){if(old.amount_cents!==i.amount_cents||old.interviews!==i.interviews)hold();i.billed_at=old.billed_at;
+      byInvoice.delete(i.stripe_invoice_id);}
+  }
+  return[...nativeHistory,...byInvoice.values()]
+    .sort((a,b)=>String(b.period_start||b.billed_at||'').localeCompare(String(a.period_start||a.billed_at||'')))
+    .slice(0,invoiceLimit);
 }
 
 /**
@@ -170,25 +187,18 @@ async function readBillingForClient({ db, clientId, asOf, invoiceLimit = 12 } = 
   const isUsage = allocation.billing_model === USAGE_BILLING_MODEL;
   // Marker detection cannot be bypassed by a later billing-model edit.
   const usage = await computeUnbilledUsage({ db, clientId: billingClientId, asOf, allocation, window: ALL_UNBILLED_WINDOW });
-  let billedInvoices = isUsage
-    ? await listBilledUsageInvoices({ db, clientId: billingClientId, limit: invoiceLimit })
-    : [];
   const accepted=isUsage?await loadAcceptedEnterpriseUsageTerms({db,clientId:billingClientId}):null;
+  let billedInvoices = isUsage
+    ? await listBilledUsageInvoices({ db, clientId: billingClientId,
+      limit: accepted?Number.MAX_SAFE_INTEGER:invoiceLimit,complete:!!accepted })
+    : [];
   if(accepted){
     const read=await readAllPages(()=>db.from('enterprise_existing_usage_batches')
       .select('id,owner_id,agreement_id,service_month,phase,unit_price_cents,groups,provider_operation',{count:'exact'})
       .eq('owner_id',billingClientId).eq('phase','reserved').order('id',{ascending:true}));
     if(read.error)hold();
     const nativeHistory=usageHistoryFromBatches(read.rows,accepted);
-    const byInvoice=new Map(billedInvoices.map(i=>[i.stripe_invoice_id,i]));
-    for(const i of nativeHistory){
-      const old=i.stripe_invoice_id?byInvoice.get(i.stripe_invoice_id):null;
-      if(old){if(old.amount_cents!==i.amount_cents||old.interviews!==i.interviews)hold();i.billed_at=old.billed_at;
-        byInvoice.delete(i.stripe_invoice_id);}
-    }
-    billedInvoices=[...nativeHistory,...byInvoice.values()]
-      .sort((a,b)=>String(b.period_start||b.billed_at||'').localeCompare(String(a.period_start||a.billed_at||'')))
-      .slice(0,invoiceLimit);
+    billedInvoices=mergeUsageHistory(nativeHistory,billedInvoices,invoiceLimit);
   }
 
   return {
@@ -214,5 +224,6 @@ module.exports = {
   poolFromAllocation,
   readBillingForClient,
   rolesFromAllocation,
-  usageHistoryFromBatches
+  usageHistoryFromBatches,
+  mergeUsageHistory
 };

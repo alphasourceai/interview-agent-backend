@@ -3,10 +3,12 @@
 // Cron entry point for annual Enterprise usage invoices. Guarded by a shared
 // secret header rather than a user session, because the caller is the scheduler.
 //
-// Monthly Enterprise clients need nothing here: their usage is added to the
+// Unmarked monthly Enterprise clients need nothing here: their usage is added to the
 // platform-fee invoice each cycle by the invoice.created webhook. An annual
 // client only gets that invoice once a year, so their usage is raised as its own
 // invoice on the 1st of each month.
+// Marked receipt-backed Usage uses the same caller every day to resume its
+// oldest closed native batch, independently of platform cadence. Default off.
 
 const express = require('express');
 
@@ -53,17 +55,20 @@ router.post('/billing/usage-invoices', async (req, res) => {
       .select(['id','client_id',...markers].join(','), { count: 'exact' }).order('id', { ascending: true }));
     if (markedScan.error || markedScan.rows.some(a => !validKey(a.client_id))) return unavailableCensus();
     const markedIds = new Set(markedScan.rows.filter(a => markers.some(k => a[k] != null)).map(a => a.client_id));
+    const nativeUsageEnabled=process.env.ENTERPRISE_MONTHLY_USAGE_ENABLED==='true';
     if (now.getUTCDate() !== 1) {
-      if (markedIds.size) {
+      if (markedIds.size&&!nativeUsageEnabled) {
         const code = 'enterprise_usage_invoice_executor_pending';
         console.warn('usage_billing_cron_held', { request_id: requestId, code })
         return res.status(503).json({ ok: false, error: 'billing_unavailable', code,
           considered: markedIds.size, invoiced: 0, skipped_clients: 0, failed: markedIds.size,
           held_clients: markedIds.size, total_cents: 0, results: [] })
       }
-      // Preserve the legacy day-1 policy; no settings/client/Stripe read here.
-      console.log('usage_billing_cron_not_due', { request_id: requestId, utc_day: now.getUTCDate() })
-      return res.json({ ok: true, skipped: 'not_first_of_month', considered: 0, invoiced: 0, skipped_clients: 0, failed: 0, total_cents: 0, results: [] })
+      if(!markedIds.size){
+        // Preserve the legacy day-1 policy; no settings/client/Stripe read here.
+        console.log('usage_billing_cron_not_due', { request_id: requestId, utc_day: now.getUTCDate() })
+        return res.json({ ok: true, skipped: 'not_first_of_month', considered: 0, invoiced: 0, skipped_clients: 0, failed: 0, total_cents: 0, results: [] })
+      }
     }
 
     // A null billing_model means "follow the plan tier", so filtering the column
@@ -93,7 +98,7 @@ router.post('/billing/usage-invoices', async (req, res) => {
       clients.push(...rows.filter(c => c.billing_interval === 'annual' || markedIds.has(c.id)))
     }
 
-    const due = clients
+    const due = clients.filter(client=>now.getUTCDate()===1||markedIds.has(client.id))
     // Exact filtered client chunks may legitimately omit requested ids. Keep
     // that census valid, but a known marker with no owner is still unavailable,
     // never a clean zero/skip. This does not certify its agreement or receipt.

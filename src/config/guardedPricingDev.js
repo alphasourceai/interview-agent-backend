@@ -7,6 +7,7 @@ const DEV_FRONTEND_URL = 'https://interview-agent-frontend-qa.onrender.com';
 const CODE = 'GUARDED_DEV_BILLING_HOLD';
 const DETAIL = 'This dev build supports pricing and agreement previews. Payments, renewals, usage collection, sending and signing are not available yet.';
 const OFF_FLAGS = Object.freeze([
+  'ENTERPRISE_MONTHLY_USAGE_ENABLED',
   'SALES_TEAM_PROVIDER_SYNC_ENABLED', 'GHL_SALES_SYNC_ENABLED',
   'SALES_VOICE_HANDOFF_ENABLED', 'SALES_VOICE_DB_ROUTES_ENABLED',
   'SALES_WON_TEAM_CHANNEL_ENABLED', 'SUPPORT_VOICE_ENABLED', 'SUPPORT_HANDOFF_ENABLED',

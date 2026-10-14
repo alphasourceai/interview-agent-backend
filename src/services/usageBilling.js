@@ -254,14 +254,23 @@ async function recordUsageLines({ db, clientId, lines, stripeInvoiceId, periodSt
  * what was actually charged, at the price it was charged at, and it must not
  * move if a role is renamed or an interview is re-examined later.
  */
-async function listBilledUsageInvoices({ db, clientId, limit = 12 } = {}) {
+async function listBilledUsageInvoices({ db, clientId, limit = 12, complete=false } = {}) {
   if (!db || !clientId) return [];
-  const { data, error } = await db
+  let data,error;
+  if(complete){
+    const read=await require('./enterpriseUsageOwnerCensus').readAllPages(()=>db.from('usage_billing_ledger')
+      .select('id,stripe_invoice_id,unit_price_cents,period_start,period_end,billed_at',{count:'exact'})
+      .eq('client_id',clientId).not('billed_at','is',null).order('id',{ascending:true}));
+    if(read.error)hold();
+    data=read.rows.sort((a,b)=>String(b.billed_at).localeCompare(String(a.billed_at)));
+  }else{
+  ({data,error} = await db
     .from('usage_billing_ledger')
     .select('stripe_invoice_id,unit_price_cents,period_start,period_end,billed_at')
     .eq('client_id', clientId)
     .not('billed_at', 'is', null)
-    .order('billed_at', { ascending: false });
+    .order('billed_at', { ascending: false }));
+  }
   if (error) throw new Error(error.message || 'Usage billing ledger lookup failed');
 
   const byInvoice = new Map();
@@ -624,6 +633,22 @@ async function createImmediateUsageInvoice({
   require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
   if (!db || !stripe || !clientId) return { skipped: true, reason: 'invalid_request' };
 
+  const accepted=await loadAcceptedEnterpriseUsageTerms({db,clientId});
+  if(accepted){
+    if(process.env.ENTERPRISE_MONTHLY_USAGE_ENABLED!=='true')hold('enterprise_usage_invoice_executor_pending');
+    const result=await require('./enterpriseExistingUsageInvoice').invoiceEnterpriseExistingUsage({
+      db,stripe,billingClientId:accepted.billingClientId,effectsEnabled:true});
+    if(['not_due','no_usage','pending','busy'].includes(result.status))return{...result,skipped:true,reason:result.status};
+    if(result.status!=='paid')hold('enterprise_usage_invoice_executor_pending');
+    const state=await require('./enterpriseExistingUsageReservation').readEnterpriseExistingUsageProvider({
+      db,billingClientId:accepted.billingClientId,batchId:result.batch_id});
+    if(state.batch?.provider_operation?.status!=='paid'||state.batch.provider_operation.invoice_id!==result.invoice_id)hold();
+    return{...result,total_cents:state.binding.total_cents,lines:state.binding.groups,
+      period_start:new Date(state.binding.period.start*1000).toISOString(),
+      period_end:new Date(state.binding.period.end*1000).toISOString()};
+  }
+  // Keep the original fence and entire unmarked annual body below unchanged.
+  // A cohort change between the two source reads must not enter that body.
   await fenceAcceptedEnterpriseUsageWriter({ db, clientId });
 
   const { data: client, error: clientError } = await db

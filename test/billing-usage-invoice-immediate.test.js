@@ -293,6 +293,26 @@ function atFixedClock(fixed, fn) {
 const onTheSecond = (fn) => atFixedClock(SECOND_OF_MONTH, fn);
 const onTheFirst = (fn) => atFixedClock(FIRST_OF_MONTH, fn);
 
+for(const cadence of ['monthly','annual'])for(const day of ['first','second'])
+test(`enabled same cron resumes marked ${cadence} on ${day}; unmarked legacy remains day1 annual only`,async()=>{
+ const prior=process.env.ENTERPRISE_MONTHLY_USAGE_ENABLED;process.env.ENTERPRISE_MONTHLY_USAGE_ENABLED='true';
+ try{await withCronSecret(()=>(day==='first'?onTheFirst:onTheSecond)(async()=>{
+  const owner='marked_'+cadence,legacy='legacy_annual',monthly='legacy_monthly';
+  const clients=[{id:owner,billing_interval:cadence,stripe_customer_id:'cus_MARKED'},
+   {id:legacy,billing_interval:'annual',stripe_customer_id:'cus_LEGACY'},
+   {id:monthly,billing_interval:'monthly',stripe_customer_id:'cus_MONTHLY'}];
+  const db=makeDb({clients,planSettings:clients.map(c=>({client_id:c.id,plan_tier:'enterprise',billing_model:'usage'}))});
+  db.tables.membership_agreements=[{id:'marker',client_id:owner,enterprise_checkout_source:{synthetic:true}}];
+  const calls=[],stripe=makeStripe();
+  const res=await runCron(loadCron(db,stripe,{invoiceService:async args=>{calls.push(args.clientId);
+   return args.clientId===owner?{status:'pending',skipped:true,reason:'pending'}:{invoice_id:'in_LEGACY',total_cents:100};}}));
+  assert.equal(res.status,200);assert.deepEqual(calls.sort(),(day==='first'?[owner,legacy]:[owner]).sort());
+  assert.equal(res.body.invoiced,day==='first'?1:0);assert.equal(res.body.total_cents,day==='first'?100:0);
+  assert.equal(res.body.skipped,1);assert.equal(res.body.results.find(r=>r.client_id===owner).reason,'pending');
+  assert.deepEqual(stripe.calls.invoices,[]);
+ }));}finally{if(prior===undefined)delete process.env.ENTERPRISE_MONTHLY_USAGE_ENABLED;else process.env.ENTERPRISE_MONTHLY_USAGE_ENABLED=prior;}
+});
+
 test('the cron refuses a wrong or missing secret', async () => {
   await withCronSecret(() => onTheFirst(async () => {
     const app = loadCron(makeDb(), makeStripe());
