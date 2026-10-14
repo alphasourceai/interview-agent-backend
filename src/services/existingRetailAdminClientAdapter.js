@@ -11,6 +11,10 @@ function periodEnded() {
   const e = new Error('retail_admin_adapter_period_ended'); e.code = e.message;
   e.status = 410; e.permanentFailure = true; throw e;
 }
+function nativeConflict() {
+  const e = new Error('retail_admin_adapter_conflict'); e.code = e.message;
+  e.status = 409; e.permanentFailure = true; throw e;
+}
 function fail(code = 'retail_admin_adapter_unknown') {
   const e = new Error(code); e.code = code; e.status = 503; throw e;
 }
@@ -45,7 +49,7 @@ async function applyClient(options) {
     && checkout.status === 'complete' && checkout.payment_status === 'paid' && checkout.mode === 'subscription'
     && checkout.currency === 'usd' && checkout.livemode === period.livemode
     && id(checkout.customer) === period.customer_id && id(checkout.subscription) === period.subscription_id
-    && (!id(checkout.invoice) || id(checkout.invoice) === period.invoice_id), 'retail_admin_adapter_checkout_unknown');
+    && id(checkout.invoice) === period.invoice_id, 'retail_admin_adapter_checkout_unknown');
   const current = snapshotStripeSdkData(funding.subscription);
   // Validate ACTUAL current SDK state before the old builder can fall back to
   // active. Never substitute original B for a newer current provider period.
@@ -63,6 +67,7 @@ async function applyClient(options) {
   const source = saved?.checkout_attempt_source;
   check(saved?.client_id === funding.clientId && saved.client_id === before.client_id
     && equal(source, before.checkout_attempt_source) && equal(saved.retail_funding_receipt, receipt)
+    && saved.checkout_session_id === period.checkout_session_id
     && equal(saved.template_snapshot, funding.sourceTemplate) && saved.template_version === funding.sourceTemplateVersion
     && funding.agreementId === agreementId && funding.paidAt === period.paid_at
     && funding.checkoutSessionId === period.checkout_session_id && funding.customerId === period.customer_id,
@@ -77,6 +82,9 @@ async function applyClient(options) {
   const ack = await db.rpc('apply_retail_existing_admin_client', { p_agreement: agreementId, p_client: saved.client_id,
     p_source: plain(source), p_funding: plain(receipt), p_initial: initial, p_subscription: subscription });
   if (ack?.error?.message === 'retail_admin_client_paid_period_ended') periodEnded();
+  if (['retail_admin_client_existing_state_conflict', 'retail_admin_client_source_denied',
+    'retail_admin_client_owner_denied', 'retail_admin_client_subscription_denied',
+    'retail_admin_client_payload_denied', 'retail_admin_client_trigger_drift'].includes(ack?.error?.message)) nativeConflict();
   check(ack && !ack.error && ack.data, 'retail_admin_adapter_ack_unknown');
   const result = snapshotStripeSdkData(ack.data);
   check(Object.keys(result).sort().join(',') === 'client_initial,status'

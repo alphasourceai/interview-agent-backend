@@ -702,7 +702,7 @@ async function adminSdkBridge(plan='basic',months=3,payment='prepaid',role=false
   const filters=[],query={select(){return query;},eq(k,val){assert.match(k,/^[a-z_]+$/);filters.push(`${k}=${lit(val)}`);return query;},
    async maybeSingle(){const r=read();assert.ok(r.data.length<=1);return{...r,data:r.data[0]||null};},then(resolve,reject){return Promise.resolve().then(read).then(resolve,reject);}};
   function read(){const data=JSON.parse(sql(`set role service_role;select coalesce(jsonb_agg(to_jsonb(t)),'[]'::jsonb) from public.${table} t${filters.length?' where '+filters.join(' and '):''};`));
-   return{data,count:data.length,error:null};}return query;},
+   return{data:hooks.afterRows?hooks.afterRows(table,data):data,count:data.length,error:null};}return query;},
   async rpc(name,a){let q;
    if(name==='read_retail_existing_funding'){
     reads.push(structuredClone(a));q='select read_retail_existing_funding('+[a.p_agreement,a.p_client,a.p_claim,a.p_source].map(lit).join(',')+');';
@@ -763,6 +763,27 @@ test('admin SDK seam refuses unpaid pinned Checkout and mismatched event session
   b.checkout.payment_status='paid';await assert.rejects(b.apply({eventSessionId:'cs_OTHER'}),{code:'retail_admin_adapter_unknown'});assert.equal(b.writes.length,0);
  }finally{await b.close();}
 });
+test('admin SDK seam requires exact pinned invoice identity before client RPC',opts,async()=>{
+ for(const invoice of [null,'','in_OTHER']){
+  const b=await adminSdkBridge();try{
+   b.checkout.invoice=invoice;const before=billingState(b.f);
+   await assert.rejects(b.apply(),e=>/^retail_admin_adapter_/.test(e.code));assert.equal(b.writes.length,0);assert.equal(billingState(b.f),before);
+  }finally{await b.close();}
+ }
+});
+test('admin SDK seam catches pre-RPC persisted session read transport drift without entering native client writer',opts,async()=>{
+ const b=await adminSdkBridge();try{
+  // Fault injection of the final pre-write DB response, NOT SQL success/money
+  // proof or a claim this transport corruption exists in a hosted database.
+  let drifted=false;
+  b.hooks.afterRows=(table,data)=>{
+   if(table==='membership_agreements'&&b.requests.length===4&&!drifted){drifted=true;return data.map(a=>({...a,checkout_session_id:'cs_OTHER'}));}
+   return data;
+  };
+  const before=billingState(b.f);await assert.rejects(b.apply(),{code:'retail_admin_adapter_source_unknown'});
+  assert.equal(drifted,true);assert.equal(b.writes.length,0);assert.equal(billingState(b.f),before);
+ }finally{await b.close();}
+});
 test('admin SDK seam preserves native commit on lost/unknown ACK, then exact no-op resumes without plan or credit claims',opts,async()=>{
  for(const bad of ['lost','extra','wrong','empty']){
   const b=await adminSdkBridge('pro',6,'prepaid',true);try{
@@ -788,8 +809,15 @@ test('admin SDK seam rechecks native owner/client after write and rejects unknow
 test('admin SDK seam native owner/source mismatch before client update leaves original tuple untouched',opts,async()=>{
  const b=await adminSdkBridge();try{
   b.hooks.beforeApply=async()=>sql(`set role service_role;update clients set archived_at=clock_timestamp() where id=${lit(b.f.client)};`);
-  await assert.rejects(b.apply(),{code:'retail_admin_adapter_ack_unknown'});
+  await assert.rejects(b.apply(),e=>e.code==='retail_admin_adapter_conflict'&&e.status===409&&e.permanentFailure===true);
   assert.equal(JSON.parse(billingState(b.f)).client.contract_start_at,null);
+ }finally{await b.close();}
+});
+test('admin SDK seam known native preference conflict is terminal manual review, not a retryable lost ACK',opts,async()=>{
+ const b=await adminSdkBridge();try{
+  await b.apply();sql(`set role service_role;update clients set auto_renew=false where id=${lit(b.f.client)};`);
+  const before=billingState(b.f);await assert.rejects(b.apply(),e=>e.code==='retail_admin_adapter_conflict'&&e.status===409&&e.permanentFailure===true);
+  assert.equal(billingState(b.f),before);
  }finally{await b.close();}
 });
 test('admin SDK seam out-of-cohort is null without SDK or writes; pending paid CAS refuses and fencing propagates',opts,async()=>{
