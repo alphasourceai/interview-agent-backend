@@ -67,6 +67,17 @@ test('hostile graphs execute no accessor or proxy',async()=>{
   const g=fixture();Object.defineProperty(g.options,'invoiceId',{enumerable:true,get(){reads++;throw Error('private');}});
   await assert.rejects(read(g.options),{code:'retail_recurring_funding_invalid_input'});assert.equal(reads,0);
 });
+test('renewal draft creation and early cash are not constrained by the future B service start',async()=>{
+  for(const earlyPaid of [false,true]){
+    const f=fixture();f.invoice.created=f.cycle.provider_period_start-3600;
+    f.invoice.status_transitions.paid_at=f.cycle.provider_period_start+(earlyPaid?-1800:0);
+    const p=verify(proofInput(f));assert.equal(p.invoice_created,f.invoice.created);
+    assert.equal(p.paid_at,new Date(f.invoice.status_transitions.paid_at*1000).toISOString());
+    assert.deepEqual((await read(f.options)).proof,p); // original A unchanged.
+  }
+  const invalid=fixture();invalid.invoice.created=invalid.invoice.status_transitions.paid_at+1;
+  assert.throws(()=>verify(proofInput(invalid)),{code:'retail_recurring_funding_paid_clock_invalid'});
+});
 test('fresh financial re-read, account/source/API fences and sanitized transport hold',async()=>{
   for(const stage of ['invoice','line','pi','charge','account','source','api','transport','gap']){
     const f=fixture();let reads=0;

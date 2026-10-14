@@ -62,7 +62,7 @@ begin
   or extract(epoch from public.retail_existing_month_anchor(start_b,span))<>(b->>'provider_period_end')::bigint
   or extract(epoch from public.retail_existing_month_anchor(start_b,n*span))<>(p->>'provider_period_start')::bigint
   or extract(epoch from public.retail_existing_month_anchor(start_b,(n+1)*span))<>(p->>'provider_period_end')::bigint
-  or(p->>'invoice_created')::bigint<(p->>'provider_period_start')::bigint
+  or(p->>'invoice_created')::bigint not between 1 and 253402300799
   or(p->>'invoice_created')::bigint>extract(epoch from paid)
   then return false;end if;
  gross:=(p->>'platform_gross_cents')::bigint;discount:=(p->>'platform_discount_cents')::bigint;

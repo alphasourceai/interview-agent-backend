@@ -227,18 +227,18 @@ const recurringSourceCall=f=>'select read_retail_existing_recurring_source('+[f.
 const nativeRecurringSource=f=>JSON.parse(sql('set role service_role;'+recurringSourceCall(f)));
 // Current A and a genuinely elapsed, authored B boundary. These fixtures
 // exercise native writers, NOT actual Stripe schedule geometry or time travel.
-async function paidCycleFixture(payment='monthly_installments',role=false){
+async function paidCycleFixture(payment='monthly_installments',role=false,{waitForB=true}={}){
  const f=fixture('basic',3,payment,role,true,false,'admin','sales_assisted','buyer@example.invalid',
   {offerVersion:STRIPE_RECURRING_OFFER_VERSION,nearCycle:true});
  record(f);nativeComplete(f);nativeBilling(f);
- await new Promise(resolve=>setTimeout(resolve,Math.max(0,f.proof.period.provider_period_end*1000-Date.now()+100)));
+ if(waitForB)await new Promise(resolve=>setTimeout(resolve,Math.max(0,f.proof.period.provider_period_end*1000-Date.now()+100)));
  const s=nativeRecurringSource(f),b=s.original_period,span=f.pkg.membership_terms.stripe_recurrence.interval_count;
  const paid=JSON.parse(sql("select to_jsonb(to_char(date_trunc('second',clock_timestamp()) at time zone 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'));"));
  const p={version:'retail_existing_recurring_funding_proof_v1',agreement_id:f.id,client_id:f.client,
   offer_version:STRIPE_RECURRING_OFFER_VERSION,provider_account_id:'acct_SYNTHETIC',livemode:false,currency:'usd',ordinal:1,
   invoice_id:'in_CYCLE_'+f.id.replaceAll('-',''),line_id:'il_CYCLE_'+f.id.replaceAll('-',''),price_id:b.price_id,
   subscription_id:b.subscription_id,subscription_item_id:b.subscription_item_id,customer_id:b.customer_id,
-  original_paid_at:b.paid_at,paid_at:paid,invoice_created:b.provider_period_end,provider_period_start:b.provider_period_end,
+  original_paid_at:b.paid_at,paid_at:paid,invoice_created:b.provider_period_end-3600,provider_period_start:b.provider_period_end,
   provider_period_end:Date.parse(anchoredMonthInstant(new Date(b.provider_period_start*1000).toISOString(),2*span))/1000,
   platform_gross_cents:f.pkg.platform_fee_cents,platform_discount_cents:0,platform_net_cents:f.pkg.platform_fee_cents,
   tax_cents:0,cash_cents:f.pkg.platform_fee_cents,payment_intent_id:'pi_CYCLE_'+f.id.replaceAll('-',''),charge_id:'ch_CYCLE_'+f.id.replaceAll('-','')};
@@ -314,6 +314,17 @@ test('NATIVE CYCLE two real sessions serialize one identity and a changed proof 
  ]);
  assert.equal(holder.code,0,holder.err);assert.notEqual(writer.code,0);assert.match(writer.err,/retail_period_replay_conflict/);
  assert.equal(billingState(x.f),before);
+});
+test('NATIVE CYCLE admits draft before its B window and early genuine-shaped cash without advancing A term',opts,async()=>{
+ const x=await paidCycleFixture('prepaid',false,{waitForB:false});
+ assert.ok(Date.parse(x.p.paid_at)<x.p.provider_period_start*1000,'authored next B boundary must still be future');
+ assert.ok(x.p.invoice_created<x.p.provider_period_start);
+ const r=JSON.parse(sql('set role service_role;'+cycleRecord(x)));assert.equal(r.status,'recorded');
+ const c=JSON.parse(sql('set role service_role;'+coverageCall(x.f)));
+ assert.equal(c.contiguous_ordinal,1);assert.equal(Date.parse(c.contract_start_at),Date.parse(x.p.original_paid_at));
+ assert.equal(Date.parse(c.contract_end_at),Date.parse(anchoredMonthInstant(x.p.original_paid_at,3)));
+ assert.equal(Date.parse(c.funded_through),Date.parse(anchoredMonthInstant(x.p.original_paid_at,6)));
+ denied('set role service_role;'+cycleRecord(x,{...x.p,invoice_created:Math.floor(Date.parse(x.p.paid_at)/1000)+1}),/retail_period_/);
 });
 const recurringSourceState=f=>sql(`select jsonb_build_object('agreement',(select to_jsonb(a) from membership_agreements a where id=${lit(f.id)}),
  'billing',(${billingStateQuery(f)}),'customer',(select to_jsonb(b) from billing_customers b where client_id=${lit(f.client)}));`);

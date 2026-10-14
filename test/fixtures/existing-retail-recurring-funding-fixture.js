@@ -21,7 +21,7 @@ function recurringFixture(plan='basic',months=3,payment='monthly_installments',r
     l.discount_amounts=d?[{discount:'di_SYNTHETIC',amount:d}]:[];
     l.tax_amounts=t?[{tax_rate:'txr_SYNTHETIC',inclusive:false,amount:t}]:[];
     const i={...structuredClone(f.inv),id:`in_CYCLE_${n}`,billing_reason:'subscription_cycle',
-      created:l.period.start,status_transitions:{paid_at:l.period.start+7},
+      created:l.period.start-3600,status_transitions:{paid_at:l.period.start+7},
       subtotal:o.platform_payment_cents,total,amount_due:total,amount_paid:total,
       total_discount_amounts:structuredClone(l.discount_amounts),total_tax_amounts:structuredClone(l.tax_amounts),
       payment_intent:total?`pi_CYCLE_${n}`:null,charge:total?`ch_CYCLE_${n}`:null,lines:{object:'list',has_more:false,data:[l]}};

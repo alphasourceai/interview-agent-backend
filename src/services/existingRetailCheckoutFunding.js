@@ -274,8 +274,9 @@ function verifyExistingRetailRecurringFunding(raw) {
     && line.amount===offer.platform_payment_cents
     && line.period?.start===cycle.provider_period_start && line.period?.end===cycle.provider_period_end,
     'retail_recurring_funding_line_mismatch');
-  check(epoch(paid) && epoch(invoice.created) && invoice.created<=paid && paid*1000>=Date.parse(p.paid_at)
-    && invoice.created>=cycle.provider_period_start && paid>=cycle.provider_period_start,
+  // A recurring draft may exist or be paid before its future service window.
+  // Its original B geometry remains exact; creation is not the cycle start.
+  check(epoch(paid) && epoch(invoice.created) && invoice.created<=paid && paid*1000>=Date.parse(p.paid_at),
     'retail_recurring_funding_paid_clock_invalid');
   const discount=discounts(line.discount_amounts),tax=taxes(line.tax_amounts),gross=offer.platform_payment_cents;
   const net=gross-discount,total=net+tax;
