@@ -70,6 +70,13 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
   assert.equal(sql("select count(*) from pg_attribute where attrelid='membership_agreements'::regclass and attname='retail_admin_billing_receipt' and not attisdropped;"),'0');
  }finally{sql('drop function public.apply_retail_existing_admin_billing(uuid);');}
  sql(onceMigration);
+ const memberMigration=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014030734_retail_existing_admin_buyer_member.sql'),'utf8');
+ try{
+  sql("create function public.ensure_retail_existing_admin_buyer_member(uuid) returns void language sql as 'select null::void';");
+  denied(memberMigration,/retail_admin_member_schema_drift/);
+  assert.equal(sql("select to_regprocedure('public.retail_admin_existing_member_schema_guard()') is null;"),'t');
+ }finally{sql('drop function public.ensure_retail_existing_admin_buyer_member(uuid);');}
+ sql(memberMigration);
  // Exact old-data oracles remain, with ONLY the new nullable receipt column.
  // Derive expected JSON from the prior saved oracle, not a fresh row read that
  // could hide migration DML or changes to an accepted historical agreement.
@@ -1230,4 +1237,179 @@ test('full admin billing SDK adapter remains absent from mounted application imp
   const file=path.join(dir,entry.name);if(entry.isDirectory())scan(file);
   else if(file.endsWith('.js')&&!file.endsWith('/existingRetailAdminBillingAdapter.js'))assert.ok(!fs.readFileSync(file,'utf8').includes('existingRetailAdminBillingAdapter'),file);
  }}scan(root);
+});
+
+// Native membership ONLY. User IDs are authored synthetic identities; no
+// hosted Auth/user/password/email operation is exercised or claimed.
+function memberFixture(plan='basic',months=3,payment='prepaid',role=false){
+ const f=onceFixture(plan,months,payment,role);f.w=nativeAdminOnce(f).receipt;f.user=crypto.randomUUID();return f;
+}
+const memberCurrent=f=>({...adminSubscription(f),cancel_at:null,pause_collection:null});
+function memberCall(f,user=f.user,current=memberCurrent(f),source=f.source,receipt=f.w,name='Synthetic Buyer'){
+ return 'select ensure_retail_existing_admin_buyer_member('+[f.id,source,receipt,current,user,name].map(lit).join(',')+');';
+}
+const nativeMember=(f,...args)=>JSON.parse(sql('set role service_role;'+memberCall(f,...args)));
+const members=f=>JSON.parse(sql(`select coalesce(jsonb_agg(to_jsonb(m) order by user_id),'[]'::jsonb) from client_members m where client_id=${lit(f.client)};`));
+for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])for(const role of [false,true])
+test(`native original admin buyer membership ${plan}/${months}/${payment}/role:${role}`,opts,()=>{
+ const f=memberFixture(plan,months,payment,role),financial=adminOnceState(f);
+ assert.deepEqual(nativeMember(f),{status:'created',role:'manager'});const first=members(f);
+ assert.equal(first.length,1);assert.equal(first[0].user_id,f.user);assert.equal(first[0].user_id_uuid,f.user);
+ assert.equal(first[0].email,'buyer@example.invalid');assert.equal(first[0].name,'Synthetic Buyer');
+ assert.deepEqual(nativeMember(f),{status:'existing',role:'manager'});assert.deepEqual(members(f),first);assert.equal(adminOnceState(f),financial);
+});
+test('native member preserves original privileged roles/names/emails and fills empty values without reassigning identity',opts,()=>{
+ for(const role of ['manager','admin','owner','super_admin','member']){
+  const f=memberFixture();sql(`insert into client_members(client_id,user_id,email,name,role) values(${lit(f.client)},${lit(f.user)},' BUYER@example.invalid ','Original Name',${lit(role)});`);
+  const r=nativeMember(f),m=members(f)[0];assert.equal(r.role,role==='member'?'manager':role);assert.equal(m.name,'Original Name');assert.equal(m.email,' BUYER@example.invalid ');
+  const saved=members(f);assert.equal(nativeMember(f).status,'existing');assert.deepEqual(members(f),saved);
+ }
+ const f=memberFixture();sql(`insert into client_members(client_id,user_id,email,name,role) values(${lit(f.client)},${lit(f.user)},null,null,'member');`);
+ assert.equal(nativeMember(f).status,'updated');assert.equal(members(f)[0].email,'buyer@example.invalid');assert.equal(members(f)[0].name,'Synthetic Buyer');
+});
+test('native member rejects ambiguous or different user/email identity before changing existing members',opts,()=>{
+ for(const mode of ['same-email-other-user','same-user-other-email','ambiguous']){
+  const f=memberFixture(),other=crypto.randomUUID();
+  const email=mode==='same-user-other-email'?'other@example.invalid':'buyer@example.invalid',user=mode==='same-user-other-email'?f.user:other;
+  sql(`insert into client_members(client_id,user_id,email,role) values(${lit(f.client)},${lit(user)},${lit(email)},'member');`);
+  if(mode==='ambiguous')sql(`insert into client_members(client_id,user_id,email,role) values(${lit(f.client)},${lit(f.user)},null,'member');`);
+  const before=members(f);denied('set role service_role;'+memberCall(f),/retail_admin_member_identity_conflict/);assert.deepEqual(members(f),before);
+ }
+});
+test('native member current nonrenewal preference allows initial paid access without rewriting preferences or consumed credit/settings',opts,()=>{
+ const f=memberFixture('pro',6,'monthly_installments',true),used=crypto.randomUUID();
+ sql(`insert into roles(id,client_id,title,slug_or_token) values(${lit(used)},${lit(f.client)},'Synthetic member credit use',${lit('SYNTHETIC_'+used)});
+  update client_role_credits set status='used',used_at=clock_timestamp(),used_by_role_id=${lit(used)} where id=${lit(f.w.credit_id)};
+  update client_plan_settings set platform_fee=17,billing_model='usage' where client_id=${lit(f.client)};
+  update clients set auto_renew=false,cancel_at_term_end=true where id=${lit(f.client)};`);
+ const financial=adminOnceState(f);assert.equal(nativeMember(f,f.user,{...memberCurrent(f),cancel_at_period_end:true}).status,'created');assert.equal(adminOnceState(f),financial);
+});
+test('native member refuses unknown/current inactive/newer/cancel/pause provider projection; marker is not current proof',opts,()=>{
+ const f=memberFixture();for(const patch of [{status:'canceled'},{status:'past_due'},{status:'trialing'},{id:'sub_OTHER'},{customer:'cus_OTHER'},
+  {current_period_end:f.proof.period.provider_period_end+1},{current_period_end:'2000000000'},{cancel_at_period_end:null},
+  {cancel_at:f.proof.period.provider_period_end-1},{cancel_at:253402300800},{cancel_at:'later'},{cancel_at:2000000000.5},
+  {pause_collection:{behavior:'keep_as_draft'}},{extra:true}]){
+  denied('set role service_role;'+memberCall(f,f.user,{...memberCurrent(f),...patch}),/retail_admin_member_current_subscription_denied/);assert.deepEqual(members(f),[]);
+ }
+});
+test('native member requires same live native first period/root owner/source/current agreement and no force-inactive override',opts,()=>{
+ for(const mode of ['archive','parent','customer','subscription','profile','status','billing','period','start','end','override','superseded','voided','current']){
+  const f=memberFixture();
+  if(mode==='parent'){const p=crypto.randomUUID();sql(`insert into clients(id,name,email) values(${lit(p)},'Synthetic other parent','parent@example.invalid');update clients set parent_client_id=${lit(p)} where id=${lit(f.client)};`);}
+  else if(mode==='profile')sql(`update billing_customers set stripe_customer_id=null where client_id=${lit(f.client)};`);
+  else if(['superseded','voided','current'].includes(mode))sql(`update membership_agreements set ${mode==='superseded'?'superseded_at=clock_timestamp()':mode==='voided'?'voided_at=clock_timestamp()':'is_current=false'} where id=${lit(f.id)};`);
+  else{const fields={archive:'archived_at=clock_timestamp()',customer:'stripe_customer_id='+lit('cus_OTHER_'+f.id.replaceAll('-','')),subscription:'stripe_subscription_id='+lit('sub_OTHER_'+f.id.replaceAll('-','')),
+   status:"subscription_status='past_due'",billing:"billing_status='inactive'",period:"current_term_end=current_term_end+interval '1 month'",
+   start:"contract_start_at=contract_start_at+interval '1 second'",end:"contract_end_at=contract_end_at+interval '1 second'",override:"access_override_mode='force_inactive'"};
+   sql(`update clients set ${fields[mode]} where id=${lit(f.client)};`);}
+  const before=adminOnceState(f);denied('set role service_role;'+memberCall(f),/retail_admin_member_|retail_funding_|retail_admin_billing_/);
+  assert.deepEqual(members(f),[]);assert.equal(adminOnceState(f),before);
+ }
+});
+test('native member refuses missing/altered/full receipt/source/user and partial client-only billing',opts,()=>{
+ const f=memberFixture();for(const [source,receipt,user] of [[{...f.source,customer_id:'cus_OTHER'},f.w,f.user],[f.source,{...f.w,extra:true},f.user],
+  [f.source,null,f.user],[f.source,f.w,null],[f.source,f.w,'00000000-0000-0000-0000-000000000000']]){
+  denied('set role service_role;'+memberCall(f,user,memberCurrent(f),source,receipt),/retail_admin_member_/);assert.deepEqual(members(f),[]);
+ }
+ const p=onceFixture();nativeAdmin(p);p.user=crypto.randomUUID();p.w=null;
+ denied('set role service_role;'+memberCall(p),/retail_admin_member_source_denied/);assert.deepEqual(members(p),[]);
+});
+test('native member same-client same-email DIFFERENT users serialize on root FOR UPDATE: one grant and one refusal',opts,async()=>{
+ const f=memberFixture(),u2=crypto.randomUUID();
+ const [a,b]=await Promise.all([parallel('set role service_role;begin;'+memberCall(f)+'select pg_sleep(0.25);commit;'),
+  parallel('set role service_role;select pg_sleep(0.03);'+memberCall(f,u2))]);
+ assert.equal(a.code,0,a.err);assert.notEqual(b.code,0);assert.match(b.err,/retail_admin_member_identity_conflict/);
+ assert.equal(members(f).length,1);assert.equal(members(f)[0].user_id,f.user);
+});
+test('native member same identity concurrent calls create once then return exact existing without another grant',opts,async()=>{
+ const f=memberFixture();const [a,b]=await Promise.all([parallel('set role service_role;begin;'+memberCall(f)+'select pg_sleep(0.15);commit;'),
+  parallel('set role service_role;'+memberCall(f))]);assert.equal(a.code,0,a.err);assert.equal(b.code,0,b.err);
+ const statuses=[a,b].map(v=>JSON.parse(v.out.split('\n').find(s=>s.startsWith('{'))).status).sort();assert.deepEqual(statuses,['created','existing']);assert.equal(members(f).length,1);
+});
+test('native membership differing-user concurrency actually blocks on the first transaction, not an empty candidate gap',opts,async()=>{
+ const f=memberFixture(),other=crypto.randomUUID(),tag='SYNTHETIC_MEMBER_'+f.id.replaceAll('-','');
+ const [holder,writer,observer]=await Promise.all([
+  parallel(`set application_name=${lit(tag+'_holder')};set role service_role;begin;${memberCall(f)}select pg_sleep(1.0);commit;`),
+  parallel(`set application_name=${lit(tag+'_writer')};set role service_role;select pg_sleep(0.1);${memberCall(f,other)}`),
+  parallel(`select pg_sleep(0.35);select exists(select 1 from pg_stat_activity w join pg_stat_activity h
+    on h.pid=any(pg_blocking_pids(w.pid)) where w.application_name=${lit(tag+'_writer')} and h.application_name=${lit(tag+'_holder')} and w.wait_event_type='Lock');`)
+ ]);
+ assert.equal(holder.code,0,holder.err);assert.notEqual(writer.code,0);assert.match(writer.err,/retail_admin_member_identity_conflict/);
+ assert.equal(observer.code,0,observer.err);assert.equal(observer.out.trim(),'t');assert.equal(members(f).length,1);
+});
+test('native member fresh clock after an actual member lock wait refuses before UPDATE at original B expiry',opts,async()=>{
+ const f=fixture('basic',3,'monthly_installments',false,false);f.proof.period.provider_period_end=Math.floor(Date.now()/1000)+2;
+ record(f);markAdminPaid(f);f.w=nativeAdminOnce(f).receipt;f.user=crypto.randomUUID();
+ sql(`insert into client_members(client_id,user_id,email,name,role) values(${lit(f.client)},${lit(f.user)},'buyer@example.invalid',null,'member');`);
+ const before=members(f),financial=adminOnceState(f);
+ const [holder,writer]=await Promise.all([parallel(`begin;select 1 from client_members where client_id=${lit(f.client)} and user_id=${lit(f.user)} for update;select pg_sleep(2.5);commit;`),
+  parallel('set role service_role;select pg_sleep(0.07);'+memberCall(f))]);assert.equal(holder.code,0,holder.err);assert.notEqual(writer.code,0);
+ assert.match(writer.err,/retail_admin_member_paid_period_ended/);assert.deepEqual(members(f),before);assert.equal(adminOnceState(f),financial);
+});
+test('native member delayed real COMMIT after B expiry rolls membership back, financial completion remains',opts,()=>{
+ const f=fixture('basic',3,'monthly_installments',false,false);f.proof.period.provider_period_end=Math.floor(Date.now()/1000)+2;
+ record(f);markAdminPaid(f);f.w=nativeAdminOnce(f).receipt;f.user=crypto.randomUUID();const financial=adminOnceState(f);
+ denied('set role service_role;begin;'+memberCall(f)+'select pg_sleep(2.5);commit;',/retail_admin_member_paid_period_ended/);
+ assert.deepEqual(members(f),[]);assert.equal(adminOnceState(f),financial);
+});
+test('native member deferred commit checks catch same-tx client/identity/role/source changes and roll back',opts,()=>{
+ for(const mode of ['inactive','archive','identity','role','current']){
+  const f=memberFixture(),financial=adminOnceState(f);const change=mode==='identity'?`update client_members set email='other@example.invalid' where client_id=${lit(f.client)};`
+   :mode==='role'?`update client_members set role='owner' where client_id=${lit(f.client)};`
+   :mode==='current'?`update membership_agreements set is_current=false where id=${lit(f.id)};`
+   :`update clients set ${mode==='archive'?'archived_at=clock_timestamp()':"billing_status='inactive'"} where id=${lit(f.client)};`;
+  denied('set role service_role;begin;'+memberCall(f)+change+'commit;',/retail_admin_member_|retail_admin_billing_|retail_funding_customer_denied/);
+  assert.deepEqual(members(f),[]);assert.equal(adminOnceState(f),financial);
+ }
+});
+test('native deferred member map independently validates two different client keys and refuses divergent same-key binding',opts,()=>{
+ const a=memberFixture(),b=memberFixture();sql('set role service_role;begin;'+memberCall(a)+memberCall(b)+'commit;');
+ assert.equal(members(a).length,1);assert.equal(members(b).length,1);
+ const f=memberFixture();denied('set role service_role;begin;'+memberCall(f)+memberCall(f,f.user,{...memberCurrent(f),cancel_at_period_end:true})+'commit;',/retail_admin_member_binding_conflict/);assert.deepEqual(members(f),[]);
+});
+test('native member guard leaves unmarked legacy member writes unchanged and new SQL adds no table/column/browser grants',opts,()=>{
+ const client=crypto.randomUUID(),user=crypto.randomUUID();sql(`insert into clients(id,name,email) values(${lit(client)},'Synthetic unmarked legacy','unmarked@example.invalid');
+  insert into client_members(client_id,user_id,email,role) values(${lit(client)},${lit(user)},'legacy@example.invalid','member');`);
+ assert.equal(sql(`select role from client_members where client_id=${lit(client)};`),'member');
+ const f=memberFixture(),before=adminOnceState(f),aclBefore=sql("select relacl::text from pg_class where oid='client_members'::regclass;");
+ for(const role of ['anon','authenticated'])denied('set role '+role+';'+memberCall(f),/permission denied/);
+ denied(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014030734_retail_existing_admin_buyer_member.sql'),'utf8'),/retail_admin_member_schema_drift/);
+ assert.equal(aclBefore,sql("select relacl::text from pg_class where oid='client_members'::regclass;"));assert.equal(adminOnceState(f),before);assert.deepEqual(members(f),[]);
+ assert.equal(sql("select prosecdef from pg_proc where oid='ensure_retail_existing_admin_buyer_member(uuid,jsonb,jsonb,jsonb,uuid,text)'::regprocedure;"),'f');
+});
+test('native member refuses pinned old billing/helper/member trigger drift and missing member privileges/RLS',opts,()=>{
+ const f=memberFixture();for(const name of ['retail_admin_existing_billing_schema_guard','retail_admin_existing_billing_context','retail_admin_existing_billing_receipt_valid',
+  'retail_admin_existing_billing_guard','retail_admin_existing_billing_commit_guard','apply_retail_existing_admin_billing','client_members_sync_user_uuid',
+  'retail_admin_existing_member_context','retail_admin_existing_member_commit_guard','ensure_retail_existing_admin_buyer_member']){
+  const definition=sql(`select pg_get_functiondef(oid) from pg_proc where proname=${lit(name)};`);
+  try{sql(definition.replace(/\nAS \$function\$\n/,'\nAS $function$\n -- native member drift\n'));
+   denied('set role service_role;'+memberCall(f),/retail_admin_member_|retail_admin_billing_/);assert.deepEqual(members(f),[]);
+  }finally{sql(definition);}
+ }
+ for(const privilege of ['SELECT','INSERT','UPDATE']){
+  try{sql('revoke '+privilege+' on public.client_members from service_role;');denied('set role service_role;'+memberCall(f),/retail_admin_member_schema_drift/);assert.deepEqual(members(f),[]);}
+  finally{sql('grant '+privilege+' on public.client_members to service_role;');}
+ }
+ try{sql('alter table public.client_members disable row level security;');denied('set role service_role;'+memberCall(f),/retail_admin_member_schema_drift/);}
+ finally{sql('alter table public.client_members enable row level security;');}
+ for(const [table,trigger] of [['client_members','trg_client_members_sync_user_uuid'],['membership_agreements','retail_admin_existing_billing_guard'],['membership_agreements','retail_admin_existing_billing_commit_guard'],['client_members','retail_admin_existing_member_commit_guard']]){
+  try{sql(`alter table public.${table} disable trigger ${trigger};`);denied('set role service_role;'+memberCall(f),/retail_admin_member_trigger_drift/);}
+  finally{sql(`alter table public.${table} enable trigger ${trigger};`);}
+ }
+ assert.deepEqual(members(f),[]);
+ try{sql("create function public.ensure_retail_existing_admin_buyer_member(uuid) returns void language sql as 'select null::void';");
+  denied('set role service_role;'+memberCall(f),/retail_admin_member_prerequisite_drift/);assert.deepEqual(members(f),[]);
+ }finally{sql('drop function public.ensure_retail_existing_admin_buyer_member(uuid);');}
+});
+test('new native admin membership RPC remains absent from mounted application source',()=>{
+ const root=path.resolve(__dirname,'../src');function scan(dir){for(const e of fs.readdirSync(dir,{withFileTypes:true})){
+  const f=path.join(dir,e.name);if(e.isDirectory())scan(f);else if(f.endsWith('.js'))assert.ok(!fs.readFileSync(f,'utf8').includes('ensure_retail_existing_admin_buyer_member'),f);
+ }}scan(root);
+});
+test('native member future cancellation at or after original B retains initial paid access without resetting nonrenewal',opts,()=>{
+ for(const offset of [0,86400]){
+  const f=memberFixture();sql(`update clients set auto_renew=false,cancel_at_term_end=true where id=${lit(f.client)};`);
+  const financial=adminOnceState(f);assert.equal(nativeMember(f,f.user,{...memberCurrent(f),cancel_at_period_end:true,cancel_at:f.proof.period.provider_period_end+offset}).status,'created');
+  assert.equal(adminOnceState(f),financial);
+ }
 });
