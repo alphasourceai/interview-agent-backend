@@ -134,8 +134,13 @@ test('final B/source/policy change holds; no money or access rollback falsely re
 test('preflight preserves guard-lost code but strips raw exceptions; has no default application importer or provider writes',async()=>{
   const f=setup();f.opts.assertFence=async()=>{throw Object.assign(Error('PRIVATE_SECRET'),{code:'public_purchase_activation_guard_lost'});};
   await assert.rejects(prepare(f.opts),e=>e.code==='public_purchase_activation_guard_lost'&&e.message==='public_purchase_activation_guard_lost');
+  // The fenced replacement-cancellation executor is the one intentional
+  // application importer; the preflight remains private everywhere else.
+  const cancellation=fs.readFileSync(path.resolve(__dirname,'../src/services/existingRetailReplacementCancellation.js'),'utf8');
+  assert.ok(cancellation.includes("require('./existingRetailReplacementPreflight')"));
   function scan(dir){for(const e of fs.readdirSync(dir,{withFileTypes:true})){const file=path.join(dir,e.name);
-    if(e.isDirectory())scan(file);else if(e.name.endsWith('.js')&&e.name!=='existingRetailReplacementPreflight.js')assert.ok(!fs.readFileSync(file,'utf8').includes('existingRetailReplacementPreflight'),file);}}
+    if(e.isDirectory())scan(file);else if(e.name.endsWith('.js')&&!['existingRetailReplacementPreflight.js','existingRetailReplacementCancellation.js'].includes(e.name))
+      assert.ok(!fs.readFileSync(file,'utf8').includes('existingRetailReplacementPreflight'),file);}}
   scan(path.resolve(__dirname,'../src'));
   const source=fs.readFileSync(path.resolve(__dirname,'../src/services/existingRetailReplacementPreflight.js'),'utf8');
   for(const forbidden of ['subscriptions.cancel(','.update(','.insert(','.upsert(','.auth','record_retail_existing_funding','apply_public_purchase_billing'])assert.ok(!source.includes(forbidden),forbidden);
