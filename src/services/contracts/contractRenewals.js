@@ -100,6 +100,7 @@ async function processContractRenewals(context = {}, dependencies = {}) {
       due: 0,
       renewed: 0,
       deactivated: 0,
+      held_retail_payment: 0,
       skipped_manual_override: 0,
       skipped_no_action: 0,
       errors: 0
@@ -140,6 +141,18 @@ async function processContractRenewals(context = {}, dependencies = {}) {
         summary.errors += 1;
         items.push({id:client.id, name:client.name || null, action:'error', contract_end_at_before:oldContractEnd,
           detail:e.message || 'renewal_terms_failed'});
+        continue;
+      }
+
+      // This legacy calendar scanner has no proof of the next paid period.
+      // Neither auto-renew nor the original payment authorizes a new term;
+      // nonrenewal must not cancel installments still owed in the current term.
+      // The paid-period processor must own both decisions. This read-time hold
+      // is not an atomic exclusion against a concurrent legacy -> retail cutover.
+      if (retailWindow) {
+        summary.held_retail_payment += 1;
+        items.push({id:client.id, name:client.name || null, action:'held_retail_payment',
+          contract_end_at_before:oldContractEnd, detail:'retail_paid_period_processor_required'});
         continue;
       }
 

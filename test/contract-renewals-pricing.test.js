@@ -10,16 +10,16 @@ const { OFFER_VERSION, retailTermWindow } = require('../src/services/membershipO
 
 const ORIGINAL = '2026-01-31T12:13:14.000Z';
 const TEMPLATE = 'membership_agreement_retail_terms_v2';
-function fixture(months = 3, payment = 'prepaid', index = 0) {
-  const snapshot = structuredClone(buildRetailPackageSnapshot({planKey:'basic', commitmentMonths:months,
+function fixture(months = 3, payment = 'prepaid', index = 0, plan = 'basic') {
+  const snapshot = structuredClone(buildRetailPackageSnapshot({planKey:plan, commitmentMonths:months,
     paymentOption:payment, channel:'sales', offerVersion:OFFER_VERSION}));
   const term = retailTermWindow({originalStart:ORIGINAL, commitmentMonths:months, termIndex:index});
   return {
-    client:{id:'synthetic-client', name:'Synthetic', plan_tier:'basic', billing_interval:snapshot.billing_cadence,
+    client:{id:'synthetic-client', name:'Synthetic', plan_tier:plan, billing_interval:snapshot.billing_cadence,
       contract_start_at:term.term_start_at, contract_end_at:term.term_end_at, auto_renew:true,
       billing_status:'active', stripe_subscription_id:'sub_SYNTHETIC', subscription_status:'active', cancel_at_term_end:false},
     agreement:{id:'synthetic-agreement', client_id:'synthetic-client', status:'signed', is_current:true,
-      checkout_status:'paid', checkout_paid_at:ORIGINAL, membership_tier:'basic', billing_option:snapshot.billing_cadence,
+      checkout_status:'paid', checkout_paid_at:ORIGINAL, membership_tier:plan, billing_option:snapshot.billing_cadence,
       template_version:TEMPLATE, template_snapshot:{template_version:TEMPLATE, package_snapshot:snapshot}}
   };
 }
@@ -62,23 +62,30 @@ test('accepted 3/6/12 prepaid and installment renewals keep the original UTC anc
   const f=fixture(3); assert.equal(getRetailRenewalWindow(f.client,f.agreement).term_end_at,'2026-07-31T12:13:14.000Z');
 });
 
-test('accepted historical prices are not re-priced by a renewal',async()=>{
+test('held retail renewal retains accepted historical prices without advancing dates',async()=>{
   const f=fixture(); const s=f.agreement.template_snapshot.package_snapshot;
   s.platform_fee=1100; s.platform_fee_cents=110000; s.platform_commitment_total_cents=110000;
   s.membership_terms.platform_payment_cents=110000; s.membership_terms.platform_commitment_total_cents=110000;
   s.membership_terms.initial_payment_cents=110000;
   const db=makeDb(f), result=await processContractRenewals({},deps(db));
-  assert.equal(result.summary.renewed,1); assert.equal(db.subscriptionWrites.length,0);
-  assert.deepEqual(Object.keys(db.writes[0].payload).sort(),['contract_end_at','contract_start_at']);
+  assert.equal(result.summary.held_retail_payment,1);assert.equal(result.summary.renewed,0);
+  assert.equal(db.subscriptionWrites.length,0);assert.deepEqual(db.writes,[]);
+  assert.deepEqual(db.client,f.client);assert.deepEqual(db.agreement,f.agreement);
 });
 
-test('existing processor renews each new term without creating payments or replacing Stripe prices',async()=>{
-  for (const months of [3,6,12]) for (const payment of ['prepaid','monthly_installments']) {
-    const f=fixture(months,payment), db=makeDb(f), result=await processContractRenewals({},deps(db));
-    assert.equal(result.summary.renewed,1);
-    assert.equal(db.client.contract_end_at,getRetailRenewalWindow(f.client,f.agreement).term_end_at);
-    assert.equal(db.subscriptionWrites.length,0);
-    assert.ok(db.writes[0].filters.some(([k,v])=>k==='auto_renew'&&v===true));
+test('existing scanner holds all retail terms and renewal choices without payment or access claims',async()=>{
+  for(const plan of ['basic','pro']) for(const months of [3,6,12])
+  for(const payment of ['prepaid','monthly_installments']) for(const renew of [true,false]) {
+    const f=fixture(months,payment,0,plan);f.client.auto_renew=renew;
+    const db=makeDb(f),d=deps(db);
+    d.stripe.subscriptions.retrieve=async()=>{throw Error('No provider read is authorized by this hold');};
+    const result=await processContractRenewals({},d);
+    assert.deepEqual(result.summary,{scanned:1,due:1,renewed:0,deactivated:0,held_retail_payment:1,
+      skipped_manual_override:0,skipped_no_action:0,errors:0});
+    assert.deepEqual(result.items,[{id:f.client.id,name:f.client.name,action:'held_retail_payment',
+      contract_end_at_before:f.client.contract_end_at,detail:'retail_paid_period_processor_required'}]);
+    assert.deepEqual(db.client,f.client);assert.deepEqual(db.agreement,f.agreement);
+    assert.deepEqual(db.writes,[]);assert.deepEqual(db.subscriptionWrites,[]);
   }
 });
 
@@ -107,20 +114,23 @@ test('invalid new accepted terms never fall back to a 12-month renewal',async()=
   }
 });
 
-test('new renewal concurrency no-ops are not counted as successful renewals',async()=>{
+test('retail hold does not enter the legacy client CAS at all',async()=>{
   for (const beforeUpdate of [c=>{c.auto_renew=false;},c=>{c.contract_end_at='2027-04-30T12:13:14.000Z';}]) {
-    const db=makeDb(fixture(),{beforeUpdate}), result=await processContractRenewals({},deps(db));
-    assert.equal(result.summary.renewed,0); assert.equal(result.summary.skipped_no_action,1); assert.equal(db.writes.length,0);
+    const f=fixture(),db=makeDb(f,{beforeUpdate}), result=await processContractRenewals({},deps(db));
+    assert.equal(result.summary.renewed,0);assert.equal(result.summary.held_retail_payment,1);
+    assert.equal(result.summary.skipped_no_action,0);assert.equal(db.writes.length,0);
+    assert.deepEqual(db.client,f.client); // The fake update hook was never entered; not a native race test.
   }
 });
 
-test('a stale non-renewal decision cannot deactivate a changed term or cancel its Stripe subscription',async()=>{
-  for (const beforeUpdate of [c=>{c.auto_renew=true;}, c=>{c.contract_end_at='2027-04-30T12:13:14.000Z';},
-    c=>{c.contract_start_at='2026-04-30T12:13:14.000Z';}]) {
-    const f=fixture(); f.client.auto_renew=false;
-    const db=makeDb(f,{beforeUpdate}), result=await processContractRenewals({},deps(db));
-    assert.equal(result.summary.deactivated,0); assert.equal(result.summary.skipped_no_action,1);
-    assert.equal(db.writes.length,0); assert.equal(db.subscriptionWrites.length,0);
+test('retail hold applies even if local inactive state would otherwise request Stripe alignment',async()=>{
+  for(const inactive of [false,true]) for(const canceled of [false,true]) {
+    const f=fixture();f.client.auto_renew=false;f.client.cancel_at_term_end=canceled;
+    if(inactive){f.client.billing_status='inactive';f.client.cancel_effective_at=f.client.contract_end_at;}
+    const db=makeDb(f),result=await processContractRenewals({},deps(db));
+    assert.equal(result.summary.deactivated,0);assert.equal(result.summary.held_retail_payment,1);
+    assert.equal(result.summary.skipped_no_action,0);assert.deepEqual(db.client,f.client);
+    assert.equal(db.writes.length,0);assert.equal(db.subscriptionWrites.length,0);
   }
 });
 
@@ -136,19 +146,35 @@ test('database timestamp representations are compared as instants, including lea
   assert.equal(getRetailRenewalWindow(leap.client,leap.agreement).term_end_at,'2029-02-28T12:13:14.000Z');
 });
 
-test('read/write errors are recorded without provider effects',async()=>{
+test('retail read and legacy write errors are recorded without provider effects',async()=>{
   for (const behavior of [{loadError:true},{updateError:true}]) {
-    const db=makeDb(fixture(),behavior), result=await processContractRenewals({},deps(db));
+    const f=fixture();if(behavior.updateError){f.client.billing_interval='monthly';f.agreement=null;}
+    const db=makeDb(f,behavior), result=await processContractRenewals({},deps(db));
     assert.equal(result.summary.errors,1); assert.equal(db.writes.length,0); assert.equal(db.subscriptionWrites.length,0);
   }
 });
 
-test('non-renewal preserves access until commitment end then uses existing deactivation',async()=>{
+test('retail nonrenewal stays unchanged before expiry and holds after expiry rather than canceling obligations',async()=>{
   const f=fixture(6,'monthly_installments'); f.client.auto_renew=false;
   const before=makeDb(f), early=await processContractRenewals({},deps(before,'2026-03-01T00:00:00.000Z'));
   assert.equal(early.summary.due,0); assert.equal(before.writes.length,0); assert.equal(before.subscriptionWrites.length,0);
   const after=makeDb(f), ended=await processContractRenewals({},deps(after));
-  assert.equal(ended.summary.deactivated,1); assert.equal(after.client.billing_status,'inactive');
-  assert.equal(after.client.cancel_effective_at,f.client.contract_end_at);
-  assert.equal(after.subscriptionWrites.length,1);
+  assert.equal(ended.summary.held_retail_payment,1);assert.equal(ended.summary.deactivated,0);
+  assert.deepEqual(after.client,f.client);assert.deepEqual(after.writes,[]);assert.deepEqual(after.subscriptionWrites,[]);
+});
+
+test('legacy nonrenewal still deactivates and aligns Stripe; provider failure is recorded',async()=>{
+  for(const failure of [false,true]){
+    const f=fixture();f.client.billing_interval='monthly';f.client.auto_renew=false;f.agreement=null;
+    const db=makeDb(f),d=deps(db);if(failure)d.stripe.subscriptions.update=async(id,payload)=>{
+      db.subscriptionWrites.push({id,payload});throw Error('synthetic legacy provider failure');};
+    const result=await processContractRenewals({},d);
+    assert.equal(result.summary.held_retail_payment,0);assert.equal(result.summary.deactivated,1);
+    assert.equal(result.summary.errors,failure?1:0);assert.equal(db.client.billing_status,'inactive');
+    assert.equal(db.client.cancel_effective_at,f.client.contract_end_at);assert.equal(db.subscriptionWrites.length,1);
+    assert.deepEqual(db.subscriptionWrites[0],{id:f.client.stripe_subscription_id,payload:{cancel_at_period_end:true}});
+    assert.equal(result.items[0].action,'deactivated');
+    if(failure)assert.equal(result.items[0].stripe_alignment_error,'synthetic legacy provider failure');
+    else assert.equal(db.client.cancel_at_term_end,true);
+  }
 });
