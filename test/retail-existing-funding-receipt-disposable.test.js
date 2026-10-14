@@ -6,6 +6,8 @@ const {OFFER_VERSION,anchoredMonthInstant}=require('../src/services/membershipOf
 const enabled=process.env.RETAIL_FUNDING_RECEIPT_DISPOSABLE==='true',opts={skip:!enabled};
 const migration=path.resolve(__dirname,'../supabase/migrations/20261013231615_retail_existing_initial_funding_receipt.sql');
 const linkedMemberMigrationPath=path.resolve(__dirname,'../supabase/migrations/20261014045836_retail_existing_linked_buyer_member.sql');
+const replacementBillingMigrationPath=path.resolve(__dirname,'../supabase/migrations/20261014130713_retail_existing_replacement_billing_repair.sql');
+const replacementBillingBodyHash='c00171923a56c63735f753a430aee2e4';
 const customerIndex='CREATE UNIQUE INDEX billing_customers_stripe_customer_id_uniq ON public.billing_customers USING btree (stripe_customer_id) WHERE (stripe_customer_id IS NOT NULL)';
 const lit=v=>v==null?'null':typeof v==='object'?`'${JSON.stringify(v).replaceAll("'","''")}'::jsonb`:typeof v==='boolean'||typeof v==='number'?String(v):`'${String(v).replaceAll("'","''")}'`;
 function run(q){return cp.spawnSync('/opt/homebrew/opt/postgresql@17/bin/psql',['-X','-q','-At','-v','ON_ERROR_STOP=1','-c',q],{encoding:'utf8'});}
@@ -90,6 +92,21 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014105926_retail_existing_replacement_reservations.sql'),'utf8'));
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014122919_retail_existing_replacement_canceled_observations.sql'),'utf8'));
  assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
+ const originalFunctions=JSON.parse(linkedOriginalCatalog),oldGuard=sql("select prosrc from pg_proc where oid='public.retail_linked_existing_member_schema_guard()'::regprocedure;");
+ sql(fs.readFileSync(replacementBillingMigrationPath,'utf8'));
+ const changedFunctions=JSON.parse(linkedOriginalFunctions()),actualHash=sql("select md5(prosrc) from pg_proc where proname='apply_public_purchase_billing';");
+ assert.equal(actualHash,replacementBillingBodyHash);
+ for(const [index,prior] of originalFunctions.entries()){
+  if(prior[0].startsWith('apply_public_purchase_billing(')){
+   assert.equal(changedFunctions[index][0],prior[0]);assert.deepEqual(changedFunctions[index].slice(2),prior.slice(2));
+   const start=prior[1].indexOf('  v_digest := encode('),end=prior[1].indexOf('\n  if v_intent.billing_applied_at is not null');
+   assert.ok(start>=0&&end>start);assert.ok(changedFunctions[index][1].includes(prior[1].slice(start,end)));
+  }else assert.deepEqual(changedFunctions[index],prior);
+ }
+ const normalizeGuard=v=>v.replace(/SELF_MD5:[a-f0-9]{32}/g,'SELF_MD5:00000000000000000000000000000000');
+ assert.equal(normalizeGuard(sql("select prosrc from pg_proc where oid='public.retail_linked_existing_member_schema_guard()'::regprocedure;")),
+  normalizeGuard(oldGuard.replace('6ed48e7c15548a4521417b99ee213bd7',actualHash)));
+ assert.deepEqual(JSON.parse(linkedOriginalFunctions()),changedFunctions);linkedOriginalCatalog=linkedOriginalFunctions();
  // Exact old-data oracles remain, with ONLY the new nullable receipt column.
  // Derive expected JSON from the prior saved oracle, not a fresh row read that
  // could hide migration DML or changes to an accepted historical agreement.
@@ -348,7 +365,7 @@ test('historical V2 no-receipt billing remains on original writer and does not b
 });
 test('accepted replacement receipt does not bypass existing first-apply billing identity conflict',opts,()=>{
  const f=fixture('basic',3,'prepaid',false,true,true);record(f);nativeComplete(f);const before=billingState(f);
- denied('set role service_role;'+billingCall(f),/billing_identity_conflict/);assert.equal(billingState(f),before);
+ denied('set role service_role;'+billingCall(f),/retail_replacement_billing_observation_denied/);assert.equal(billingState(f),before);
 });
 test('billing migration preserves exact original security/ACL/signature; unknown/reapplied source refuses',opts,()=>{
  const catalog=JSON.parse(sql("select jsonb_build_object('owner',proowner::regrole::text,'definer',prosecdef,'config',proconfig,'acl',proacl::text,'args',pronargs) from pg_proc where proname='apply_public_purchase_billing';"));
@@ -1627,7 +1644,7 @@ for(const source of ['sales_assisted','public_purchase_intent'])for(const plan o
 for(const payment of source==='sales_assisted'?['prepaid','monthly_installments']:['prepaid'])for(const role of [false,true])
 test(`UNMOUNTED linked installed SDK -> SAME original native digest ${source}/${plan}/${months}/${payment}/role:${role}`,opts,async()=>{
  const b=await linkedBridge(plan,months,payment,role,source);try{
-  const catalog=linkedCatalog();assert.match(catalog,/6ed48e7c15548a4521417b99ee213bd7/);
+  const catalog=linkedCatalog();assert.ok(catalog.includes(replacementBillingBodyHash));
   const before=row(b.f),r=await b.apply();assert.equal(r.status,'applied');assert.match(r.digest,/^[a-f0-9]{64}$/);
   assert.equal(r.membership_activation_required,true);assert.equal(r.credits_spendable,false);assert.equal(r.billing_applied,true);
   assert.ok(Object.isFrozen(r)&&Object.isFrozen(r.clientInitial)&&Object.isFrozen(r.currentProviderSubscription));
@@ -2329,7 +2346,7 @@ for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment
  }
 test('REPLACEMENT RESERVE linked paid clock retains genuine original billing identity conflict without fabricating completion',opts,()=>{
  const f=fixture('basic',3,'monthly_installments',true,true,true);record(f);nativeComplete(f);
- const before=billingState(f);denied('set role service_role;'+billingCall(f),/billing_identity_conflict/);
+ const before=billingState(f);denied('set role service_role;'+billingCall(f),/retail_replacement_billing_observation_denied/);
  assert.equal(billingState(f),before);const result=replacementReserve(f);assert.equal(result.status,'reserved');
  assert.equal(sql(`select billing_applied_at is null and billing_apply_digest is null from public_purchase_intents where id=${lit(f.intent)};`),'t');
  assert.equal(billingState(f),before);assert.equal(row(f).replaced_stripe_subscription_canceled_at,null);
@@ -2583,4 +2600,133 @@ test('CANCEL OBSERVE browser, owner mutation, grants/helper/trigger drift and re
  denied(fs.readFileSync(observationMigration,'utf8'),/retail_cancel_observation_schema_drift/);
  assert.deepEqual(observationRows(f),saved);assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
  assert.equal(sql("select has_schema_privilege('service_role','private_sales','USAGE');"),'f');
+});
+
+// SAME real original financial writer, with native canceled OBSERVATION only.
+// This does NOT call Stripe, establish actor cancellation or grant access/Auth.
+function repairFixture(plan='basic',months=3,payment='prepaid',role=false,source='sales_assisted'){
+ const f=fixture(plan,months,payment,role,true,true,'admin',source);record(f);nativeComplete(f);
+ const request=replacementReserve(f).request;observationRecord(f,request,canceledProjection(request));
+ return {...f,request};
+}
+function priorRepairPlan(f,plan=f.pkg.plan_key==='basic'?'pro':'basic',cadence=f.pkg.billing_cadence==='annual'?'monthly':'annual'){
+ sql(`update clients set plan_tier=${lit(plan)},billing_interval=${lit(cadence)} where id=${lit(f.client)};
+  insert into client_plan_settings(client_id,plan_tier,billing_interval,platform_fee,per_role_fee,included_interviews_per_role,
+   additional_interview_fee,max_interview_minutes,usage_interview_fee_cents,rollover_days)
+  values(${lit(f.client)},${lit(plan)},${lit(cadence)},123,111,7,9,6,777,37);`);
+}
+for(const source of ['sales_assisted','public_purchase_intent'])for(const plan of ['basic','pro'])for(const months of [3,6,12])
+for(const payment of source==='sales_assisted'?['prepaid','monthly_installments']:['prepaid'])for(const role of [false,true])
+test(`REPLACEMENT BILL REPAIR native same28arg/digest ${source}/${plan}/${months}/${payment}/role${role}`,opts,()=>{
+ const f=repairFixture(plan,months,payment,role,source);priorRepairPlan(f);
+ const before=row(f),journal=replacementRows(f),facts=observationRows(f),query=billingCall(f);
+ const first=nativeBilling(f);assert.equal(first.status,'applied');assert.match(first.digest,/^[a-f0-9]{64}$/);
+ const state=billingState(f),saved=JSON.parse(state);assert.equal(saved.client.stripe_subscription_id,f.proof.period.subscription_id);
+ assert.equal(saved.client.stripe_customer_id,f.proof.period.customer_id);assert.equal(saved.client.plan_tier,plan);
+ assert.equal(saved.client.billing_interval,f.pkg.billing_cadence);assert.equal(saved.plan.plan_tier,plan);
+ assert.equal(saved.plan.billing_interval,f.pkg.billing_cadence);assert.equal(saved.plan.platform_fee,f.pkg.platform_fee);
+ assert.equal(saved.plan.usage_interview_fee_cents,777);if(plan==='basic')assert.equal(saved.plan.rollover_days,37);
+ assert.equal(saved.plan.scored_question_count,f.pkg.membership_terms.scored_question_count);
+ assert.equal(saved.plan.billing_model,f.pkg.membership_terms.billing_model);
+ assert.equal(new Date(saved.client.contract_start_at).toISOString(),f.proof.period.paid_at);
+ assert.equal(saved.intent.billing_apply_digest,first.digest);assert.equal(saved.credits?.length||0,role?1:0);
+ assert.deepEqual(row(f),before);assert.deepEqual(replacementRows(f),journal);assert.deepEqual(observationRows(f),facts);
+ assert.equal(row(f).replaced_stripe_subscription_canceled_at,null);assert.equal(billingCall(f),query);
+ const replay=nativeBilling(f);assert.equal(replay.status,'already_applied');assert.equal(replay.digest,first.digest);assert.equal(billingState(f),state);
+ assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
+});
+test('REPLACEMENT BILL REPAIR root null/new/third and same-plan pointers cannot bypass a perfect native fact',opts,()=>{
+ for(const pointer of [null,'new','third']){
+  const f=repairFixture();sql(`update clients set stripe_subscription_id=${lit(pointer===null?null:pointer==='new'?f.proof.period.subscription_id:'sub_THIRD')} where id=${lit(f.client)};`);
+  const before=billingState(f);denied('set role service_role;'+billingCall(f),/retail_(replacement_billing_admission|funding_billing_customer)_denied/);
+  assert.equal(billingState(f),before);assert.equal(row(f).replaced_stripe_subscription_canceled_at,null);
+ }
+});
+test('REPLACEMENT BILL REPAIR mandatory firstwrite refuses missing fact, journal and changed live source/claim/customer',opts,()=>{
+ for(const change of ['fact','journal','void','archive','current','claim','customer','profile','source']){
+  const f=change==='fact'||change==='journal'?fixture('basic',3,'prepaid',false,true,true):repairFixture();
+  if(change==='fact'||change==='journal'){record(f);nativeComplete(f);if(change==='fact')replacementReserve(f);}
+  if(change==='void')sql(`update membership_agreements set voided_at=clock_timestamp() where id=${lit(f.id)};`);
+  if(change==='archive')sql(`update clients set archived_at=clock_timestamp() where id=${lit(f.client)};`);
+  if(change==='current')sql(`update membership_agreements set is_current=false where id=${lit(f.id)};`);
+  if(change==='claim')sql(`update public_purchase_intents set activation_claimed_at=clock_timestamp()-interval '6 minutes' where id=${lit(f.intent)};`);
+  if(change==='customer')sql(`update clients set stripe_customer_id='cus_CHANGED' where id=${lit(f.client)};`);
+  if(change==='profile')sql(`update billing_customers set stripe_customer_id=null where client_id=${lit(f.client)};`);
+  if(change==='source')sql(`update membership_agreements set replacement_policy=null where id=${lit(f.id)};`);
+  const before=billingState(f),r=run('set role service_role;'+billingCall(f));
+  if(change==='claim'||change==='current')assert.ok(r.status!==0||JSON.parse(r.stdout.trim()).status!=='applied');
+  else{assert.notEqual(r.status,0);assert.match(r.stderr,/retail_(replacement_billing|funding_billing)_/);}
+  assert.equal(billingState(f),before);
+ }
+});
+test('REPLACEMENT BILL REPAIR credit conflict rolls back root/plan/intent and retry cannot duplicate credit',opts,()=>{
+ const f=repairFixture('pro',6,'prepaid',true);priorRepairPlan(f);
+ const credit=f.pkg.first_role_prepay;
+ sql(`insert into client_role_credits(billing_client_id,source_client_id,source_public_purchase_intent_id,source_membership_agreement_id,
+  source_stripe_checkout_session_id,credit_type,membership_key,normal_role_fee_cents,discounted_credit_amount_cents,discount_percent,status,metadata)
+  values(${lit(f.client)},${lit(f.client)},${lit(f.intent)},${lit(f.id)},${lit(f.proof.period.checkout_session_id)},'first_role_prepay','pro',
+  ${credit.normal_role_fee_cents},${credit.discounted_credit_amount_cents+1},10,'unused','{"non_refundable":true,"expires":false}');`);
+ const before=billingState(f);denied('set role service_role;'+billingCall(f),/existing_credit_conflict/);assert.equal(billingState(f),before);
+});
+test('REPLACEMENT BILL REPAIR original digest replay after used credit and changed plan remains no-op',opts,()=>{
+ const f=repairFixture('pro',6,'prepaid',true);priorRepairPlan(f);const first=nativeBilling(f);
+ const role=crypto.randomUUID();sql(`insert into roles(id,client_id,title,slug_or_token) values(${lit(role)},${lit(f.client)},'Synthetic Used Credit',${lit('synthetic-'+role)});
+  update client_role_credits set status='used',used_by_role_id=${lit(role)},used_at=clock_timestamp() where source_client_id=${lit(f.client)};
+  update client_plan_settings set platform_fee=123,usage_interview_fee_cents=888 where client_id=${lit(f.client)};`);
+ const before=billingState(f),replay=nativeBilling(f);assert.equal(replay.status,'already_applied');assert.equal(replay.digest,first.digest);assert.equal(billingState(f),before);
+});
+test('REPLACEMENT BILL REPAIR same-order journal, observation and financial writers serialize without reverse locks',opts,async()=>{
+ for(const holding of ['journal','observation','finance']){
+  const f=repairFixture(),tag='RB'+crypto.randomUUID().replaceAll('-','');priorRepairPlan(f);
+  const hQuery=holding==='journal'?replacementCall(f):holding==='observation'?observationCall(f,f.request,canceledProjection(f.request)):billingCall(f);
+  // Preserve exact recorded canceled_at for retry, not a newer authored clock.
+  const fact=observationRows(f)[0].observation.old_subscription;
+  const realHolder=holding==='observation'?observationCall(f,f.request,fact):hQuery;
+  const follower=holding==='finance'?observationCall(f,f.request,fact):billingCall(f);
+  const [h,w,o]=await Promise.all([
+   parallel(`set application_name=${lit(tag+'H')};set role service_role;begin;${realHolder}select pg_sleep(0.65);commit;`),
+   parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;${follower}`),
+   parallel(`select pg_sleep(0.35);select exists(select 1 from pg_stat_activity w join pg_stat_activity h on h.pid=any(pg_blocking_pids(w.pid))
+    where w.application_name=${lit(tag+'W')} and h.application_name=${lit(tag+'H')} and w.wait_event_type='Lock');`)]);
+  assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.out.trim(),'t');assert.equal(observationRows(f).length,1);
+  assert.equal(JSON.parse(billingState(f)).client.stripe_subscription_id,f.proof.period.subscription_id);
+ }
+});
+test('REPLACEMENT BILL REPAIR final advisory wait rechecks native claim clock before any financial DML',opts,async()=>{
+ const f=repairFixture(),tag='RC'+crypto.randomUUID().replaceAll('-','');priorRepairPlan(f);
+ sql(`update public_purchase_intents set activation_claimed_at=clock_timestamp()-interval '5 minutes'+interval '1 second' where id=${lit(f.intent)};`);
+ const before=billingState(f);
+ const [h,w,o]=await Promise.all([
+  parallel(`set application_name=${lit(tag+'H')};begin;select pg_advisory_xact_lock(1632842307,hashtext(${lit(f.id)}));select pg_sleep(1.5);commit;`),
+  parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;${billingCall(f)}`),
+  parallel(`select pg_sleep(0.45);select exists(select 1 from pg_stat_activity w where w.application_name=${lit(tag+'W')} and w.wait_event='advisory');`)]);
+ assert.equal(h.code,0,h.err);assert.notEqual(w.code,0);assert.match(w.err,/retail_replacement_billing_(clock|admission)_denied/);
+ assert.equal(o.out.trim(),'t');assert.equal(billingState(f),before);
+});
+test('REPLACEMENT BILL REPAIR authored near-expiry original B is rejected after the actual advisory wait',opts,async()=>{
+ // Negative-only authored provider period, captured BEFORE native receipt.
+ // No production time override, receipt mutation or positive billing claim.
+ const f=fixture('basic',3,'prepaid',false,true,true);f.proof.period.provider_period_end=Math.floor(Date.now()/1000)+4;
+ record(f);nativeComplete(f);const request=replacementReserve(f).request;observationRecord(f,request,canceledProjection(request));priorRepairPlan(f);
+ const tag='RP'+crypto.randomUUID().replaceAll('-',''),before=billingState(f);
+ const [h,w,o]=await Promise.all([
+  parallel(`set application_name=${lit(tag+'H')};begin;select pg_advisory_xact_lock(1632842307,hashtext(${lit(f.id)}));select pg_sleep(4.5);commit;`),
+  parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;${billingCall(f)}`),
+  parallel(`select pg_sleep(0.45);select exists(select 1 from pg_stat_activity w where w.application_name=${lit(tag+'W')} and w.wait_event='advisory');`)]);
+ assert.equal(h.code,0,h.err);assert.notEqual(w.code,0);assert.match(w.err,/retail_replacement_billing_clock_denied/);
+ assert.equal(o.out.trim(),'t');assert.equal(billingState(f),before);
+});
+test('REPLACEMENT BILL REPAIR original owner/ACL/signature and external helper pins; browser/service helper unavailable',opts,()=>{
+ const f=repairFixture();priorRepairPlan(f);const before=billingState(f);
+ const helper="private_retail_replacement.billing_replacement_proof(public.membership_agreements,public.public_purchase_intents,public.clients,text,text,timestamp with time zone)";
+ assert.equal(sql(`select has_function_privilege('service_role',${lit(helper)},'EXECUTE');`),'f');
+ for(const role of ['anon','authenticated'])denied('set role '+role+';'+billingCall(f),/permission denied/);
+ const definition=sql(`select pg_get_functiondef(${lit(helper)}::regprocedure);`);
+ for(const replacement of [definition.replace('\nbegin\n','\nbegin\n -- synthetic body drift\n'),
+  "create or replace function private_retail_replacement.billing_replacement_proof(p_a public.membership_agreements,p_i public.public_purchase_intents,p_c public.clients,p_customer text,p_subscription text,p_clock timestamptz) returns boolean language sql as 'select true';"]){
+  denied('begin;'+replacement+';set role service_role;'+billingCall(f)+'commit;',/retail_replacement_billing_helper_drift/);assert.equal(billingState(f),before);
+ }
+ denied('begin;grant execute on function '+helper+' to service_role;set role service_role;'+billingCall(f)+'commit;',/retail_replacement_billing_helper_drift/);
+ denied(fs.readFileSync(replacementBillingMigrationPath,'utf8'),/retail_replacement_billing_prerequisite_drift/);
+ assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);assert.equal(sql("select has_schema_privilege('service_role','private_sales','USAGE');"),'f');
 });
