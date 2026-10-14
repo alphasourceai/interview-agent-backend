@@ -41,8 +41,9 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
   assert.equal(sql("select to_regprocedure('public.retail_existing_funding_schema_guard()') is null;"),'t');
  }finally{sql(customerIndex+';');}
  sql(amendment);
+ sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014000816_retail_existing_funding_replay_read.sql'),'utf8'));
 });
-function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true){
+function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false){
  const id=crypto.randomUUID(),client=crypto.randomUUID(),intent=crypto.randomUUID(),key='SYNTHETIC_CLAIM_'+crypto.randomUUID(),suffix=id.replaceAll('-','');
  const customer='cus_'+suffix,session='cs_'+suffix,pkg=buildRetailPackageSnapshot({planKey:plan,commitmentMonths:months,paymentOption:payment,firstRolePrepaySelected:role,offerVersion:OFFER_VERSION,channel:'sales'});
  const snapshot={template_version:'membership_agreement_retail_terms_v2',source:linked?'sales_assisted':'admin',package_snapshot:pkg,
@@ -63,7 +64,9 @@ function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true)
   ${lit(role?pkg.first_role_prepay.discounted_credit_amount_cents:null)},${lit(role?pkg.first_role_prepay.normal_role_fee_cents:null)},${lit(role?10:null)},
   ${lit(role?'first_role_prepay':null)},'successful_payment',clock_timestamp()+interval '7 days','Synthetic Native Funding','QA','Buyer','buyer@example.invalid');`);
  const config={public_backend_base:'https://api.example.invalid',public_sign_base:'https://site.example.invalid'};
- const attempt=JSON.parse(sql(`set role service_role;select claim_retail_existing_checkout_attempt(${[id,client,snapshot,customer,false,null,config].map(lit).join(',')});`));
+ const replacementId=replacement?'sub_ACCEPTED_'+suffix:null;
+ if(replacement)sql(`set role service_role;update clients set stripe_subscription_id=${lit(replacementId)} where id=${lit(client)};`);
+ const attempt=JSON.parse(sql(`set role service_role;select claim_retail_existing_checkout_attempt(${[id,client,snapshot,customer,false,replacementId,config].map(lit).join(',')});`));
  sql(`set role service_role;select pin_retail_existing_checkout_session(${[id,client,attempt,session].map(lit).join(',')});`);
  if(linked)sql(`set role service_role;select claim_public_purchase_activation(${lit(id)},${lit(key)});`);
  const source=JSON.parse(sql(`select checkout_attempt_source from membership_agreements where id=${lit(id)};`));
@@ -80,6 +83,14 @@ function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true)
 function call(f,proof=f.proof,source=f.source,key=f.key){return `select record_retail_existing_funding(${[f.id,f.client,key,source,proof].map(lit).join(',')});`;}
 const record=f=>JSON.parse(sql('set role service_role;'+call(f)));
 const row=f=>JSON.parse(sql(`select to_jsonb(a) from membership_agreements a where id=${lit(f.id)};`));
+const readCall=(f,key=f.key,source=f.source)=>`select read_retail_existing_funding(${[f.id,f.client,key,source].map(lit).join(',')});`;
+const readReceipt=f=>JSON.parse(sql('set role service_role;'+readCall(f)));
+function nativeComplete(f){
+ const start=f.proof.period.paid_at.slice(0,10),end=anchoredMonthInstant(f.proof.period.paid_at,f.pkg.membership_terms.commitment_months).slice(0,10);
+ const r=JSON.parse(sql('set role service_role;select complete_public_purchase_activation('+[
+  f.id,f.key,f.proof.period.paid_at,f.proof.period.checkout_session_id,f.client,false,f.pkg.plan_key,f.pkg.billing_cadence,start,end].map(lit).join(',')+');'));
+ assert.equal(r.status,'completed');return r;
+}
 test('full schema migration preserves old table ACL/RLS and cannot overwrite prior application',opts,()=>{
  assert.equal(acl(),priorAcl);denied(fs.readFileSync(migration,'utf8'),/retail_funding_schema_drift/);
  assert.equal(sql(`select to_jsonb(a)-'retail_funding_receipt' from membership_agreements a where id=${lit(legacyId)};`),legacyBefore);
@@ -97,6 +108,67 @@ test(`native first funding ${plan}/${months}/${payment}/role:${role}`,opts,()=>{
 test('admin no-intent receipt does not fabricate intent or paid/access state',opts,()=>{
  const f=fixture('pro',6,'prepaid',true,false);assert.deepEqual(record(f).proof,f.proof);
  assert.equal(sql(`select count(*) from public_purchase_intents where agreement_id=${lit(f.id)};`),'0');assert.equal(row(f).checkout_paid_at,null);
+});
+for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])for(const role of [false,true])
+test(`native locked retry ${plan}/${months}/${payment}/role:${role} across actual completion`,opts,()=>{
+ const f=fixture(plan,months,payment,role),receipt=record(f),before=row(f),intent=sql(`select to_jsonb(i) from public_purchase_intents i where id=${lit(f.intent)};`);
+ const pending=readReceipt(f);assert.equal(pending.phase,'pending');assert.deepEqual(pending.receipt,receipt);
+ assert.deepEqual(row(f),before);assert.equal(sql(`select to_jsonb(i) from public_purchase_intents i where id=${lit(f.intent)};`),intent);
+ nativeComplete(f);const completed=row(f),paid=readReceipt(f);assert.equal(paid.phase,'paid');assert.deepEqual(paid.receipt,receipt);
+ assert.deepEqual(row(f),completed);
+ assert.equal(sql(`select stripe_subscription_id is null from clients where id=${lit(f.client)};`),'t');
+ assert.equal(sql(`select activated_at=checkout_paid_at from public_purchase_intents i join membership_agreements a on i.agreement_id=a.id where i.id=${lit(f.intent)};`),'t');
+ sql(`set role service_role;update clients set stripe_subscription_id=${lit(f.proof.period.subscription_id)} where id=${lit(f.client)};`);
+ assert.deepEqual(readReceipt(f),paid);
+});
+test('native admin retry reads original receipt before and after paid CAS without an invented claim',opts,()=>{
+ const f=fixture('pro',6,'prepaid',true,false),receipt=record(f);assert.equal(readReceipt(f).phase,'pending');
+ sql(`set role service_role;update membership_agreements set checkout_status='paid',checkout_paid_at=${lit(f.proof.period.paid_at)} where id=${lit(f.id)};`);
+ const paid=readReceipt(f);assert.equal(paid.phase,'paid');assert.deepEqual(paid.receipt,receipt);
+ assert.equal(sql(`select stripe_subscription_id is null from clients where id=${lit(f.client)};`),'t');
+ denied('set role service_role;'+readCall(f,'FAKE_CLAIM_000000000000000000000000'),/retail_funding_admin_claim_denied/);
+});
+test('existing accepted replacement stays valid across linked completion-before-billing; unrelated replacement refuses',opts,()=>{
+ const f=fixture('basic',3,'prepaid',false,true,true),receipt=record(f);
+ assert.ok(row(f).replaces_stripe_subscription_id);assert.equal(readReceipt(f).phase,'pending');
+ nativeComplete(f);const paid=readReceipt(f);assert.equal(paid.phase,'paid');assert.deepEqual(paid.receipt,receipt);
+ assert.equal(sql(`select stripe_subscription_id from clients where id=${lit(f.client)};`),row(f).replaces_stripe_subscription_id);
+ sql(`set role service_role;update clients set stripe_subscription_id='sub_NOT_ACCEPTED' where id=${lit(f.client)};`);
+ denied('set role service_role;'+readCall(f),/retail_funding_customer_denied/);
+});
+test('native replay has no enrollment and browser/owner impersonation/claim/source drift is refused',opts,()=>{
+ const f=fixture();denied('set role service_role;'+readCall(f),/retail_funding_receipt_unavailable/);
+ assert.equal(row(f).retail_funding_receipt,null);record(f);
+ for(const role of ['anon','authenticated'])denied(`set role ${role};`+readCall(f),/permission denied/);
+ denied(readCall(f),/retail_funding_server_only/);
+ denied('set role service_role;'+readCall(f,'WRONG_CLAIM_000000000000000000000000'),/retail_funding_claim_denied/);
+ denied('set role service_role;'+readCall(f,f.key,{...f.source,customer_id:'cus_OTHER'}),/retail_funding_source_denied/);
+ nativeComplete(f);sql(`set role service_role;update clients set stripe_subscription_id='sub_OTHER' where id=${lit(f.client)};`);
+ denied('set role service_role;'+readCall(f),/retail_funding_customer_denied/);
+});
+test('native paid replay rejects expired lease, cancellation/archive and lost customer ownership',opts,()=>{
+ for(const change of ['lease','cancel','archive','customer']){
+  const f=fixture();record(f);nativeComplete(f);
+  if(change==='lease')sql(`update public_purchase_intents set activation_claimed_at=clock_timestamp()-interval '6 minutes' where id=${lit(f.intent)};`);
+  if(change==='cancel')sql(`update public_purchase_intents set canceled_at=clock_timestamp() where id=${lit(f.intent)};`);
+  if(change==='archive')sql(`update clients set archived_at=clock_timestamp() where id=${lit(f.client)};`);
+  if(change==='customer')sql(`update billing_customers set stripe_customer_id=null where client_id=${lit(f.client)};`);
+  const before=row(f);denied('set role service_role;'+readCall(f));assert.deepEqual(row(f),before);
+ }
+});
+test('native read migration refuses reapplication and changes no prior functions/table grants',opts,()=>{
+ assert.equal(acl(),priorAcl);
+ denied(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014000816_retail_existing_funding_replay_read.sql'),'utf8'),/retail_funding_replay_schema_drift/);
+ assert.equal(sql("select bool_and(not prosecdef and proconfig=array['search_path=pg_catalog','lock_timeout=10s'] and not has_function_privilege('anon',oid,'EXECUTE') and not has_function_privilege('authenticated',oid,'EXECUTE')) from pg_proc where proname='read_retail_existing_funding';"),'t');
+});
+test('native reader samples lease freshness after its shared intent lock wait',opts,async()=>{
+ const f=fixture();record(f);nativeComplete(f);
+ const [a,b]=await Promise.all([
+  parallel(`begin;select id from public_purchase_intents where id=${lit(f.intent)} for update;
+   update public_purchase_intents set activation_claimed_at=clock_timestamp()-interval '299.85 seconds' where id=${lit(f.intent)};
+   select pg_sleep(0.3);commit;`),
+  parallel('set role service_role;select pg_sleep(0.04);'+readCall(f))]);
+ assert.equal(a.code,0,a.err);assert.notEqual(b.code,0);assert.match(b.err,/retail_funding_claim_denied/);
 });
 const checkoutTrigger=()=>sql("select jsonb_build_array(tgenabled,pg_get_triggerdef(oid),tgfoid::regprocedure::text) from pg_trigger where tgrelid='public.membership_agreements'::regclass and tgname='retail_existing_checkout_attempt_guard';");
 function agedFixture(missingDeadline=false){
@@ -167,7 +239,8 @@ test('each missing SELECT or UPDATE lock prerequisite refuses without broadening
   try{sql(`revoke ${privilege} on public.${table} from service_role;`);
    assert.equal(sql(`select has_table_privilege('service_role','public.${table}','${privilege}');`),'f');
    denied('set role service_role;select retail_existing_funding_schema_guard();',/retail_funding_schema_drift/);
-   denied('set role service_role;'+call(f),/retail_funding_schema_drift/);assert.equal(row(f).retail_funding_receipt,null);
+   denied('set role service_role;'+call(f),/retail_funding_schema_drift/);
+   denied('set role service_role;'+readCall(f),/retail_funding_schema_drift/);assert.equal(row(f).retail_funding_receipt,null);
   }finally{sql(`grant ${privilege} on public.${table} to service_role;`);}
   assert.equal(acl(),prior);
  }
@@ -246,16 +319,21 @@ test('prepaid cadence amendment preserves annual/monthly legacy values and refus
  assert.match(def,/'monthly'.*'annual'.*'prepaid'/);assert.equal(acl(),priorAcl);
  denied(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261013232342_retail_existing_purchase_intent_prepaid.sql'),'utf8'),/retail_intent_cadence_constraint_drift/);
 });
-test('real SDK16/API2023 loopback feeds actual native RPC and fresh DB ACK/readback with no provider writes',opts,async()=>{
+async function sdkNativeBridge(loseAck=false){
  const http=require('node:http'),Stripe=require('stripe'),{fixture:fundingFixture}=require('./fixtures/existing-retail-funding-fixture');
- const f=fixture('basic',3,'monthly_installments',true),v=fundingFixture('basic',3,'monthly_installments',true),p=f.proof,requests=[],writes=[];
+ const f=fixture('basic',3,'monthly_installments',true),v=fundingFixture('basic',3,'monthly_installments',true),p=f.proof,requests=[],writes=[],reads=[];
+ let receiptExists=false;
  const nativeDb={from(table){assert.ok(['membership_agreements','public_purchase_intents','clients','billing_customers'].includes(table));const filters=[];
   const query={select(){return query;},eq(k,val){assert.match(k,/^[a-z_]+$/);filters.push(`${k}=${lit(val)}`);return query;},
    async maybeSingle(){const r=read();assert.ok(r.data.length<=1);return{...r,data:r.data[0]||null};},then(resolve,reject){return Promise.resolve().then(read).then(resolve,reject);}};
   function read(){const data=JSON.parse(sql(`set role service_role;select coalesce(jsonb_agg(to_jsonb(t)),'[]'::jsonb) from public.${table} t${filters.length?' where '+filters.join(' and '):''};`));
    return{data,count:data.length,error:null};}return query;},
-  async rpc(name,a){assert.equal(name,'record_retail_existing_funding');writes.push(structuredClone(a));
-   const data=JSON.parse(sql('set role service_role;'+`select record_retail_existing_funding(${[a.p_agreement,a.p_client,a.p_claim,a.p_source,a.p_proof].map(lit).join(',')});`));return{data,error:null};}};
+  async rpc(name,a){if(name==='read_retail_existing_funding'){
+    reads.push(structuredClone(a));return{data:JSON.parse(sql('set role service_role;select read_retail_existing_funding('+[a.p_agreement,a.p_client,a.p_claim,a.p_source].map(lit).join(',')+');')),error:null};
+   }
+   assert.equal(name,'record_retail_existing_funding');writes.push(structuredClone(a));
+   const data=JSON.parse(sql('set role service_role;'+`select record_retail_existing_funding(${[a.p_agreement,a.p_client,a.p_claim,a.p_source,a.p_proof].map(lit).join(',')});`));
+   if(loseAck)throw Error('Simulated native commit then lost ACK');return{data,error:null};}};
  Object.assign(v.cs,{id:p.period.checkout_session_id,customer:p.period.customer_id,subscription:p.period.subscription_id,invoice:p.period.invoice_id,created:p.checkout_created});
  Object.assign(v.s,{id:p.period.subscription_id,customer:p.period.customer_id});
  Object.assign(v.s.items.data[0],{id:p.period.subscription_item_id,subscription:p.period.subscription_id});
@@ -280,14 +358,30 @@ test('real SDK16/API2023 loopback feeds actual native RPC and fresh DB ACK/readb
   else if(url.pathname===`/v1/payment_intents/${v.pi.id}`)body=v.pi;
   else if(url.pathname===`/v1/charges/${v.ch.id}`)body=v.ch;
   else{res.statusCode=400;body={error:{message:'Unexpected synthetic request'}};}
+  if(receiptExists&&!['/v1/account',`/v1/checkout/sessions/${v.cs.id}`,`/v1/subscriptions/${v.s.id}`].includes(url.pathname)){
+   res.statusCode=400;body={error:{message:'Historical money reproof forbidden on receipt replay'}};
+  }
   res.setHeader('content-type','application/json');res.end(JSON.stringify(body));});
  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
  try{
   const stripe=new Stripe('sk_test_SYNTHETIC_NO_PROVIDER',{apiVersion:'2023-10-16',host:'127.0.0.1',port:server.address().port,protocol:'http',maxNetworkRetries:0});
   const {recordExistingRetailFunding}=require('../src/services/existingRetailFundingReceipt');
-  const r=await recordExistingRetailFunding({db:nativeDb,stripe,agreementId:f.id,intentId:f.intent,eventSessionId:v.cs.id,eventLivemode:false,claimKey:f.key});
-  assert.deepEqual(JSON.parse(JSON.stringify(r.receipt)),row(f).retail_funding_receipt);assert.equal(writes.length,1);
-  assert.deepEqual(JSON.parse(JSON.stringify(r.receipt.proof)),p);assert.equal(row(f).checkout_paid_at,null);
+  const recordOptions={db:nativeDb,stripe,agreementId:f.id,intentId:f.intent,eventSessionId:v.cs.id,eventLivemode:false,claimKey:f.key};
+  if(loseAck)await assert.rejects(recordExistingRetailFunding(recordOptions),{code:'retail_funding_receipt_ack_unknown'});
+  else{const r=await recordExistingRetailFunding(recordOptions);assert.deepEqual(JSON.parse(JSON.stringify(r.receipt)),row(f).retail_funding_receipt);}
+  assert.equal(writes.length,1);assert.deepEqual(row(f).retail_funding_receipt.proof,p);assert.equal(row(f).checkout_paid_at,null);
   assert.equal(requests.length,9);assert.ok(requests.every(x=>x.method==='GET'&&x.version==='2023-10-16'));
+  receiptExists=true;Object.assign(v.ch,{refunded:true,amount_refunded:v.ch.amount});v.s.latest_invoice='in_LATER';v.s.current_period_end+=90000;
+  const {readExistingRetailFundingReceipt}=require('../src/services/existingRetailFundingReplay');
+  const options={db:nativeDb,stripe,agreementId:f.id,intentId:f.intent,eventSessionId:v.cs.id,eventLivemode:false,claimKey:f.key};
+  const pending=await readExistingRetailFundingReceipt(options);assert.equal(pending.funding.replay,false);
+  assert.deepEqual(JSON.parse(JSON.stringify(pending.receipt)),row(f).retail_funding_receipt);
+  nativeComplete(f);const paid=await readExistingRetailFundingReceipt({...options,eventInvoiceId:'in_LATER'});assert.equal(paid.funding.replay,true);
+  assert.equal(paid.funding.paidAt,p.period.paid_at);assert.deepEqual(JSON.parse(JSON.stringify(paid.funding.initialProviderPeriod)),p.period);
+  assert.equal(writes.length,1);assert.equal(reads.length,4);assert.equal(requests.length,15);
+  assert.ok(requests.every(x=>x.method==='GET'&&x.version==='2023-10-16'));
+  assert.ok(requests.slice(9).every(x=>['/v1/account',`/v1/checkout/sessions/${v.cs.id}`,`/v1/subscriptions/${v.s.id}`].includes(x.path)));
  }finally{await new Promise(resolve=>server.close(resolve));}
-});
+}
+test('real SDK16/API2023 loopback feeds actual native RPC and fresh DB ACK/readback with no provider writes',opts,()=>sdkNativeBridge());
+test('real SDK/native commit with lost ACK and subsequent refund replays original receipt without historical money calls',opts,()=>sdkNativeBridge(true));
