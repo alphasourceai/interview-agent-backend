@@ -81,9 +81,12 @@ function assertConfiguration(config, configurationId, livemode) {
     && config.active === true && config.is_default === false && config.application === null
     && config.livemode === livemode && config.login_page?.enabled === false);
   const features=config.features,allowed=['customer_update','invoice_history','payment_method_update','subscription_cancel','subscription_update'];
-  requireFact(features && Object.keys(features).length === allowed.length
-    && Object.keys(features).every(key=>allowed.includes(key)));
+  // Stripe also returns this disabled control on API2023-10-16. Its presence
+  // must not block an otherwise restricted portal; enabling it is still held.
+  requireFact(features && Object.keys(features).every(key=>allowed.includes(key)||key==='subscription_pause'));
   for (const feature of allowed) requireFact(features[feature]?.enabled === ['invoice_history','payment_method_update'].includes(feature));
+  if(Object.hasOwn(features,'subscription_pause')) requireFact(features.subscription_pause
+    && !Array.isArray(features.subscription_pause) && features.subscription_pause.enabled===false);
 }
 function assertSession(session,{customerId,configurationId,returnUrl,livemode,retail=true}) {
   requireFact(session?.object === 'billing_portal.session' && /^bps_[A-Za-z0-9_]+$/.test(session.id || '')

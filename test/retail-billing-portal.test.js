@@ -49,6 +49,19 @@ test('all12 accepted offers use the restricted explicit portal and preserve acce
   assert.deepEqual(f.calls,[{op:'read',id:CONFIG},{op:'create',payload:{customer:CUSTOMER,return_url:RETURN,configuration:CONFIG}},{op:'read',id:CONFIG}]);
  }
 });
+test('actual API2023 portal accepts only the known disabled optional pause control',async()=>{
+ const f=fixture();f.config.features.subscription_pause={enabled:false};
+ assert.equal((await service(f)).url,f.session.url);
+ assert.equal(f.calls.filter(x=>x.op==='create').length,1);
+ for(const pause of [{enabled:true},{},{enabled:'false'},null,[]]){
+  const g=fixture();g.config.features.subscription_pause=pause;
+  await assert.rejects(service(g),{code:'RETAIL_PORTAL_UNAVAILABLE'});
+  assert.equal(g.calls.some(x=>x.op==='create'),false);
+ }
+ const unknown=fixture();unknown.config.features.future_feature={enabled:false};
+ await assert.rejects(service(unknown),{code:'RETAIL_PORTAL_UNAVAILABLE'});
+ assert.equal(unknown.calls.some(x=>x.op==='create'),false);
+});
 test('genuine legacy and unmarked Enterprise preserve exact existing default-portal payload',async()=>{
  for(const plan of ['basic','enterprise']){
   const f=fixture();f.client.plan_tier=plan;f.client.billing_interval='monthly';f.tables.membership_agreements=[];f.subscription.metadata={};
