@@ -792,6 +792,16 @@ async function sendPendingApprovalDigestEmail(to, details = {}) {
   return { statusCode: resp?.statusCode || 0 }
 }
 
+async function sendRetailRenewalNoticeEmail(to,facts) {
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
+  if(!API_KEY)return{skipped:true};
+  const {noticeEmail,renderRetailRenewalNotice}=require('../services/contracts/retailRenewalNotice');
+  const recipient=noticeEmail(to),content=renderRetailRenewalNotice(facts,{buildBrandedEmailShell,escapeHtml});
+  const [resp]=await sg.send({to:recipient,from:FROM,...content,categories:['retail_renewal_notice'],
+    customArgs:{email_category:'retail_renewal_notice'}});
+  return{statusCode:resp?.statusCode||0,providerReference:resp?.headers?.['x-message-id']||null};
+}
+
 module.exports = {
   escapeHtml,
   buildBrandedEmailShell,
@@ -806,5 +816,6 @@ module.exports = {
   sendMembershipAgreementSignedCopyEmail,
   sendMembershipAgreementCompletedInternalNotification,
   sendSecondRoundSchedulingEmail,
-  sendPendingApprovalDigestEmail
+  sendPendingApprovalDigestEmail,
+  sendRetailRenewalNoticeEmail
 }

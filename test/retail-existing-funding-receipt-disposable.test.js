@@ -104,6 +104,10 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
   sql('grant usage on schema extensions to service_role;');
   sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014201414_retail_existing_recurring_commission_proof.sql'),'utf8'));
  }
+ if(process.env.RETAIL_NATIVE_RENEWAL_NOTICE==='true'){
+  sql('grant usage on schema extensions to service_role;'); // Existing hosted baseline, not migration permission.
+  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014223600_retail_existing_renewal_notice.sql'),'utf8'));
+ }
  const changedFunctions=JSON.parse(linkedOriginalFunctions()),actualHash=sql("select md5(prosrc) from pg_proc where proname='apply_public_purchase_billing';");
  assert.equal(actualHash,replacementBillingBodyHash);
  for(const [index,prior] of originalFunctions.entries()){
@@ -163,6 +167,15 @@ function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,
   // ahead of real current cash A. No clock override/backfill/trigger disabling.
   const start=new Date(created*1000);start.setUTCMonth(start.getUTCMonth()-pkg.membership_terms.stripe_recurrence.interval_count);
   start.setUTCSeconds(start.getUTCSeconds()+3);
+  proof.period.provider_period_start=start.getTime()/1000;
+  proof.period.provider_period_end=Date.parse(anchoredMonthInstant(start.toISOString(),pkg.membership_terms.stripe_recurrence.interval_count))/1000;
+ }
+ if(Number.isInteger(options.noticeDays)){
+  // Authored prepaid provider geometry, NOT actual Stripe or a native clock
+  // override: current real cash is within the first period, whose B+term is
+  // 15/45days ahead. Original A/native recorded_at are real current instants.
+  const target=new Date(created*1000);target.setUTCDate(target.getUTCDate()+options.noticeDays);
+  const start=new Date(target);start.setUTCMonth(start.getUTCMonth()-pkg.membership_terms.stripe_recurrence.interval_count);
   proof.period.provider_period_start=start.getTime()/1000;
   proof.period.provider_period_end=Date.parse(anchoredMonthInstant(start.toISOString(),pkg.membership_terms.stripe_recurrence.interval_count))/1000;
  }
@@ -3180,6 +3193,61 @@ test('REPLACEMENT BILL REPAIR authored near-expiry original B is rejected after 
  assert.equal(h.code,0,h.err);assert.notEqual(w.code,0);assert.match(w.err,/retail_replacement_billing_clock_denied/);
  assert.equal(o.out.trim(),'t');assert.equal(billingState(f),before);
 });
+test('NATIVE NOTICE real current source + authored prepaid B geometry, attempt once, append-only ack and owner hash',
+ {...opts,skip:!enabled||process.env.RETAIL_NATIVE_RENEWAL_NOTICE!=='true'},()=>{
+ const make=(months=3,payment='prepaid',days=15,version=STRIPE_RECURRING_OFFER_VERSION)=>{
+  const f=fixture('basic',months,payment,false,true,false,'admin','sales_assisted',`notice-${crypto.randomUUID()}@example.invalid`,
+   {offerVersion:version,...(payment==='prepaid'?{noticeDays:days}:{})});record(f);nativeComplete(f);nativeBilling(f);return f;
+ };
+ const hash=f=>crypto.createHash('sha256').update(f.buyerEmail).digest('hex');
+ const attemptIds=new Map();
+ const notice=(f,action='claim',ack=null,h=hash(f),identity=action==='record'?attemptIds.get(f.id):null)=>
+  'select retail_existing_renewal_notice('+[f.id,f.client,action,ack,h,identity??null].map(lit).join(',')+');';
+ const invoke=(f,...args)=>JSON.parse(sql('set role service_role;'+notice(f,...args)));
+ const count=f=>sql(`select count(*) from billing_events where client_id=${lit(f.client)} and type like 'retail.renewal.notice.%';`);
+ const untouched=f=>sql(`select jsonb_build_object('client',(select to_jsonb(x) from clients x where id=${lit(f.client)}),
+  'plan',(select to_jsonb(x) from client_plan_settings x where client_id=${lit(f.client)}),
+  'ledger',(select coalesce(jsonb_agg(to_jsonb(x)),'[]'::jsonb) from usage_billing_ledger x where client_id=${lit(f.client)}));`);
+ const f=make(),before=untouched(f),prior=acl();
+ denied('set role anon;'+notice(f),/permission denied/);
+ assert.equal(invoke(f,'claim',null,'a'.repeat(64)).status,'held');assert.equal(count(f),'0');
+ for(const ack of [{outcome:'accepted',provider_reference:null,clock:'bad'},{outcome:'delivered',provider_reference:null}])
+  denied('set role service_role;'+notice(f,'record',ack),/notice_ack_denied/);
+ const claimed=invoke(f);assert.equal(claimed.status,'claimed');attemptIds.set(f.id,claimed.attempt_identity);
+ assert.equal(claimed.attempt_identity,`retail-renewal-notice:${f.id}:${claimed.facts.billing_cutoff_at}:attempted`);
+ assert.equal(claimed.facts.recipient_email,f.buyerEmail);
+ assert.equal(claimed.facts.recipient_sha256,hash(f));assert.equal(count(f),'1');
+ assert.equal(invoke(f).status,'held');assert.equal(count(f),'1');
+ assert.equal(invoke(f,'record',{outcome:'accepted',provider_reference:null},hash(f),claimed.attempt_identity+'-wrong').status,'held');
+ assert.equal(invoke(f,'record',{outcome:'accepted',provider_reference:'SYNTHETIC-ACK'}).status,'recorded');
+ assert.equal(invoke(f,'record',{outcome:'unknown',provider_reference:null}).status,'held');
+ assert.equal(invoke(f).status,'already_attempted');assert.equal(count(f),'2');
+ assert.equal(sql(`select bool_and(processed_ok and role_id is null and error is null) from billing_events
+  where client_id=${lit(f.client)} and type like 'retail.renewal.notice.%';`),'t');
+ assert.equal(sql(`select payload->'ack'->>'outcome' from billing_events where client_id=${lit(f.client)} and type='retail.renewal.notice.ack';`),'accepted');
+ // Authored later audit-row fixture, NOT an elapsed renewal/provider event.
+ // A delayed record for the acknowledged original attempt must not bind it.
+ const laterId=claimed.attempt_identity.replace(claimed.facts.billing_cutoff_at,'2099-01-01T00:00:00.000Z');
+ const late=sql(`begin;insert into billing_events(stripe_event_id,type,processed_ok,client_id,payload)
+  select ${lit(laterId)},type,true,client_id,payload||jsonb_build_object('billing_cutoff_at','2099-01-01T00:00:00.000Z')
+  from billing_events where stripe_event_id=${lit(claimed.attempt_identity)};set role service_role;
+  ${notice(f,'record',{outcome:'accepted',provider_reference:'OLD-REPLAY'})}
+  select count(*) from billing_events where stripe_event_id=${lit(laterId+':ack')};rollback;`).split('\n');
+ assert.equal(JSON.parse(late[0]).status,'held');assert.equal(late[1],'0');
+ assert.equal(untouched(f),before);assert.equal(acl(),prior);
+ for(const months of [6,12]){const x=make(months);assert.equal(invoke(x).status,'claimed');}
+ for(const x of [make(3,'prepaid',45),make(3,'monthly_installments')]){
+  assert.equal(invoke(x).status,'not_due');assert.equal(count(x),'0');
+ }
+ const legacy=make(3,'prepaid',15,OFFER_VERSION);assert.equal(invoke(legacy).status,'held');assert.equal(count(legacy),'0');
+ const off=make();
+ const request='select change_retail_existing_renewal('+[off.id,off.client,nativeRecurringSource(off),'request',false,null,null,null].map(lit).join(',')+');';
+ const held=sql('set role service_role;begin;'+request+notice(off)+'rollback;').split('\n').at(-1);
+ assert.equal(JSON.parse(held).status,'held');assert.equal(count(off),'0');
+ assert.equal(sql(`select prosecdef=false and proconfig @> array['search_path=pg_catalog','statement_timeout=2s']
+  from pg_proc where oid='public.retail_existing_renewal_notice(uuid,uuid,text,jsonb,text,text)'::regprocedure;`),'t');
+});
+
 test('REPLACEMENT BILL REPAIR original owner/ACL/signature and external helper pins; browser/service helper unavailable',opts,()=>{
  const f=repairFixture();priorRepairPlan(f);const before=billingState(f);
  const helper="private_retail_replacement.billing_replacement_proof(public.membership_agreements,public.public_purchase_intents,public.clients,text,text,timestamp with time zone)";

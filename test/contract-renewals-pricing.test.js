@@ -11,6 +11,27 @@ const {STRIPE_RECURRING_OFFER_VERSION}=require('../src/services/membershipOffers
 
 const ORIGINAL = '2026-01-31T12:13:14.000Z';
 const TEMPLATE = 'membership_agreement_retail_terms_v2';
+test('notice held or fault leaves current v2 contract accounting unchanged and cannot enter legacy processing',async()=>{
+ const names=['../src/services/contracts/contractRenewals','../src/services/existingRetailRecurringPayment',
+  '../src/services/existingRetailRenewalPreference','../src/services/contracts/retailRenewalNotice'];
+ const files=names.map(require.resolve),saved=files.map(f=>require.cache[f]);
+ try{
+  for(const outcome of ['held','throw']){
+   let calls=0;
+   const exports=[null,{refreshExistingRetailCoverage:async()=>({status:'active'})},
+    {reconcileExistingRetailRenewal:async()=>({status:'disabled'})},
+    {processRetailRenewalNotice:async()=>{calls++;if(outcome==='throw')throw Error('SYNTHETIC mail fault');return{status:'held'};}}];
+   delete require.cache[files[0]];
+   for(let n=1;n<files.length;n++)require.cache[files[n]]={id:files[n],filename:files[n],loaded:true,exports:exports[n]};
+   const f=fixture();f.agreement.template_snapshot.package_snapshot.pricing_version=STRIPE_RECURRING_OFFER_VERSION;
+   f.agreement.template_snapshot.package_snapshot.membership_terms.offer_version=STRIPE_RECURRING_OFFER_VERSION;
+   const db=makeDb(f),result=await require(names[0]).processContractRenewals({}, {db,now:new Date('2026-03-01T00:00:00Z')});
+   assert.equal(calls,1);assert.equal(result.summary.skipped_no_action,1);assert.equal(result.summary.errors,0);
+   assert.equal(result.summary.renewed,0);assert.equal(result.summary.deactivated,0);assert.equal(db.writes.length,0);
+   assert.equal(result.items[0].action,'paid_coverage_refreshed');
+  }
+ }finally{files.forEach((f,n)=>{if(saved[n])require.cache[f]=saved[n];else delete require.cache[f];});}
+});
 function fixture(months = 3, payment = 'prepaid', index = 0, plan = 'basic') {
   const snapshot = structuredClone(buildRetailPackageSnapshot({planKey:plan, commitmentMonths:months,
     paymentOption:payment, channel:'sales', offerVersion:OFFER_VERSION}));

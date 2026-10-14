@@ -156,7 +156,16 @@ async function processContractRenewals(context = {}, dependencies = {}) {
             effectsEnabled:process.env.RETAIL_STRIPE_RENEWAL_CONTROL_ENABLED==='true'});
           summary.skipped_no_action+=1;
           items.push({id:client.id,name:client.name||null,action:'paid_coverage_refreshed',detail:result.status,
-            contract_end_at_before:oldContractEnd});continue;
+            contract_end_at_before:oldContractEnd});
+          // Independent mail catch: a reminder hold never changes the existing
+          // renewal accounting or falls through to legacy renew/deactivation.
+          try{
+            const notice=await require('./retailRenewalNotice').processRetailRenewalNotice({db,agreementId:agreement.id,clientId:client.id,
+              enabled:process.env.RETAIL_RENEWAL_NOTICE_ENABLED==='true',allowRecipients:dependencies.renewalNoticeAllowRecipients||[],
+              send:dependencies.sendRenewalNotice||null});
+            if(['held','unknown','rejected'].includes(notice.status))console.warn('retail_renewal_notice_held',{code:notice.code||notice.status});
+          }catch(_){console.warn('retail_renewal_notice_held',{code:'retail_renewal_notice_held'});}
+          continue;
         }
         if(!due)continue;
         retailWindow = getRetailRenewalWindow(client, agreement);
