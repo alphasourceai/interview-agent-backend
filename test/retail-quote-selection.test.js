@@ -1,14 +1,14 @@
 'use strict';
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {OFFER_VERSION} = require('../src/services/membershipOffers');
+const {OFFER_VERSION,STRIPE_RECURRING_OFFER_VERSION,listRetailOffers} = require('../src/services/membershipOffers');
 const {buildRetailPackageSnapshot} = require('../src/services/membershipPackageCompatibility');
 const {normalizeRetailQuoteSelection,retailQuoteCatalog,validateRetailIntentSource,validateRetailAgreementSource,RETAIL_TEMPLATE}
   = require('../src/services/retailQuoteSelection');
 const {normalizeSalesDraft,validateSalesDraft,calculatePricing,agreementInputFromDraft,fingerprint} = require('../src/services/salesWorkspace');
 const {buildMembershipAgreementHtml} = require('../src/render/membershipAgreement');
 const on = {MEMBERSHIP_PRICING_TERMS_ENABLED:'true'}, off = {};
-const keys = (months=3,payment='prepaid') => ({plan_key:'basic',commitment_months:months,payment_option:payment,offer_version:OFFER_VERSION});
+const keys = (months=3,payment='prepaid') => ({plan_key:'basic',commitment_months:months,payment_option:payment,offer_version:STRIPE_RECURRING_OFFER_VERSION});
 const identity = {company_legal_name:'Synthetic Only',buyer_first_name:'QA',buyer_last_name:'Buyer',buyer_email:'buyer@example.invalid',
   buyer_phone:'555-555-0100',buyer_title:'Owner',candidate_assistance_name:'QA Buyer',candidate_assistance_email:'buyer@example.invalid'};
 test('quote gate is exact default-off and legacy selection unchanged',()=>{
@@ -20,7 +20,10 @@ test('quote gate is exact default-off and legacy selection unchanged',()=>{
 test('public catalog prepaid only and staff catalog both payment choices from same factory',()=>{
   assert.equal(retailQuoteCatalog('public',on).offers.length,6);
   assert.equal(retailQuoteCatalog('sales',on).offers.length,12);
-  assert.equal(retailQuoteCatalog('admin',on).pricing_version,OFFER_VERSION);
+  assert.equal(retailQuoteCatalog('admin',on).pricing_version,STRIPE_RECURRING_OFFER_VERSION);
+  for(const channel of ['public','sales','admin'])assert.ok(retailQuoteCatalog(channel,on).offers
+    .every(o=>o.offer_version===STRIPE_RECURRING_OFFER_VERSION));
+  assert.ok(listRetailOffers({channel:'public'}).every(o=>o.offer_version===OFFER_VERSION));
   assert.ok(retailQuoteCatalog('public',on).offers.every(o=>o.payment_option==='prepaid'));
   const publicCatalog=retailQuoteCatalog('public',on);
   const {RETAIL_PRICES_CENTS}=require('../src/services/membershipOffers');
@@ -30,7 +33,7 @@ test('public catalog prepaid only and staff catalog both payment choices from sa
   assert.equal(Object.hasOwn(retailQuoteCatalog('sales',on),'monthly_payment_references'),false);
 });
 test('enabled selection refuses missing stale forbidden or conflicting keys',()=>{
-  const bad=[{},keys(4),{...keys(),offer_version:'old'},keys(3,'monthly_installments'),
+  const bad=[{},keys(4),{...keys(),offer_version:'old'},{...keys(),offer_version:OFFER_VERSION},keys(3,'monthly_installments'),
     {...keys(),billing_cadence:'annual'},{...keys(),commitmentMonths:6},
     {...keys(),paymentOption:'monthly_installments'},{...keys(),pricingVersion:'old'},{...keys(),plan:'pro'}];
   for(const body of bad) assert.throws(()=>normalizeRetailQuoteSelection(body,{channel:'public',env:on}));
@@ -66,6 +69,8 @@ test('saved retail intent and agreement require protocol columns markers and mat
     first_role_prepay_selected:false,first_role_prepay_amount_cents:null,first_role_normal_role_fee_cents:null,
     first_role_prepay_discount_percent:null,first_role_prepay_credit_type:null};
   assert.equal(validateRetailIntentSource(intent).commitment_months,3);
+  // Historical v1 sources keep their exact accepted version even with gateoff.
+  assert.equal(normalizeRetailQuoteSelection({},{channel:'public',env:off,savedPackageSnapshot:s}).offer_version,OFFER_VERSION);
   for(const override of [{protocol:'legacy_complete'},{selected_billing_cadence:'annual'}, {selected_plan_key:'pro'},
     {first_role_prepay_selected:true},{first_role_prepay_amount_cents:0}])
     assert.throws(()=>validateRetailIntentSource({...intent,...override}),{code:'retail_quote_source_mismatch'});

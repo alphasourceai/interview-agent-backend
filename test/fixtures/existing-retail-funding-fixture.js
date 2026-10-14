@@ -10,7 +10,10 @@ function fixture(plan='basic',months=3,payment='prepaid',role=false,{admin=false
   const pkg=buildRetailPackageSnapshot({planKey:plan,commitmentMonths:months,paymentOption:payment,firstRolePrepaySelected:role,offerVersion:OFFER_VERSION,channel:'sales'});
   const draft=normalizeSalesDraft({plan_key:plan,commitment_months:months,payment_option:payment,offer_version:OFFER_VERSION,
     first_role_prepay_selected:role,company_legal_name:'Synthetic',buyer_first_name:'QA',buyer_last_name:'Buyer',
-    buyer_email:'buyer@example.invalid',buyer_phone:'synthetic',buyer_title:'Owner'}, {env:{MEMBERSHIP_PRICING_TERMS_ENABLED:'true'}});
+    buyer_email:'buyer@example.invalid',buyer_phone:'synthetic',buyer_title:'Owner'},
+    // This fixture represents an already-issued historical v1 agreement, not
+    // an enabled new-sale producer. Preserve its accepted snapshot unchanged.
+    {savedPackageSnapshot:pkg,env:{MEMBERSHIP_PRICING_TERMS_ENABLED:'true'}});
   const {normalized}=buildMembershipAgreementHtml(agreementInputFromDraft(draft,pkg),{packageSnapshot:pkg});
   const g={id:G,client_id:C,membership_tier:plan,billing_option:pkg.billing_cadence,auto_renew:true,notice_deadline_days:30,
     status:'signed',is_current:true,signer_accepted:true,superseded_by_agreement_id:null,checkout_status:'pending_payment',checkout_session_id:'cs_SYNTHETIC',

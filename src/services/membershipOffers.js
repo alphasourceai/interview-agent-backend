@@ -126,11 +126,11 @@ function buildRetailOffer(input = {}) {
   });
 }
 
-function listRetailOffers({ channel } = {}) {
+function listRetailOffers({ channel, offerVersion=OFFER_VERSION } = {}) {
   if (!CHANNELS.includes(channel)) fail('invalid_offer_channel');
   const options = channel === 'public' ? ['prepaid'] : PAYMENT_OPTIONS;
   return Object.keys(RETAIL_PRICES_CENTS).flatMap(planKey => COMMITMENT_MONTHS.flatMap(commitmentMonths =>
-    options.map(paymentOption => buildRetailOffer({ planKey, commitmentMonths, paymentOption, channel, offerVersion: OFFER_VERSION }))
+    options.map(paymentOption => buildRetailOffer({ planKey, commitmentMonths, paymentOption, channel, offerVersion }))
   ));
 }
 

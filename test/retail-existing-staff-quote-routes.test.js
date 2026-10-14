@@ -2,7 +2,7 @@
 const assert=require('node:assert/strict'),{test}=require('node:test'),express=require('express'),request=require('supertest'),path=require('node:path');
 const root=path.resolve(__dirname,'..');
 const client='11111111-1111-4111-8111-111111111111';
-const version='retail-terms-2026-10-11-v1',marker='membership_agreement_retail_terms_v2';
+const version='retail-stripe-terms-2026-10-14-v2',marker='membership_agreement_retail_terms_v2';
 function stub(name,exports){const filename=path.join(root,name);require.cache[filename]={id:filename,filename,loaded:true,exports};}
 class Query{
   constructor(db,table){this.db=db;this.table=table;this.predicates=[];this.mode='select';}

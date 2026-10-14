@@ -1,7 +1,7 @@
 'use strict';
 
 // Selection adapter for the current quote paths, not a second checkout system.
-const { OFFER_VERSION, listRetailOffers, buildRetailOffer, RETAIL_PRICES_CENTS } = require('./membershipOffers');
+const { STRIPE_RECURRING_OFFER_VERSION, listRetailOffers, buildRetailOffer, RETAIL_PRICES_CENTS } = require('./membershipOffers');
 const { buildRetailPackageSnapshot, readRetailPackageOffer } = require('./membershipPackageCompatibility');
 const RETAIL_TEMPLATE = 'membership_agreement_retail_terms_v2';
 const enabled = (env = process.env) => env.MEMBERSHIP_PRICING_TERMS_ENABLED === 'true';
@@ -30,6 +30,7 @@ function normalizeRetailQuoteSelection(body = {}, { channel, env = process.env, 
   const version = field(body, ['offer_version', 'offerVersion', 'pricing_version', 'pricingVersion']);
   const supplied = months !== undefined || payment !== undefined || version !== undefined;
   if (!enabled(env)) { if (supplied) fail('retail_pricing_not_enabled', 409); return null; }
+  if(version!==STRIPE_RECURRING_OFFER_VERSION)fail('stale_offer_version');
   const plan = field(body, ['plan_key', 'plan', 'selected_plan_key', 'membership_tier', 'membershipTier'],
     v => String(v || '').trim().toLowerCase() === 'essential' ? 'basic' : String(v || '').trim().toLowerCase());
   // Only server selection keys determine a NEW offer. Never accept raw prices.
@@ -70,14 +71,15 @@ function validateRetailIntentSource(intent) {
 }
 function retailQuoteCatalog(channel, env = process.env) {
   if (!enabled(env)) return null;
-  return { pricing_version: OFFER_VERSION, offers: listRetailOffers({ channel }),
+  return { pricing_version: STRIPE_RECURRING_OFFER_VERSION,
+    offers: listRetailOffers({ channel,offerVersion:STRIPE_RECURRING_OFFER_VERSION }),
     // Display-only comparison, not an authorized public installment offer.
     // Keep checkout authority in the six public PREPAID selection keys.
     ...(channel === 'public' ? { monthly_payment_references: Object.fromEntries(
       ['basic','pro'].map(plan => [plan, Object.fromEntries([3,6,12].map(months =>
         [months, RETAIL_PRICES_CENTS[plan][months].monthly_installments]))])) } : {}),
     first_role_prepay_prices: Object.fromEntries(['basic','pro'].map(planKey => [planKey,
-      buildRetailOffer({planKey,channel,commitmentMonths:3,paymentOption:'prepaid',offerVersion:OFFER_VERSION,
+      buildRetailOffer({planKey,channel,commitmentMonths:3,paymentOption:'prepaid',offerVersion:STRIPE_RECURRING_OFFER_VERSION,
         firstRolePrepaySelected:true}).first_role_prepay.amount_cents])) };
 }
 function validateRetailAgreementSource(agreement, intent) {
