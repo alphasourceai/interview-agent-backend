@@ -87,6 +87,22 @@ test('tampered rate, allocation, prefix, account and no_usage hold before buildi
     const { raw } = await binding(); change(raw); assert.throws(() => proof.usageInvoiceBinding(raw), { code: 'enterprise_usage_invoice_held' });
   }
 });
+test('fresh full census revalidates reserved ledger and allocation without repricing frozen labels', async () => {
+  const {raw,b}=await binding();
+  const census=Object.fromEntries(['clients','agreements','settings','roles','interviews','pools','purchases','credits','ledger','intents','customers','seals']
+    .map(k=>[k,clone(raw.snapshot[k])]));
+  census.ledger=raw.groups.flatMap(g=>g.interview_ids.map(interview_id=>({id:randomUUID(),client_id:raw.owner_id,
+    role_id:g.role_id,interview_id,unit_price_cents:g.unit_price_cents,enterprise_usage_batch_id:raw.id,
+    period_start:raw.snapshot.month_start,period_end:raw.snapshot.month_end,
+    stripe_invoice_id:null,stripe_invoice_item_id:null,billed_at:null})));
+  const read={status:'read',batch:raw,census,receipt:raw.snapshot.receipt,observed_at:raw.snapshot.observed_at};
+  assert.deepEqual(proof.usageInvoiceFreshBinding(read),b);
+  census.roles[0].title='Changed current title';assert.deepEqual(proof.usageInvoiceFreshBinding(read),b);
+  for(const change of [r=>{r.census.ledger.pop();},r=>{r.census.ledger[0].stripe_invoice_id='in_UNPROVEN';},
+    r=>{r.census.interviews[0].completed_at=null;},r=>{r.receipt.client_initial.stripe_customer_id='cus_OTHER';}]){
+    const bad=clone(read);change(bad);assert.throws(()=>proof.usageInvoiceFreshBinding(bad));
+  }
+});
 test('shell and per-role partial proofs precede full finalized proof; never claim cash or effects', async () => {
   const { b } = await binding();
   for (const [n, status] of [[0, 'draft'], [1, 'draft'], [2, 'draft'], [2, 'open'], [2, 'paid']]) {

@@ -56,6 +56,30 @@ function usageInvoiceCreateRequest(b) {
     collection_method: 'charge_automatically', auto_advance: false, pending_invoice_items_behavior: 'exclude',
     currency: 'usd', metadata: metadata(b) } });
 }
+function usageInvoiceFreshBinding(raw) {
+  const read = clean(raw, native), b = read.batch, original = usageInvoiceBinding(b), census = read.census;
+  check(read.status === 'read' && typeof read.observed_at === 'string' && Number.isFinite(Date.parse(read.observed_at))
+    && isDeepStrictEqual(read.receipt, b.snapshot.receipt) && census && Array.isArray(census.ledger));
+  const expected = new Map(b.groups.flatMap(g => g.interview_ids.map(iv => [iv, g]))), seen = new Set();
+  const finalize = b.provider_operation?.operations?.finalize?.proof;
+  for (const row of census.ledger.filter(row => row.enterprise_usage_batch_id === b.id)) {
+    const g = expected.get(row.interview_id); check(g && !seen.has(row.interview_id)); seen.add(row.interview_id);
+    check(row.client_id === b.owner_id && row.role_id === g.role_id && row.unit_price_cents === g.unit_price_cents
+      && Date.parse(row.period_start) / 1000 === original.period.start && Date.parse(row.period_end) / 1000 === original.period.end);
+    const unstamped = row.stripe_invoice_id === null && row.stripe_invoice_item_id === null && row.billed_at === null;
+    if (!unstamped) check(finalize?.stage === 'finalized' && row.stripe_invoice_id === finalize.invoice_id
+      && finalize.items.some(i => i.role_id === g.role_id && i.invoice_item_id === row.stripe_invoice_item_id)
+      && typeof row.billed_at === 'string' && Number.isFinite(Date.parse(row.billed_at)));
+  }
+  check(seen.size === expected.size);
+  const current = { ...b.snapshot, ...census, observed_at: read.observed_at, receipt: read.receipt,
+    ledger: census.ledger.filter(row => row.enterprise_usage_batch_id !== b.id) };
+  let planned; try { planned = planEnterpriseExistingUsage(current); } catch (_) { held(); }
+  check(isDeepStrictEqual(clean(planned.groups, native), b.groups) && isDeepStrictEqual(clean(planned.prefix, native), b.prefix));
+  // Original labels/digest/key remain frozen; current census only revalidates
+  // the same allocation/source, not a request rewrite using today's titles.
+  return original;
+}
 function usageInvoiceItemRequest(b, invoiceId, roleId) {
   check(id(invoiceId, 'in'));
   const g = b.groups.find(g => g.role_id === roleId); check(g);
@@ -226,6 +250,6 @@ async function readUsageInvoiceCensus({ stripe, binding: b, invoiceId = null }) 
   check(isDeepStrictEqual(invoices, again)); await account(); api();
   return { invoices, invoice, items, lines, provider_effect_authorized: false };
 }
-module.exports = { usageInvoiceBinding, usageInvoiceCreateRequest, usageInvoiceItemRequest, usageInvoiceFinalizeRequest,
+module.exports = { usageInvoiceBinding, usageInvoiceFreshBinding, usageInvoiceCreateRequest, usageInvoiceItemRequest, usageInvoiceFinalizeRequest,
   usageInvoicePayRequest, verifyUsageInvoicePhase, selectUsageInvoicePaymentMethod, verifyUsageInvoicePaid,
   readUsageInvoiceCensus, completePages };
