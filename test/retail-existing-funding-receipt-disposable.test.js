@@ -87,6 +87,7 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
  }finally{sql('drop function public.ensure_retail_existing_linked_buyer_member(uuid);');}
  sql(linkedMemberMigration);
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014092615_legacy_contract_atomic_actions.sql'),'utf8'));
+ sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014105926_retail_existing_replacement_reservations.sql'),'utf8'));
  assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
  // Exact old-data oracles remain, with ONLY the new nullable receipt column.
  // Derive expected JSON from the prior saved oracle, not a fresh row read that
@@ -2289,5 +2290,179 @@ test('LEGACY ATOMIC actual legacy RPC wins before original paid/financial enroll
  assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.out.trim(),'t');
  assert.equal(JSON.parse(h.out.trim().split('\n').find(x=>x.startsWith('{'))).status,'applied');
  assert.equal(legacyAction(f,'record_cancel',old).status,'held');assert.equal(legacyProjection(f).cancel_at_term_end,false);
+ assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
+});
+
+// These are actual native reservations over authored funding receipts. They do
+// NOT call Stripe, cancel a subscription, grant access or complete old billing.
+const replacementMigration=path.resolve(__dirname,'../supabase/migrations/20261014105926_retail_existing_replacement_reservations.sql');
+function replacementCall(f,{intent=f.key?f.intent:null,claim=f.key,current=linkedMemberCurrent(f)}={}){
+ return 'select reserve_retail_existing_replacement_cancel('+[f.id,intent,claim,current].map(lit).join(',')+');';
+}
+const replacementReserve=(f,args)=>JSON.parse(sql('set role service_role;'+replacementCall(f,args)));
+const replacementRows=f=>JSON.parse(sql(`select coalesce(jsonb_agg(to_jsonb(r)),'[]') from private_retail_replacement.reservations r where agreement_id=${lit(f.id)};`));
+const replacementPublic=f=>sql(`select jsonb_build_object('agreement',(select to_jsonb(a) from membership_agreements a where id=${lit(f.id)}),
+ 'client',(select to_jsonb(c) from clients c where id=${lit(f.client)}),'intent',(select to_jsonb(i) from public_purchase_intents i where id=${lit(f.intent)}),
+ 'plan',(select to_jsonb(p) from client_plan_settings p where client_id=${lit(f.client)}),
+ 'credits',(select jsonb_agg(to_jsonb(r) order by id) from client_role_credits r where source_client_id=${lit(f.client)}));`);
+for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])
+ for(const source of ['sales_assisted','public_purchase_intent','admin'])for(const role of [false,true]){
+  if(source==='public_purchase_intent'&&payment==='monthly_installments')continue;
+  test(`REPLACEMENT RESERVE genuine funded-pending ${plan}/${months}/${payment}/${source}/role${role}`,opts,()=>{
+   const f=fixture(plan,months,payment,role,source!=='admin',true,'admin',source);record(f);
+   const before=replacementPublic(f),first=replacementReserve(f),again=replacementReserve(f);
+   assert.equal(first.status,'reserved');assert.equal(again.status,'existing');assert.deepEqual(first.request,again.request);assert.equal(first.created_at,again.created_at);
+   assert.equal(replacementRows(f).length,1);assert.equal(replacementPublic(f),before);
+   assert.equal(first.request.version,'retail_existing_replacement_cancel_v1');assert.equal(first.request.api_version,'2023-10-16');
+   assert.equal(Object.keys(first.request).length,13);assert.equal(first.request.agreement_id,f.id);assert.equal(first.request.client_id,f.client);
+   assert.equal(first.request.intent_id,f.key?f.intent:null);assert.equal(first.request.provider_account_id,f.proof.provider_account_id);
+   assert.equal(first.request.customer_id,f.proof.period.customer_id);assert.equal(first.request.new_subscription_id,f.proof.period.subscription_id);
+   assert.equal(first.request.old_subscription_id,row(f).replaces_stripe_subscription_id);assert.equal(first.request.livemode,false);
+   assert.deepEqual(first.request.cancellation,{method:'DELETE',path:'/v1/subscriptions/'+row(f).replaces_stripe_subscription_id,
+    parameters:{invoice_now:false,prorate:false},policy:'immediate_cancel'});
+   assert.match(first.request.source_digest,/^[a-f0-9]{64}$/);assert.match(first.request.funding_receipt_digest,/^[a-f0-9]{64}$/);
+   assert.match(first.created_at,/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/);
+   assert.equal(row(f).checkout_status,'pending_payment');assert.equal(row(f).checkout_paid_at,null);
+   assert.equal(row(f).replaced_stripe_subscription_canceled_at,null);assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
+  });
+ }
+test('REPLACEMENT RESERVE linked paid clock retains genuine original billing identity conflict without fabricating completion',opts,()=>{
+ const f=fixture('basic',3,'monthly_installments',true,true,true);record(f);nativeComplete(f);
+ const before=billingState(f);denied('set role service_role;'+billingCall(f),/billing_identity_conflict/);
+ assert.equal(billingState(f),before);const result=replacementReserve(f);assert.equal(result.status,'reserved');
+ assert.equal(sql(`select billing_applied_at is null and billing_apply_digest is null from public_purchase_intents where id=${lit(f.intent)};`),'t');
+ assert.equal(billingState(f),before);assert.equal(row(f).replaced_stripe_subscription_canceled_at,null);
+});
+test('REPLACEMENT RESERVE paid-clock rows with authored B root permit reservation without claiming billing completion',opts,()=>{
+ for(const linked of [true,false]){
+  // Replacement id is frozen BEFORE funding; emulate the supported initial
+  // client state B after completion without pretending the old writer succeeded.
+  const f=fixture('basic',3,'prepaid',false,linked,true);record(f);
+  if(linked)nativeComplete(f);else markAdminPaid(f);
+  sql(`update clients set stripe_subscription_id=${lit(f.proof.period.subscription_id)} where id=${lit(f.client)};`);
+  const before=replacementPublic(f);assert.equal(replacementReserve(f).status,'reserved');assert.equal(replacementPublic(f),before);
+ }
+});
+test('REPLACEMENT RESERVE no replacement requires genuine funding and null policy; failed proof never becomes a no-op',opts,()=>{
+ for(const linked of [true,false]){
+  const f=fixture('basic',3,'prepaid',false,linked);denied('set role service_role;'+replacementCall(f),/retail_(funding|replacement)_/);
+  assert.equal(replacementRows(f).length,0);record(f);const before=replacementPublic(f);
+  assert.deepEqual(replacementReserve(f),{status:'no_replacement',request:null,created_at:null});assert.equal(replacementPublic(f),before);
+  sql(`update membership_agreements set replacement_policy='immediate_cancel' where id=${lit(f.id)};`);
+  denied('set role service_role;'+replacementCall(f),/retail_replacement_source_denied/);assert.equal(replacementRows(f).length,0);
+ }
+ denied(`set role service_role;select reserve_retail_existing_replacement_cancel(${[legacyId,null,null,{}].map(lit).join(',')});`,/retail_(funding|replacement)_/);
+});
+test('REPLACEMENT RESERVE nullable or changed non-null replacement policy is held, never silently rewritten',opts,()=>{
+ for(const policy of [null,'other']){
+  const f=fixture('basic',3,'prepaid',false,true,true);record(f);
+  sql(`update membership_agreements set replacement_policy=${lit(policy)} where id=${lit(f.id)};`);
+  denied('set role service_role;'+replacementCall(f),/retail_replacement_source_denied/);assert.equal(replacementRows(f).length,0);
+ }
+ const f=fixture('basic',3,'prepaid',false,true,true);record(f);replacementReserve(f);const rowsBefore=replacementRows(f);
+ sql(`update membership_agreements set replacement_policy=null where id=${lit(f.id)};`);
+ denied('set role service_role;'+replacementCall(f),/retail_replacement_source_denied/);assert.deepEqual(replacementRows(f),rowsBefore);
+});
+test('REPLACEMENT RESERVE wrong linked/admin caller shape, clock, provider tuple or third root is refused',opts,()=>{
+ for(const linked of [true,false]){
+  const f=fixture('basic',3,'prepaid',false,linked,true);record(f);
+  for(const args of [
+   {intent:linked?null:crypto.randomUUID()},{claim:linked?'WRONG':crypto.randomUUID()},
+   {current:{...linkedMemberCurrent(f),id:'sub_OTHER'}},{current:{...linkedMemberCurrent(f),customer:'cus_OTHER'}},
+   {current:{...linkedMemberCurrent(f),status:'canceled'}},{current:{...linkedMemberCurrent(f),current_period_end:1}},
+   {current:{...linkedMemberCurrent(f),pause_collection:{behavior:'keep_as_draft'}}},
+   {current:{...linkedMemberCurrent(f),cancel_at_period_end:true}},{current:{...linkedMemberCurrent(f),extra:true}}]){
+   denied('set role service_role;'+replacementCall(f,args),/retail_(replacement|funding)_/);assert.equal(replacementRows(f).length,0);
+  }
+  sql(`update clients set stripe_subscription_id=${lit('sub_THIRD_'+f.client.replaceAll('-',''))} where id=${lit(f.client)};`);
+  denied('set role service_role;'+replacementCall(f),/retail_(funding|replacement)_/);assert.equal(replacementRows(f).length,0);
+ }
+});
+test('REPLACEMENT RESERVE real concurrent workers wait upstream and reserve exactly one unchanged request',opts,async()=>{
+ const f=fixture('pro',6,'monthly_installments',false,true,true);record(f);const tag='RR'+crypto.randomUUID().replaceAll('-','');
+ const [first,second,observer]=await Promise.all([
+  parallel(`set application_name=${lit(tag+'H')};set role service_role;begin;${replacementCall(f)}select pg_sleep(0.65);commit;`),
+  parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;${replacementCall(f)}`),
+  parallel(`select pg_sleep(0.35);select exists(select 1 from pg_stat_activity w join pg_stat_activity h on h.pid=any(pg_blocking_pids(w.pid))
+   where w.application_name=${lit(tag+'W')} and h.application_name=${lit(tag+'H')});`)]);
+ assert.equal(first.code,0,first.err);assert.equal(second.code,0,second.err);assert.equal(observer.out.trim(),'t');
+ const a=JSON.parse(first.out.trim().split('\n').find(x=>x.startsWith('{'))),b=JSON.parse(second.out.trim().split('\n').find(x=>x.startsWith('{')));
+ assert.equal(a.status,'reserved');assert.equal(b.status,'existing');assert.deepEqual(a.request,b.request);assert.equal(a.created_at,b.created_at);
+ assert.equal(replacementRows(f).length,1);
+});
+test('REPLACEMENT RESERVE replays retained committed row after a deliberately discarded native ACK',opts,()=>{
+ const f=fixture('basic',3,'prepaid',false,true,true);record(f);sql('set role service_role;'+replacementCall(f));
+ const saved=replacementRows(f);const ack=replacementReserve(f);assert.equal(ack.status,'existing');assert.deepEqual(ack.request,saved[0].request);
+ assert.equal(replacementRows(f).length,1);assert.equal(row(f).replaced_stripe_subscription_canceled_at,null);
+});
+test('REPLACEMENT RESERVE expired claim after actual last advisory wait refuses existing ACK and retains journal',opts,async()=>{
+ const f=fixture('basic',3,'prepaid',false,true,true);record(f);replacementReserve(f);const saved=replacementRows(f);
+ sql(`update public_purchase_intents set activation_claimed_at=clock_timestamp()-interval '4 minutes 58 seconds' where id=${lit(f.intent)};`);
+ const tag='RA'+crypto.randomUUID().replaceAll('-','');
+ const [holder,writer,observer]=await Promise.all([
+  parallel(`set application_name=${lit(tag+'H')};begin;select pg_advisory_xact_lock(1632842307,hashtext(${lit(f.id)}::uuid::text));select pg_sleep(2.7);commit;`),
+  parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;${replacementCall(f)}`),
+  parallel(`select pg_sleep(0.8);select exists(select 1 from pg_stat_activity w join pg_stat_activity h on h.pid=any(pg_blocking_pids(w.pid))
+   where w.application_name=${lit(tag+'W')} and h.application_name=${lit(tag+'H')} and w.wait_event_type='Lock' and w.wait_event='advisory');`)]);
+ assert.equal(holder.code,0,holder.err);assert.notEqual(writer.code,0);assert.match(writer.err,/retail_replacement_(claim|clock)_denied/);
+ assert.equal(observer.code,0,observer.err);assert.equal(observer.out.trim(),'t');
+ assert.deepEqual(replacementRows(f),saved);
+});
+test('REPLACEMENT RESERVE admin phantom intent waits on locked agreement then existing source guard refuses link',opts,async()=>{
+ const f=fixture('basic',3,'prepaid',false,false,true);record(f);const id=crypto.randomUUID(),tag='RI'+crypto.randomUUID().replaceAll('-','');
+ const insert=`insert into public_purchase_intents(id,agreement_id,client_id,company_legal_name,buyer_first_name,buyer_last_name,buyer_email,
+  selected_plan_key,selected_billing_cadence,package_snapshot,protocol,status,term_start_basis,expires_at)
+  values(${[id,f.id,f.client,'Synthetic Phantom','QA','Buyer','phantom@example.invalid',f.pkg.plan_key,f.pkg.billing_cadence,f.pkg,
+   'fenced_v2','checkout_pending','successful_payment'].map(lit).join(',')},clock_timestamp()+interval '7 days');`;
+ const [holder,writer,observer]=await Promise.all([
+  parallel(`set application_name=${lit(tag+'H')};set role service_role;begin;${replacementCall(f)}select pg_sleep(0.65);commit;`),
+  parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;${insert}`),
+  parallel(`select pg_sleep(0.35);select exists(select 1 from pg_stat_activity w join pg_stat_activity h on h.pid=any(pg_blocking_pids(w.pid))
+   where w.application_name=${lit(tag+'W')} and h.application_name=${lit(tag+'H')});`)]);
+ assert.equal(holder.code,0,holder.err);assert.notEqual(writer.code,0);assert.match(writer.err,/retail_admin_client_intent_link_denied/);
+ assert.equal(observer.out.trim(),'t');assert.equal(replacementRows(f).length,1);
+ assert.equal(sql(`select count(*) from public_purchase_intents where agreement_id=${lit(f.id)};`),'0');
+});
+test('REPLACEMENT RESERVE browser denied; service direct insert, all-role mutation and hidden schema drift refuse',opts,()=>{
+ const f=fixture('basic',3,'prepaid',false,true,true);record(f);const r=replacementReserve(f),saved=replacementRows(f);
+ for(const role of ['anon','authenticated']){
+  denied(`set role ${role};${replacementCall(f)}`,/permission denied/);
+  denied(`set role ${role};select * from private_retail_replacement.reservations;`,/permission denied/);
+ }
+ const g=fixture('basic',3,'prepaid',false,true,true);record(g);
+ denied(`set role service_role;insert into private_retail_replacement.reservations(agreement_id,request) values(${lit(g.id)},${lit(r.request)});`,/retail_replacement_writer_denied/);
+ denied(`update private_retail_replacement.reservations set request='{}' where agreement_id=${lit(f.id)};`,/retail_replacement_immutable/);
+ denied(`delete from private_retail_replacement.reservations where agreement_id=${lit(f.id)};`,/retail_replacement_immutable/);
+ denied(`begin;alter table private_retail_replacement.reservations disable trigger immutable_reservation;set role service_role;${replacementCall(f)}commit;`,/retail_replacement_schema_drift/);
+ denied(`begin;grant select on private_retail_replacement.reservations to authenticated;set role service_role;${replacementCall(f)}commit;`,/retail_replacement_schema_drift/);
+ denied(`begin;revoke insert on private_retail_replacement.reservations from service_role;set role service_role;${replacementCall(f)}commit;`,/retail_replacement_schema_drift/);
+ denied(`begin;alter table private_retail_replacement.reservations drop constraint finite_created;set role service_role;${replacementCall(f)}commit;`,/retail_replacement_schema_drift/);
+ denied(fs.readFileSync(replacementMigration,'utf8'),/retail_replacement_schema_drift/);
+ assert.deepEqual(replacementRows(f),saved);assert.equal(replacementRows(g).length,0);
+ assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
+ assert.equal(sql("select has_schema_privilege('service_role','private_sales','USAGE');"),'f');
+});
+test('REPLACEMENT RESERVE forged writer context cannot substitute body or timestamp; schema helper and grant drift hold',opts,()=>{
+ const f=fixture('pro',6,'prepaid',false,true,true);record(f);
+ const writer={agreement_id:f.id,intent_id:f.intent,claim:f.key,current:linkedMemberCurrent(f)};
+ const original=JSON.parse(sql(`set role service_role;select private_retail_replacement.proof(${[f.id,f.intent,f.key,writer.current].map(lit).join(',')});`));
+ for(const patch of [{customer_id:'cus_OTHER'},{old_subscription_id:'sub_OTHER'},{new_subscription_id:'sub_OTHER'},
+  {provider_account_id:'acct_OTHER'},{livemode:true},{funding_receipt_digest:'0'.repeat(64)},
+  {source_digest:'0'.repeat(64)},{cancellation:{...original.cancellation,parameters:{invoice_now:true,prorate:true}}},{extra:true}]){
+  denied(`set role service_role;select set_config('private_retail_replacement.writer',${lit(JSON.stringify(writer))},false);
+   insert into private_retail_replacement.reservations(agreement_id,request) values(${lit(f.id)},${lit({...original,...patch})});`,/retail_replacement_request_denied/);
+ }
+ assert.equal(replacementRows(f).length,0);
+ // Genuine low-level server proof is admitted, but cannot backdate the journal.
+ sql(`set role service_role;select set_config('private_retail_replacement.writer',${lit(JSON.stringify(writer))},false);
+  insert into private_retail_replacement.reservations(agreement_id,request,created_at) values(${lit(f.id)},${lit(original)},'2000-01-01Z');`);
+ const rows=replacementRows(f),ack=replacementReserve(f);assert.equal(ack.status,'existing');assert.deepEqual(ack.request,original);
+ assert.ok(Date.parse(rows[0].created_at)>Date.parse('2026-01-01Z'));assert.equal(rows.length,1);
+ denied(`begin;grant update on private_retail_replacement.reservations to service_role;set role service_role;${replacementCall(f)}commit;`,/retail_replacement_schema_drift/);
+ denied(`begin;grant usage on schema private_retail_replacement to authenticated;set role service_role;${replacementCall(f)}commit;`,/retail_replacement_schema_drift/);
+ const definition=sql("select pg_get_functiondef('private_retail_replacement.proof(uuid,uuid,text,jsonb)'::regprocedure);");
+ denied(`begin;${definition.replace('\nbegin\n','\nbegin\n -- synthetic body drift\n')};set role service_role;${replacementCall(f)}commit;`,/retail_replacement_function_drift/);
+ sql(`update clients set stripe_subscription_id=null where id=${lit(f.client)};`);
+ denied('set role service_role;'+replacementCall(f),/retail_replacement_source_denied/);assert.deepEqual(replacementRows(f),rows);
  assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
 });
