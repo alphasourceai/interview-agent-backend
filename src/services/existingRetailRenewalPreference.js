@@ -192,8 +192,11 @@ async function requestExistingRetailRenewal(input) {
 async function readExistingRetailRenewalSummary(input) {
   const source = await sourceFor(input), result = await native(input.db, source, 'read');
   const op = result.operation;
+  // A completed renewal-on is a past setting operation, not a permanent
+  // display anchor. Open/uncertain/off operations retain their stored cutoff.
+  const completedOn = result.status === 'applied' && op?.requested_auto_renew === true;
   return {
-    stripe_renewal_billing_cutoff_at: op?.billing_cutoff_at || renewalBillingCutoff(source),
+    stripe_renewal_billing_cutoff_at: completedOn ? renewalBillingCutoff(source) : op?.billing_cutoff_at || renewalBillingCutoff(source),
     renewal_request_status: result.status,
     requested_auto_renew: op?.requested_auto_renew ?? null,
     renewal_requested_at: op?.requested_at ?? null

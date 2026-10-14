@@ -4,7 +4,7 @@ const { randomUUID } = require('node:crypto');
 const { recurringFixture } = require('./fixtures/existing-retail-recurring-funding-fixture');
 const { anchoredMonthInstant } = require('../src/services/membershipOffers');
 const { renewalBillingCutoff, renewalSubscriptionProjection, requestExistingRetailRenewal,
-  reconcileExistingRetailRenewal } = require('../src/services/existingRetailRenewalPreference');
+  reconcileExistingRetailRenewal, readExistingRetailRenewalSummary } = require('../src/services/existingRetailRenewalPreference');
 
 function fixture(months = 3, payment = 'prepaid') {
   const f = recurringFixture('basic', months, payment, true, { ordinal: 1 });
@@ -159,6 +159,18 @@ test('whole commitment boundary is original B, not next monthly period or contra
   assert.equal(renewalBillingCutoff(f.source, Date.parse('2026-02-15Z')), '2026-04-30T11:59:59.000Z');
   assert.equal(renewalBillingCutoff(f.source, Date.parse('2026-04-30T11:59:59.000Z')), '2026-07-31T11:59:59.000Z');
   assert.equal(renewalBillingCutoff(f.source, Date.parse('2026-12-01Z')), '2027-01-31T11:59:59.000Z');
+});
+test('summary projects the next B for completed renewal-on but preserves stored open/off cutoffs',async()=>{
+ for(const [status,on] of [['applied',true],['applied',false],['waiting',true],['claimed',true],['unknown',true],['held',true]]){
+  const f=fixture(3,'monthly_installments'),rpc=f.input.db.rpc,stored='2026-01-01T00:00:00.000Z';
+  const operation={operation_id:randomUUID(),source:structuredClone(f.source),generation:1,
+   requested_auto_renew:on,billing_cutoff_at:stored,requested_at:'2025-12-01T00:00:00.000Z'};
+  f.input.db.rpc=async(name,args)=>name==='change_retail_existing_renewal'&&args.p_action==='read'
+   ?{data:{status,operation},error:null}:rpc(name,args);
+  const before=structuredClone(operation),result=await readExistingRetailRenewalSummary(f.input);
+  assert.equal(result.stripe_renewal_billing_cutoff_at,status==='applied'&&on?renewalBillingCutoff(f.source):stored);
+  assert.deepEqual(operation,before);assert.equal(f.writes.length,0);
+ }
 });
 test('pure provider projection retains unchanged identities without private metadata', () => {
   const f = fixture(); f.sub.metadata = { private: 'not returned' };
