@@ -23,6 +23,16 @@ begin
   execute replace(definition_,needle_,'to_jsonb(x)-''snapshot''-''provider_operation'' order by x.service_month,x.id');
  end loop;
  definition_:=pg_get_functiondef('public.enterprise_existing_usage_batch_guard()'::regprocedure);
+ needle_:=' if TG_OP=''INSERT'' then';
+ replacement_:=$guard$ if TG_OP='INSERT' then
+  if new.provider_operation is not null then raise exception 'enterprise_usage_provider_reserved_only';end if;
+ else
+  if old.phase<>'reserved' and new.provider_operation is distinct from old.provider_operation
+   then raise exception 'enterprise_usage_provider_reserved_only';end if;
+ end if;
+ if TG_OP='INSERT' then$guard$;
+ if position(needle_ in definition_)=0 then raise exception 'enterprise_usage_batch_leaf_guard_patch_drift';end if;
+ definition_:=replace(definition_,needle_,replacement_);
  needle_:='  if old.phase not in(''prepared'',''held'')';
  replacement_:=$guard$  if old.phase='reserved' and new.phase='reserved'
    and(to_jsonb(new)-'provider_operation')=(to_jsonb(old)-'provider_operation')
@@ -101,6 +111,19 @@ begin
   into groups_,sum_,count_ from jsonb_array_elements(b.groups)x;
  if count_<1 or sum_<1 or sum_>2147483647 then raise exception 'enterprise_usage_provider_groups_denied';end if;
  step_:=p_step;invoice_:=leaf_->>'invoice_id';
+ -- A provider payment proof cannot outrun the one complete invoiced stamp.
+ -- Check store AND sent/observe so a pay leaf cannot make unstamped ledger
+ -- rows terminal/unreachable. Finalization remains invoicing, not bank cash.
+ if step_='pay' and p_action in('store','sent','observe') then
+  if invoice_ is null or leaf_->'operations'->'finalize'->'proof'->>'stage' is distinct from 'finalized'
+   or(select count(*) from public.usage_billing_ledger where enterprise_usage_batch_id=b.id)
+    is distinct from(select sum((x->>'quantity')::bigint) from jsonb_array_elements(groups_)x)
+   or exists(select 1 from public.usage_billing_ledger l where l.enterprise_usage_batch_id=b.id
+    and(l.stripe_invoice_id is distinct from invoice_ or l.billed_at is null
+     or not exists(select 1 from jsonb_array_elements(leaf_->'operations'->'finalize'->'proof'->'items')x
+      where x->>'role_id'=l.role_id::text and x->>'invoice_item_id'=l.stripe_invoice_item_id)))
+   then raise exception 'enterprise_usage_provider_full_stamp_required_before_pay';end if;
+ end if;
  if p_action='store' then
   if p_lease is not null or p_proof is not null or jsonb_typeof(p_request) is distinct from 'object'
    or(select count(*) from jsonb_object_keys(p_request))<>2 or not(p_request ?& array['key','body'])
