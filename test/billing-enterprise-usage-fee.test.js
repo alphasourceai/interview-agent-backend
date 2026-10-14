@@ -96,6 +96,25 @@ const BASE_FEES = Object.freeze({
   additional_interview_fee: 0
 })
 
+test('Standard rollover and no-pool Usage retain existing checkout without a pool seal or native proof',async()=>{
+ const {prepareEnterprisePoolTerms}=require('../src/services/enterprisePoolSnapshot');
+ const {isMarkedEnterpriseAgreement}=require('../src/services/enterpriseAgreementExecution');
+ for(const model of ['fixed','rollover','usage']){
+  const fees=prepareEnterprisePoolTerms({...BASE_FEES,membership_tier:'enterprise',billing_model:model,
+   pool_quantity:0,usage_interview_fee_cents:2500,...(model==='rollover'?{rollover_days:60}:{})});
+  assert.equal(fees.pool_offer_snapshot,null);
+  assert.equal(isMarkedEnterpriseAgreement({membership_tier:'enterprise',template_snapshot:{values:fees}}),false);
+  const {stripeCalls}=await enterpriseCheckout(fees);
+  assert.equal(stripeCalls.prices.length,1);assert.equal(stripeCalls.sessions.length,1);
+  assert.equal(stripeCalls.sessions[0].line_items.length,1);assert.equal(stripeCalls.sessions[0].metadata.billing_model,model);
+ }
+});
+test('positive reviewed Enterprise pool still requires its existing signed agreement, never anonymous admin checkout',async()=>{
+ const {prepareEnterprisePoolTerms}=require('../src/services/enterprisePoolSnapshot');
+ const fees=prepareEnterprisePoolTerms({...BASE_FEES,membership_tier:'enterprise',billing_model:'usage',pool_quantity:30,usage_interview_fee_cents:2500});
+ await assert.rejects(()=>enterpriseCheckout(fees),{code:'enterprise_pool_signed_agreement_required'});
+});
+
 async function enterpriseCheckout(enterpriseFees) {
   const stripeCalls = { sessions: [], prices: [] }
   const previousKey = process.env.STRIPE_SECRET_KEY

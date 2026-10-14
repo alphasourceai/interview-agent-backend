@@ -396,6 +396,7 @@ async function activateCase(plan, cadence, extra = {}) {
     subscription: makeSubscription(cadence),
     requireParentClient: async () => ({ ok: true }),
     retailFunding: extra.retailFunding || null,
+    stripe:extra.stripe,
     fallbackCustomerId: extra.fallbackCustomerId || null,
     ensureRecovery: async () => {
       recoveryCalls += 1
@@ -417,6 +418,45 @@ async function activateCase(plan, cadence, extra = {}) {
   })
   return { db, result, sentEmails, welcomeEmails, recoveryCalls }
 }
+
+test('unmarked signed replacement cancels old customer-matched subscription before activation and stamps once',async()=>{
+ const db=makeDb();db.purchaseIntents=[];const agreement=db.membershipAgreements[0];
+ Object.assign(agreement,{replaces_stripe_subscription_id:'sub_OLD',replacement_policy:'immediate_cancel'});
+ const calls=[];let old={id:'sub_OLD',customer:'cus_test_public',status:'active'};
+ const stripe={subscriptions:{retrieve:async id=>{calls.push(['retrieve',id]);return {...old};},cancel:async(id,body)=>{
+  calls.push(['cancel',id,body]);assert.equal(db.clients[0].billing_status,'inactive');old.status='canceled';return {...old};}}};
+ const first=await activateCase('basic','monthly',{db,stripe});assert.equal(first.result.ok,true);
+ assert.ok(agreement.replaced_stripe_subscription_canceled_at);assert.equal(calls.filter(c=>c[0]==='cancel').length,1);
+ assert.deepEqual(calls.find(c=>c[0]==='cancel')[2],{invoice_now:false,prorate:false});
+ await activateCase('basic','monthly',{db,stripe});assert.equal(calls.length,3,'persisted stamp avoids any second provider operation');
+ assert.equal(db.inserts.some(r=>r.table==='client_interview_pools'),false);
+});
+test('unmarked replacement customer mismatch and unknown cancellation keep activation incomplete',async()=>{
+ for(const scenario of ['mismatch','unknown']){
+  const db=makeDb();db.purchaseIntents=[];const a=db.membershipAgreements[0];
+  Object.assign(a,{replaces_stripe_subscription_id:'sub_OLD',replacement_policy:'immediate_cancel'});
+  let canceled=0;const stripe={subscriptions:{retrieve:async()=>({id:'sub_OLD',customer:scenario==='mismatch'?'cus_OTHER':'cus_test_public',status:'active'}),
+   cancel:async()=>{canceled++;throw Error('SYNTHETIC provider timeout');}}};
+  await assert.rejects(()=>activateCase('basic','monthly',{db,stripe}),{code:scenario==='mismatch'?'legacy_replacement_customer_mismatch':'legacy_replacement_cancel_unknown'});
+  assert.equal(canceled,scenario==='mismatch'?0:1);assert.equal(db.clients[0].billing_status,'inactive');
+  assert.notEqual(a.checkout_status,'paid');assert.equal(db.upserts.length+db.inserts.length,0);
+ }
+});
+test('already-canceled legacy replacement is stamped without a cancel call',async()=>{
+ const db=makeDb();db.purchaseIntents=[];const a=db.membershipAgreements[0];
+ Object.assign(a,{replaces_stripe_subscription_id:'sub_OLD',replacement_policy:'immediate_cancel'});
+ let cancels=0;const stripe={subscriptions:{retrieve:async()=>({id:'sub_OLD',customer:'cus_test_public',status:'canceled'}),cancel:async()=>{cancels++;throw Error('must not cancel again');}}};
+ await activateCase('basic','monthly',{db,stripe});assert.equal(cancels,0);assert.ok(a.replaced_stripe_subscription_canceled_at);
+});
+test('lost cancellation acknowledgment retries by canceled readback and never sends a second cancel',async()=>{
+ const db=makeDb();db.purchaseIntents=[];const a=db.membershipAgreements[0];
+ Object.assign(a,{replaces_stripe_subscription_id:'sub_OLD',replacement_policy:'immediate_cancel'});
+ let status='active',cancels=0;const stripe={subscriptions:{retrieve:async()=>({id:'sub_OLD',customer:'cus_test_public',status}),
+  cancel:async()=>{cancels++;status='canceled';throw Error('SYNTHETIC lost cancel ACK');}}};
+ await assert.rejects(()=>activateCase('basic','monthly',{db,stripe}),{code:'legacy_replacement_cancel_unknown'});
+ assert.equal(db.clients[0].billing_status,'inactive');assert.ok(!a.replaced_stripe_subscription_canceled_at);
+ await activateCase('basic','monthly',{db,stripe});assert.equal(cancels,1);assert.ok(a.replaced_stripe_subscription_canceled_at);
+});
 
 function injectModule(filename, exports) {
   require.cache[filename] = {

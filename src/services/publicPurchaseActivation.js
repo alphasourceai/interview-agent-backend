@@ -844,6 +844,41 @@ async function sendFencedWelcomeEmail({ db, intent, agreement, clientId, buyerEm
   }
 }
 
+// Reuse the existing legacy replacement fields and Stripe cancel call. The
+// browser success redirect is not an activation worker and cannot own this.
+async function finishUnmarkedAgreementReplacement({db,stripe,agreement,subscription,fallbackCustomerId,fallbackSubscriptionId}) {
+  const oldId=cleanText(agreement.replaces_stripe_subscription_id);
+  if(!oldId||agreement.replacement_policy!=='immediate_cancel'||agreement.retail_funding_receipt!=null
+    ||['enterprise_checkout_source','enterprise_checkout_pool_id','enterprise_checkout_prices',
+      'enterprise_funding_receipt','enterprise_billing_receipt'].some(k=>agreement[k]!=null))return;
+  if(agreement.replaced_stripe_subscription_canceled_at)return;
+  const refuse=code=>{throw Object.assign(new Error(code),{code,status:503});};
+  try{
+    const newId=pickId(subscription?.id)||cleanText(fallbackSubscriptionId);
+    const customer=pickId(subscription?.customer)||cleanText(fallbackCustomerId);
+    if(!newId||!customer||oldId===newId||!['active','trialing'].includes(subscription?.status)
+      ||typeof stripe?.subscriptions?.retrieve!=='function'||typeof stripe?.subscriptions?.cancel!=='function')
+      refuse('legacy_replacement_source_unavailable');
+    const old=await stripe.subscriptions.retrieve(oldId);
+    if(old?.id!==oldId||pickId(old.customer)!==customer)refuse('legacy_replacement_customer_mismatch');
+    if(old.status!=='canceled'){
+      await stripe.subscriptions.cancel(oldId,{invoice_now:false,prorate:false});
+      const confirmed=await stripe.subscriptions.retrieve(oldId);
+      if(confirmed?.id!==oldId||pickId(confirmed.customer)!==customer||confirmed.status!=='canceled')
+        refuse('legacy_replacement_cancel_unknown');
+    }
+    const stamp=new Date().toISOString();
+    const {data:marked,error}=await db.from('membership_agreements').update({replaced_stripe_subscription_canceled_at:stamp,replacement_error:null})
+      .eq('id',agreement.id).eq('replaces_stripe_subscription_id',oldId).eq('replacement_policy','immediate_cancel')
+      .select('id,replaced_stripe_subscription_canceled_at').maybeSingle();
+    if(error||!marked?.replaced_stripe_subscription_canceled_at)refuse('legacy_replacement_stamp_unavailable');
+    agreement.replaced_stripe_subscription_canceled_at=marked.replaced_stripe_subscription_canceled_at;
+  }catch(error){
+    if(error?.status===503)throw error;
+    refuse('legacy_replacement_cancel_unknown'); // Existing webhook retry reads canceled before resending.
+  }
+}
+
 async function activatePublicPurchaseAgreementCheckout(options = {}) {
   const db = options.db || supabaseAdmin;
   const authAdmin = options.authAdmin || supabaseAdmin.auth?.admin;
@@ -860,7 +895,7 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
 
   const { data: agreement, error: agreementErr } = await db
     .from('membership_agreements')
-    .select('id,client_id,status,is_current,checkout_status,checkout_session_id,checkout_paid_at,primary_admin_name,admin_email,client_legal_name,dba_trade_name,membership_tier,billing_option,auto_renew,template_snapshot,template_version,retail_funding_receipt,retail_admin_billing_receipt,replaces_stripe_subscription_id,replacement_policy,replaced_stripe_subscription_canceled_at,superseded_by_agreement_id')
+    .select('id,client_id,status,is_current,checkout_status,checkout_session_id,checkout_paid_at,primary_admin_name,admin_email,client_legal_name,dba_trade_name,membership_tier,billing_option,auto_renew,template_snapshot,template_version,retail_funding_receipt,retail_admin_billing_receipt,replaces_stripe_subscription_id,replacement_policy,replaced_stripe_subscription_canceled_at,superseded_by_agreement_id,enterprise_checkout_source,enterprise_checkout_pool_id,enterprise_checkout_prices,enterprise_funding_receipt,enterprise_billing_receipt')
     .eq('id', agreementId)
     .maybeSingle();
   if (agreementErr) throw new Error(agreementErr.message || 'Agreement lookup failed');
@@ -1015,6 +1050,10 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     throw err;
   }
   const billingClientId = cleanText(parentGuard.clientId || clientId) || clientId;
+
+  if(!retailOffer)await finishUnmarkedAgreementReplacement({db,stripe:options.stripe,agreement,
+    subscription:options.subscription,fallbackCustomerId:options.fallbackCustomerId,
+    fallbackSubscriptionId:options.fallbackSubscriptionId});
 
   if (intent?.id && claimKey) {
     if (cleanText(intent.protocol) !== 'fenced_v2') {
