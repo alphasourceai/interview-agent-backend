@@ -63,11 +63,23 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
   denied(adminMigration,/retail_admin_client_schema_drift/);assert.equal(acl(),priorAcl);
  }finally{sql('drop function public.apply_retail_existing_admin_client(uuid,uuid,jsonb,jsonb,jsonb);');}
  sql(adminMigration);
+ const onceMigration=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014020146_retail_existing_admin_once_billing.sql'),'utf8');
+ try{
+  sql("create function public.apply_retail_existing_admin_billing(uuid) returns void language sql as 'select null::void';");
+  denied(onceMigration,/retail_admin_billing_schema_drift/);
+  assert.equal(sql("select count(*) from pg_attribute where attrelid='membership_agreements'::regclass and attname='retail_admin_billing_receipt' and not attisdropped;"),'0');
+ }finally{sql('drop function public.apply_retail_existing_admin_billing(uuid);');}
+ sql(onceMigration);
+ // Exact old-data oracles remain, with ONLY the new nullable receipt column.
+ // Derive expected JSON from the prior saved oracle, not a fresh row read that
+ // could hide migration DML or changes to an accepted historical agreement.
+ legacyBefore=sql(`select (${lit(JSON.parse(legacyBefore))}||jsonb_build_object('retail_admin_billing_receipt',null))::text;`);
+ historicalBefore=sql(`select (${lit(JSON.parse(historicalBefore))}||jsonb_build_object('retail_admin_billing_receipt',null))::text;`);
 });
-function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false){
+function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false,adminSource='admin'){
  const id=crypto.randomUUID(),client=crypto.randomUUID(),intent=crypto.randomUUID(),key='SYNTHETIC_CLAIM_'+crypto.randomUUID(),suffix=id.replaceAll('-','');
  const customer='cus_'+suffix,session='cs_'+suffix,pkg=buildRetailPackageSnapshot({planKey:plan,commitmentMonths:months,paymentOption:payment,firstRolePrepaySelected:role,offerVersion:OFFER_VERSION,channel:'sales'});
- const snapshot={template_version:'membership_agreement_retail_terms_v2',source:linked?'sales_assisted':'admin',package_snapshot:pkg,
+ const snapshot={template_version:'membership_agreement_retail_terms_v2',source:linked?'sales_assisted':adminSource,package_snapshot:pkg,
   ...(linked?{purchase_intent:{id:intent}}:{}),values:{membership_tier:plan,billing_option:pkg.billing_cadence,auto_renew:true,
    commitment_months:months,payment_option:payment,pricing_version:pkg.pricing_version,term_start_basis:'successful_payment',platform_fee:String(pkg.platform_fee),
    per_role_fee:String(pkg.per_role_fee),additional_interview_fee:String(pkg.additional_interview_fee),included_interviews_per_role:String(pkg.included_interviews_per_role),
@@ -850,4 +862,191 @@ test('admin client SDK adapter remains absent from mounted application imports',
   const file=path.join(dir,entry.name);if(entry.isDirectory())scan(file);
   else if(file.endsWith('.js')&&!file.endsWith('/existingRetailAdminClientAdapter.js'))assert.ok(!fs.readFileSync(file,'utf8').includes('existingRetailAdminClientAdapter'),file);
  }}scan(root);
+});
+
+function adminOnceCall(f,initial=adminInitial(f),source=f.source,funding=row(f).retail_funding_receipt,sub=adminSubscription(f)){
+ return 'select apply_retail_existing_admin_billing('+[f.id,f.client,source,funding,initial,sub].map(lit).join(',')+');';
+}
+const nativeAdminOnce=f=>JSON.parse(sql('set role service_role;'+adminOnceCall(f)));
+const adminOnceState=f=>sql(`select jsonb_build_object('billing',${lit(JSON.parse(billingState(f)))},
+ 'agreement',(select to_jsonb(a) from membership_agreements a where id=${lit(f.id)}));`);
+function originalPlan(f){
+ return require('../src/services/alphaScreenPackages').buildAlphaScreenPlanSettingsPayload({clientId:f.client,planKey:f.pkg.plan_key,
+  billingInterval:f.pkg.billing_cadence,packageSnapshot:f.pkg});
+}
+function onceFixture(plan='basic',months=3,payment='prepaid',role=false){const f=fixture(plan,months,payment,role,false);record(f);markAdminPaid(f);return f;}
+for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])for(const role of [false,true])
+test(`admin atomic original client/settings/once credit ${plan}/${months}/${payment}/role:${role}`,opts,()=>{
+ const f=onceFixture(plan,months,payment,role),initial=adminInitial(f),result=nativeAdminOnce(f),w=result.receipt;
+ assert.equal(result.status,'applied');assert.deepEqual(w.client_initial,initial);assert.deepEqual(w.source,f.source);
+ assert.deepEqual(w.funding_receipt,row(f).retail_funding_receipt);assert.deepEqual(w.subscription,adminSubscription(f));
+ const expected=originalPlan(f);for(const key of Object.keys(expected))assert.deepEqual(w.plan_initial[key],expected[key]);
+ assert.equal(w.plan_initial.rollover_days,90);assert.ok(Date.parse(w.applied_at)>=Date.parse(w.funding_receipt.recorded_at));
+ const data=JSON.parse(billingState(f));for(const key of Object.keys(w.plan_initial))assert.deepEqual(data.plan[key],w.plan_initial[key]);
+ assert.equal(data.intent,null);assert.equal((data.credits||[]).length,role?1:0);
+ if(role){const credit=data.credits[0];assert.equal(credit.id,w.credit_id);
+  for(const key of Object.keys(w.credit_initial)){
+   if(['created_at','updated_at'].includes(key))assert.equal(new Date(credit[key]).toISOString(),w.credit_initial[key]);
+   else assert.deepEqual(credit[key],w.credit_initial[key]);
+  }
+  assert.equal(w.credit_initial.status,'unused');assert.equal(w.credit_initial.metadata.source,'public_purchase_activation');
+  assert.equal(w.credit_initial.discounted_credit_amount_cents,f.pkg.first_role_prepay.discounted_credit_amount_cents);
+ }else{assert.equal(w.credit_id,null);assert.equal(w.credit_initial,null);}
+ const before=adminOnceState(f);assert.deepEqual(nativeAdminOnce(f),{status:'already_applied',receipt:w});assert.equal(adminOnceState(f),before);
+});
+test('admin atomic initial settings preserve sticky model and fixed omitted rollover while keeping original Pro rollout default',opts,()=>{
+ for(const plan of ['basic','pro']){
+  const f=onceFixture(plan);sql(`set role service_role;insert into client_plan_settings(client_id,plan_tier,billing_interval,platform_fee,per_role_fee,
+   included_interviews_per_role,additional_interview_fee,max_interview_minutes,billing_model,rollover_days,usage_interview_fee_cents)
+   values(${lit(f.client)},'pro','monthly',123,699,30,30,12,'usage',37,456);`);
+  const w=nativeAdminOnce(f).receipt,p=JSON.parse(billingState(f)).plan;assert.equal(w.plan_initial.billing_model,'usage');assert.equal(p.billing_model,'usage');
+  assert.equal(p.usage_interview_fee_cents,456);assert.equal(p.rollover_days,plan==='pro'?90:37);
+ }
+});
+test('admin atomic partial exact client-only tuple is not completion; settings/credit marker finish exactly once',opts,()=>{
+ const f=onceFixture('pro',6,'monthly_installments',true);nativeAdmin(f);assert.equal(row(f).retail_admin_billing_receipt,null);
+ assert.equal(JSON.parse(billingState(f)).plan,null);assert.equal(nativeAdminOnce(f).status,'applied');
+ assert.equal(JSON.parse(billingState(f)).credits.length,1);assert.equal(nativeAdminOnce(f).status,'already_applied');
+});
+test('admin atomic billing replay preserves admin fee/model/renewal changes and does not replenish consumed credit',opts,()=>{
+ const f=onceFixture('pro',6,'prepaid',true),w=nativeAdminOnce(f).receipt,role=crypto.randomUUID();
+ sql(`set role service_role;insert into roles(id,client_id,title,slug_or_token) values(${lit(role)},${lit(f.client)},'Synthetic consumed credit role',${lit('SYNTHETIC_'+role)});
+  update client_role_credits set status='used',used_at=clock_timestamp(),used_by_role_id=${lit(role)},updated_at=clock_timestamp() where id=${lit(w.credit_id)};
+  update client_plan_settings set platform_fee=123,billing_model='fixed',rollover_days=37 where client_id=${lit(f.client)};
+  update clients set auto_renew=false,cancel_at_term_end=true where id=${lit(f.client)};`);
+ const before=adminOnceState(f);assert.equal(nativeAdminOnce(f).status,'already_applied');assert.equal(adminOnceState(f),before);
+ assert.equal(JSON.parse(billingState(f)).credits[0].status,'used');
+});
+test('admin atomic replay does not recreate deleted mutable plan or consumed-credit ledger',opts,()=>{
+ const f=onceFixture('basic',3,'prepaid',true);nativeAdminOnce(f);
+ sql(`set role service_role;delete from client_plan_settings where client_id=${lit(f.client)};delete from client_role_credits where source_membership_agreement_id=${lit(f.id)};`);
+ const before=adminOnceState(f);assert.equal(nativeAdminOnce(f).status,'already_applied');assert.equal(adminOnceState(f),before);
+ assert.equal(JSON.parse(billingState(f)).plan,null);assert.equal(JSON.parse(billingState(f)).credits,null);
+});
+test('admin atomic conflicting previous client preference or credit aborts without settings or marker',opts,()=>{
+ const f=onceFixture('pro',6,'prepaid',true);nativeAdmin(f);sql(`set role service_role;update clients set auto_renew=false where id=${lit(f.client)};`);
+ const before=adminOnceState(f);denied('set role service_role;'+adminOnceCall(f),/retail_admin_client_existing_state_conflict/);assert.equal(adminOnceState(f),before);
+});
+test('admin atomic guarded receipt cannot be forged/cleared/rewritten and first-transaction mutations roll back',opts,()=>{
+ const f=onceFixture('basic',3,'prepaid',true),before=adminOnceState(f);
+ denied(`set role service_role;update membership_agreements set retail_admin_billing_receipt='{}' where id=${lit(f.id)};`,/retail_admin_billing_record_required/);
+ assert.equal(adminOnceState(f),before);
+ for(const mutation of [`update client_plan_settings set platform_fee=1 where client_id=${lit(f.client)};`,
+  `update clients set auto_renew=false where id=${lit(f.client)};`,
+  `delete from client_role_credits where source_membership_agreement_id=${lit(f.id)};`]){
+  denied('set role service_role;begin;'+adminOnceCall(f)+mutation+'commit;',/retail_admin_billing_commit_state_denied/);assert.equal(adminOnceState(f),before);
+ }
+ nativeAdminOnce(f);const complete=adminOnceState(f);
+ for(const value of ['null',"'{}'::jsonb"])denied(`set role service_role;update membership_agreements set retail_admin_billing_receipt=${value} where id=${lit(f.id)};`,/retail_admin_billing_immutable/);
+ assert.equal(adminOnceState(f),complete);
+});
+test('admin atomic concurrent writers serialize to one receipt and one optional credit',opts,async()=>{
+ const f=onceFixture('pro',6,'prepaid',true),q=adminOnceCall(f);
+ const [a,b]=await Promise.all([parallel('set role service_role;begin;'+q+'select pg_sleep(0.1);commit;'),parallel('set role service_role;'+q)]);
+ assert.equal(a.code,0,a.err);assert.equal(b.code,0,b.err);
+ const states=[a,b].map(v=>JSON.parse(v.out.split('\n').find(s=>s.startsWith('{'))).status).sort();assert.deepEqual(states,['already_applied','applied']);
+ assert.equal(JSON.parse(billingState(f)).credits.length,1);
+});
+test('admin atomic new RPC browser denied, prerequisite source drift/reapply refuses without data or ACL changes',opts,()=>{
+ const f=onceFixture(),before=adminOnceState(f),m=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014020146_retail_existing_admin_once_billing.sql'),'utf8');
+ for(const role of ['anon','authenticated'])denied('set role '+role+';'+adminOnceCall(f),/permission denied/);
+ denied(m,/retail_admin_billing_schema_drift/);assert.equal(adminOnceState(f),before);assert.equal(acl(),priorAcl);
+ const original=sql("select pg_get_functiondef(oid) from pg_proc where proname='apply_retail_existing_admin_client';");
+ try{sql(original.replace('\nbegin\n','\nbegin\n -- synthetic drift\n'));denied('set role service_role;'+adminOnceCall(f),/retail_admin_billing_prerequisite_drift/);assert.equal(adminOnceState(f),before);}
+ finally{sql(original);}
+});
+function seedAdminCredit(f,patch={}){
+ const role=f.pkg.first_role_prepay,p={billing_client_id:f.client,source_client_id:f.client,source_public_purchase_intent_id:null,
+  source_membership_agreement_id:f.id,source_stripe_checkout_session_id:f.proof.period.checkout_session_id,
+  credit_type:'first_role_prepay',membership_key:f.pkg.plan_key,normal_role_fee_cents:role.normal_role_fee_cents,
+  discounted_credit_amount_cents:role.discounted_credit_amount_cents||35900,discount_percent:10,status:'unused',
+  metadata:{source:'public_purchase_activation',non_refundable:true,expires:false,purchase_intent_id:null,membership_agreement_id:f.id},
+  created_at:f.proof.period.paid_at,updated_at:f.proof.period.paid_at,...patch};
+ return sql('set role service_role;insert into client_role_credits('+Object.keys(p).join(',')+') values('+Object.values(p).map(lit).join(',')+') returning id;');
+}
+test('admin atomic existing original unused credit is adopted only with exact immutable provenance',opts,()=>{
+ const f=onceFixture('pro',6,'monthly_installments',true),id=seedAdminCredit(f),w=nativeAdminOnce(f).receipt;
+ assert.equal(w.credit_id,id);assert.equal(JSON.parse(billingState(f)).credits.length,1);
+ assert.equal(nativeAdminOnce(f).status,'already_applied');
+});
+test('admin atomic wrong prior credit metadata/session/amount and duplicate agreement credit refuse all billing DML',opts,()=>{
+ for(const mode of ['metadata','session','amount','duplicate','unselected']){
+  const f=onceFixture('pro',6,'prepaid',mode!=='unselected');
+  if(mode==='metadata')seedAdminCredit(f,{metadata:{non_refundable:false}});
+  else if(mode==='session')seedAdminCredit(f,{source_stripe_checkout_session_id:'cs_OTHER_'+crypto.randomUUID().replaceAll('-','')});
+  else if(mode==='amount')seedAdminCredit(f,{discounted_credit_amount_cents:1});
+  else{seedAdminCredit(f);if(mode==='duplicate')seedAdminCredit(f,{source_stripe_checkout_session_id:'cs_OTHER_'+crypto.randomUUID().replaceAll('-','')});}
+  const before=adminOnceState(f);denied('set role service_role;'+adminOnceCall(f),/retail_admin_billing_credit_conflict/);assert.equal(adminOnceState(f),before);
+ }
+});
+test('admin atomic owner/archive/source/payload/subscription refusal writes no plan/credit or completion marker',opts,()=>{
+ for(const mode of ['archive','owner','payload','source','subscription']){
+  const f=onceFixture('pro',6,'prepaid',true);let q=adminOnceCall(f);
+  if(mode==='archive')sql(`set role service_role;update clients set archived_at=clock_timestamp() where id=${lit(f.client)};`);
+  if(mode==='owner')sql(`set role service_role;update billing_customers set stripe_customer_id=null where client_id=${lit(f.client)};`);
+  if(mode==='payload')q=adminOnceCall(f,{...adminInitial(f),auto_renew:false});
+  if(mode==='source')q=adminOnceCall(f,adminInitial(f),{...f.source,customer_id:'cus_OTHER'});
+  if(mode==='subscription')q=adminOnceCall(f,adminInitial(f),f.source,row(f).retail_funding_receipt,{...adminSubscription(f),current_period_end:f.proof.period.provider_period_end+1});
+  const before=adminOnceState(f);denied('set role service_role;'+q,/retail_admin_billing_|retail_funding_/);assert.equal(adminOnceState(f),before);
+ }
+});
+test('admin atomic actual downstream plan/credit lock wait expires first B and rolls all billing writes back',opts,async()=>{
+ for(const target of ['plan','credit']){
+  const f=fixture('basic',3,'monthly_installments',target==='credit',false);f.proof.period.provider_period_end=Math.floor(Date.now()/1000)+2;
+  // Synthetic original-B short native fixture, NOT a Stripe recurrence claim.
+  record(f);markAdminPaid(f);
+  if(target==='plan'){
+   const p=originalPlan(f);delete p.billing_model;
+   sql('set role service_role;insert into client_plan_settings('+Object.keys(p).join(',')+') values('+Object.values(p).map(lit).join(',')+');');
+  }else seedAdminCredit(f);
+  const before=adminOnceState(f),table=target==='plan'?'client_plan_settings':'client_role_credits';
+  const where=target==='plan'?`client_id=${lit(f.client)}`:`source_membership_agreement_id=${lit(f.id)}`;
+  const [holder,writer]=await Promise.all([parallel(`begin;select 1 from ${table} where ${where} for update;select pg_sleep(2.5);commit;`),
+   parallel('set role service_role;select pg_sleep(0.07);'+adminOnceCall(f))]);
+  assert.equal(holder.code,0,holder.err);assert.notEqual(writer.code,0);assert.match(writer.err,/retail_admin_client_paid_period_ended/);assert.equal(adminOnceState(f),before);
+ }
+});
+test('admin atomic real transaction commit after B expires rolls back; historical receipt replay after expiry stays financial-only',opts,()=>{
+ const f=fixture('basic',3,'monthly_installments',true,false);f.proof.period.provider_period_end=Math.floor(Date.now()/1000)+2;
+ record(f);markAdminPaid(f);const before=adminOnceState(f);
+ denied('set role service_role;begin;'+adminOnceCall(f)+'select pg_sleep(2.5);commit;',/retail_admin_billing_commit_state_denied/);assert.equal(adminOnceState(f),before);
+ const r=fixture('basic',3,'monthly_installments',true,false);r.proof.period.provider_period_end=Math.floor(Date.now()/1000)+2;
+ record(r);markAdminPaid(r);const w=nativeAdminOnce(r).receipt,applied=adminOnceState(r);sql('select pg_sleep(2.5);');
+ assert.deepEqual(nativeAdminOnce(r),{status:'already_applied',receipt:w});assert.equal(adminOnceState(r),applied);
+});
+test('admin atomic nullable marker does not enroll accepted legacy or already-paid V2 without original receipt',opts,()=>{
+ for(const f of [historicalV2,historicalBillingV2]){
+  const before=row(f);denied('set role service_role;'+adminOnceCall(f),/retail_admin_billing_source_denied/);assert.deepEqual(row(f),before);
+  assert.equal(row(f).retail_admin_billing_receipt,null);
+ }
+ assert.equal(sql(`select retail_admin_billing_receipt is null from membership_agreements where id=${lit(legacyId)};`),'t');
+});
+test('admin atomic every newly pinned projection/source helper drift refuses before billing DML',opts,()=>{
+ const f=onceFixture('pro',6,'prepaid',true),before=adminOnceState(f);
+ for(const name of ['retail_existing_package','retail_existing_valid_offer','retail_existing_month_anchor','retail_existing_closed_object',
+  'retail_existing_checkout_material','retail_existing_checkout_config_valid','retail_existing_funding_schema_guard']){
+  const definition=sql(`select pg_get_functiondef(oid) from pg_proc where proname=${lit(name)};`);
+  const changed=definition.replace(/\nAS \$function\$\n/,'\nAS $function$\n -- disposable helper drift sentinel\n');
+  assert.notEqual(changed,definition);
+  try{sql(changed);denied('set role service_role;'+adminOnceCall(f),/retail_admin_billing_prerequisite_drift/);assert.equal(adminOnceState(f),before);}
+  finally{sql(definition);}
+ }
+});
+test('admin atomic missing plan/credit insert privilege or RLS refuses rather than adding grants',opts,()=>{
+ const f=onceFixture('pro',6,'prepaid',true),before=adminOnceState(f);
+ const old=sql("select jsonb_agg(jsonb_build_array(relname,relacl::text,relrowsecurity) order by relname) from pg_class where oid in('client_plan_settings'::regclass,'client_role_credits'::regclass);");
+ for(const table of ['client_plan_settings','client_role_credits']){
+  try{sql(`revoke insert on public.${table} from service_role;`);denied('set role service_role;'+adminOnceCall(f),/retail_admin_billing_schema_drift/);assert.equal(adminOnceState(f),before);}
+  finally{sql(`grant insert on public.${table} to service_role;`);}
+  try{sql(`alter table public.${table} disable row level security;`);denied('set role service_role;'+adminOnceCall(f),/retail_admin_billing_schema_drift/);assert.equal(adminOnceState(f),before);}
+  finally{sql(`alter table public.${table} enable row level security;`);}
+ }
+ assert.equal(sql("select jsonb_agg(jsonb_build_array(relname,relacl::text,relrowsecurity) order by relname) from pg_class where oid in('client_plan_settings'::regclass,'client_role_credits'::regclass);"),old);
+});
+test('native JSONb numeric scale equivalence is exact, not an amount comparison waiver',opts,()=>{
+ assert.equal(sql("select '299'::jsonb='299.00'::jsonb and to_jsonb(299::numeric(10,2))='299'::jsonb;"),'t');
+});
+test('admin atomic native boundary refuses unknown non-admin source despite a valid native receipt',opts,()=>{
+ const f=fixture('pro',6,'prepaid',true,false,false,'unknown_source');record(f);markAdminPaid(f);
+ const before=adminOnceState(f);denied('set role service_role;'+adminOnceCall(f),/retail_admin_billing_source_denied/);assert.equal(adminOnceState(f),before);
 });
