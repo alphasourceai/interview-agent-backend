@@ -684,3 +684,142 @@ async function sdkNativeBridge(loseAck=false){
 }
 test('real SDK16/API2023 loopback feeds actual native RPC and fresh DB ACK/readback with no provider writes',opts,()=>sdkNativeBridge());
 test('real SDK/native commit with lost ACK and subsequent refund replays original receipt without historical money calls',opts,()=>sdkNativeBridge(true));
+
+// Real installed current SDK GET -> real native admin CLIENT-write seam. The
+// initial receipt/CAS here are actual previously-tested native synthetic paths,
+// not a live provider money claim. No historical money reproof on this retry.
+async function adminSdkBridge(plan='basic',months=3,payment='prepaid',role=false){
+ const http=require('node:http'),Stripe=require('stripe');
+ const f=fixture(plan,months,payment,role,false);record(f);markAdminPaid(f);adminInitial(f);
+ const p=f.proof,requests=[],writes=[],reads=[];
+ const current={object:'subscription',id:p.period.subscription_id,customer:p.period.customer_id,currency:'usd',livemode:false,
+  status:'active',current_period_end:p.period.provider_period_end,start_date:p.period.provider_period_start,
+  cancel_at_period_end:false,cancel_at:null,pause_collection:null};
+ const checkout={object:'checkout.session',id:p.period.checkout_session_id,customer:p.period.customer_id,
+  subscription:p.period.subscription_id,invoice:p.period.invoice_id,currency:'usd',livemode:false,mode:'subscription',status:'complete',payment_status:'paid'};
+ const hooks={};
+ const db={from(table){assert.ok(['membership_agreements','public_purchase_intents','clients','billing_customers'].includes(table));
+  const filters=[],query={select(){return query;},eq(k,val){assert.match(k,/^[a-z_]+$/);filters.push(`${k}=${lit(val)}`);return query;},
+   async maybeSingle(){const r=read();assert.ok(r.data.length<=1);return{...r,data:r.data[0]||null};},then(resolve,reject){return Promise.resolve().then(read).then(resolve,reject);}};
+  function read(){const data=JSON.parse(sql(`set role service_role;select coalesce(jsonb_agg(to_jsonb(t)),'[]'::jsonb) from public.${table} t${filters.length?' where '+filters.join(' and '):''};`));
+   return{data,count:data.length,error:null};}return query;},
+  async rpc(name,a){let q;
+   if(name==='read_retail_existing_funding'){
+    reads.push(structuredClone(a));q='select read_retail_existing_funding('+[a.p_agreement,a.p_client,a.p_claim,a.p_source].map(lit).join(',')+');';
+   }else{
+    assert.equal(name,'apply_retail_existing_admin_client');writes.push(structuredClone(a));
+    await hooks.beforeApply?.(a);
+    q='select apply_retail_existing_admin_client('+[a.p_agreement,a.p_client,a.p_source,a.p_funding,a.p_initial,a.p_subscription].map(lit).join(',')+');';
+   }
+   const r=run('set role service_role;'+q);
+   if(r.status!==0)return{data:null,error:{message:(r.stderr.match(/ERROR:\s+([^\n]+)/)||[])[1]||'native synthetic error'}};
+   const data=JSON.parse(r.stdout.trim());
+   if(name==='apply_retail_existing_admin_client')return hooks.afterApply?await hooks.afterApply(data):{data,error:null};
+   return hooks.afterRead?await hooks.afterRead(data,reads.length):{data,error:null};}};
+ const server=http.createServer((req,res)=>{requests.push({method:req.method,path:req.url,version:req.headers['stripe-version']});let body;
+  if(req.method==='GET'&&req.url==='/v1/account')body={object:'account',id:p.provider_account_id};
+  else if(req.method==='GET'&&req.url===`/v1/checkout/sessions/${checkout.id}`)body=checkout;
+  else if(req.method==='GET'&&req.url===`/v1/subscriptions/${current.id}`)body=current;
+  else{res.statusCode=400;body={error:{message:'Unexpected request; native admin retry is GET-only'}};}
+  res.setHeader('content-type','application/json');res.end(JSON.stringify(body));});
+ await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
+ const stripe=new Stripe('sk_test_SYNTHETIC_NO_PROVIDER',{apiVersion:'2023-10-16',host:'127.0.0.1',port:server.address().port,protocol:'http',maxNetworkRetries:0});
+ const {applyExistingRetailAdminClient}=require('../src/services/existingRetailAdminClientAdapter');
+ const options={db,stripe,agreementId:f.id,eventSessionId:checkout.id,eventLivemode:false};
+ return{f,current,checkout,hooks,db,requests,writes,reads,options,
+  apply:patch=>applyExistingRetailAdminClient({...options,...patch}),close:()=>new Promise(resolve=>server.close(resolve))};
+}
+for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])for(const role of [false,true])
+test(`admin current SDK -> native client ACK/readback ${plan}/${months}/${payment}/role:${role}`,opts,async()=>{
+ const b=await adminSdkBridge(plan,months,payment,role);
+ try{
+  const before=row(b.f),result=await b.apply();assert.equal(result.status,'applied');assert.equal(result.client_update_applied,true);
+  assert.equal(result.billing_completion_required,true);assert.equal(result.membership_activation_required,true);assert.equal(result.credits_spendable,false);
+  assert.ok(Object.isFrozen(result)&&Object.isFrozen(result.clientInitial)&&Object.isFrozen(result.funding));
+  assert.deepEqual(result.clientInitial,adminInitial(b.f));assert.deepEqual(row(b.f),before);
+  const state=billingState(b.f);assert.equal((await b.apply()).status,'already_applied');assert.equal(billingState(b.f),state);
+  const data=JSON.parse(state);assert.equal(data.plan,null);assert.equal(data.credits,null);assert.equal(data.intent,null);
+  assert.equal(b.requests.length,8);assert.equal(b.writes.length,2);assert.equal(b.reads.length,6);
+  assert.ok(b.requests.every(r=>r.method==='GET'&&r.version==='2023-10-16'));
+ }finally{await b.close();}
+});
+test('admin SDK seam rejects canceled/trialing/pastdue/cancel/pause/current period mismatch without native client writes',opts,async()=>{
+ for(const patch of [{status:'canceled'},{status:'trialing'},{status:'past_due'},{cancel_at_period_end:true},{cancel_at:2000000000},
+  {pause_collection:{behavior:'keep_as_draft'}},{current_period_end:1},{current_period_end:Date.now()},
+  {current_period_end:2000000000.5},{customer:'cus_OTHER'},{current_period_end:undefined}]){
+  const b=await adminSdkBridge();try{
+   Object.assign(b.current,patch);const before=billingState(b.f);
+   await assert.rejects(b.apply(),e=>/^retail_admin_adapter_/.test(e.code));assert.equal(b.writes.length,0);assert.equal(billingState(b.f),before);
+  }finally{await b.close();}
+ }
+ const b=await adminSdkBridge();try{
+  b.current.current_period_end+=1;await assert.rejects(b.apply(),{code:'retail_admin_adapter_subscription_unknown'});assert.equal(b.writes.length,0);
+ }finally{await b.close();}
+});
+test('admin SDK seam refuses unpaid pinned Checkout and mismatched event session before native client write',opts,async()=>{
+ const b=await adminSdkBridge();try{
+  b.checkout.payment_status='unpaid';const before=billingState(b.f);
+  await assert.rejects(b.apply(),{code:'retail_admin_adapter_checkout_unknown'});assert.equal(b.writes.length,0);assert.equal(billingState(b.f),before);
+  b.checkout.payment_status='paid';await assert.rejects(b.apply({eventSessionId:'cs_OTHER'}),{code:'retail_admin_adapter_unknown'});assert.equal(b.writes.length,0);
+ }finally{await b.close();}
+});
+test('admin SDK seam preserves native commit on lost/unknown ACK, then exact no-op resumes without plan or credit claims',opts,async()=>{
+ for(const bad of ['lost','extra','wrong','empty']){
+  const b=await adminSdkBridge('pro',6,'prepaid',true);try{
+   b.hooks.afterApply=async data=>{if(bad==='lost')throw Error('synthetic lost ACK with private provider details');
+    return{data:bad==='extra'?{...data,unexpected:true}:bad==='wrong'?{...data,client_initial:{...data.client_initial,plan_tier:'basic'}}:null,error:null};};
+   await assert.rejects(b.apply(),e=>/^retail_admin_adapter_/.test(e.code)&&!e.message.includes('private'));
+   const committed=billingState(b.f);assert.equal(JSON.parse(committed).client.stripe_subscription_id,b.f.proof.period.subscription_id);
+   delete b.hooks.afterApply;assert.equal((await b.apply()).status,'already_applied');assert.equal(billingState(b.f),committed);
+   assert.equal(JSON.parse(committed).plan,null);assert.equal(JSON.parse(committed).credits,null);
+  }finally{await b.close();}
+ }
+});
+test('admin SDK seam rechecks native owner/client after write and rejects unknown receipt read ACK',opts,async()=>{
+ for(const mode of ['archive','preference','extra-read']){
+  const b=await adminSdkBridge();try{
+   if(mode==='extra-read')b.hooks.afterRead=async(data,count)=>({data:count===3?{...data,unexpected:true}:data,error:null});
+   else b.hooks.afterApply=async data=>{sql(`set role service_role;update clients set ${mode==='archive'?"archived_at=clock_timestamp()":'auto_renew=false'} where id=${lit(b.f.client)};`);return{data,error:null};};
+   await assert.rejects(b.apply(),e=>/^retail_admin_adapter_/.test(e.code));assert.equal(b.writes.length,1);
+   assert.equal(JSON.parse(billingState(b.f)).plan,null);
+  }finally{await b.close();}
+ }
+});
+test('admin SDK seam native owner/source mismatch before client update leaves original tuple untouched',opts,async()=>{
+ const b=await adminSdkBridge();try{
+  b.hooks.beforeApply=async()=>sql(`set role service_role;update clients set archived_at=clock_timestamp() where id=${lit(b.f.client)};`);
+  await assert.rejects(b.apply(),{code:'retail_admin_adapter_ack_unknown'});
+  assert.equal(JSON.parse(billingState(b.f)).client.contract_start_at,null);
+ }finally{await b.close();}
+});
+test('admin SDK seam out-of-cohort is null without SDK or writes; pending paid CAS refuses and fencing propagates',opts,async()=>{
+ const b=await adminSdkBridge();try{
+  const linked=fixture();record(linked);
+  for(const agreementId of [linked.id,historicalV2.id,legacyId,crypto.randomUUID()])assert.equal(await b.apply({agreementId}),null);
+  assert.equal(b.requests.length,0);assert.equal(b.writes.length,0);
+  const pending=fixture('basic',3,'prepaid',false,false);record(pending);
+  await assert.rejects(b.apply({agreementId:pending.id}),{code:'retail_admin_adapter_source_unknown'});assert.equal(b.requests.length,0);
+  const sentinel=Object.assign(Error('guard lost'),{code:'public_purchase_activation_guard_lost'});
+  await assert.rejects(b.apply({assertFence:async()=>{throw sentinel;}}),e=>e===sentinel);assert.equal(b.requests.length,0);
+ }finally{await b.close();}
+});
+test('admin SDK seam expiry is terminal before write or after a committed client tuple, never reported as rollback',opts,async()=>{
+ for(const when of ['before','after']){
+  const b=await adminSdkBridge(),now=Date.now;
+  try{
+   const future=()=>b.f.proof.period.provider_period_end*1000+1000;
+   if(when==='before')Date.now=future;
+   else b.hooks.afterApply=async data=>{Date.now=future;return{data,error:null};};
+   await assert.rejects(b.apply(),e=>e.code==='retail_admin_adapter_period_ended'&&e.status===410&&e.permanentFailure===true);
+   assert.equal(b.writes.length,when==='before'?0:1);
+   assert.equal(JSON.parse(billingState(b.f)).client.contract_start_at!==null,when==='after');
+  }finally{Date.now=now;await b.close();}
+ }
+});
+test('admin client SDK adapter remains absent from mounted application imports',()=>{
+ const root=path.resolve(__dirname,'../src');
+ function scan(dir){for(const entry of fs.readdirSync(dir,{withFileTypes:true})){
+  const file=path.join(dir,entry.name);if(entry.isDirectory())scan(file);
+  else if(file.endsWith('.js')&&!file.endsWith('/existingRetailAdminClientAdapter.js'))assert.ok(!fs.readFileSync(file,'utf8').includes('existingRetailAdminClientAdapter'),file);
+ }}scan(root);
+});
