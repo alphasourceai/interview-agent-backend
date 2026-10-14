@@ -95,6 +95,7 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
  assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
  const originalFunctions=JSON.parse(linkedOriginalCatalog),oldGuard=sql("select prosrc from pg_proc where oid='public.retail_linked_existing_member_schema_guard()'::regprocedure;");
  sql(fs.readFileSync(replacementBillingMigrationPath,'utf8'));
+ sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014165458_retail_existing_recurring_source_read.sql'),'utf8'));
  const changedFunctions=JSON.parse(linkedOriginalFunctions()),actualHash=sql("select md5(prosrc) from pg_proc where proname='apply_public_purchase_billing';");
  assert.equal(actualHash,replacementBillingBodyHash);
  for(const [index,prior] of originalFunctions.entries()){
@@ -212,6 +213,97 @@ function adminCall(f,payload=adminInitial(f),source=f.source,receipt=row(f).reta
  return 'select apply_retail_existing_admin_client('+[f.id,f.client,source,receipt,payload,sub].map(lit).join(',')+');';
 }
 const nativeAdmin=f=>JSON.parse(sql('set role service_role;'+adminCall(f)));
+// Distinct read-instant historical provenance, NOT activation/member/access.
+const recurringSourceCall=f=>'select read_retail_existing_recurring_source('+[f.id,f.client].map(lit).join(',')+');';
+const nativeRecurringSource=f=>JSON.parse(sql('set role service_role;'+recurringSourceCall(f)));
+const recurringSourceState=f=>sql(`select jsonb_build_object('agreement',(select to_jsonb(a) from membership_agreements a where id=${lit(f.id)}),
+ 'billing',(${billingStateQuery(f)}),'customer',(select to_jsonb(b) from billing_customers b where client_id=${lit(f.client)}));`);
+function billingStateQuery(f){return `select jsonb_build_object('client',(select to_jsonb(c) from clients c where id=${lit(f.client)}),
+ 'intent',(select to_jsonb(i) from public_purchase_intents i where id=${lit(f.intent)}),
+ 'plan',(select to_jsonb(p) from client_plan_settings p where client_id=${lit(f.client)}),
+ 'credits',(select jsonb_agg(to_jsonb(r) order by id) from client_role_credits r where source_client_id=${lit(f.client)}))`;}
+function recurringSourceFixture(plan='basic',months=3,payment='prepaid',role=false,source='sales_assisted'){
+ const linked=source!=='admin',f=fixture(plan,months,payment,role,linked,false,'admin',source);
+ record(f);if(linked){nativeComplete(f);nativeBilling(f);}else{markAdminPaid(f);nativeAdmin(f);}
+ return f;
+}
+for(const source of ['admin','sales_assisted','public_purchase_intent'])for(const plan of ['basic','pro'])
+for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])for(const role of [false,true]){
+ if(source==='public_purchase_intent'&&payment==='monthly_installments')continue;
+ test(`RECURRING SOURCE native ${source}/${plan}/${months}/${payment}/role:${role}`,opts,()=>{
+  const f=recurringSourceFixture(plan,months,payment,role,source),oldReader=sql("select pg_get_functiondef('public.read_retail_existing_funding(uuid,uuid,text,jsonb)'::regprocedure);");
+  if(source!=='admin'){
+   sql(`update public_purchase_intents set activation_claim_key=null,activation_claimed_at=null where id=${lit(f.intent)};`);
+   denied('set role service_role;'+readCall(f),/retail_funding_claim_denied/);
+  }
+  sql(`update clients set auto_renew=false,subscription_status='past_due',current_term_end='2025-01-01Z',contract_end_at='2025-01-01Z' where id=${lit(f.client)};`);
+  const before=recurringSourceState(f),result=nativeRecurringSource(f);
+  assert.deepEqual(result,{version:'retail_existing_recurring_source_v1',agreement_id:f.id,client_id:f.client,
+   source_intent_id:source==='admin'?null:f.intent,package_snapshot:f.pkg,original_period:f.proof.period,
+   original_provider_account_id:'acct_SYNTHETIC',effect_authorized:false,collection_ready:false,paid_access_authorized:false,payroll_authorized:false});
+  assert.equal(recurringSourceState(f),before);assert.equal(sql("select pg_get_functiondef('public.read_retail_existing_funding(uuid,uuid,text,jsonb)'::regprocedure);"),oldReader);
+ });
+}
+test('RECURRING SOURCE source/ownership/pending and incomplete pointer refuse without changes',opts,()=>{
+ for(const change of ['pending','unbound','not-current','voided','archived','child','customer','profile','subscription','intent-status','intent-canceled']){
+  let f;if(change==='pending'||change==='unbound'){f=fixture();record(f);if(change==='unbound')nativeComplete(f);}
+  else f=recurringSourceFixture();
+  if(change==='not-current')sql(`update membership_agreements set is_current=false where id=${lit(f.id)};`);
+  if(change==='voided')sql(`update membership_agreements set voided_at=clock_timestamp() where id=${lit(f.id)};`);
+  if(change==='archived')sql(`update clients set archived_at=clock_timestamp() where id=${lit(f.client)};`);
+  if(change==='child'){const p=crypto.randomUUID();sql(`insert into clients(id,name,email) values(${lit(p)},'Synthetic Parent','parent@example.invalid');update clients set parent_client_id=${lit(p)} where id=${lit(f.client)};`);}
+  if(change==='customer')sql(`update clients set stripe_customer_id='cus_WRONG' where id=${lit(f.client)};`);
+  if(change==='profile')sql(`update billing_customers set stripe_customer_id=null where client_id=${lit(f.client)};`);
+  if(change==='subscription')sql(`update clients set stripe_subscription_id='sub_WRONG' where id=${lit(f.client)};`);
+  if(change==='intent-status')sql(`update public_purchase_intents set status='expired' where id=${lit(f.intent)};`);
+  if(change==='intent-canceled')sql(`update public_purchase_intents set canceled_at=clock_timestamp() where id=${lit(f.intent)};`);
+  const before=recurringSourceState(f);denied('set role service_role;'+recurringSourceCall(f),/retail_recurring_source_/);assert.equal(recurringSourceState(f),before);
+ }
+ const f=recurringSourceFixture(),before=recurringSourceState(f);
+ denied('set role service_role;'+recurringSourceCall({...f,client:crypto.randomUUID()}),/retail_recurring_source_denied/);
+ assert.equal(recurringSourceState(f),before);
+});
+test('RECURRING SOURCE legacy/missing receipt cannot enroll or backfill; expired lease succeeds',opts,()=>{
+ const legacy={id:legacyId,client:crypto.randomUUID()};denied('set role service_role;'+recurringSourceCall(legacy),/retail_recurring_source_denied/);
+ const f=recurringSourceFixture();sql(`update public_purchase_intents set activation_claimed_at=clock_timestamp()-interval '1 day' where id=${lit(f.intent)};`);
+ const before=recurringSourceState(f);assert.equal(nativeRecurringSource(f).original_period.paid_at,f.proof.period.paid_at);
+ assert.equal(recurringSourceState(f),before);denied('set role service_role;'+readCall(f),/retail_funding_claim_denied/);
+ const unrecorded=fixture();
+ denied(`update membership_agreements set checkout_status='paid',checkout_paid_at=clock_timestamp() where id=${lit(unrecorded.id)};`,/retail_funding_receipt_required/);
+ denied('set role service_role;'+recurringSourceCall(unrecorded),/retail_recurring_source_denied/);
+});
+test('RECURRING SOURCE native ACL/config/overload/prerequisite drift and immutable source remain fenced',opts,()=>{
+ const f=recurringSourceFixture(),before=recurringSourceState(f),sig='public.read_retail_existing_recurring_source(uuid,uuid)';
+ for(const role of ['anon','authenticated'])denied('set role '+role+';'+recurringSourceCall(f),/permission denied/);
+ denied(recurringSourceCall(f),/retail_recurring_source_server_only/);
+ assert.equal(sql(`select prosecdef::text||':'||provolatile::text||':'||proconfig::text from pg_proc where oid=${lit(sig)}::regprocedure;`),'false:v:{search_path=pg_catalog,lock_timeout=10s}');
+ for(const q of [`grant execute on function ${sig} to authenticated`, `alter function ${sig} security definer`,
+  `alter function ${sig} set search_path=public`, `create function public.read_retail_existing_recurring_source(uuid) returns void language sql as 'select null::void'`]){
+  denied('begin;'+q+';set role service_role;'+recurringSourceCall(f)+'commit;',/retail_recurring_source_(schema_drift|server_only)/);
+ }
+ for(const name of ['retail_existing_checkout_material(jsonb,jsonb,text)','retail_existing_funding_receipt_valid(jsonb,jsonb)',
+  'retail_existing_package(jsonb)','retail_existing_valid_offer(jsonb)']){
+  const def=sql(`select pg_get_functiondef(${lit('public.'+name)}::regprocedure);`);
+  const changed=def.replace('\nbegin\n','\nbegin\n -- local drift probe\n');assert.notEqual(changed,def);
+  denied('begin;'+changed+';set role service_role;'+recurringSourceCall(f)+'commit;',/retail_recurring_source_prerequisite_drift/);
+ }
+ for(const [table,trigger] of [['membership_agreements','retail_existing_checkout_attempt_guard'],
+  ['membership_agreements','retail_existing_funding_guard'],['public_purchase_intents','retail_existing_funding_intent_clock_guard']]){
+  denied('begin;alter table public.'+table+' disable trigger '+trigger+';set role service_role;'+recurringSourceCall(f)+'commit;',/retail_recurring_source_trigger_drift/);
+ }
+ denied(`update membership_agreements set retail_funding_receipt=jsonb_set(retail_funding_receipt,'{proof,period,paid_at}','"2025-01-01T00:00:00.000Z"') where id=${lit(f.id)};`,/retail_funding_immutable/);
+ assert.equal(recurringSourceState(f),before);
+});
+test('RECURRING SOURCE native locks block source mutation; next reader refuses changed intent',opts,async()=>{
+ const f=recurringSourceFixture(),tag='RS'+crypto.randomUUID().replaceAll('-','');
+ const [h,w,o]=await Promise.all([
+  parallel(`set application_name=${lit(tag+'H')};set role service_role;begin;${recurringSourceCall(f)}select pg_sleep(0.8);commit;`),
+  parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;update public_purchase_intents set status='expired' where id=${lit(f.intent)};`),
+  parallel(`select pg_sleep(0.4);select exists(select 1 from pg_stat_activity w join pg_stat_activity h on h.pid=any(pg_blocking_pids(w.pid))
+   where w.application_name=${lit(tag+'W')} and h.application_name=${lit(tag+'H')} and w.wait_event_type='Lock');`)]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.out.trim(),'t');
+ denied('set role service_role;'+recurringSourceCall(f),/retail_recurring_source_intent_denied/);
+});
 for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])for(const role of [false,true])
 test(`admin original payload -> native client only ${plan}/${months}/${payment}/role:${role}`,opts,()=>{
  const f=fixture(plan,months,payment,role,false);record(f);markAdminPaid(f);const before=row(f),p=adminInitial(f);

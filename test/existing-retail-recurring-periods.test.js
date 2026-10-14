@@ -180,13 +180,15 @@ test('sealed SDK root metadata is ignored without inspecting its data', () => {
     writable: false, configurable: false });
   assert.deepEqual(inspect(v), result);
 });
-test('the chronology inspector has no application importer', () => {
+test('the chronology inspector has only the explicitly unmounted native source adapter importer', () => {
+  const importers = [];
   function scan(dir) { for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const file = path.join(dir, entry.name);
     if (entry.isDirectory()) scan(file);
     else if (entry.name.endsWith('.js') && entry.name !== 'existingRetailRecurringPeriods.js') {
-      assert.equal(fs.readFileSync(file, 'utf8').includes('existingRetailRecurringPeriods'), false, file);
+      if (fs.readFileSync(file, 'utf8').includes('existingRetailRecurringPeriods')) importers.push(path.relative(path.resolve(__dirname, '../src'), file));
     }
   } }
   scan(path.resolve(__dirname, '../src'));
+  assert.deepEqual(importers.sort(), ['services/existingRetailRecurringSource.js']);
 });
