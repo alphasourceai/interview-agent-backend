@@ -5,8 +5,8 @@ set local lock_timeout='10s';
 do $baseline$
 declare s text[];p record;
 begin
- if exists(select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace
-  where n.nspname='public' and p.proname='apply_retail_existing_admin_client')
+ if exists(select 1 from pg_proc proc join pg_namespace n on n.oid=proc.pronamespace
+  where n.nspname='public' and proc.proname='apply_retail_existing_admin_client')
   then raise exception 'retail_admin_client_schema_drift';end if;
  foreach s slice 1 in array array[
   array['retail_existing_funding_schema_guard()','abfab9e6f97d88c8aa940b8a993db42b','s'],
