@@ -58,6 +58,11 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
  }finally{sql(definition);}
  assert.equal(billingCatalog(),originalBilling);
  sql(billingMigration);
+ const adminMigration=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014010430_retail_existing_admin_client_write.sql'),'utf8');
+ try{sql("create function public.apply_retail_existing_admin_client(uuid,uuid,jsonb,jsonb,jsonb) returns void language sql as 'select null::void';");
+  denied(adminMigration,/retail_admin_client_schema_drift/);assert.equal(acl(),priorAcl);
+ }finally{sql('drop function public.apply_retail_existing_admin_client(uuid,uuid,jsonb,jsonb,jsonb);');}
+ sql(adminMigration);
 });
 function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false){
  const id=crypto.randomUUID(),client=crypto.randomUUID(),intent=crypto.randomUUID(),key='SYNTHETIC_CLAIM_'+crypto.randomUUID(),suffix=id.replaceAll('-','');
@@ -127,6 +132,127 @@ const billingState=f=>sql(`select jsonb_build_object('client',(select to_jsonb(c
  'intent',(select to_jsonb(i) from public_purchase_intents i where id=${lit(f.intent)}),
  'plan',(select to_jsonb(p) from client_plan_settings p where client_id=${lit(f.client)}),
  'credits',(select jsonb_agg(to_jsonb(r) order by id) from client_role_credits r where source_client_id=${lit(f.client)}));`);
+function markAdminPaid(f){
+ sql(`set role service_role;update membership_agreements set checkout_status='paid',checkout_paid_at=${lit(f.proof.period.paid_at)} where id=${lit(f.id)};`);
+}
+function adminInitial(f){
+ // Match the canonical activation tests: mock ONLY the unneeded hosted-client
+ // module, never the original payload builder or the real native SQL writer.
+ const clientPath=require.resolve('../src/clients/supabase');
+ if(!require.cache[clientPath])require.cache[clientPath]={id:clientPath,filename:clientPath,loaded:true,
+  exports:{supabaseAdmin:{auth:{admin:{}},from(){throw Error('hosted database forbidden');},rpc(){throw Error('hosted database forbidden');}}}};
+ const {buildClientActivationPayload}=require('../src/services/publicPurchaseActivation');
+ return buildClientActivationPayload({agreement:row(f),subscription:{id:f.proof.period.subscription_id,customer:f.proof.period.customer_id,status:'active',
+  start_date:f.proof.period.provider_period_start,current_period_end:f.proof.period.provider_period_end,cancel_at_period_end:false},
+  planKey:f.pkg.plan_key,billingInterval:f.pkg.billing_cadence,packageSnapshot:f.pkg,paidAt:f.proof.period.paid_at});
+}
+const adminSubscription=f=>({id:f.proof.period.subscription_id,customer:f.proof.period.customer_id,status:'active',current_period_end:f.proof.period.provider_period_end,cancel_at_period_end:false});
+function adminCall(f,payload=adminInitial(f),source=f.source,receipt=row(f).retail_funding_receipt,sub=adminSubscription(f)){
+ return 'select apply_retail_existing_admin_client('+[f.id,f.client,source,receipt,payload,sub].map(lit).join(',')+');';
+}
+const nativeAdmin=f=>JSON.parse(sql('set role service_role;'+adminCall(f)));
+for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])for(const role of [false,true])
+test(`admin original payload -> native client only ${plan}/${months}/${payment}/role:${role}`,opts,()=>{
+ const f=fixture(plan,months,payment,role,false);record(f);markAdminPaid(f);const before=row(f),p=adminInitial(f);
+ const result=nativeAdmin(f);assert.equal(result.status,'applied');assert.deepEqual(result.client_initial,p);
+ const state=JSON.parse(billingState(f));assert.equal(state.plan,null);assert.equal(state.credits,null);assert.equal(state.intent,null);
+ for(const field of Object.keys(p)){
+  if(['current_term_end','contract_start_at','contract_end_at'].includes(field))assert.equal(Date.parse(state.client[field]),Date.parse(p[field]));
+  else assert.deepEqual(state.client[field],p[field]);
+ }
+ const applied=billingState(f);assert.equal(nativeAdmin(f).status,'already_applied');assert.equal(billingState(f),applied);assert.deepEqual(row(f),before);
+});
+test('admin client primitive refuses linked source, historical no-receipt and pending unpaid state',opts,()=>{
+ const linked=fixture();record(linked);nativeComplete(linked);const l=billingState(linked);
+ denied('set role service_role;'+adminCall(linked),/retail_admin_client_/);assert.equal(billingState(linked),l);
+ const pending=fixture('basic',3,'prepaid',false,false);record(pending);const p=billingState(pending);
+ denied('set role service_role;'+adminCall(pending),/retail_admin_client_/);assert.equal(billingState(pending),p);
+ denied('set role service_role;'+adminCall(historicalV2),/retail_admin_client_/);
+});
+test('admin native write rechecks moved owner/archive/parent/customer/sub/current/voided state after proof and paid CAS',opts,()=>{
+ for(const change of ['profile','archive','parent','customer','subscription','current','void']){
+  const f=fixture('basic',3,'prepaid',false,false);record(f);markAdminPaid(f);
+  if(change==='profile')sql(`update billing_customers set stripe_customer_id=null where client_id=${lit(f.client)};`);
+  if(change==='archive')sql(`update clients set archived_at=clock_timestamp() where id=${lit(f.client)};`);
+  if(change==='parent'){const id=crypto.randomUUID();sql(`insert into clients(id,name,email) values(${lit(id)},'Synthetic Parent','parent@example.invalid');update clients set parent_client_id=${lit(id)} where id=${lit(f.client)};`);}
+  if(change==='customer')sql(`update clients set stripe_customer_id='cus_CHANGED' where id=${lit(f.client)};`);
+  if(change==='subscription')sql(`update clients set stripe_subscription_id=${lit('sub_ADMIN_CHANGED_'+f.client.replaceAll('-',''))} where id=${lit(f.client)};`);
+  if(change==='current')sql(`update membership_agreements set is_current=false where id=${lit(f.id)};`);
+  if(change==='void')sql(`update membership_agreements set voided_at=clock_timestamp() where id=${lit(f.id)};`);
+  const before=billingState(f);denied('set role service_role;'+adminCall(f),/retail_admin_client_/);assert.equal(billingState(f),before);
+ }
+});
+test('admin initial projection refuses injected or changed fields and source/receipt mismatch',opts,()=>{
+ const f=fixture('pro',6,'prepaid',true,false);record(f);markAdminPaid(f);const before=billingState(f);
+ for(const patch of [{stripe_customer_id:'cus_CHANGED'},{stripe_subscription_id:'sub_CHANGED'},{subscription_status:'trialing'},
+  {billing_status:'inactive'},{auto_renew:false},{cancel_at_term_end:true},{contract_end_at:'2099-01-01T00:00:00.000Z'},
+  {contract_start_at:'2026-01-01T00:00:00.000Z'},{current_term_end:'2099-01-01T00:00:00.000Z'},{extra:true}]){
+  denied('set role service_role;'+adminCall(f,{...adminInitial(f),...patch}),/retail_admin_client_payload_denied/);assert.equal(billingState(f),before);
+ }
+ const missing=adminInitial(f);delete missing.plan_tier;denied('set role service_role;'+adminCall(f,missing),/retail_admin_client_payload_denied/);
+ denied('set role service_role;'+adminCall(f,adminInitial(f),{...f.source,customer_id:'cus_OTHER'}),/retail_admin_client_source_denied/);
+ denied('set role service_role;'+adminCall(f,adminInitial(f),f.source,{...row(f).retail_funding_receipt,extra:true}),/retail_admin_client_source_denied/);
+ assert.equal(billingState(f),before);
+});
+test('admin identical client retry does not reset changed renewal preferences or overwrite unrelated contract',opts,()=>{
+ const f=fixture('basic',3,'prepaid',false,false);record(f);markAdminPaid(f);nativeAdmin(f);
+ sql(`update clients set auto_renew=false,cancel_at_term_end=true where id=${lit(f.client)};`);const before=billingState(f);
+ denied('set role service_role;'+adminCall(f),/retail_admin_client_existing_state_conflict/);assert.equal(billingState(f),before);
+});
+test('admin current subscription cannot be replaced by the original builder active-status fallback or newer unpaid period',opts,()=>{
+ const f=fixture('pro',6,'monthly_installments',false,false);record(f);markAdminPaid(f);const before=billingState(f);
+ for(const patch of [{status:'canceled'},{status:'past_due'},{status:'trialing'},{cancel_at_period_end:true},
+  {id:'sub_OTHER'},{customer:'cus_OTHER'},{current_period_end:f.proof.period.provider_period_end+86400},{extra:true}]){
+  denied('set role service_role;'+adminCall(f,adminInitial(f),f.source,row(f).retail_funding_receipt,{...adminSubscription(f),...patch}),/retail_admin_client_subscription_denied/);
+  assert.equal(billingState(f),before);
+ }
+});
+test('admin substituted receipt lacking B refuses before client write without weakening immutable receipt validation',opts,()=>{
+ const f=fixture('basic',3,'prepaid',false,false);record(f);markAdminPaid(f);
+ const p=structuredClone(row(f).retail_funding_receipt);p.proof.period.provider_period_end=null;
+ const before=billingState(f);denied('set role service_role;'+adminCall(f,adminInitial(f),f.source,p),/retail_admin_client_source_denied/);assert.equal(billingState(f),before);
+});
+test('admin pinned existing native month anchor matches original JS month-end and leap-year terms',opts,()=>{
+ for(const a of ['2024-01-31T12:34:56.000Z','2024-02-29T12:34:56.000Z','2026-08-31T12:34:56.000Z'])for(const months of [3,6,12]){
+  const native=sql(`set role service_role;select public.retail_existing_month_anchor(${lit(a)},${months});`);
+  assert.equal(new Date(native).toISOString(),anchoredMonthInstant(a,months));
+ }
+});
+test('admin concurrent same tuple writers serialize to one client apply and one no-op',opts,async()=>{
+ const f=fixture('basic',3,'prepaid',false,false);record(f);markAdminPaid(f);
+ const [a,b]=await Promise.all([parallel('set role service_role;begin;'+adminCall(f)+'select pg_sleep(0.1);commit;'),parallel('set role service_role;'+adminCall(f))]);
+ assert.equal(a.code,0,a.err);assert.equal(b.code,0,b.err);
+ const statuses=[a,b].map(r=>JSON.parse(r.out.split('\n').find(s=>s.startsWith('{'))).status).sort();assert.deepEqual(statuses,['already_applied','applied']);
+});
+test('native sealed admin source rejects phantom intent insert during admin client transaction',opts,async()=>{
+ const f=fixture('basic',3,'prepaid',false,false);record(f);markAdminPaid(f);const id=crypto.randomUUID();
+ const insert=`insert into public_purchase_intents(id,agreement_id,selected_plan_key,selected_billing_cadence,company_legal_name,buyer_first_name,buyer_last_name,buyer_email)
+  values(${lit(id)},${lit(f.id)},'basic','monthly','Synthetic Phantom','QA','Buyer','phantom@example.invalid');`;
+ const [writer,link]=await Promise.all([parallel('set role service_role;begin;'+adminCall(f)+'select pg_sleep(0.4);commit;'),
+  parallel('set role service_role;select pg_sleep(0.07);'+insert)]);
+ assert.equal(writer.code,0,writer.err);assert.notEqual(link.code,0);assert.match(link.err,/retail_admin_client_intent_link_denied/);
+ assert.equal(sql(`select count(*) from public_purchase_intents where agreement_id=${lit(f.id)};`),'0');
+});
+test('admin RPC is invoker/browser denied and migration reapply leaves original state intact',opts,()=>{
+ assert.equal(sql("select not prosecdef and proconfig=array['search_path=pg_catalog','lock_timeout=10s'] from pg_proc where proname='apply_retail_existing_admin_client';"),'t');
+ const f=fixture('basic',3,'prepaid',false,false);record(f);markAdminPaid(f);const before=billingState(f);
+ for(const role of ['anon','authenticated'])denied('set role '+role+';'+adminCall(f),/permission denied/);
+ denied(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014010430_retail_existing_admin_client_write.sql'),'utf8'),/retail_admin_client_schema_drift/);
+ assert.equal(billingState(f),before);assert.equal(acl(),priorAcl);
+ try{sql('alter table public.public_purchase_intents disable trigger retail_existing_funding_intent_clock_guard;');
+  denied('set role service_role;'+adminCall(f),/retail_admin_client_trigger_drift/);assert.equal(billingState(f),before);
+ }finally{sql('alter table public.public_purchase_intents enable trigger retail_existing_funding_intent_clock_guard;');}
+});
+test('admin primitive checks paid-period expiry after a blocked profile lock, before first client write',opts,async()=>{
+ const f=fixture('basic',3,'monthly_installments',false,false);f.proof.period.provider_period_end=Math.floor(Date.now()/1000)+2;
+ // Synthetic native receipt fixture only, not proof of a provider recurrence.
+ record(f);markAdminPaid(f);const before=billingState(f);
+ const [holder,writer]=await Promise.all([
+  parallel(`begin;select 1 from billing_customers where client_id=${lit(f.client)} for update;select pg_sleep(2.5);commit;`),
+  parallel('set role service_role;select pg_sleep(0.07);'+adminCall(f))]);
+ assert.equal(holder.code,0,holder.err);assert.notEqual(writer.code,0);assert.match(writer.err,/retail_admin_client_paid_period_ended/);
+ assert.equal(billingState(f),before);
+});
 test('actual billing writer refuses a moved global owner after valid receipt and native completion',opts,()=>{
  const f=fixture();record(f);nativeComplete(f);
  sql(`update billing_customers set stripe_customer_id=null where client_id=${lit(f.client)};`);
