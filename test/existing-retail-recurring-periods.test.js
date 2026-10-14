@@ -180,7 +180,7 @@ test('sealed SDK root metadata is ignored without inspecting its data', () => {
     writable: false, configurable: false });
   assert.deepEqual(inspect(v), result);
 });
-test('the chronology inspector has only the explicitly unmounted native source adapter importer', () => {
+test('the chronology inspector importers remain only the explicitly unmounted native source and SDK census', () => {
   const importers = [];
   function scan(dir) { for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const file = path.join(dir, entry.name);
@@ -190,5 +190,5 @@ test('the chronology inspector has only the explicitly unmounted native source a
     }
   } }
   scan(path.resolve(__dirname, '../src'));
-  assert.deepEqual(importers.sort(), ['services/existingRetailRecurringSource.js']);
+  assert.deepEqual(importers.sort(), ['services/existingRetailRecurringCensus.js', 'services/existingRetailRecurringSource.js']);
 });
