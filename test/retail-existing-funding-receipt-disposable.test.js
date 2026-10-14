@@ -83,10 +83,10 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
  legacyBefore=sql(`select (${lit(JSON.parse(legacyBefore))}||jsonb_build_object('retail_admin_billing_receipt',null))::text;`);
  historicalBefore=sql(`select (${lit(JSON.parse(historicalBefore))}||jsonb_build_object('retail_admin_billing_receipt',null))::text;`);
 });
-function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false,adminSource='admin'){
+function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false,adminSource='admin',linkedSource='sales_assisted'){
  const id=crypto.randomUUID(),client=crypto.randomUUID(),intent=crypto.randomUUID(),key='SYNTHETIC_CLAIM_'+crypto.randomUUID(),suffix=id.replaceAll('-','');
- const customer='cus_'+suffix,session='cs_'+suffix,pkg=buildRetailPackageSnapshot({planKey:plan,commitmentMonths:months,paymentOption:payment,firstRolePrepaySelected:role,offerVersion:OFFER_VERSION,channel:'sales'});
- const snapshot={template_version:'membership_agreement_retail_terms_v2',source:linked?'sales_assisted':adminSource,package_snapshot:pkg,
+ const customer='cus_'+suffix,session='cs_'+suffix,pkg=buildRetailPackageSnapshot({planKey:plan,commitmentMonths:months,paymentOption:payment,firstRolePrepaySelected:role,offerVersion:OFFER_VERSION,channel:linked&&linkedSource==='public_purchase_intent'?'public':'sales'});
+ const snapshot={template_version:'membership_agreement_retail_terms_v2',source:linked?linkedSource:adminSource,package_snapshot:pkg,
   ...(linked?{purchase_intent:{id:intent}}:{}),values:{membership_tier:plan,billing_option:pkg.billing_cadence,auto_renew:true,
    commitment_months:months,payment_option:payment,pricing_version:pkg.pricing_version,term_start_basis:'successful_payment',platform_fee:String(pkg.platform_fee),
    per_role_fee:String(pkg.per_role_fee),additional_interview_fee:String(pkg.additional_interview_fee),included_interviews_per_role:String(pkg.included_interviews_per_role),
@@ -707,9 +707,10 @@ test('real SDK/native commit with lost ACK and subsequent refund replays origina
 // Real installed current SDK GET -> real native admin CLIENT-write seam. The
 // initial receipt/CAS here are actual previously-tested native synthetic paths,
 // not a live provider money claim. No historical money reproof on this retry.
-async function adminSdkBridge(plan='basic',months=3,payment='prepaid',role=false,fullBilling=false,initialPaid=true){
+async function adminSdkBridge(plan='basic',months=3,payment='prepaid',role=false,fullBilling=false,initialPaid=true,linkedSource=null){
  const http=require('node:http'),Stripe=require('stripe');
- const f=fixture(plan,months,payment,role,false);record(f);if(initialPaid)markAdminPaid(f);adminInitial(f);
+ const f=fixture(plan,months,payment,role,Boolean(linkedSource),false,'admin',linkedSource||'sales_assisted');record(f);
+ if(linkedSource)nativeComplete(f);else{if(initialPaid)markAdminPaid(f);adminInitial(f);}
  const p=f.proof,requests=[],writes=[],reads=[],memberCalls=[],contextCalls=[];
  const current={object:'subscription',id:p.period.subscription_id,customer:p.period.customer_id,currency:'usd',livemode:false,
   status:'active',current_period_end:p.period.provider_period_end,start_date:p.period.provider_period_start,
@@ -739,6 +740,15 @@ async function adminSdkBridge(plan='basic',months=3,payment='prepaid',role=false
     q='select ensure_retail_existing_admin_buyer_member('+[a.p_agreement,a.p_source,a.p_receipt,a.p_current,a.p_user,a.p_name].map(lit).join(',')+');';
    }else if(name==='read_retail_existing_funding'){
     reads.push(structuredClone(a));q='select read_retail_existing_funding('+[a.p_agreement,a.p_client,a.p_claim,a.p_source].map(lit).join(',')+');';
+   }else if(name==='apply_public_purchase_billing'){
+    assert.ok(linkedSource,'Original admin tests cannot call linked billing');
+    const keys=['p_intent_id','p_claim_key','p_client_id','p_billing_client_id','p_stripe_customer_id','p_stripe_subscription_id',
+     'p_subscription_status','p_billing_status','p_billing_interval','p_plan_tier','p_current_term_end','p_cancel_at_term_end',
+     'p_auto_renew','p_cancel_effective_at','p_contract_start_at','p_contract_end_at','p_platform_fee','p_per_role_fee',
+     'p_included_interviews_per_role','p_additional_interview_fee','p_max_interview_minutes','p_credit_selected','p_credit_type',
+     'p_credit_normal_role_fee_cents','p_credit_discounted_amount_cents','p_credit_discount_percent','p_credit_non_refundable','p_credit_expires'];
+    assert.deepEqual(Object.keys(a).sort(),[...keys].sort());writes.push(structuredClone(a));await hooks.beforeApply?.(a);
+    q='select apply_public_purchase_billing('+keys.map(k=>lit(a[k])).join(',')+');';
    }else{
     assert.equal(name,fullBilling?'apply_retail_existing_admin_billing':'apply_retail_existing_admin_client');writes.push(structuredClone(a));
     await hooks.beforeApply?.(a);
@@ -749,7 +759,7 @@ async function adminSdkBridge(plan='basic',months=3,payment='prepaid',role=false
    const data=JSON.parse(r.stdout.trim());
    if(name==='retail_admin_existing_member_context')return hooks.afterContext?await hooks.afterContext(data):{data,error:null};
    if(name==='ensure_retail_existing_admin_buyer_member')return hooks.afterMember?await hooks.afterMember(data):{data,error:null};
-   if(name==='apply_retail_existing_admin_client'||name==='apply_retail_existing_admin_billing')return hooks.afterApply?await hooks.afterApply(data,writes.length):{data,error:null};
+   if(name==='apply_retail_existing_admin_client'||name==='apply_retail_existing_admin_billing'||name==='apply_public_purchase_billing')return hooks.afterApply?await hooks.afterApply(data,writes.length):{data,error:null};
    return hooks.afterRead?await hooks.afterRead(data,reads.length):{data,error:null};}};
  const server=http.createServer((req,res)=>{requests.push({method:req.method,path:req.url,version:req.headers['stripe-version']});let body;
   if(req.method==='GET'&&req.url==='/v1/account')body={object:'account',id:p.provider_account_id};
@@ -759,9 +769,9 @@ async function adminSdkBridge(plan='basic',months=3,payment='prepaid',role=false
   res.setHeader('content-type','application/json');res.end(JSON.stringify(body));});
  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
  const stripe=new Stripe('sk_test_SYNTHETIC_NO_PROVIDER',{apiVersion:'2023-10-16',host:'127.0.0.1',port:server.address().port,protocol:'http',maxNetworkRetries:0});
- const applyAdapter=fullBilling?require('../src/services/existingRetailAdminBillingAdapter').applyExistingRetailAdminBilling
+ const applyAdapter=linkedSource?require('../src/services/existingRetailLinkedBillingAdapter').applyExistingRetailLinkedBilling:fullBilling?require('../src/services/existingRetailAdminBillingAdapter').applyExistingRetailAdminBilling
   :require('../src/services/existingRetailAdminClientAdapter').applyExistingRetailAdminClient;
- const options={db,stripe,agreementId:f.id,eventSessionId:checkout.id,eventLivemode:false};
+ const options={db,stripe,agreementId:f.id,eventSessionId:checkout.id,eventLivemode:false,...(linkedSource?{claimKey:f.key,intentId:f.intent}:{})};
  return{f,current,checkout,hooks,db,requests,writes,reads,memberCalls,contextCalls,options,
   apply:patch=>applyAdapter({...options,...patch}),close:()=>new Promise(resolve=>server.close(resolve))};
 }
@@ -1568,4 +1578,200 @@ test('mounted admin installed Supabase SDK transports composite RPC/member ACK a
   // Installed SDK wire/shape exercise against our authored gateway, NOT a
   // real PostgREST instance or hosted Auth/authorization/provider acceptance.
  }finally{await new Promise(resolve=>gateway.close(resolve));await b.close();}
+});
+
+// New linked seam is financial ONLY and intentionally UNMOUNTED. Original
+// completion/claim/receipt are real native fixtures; no account/Auth/email.
+const linkedBridge=(plan='basic',months=3,payment='prepaid',role=false,source='sales_assisted')=>adminSdkBridge(plan,months,payment,role,false,true,source);
+const linkedCatalog=()=>sql("select jsonb_agg(jsonb_build_array(oid::regprocedure::text,md5(prosrc),proowner::regrole::text,prosecdef,provolatile,proconfig,proacl::text) order by oid::regprocedure::text) from pg_proc where proname='apply_public_purchase_billing';");
+for(const source of ['sales_assisted','public_purchase_intent'])for(const plan of ['basic','pro'])for(const months of [3,6,12])
+for(const payment of source==='sales_assisted'?['prepaid','monthly_installments']:['prepaid'])for(const role of [false,true])
+test(`UNMOUNTED linked installed SDK -> SAME original native digest ${source}/${plan}/${months}/${payment}/role:${role}`,opts,async()=>{
+ const b=await linkedBridge(plan,months,payment,role,source);try{
+  const catalog=linkedCatalog();assert.match(catalog,/6ed48e7c15548a4521417b99ee213bd7/);
+  const before=row(b.f),r=await b.apply();assert.equal(r.status,'applied');assert.match(r.digest,/^[a-f0-9]{64}$/);
+  assert.equal(r.membership_activation_required,true);assert.equal(r.credits_spendable,false);assert.equal(r.billing_applied,true);
+  assert.ok(Object.isFrozen(r)&&Object.isFrozen(r.clientInitial)&&Object.isFrozen(r.currentProviderSubscription));
+  assert.equal(r.currentProviderSubscription.status,'active');assert.equal(r.clientInitial.contract_start_at,b.f.proof.period.paid_at);
+  assert.equal(r.clientInitial.contract_end_at,anchoredMonthInstant(b.f.proof.period.paid_at,months));
+  assert.deepEqual(row(b.f),before);assert.equal(b.memberCalls.length,0);assert.equal(b.contextCalls.length,0);
+  const state=billingState(b.f),data=JSON.parse(state);assert.equal(data.credits?.length||0,role?1:0);
+  assert.equal(data.intent.billing_apply_digest,r.digest);assert.ok(data.intent.billing_applied_at);
+  assert.equal(new Date(data.intent.activated_at).toISOString(),b.f.proof.period.paid_at);
+  assert.equal(data.plan.platform_fee,b.f.pkg.platform_fee);assert.equal(data.plan.per_role_fee,b.f.pkg.per_role_fee);
+  const retry=await b.apply();assert.equal(retry.status,'already_applied');assert.equal(retry.digest,r.digest);
+  assert.equal(billingState(b.f),state);assert.equal(linkedCatalog(),catalog);assert.equal(b.writes.length,4);
+  assert.ok(b.requests.every(r=>r.method==='GET'&&r.version==='2023-10-16'));
+  if(!role)for(const a of b.writes)for(const k of ['p_credit_type','p_credit_normal_role_fee_cents','p_credit_discounted_amount_cents','p_credit_discount_percent','p_credit_non_refundable','p_credit_expires'])assert.equal(a[k],null);
+ }finally{await b.close();}
+});
+test('linked financial replay keeps later SDK period/status/pause separate and never resets preferences/settings/used credits',opts,async()=>{
+ for(const patch of [{current_period_end:2100000000},{status:'canceled'},{status:'past_due'},{pause_collection:{behavior:'keep_as_draft'}},
+  {cancel_at_period_end:true,cancel_at:2100000000}]){
+  const b=await linkedBridge('pro',6,'monthly_installments',true);try{
+   const first=await b.apply(),role=crypto.randomUUID();
+   sql(`insert into roles(id,client_id,title,slug_or_token) values(${lit(role)},${lit(b.f.client)},'Synthetic linked spent credit',${lit('SYNTHETIC_'+role)});
+    update client_role_credits set status='used',used_at=clock_timestamp(),used_by_role_id=${lit(role)} where source_public_purchase_intent_id=${lit(b.f.intent)};
+    update clients set auto_renew=false,cancel_at_term_end=true,subscription_status='past_due',billing_status='past_due',current_term_end='2099-01-01Z' where id=${lit(b.f.client)};
+    update client_plan_settings set platform_fee=77,billing_model='usage' where client_id=${lit(b.f.client)};`);
+   Object.assign(b.current,patch);const state=billingState(b.f),r=await b.apply();assert.equal(r.status,'already_applied');assert.equal(r.digest,first.digest);
+   for(const [k,v] of Object.entries(patch))assert.deepEqual(r.currentProviderSubscription[k],v);
+   assert.equal(r.clientInitial.subscription_status,'active');assert.equal(r.clientInitial.auto_renew,true);assert.equal(r.planInitial.platform_fee,b.f.pkg.platform_fee);
+   assert.equal(r.credits_spendable,false);assert.equal(r.membership_activation_required,true);assert.equal(billingState(b.f),state);assert.equal(b.memberCalls.length,0);
+  }finally{await b.close();}
+ }
+});
+test('linked first financial apply refuses inactive/paused/missing/current-period drift before writer',opts,async()=>{
+ for(const patch of [{status:'past_due'},{status:'trialing'},{status:'canceled'},{cancel_at_period_end:true},{cancel_at:2100000000},
+  {pause_collection:{behavior:'keep_as_draft'}},{cancel_at:undefined},{pause_collection:undefined},{current_period_end:1},{current_period_end:2100000000.5}]){
+  const b=await linkedBridge();try{
+   Object.assign(b.current,patch);const before=billingState(b.f);
+   await assert.rejects(b.apply(),e=>/^retail_linked_billing_/.test(e.code));assert.equal(b.writes.length,0);assert.equal(billingState(b.f),before);
+  }finally{await b.close();}
+ }
+});
+test('linked lost/malformed native ACK leaves financial commit and same original retry recovers without duplicate credit',opts,async()=>{
+ for(const mode of ['lost','empty','extra','digest','status']){
+  const b=await linkedBridge('pro',12,'prepaid',true);try{
+   b.hooks.afterApply=(data,count)=>{if(count!==1)return{data,error:null};if(mode==='lost')throw Error('PRIVATE provider/token details');
+    return{data:mode==='empty'?null:mode==='extra'?{...data,extra:true}:mode==='digest'?{...data,digest:'bad'}:{...data,status:'completed'},error:null};};
+   await assert.rejects(b.apply(),e=>e.status===503&&/^retail_linked_billing_/.test(e.code)&&!e.message.includes('PRIVATE'));
+   const before=billingState(b.f),data=JSON.parse(before);assert.match(data.intent.billing_apply_digest,/^[a-f0-9]{64}$/);assert.equal(data.credits.length,1);
+   delete b.hooks.afterApply;b.current.current_period_end+=86400;
+   assert.equal((await b.apply()).status,'already_applied');assert.equal(billingState(b.f),before);assert.equal(b.memberCalls.length,0);
+  }finally{await b.close();}
+ }
+});
+test('linked original writer native clock/term/package/digest/credit conflicts map to permanent safe 409',opts,async()=>{
+ for(const mode of ['clock','term','package','credit','digest']){
+  const b=await linkedBridge('pro',6,'monthly_installments',true);try{
+   if(mode==='digest')await b.apply();const before=billingState(b.f);
+   b.hooks.beforeApply=a=>{if(mode==='clock')a.p_contract_start_at='2026-01-01Z';if(mode==='term')a.p_contract_end_at='2099-01-01Z';
+    if(mode==='package')a.p_platform_fee+=1;if(mode==='credit')a.p_credit_normal_role_fee_cents+=1;
+    if(mode==='digest')a.p_auto_renew=false;};
+   await assert.rejects(b.apply(),e=>e.code==='retail_linked_billing_conflict'&&e.status===409&&e.permanentFailure);
+   assert.equal(billingState(b.f),before);assert.equal(b.memberCalls.length,0);
+  }finally{await b.close();}
+ }
+});
+test('linked native guard rejects owner/source loss before first writer and after ordinary readback',opts,async()=>{
+ for(const when of ['first','second']){
+  const b=await linkedBridge('basic',3,'prepaid',false);try{
+   let changed=false;b.hooks.beforeApply=()=>{if(b.writes.length===(when==='first'?1:2)&&!changed){changed=true;sql(`update clients set archived_at=clock_timestamp() where id=${lit(b.f.client)};`);}};
+   await assert.rejects(b.apply(),e=>e.code==='retail_linked_billing_conflict'&&e.status===409&&e.permanentFailure);
+   const state=JSON.parse(billingState(b.f));assert.equal(Boolean(state.intent.billing_applied_at),when==='second');assert.equal(b.memberCalls.length,0);
+  }finally{await b.close();}
+ }
+});
+test('linked paired marker/ACK/readback mismatch refuses without a first-write fallback',opts,async()=>{
+ for(const mode of ['pair','bad-digest','bad-date','future','different-digest','after-missing','after-source']){
+  const b=await linkedBridge();try{
+   if(mode==='different-digest'||mode==='future')await b.apply();
+   const before=billingState(b.f);b.hooks.afterRows=(table,data)=>{
+    if(table==='public_purchase_intents')return data.map(i=>{
+     if(mode==='pair')return{...i,billing_applied_at:'2026-01-01T00:00:00Z'};
+     if(mode==='bad-digest')return{...i,billing_applied_at:'2026-01-01T00:00:00Z',billing_apply_digest:'BAD'};
+     if(mode==='bad-date')return{...i,billing_applied_at:'2026-02-30T00:00:00Z',billing_apply_digest:'a'.repeat(64)};
+     if(mode==='future')return{...i,billing_applied_at:'2099-01-01T00:00:00Z'};
+     if(mode==='different-digest')return{...i,billing_apply_digest:'a'.repeat(64)};
+     if(mode==='after-missing'&&b.writes.length)return{...i,billing_applied_at:null,billing_apply_digest:null};return i;
+    });
+    if(table==='membership_agreements'&&mode==='after-source'&&b.writes.length)return data.map(a=>({...a,checkout_attempt_source:{...a.checkout_attempt_source,customer_id:'cus_OTHER'}}));
+    return data;
+   };
+   await assert.rejects(b.apply(),e=>e.status===503&&/^retail_linked_billing_/.test(e.code));
+   if(['pair','bad-digest','bad-date'].includes(mode)){assert.equal(b.writes.length,0);assert.equal(billingState(b.f),before);}
+   if(mode==='different-digest')assert.equal(billingState(b.f),before);
+   if(mode.startsWith('after'))assert.ok(JSON.parse(billingState(b.f)).intent.billing_applied_at);
+  }finally{await b.close();}
+ }
+});
+test('linked seam refuses wrong API/mode/session/sub/invoice/claim identity and preserves guard-lost sentinel',opts,async()=>{
+ for(const patch of [{stripe:{getApiField:()=> '2099-01-01'}},{eventLivemode:true},{eventSessionId:'cs_OTHER'},
+  {eventSubscriptionId:'sub_OTHER'},{intentId:crypto.randomUUID()},{claimKey:'bad'}]){
+  const b=await linkedBridge();try{
+   const before=billingState(b.f);await assert.rejects(b.apply(patch),e=>/^retail_linked_billing_/.test(e.code));assert.equal(b.writes.length,0);assert.equal(billingState(b.f),before);
+  }finally{await b.close();}
+ }
+ const b=await linkedBridge();try{
+  for(const invoice of [null,'in_OTHER']){b.checkout.invoice=invoice;await assert.rejects(b.apply(),e=>/^retail_linked_billing_/.test(e.code));assert.equal(b.writes.length,0);}
+  b.checkout.invoice=b.f.proof.period.invoice_id;b.checkout.payment_status='unpaid';await assert.rejects(b.apply(),{code:'retail_linked_billing_checkout_unknown'});
+  const sentinel=Object.assign(Error('existing guard lost'),{code:'public_purchase_activation_guard_lost'});
+  await assert.rejects(b.apply({assertFence:async()=>{throw sentinel;}}),e=>e===sentinel);
+ }finally{await b.close();}
+});
+test('linked original native lease loss is retryable guard-lost and not hidden by financial no-op',opts,async()=>{
+ const b=await linkedBridge();try{
+  await b.apply();const before=billingState(b.f);b.hooks.beforeApply=a=>{a.p_claim_key='SYNTHETIC_WRONG_'+crypto.randomUUID();};
+  await assert.rejects(b.apply(),{code:'public_purchase_activation_guard_lost'});assert.equal(billingState(b.f),before);
+ }finally{await b.close();}
+});
+test('linked adapter stays unmounted and does not call account/member/admin/Checkout mutation engines',()=>{
+ const root=path.resolve(__dirname,'../src');function scan(dir){for(const e of fs.readdirSync(dir,{withFileTypes:true})){
+  const f=path.join(dir,e.name);if(e.isDirectory())scan(f);else if(f.endsWith('.js')&&path.basename(f)!=='existingRetailLinkedBillingAdapter.js')assert.ok(!fs.readFileSync(f,'utf8').includes('existingRetailLinkedBillingAdapter'),f);
+ }}scan(root);
+ const source=fs.readFileSync(path.join(root,'services/existingRetailLinkedBillingAdapter.js'),'utf8');
+ for(const forbidden of ['ensureBuyerAccountSetup','ensureRecovery','sendWelcome','enqueueSalesWon','apply_retail_existing_admin','ensure_public_purchase_buyer_member','complete_public_purchase_activation','.update(','.upsert(','.insert('])assert.ok(!source.includes(forbidden),forbidden);
+});
+test('linked adapter leaves original admin/legacy cohorts alone, refuses enrolled protocol drift and public monthly',opts,async()=>{
+ const apply=require('../src/services/existingRetailLinkedBillingAdapter').applyExistingRetailLinkedBilling;
+ const admin=await adminSdkBridge();try{assert.equal(await apply(admin.options),null);assert.equal(admin.writes.length,0);}finally{await admin.close();}
+ const b=await linkedBridge();try{
+  b.hooks.afterRows=(table,data)=>table==='public_purchase_intents'?data.map(i=>({...i,protocol:'legacy_complete'})):data;
+  assert.equal(await b.apply(),null);assert.equal(b.writes.length,0);
+  b.hooks.afterRows=(table,data)=>table==='public_purchase_intents'?data.map(i=>({...i,protocol:'unknown'})):data;
+  await assert.rejects(b.apply(),{code:'retail_linked_billing_source_unknown'});assert.equal(b.writes.length,0);
+  delete b.hooks.afterRows;
+  b.hooks.afterRows=(table,data)=>table==='membership_agreements'?data.map(a=>({...a,template_snapshot:{...a.template_snapshot,source:'public_purchase_intent',package_snapshot:{...a.template_snapshot.package_snapshot,membership_terms:{...a.template_snapshot.package_snapshot.membership_terms,payment_option:'monthly_installments'}}}})):data;
+  await assert.rejects(b.apply(),e=>/^retail_linked_billing_/.test(e.code));assert.equal(b.writes.length,0);
+ }finally{await b.close();}
+});
+test('linked JS first-period clock expiry refuses fresh billing but historical financial replay stays no-DML',opts,async()=>{
+ const first=await linkedBridge(),historical=await linkedBridge(),now=Date.now;try{
+  await historical.apply();const freshBefore=billingState(first.f),oldBefore=billingState(historical.f);
+  Date.now=()=>Math.max(first.current.current_period_end,historical.current.current_period_end)*1000+1000;
+  await assert.rejects(first.apply(),e=>e.code==='retail_linked_billing_period_ended'&&e.status===410&&e.permanentFailure);
+  assert.equal(first.writes.length,0);assert.equal(billingState(first.f),freshBefore);
+  const r=await historical.apply();assert.equal(r.status,'already_applied');assert.equal(r.membership_activation_required,true);assert.equal(r.credits_spendable,false);
+  assert.equal(billingState(historical.f),oldBefore);
+  // Controlled JS clock only. Native lock/commit clock tests remain separate;
+  // financial replay is not expired-period membership or full-term access.
+ }finally{Date.now=now;await first.close();await historical.close();}
+});
+test('linked native fresh lease refusal and unknown enrolled source fail closed without billing fallback',opts,async()=>{
+ const b=await linkedBridge();try{
+  b.hooks.afterRows=(table,data)=>table==='membership_agreements'?data.map(a=>({...a,template_snapshot:{...a.template_snapshot,source:'unknown'}})):data;
+  await assert.rejects(b.apply(),{code:'retail_linked_billing_source_unknown'});assert.equal(b.writes.length,0);delete b.hooks.afterRows;
+  b.hooks.beforeApply=()=>sql(`update public_purchase_intents set activation_claimed_at=clock_timestamp()-interval '6 minutes' where id=${lit(b.f.intent)};`);
+  await assert.rejects(b.apply(),{code:'public_purchase_activation_guard_lost'});
+  const state=JSON.parse(billingState(b.f));assert.equal(state.intent.billing_applied_at,null);assert.equal(state.plan,null);assert.equal(state.credits,null);
+ }finally{await b.close();}
+});
+test('linked installed Supabase SDK transports SAME original digest RPC through authored native loopback gateway',opts,async()=>{
+ const http=require('node:http'),{createClient}=require('@supabase/supabase-js'),b=await linkedBridge('pro',12,'prepaid',true),requests=[];
+ const server=http.createServer(async(req,res)=>{
+  try{
+   const url=new URL(req.url,'http://127.0.0.1');requests.push({method:req.method,path:url.pathname});let result;
+   if(req.method==='POST'&&url.pathname.startsWith('/rest/v1/rpc/')){
+    const name=url.pathname.split('/').at(-1);assert.ok(['apply_public_purchase_billing','read_retail_existing_funding'].includes(name));
+    let body='';for await(const chunk of req)body+=chunk;result=await b.db.rpc(name,JSON.parse(body));
+   }else if(req.method==='GET'&&url.pathname.startsWith('/rest/v1/')){
+    let query=b.db.from(url.pathname.split('/').at(-1)).select('*');
+    for(const [key,value] of url.searchParams){if(['select','order','limit'].includes(key))continue;
+     if(value.startsWith('eq.'))query=query.eq(key,value.slice(3));else if(value==='is.null')query=query.is(key,null);else throw Error('Unsupported synthetic filter');}
+    result=await query;res.setHeader('content-range',result.data.length?`0-${result.data.length-1}/${result.count}`:'*/0');
+   }else throw Error('Unexpected synthetic request');
+   res.setHeader('content-type','application/json');res.statusCode=result.error?400:200;res.end(JSON.stringify(result.error||result.data));
+  }catch(e){res.statusCode=500;res.end(JSON.stringify({message:'Synthetic native gateway error'}));}
+ });
+ await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
+ try{
+  const db=createClient(`http://127.0.0.1:${server.address().port}`,'SYNTHETIC_NO_PROVIDER_KEY',{auth:{persistSession:false,autoRefreshToken:false,detectSessionInUrl:false}});
+  const first=await b.apply({db});assert.equal(first.status,'applied');const before=billingState(b.f);
+  assert.equal((await b.apply({db})).status,'already_applied');assert.equal(billingState(b.f),before);assert.equal(b.writes.length,4);
+  assert.equal(b.memberCalls.length,0);assert.ok(requests.some(r=>r.path.endsWith('/apply_public_purchase_billing')));
+  assert.ok(requests.every(r=>r.method==='GET'||r.method==='POST'&&r.path.startsWith('/rest/v1/rpc/')));
+  // Actual installed SDK/real native SQL, authored gateway only. No real
+  // PostgREST instance, hosted authorization, account or provider acceptance.
+ }finally{await new Promise(resolve=>server.close(resolve));await b.close();}
 });
