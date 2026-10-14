@@ -16,6 +16,9 @@ const {
   withAdminClientHierarchyMetadata,
 } = require('../../services/admin/adminHelpers');
 const { ensureUserIdAndInvite } = require('../../services/users/userProvisioning');
+const { loadExistingRetailSubscriptionTerms } = require('../../services/contracts/subscriptionPricingTerms');
+const { STRIPE_RECURRING_OFFER_VERSION } = require('../../services/membershipOffers');
+const { requestExistingRetailRenewal } = require('../../services/existingRetailRenewalPreference');
 
 const router = express.Router();
 
@@ -150,6 +153,21 @@ router.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (req, r
   if (clientError) return res.status(500).json({ error: 'update_client_failed', detail: clientError.message })
   if (!client) return res.status(404).json({ error: 'client_not_found' })
   if (!client.stripe_subscription_id) return res.status(400).json({ error: 'missing_stripe_subscription' })
+  // New terms reuse this control. Old accepted agreements retain the original
+  // path below; a marked-source error never falls through to legacy mutation.
+  try {
+    const terms = await loadExistingRetailSubscriptionTerms({ db: supabaseAdmin, clientId: client.id });
+    if (terms?.offer?.offer_version === STRIPE_RECURRING_OFFER_VERSION) {
+      const renewal = await requestExistingRetailRenewal({ db: supabaseAdmin,
+        stripe: require('../../clients/stripe'), clientId: client.id, agreementId: terms.agreementId,
+        autoRenew, effectsEnabled: process.env.RETAIL_STRIPE_RENEWAL_CONTROL_ENABLED === 'true' });
+      return res.json({ ok: true, renewal: { status: renewal.status,
+        requested_auto_renew: renewal.operation?.requested_auto_renew ?? null,
+        stripe_renewal_billing_cutoff_at: renewal.operation?.billing_cutoff_at ?? null } });
+    }
+  } catch (e) {
+    return res.status(e?.status === 409 ? 409 : 503).json({ error: 'retail_renewal_control_unavailable' });
+  }
   const subscriptionStatus = String(client.subscription_status || '').toLowerCase()
   if (subscriptionStatus !== 'active' && subscriptionStatus !== 'trialing') {
     return res.status(400).json({ error: 'subscription_not_mutable' })

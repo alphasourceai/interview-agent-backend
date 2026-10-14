@@ -8,6 +8,7 @@ const { supabaseAdmin } = require('../../clients/supabase');
 const { readRetailPackageOffer } = require('../membershipPackageCompatibility');
 const { retailTermWindow,STRIPE_RECURRING_OFFER_VERSION } = require('../membershipOffers');
 const {refreshExistingRetailCoverage}=require('../existingRetailRecurringPayment');
+const {reconcileExistingRetailRenewal}=require('../existingRetailRenewalPreference');
 const { legacyContractAction } = require('./legacyContractActions');
 
 function invalidRetailRenewal() {
@@ -149,6 +150,10 @@ async function processContractRenewals(context = {}, dependencies = {}) {
         if (agreementError) throw new Error(agreementError.message || 'renewal_agreement_read_failed');
         if(agreement?.template_snapshot?.package_snapshot?.membership_terms?.offer_version===STRIPE_RECURRING_OFFER_VERSION){
           const result=await refreshExistingRetailCoverage({db,agreementId:agreement.id,clientId:client.id});
+          // Coverage's own transaction has committed; this separate setting
+          // operation cannot cancel owed months or authorize funded access.
+          await reconcileExistingRetailRenewal({db,stripe,agreementId:agreement.id,clientId:client.id,
+            effectsEnabled:process.env.RETAIL_STRIPE_RENEWAL_CONTROL_ENABLED==='true'});
           summary.skipped_no_action+=1;
           items.push({id:client.id,name:client.name||null,action:'paid_coverage_refreshed',detail:result.status,
             contract_end_at_before:oldContractEnd});continue;

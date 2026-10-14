@@ -97,6 +97,7 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
  sql(fs.readFileSync(replacementBillingMigrationPath,'utf8'));
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014165458_retail_existing_recurring_source_read.sql'),'utf8'));
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014181400_retail_existing_recurring_invoice_receipts.sql'),'utf8'));
+ sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014185906_retail_existing_renewal_preference.sql'),'utf8'));
  const changedFunctions=JSON.parse(linkedOriginalFunctions()),actualHash=sql("select md5(prosrc) from pg_proc where proname='apply_public_purchase_billing';");
  assert.equal(actualHash,replacementBillingBodyHash);
  for(const [index,prior] of originalFunctions.entries()){
@@ -246,6 +247,54 @@ async function paidCycleFixture(payment='monthly_installments',role=false,{waitF
 }
 const cycleRecord=(x,p=x.p,s=x.s)=>'select record_retail_existing_paid_period('+[x.f.id,x.f.client,s,p].map(lit).join(',')+');';
 const coverageCall=f=>'select refresh_retail_existing_paid_coverage('+[f.id,f.client].map(lit).join(',')+');';
+
+const renewalCall=(f,s,action,{auto=null,op=null,generation=null,observation=null}={})=>
+ 'select change_retail_existing_renewal('+[f.id,f.client,s,action,auto,op,generation,observation].map(lit).join(',')+');';
+const nativeRenewal=(f,s,action,args)=>JSON.parse(sql('set role service_role;'+renewalCall(f,s,action,args)));
+function renewalProjection(f){const b=f.proof.period,o=f.pkg.membership_terms;
+ return{subscription_id:b.subscription_id,customer_id:b.customer_id,livemode:b.livemode,price_id:b.price_id,
+  subscription_item_id:b.subscription_item_id,unit_amount:o.platform_payment_cents,interval_count:o.stripe_recurrence.interval_count,
+  quantity:1,currency:'usd',billing_cycle_anchor:b.provider_period_start,current_period_start:b.provider_period_start,
+  current_period_end:b.provider_period_end,status:'active',cancel_at_period_end:false,cancel_at:null,test_clock:null};}
+function paidRenewalFixture(months=3,payment='prepaid'){
+ const f=fixture('basic',months,payment,true,true,false,'admin','sales_assisted','buyer@example.invalid',
+  {offerVersion:STRIPE_RECURRING_OFFER_VERSION});record(f);nativeComplete(f);nativeBilling(f);return{f,s:nativeRecurringSource(f)};
+}
+test('NATIVE RENEWAL only guarded field and audit change; browser/direct service denied; owed monthly request stays waiting',opts,()=>{
+ for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments']){
+  const{f,s}=paidRenewalFixture(months,payment),before=JSON.parse(billingState(f)),r=nativeRenewal(f,s,'request',{auto:false});
+  assert.equal(r.status,'waiting');assert.equal(r.operation.requested_auto_renew,false);
+  assert.equal(r.operation.billing_cutoff_at,anchoredMonthInstant(new Date(f.proof.period.provider_period_start*1000).toISOString(),months));
+  const after=JSON.parse(billingState(f));assert.equal(after.client.auto_renew,true);
+  delete after.client.retail_renewal_change;delete before.client.retail_renewal_change;assert.deepEqual(after,before);
+  const observed=renewalProjection(f);
+  if(payment==='monthly_installments')denied('set role service_role;'+renewalCall(f,s,'claim',{
+   op:r.operation.operation_id,generation:0,observation:observed}),/retail_renewal_arm_denied/);
+  denied(`set role authenticated;update clients set retail_renewal_change='{}'::jsonb where id=${lit(f.client)};`,/permission denied|retail_renewal_writer_required/);
+  denied(`set role service_role;update clients set retail_renewal_change=null where id=${lit(f.client)};`,/retail_renewal_writer_required/);
+  denied(`set role service_role;update clients set auto_renew=false where id=${lit(f.client)};`,/retail_renewal_writer_required/);
+  const opposite=nativeRenewal(f,s,'request',{auto:true});assert.notEqual(opposite.operation.operation_id,r.operation.operation_id);
+  assert.equal(opposite.status,'waiting');assert.equal(sql(`select count(*) from billing_events where client_id=${lit(f.client)} and type='retail.renewal.requested';`),'2');
+ }
+});
+test('NATIVE RENEWAL claim/unknown replay keeps identity; opposite cannot replace; exact readback commits preference only',opts,()=>{
+ const{f,s}=paidRenewalFixture(),obs=renewalProjection(f),before=JSON.parse(billingState(f));
+ const r=nativeRenewal(f,s,'request',{auto:false}),id=r.operation.operation_id;
+ const c=nativeRenewal(f,s,'claim',{op:id,generation:0,observation:obs});assert.equal(c.operation.generation,1);
+ const a={op:id,generation:1,observation:obs};assert.equal(nativeRenewal(f,s,'send',a).status,'claimed');
+ assert.equal(nativeRenewal(f,s,'request',{auto:true}).operation.operation_id,id);
+ assert.equal(nativeRenewal(f,s,'claim',{op:id,generation:1,observation:obs}).status,'busy');
+ assert.equal(nativeRenewal(f,s,'unknown',{op:id,generation:1}).status,'unknown');
+ const next=nativeRenewal(f,s,'claim',{op:id,generation:1,observation:obs});assert.equal(next.operation.generation,2);
+ denied('set role service_role;'+renewalCall(f,s,'finish',{op:id,generation:1,observation:obs}),/retail_renewal_identity_denied/);
+ denied('set role service_role;'+renewalCall(f,s,'finish',{op:id,generation:2,observation:obs}),/retail_renewal_readback_denied/);
+ const proof={...obs,cancel_at_period_end:true,cancel_at:obs.current_period_end};
+ const result=nativeRenewal(f,s,'finish',{op:id,generation:2,observation:proof});assert.equal(result.status,'applied');
+ const after=JSON.parse(billingState(f));assert.equal(after.client.auto_renew,false);assert.equal(after.client.cancel_at_term_end,true);
+ after.client.auto_renew=before.client.auto_renew;after.client.cancel_at_term_end=before.client.cancel_at_term_end;
+ delete before.client.retail_renewal_change;delete after.client.retail_renewal_change;assert.deepEqual(after,before);
+ assert.equal(sql(`select count(distinct stripe_event_id)=count(*) from billing_events where client_id=${lit(f.client)};`),'t');
+});
 test('NATIVE CYCLE actual original writer -> recurring receipt -> idempotent coverage preserves other records',opts,async()=>{
  const x=await paidCycleFixture('monthly_installments',true),before=billingState(x.f),original=row(x.f).retail_funding_receipt;
  const r=JSON.parse(sql('set role service_role;'+cycleRecord(x)));assert.equal(r.status,'recorded');

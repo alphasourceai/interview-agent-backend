@@ -23,6 +23,7 @@ const { markPoolFailed, markPoolPaid } = require('../../services/interviewPool')
 const { loadExistingRetailSubscriptionTerms, assertExistingRetailSubscription } = require('../../services/contracts/subscriptionPricingTerms');
 const {STRIPE_RECURRING_OFFER_VERSION}=require('../../services/membershipOffers');
 const {completeExistingRetailRecurringPayment,refreshExistingRetailCoverage,classifyExistingRetailRecurringEvent}=require('../../services/existingRetailRecurringPayment');
+const {reconcileExistingRetailRenewal}=require('../../services/existingRetailRenewalPreference');
 const { assertExistingRetailFundingSource } = require('../../services/existingRetailCheckoutFunding');
 const { readExistingRetailActivationFunding } = require('../../services/existingRetailActivationFunding');
 const { enterprisePoolProofRequired, assertExistingEnterprisePoolActivationAvailableFromDb } = require('../../services/existingEnterprisePoolActivationHold');
@@ -900,6 +901,8 @@ router.post('/', async (req, res) => {
         await refreshExistingRetailCoverage({db:supabaseAdmin,agreementId,clientId});
       }
       if(event.type.startsWith('invoice.'))await syncBillingInvoiceFromStripeEvent(eventObject,request_id);
+      await reconcileExistingRetailRenewal({db:supabaseAdmin,stripe,agreementId,clientId,
+        effectsEnabled:process.env.RETAIL_STRIPE_RENEWAL_CONTROL_ENABLED==='true'});
       await markProcessed(true,null);return res.status(200).json({ok:true});
     }
     if (existingEnterprisePaymentEvent?.action === 'held') {

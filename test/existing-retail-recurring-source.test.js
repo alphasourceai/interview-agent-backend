@@ -69,10 +69,10 @@ test('DB/native errors normalized and no fallback to source tables or activation
     await assert.rejects(read(f.options), e => e.code === 'retail_recurring_source_unknown' && e.status === 503 && !e.message.includes('PRIVATE'));
   }
 });
-test('native source adapter importers remain the SDK census and existing funding adapter', () => {
+test('native source adapter importers are confined to funding, census and setting-only renewal', () => {
   function walk(dir) { return fs.readdirSync(dir, { withFileTypes: true }).flatMap(e => e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]); }
   const importers = walk(path.join(__dirname, '../src')).filter(p => /\.(js|cjs|mjs|ts|tsx)$/.test(p)
     && path.basename(p) !== 'existingRetailRecurringSource.js' && fs.readFileSync(p, 'utf8').includes('existingRetailRecurringSource'));
   assert.deepEqual(importers.map(p => path.relative(path.join(__dirname, '../src'), p)),
-    ['services/existingRetailCheckoutFunding.js','services/existingRetailRecurringCensus.js']);
+    ['services/existingRetailCheckoutFunding.js','services/existingRetailRecurringCensus.js','services/existingRetailRenewalPreference.js']);
 });
