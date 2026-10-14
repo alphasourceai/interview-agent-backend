@@ -1,5 +1,5 @@
 'use strict';
-// UNMOUNTED: trusted existing SDK/receipt -> SAME native original billing.
+// Internal trusted existing SDK/receipt -> SAME native original billing.
 // Historical financial completion is never current access/Auth/renewal proof.
 const { isDeepStrictEqual } = require('node:util');
 const { snapshotStripeSdkData } = require('./enterprisePoolPaymentProof');

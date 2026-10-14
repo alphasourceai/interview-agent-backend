@@ -671,7 +671,8 @@ async function ensureBuyerAccountSetup({
   ensureRecovery,
   sendRecoveryEmail,
   assertFence = async () => {},
-  activationClaimKey = null
+  activationClaimKey = null,
+  retailAdminMemberTail = null
 }) {
   const buyerEmail = lowerEmail(intent?.buyer_email || agreement?.admin_email);
   if (!buyerEmail) {
@@ -738,7 +739,9 @@ async function ensureBuyerAccountSetup({
 
   await assertFence();
   let membership;
-  if (intent?.id && activationClaimKey) {
+  if (retailAdminMemberTail) {
+    membership = await retailAdminMemberTail.ensureMember({ userId, name: buyerName });
+  } else if (intent?.id && activationClaimKey) {
     const { data, error } = await db.rpc('ensure_public_purchase_buyer_member', {
       p_intent_id: intent.id,
       p_claim_key: activationClaimKey,
@@ -854,7 +857,7 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
 
   const { data: agreement, error: agreementErr } = await db
     .from('membership_agreements')
-    .select('id,client_id,status,is_current,checkout_status,checkout_session_id,checkout_paid_at,primary_admin_name,admin_email,client_legal_name,dba_trade_name,membership_tier,billing_option,auto_renew,template_snapshot,superseded_by_agreement_id')
+    .select('id,client_id,status,is_current,checkout_status,checkout_session_id,checkout_paid_at,primary_admin_name,admin_email,client_legal_name,dba_trade_name,membership_tier,billing_option,auto_renew,template_snapshot,template_version,retail_funding_receipt,retail_admin_billing_receipt,superseded_by_agreement_id')
     .eq('id', agreementId)
     .maybeSingle();
   if (agreementErr) throw new Error(agreementErr.message || 'Agreement lookup failed');
@@ -895,7 +898,13 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
       || funding.customerId !== options.fallbackCustomerId) {
       const e = new Error('retail_funding_source_required'); e.code = e.message; throw e;
     }
-    const original = cleanText(agreement.checkout_paid_at || intent?.activated_at || options.paidAt);
+    // PostgreSQL timestamptz readback may use an explicit offset rather than Z.
+    // Normalize only a persisted first-payment instant; the provider proof stays
+    // strict and this must never substitute the retry's event time or now.
+    const persistedOriginal = cleanText(agreement.checkout_paid_at || intent?.activated_at);
+    let original = persistedOriginal || cleanText(options.paidAt);
+    if (persistedOriginal && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/.test(persistedOriginal)
+      && Number.isFinite(Date.parse(persistedOriginal))) original = new Date(persistedOriginal).toISOString();
     if (!original) { const e = new Error('retail_original_payment_time_required'); e.code = e.message; throw e; }
     retailTermWindow({ originalStart:original, commitmentMonths:retailOffer.commitment_months });
     paidAt = original;
@@ -919,7 +928,12 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     throw err;
   }
 
-  const assertFence = options.assertActivationFence || (async () => {});
+  const originalFence = options.assertActivationFence || (async () => {});
+  let retailAdminMemberTail = null;
+  const assertFence = async () => {
+    await originalFence();
+    if (retailAdminMemberTail) await retailAdminMemberTail.assertReady();
+  };
   const claimKey = cleanText(options.activationClaimKey);
   if (intent?.id && cleanText(intent.protocol) === 'fenced_v2' && !claimKey) {
     const error = new Error('Fenced public purchase requires an activation claim');
@@ -982,7 +996,7 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
   const agreementAlreadyPaid = cleanText(agreement.checkout_status).toLowerCase() === 'paid';
   // Replayed checkout events and later invoices must never move the original
   // sale's paid/activated date into another payroll period.
-  const activationPaidAt = cleanText(agreement.checkout_paid_at || intent?.activated_at) || paidAt;
+  const activationPaidAt = retailOffer ? paidAt : cleanText(agreement.checkout_paid_at || intent?.activated_at) || paidAt;
   const clientAlreadyActive = isLiveClientActivationState(existingClientState);
   const parentGuard = await requireParent(db, clientId, {
     route: 'public_purchase_webhook_activation',
@@ -1183,6 +1197,27 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     }
   }
 
+  let responsePlanSettingsPayload;
+  let firstRoleCreditStatus;
+  // The original first-funding chooser returns its fresh proof, not a replay
+  // flag. Enrollment is the PERSISTED native receipt, never a caller flag.
+  const nativeRetailAdmin = retailOffer && !intent?.id && agreement.retail_funding_receipt;
+  if (nativeRetailAdmin) {
+    if (agreement.template_version !== 'membership_agreement_retail_terms_v2' || options.retailFunding?.sourceIntentId !== null
+      || claimKey || getTemplateSnapshot(agreement).purchase_intent
+      || ![undefined, null, 'admin'].includes(getTemplateSnapshot(agreement).source)) {
+      const error = new Error('retail_admin_member_tail_source_unknown'); error.code = error.message; throw error;
+    }
+    const { prepareExistingRetailAdminMemberTail } = require('./existingRetailAdminMemberTail');
+    retailAdminMemberTail = await prepareExistingRetailAdminMemberTail({ db, stripe: options.stripe, agreementId,
+      eventSessionId: checkoutSessionId, eventSubscriptionId: options.subscription?.id || options.fallbackSubscriptionId || null,
+      eventInvoiceId: options.eventInvoiceId || null, eventLivemode: options.eventLivemode, assertFence: originalFence });
+    if (!retailAdminMemberTail) throw new Error('retail_admin_member_tail_source_unknown');
+    const { billing_model: initialModel, ...initialSettings } = retailAdminMemberTail.billing.receipt.plan_initial;
+    responsePlanSettingsPayload = initialSettings; // Accepted INITIAL settings, never a mutable settings write on replay.
+    firstRoleCreditStatus = retailAdminMemberTail.billing.receipt.credit_id
+      ? (retailAdminMemberTail.billing.status === 'applied' ? 'created' : 'already_created') : 'not_selected';
+  } else {
   const clientActivationPayload = buildClientActivationPayload({
     agreement,
     subscription: options.subscription,
@@ -1209,6 +1244,7 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
       packageSnapshot
     });
   const { billing_model: explicitBillingModel = null, ...planSettingsPayload } = canonicalPlanSettings || {};
+  responsePlanSettingsPayload = planSettingsPayload;
   // Canonical retail features are initial settings, not permission to replace
   // an administrator's sticky model on an unfenced retry. As for Enterprise,
   // recordExplicitBillingModel sets it only where the existing column is null.
@@ -1226,7 +1262,7 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
   }
 
   await assertFence();
-  const firstRoleCreditStatus = await createFirstRolePrepayCredit({
+  firstRoleCreditStatus = await createFirstRolePrepayCredit({
     db,
     agreement,
     intent,
@@ -1238,6 +1274,7 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     nowIso: activationPaidAt,
     logger
   });
+  }
 
   await assertFence();
   const setup = await ensureBuyerAccountSetup({
@@ -1250,7 +1287,8 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     logger,
     ensureRecovery,
     sendRecoveryEmail,
-    assertFence
+    assertFence,
+    retailAdminMemberTail
   });
   let welcomeEmailStatus = 'not_sent';
   const buyerEmail = lowerEmail(intent?.buyer_email || agreement?.admin_email);
@@ -1318,7 +1356,7 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     client_id: clientId,
     plan_key: planKey,
     billing_interval: billingInterval,
-    plan_settings: planSettingsPayload,
+    plan_settings: responsePlanSettingsPayload,
     member_status: setup.member_status,
     member_role: setup.member_role,
     auth_status: setup.auth_status,
