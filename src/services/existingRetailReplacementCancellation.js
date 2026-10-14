@@ -83,7 +83,15 @@ async function execute(options = {}) {
     if (!canceled) {
       if (!apiVersion(stripe)) fail('retail_replacement_cancel_api_changed');
       let fresh;
-      try { fresh = snap(await stripe.subscriptions.retrieve(request.old_subscription_id)); }
+      try {
+        // The shared Stripe client allows one network retry by default. Keep
+        // this confirmation to exactly one bounded request after an unknown
+        // DELETE outcome; a second GET could otherwise race another mutation.
+        fresh = snap(await stripe.subscriptions.retrieve(request.old_subscription_id, {}, {
+          maxNetworkRetries: 0,
+          timeout: TIMEOUT_PROFILES.mutation.requestMs
+        }));
+      }
       catch (_) { fail('retail_replacement_cancel_unconfirmed'); }
       await assertFence();
       canceled = canceledProjection(fresh, request);

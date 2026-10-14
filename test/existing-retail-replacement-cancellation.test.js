@@ -31,6 +31,7 @@ test('executes one bounded, no-retry cancellation and records the native observa
  const h=harness();const result=await execute(h.options);
  assert.deepEqual(result,{status:'observed'});assert.equal(h.calls.cancel.length,1);assert.deepEqual(h.calls.cancel[0][0],request.old_subscription_id);
  assert.deepEqual(h.calls.cancel[0][1],{invoice_now:false,prorate:false});assert.equal(h.calls.cancel[0][2].maxNetworkRetries,0);
+ assert.equal(h.calls.cancel[0][2].timeout,12000);
  assert.equal(h.calls.retrieve.length,0);assert.equal(h.calls.rpc.length,1);assert.equal(h.calls.rpc[0][0],'record_retail_existing_replacement_canceled');
  assert.ok(h.calls.fence>=3);
 });
@@ -38,6 +39,7 @@ test('executes one bounded, no-retry cancellation and records the native observa
 test('ambiguous DELETE result is resolved by exactly one fresh GET; it is never blindly retried',async()=>{
  const h=harness({cancelError:new Error('provider detail must not escape'),fresh:old('canceled')});
  assert.deepEqual(await execute(h.options),{status:'observed'});assert.equal(h.calls.cancel.length,1);assert.equal(h.calls.retrieve.length,1);assert.equal(h.calls.rpc.length,1);
+ assert.deepEqual(h.calls.retrieve[0],[request.old_subscription_id,{}, {maxNetworkRetries:0,timeout:12000}]);
 });
 
 test('unconfirmed provider state remains retryable and writes no cancellation fact',async()=>{
