@@ -21,7 +21,8 @@ const { applyUsageToInvoice } = require('../../services/usageBilling');
 const { fenceAcceptedEnterpriseUsageWriter } = require('../../services/acceptedEnterpriseUsageTerms');
 const { markPoolFailed, markPoolPaid } = require('../../services/interviewPool');
 const { loadExistingRetailSubscriptionTerms, assertExistingRetailSubscription } = require('../../services/contracts/subscriptionPricingTerms');
-const { readExistingRetailCheckoutFunding, assertExistingRetailFundingSource } = require('../../services/existingRetailCheckoutFunding');
+const { assertExistingRetailFundingSource } = require('../../services/existingRetailCheckoutFunding');
+const { readExistingRetailActivationFunding } = require('../../services/existingRetailActivationFunding');
 const { enterprisePoolProofRequired, assertExistingEnterprisePoolActivationAvailableFromDb } = require('../../services/existingEnterprisePoolActivationHold');
 const router = express.Router();
 
@@ -645,17 +646,19 @@ async function markAgreementCheckoutPaid(agreementId, options = {}) {
       });
       return { ...result, financial_completion: enterprisePayment };
     }
-    const funding = await readExistingRetailCheckoutFunding({
+    const funding = await readExistingRetailActivationFunding({
       db: fencedDb, stripe: options.stripe || stripe, agreementId: normalizedAgreementId,
       intentId: claim.intentId || null, eventSessionId: options.checkoutSessionId || null,
       eventSubscriptionId: pickId(options.subscription?.id) || options.fallbackSubscriptionId || null,
-      eventInvoiceId: options.invoiceId || null, eventLivemode: options.eventLivemode, assertFence
+      eventInvoiceId: options.invoiceId || null, eventLivemode: options.eventLivemode, assertFence,
+      claimKey: claim.claimed ? claim.key : null
     });
     // Enterprise prices are per client and travel on the subscription, so they are
     // read here with the same builder the subscription events use. Null for any
     // other tier, which takes its package defaults.
     const enterprisePlanSettings = buildEnterprisePlanSettingsForActivation(options);
-    if(funding){await assertFence();await assertExistingRetailFundingSource({db:fencedDb,funding});}
+    if(funding){await assertFence();await assertExistingRetailFundingSource({db:fencedDb,
+      funding:funding.receiptReplay?{...funding,replay:false}:funding});}
     const result = await activate({
       agreementId: normalizedAgreementId,
       checkoutSessionId: funding?.checkoutSessionId || options.checkoutSessionId || null,

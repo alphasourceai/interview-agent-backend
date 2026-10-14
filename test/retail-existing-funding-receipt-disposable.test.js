@@ -11,7 +11,7 @@ function run(q){return cp.spawnSync('/opt/homebrew/opt/postgresql@17/bin/psql',[
 function sql(q){const r=run(q);assert.equal(r.status,0,r.stderr);return r.stdout.trim();}
 function denied(q,pattern=/retail_funding_/){const r=run(q);assert.notEqual(r.status,0);assert.match(r.stderr,pattern);}
 const acl=()=>sql("select jsonb_agg(jsonb_build_array(relname,relacl::text,relrowsecurity) order by relname) from pg_class where oid in('clients'::regclass,'membership_agreements'::regclass,'public_purchase_intents'::regclass,'billing_customers'::regclass);");
-let priorAcl,legacyBefore,priorFunctions;const legacyId=crypto.randomUUID();
+let priorAcl,legacyBefore,priorFunctions,historicalV2,historicalBefore,historicalIntentBefore;const legacyId=crypto.randomUUID();
 const functionCatalog=()=>sql("select jsonb_agg(jsonb_build_array(proname,md5(prosrc),provolatile,prosecdef,proconfig,proowner::regrole::text,proacl::text) order by proname) from pg_proc where proname in ('retail_existing_funding_context','record_retail_existing_funding');");
 before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/tmp\/alphascreen-retail-funding-pg\.[A-Za-z0-9]+$/);
  assert.equal(process.env.PGPORT,'55456');assert.equal(process.env.PGUSER,'postgres');assert.equal(process.env.PGDATABASE,'postgres');assert.equal(process.env.PGPASSWORD,undefined);
@@ -42,6 +42,12 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
  }finally{sql(customerIndex+';');}
  sql(amendment);
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014000816_retail_existing_funding_replay_read.sql'),'utf8'));
+ // Explicit synthetic already-paid V2 cohort BEFORE the new admission gate,
+ // using actual original completion. Never infer an original period/backfill.
+ historicalV2=fixture('basic',3,'monthly_installments');nativeComplete(historicalV2);
+ historicalBefore=sql(`select to_jsonb(a) from membership_agreements a where id=${lit(historicalV2.id)};`);
+ historicalIntentBefore=sql(`select to_jsonb(i) from public_purchase_intents i where id=${lit(historicalV2.intent)};`);
+ sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014001920_retail_existing_receipt_activation_admission.sql'),'utf8'));
 });
 function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false){
  const id=crypto.randomUUID(),client=crypto.randomUUID(),intent=crypto.randomUUID(),key='SYNTHETIC_CLAIM_'+crypto.randomUUID(),suffix=id.replaceAll('-','');
@@ -86,11 +92,39 @@ const row=f=>JSON.parse(sql(`select to_jsonb(a) from membership_agreements a whe
 const readCall=(f,key=f.key,source=f.source)=>`select read_retail_existing_funding(${[f.id,f.client,key,source].map(lit).join(',')});`;
 const readReceipt=f=>JSON.parse(sql('set role service_role;'+readCall(f)));
 function nativeComplete(f){
- const start=f.proof.period.paid_at.slice(0,10),end=anchoredMonthInstant(f.proof.period.paid_at,f.pkg.membership_terms.commitment_months).slice(0,10);
- const r=JSON.parse(sql('set role service_role;select complete_public_purchase_activation('+[
-  f.id,f.key,f.proof.period.paid_at,f.proof.period.checkout_session_id,f.client,false,f.pkg.plan_key,f.pkg.billing_cadence,start,end].map(lit).join(',')+');'));
- assert.equal(r.status,'completed');return r;
+ const r=JSON.parse(sql('set role service_role;'+completeCall(f)));assert.equal(r.status,'completed');return r;
 }
+function completeCall(f){
+ const start=f.proof.period.paid_at.slice(0,10),end=anchoredMonthInstant(f.proof.period.paid_at,f.pkg.membership_terms.commitment_months).slice(0,10);
+ return 'select complete_public_purchase_activation('+[
+  f.id,f.key,f.proof.period.paid_at,f.proof.period.checkout_session_id,f.client,false,f.pkg.plan_key,f.pkg.billing_cadence,start,end].map(lit).join(',')+');';
+}
+test('fresh retail complete/direct paid/activated writes require a prior receipt and leave all state unchanged',opts,()=>{
+ const f=fixture(),a=row(f),i=sql(`select to_jsonb(i) from public_purchase_intents i where id=${lit(f.intent)};`),c=sql(`select to_jsonb(c) from clients c where id=${lit(f.client)};`);
+ denied('set role service_role;'+completeCall(f),/retail_funding_receipt_required/);
+ denied(`set role service_role;update membership_agreements set checkout_paid_at=${lit(f.proof.period.paid_at)} where id=${lit(f.id)};`,/retail_funding_receipt_required/);
+ denied(`set role service_role;update public_purchase_intents set activated_at=${lit(f.proof.period.paid_at)} where id=${lit(f.intent)};`,/retail_funding_receipt_required/);
+ assert.deepEqual(row(f),a);assert.equal(sql(`select to_jsonb(i) from public_purchase_intents i where id=${lit(f.intent)};`),i);
+ assert.equal(sql(`select to_jsonb(c) from clients c where id=${lit(f.client)};`),c);
+ record(f);assert.equal(nativeComplete(f).status,'completed');
+});
+test('migration preserves previously paid V2 without receipt; original completion replay changes only audit timestamps',opts,()=>{
+ assert.equal(sql(`select to_jsonb(a) from membership_agreements a where id=${lit(historicalV2.id)};`),historicalBefore);
+ assert.equal(sql(`select to_jsonb(i) from public_purchase_intents i where id=${lit(historicalV2.intent)};`),historicalIntentBefore);
+ assert.equal(row(historicalV2).retail_funding_receipt,null);nativeComplete(historicalV2);
+ assert.equal(row(historicalV2).retail_funding_receipt,null);
+ const beforeA=JSON.parse(historicalBefore),afterA=row(historicalV2);
+ const beforeI=JSON.parse(historicalIntentBefore),afterI=JSON.parse(sql(`select to_jsonb(i) from public_purchase_intents i where id=${lit(historicalV2.intent)};`));
+ for(const [before,after] of [[beforeA,afterA],[beforeI,afterI]]){
+  assert.ok(Date.parse(after.updated_at)>=Date.parse(before.updated_at));
+  delete before.updated_at;delete after.updated_at;assert.deepEqual(after,before);
+ }
+});
+test('admission migration rejects reapplication without changing table ACL/RLS or existing historical row',opts,()=>{
+ const before=sql(`select to_jsonb(a) from membership_agreements a where id=${lit(historicalV2.id)};`);
+ denied(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014001920_retail_existing_receipt_activation_admission.sql'),'utf8'),/retail_funding_admission_prerequisite_drift/);
+ assert.equal(acl(),priorAcl);assert.equal(sql(`select to_jsonb(a) from membership_agreements a where id=${lit(historicalV2.id)};`),before);
+});
 test('full schema migration preserves old table ACL/RLS and cannot overwrite prior application',opts,()=>{
  assert.equal(acl(),priorAcl);denied(fs.readFileSync(migration,'utf8'),/retail_funding_schema_drift/);
  assert.equal(sql(`select to_jsonb(a)-'retail_funding_receipt' from membership_agreements a where id=${lit(legacyId)};`),legacyBefore);
