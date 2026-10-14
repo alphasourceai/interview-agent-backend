@@ -41,7 +41,7 @@ begin
   or p->'billing_cycle_anchor' is distinct from b->'provider_period_start'
   or p->'unit_amount' is distinct from o->'platform_payment_cents'
   or p->'interval_count' is distinct from o->'stripe_recurrence'->'interval_count' or p->'quantity' is distinct from '1'::jsonb
-  or p->>'status' is null or p->>'status' not in('active','past_due','unpaid')
+  or p->>'status' is null or p->>'status' not in('active','past_due','unpaid','canceled')
   or jsonb_typeof(p->'cancel_at_period_end') is distinct from 'boolean'
   or(p->'test_clock'<>'null'::jsonb and (p->'livemode'='true'::jsonb or jsonb_typeof(p->'test_clock')<>'string'))
   then return false;end if;
@@ -68,7 +68,7 @@ create function public.change_retail_existing_renewal(p_agreement uuid,p_client 
  p_auto_renew boolean,p_operation uuid,p_generation integer,p_observation jsonb)
 returns jsonb language plpgsql volatile security invoker set search_path=pg_catalog set lock_timeout='10s' as $$
 declare c public.clients;s jsonb;o jsonb;b jsonb;r jsonb;prior jsonb;clock timestamptz;cutoff timestamptz;
- months integer;step integer;status text;fact text;now_text text;operation uuid;generation integer;obs jsonb;
+ months integer;step integer;status text;fact text;now_text text;operation uuid;generation integer;obs jsonb;matches boolean;
 begin
  if current_user<>'service_role' then raise exception 'retail_renewal_server_only';end if;
  if p_action is null or p_action not in('read','request','claim','send','repair','unknown','finish','hold')
@@ -91,8 +91,9 @@ begin
  if p_action='request' then
   if p_auto_renew is null or p_operation is not null or p_generation is not null or p_observation is not null
    then raise exception 'retail_renewal_request_denied';end if;
-  if r is not null and (r->'requested_auto_renew'=to_jsonb(p_auto_renew)
-    or r->>'status' in('claimed','unknown','held'))
+  if r is not null and (r->>'status' in('claimed','unknown')
+    or(r->>'status'='held' and(r->>'billing_cutoff_at')::timestamptz>clock)
+    or(r->>'status'<>'held' and r->'requested_auto_renew'=to_jsonb(p_auto_renew)))
    then return jsonb_build_object('status',r->>'status','operation',r);end if;
   months:=(o->>'commitment_months')::integer;
   step:=greatest(1,((extract(year from clock)::integer-extract(year from to_timestamp((b->>'provider_period_start')::bigint))::integer)*12
@@ -112,34 +113,40 @@ begin
   cutoff:=(r->>'billing_cutoff_at')::timestamptz;
   if status='applied' then return jsonb_build_object('status',status,'operation',r);end if;
   if p_action='hold' then
-   if status='claimed' and(r->>'lease_until')::timestamptz>clock then
-    return jsonb_build_object('status','busy','operation',r);end if;
+   -- Exact generation is required above, so only the current claimant can
+   -- terminally hold its known rejection. Do not lose known 4xx in busy state.
    r:=jsonb_set(r,'{status}','"held"');fact:='held';
   elsif p_action='claim' then
    if status='held' then return jsonb_build_object('status',status,'operation',r);end if;
    if status in('claimed','unknown') and(r->>'lease_until')::timestamptz>clock then
     return jsonb_build_object('status','busy','operation',r);end if;
+   matches:=case when r->'requested_auto_renew'='true'::jsonb then
+    p_observation->>'status'<>'canceled' and p_observation->'cancel_at_period_end'='false'::jsonb and p_observation->'cancel_at'='null'::jsonb
+    else p_observation->'cancel_at_period_end'='true'::jsonb and to_timestamp((p_observation->>'cancel_at')::bigint)=cutoff end;
    if not coalesce(public.retail_existing_renewal_projection_valid(p_observation,s),false)
-    or p_observation->>'status'<>'active' or to_timestamp((p_observation->>'current_period_end')::bigint)<>cutoff or cutoff<=clock
+    or p_observation->'test_clock' is distinct from 'null'::jsonb
+    or to_timestamp((p_observation->>'current_period_end')::bigint)<>cutoff
+    or(not coalesce(matches,false) and(p_observation->>'status'<>'active' or cutoff<=clock))
     or(p_observation->'cancel_at'<>'null'::jsonb and to_timestamp((p_observation->>'cancel_at')::bigint)<>cutoff)
     then raise exception 'retail_renewal_arm_denied';end if;
-   if r->'sent_at'<>'null'::jsonb and ((r->'observation')-'cancel_at'-'cancel_at_period_end')
-    is distinct from(p_observation-'cancel_at'-'cancel_at_period_end') then raise exception 'retail_renewal_provider_changed';end if;
+   if r->'sent_at'<>'null'::jsonb and ((r->'observation')-'cancel_at'-'cancel_at_period_end'-'status')
+    is distinct from(p_observation-'cancel_at'-'cancel_at_period_end'-'status') then raise exception 'retail_renewal_provider_changed';end if;
    r:=r||jsonb_build_object('status','claimed','generation',generation+1,'lease_until',clock+interval '120 seconds','observation',p_observation);
    fact:='claim-'||(generation+1)::text;
   else
-   if status<>'claimed' or(r->>'lease_until')::timestamptz<=clock or cutoff<=clock
+   if status<>'claimed' or(r->>'lease_until')::timestamptz<=clock or(p_action<>'finish' and cutoff<=clock)
     then raise exception 'retail_renewal_claim_expired';end if;
    if p_action='unknown' then
     r:=r||jsonb_build_object('status','unknown','lease_until',clock);fact:='unknown-'||generation::text;
    else
     obs:=p_observation;
     if not coalesce(public.retail_existing_renewal_projection_valid(obs,s),false)
-     or obs->>'status'<>'active' or to_timestamp((obs->>'current_period_end')::bigint)<>cutoff
+     or(p_action<>'finish' and obs->>'status'<>'active') or obs->'test_clock' is distinct from 'null'::jsonb
+     or to_timestamp((obs->>'current_period_end')::bigint)<>cutoff
      or(obs-'cancel_at'-'cancel_at_period_end') is distinct from((r->'observation')-'cancel_at'-'cancel_at_period_end')
      then raise exception 'retail_renewal_provider_changed';end if;
     if p_action='finish' then
-     if (r->'requested_auto_renew'='true'::jsonb and (obs->'cancel_at_period_end'<>'false'::jsonb or obs->'cancel_at'<>'null'::jsonb))
+     if (r->'requested_auto_renew'='true'::jsonb and (obs->>'status'='canceled' or obs->'cancel_at_period_end'<>'false'::jsonb or obs->'cancel_at'<>'null'::jsonb))
       or(r->'requested_auto_renew'='false'::jsonb and(obs->'cancel_at_period_end'<>'true'::jsonb
        or to_timestamp((obs->>'cancel_at')::bigint) is distinct from cutoff)) then raise exception 'retail_renewal_readback_denied';end if;
      r:=r||jsonb_build_object('status','applied','observation',obs,'completed_at',now_text,'lease_until',null);fact:='applied';
@@ -147,7 +154,6 @@ begin
      if obs->'cancel_at'<>'null'::jsonb and to_timestamp((obs->>'cancel_at')::bigint)<>cutoff
       then raise exception 'retail_renewal_foreign_cancel';end if;
      if r->'sent_at'='null'::jsonb then r:=jsonb_set(r,'{sent_at}',to_jsonb(now_text));end if;
-     if clock-(r->>'sent_at')::timestamptz>=interval '23 hours' then raise exception 'retail_renewal_key_expired';end if;
      fact:='send-'||generation::text;
     elsif p_action='repair' then
      if r->'requested_auto_renew'<>'true'::jsonb or r->'sent_at'='null'::jsonb
@@ -178,8 +184,8 @@ begin
  end if;
  -- An audit-identity wait must not let a setting reservation cross B or its
  -- claim lease. Any failure rolls the row/audit writes back together.
- if p_action in('claim','send','repair','finish') and ((r->>'billing_cutoff_at')::timestamptz<=clock_timestamp()
-  or(p_action<>'finish' and(r->>'lease_until')::timestamptz<=clock_timestamp()))
+ if p_action in('claim','send','repair') and ((p_action<>'claim' and(r->>'billing_cutoff_at')::timestamptz<=clock_timestamp())
+  or(r->>'lease_until')::timestamptz<=clock_timestamp())
   then raise exception 'retail_renewal_claim_expired';end if;
  return jsonb_build_object('status',r->>'status','operation',r);
 end $$;

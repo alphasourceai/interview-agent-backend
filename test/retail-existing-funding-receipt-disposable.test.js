@@ -295,6 +295,34 @@ test('NATIVE RENEWAL claim/unknown replay keeps identity; opposite cannot replac
  delete before.client.retail_renewal_change;delete after.client.retail_renewal_change;assert.deepEqual(after,before);
  assert.equal(sql(`select count(distinct stripe_event_id)=count(*) from billing_events where client_id=${lit(f.client)};`),'t');
 });
+test('NATIVE RENEWAL actual elapsed B still permits proven lost-ACK finish with no new send or access rewrite',opts,async()=>{
+ const f=fixture('basic',3,'prepaid',true,true,false,'admin','sales_assisted','buyer@example.invalid',
+  {offerVersion:STRIPE_RECURRING_OFFER_VERSION,nearCycle:true});record(f);nativeComplete(f);nativeBilling(f);
+ const s=nativeRecurringSource(f),obs=renewalProjection(f),r=nativeRenewal(f,s,'request',{auto:false}),id=r.operation.operation_id;
+ assert.equal(Date.parse(r.operation.billing_cutoff_at)/1000,obs.current_period_end);
+ nativeRenewal(f,s,'claim',{op:id,generation:0,observation:obs});nativeRenewal(f,s,'send',{op:id,generation:1,observation:obs});
+ nativeRenewal(f,s,'unknown',{op:id,generation:1});
+ await new Promise(resolve=>setTimeout(resolve,Math.max(0,obs.current_period_end*1000-Date.now()+100)));
+ const before=JSON.parse(billingState(f)),known={...obs,status:'canceled',cancel_at_period_end:true,cancel_at:obs.current_period_end};
+ const resumed=nativeRenewal(f,s,'claim',{op:id,generation:1,observation:known});assert.equal(resumed.operation.generation,2);
+ denied('set role service_role;'+renewalCall(f,s,'send',{op:id,generation:2,observation:known}),/retail_renewal_claim_expired/);
+ assert.equal(nativeRenewal(f,s,'finish',{op:id,generation:2,observation:known}).status,'applied');
+ const after=JSON.parse(billingState(f));assert.equal(after.client.auto_renew,false);
+ for(const key of ['auto_renew','cancel_at_term_end','retail_renewal_change'])delete after.client[key],delete before.client[key];
+ assert.deepEqual(after,before);
+});
+test('NATIVE RENEWAL explicit request after held B creates a new operation; native test-clock arm refused',opts,async()=>{
+ const f=fixture('basic',3,'prepaid',false,true,false,'admin','sales_assisted','buyer@example.invalid',
+  {offerVersion:STRIPE_RECURRING_OFFER_VERSION,nearCycle:true});record(f);nativeComplete(f);nativeBilling(f);
+ const s=nativeRecurringSource(f),obs=renewalProjection(f),r=nativeRenewal(f,s,'request',{auto:false}),id=r.operation.operation_id;
+ denied('set role service_role;'+renewalCall(f,s,'claim',{op:id,generation:0,observation:{...obs,test_clock:'clock_SYNTHETIC'}}),/retail_renewal_arm_denied/);
+ assert.equal(nativeRenewal(f,s,'hold',{op:id,generation:0}).status,'held');
+ assert.equal(nativeRenewal(f,s,'request',{auto:true}).operation.operation_id,id);
+ await new Promise(resolve=>setTimeout(resolve,Math.max(0,obs.current_period_end*1000-Date.now()+100)));
+ const next=nativeRenewal(f,s,'request',{auto:true});assert.equal(next.status,'waiting');assert.notEqual(next.operation.operation_id,id);
+ assert.equal(next.operation.billing_cutoff_at,anchoredMonthInstant(new Date(obs.billing_cycle_anchor*1000).toISOString(),6));
+ assert.equal(sql(`select count(*) from billing_events where client_id=${lit(f.client)} and type='retail.renewal.held';`),'1');
+});
 test('NATIVE CYCLE actual original writer -> recurring receipt -> idempotent coverage preserves other records',opts,async()=>{
  const x=await paidCycleFixture('monthly_installments',true),before=billingState(x.f),original=row(x.f).retail_funding_receipt;
  const r=JSON.parse(sql('set role service_role;'+cycleRecord(x)));assert.equal(r.status,'recorded');

@@ -38,8 +38,8 @@ function renewalSubscriptionProjection(raw, source) {
     && sub?.object === 'subscription' && sub.id === p.subscription_id && sub.customer === p.customer_id
     && sub.livemode === p.livemode && sub.currency === 'usd' && sub.billing_cycle_anchor === p.provider_period_start
     && epoch(sub.current_period_start) && epoch(sub.current_period_end)
-    && ['active', 'past_due', 'unpaid'].includes(sub.status) && typeof sub.cancel_at_period_end === 'boolean'
-    && (sub.cancel_at === null || epoch(sub.cancel_at)) && sub.canceled_at === null
+    && ['active', 'past_due', 'unpaid', 'canceled'].includes(sub.status) && typeof sub.cancel_at_period_end === 'boolean'
+    && (sub.cancel_at === null || epoch(sub.cancel_at)) && (sub.canceled_at === null || epoch(sub.canceled_at))
     && sub.schedule === null && sub.pause_collection === null && sub.trial_start === null && sub.trial_end === null
     && sub.items?.object === 'list' && sub.items.has_more === false && sub.items.data?.length === 1
     && (sub.test_clock === null || (!sub.livemode && typeof sub.test_clock === 'string')));
@@ -81,7 +81,7 @@ async function sourceFor(input) {
   return readExistingRetailRecurringSource({ db: input.db, agreementId: input.agreementId, clientId: input.clientId });
 }
 function desired(sub, op) {
-  return op.requested_auto_renew ? sub.cancel_at_period_end === false && sub.cancel_at === null
+  return op.requested_auto_renew ? sub.status !== 'canceled' && sub.cancel_at_period_end === false && sub.cancel_at === null
     : sub.cancel_at_period_end === true && sub.cancel_at === Date.parse(op.billing_cutoff_at) / 1000;
 }
 function unchanged(before, after) {
@@ -97,7 +97,11 @@ async function reconcileExistingRetailRenewal(input) {
   if (!r.operation || ['applied', 'held'].includes(r.status)) return r;
   const { stripe, db } = input, op = r.operation;
   const api = () => check(stripe.getApiField('version') === '2023-10-16');
-  const provider = async fn => { api(); try { return await fn(); } catch (_) { throw new RenewalError(); } };
+  const provider = async fn => { api(); try { return await fn(); } catch (e) {
+    const error = new RenewalError();
+    error.knownRejection = Number.isInteger(e?.statusCode) && e.statusCode >= 400 && e.statusCode < 500;
+    throw error;
+  } };
   const account = async () => {
     const a = snapshot(await provider(() => stripe.accounts.retrieve()));
     check(a?.object === 'account' && a.id === source.original_provider_account_id);
@@ -120,11 +124,13 @@ async function reconcileExistingRetailRenewal(input) {
   let before = await read();
   check(isDeepStrictEqual(await sourceFor(input), source));
   const cutoff = Date.parse(op.billing_cutoff_at) / 1000;
+  if (before.test_clock !== null) return native(db, source, 'hold', {
+    p_operation: op.operation_id, p_generation: op.generation });
   // Waiting is a saved preference, never a premature cancellation of owed installments.
   if (before.current_period_end < cutoff) return r;
-  if (before.status !== 'active') return r; // Retain a pending request until mutability returns.
-  if (before.current_period_end !== cutoff || cutoff * 1000 <= Date.now()
-    || (before.livemode && before.test_clock !== null)
+  const alreadyDesired = desired(before, op);
+  if (before.status !== 'active' && !alreadyDesired) return r; // Waiting, not a provider send.
+  if (before.current_period_end !== cutoff || (!alreadyDesired && cutoff * 1000 <= Date.now())
     || (before.cancel_at !== null && before.cancel_at !== cutoff)) return native(db, source, 'hold', {
     p_operation: op.operation_id, p_generation: op.generation
   });
@@ -140,8 +146,6 @@ async function reconcileExistingRetailRenewal(input) {
     agreementId: source.agreement_id, clientId: source.client_id });
   // Lost ACK: observed exact setting is authoritative. Never mint another key.
   if (desired(before, current)) return native(db, source, 'finish', { ...args, p_observation: before });
-  if (current.sent_at && Date.now() - Date.parse(current.sent_at) >= 23 * 60 * 60 * 1000)
-    return native(db, source, 'hold', args); // No inference from Stripe's key expiry.
   const armed = await native(db, source, 'send', { ...args, p_observation: before });
   if (armed.status !== 'claimed') return armed;
   try {
@@ -167,7 +171,11 @@ async function reconcileExistingRetailRenewal(input) {
       agreementId: source.agreement_id, clientId: source.client_id }), censusBefore));
     check(isDeepStrictEqual(await sourceFor(input), source));
     return await native(db, source, 'finish', { ...args, p_observation: after });
-  } catch (_) {
+  } catch (error) {
+    if (error.knownRejection === true) {
+      // Known rejected request is held once; transport/commit loss is different.
+      try { return await native(db, source, 'hold', args); } catch (_) { throw new RenewalError(); }
+    }
     // Provider or commit acknowledgement may be lost. Keep the same operation.
     try { await native(db, source, 'unknown', args); } catch (_) { /* lease remains */ }
     throw new RenewalError();

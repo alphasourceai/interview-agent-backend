@@ -61,6 +61,26 @@ test(`existing ${months}/${payment} stores whole commitment cutoff and uses nati
   if (payment === 'prepaid') assert.deepEqual(f.writes[0].body, { cancel_at_period_end: true, proration_behavior: 'none' });
   assert.deepEqual(f.source, before); // Setting changes do not mutate accepted money/contract source.
 });
+test('known Stripe4xx is held once instead of retried until key age', async () => {
+  const f = fixture(); let updates = 0;
+  f.sdk.subscriptions.update = async () => { updates++; throw Object.assign(Error('SYNTHETIC rejection'), { statusCode: 400 }); };
+  assert.equal((await requestExistingRetailRenewal({ ...f.input, autoRenew: false })).status, 'held');
+  assert.equal((await reconcileExistingRetailRenewal(f.input)).status, 'held'); assert.equal(updates, 1);
+});
+test('same operation and body retry without treating key age as absence proof', async () => {
+  const f = fixture(); f.failAt('provider');
+  // Do not change financial/provider clocks: only authored mock operation age.
+  await assert.rejects(requestExistingRetailRenewal({ ...f.input, autoRenew: false }));
+  f.operation.sent_at = '2020-01-01T00:00:00Z'; f.sub.cancel_at_period_end = false; f.sub.cancel_at = null;
+  const id = f.operation.operation_id;
+  assert.equal((await reconcileExistingRetailRenewal(f.input)).status, 'applied');
+  assert.equal(f.writes.length, 2); assert.equal(f.operation.operation_id, id);
+  assert.deepEqual(f.writes[0], f.writes[1]);
+});
+test('test clocks are held even in test mode; optional setting-only proof is outside mounted arm', async () => {
+  const f = fixture(); f.sub.test_clock = 'clock_SYNTHETIC';
+  assert.equal((await requestExistingRetailRenewal({ ...f.input, autoRenew: false })).status, 'held'); assert.equal(f.writes.length, 0);
+});
 test('renewal on is the original flag body; explicit cancel repair has a separate stable key', async () => {
   for (const repair of [false, true]) {
     const f = fixture(); f.sub.cancel_at_period_end = true; f.sub.cancel_at = f.sub.current_period_end; f.holdCancel(repair);
