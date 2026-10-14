@@ -113,11 +113,18 @@ test('a renewal update is conditional on the contract_end_at the run read', asyn
   const source = fs.readFileSync(
     path.join(ROOT, 'src', 'services', 'contracts', 'contractRenewals.js'), 'utf8');
 
-  // The update must carry both the row id and the value this run read.
-  assert.match(
-    source,
-    /\.update\(\{[\s\S]*?contract_end_at: newContractEnd[\s\S]*?\}\)[\s\S]*?\.eq\('id', client\.id\)[\s\S]*?\.eq\('contract_end_at', oldContractEnd\)/,
-    'the renewal update must be guarded on the contract_end_at that was read');
+  // The original JS writer now delegates its same-end CAS to a native action
+  // holding the root before source classification. Keep the security invariant,
+  // not the old direct-UPDATE spelling. Native tests prove actual concurrency.
+  assert.match(source,/legacyContractAction\(db,client,'renew'\)/);
+  assert.equal((source.match(/\.from\('clients'\)/g)||[]).length,1);
+  assert.match(source,/\.from\('clients'\)\s*\.select\(/);
+  assert.doesNotMatch(source,/\.from\('clients'\)\s*\.update\(/);
+  const native=fs.readFileSync(path.join(ROOT,'supabase','migrations','20261014092615_legacy_contract_atomic_actions.sql'),'utf8');
+  assert.match(native,/select \* into strict c from public\.clients where id=p_client for update/);
+  assert.match(native,/'contract_end_at',c\.contract_end_at/);
+  assert.equal((native.match(/where t\.id=p_client and public\.legacy_contract_projection\(t\)-'id'=public\.legacy_contract_projection\(e\)-'id'/g)||[]).length,3);
+  assert.equal((native.match(/and public\.legacy_contract_cohort\(t\)='legacy'/g)||[]).length,3);
 });
 
 test('a stale writer matches zero rows', async () => {

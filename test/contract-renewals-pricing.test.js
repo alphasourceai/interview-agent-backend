@@ -25,6 +25,29 @@ function fixture(months = 3, payment = 'prepaid', index = 0, plan = 'basic') {
 }
 function makeDb({client, agreement}, behavior = {}) {
   const db = {client:structuredClone(client), agreement:structuredClone(agreement), writes:[], subscriptionWrites:[], reads:[]};
+  const keys='contract_start_at,contract_end_at,auto_renew,manual_active_override,billing_status,subscription_status,stripe_subscription_id,stripe_customer_id,cancel_at_term_end,cancel_effective_at,plan_tier,billing_interval,parent_client_id,archived_at'.split(',');
+  const projection=()=>({id:db.client.id,...Object.fromEntries(keys.map(k=>[k,db.client[k]??null]))});
+  db.rpc=async(name,args)=>{
+    assert.equal(name,'apply_legacy_contract_action');
+    if(behavior.beforeUpdate){behavior.beforeUpdate(db.client);behavior.beforeUpdate=null;}
+    const before=projection(),expected={...before};delete expected.id;
+    const result=status=>({data:{status,client:projection()},error:null});
+    if(JSON.stringify(expected)!==JSON.stringify(args.p_expected))return result('changed');
+    if(behavior.updateError)return{data:null,error:{message:'synthetic update failed'}};
+    let payload;
+    if(args.p_action==='renew'){
+      const start=new Date(db.client.contract_end_at).toISOString(),end=new Date(start);end.setUTCMonth(end.getUTCMonth()+12);
+      payload={contract_start_at:start,contract_end_at:end.toISOString()};
+    }else if(args.p_action==='deactivate'){
+      if(db.client.billing_status==='inactive'&&db.client.cancel_effective_at)return result('unchanged');
+      payload={billing_status:'inactive',cancel_effective_at:new Date(db.client.contract_end_at).toISOString()};
+    }else if(args.p_action==='check_cancel')return result('permitted');
+    else if(args.p_action==='record_cancel')payload={cancel_at_term_end:true};
+    else throw Error('Unexpected synthetic action');
+    db.writes.push({payload:structuredClone(payload),filters:[['id',db.client.id]]});Object.assign(db.client,payload);
+    if(behavior.afterNativeWrite)return behavior.afterNativeWrite(result('applied'),db);
+    return result('applied');
+  };
   db.from = table => {
     const q = {filters:[], payload:null, selected:null,
       select(columns) { this.selected=columns; db.reads.push({table,columns}); return this; },
@@ -177,4 +200,14 @@ test('legacy nonrenewal still deactivates and aligns Stripe; provider failure is
     if(failure)assert.equal(result.items[0].stripe_alignment_error,'synthetic legacy provider failure');
     else assert.equal(db.client.cancel_at_term_end,true);
   }
+});
+
+test('legacy lost/corrupt native ACK stops before Stripe without pretending the local commit rolled back',async()=>{
+ for(const extra of [false,true]){
+  const f=fixture();f.client.billing_interval='monthly';f.client.auto_renew=false;f.agreement=null;
+  const db=makeDb(f,{afterNativeWrite:r=>extra?{data:{...r.data,unknown:true},error:null}:{data:null,error:{message:'synthetic ACK loss'}}});
+  const r=await processContractRenewals({},deps(db));assert.equal(r.summary.errors,1);
+  assert.equal(r.summary.deactivated,0);assert.deepEqual(db.subscriptionWrites,[]);
+  assert.equal(db.client.billing_status,'inactive');assert.equal(db.writes.length,1);
+ }
 });

@@ -86,6 +86,7 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
   assert.equal(sql("select to_regprocedure('retail_linked_existing_member_schema_guard()') is null;"),'t');
  }finally{sql('drop function public.ensure_retail_existing_linked_buyer_member(uuid);');}
  sql(linkedMemberMigration);
+ sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014092615_legacy_contract_atomic_actions.sql'),'utf8'));
  assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
  // Exact old-data oracles remain, with ONLY the new nullable receipt column.
  // Derive expected JSON from the prior saved oracle, not a fresh row read that
@@ -2121,4 +2122,172 @@ test('internal linked member seam is mounted only by original activation and nev
  }}scan(root);
  const s=fs.readFileSync(path.join(root,'services/existingRetailLinkedMemberTail.js'),'utf8');
  for(const name of ['ensureRecovery','ensureBuyerAccountSetup','sendRecoveryEmail','sendWelcomeEmail','.insert(','.update(','.upsert('])assert.ok(!s.includes(name),name);
+});
+
+// Actual original-schema native scanner guard, never hosted/provider effects.
+function legacyFixture(renew=true){const client=crypto.randomUUID(),suffix=client.replaceAll('-','');
+ sql(`insert into clients(id,name,email,plan_tier,billing_interval,billing_status,subscription_status,stripe_customer_id,
+  stripe_subscription_id,contract_start_at,contract_end_at,auto_renew,cancel_at_term_end)
+ values(${lit(client)},'Synthetic Legacy Atomic','legacy@example.invalid','basic','monthly','active','active',${lit('cus_L'+suffix)},
+ ${lit('sub_L'+suffix)},'2025-01-31T12:13:14.123Z','2026-01-31T12:13:14.123Z',${renew},false);`);return{client};}
+const legacyProjection=f=>JSON.parse(sql(`select legacy_contract_projection(c) from clients c where id=${lit(f.client)};`));
+const legacyExpected=f=>{const p=legacyProjection(f);delete p.id;return p;};
+const legacyActionCall=(f,action='renew',expected=legacyExpected(f))=>`select apply_legacy_contract_action(${[f.client,expected,action].map(lit).join(',')});`;
+const legacyAction=(f,...args)=>JSON.parse(sql('set role service_role;'+legacyActionCall(f,...args)));
+function legacyAgreement(f,current=true,snapshot={},receipt=null){const id=crypto.randomUUID();
+ sql(`insert into membership_agreements(id,client_id,status,is_current,client_legal_name,primary_admin_name,admin_email,
+ membership_tier,billing_option,template_version,template_snapshot,draft_pdf_path,signer_token_hash,signer_token_expires_at)
+ values(${lit(id)},${lit(f.client)},'draft',${current},'Synthetic Legacy','QA','legacy@example.invalid','basic','monthly','legacy',
+ ${lit(snapshot)},'synthetic.pdf',${lit(crypto.createHash('sha256').update(id).digest('hex'))},clock_timestamp()+interval '1 day');`);return id;}
+test('LEGACY ATOMIC actual native renew and nonrenewal retain original action fields and milliseconds',opts,()=>{
+ const f=legacyFixture(),before=legacyProjection(f),r=legacyAction(f);assert.equal(r.status,'applied');
+ assert.equal(Date.parse(r.client.contract_start_at),Date.parse(before.contract_end_at));
+ assert.equal(new Date(r.client.contract_end_at).toISOString(),'2027-01-31T12:13:14.123Z');
+ const e=legacyExpected(f);assert.equal(legacyAction(f,'renew',e).status,'changed');
+ const d=legacyFixture(false);assert.equal(legacyAction(d,'deactivate').status,'applied');
+ assert.equal(legacyAction(d,'deactivate').status,'unchanged');assert.equal(legacyAction(d,'check_cancel').status,'permitted');
+ const p=legacyProjection(d);assert.equal(legacyAction(d,'record_cancel').status,'applied');assert.equal(legacyProjection(d).cancel_at_term_end,true);
+ const after=legacyProjection(d);after.cancel_at_term_end=false;assert.deepEqual(after,p);
+ sql(`update clients set contract_start_at='2023-02-28Z',contract_end_at='2024-02-29T12:13:14.123456Z' where id=${lit(f.client)};`);
+ assert.equal(new Date(legacyAction(f).client.contract_end_at).toISOString(),'2025-03-01T12:13:14.123Z');
+});
+test('LEGACY ATOMIC actual marked current holds and noncurrent unfunded proposal preserves legacy',opts,()=>{
+ const f=legacyFixture(),a=legacyAgreement(f,false,{package_snapshot:{membership_terms:{}}});
+ assert.equal(legacyAction(f).status,'applied');
+ sql(`update clients set contract_start_at='2025-01-31Z',contract_end_at='2026-01-31Z' where id=${lit(f.client)};
+ update membership_agreements set is_current=true where id=${lit(a)};`);
+ const before=legacyProjection(f);assert.equal(legacyAction(f).status,'held');assert.deepEqual(legacyProjection(f),before);
+});
+test('LEGACY ATOMIC original receipt/native financial state cannot become legacy',opts,()=>{
+ const f=linkedMemberFixture();assert.equal(legacyAction(f).status,'held');assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
+});
+test('LEGACY ATOMIC strict input/types/roles and disabled/body/order gate drift are unavailable',opts,()=>{
+ const f=legacyFixture(),expected=legacyExpected(f),before=legacyProjection(f);
+ for(const e of [{...expected,extra:1},{...expected,auto_renew:'true'},{...expected,contract_end_at:'infinity'},{}])
+  denied('set role service_role;'+legacyActionCall(f,'renew',e),/legacy_contract_input_unavailable/);
+ for(const role of ['anon','authenticated'])denied('set role '+role+';'+legacyActionCall(f),/permission denied/);
+ try{sql('alter table membership_agreements disable trigger zz_retail_legacy_cohort_gate;');
+  denied('set role service_role;'+legacyActionCall(f),/legacy_contract_gate_unavailable/);
+ }finally{sql('alter table membership_agreements enable trigger zz_retail_legacy_cohort_gate;');}
+ const def=sql("select pg_get_functiondef('zz_retail_legacy_cohort_gate()'::regprocedure);");
+ try{sql(def.replace('\nbegin\n','\nbegin\n -- synthetic gate drift\n'));denied('set role service_role;'+legacyActionCall(f),/legacy_contract_gate_unavailable/);}
+ finally{sql(def);}
+ try{sql("create trigger zzz_synthetic_late_gate before update on membership_agreements for each row execute function zz_retail_legacy_cohort_gate();");
+  denied('set role service_role;'+legacyActionCall(f),/legacy_contract_gate_unavailable/);
+ }finally{sql('drop trigger zzz_synthetic_late_gate on membership_agreements;');}
+ assert.deepEqual(legacyProjection(f),before);
+});
+test('LEGACY ATOMIC bypass actual orphan DELETE passes; RLS-hidden root cannot skip lock',opts,()=>{
+ const f=legacyFixture(),a=legacyAgreement(f);sql(`delete from clients where id=${lit(f.client)};`);
+ sql(`set role service_role;delete from membership_agreements where id=${lit(a)};`);
+ const g=legacyFixture(),b=legacyAgreement(g);sql(`delete from clients where id=${lit(g.client)};delete from membership_agreements where id=${lit(b)};`);
+ const live=legacyFixture(),c=legacyAgreement(live);
+ denied(`begin;create role legacy_contract_hidden nologin;grant usage on schema public to legacy_contract_hidden;
+ grant usage on schema auth to legacy_contract_hidden;grant select on client_members to legacy_contract_hidden;
+ grant select,update on clients to legacy_contract_hidden;grant select,delete on membership_agreements to legacy_contract_hidden;
+ create policy synthetic_legacy_agreement_visibility on membership_agreements for all to legacy_contract_hidden using(true) with check(true);
+ set local role legacy_contract_hidden;delete from membership_agreements where id=${lit(c)};commit;`,/legacy_contract_gate_root_unavailable/);
+ assert.equal(sql(`select count(*) from membership_agreements where id=${lit(c)};`),'1');
+});
+test('LEGACY ATOMIC hidden non-bypass DELETE aborts while actual service root is locked',opts,async()=>{
+ const f=legacyFixture(),a=legacyAgreement(f),before=legacyProjection(f);
+ const [h,w]=await Promise.all([
+  parallel(`set role service_role;begin;select 1 from clients where id=${lit(f.client)} for update;select pg_sleep(0.6);commit;`),
+  parallel(`select pg_sleep(0.1);begin;create role legacy_contract_hidden_locked nologin;
+   grant usage on schema public,auth to legacy_contract_hidden_locked;grant select,update on clients to legacy_contract_hidden_locked;
+   grant select on client_members to legacy_contract_hidden_locked;grant select,delete on membership_agreements to legacy_contract_hidden_locked;
+   create policy synthetic_legacy_locked_visibility on membership_agreements for all to legacy_contract_hidden_locked using(true) with check(true);
+   set local role legacy_contract_hidden_locked;delete from membership_agreements where id=${lit(a)};commit;`)]);
+ assert.equal(h.code,0,h.err);assert.notEqual(w.code,0);assert.match(w.err,/legacy_contract_gate_root_unavailable/);
+ assert.deepEqual(legacyProjection(f),before);assert.equal(sql(`select count(*) from membership_agreements where id=${lit(a)};`),'1');
+});
+test('LEGACY ATOMIC same original root serializes two renew CAS calls',opts,async()=>{
+ const f=legacyFixture(),q=legacyActionCall(f);
+ const [a,b]=await Promise.all([parallel('set role service_role;begin;'+q+'select pg_sleep(0.2);commit;'),parallel('set role service_role;'+q)]);
+ assert.equal(a.code,0,a.err);assert.equal(b.code,0,b.err);
+ const status=r=>JSON.parse(r.out.trim().split('\n').find(x=>x.startsWith('{'))).status;
+ assert.deepEqual([status(a),status(b)].sort(),['applied','changed']);
+});
+test('LEGACY ATOMIC every typed field drift, manual and future native clock refuse without write',opts,()=>{
+ const f=legacyFixture(),expected=legacyExpected(f),before=legacyProjection(f);
+ for(const k of Object.keys(expected)){
+  const v=expected[k],changed={...expected,[k]:typeof v==='boolean'?!v:v===null?'x':null};
+  const r=run('set role service_role;'+legacyActionCall(f,'renew',changed));
+  if(r.status===0)assert.equal(JSON.parse(r.stdout).status,'changed');else assert.match(r.stderr,/legacy_contract_input_unavailable/);
+  assert.deepEqual(legacyProjection(f),before);
+ }
+ sql(`update clients set contract_end_at=clock_timestamp()+interval '1 day' where id=${lit(f.client)};`);
+ assert.equal(legacyAction(f).status,'changed');
+ sql(`update clients set contract_end_at='2026-01-31Z',manual_active_override=true where id=${lit(f.client)};`);
+ assert.equal(legacyAction(f).status,'changed');
+});
+test('LEGACY ATOMIC missing root I/U abort and duplicate current source is unavailable',opts,()=>{
+ const f=legacyFixture(),a=legacyAgreement(f);
+ // Privileged disposable schema-fault fixture only; rollback restores the
+ // existing unique index. Two current rows are NOT possible for normal writers.
+ const rowSql=sql(`select to_jsonb(a) from membership_agreements a where id=${lit(a)};`),dup=JSON.parse(rowSql);
+ dup.id=crypto.randomUUID();dup.signer_token_hash=crypto.randomBytes(32).toString('hex');
+ denied(`begin;drop index membership_agreements_one_current_per_client_idx;
+ insert into membership_agreements select (jsonb_populate_record(null::membership_agreements,${lit(dup)})).*;
+ set role service_role;${legacyActionCall(f)}commit;`,/legacy_contract_source_unavailable/);
+ denied(`update membership_agreements set client_id=${lit(crypto.randomUUID())} where id=${lit(a)};`,/legacy_contract_gate_root_unavailable/);
+ const missing={client:crypto.randomUUID()};assert.throws(()=>legacyAgreement(missing),/legacy_contract_gate_root_unavailable/);
+});
+test('LEGACY ATOMIC actual root-held marker and first receipt writers wait; next action holds',opts,async()=>{
+ for(const receipt of [false,true]){
+  const f=receipt?fixture():legacyFixture(),a=receipt?f.id:legacyAgreement(f,false),tag='LG'+crypto.randomUUID().replaceAll('-','');
+  const change=receipt?call(f):`update membership_agreements set is_current=true,template_snapshot='{"package_snapshot":{"membership_terms":{}}}' where id=${lit(a)};`;
+  const [h,w,o]=await Promise.all([
+   parallel(`set application_name=${lit(tag+'H')};begin;select 1 from clients where id=${lit(f.client)} for update;select pg_sleep(0.65);commit;`),
+   parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;${change}`),
+   parallel(`select pg_sleep(0.35);select exists(select 1 from pg_stat_activity w join pg_stat_activity h on h.pid=any(pg_blocking_pids(w.pid)) where w.application_name=${lit(tag+'W')} and h.application_name=${lit(tag+'H')} and w.wait_event_type='Lock');`)]);
+  assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.code,0,o.err);assert.equal(o.out.trim(),'t');
+  assert.equal(legacyAction(f).status,'held');
+ }
+});
+test('LEGACY ATOMIC source SHARE-first causes root action to wait and see held',opts,async()=>{
+ const f=legacyFixture(),a=legacyAgreement(f,false),q=legacyActionCall(f),tag='LS'+crypto.randomUUID().replaceAll('-','');
+ const [h,w,o]=await Promise.all([
+  parallel(`set application_name=${lit(tag+'H')};begin;update membership_agreements set is_current=true,template_snapshot='{"package_snapshot":{"membership_terms":{}}}' where id=${lit(a)};select pg_sleep(0.65);commit;`),
+  parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;${q}`),
+  parallel(`select pg_sleep(0.35);select exists(select 1 from pg_stat_activity w join pg_stat_activity h on h.pid=any(pg_blocking_pids(w.pid)) where w.application_name=${lit(tag+'W')} and h.application_name=${lit(tag+'H')} and w.wait_event_type='Lock');`)]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.out.trim(),'t');
+ assert.equal(JSON.parse(w.out.trim().split('\n').find(x=>x.startsWith('{'))).status,'held');
+});
+test('LEGACY ATOMIC gate sees final NEW from earlier trigger, retains native original financial enrollment',opts,async()=>{
+ const f=legacyFixture(),a=legacyAgreement(f,false);
+ sql(`create function public.synthetic_early_legacy_marker() returns trigger language plpgsql as $$ begin NEW.is_current:=true;NEW.template_snapshot:='{"package_snapshot":{"membership_terms":{}}}';return NEW;end $$;
+ create trigger aaa_synthetic_early_legacy_marker before update on membership_agreements for each row execute function synthetic_early_legacy_marker();`);
+ try{
+  const [h,w]=await Promise.all([parallel(`begin;select 1 from clients where id=${lit(f.client)} for update;select pg_sleep(0.3);commit;`),
+   parallel(`select pg_sleep(0.05);update membership_agreements set client_legal_name='Synthetic final image' where id=${lit(a)};`)]);
+  assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(legacyAction(f).status,'held');
+ }finally{sql('drop trigger aaa_synthetic_early_legacy_marker on membership_agreements;drop function synthetic_early_legacy_marker();');}
+ const g=fixture();record(g);nativeComplete(g);
+ const [h,w]=await Promise.all([parallel(`begin;select 1 from clients where id=${lit(g.client)} for update;select pg_sleep(0.3);commit;`),
+  parallel('select pg_sleep(0.05);set role service_role;'+billingCall(g))]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(legacyAction(g).status,'held');
+ assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
+});
+test('LEGACY ATOMIC original financial-writer first makes stale scanner wait and hold',opts,async()=>{
+ const f=fixture();record(f);nativeComplete(f);const q=legacyActionCall(f),tag='LF'+crypto.randomUUID().replaceAll('-','');
+ const [h,w,o]=await Promise.all([
+  parallel(`set application_name=${lit(tag+'H')};set role service_role;begin;${billingCall(f)}select pg_sleep(0.6);commit;`),
+  parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;${q}`),
+  parallel(`select pg_sleep(0.35);select exists(select 1 from pg_stat_activity w join pg_stat_activity h on h.pid=any(pg_blocking_pids(w.pid)) where w.application_name=${lit(tag+'W')} and h.application_name=${lit(tag+'H')});`)]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.out.trim(),'t');
+ assert.equal(JSON.parse(w.out.trim().split('\n').find(x=>x.startsWith('{'))).status,'held');
+});
+test('LEGACY ATOMIC actual legacy RPC wins before original paid/financial enrollment then cannot flag new root',opts,async()=>{
+ const f=fixture('basic',3,'monthly_installments');sql(`update membership_agreements set is_current=false where id=${lit(f.id)};
+ update clients set billing_interval='monthly',contract_start_at='2025-01-31Z',contract_end_at='2026-01-31Z',auto_renew=true where id=${lit(f.client)};`);
+ const q=legacyActionCall(f),old=legacyExpected(f),tag='LW'+crypto.randomUUID().replaceAll('-','');
+ const [h,w,o]=await Promise.all([
+  parallel(`set application_name=${lit(tag+'H')};set role service_role;begin;${q}select pg_sleep(0.65);commit;`),
+  parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;update membership_agreements set is_current=true where id=${lit(f.id)};${call(f)}${completeCall(f)}${billingCall(f)}`),
+  parallel(`select pg_sleep(0.35);select exists(select 1 from pg_stat_activity w join pg_stat_activity h on h.pid=any(pg_blocking_pids(w.pid)) where w.application_name=${lit(tag+'W')} and h.application_name=${lit(tag+'H')});`)]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.out.trim(),'t');
+ assert.equal(JSON.parse(h.out.trim().split('\n').find(x=>x.startsWith('{'))).status,'applied');
+ assert.equal(legacyAction(f,'record_cancel',old).status,'held');assert.equal(legacyProjection(f).cancel_at_term_end,false);
+ assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
 });

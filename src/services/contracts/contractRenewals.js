@@ -7,6 +7,7 @@
 const { supabaseAdmin } = require('../../clients/supabase');
 const { readRetailPackageOffer } = require('../membershipPackageCompatibility');
 const { retailTermWindow } = require('../membershipOffers');
+const { legacyContractAction } = require('./legacyContractActions');
 
 function invalidRetailRenewal() {
   throw new Error('retail_renewal_terms_mismatch');
@@ -87,7 +88,7 @@ async function processContractRenewals(context = {}, dependencies = {}) {
 
     const { data: clients, error } = await db
       .from('clients')
-      .select('id,name,plan_tier,billing_interval,billing_status,manual_active_override,contract_start_at,contract_end_at,auto_renew,cancel_effective_at,stripe_subscription_id,subscription_status,cancel_at_term_end')
+      .select('id,name,plan_tier,billing_interval,billing_status,manual_active_override,contract_start_at,contract_end_at,auto_renew,cancel_effective_at,stripe_subscription_id,stripe_customer_id,subscription_status,cancel_at_term_end,parent_client_id,archived_at')
 
     if (error) {
       const e = new Error(error.message || 'process_contracts_failed')
@@ -106,6 +107,14 @@ async function processContractRenewals(context = {}, dependencies = {}) {
       errors: 0
     }
     const items = []
+    const heldAction = (client,action) => {
+      if (!['changed','held'].includes(action?.status)) return false;
+      const held=action.status==='held';
+      summary[held?'held_retail_payment':'skipped_no_action']+=1;
+      items.push({id:client.id,name:client.name||null,action:held?'held_retail_payment':'skipped_no_action',
+        contract_end_at_before:client.contract_end_at,detail:held?'retail_paid_period_processor_required':'legacy_contract_guard_changed'});
+      return true;
+    };
 
     for (const client of (clients || [])) {
       const oldContractEnd = client?.contract_end_at || null
@@ -173,17 +182,7 @@ async function processContractRenewals(context = {}, dependencies = {}) {
 
         // Conditional on the value this run read, so two concurrent runs cannot both
         // renew the same client and advance the term twice. The loser matches no rows.
-        let renewalQuery = db
-          .from('clients')
-          .update({
-            contract_start_at: newContractStart,
-            contract_end_at: newContractEnd
-          })
-          .eq('id', client.id)
-          .eq('contract_end_at', oldContractEnd)
-        if (retailWindow) renewalQuery = renewalQuery.eq('contract_start_at', client.contract_start_at)
-          .eq('auto_renew', true).select('id').maybeSingle();
-        const {data:renewedClient, error:renewError} = await renewalQuery;
+        const {data:renewedClient, error:renewError} = await legacyContractAction(db,client,'renew');
 
         if (renewError) {
           summary.errors += 1
@@ -197,11 +196,10 @@ async function processContractRenewals(context = {}, dependencies = {}) {
           continue
         }
 
-        if (retailWindow && !renewedClient?.id) {
-          summary.skipped_no_action += 1;
-          items.push({id:client.id, name:client.name || null, action:'skipped_no_action',
-            contract_end_at_before:oldContractEnd, detail:'renewal_guard_changed'});
-          continue;
+        if(heldAction(client,renewedClient))continue;
+        if(renewedClient?.status!=='applied'||Date.parse(renewedClient.client.contract_start_at)!==Date.parse(newContractStart)
+          ||Date.parse(renewedClient.client.contract_end_at)!==Date.parse(newContractEnd)){
+          summary.errors+=1;items.push({id:client.id,name:client.name||null,action:'error',contract_end_at_before:oldContractEnd,detail:'legacy_contract_action_unavailable'});continue;
         }
 
         summary.renewed += 1
@@ -223,6 +221,7 @@ async function processContractRenewals(context = {}, dependencies = {}) {
       const alreadyInactiveProcessed =
         String(client?.billing_status || '').toLowerCase() === 'inactive' &&
         !!client?.cancel_effective_at
+      let actionClient=client;
 
       if (alreadyInactiveProcessed && !stripeAlignmentNeeded) {
         summary.skipped_no_action += 1
@@ -238,16 +237,7 @@ async function processContractRenewals(context = {}, dependencies = {}) {
 
       if (!alreadyInactiveProcessed) {
         const cancelEffectiveAt = oldEndDate.toISOString()
-        let deactivationQuery = db
-          .from('clients')
-          .update({
-            billing_status: 'inactive',
-            cancel_effective_at: cancelEffectiveAt
-          })
-          .eq('id', client.id)
-        if (retailWindow) deactivationQuery = deactivationQuery.eq('contract_end_at', oldContractEnd)
-          .eq('contract_start_at', client.contract_start_at).eq('auto_renew', false).select('id').maybeSingle();
-        const {data:deactivatedClient, error:deactivateError} = await deactivationQuery;
+        const {data:deactivatedClient, error:deactivateError} = await legacyContractAction(db,client,'deactivate');
 
         if (deactivateError) {
           summary.errors += 1
@@ -260,12 +250,12 @@ async function processContractRenewals(context = {}, dependencies = {}) {
           })
           continue
         }
-        if (retailWindow && !deactivatedClient?.id) {
-          summary.skipped_no_action += 1;
-          items.push({id:client.id, name:client.name || null, action:'skipped_no_action',
-            contract_end_at_before:oldContractEnd, detail:'deactivation_guard_changed'});
-          continue;
+        if(heldAction(client,deactivatedClient))continue;
+        if(!['applied','unchanged'].includes(deactivatedClient?.status)||deactivatedClient.client.billing_status!=='inactive'
+          ||Date.parse(deactivatedClient.client.cancel_effective_at)!==Date.parse(cancelEffectiveAt)){
+          summary.errors+=1;items.push({id:client.id,name:client.name||null,action:'error',contract_end_at_before:oldContractEnd,detail:'legacy_contract_action_unavailable'});continue;
         }
+        actionClient=deactivatedClient.client;
       }
 
       let stripeAlignmentError = null
@@ -276,11 +266,12 @@ async function processContractRenewals(context = {}, dependencies = {}) {
           summary.errors += 1
         } else {
           try {
+            const checked=await legacyContractAction(db,actionClient,'check_cancel');
+            if(checked.error||checked.data?.status!=='permitted')throw new Error('legacy_contract_action_unavailable');
             await stripe.subscriptions.update(client.stripe_subscription_id, { cancel_at_period_end: true })
-            const { error: localStripeFlagError } = await db
-              .from('clients')
-              .update({ cancel_at_term_end: true })
-              .eq('id', client.id)
+            const recorded=await legacyContractAction(db,checked.data.client,'record_cancel');
+            const localStripeFlagError=recorded.error||(!['applied','unchanged'].includes(recorded.data?.status)||recorded.data?.client?.cancel_at_term_end!==true
+              ?{message:'legacy_contract_action_unavailable'}:null);
             if (localStripeFlagError) {
               stripeAlignmentError = localStripeFlagError.message || 'cancel_at_term_end_update_failed'
               summary.errors += 1
