@@ -728,5 +728,6 @@ module.exports = {
   markUsageLinesBilled,
   priorMonthBounds,
   recordUsageLines,
-  stampMissingCompletedAt
+  stampMissingCompletedAt,
+  usageOperationKey
 };
