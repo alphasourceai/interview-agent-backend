@@ -304,7 +304,7 @@ async function createSubscriptionCheckoutSession({
   enterpriseAgreement = null,
   now = null
 }) {
-  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed()
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed('billing')
   const normalizedClientId = String(clientId || '').trim()
   const normalizedPlanTier = normalizePlanTier(planTier)
   const retailOffer = readRetailPackageOffer(packageSnapshot)

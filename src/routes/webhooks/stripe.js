@@ -809,7 +809,7 @@ router.post('/', async (req, res) => {
     });
   }
 
-  if (devGuard.isGuardedPricingDev()) {
+  if (devGuard.isGuardedPricingDev() && (!devGuard.isDevBillingSandbox() || event?.livemode !== false)) {
     return res.status(503).json({ error: 'billing_unavailable', code: devGuard.CODE, detail: devGuard.DETAIL, request_id });
   }
   const eventObject = event?.data?.object || null;

@@ -495,7 +495,7 @@ async function findExistingUsageItem({ stripe, invoiceId, customerId, clientId, 
 async function applyUsageToInvoice({
   db, stripe, clientId, customerId, invoiceId, asOf, metadata, now
 } = {}) {
-  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed('billing');
   if (!db || !stripe || !clientId || !invoiceId) {
     return { applied: false, reason: 'invalid_request', items: 0, total_cents: 0 };
   }
@@ -630,7 +630,7 @@ async function applyUsageToInvoice({
 async function createImmediateUsageInvoice({
   db, stripe, clientId, customerId, asOf, requestId, reason, now
 } = {}) {
-  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed('billing');
   if (!db || !stripe || !clientId) return { skipped: true, reason: 'invalid_request' };
 
   const accepted=await loadAcceptedEnterpriseUsageTerms({db,clientId});

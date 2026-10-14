@@ -3,6 +3,10 @@ require('dotenv').config()
 const guardedPricingDev = require('./src/config/guardedPricingDev');
 guardedPricingDev.assertGuardedPricingDevConfiguration();
 
+function buildApp() {
+if (guardedPricingDev.sandboxRequested() && !guardedPricingDev.isDevBillingSandbox()) {
+  throw new Error('guarded_dev_sandbox_not_verified');
+}
 // Loaded explicitly so serverless bundlers include the native canvas pdf-parse needs.
 try { require('@napi-rs/canvas') } catch (_) {}
 
@@ -591,4 +595,14 @@ if (require.main === module) {
 app.supportVoiceGateway = supportVoiceGateway
 app.start = start
 app.shutdown = shutdown
-module.exports = app
+return app
+}
+
+// Preserve the existing app and start entry. Only the explicitly selected dev
+// mode needs an asynchronous one-shot provider check before router imports.
+if (require.main === module && guardedPricingDev.sandboxRequested()) {
+  guardedPricingDev.initializeDevBillingSandbox().then(() => { module.exports = buildApp(); })
+    .catch(() => { console.error('guarded_dev_sandbox_boot_failed'); process.exitCode = 1; });
+} else {
+  module.exports = buildApp();
+}

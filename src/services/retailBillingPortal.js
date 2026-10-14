@@ -99,7 +99,7 @@ function assertSession(session,{customerId,configurationId,returnUrl,livemode,re
 }
 
 async function createClientBillingPortalSession(options) {
-  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed('billing');
   try {
     const {stripe,customerId,returnUrl,configurationId,stripeKey}=options;
     const initial=await readState(options);

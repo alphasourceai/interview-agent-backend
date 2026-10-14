@@ -13,7 +13,7 @@ const stateResult = (status, extra = {}) => ({ status, ...extra, provider_effect
   paid_access_authorized: false, payroll_authorized: false });
 
 async function invoiceEnterpriseExistingUsage({ db, stripe, billingClientId, effectsEnabled = false, maxSteps = 8 }) {
-  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed();
+  require('../config/guardedPricingDev').assertGuardedDevOutboundAllowed('billing');
   if (effectsEnabled !== true) return stateResult('disabled');
   check(Number.isSafeInteger(maxSteps) && maxSteps >= 1 && maxSteps <= 50);
   const api = () => check(stripe?.getApiField('version') === '2023-10-16');
