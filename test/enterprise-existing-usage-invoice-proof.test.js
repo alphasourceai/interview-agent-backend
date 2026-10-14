@@ -123,6 +123,18 @@ test('shell and per-role partial proofs precede full finalized proof; never clai
   }
   const partial = objects(b, 1, 'open'); assert.throws(() => proof.verifyUsageInvoicePhase(partial));
   const shell = objects(b, 0); shell.replayInvoiceId = null; assert.throws(() => proof.verifyUsageInvoicePhase(shell));
+  shell.stage='items';assert.throws(()=>proof.verifyUsageInvoicePhase(shell));
+});
+test('integer-amount items accept null Price/decimal but never mismatched or coerced values',async()=>{
+ const {b}=await binding(),f=objects(b);
+ for(const item of f.items){item.price=null;item.unit_amount_decimal=null;}
+ for(const line of f.lines){line.price=null;line.unit_amount_excluding_tax=null;}
+ assert.equal(proof.verifyUsageInvoicePhase(f).total_cents,b.total_cents);
+ for(const change of [x=>{x.items[0].unit_amount='2500';},x=>{x.items[0].unit_amount_decimal='2499';},
+  x=>{x.lines[0].unit_amount_excluding_tax='2499';},x=>{x.lines[0].amount=1;},
+  x=>{x.items[0].price=objects(b).items[0].price;x.items[0].price.unit_amount=1;}]){
+  const bad=clone(f);change(bad);assert.throws(()=>proof.verifyUsageInvoicePhase(bad));
+ }
 });
 for (const [name, change] of [
   ['tax', f => { f.invoice.total_tax_amounts = [{ amount: 0 }]; }],
@@ -200,6 +212,7 @@ test('read-only SDK census keeps foreign platform invoices and never writes or i
       listLineItems: async () => list(f.lines) }, invoiceItems: { list: async () => list(f.items) } };
   const r = await proof.readUsageInvoiceCensus({ stripe, binding: b, invoiceId: f.invoiceId });
   assert.equal(r.invoices.length, 2); assert.equal(r.provider_effect_authorized, false); assert.equal(calls.length, 2);
+  assert.equal(r.paid_access_authorized,false);assert.equal(r.payroll_authorized,false);
   stripe.invoices.list = async () => list([foreign]);
   await assert.rejects(() => proof.readUsageInvoiceCensus({ stripe, binding: b, invoiceId: f.invoiceId }));
   const empty = await proof.readUsageInvoiceCensus({ stripe, binding: b });

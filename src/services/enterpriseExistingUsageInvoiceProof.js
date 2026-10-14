@@ -6,7 +6,7 @@
 const { isDeepStrictEqual } = require('node:util');
 const { snapshotStripeSdkData: sdk, snapshotEnterpriseUsageCensusData: native } = require('./enterprisePoolPaymentProof');
 const { planEnterpriseExistingUsage } = require('./enterpriseExistingUsageReservation');
-const { usageOperationKey } = require('./usageBilling');
+const { usageOperationKey, normalizeRoleStatus } = require('./usageBilling');
 const UUID = /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const id = (v, prefix) => typeof v === 'string' && v.length <= 255 && new RegExp(`^${prefix}_[A-Za-z0-9_]+$`).test(v);
 const cents = n => Number.isSafeInteger(n) && n >= 0 && n <= 2147483647;
@@ -41,7 +41,7 @@ function usageInvoiceBinding(raw) {
     check(role && client && cents(g.amount_cents) && g.amount_cents > 0);
     const label = role.client_id === b.owner_id ? null : text(client.entity_label || client.name);
     const month = new Date(s.month_start).toLocaleString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
-    const title = text(role.title), status = text(role.status);
+    const title = text(role.title), status = normalizeRoleStatus(text(role.status));
     return { ...g, description: label ? `Interviews — ${label} · ${title} [${status}] (${month})`
       : `Interviews — ${title} [${status}] (${month})` };
   }).sort((a, c) => a.role_id.localeCompare(c.role_id));
@@ -127,8 +127,10 @@ function invoiceMoney(i, expected) {
 }
 function matchingMetadata(actual, expected) { check(actual && Object.entries(expected).every(([k, v]) => actual[k] === v)); }
 function matchingPrice(price, request, mode) {
+  if(price===null)return; // Integer-amount legacy item bodies need not create a Price.
   check(price?.object === 'price' && id(price.id, 'price') && price.livemode === mode && price.currency === 'usd'
-    && price.unit_amount === request.unit_amount && price.unit_amount_decimal === String(request.unit_amount)
+    && price.unit_amount === request.unit_amount
+    && (price.unit_amount_decimal===null||price.unit_amount_decimal === String(request.unit_amount))
     && price.type === 'one_time' && price.recurring === null && price.billing_scheme === 'per_unit'
     && price.transform_quantity === null && price.tiers_mode === null && price.custom_unit_amount === null);
 }
@@ -137,7 +139,8 @@ function matchingItem(item, request, mode) {
     && item.invoice === request.invoice && item.livemode === mode && item.currency === 'usd'
     && item.subscription === null && item.proration === false && empty(item.tax_rates) && empty(item.discounts)
     && item.quantity === request.quantity && item.unit_amount === request.unit_amount
-    && item.unit_amount_decimal === String(request.unit_amount) && item.amount === request.quantity * request.unit_amount
+    && (item.unit_amount_decimal===null||item.unit_amount_decimal === String(request.unit_amount))
+    && item.amount === request.quantity * request.unit_amount
     && item.description === request.description && isDeepStrictEqual(item.period, request.period));
   matchingMetadata(item.metadata, request.metadata); matchingPrice(item.price, request, mode);
 }
@@ -147,7 +150,7 @@ function matchingLine(line, item, request, mode) {
     && line.livemode === mode && line.currency === 'usd' && line.proration === false
     && empty(line.tax_amounts) && empty(line.tax_rates) && empty(line.discount_amounts) && empty(line.discounts)
     && line.quantity === request.quantity && line.amount === item.amount && line.amount_excluding_tax === item.amount
-    && line.unit_amount_excluding_tax === String(request.unit_amount)
+    && (line.unit_amount_excluding_tax===null||line.unit_amount_excluding_tax === String(request.unit_amount))
     && line.description === request.description && isDeepStrictEqual(line.period, request.period));
   matchingMetadata(line.metadata, request.metadata); matchingPrice(line.price, request, mode);
 }
@@ -177,6 +180,7 @@ function verifyUsageInvoicePhase({ binding: b, invoice, items, lines, provenRole
     check(i.status === 'draft' && i.paid === false && i.attempted === false && i.amount_paid === 0
       && i.amount_remaining === 0 && i.ending_balance === null);
     if (stage === 'shell') check(roles.length === 0 && replayInvoiceId === invoiceId);
+    else check(roles.length>0);
   } else {
     check(['finalized', 'paid'].includes(stage) && roles.length === b.groups.length && sum === b.total_cents
       && i.ending_balance === 0 && epoch(i.status_transitions?.finalized_at));
@@ -248,7 +252,8 @@ async function readUsageInvoiceCensus({ stripe, binding: b, invoiceId = null }) 
   // an atomic provider snapshot, and cannot prove absence after an unknown send.
   const again = await completePages(args => provider(() => stripe.invoices.list({ customer: b.customer_id, ...args })), 'in');
   check(isDeepStrictEqual(invoices, again)); await account(); api();
-  return { invoices, invoice, items, lines, provider_effect_authorized: false };
+  return { invoices, invoice, items, lines, provider_effect_authorized: false,
+    paid_access_authorized:false,payroll_authorized:false };
 }
 module.exports = { usageInvoiceBinding, usageInvoiceFreshBinding, usageInvoiceCreateRequest, usageInvoiceItemRequest, usageInvoiceFinalizeRequest,
   usageInvoicePayRequest, verifyUsageInvoicePhase, selectUsageInvoicePaymentMethod, verifyUsageInvoicePaid,

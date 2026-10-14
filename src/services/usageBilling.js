@@ -726,6 +726,7 @@ module.exports = {
   listBilledUsageInvoices,
   listLedgerRowsForInvoice,
   markUsageLinesBilled,
+  normalizeRoleStatus,
   priorMonthBounds,
   recordUsageLines,
   stampMissingCompletedAt,
