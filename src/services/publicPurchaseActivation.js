@@ -672,7 +672,8 @@ async function ensureBuyerAccountSetup({
   sendRecoveryEmail,
   assertFence = async () => {},
   activationClaimKey = null,
-  retailAdminMemberTail = null
+  retailAdminMemberTail = null,
+  retailLinkedMemberTail = null
 }) {
   const buyerEmail = lowerEmail(intent?.buyer_email || agreement?.admin_email);
   if (!buyerEmail) {
@@ -739,7 +740,9 @@ async function ensureBuyerAccountSetup({
 
   await assertFence();
   let membership;
-  if (retailAdminMemberTail) {
+  if (retailLinkedMemberTail) {
+    membership = await retailLinkedMemberTail.ensureMember({ userId, name: buyerName });
+  } else if (retailAdminMemberTail) {
     membership = await retailAdminMemberTail.ensureMember({ userId, name: buyerName });
   } else if (intent?.id && activationClaimKey) {
     const { data, error } = await db.rpc('ensure_public_purchase_buyer_member', {
@@ -930,9 +933,11 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
 
   const originalFence = options.assertActivationFence || (async () => {});
   let retailAdminMemberTail = null;
+  let retailLinkedMemberTail = null;
   const assertFence = async () => {
     await originalFence();
     if (retailAdminMemberTail) await retailAdminMemberTail.assertReady();
+    if (retailLinkedMemberTail) await retailLinkedMemberTail.assertReady();
   };
   const claimKey = cleanText(options.activationClaimKey);
   if (intent?.id && cleanText(intent.protocol) === 'fenced_v2' && !claimKey) {
@@ -1022,71 +1027,93 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
       error.code = 'billing_parent_mismatch';
       throw error;
     }
-    const subscriptionStartAt = toIsoFromUnixSeconds(options.subscription?.start_date) ||
-      toIsoFromUnixSeconds(options.subscription?.created);
-    if (!pickId(options.subscription?.id) || !subscriptionStartAt ||
-      !LIVE_SUBSCRIPTION_STATUSES.has(cleanText(options.subscription?.status).toLowerCase())) {
-      const error = new Error('A live Stripe subscription snapshot is required for fenced activation');
-      error.code = 'activation_subscription_snapshot_missing';
-      throw error;
-    }
-    const clientPayload = buildClientActivationPayload({
-      agreement, subscription: options.subscription, planKey, billingInterval,
-      fallbackCustomerId: options.fallbackCustomerId,
-      fallbackSubscriptionId: options.fallbackSubscriptionId, packageSnapshot, paidAt:activationPaidAt
-    });
-    // A retry without Stripe's original start timestamp must not invent a new
-    // digest from the current wall clock.
-    if (!retailOffer) {
-      clientPayload.contract_start_at = cleanText(existingClientState?.contract_start_at) || subscriptionStartAt;
-      clientPayload.contract_end_at = cleanText(existingClientState?.contract_end_at) || addMonthsToIso(clientPayload.contract_start_at, 12);
-      clientPayload.current_term_end = cleanText(existingClientState?.current_term_end) || clientPayload.current_term_end || clientPayload.contract_end_at;
-    }
-    const planPayload = buildAlphaScreenPlanSettingsPayload({ clientId, planKey, billingInterval, packageSnapshot });
-    if (!planPayload) throw new Error('Public purchase plan settings are invalid');
-    const credit = getFirstRolePrepaySnapshot(packageSnapshot);
-    const creditSelected = credit?.selected === true;
-    await assertFence();
-    const { data: billing, error: billingError } = await db.rpc('apply_public_purchase_billing', {
-      p_intent_id: intent.id,
-      p_claim_key: claimKey,
-      p_client_id: clientId,
-      p_billing_client_id: billingClientId,
-      p_stripe_customer_id: clientPayload.stripe_customer_id,
-      p_stripe_subscription_id: clientPayload.stripe_subscription_id,
-      p_subscription_status: clientPayload.subscription_status,
-      p_billing_status: clientPayload.billing_status,
-      p_billing_interval: clientPayload.billing_interval,
-      p_plan_tier: clientPayload.plan_tier,
-      p_current_term_end: clientPayload.current_term_end,
-      p_cancel_at_term_end: clientPayload.cancel_at_term_end,
-      p_auto_renew: clientPayload.auto_renew,
-      p_cancel_effective_at: clientPayload.cancel_effective_at,
-      p_contract_start_at: clientPayload.contract_start_at,
-      p_contract_end_at: clientPayload.contract_end_at,
-      p_platform_fee: planPayload.platform_fee,
-      p_per_role_fee: planPayload.per_role_fee,
-      p_included_interviews_per_role: planPayload.included_interviews_per_role,
-      p_additional_interview_fee: planPayload.additional_interview_fee,
-      p_max_interview_minutes: planPayload.max_interview_minutes,
-      p_credit_selected: creditSelected,
-      p_credit_type: creditSelected ? credit.credit_type : null,
-      p_credit_normal_role_fee_cents: creditSelected ? credit.normal_role_fee_cents : null,
-      p_credit_discounted_amount_cents: creditSelected ? credit.discounted_credit_amount_cents : null,
-      p_credit_discount_percent: creditSelected ? credit.discount_percent : null,
-      p_credit_non_refundable: creditSelected ? credit.non_refundable === true : null,
-      p_credit_expires: creditSelected ? credit.expires === true : null
-    });
-    if (billingError || !['applied', 'already_applied'].includes(billing?.status)) {
-      const error = new Error(billingError?.message || `Billing refused: ${billing?.status || 'unknown'}`);
-      error.code = billing?.status || billingError?.code || 'billing_rpc_failed';
-      throw error;
+    let billing, planPayload, creditSelected;
+    if (retailOffer && agreement.template_version === 'membership_agreement_retail_terms_v2' && agreement.retail_funding_receipt) {
+      if (!['public_purchase_intent', 'sales_assisted'].includes(getTemplateSnapshot(agreement).source)) {
+        const e = new Error('retail_linked_member_tail_source_unknown'); e.code = e.message; e.status = 503; throw e;
+      }
+      const { prepareExistingRetailLinkedMemberTail } = require('./existingRetailLinkedMemberTail');
+      retailLinkedMemberTail = await prepareExistingRetailLinkedMemberTail({ db, stripe: options.stripe, agreementId,
+        intentId: intent.id, claimKey, eventSessionId: checkoutSessionId,
+        eventSubscriptionId: pickId(options.subscription?.id) || options.fallbackSubscriptionId || null,
+        eventInvoiceId: options.eventInvoiceId, eventLivemode: options.eventLivemode, assertFence: originalFence });
+      if (!retailLinkedMemberTail || retailLinkedMemberTail.buyerEmail !== lowerEmail(intent.buyer_email || agreement.admin_email)) {
+        const e = new Error('retail_linked_member_tail_source_unknown'); e.code = e.message; e.status = 503; throw e;
+      }
+      // Original financial writer/digest, historical accepted INITIAL payload.
+      // A selected unknown/conflicting cohort NEVER falls through old writers.
+      billing = retailLinkedMemberTail.billing;
+      planPayload = billing.planInitial;
+      creditSelected = getFirstRolePrepaySnapshot(packageSnapshot)?.selected === true;
+    } else {
+      const subscriptionStartAt = toIsoFromUnixSeconds(options.subscription?.start_date) ||
+        toIsoFromUnixSeconds(options.subscription?.created);
+      if (!pickId(options.subscription?.id) || !subscriptionStartAt ||
+        !LIVE_SUBSCRIPTION_STATUSES.has(cleanText(options.subscription?.status).toLowerCase())) {
+        const error = new Error('A live Stripe subscription snapshot is required for fenced activation');
+        error.code = 'activation_subscription_snapshot_missing';
+        throw error;
+      }
+      const clientPayload = buildClientActivationPayload({
+        agreement, subscription: options.subscription, planKey, billingInterval,
+        fallbackCustomerId: options.fallbackCustomerId,
+        fallbackSubscriptionId: options.fallbackSubscriptionId, packageSnapshot, paidAt:activationPaidAt
+      });
+      // A retry without Stripe's original start timestamp must not invent a new
+      // digest from the current wall clock.
+      if (!retailOffer) {
+        clientPayload.contract_start_at = cleanText(existingClientState?.contract_start_at) || subscriptionStartAt;
+        clientPayload.contract_end_at = cleanText(existingClientState?.contract_end_at) || addMonthsToIso(clientPayload.contract_start_at, 12);
+        clientPayload.current_term_end = cleanText(existingClientState?.current_term_end) || clientPayload.current_term_end || clientPayload.contract_end_at;
+      }
+      planPayload = buildAlphaScreenPlanSettingsPayload({ clientId, planKey, billingInterval, packageSnapshot });
+      if (!planPayload) throw new Error('Public purchase plan settings are invalid');
+      const credit = getFirstRolePrepaySnapshot(packageSnapshot);
+      creditSelected = credit?.selected === true;
+      await assertFence();
+      const { data: legacyBilling, error: billingError } = await db.rpc('apply_public_purchase_billing', {
+        p_intent_id: intent.id,
+        p_claim_key: claimKey,
+        p_client_id: clientId,
+        p_billing_client_id: billingClientId,
+        p_stripe_customer_id: clientPayload.stripe_customer_id,
+        p_stripe_subscription_id: clientPayload.stripe_subscription_id,
+        p_subscription_status: clientPayload.subscription_status,
+        p_billing_status: clientPayload.billing_status,
+        p_billing_interval: clientPayload.billing_interval,
+        p_plan_tier: clientPayload.plan_tier,
+        p_current_term_end: clientPayload.current_term_end,
+        p_cancel_at_term_end: clientPayload.cancel_at_term_end,
+        p_auto_renew: clientPayload.auto_renew,
+        p_cancel_effective_at: clientPayload.cancel_effective_at,
+        p_contract_start_at: clientPayload.contract_start_at,
+        p_contract_end_at: clientPayload.contract_end_at,
+        p_platform_fee: planPayload.platform_fee,
+        p_per_role_fee: planPayload.per_role_fee,
+        p_included_interviews_per_role: planPayload.included_interviews_per_role,
+        p_additional_interview_fee: planPayload.additional_interview_fee,
+        p_max_interview_minutes: planPayload.max_interview_minutes,
+        p_credit_selected: creditSelected,
+        p_credit_type: creditSelected ? credit.credit_type : null,
+        p_credit_normal_role_fee_cents: creditSelected ? credit.normal_role_fee_cents : null,
+        p_credit_discounted_amount_cents: creditSelected ? credit.discounted_credit_amount_cents : null,
+        p_credit_discount_percent: creditSelected ? credit.discount_percent : null,
+        p_credit_non_refundable: creditSelected ? credit.non_refundable === true : null,
+        p_credit_expires: creditSelected ? credit.expires === true : null
+      });
+      if (billingError || !['applied', 'already_applied'].includes(legacyBilling?.status)) {
+        const error = new Error(billingError?.message || `Billing refused: ${legacyBilling?.status || 'unknown'}`);
+        error.code = legacyBilling?.status || billingError?.code || 'billing_rpc_failed';
+        throw error;
+      }
+      billing = legacyBilling;
     }
     await assertFence();
     const setup = await ensureBuyerAccountSetup({
       db, authAdmin, clientId, agreement, intent, requestId: options.requestId || null,
       logger, ensureRecovery, sendRecoveryEmail, assertFence,
-      activationClaimKey: claimKey
+      activationClaimKey: claimKey,
+      retailLinkedMemberTail
     });
     const buyerEmail = lowerEmail(intent.buyer_email);
     const buyerName = buildBuyerName(intent, agreement) || buyerEmail;
