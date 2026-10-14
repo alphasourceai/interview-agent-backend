@@ -235,8 +235,12 @@ end $$;
 revoke all on function public.enterprise_existing_usage_census(uuid) from public,anon,authenticated;
 grant execute on function public.enterprise_existing_usage_census(uuid) to service_role;
 
+-- Existing PostgREST hoists RPC proconfig statement_timeout before its main
+-- query. A raw SQL client must arm that same deadline BEFORE SELECT; changing
+-- a GUC inside a running function alone is not a hard statement timer.
+-- https://docs.postgrest.org/en/stable/references/transactions.html#hoisted-function-settings
 create function public.prepare_enterprise_existing_usage(p_owner uuid)
-returns jsonb language plpgsql volatile security invoker set search_path=pg_catalog set lock_timeout='10s' as $$
+returns jsonb language plpgsql volatile security invoker set search_path=pg_catalog set lock_timeout='10s' set statement_timeout='2s' as $$
 declare census jsonb;receipt jsonb;agm uuid;clock_ timestamptz;month_ date;start_ timestamptz;end_ timestamptz;
  b public.enterprise_existing_usage_batches;identity_ jsonb;document_ jsonb;digest_ text;history_ jsonb;
  audit_ jsonb;audit_id text;prior_audit jsonb;steps integer:=0;rate_ integer;
@@ -279,15 +283,15 @@ begin
  end loop;
  if month_::timestamp at time zone 'UTC'>=end_
   or(month_::timestamp+interval '1 month') at time zone 'UTC'>clock_
-  then return jsonb_build_object('phase','not_due','provider_effect_authorized',false);end if;
+  then return jsonb_build_object('phase','not_due','provider_effect_authorized',false,'paid_access_authorized',false,'payroll_authorized',false);end if;
  if exists(select 1 from public.enterprise_existing_usage_batches where owner_id=p_owner
   and service_month<month_ and phase not in('reserved','no_usage'))
-  then return jsonb_build_object('phase','held','provider_effect_authorized',false);end if;
+  then return jsonb_build_object('phase','held','provider_effect_authorized',false,'paid_access_authorized',false,'payroll_authorized',false);end if;
  select * into b from public.enterprise_existing_usage_batches where owner_id=p_owner and service_month=month_ for update;
  identity_:=jsonb_build_object('agreement_id',agm,'owner_id',p_owner,'service_month',month_,
   'receipt',receipt);
  if b.id is not null and(b.phase<>'prepared' or b.agreement_id<>agm or b.source_identity is distinct from identity_)
-  then return jsonb_build_object('phase','held','provider_effect_authorized',false);end if;
+  then return jsonb_build_object('phase','held','provider_effect_authorized',false,'paid_access_authorized',false,'payroll_authorized',false);end if;
  -- Include immutable prior identity/groups/prefix/digest, not its recursively
  -- nested old census document. This still attests all required prior inputs.
  select coalesce(jsonb_agg(to_jsonb(x)-'snapshot' order by x.service_month,x.id),'[]'::jsonb) into history_
@@ -300,7 +304,7 @@ begin
   'month_end',to_char(month_::timestamp+interval '1 month','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'));
  if b.id is not null and b.expires_at>=clock_ and b.snapshot-'observed_at'=document_-'observed_at' then
   return jsonb_build_object('phase','prepared','batch_id',b.id,'generation',b.generation,
-   'snapshot_digest',b.snapshot_digest,'snapshot',b.snapshot);
+   'snapshot_digest',b.snapshot_digest,'snapshot',b.snapshot,'provider_effect_authorized',false,'paid_access_authorized',false,'payroll_authorized',false);
  end if;
  digest_:=encode(sha256(convert_to(document_::text,'UTF8')),'hex');
  if b.id is null then b.id:=gen_random_uuid();b.generation:=0;end if;
@@ -329,13 +333,13 @@ begin
    values(audit_id,'enterprise.usage.prepared',true,p_owner,audit_);
  end if;
  return jsonb_build_object('phase','prepared','batch_id',b.id,'generation',b.generation,
-  'snapshot_digest',b.snapshot_digest,'snapshot',b.snapshot);
+  'snapshot_digest',b.snapshot_digest,'snapshot',b.snapshot,'provider_effect_authorized',false,'paid_access_authorized',false,'payroll_authorized',false);
 end $$;
 revoke all on function public.prepare_enterprise_existing_usage(uuid) from public,anon,authenticated;
 grant execute on function public.prepare_enterprise_existing_usage(uuid) to service_role;
 
 create function public.reserve_enterprise_existing_usage(p_batch uuid,p_generation integer,p_digest text,p_groups jsonb,p_prefix jsonb)
-returns jsonb language plpgsql volatile security invoker set search_path=pg_catalog set lock_timeout='10s' as $$
+returns jsonb language plpgsql volatile security invoker set search_path=pg_catalog set lock_timeout='10s' set statement_timeout='2s' as $$
 declare owner_ uuid;b public.enterprise_existing_usage_batches;census jsonb;receipt jsonb;document_ jsonb;history_ jsonb;
  identity_ jsonb;month_ date;clock_ timestamptz;start_ timestamptz;end_ timestamptz;steps integer:=0;
  g jsonb;e jsonb;iv jsonb;old_ jsonb;previous_ timestamptz;previous_id text;stamp_ timestamptz;
@@ -365,7 +369,7 @@ begin
    then raise exception 'enterprise_usage_reserve_winner_conflict';end if;
   select coalesce(sum((x->>'amount_cents')::bigint),0) into total_ from jsonb_array_elements(b.groups)x;
   return jsonb_build_object('phase',b.phase,'batch_id',b.id,'generation',b.generation,'total_cents',total_,
-   'provider_effect_authorized',false,'paid_access_authorized',false);
+   'provider_effect_authorized',false,'paid_access_authorized',false,'payroll_authorized',false);
  end if;
  if b.phase<>'prepared' then raise exception 'enterprise_usage_reserve_phase_denied';end if;
  start_:=(receipt->'client_initial'->>'contract_start_at')::timestamptz;
@@ -453,7 +457,7 @@ begin
  end loop;
  perform set_config('private_sales.enterprise_usage_writer','',true);
  return jsonb_build_object('phase',b.phase,'batch_id',b.id,'generation',b.generation,'total_cents',total_,
-  'provider_effect_authorized',false,'paid_access_authorized',false);
+  'provider_effect_authorized',false,'paid_access_authorized',false,'payroll_authorized',false);
 end $$;
 revoke all on function public.reserve_enterprise_existing_usage(uuid,integer,text,jsonb,jsonb) from public,anon,authenticated;
 grant execute on function public.reserve_enterprise_existing_usage(uuid,integer,text,jsonb,jsonb) to service_role;

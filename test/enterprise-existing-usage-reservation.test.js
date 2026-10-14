@@ -97,3 +97,15 @@ test('unmounted bridge skips an open service month without minting a no-usage or
  assert.equal(calls,1);assert.equal(result.phase,'not_due');assert.equal(Object.hasOwn(result,'total_cents'),false);
  assert.equal(result.provider_effect_authorized,false);assert.equal(result.paid_access_authorized,false);assert.equal(result.payroll_authorized,false);
 });
+test('native census accepts realistic agreement HTML without widening SDK proof limits',async()=>{
+ const f=await fixture(),html='SYNTHETIC AGREEMENT '+ 'X'.repeat(240000);
+ f.s.agreements[0].template_snapshot.rendered_html=html;
+ f.s.agreements[0].enterprise_checkout_source.material.template_snapshot.rendered_html=html;
+ assert.equal(plan(f.s).total_cents,5000);
+ const {snapshotStripeSdkData,snapshotEnterpriseUsageCensusData}=require('../src/services/enterprisePoolPaymentProof');
+ assert.throws(()=>snapshotStripeSdkData({html}),{code:'pool_proof_invalid_graph'});
+ assert.equal(snapshotEnterpriseUsageCensusData({html}).html,html);
+ for(const bad of [()=>{const x={};Object.defineProperty(x,'v',{enumerable:true,get(){throw Error('getter must not run');}});return x;},
+  ()=>new Proxy({v:1},{}),()=>{const x={};x.self=x;return x;},()=>({v:undefined}),()=>({a:'X'.repeat(9000000),b:'X'.repeat(9000000)})])
+  assert.throws(()=>snapshotEnterpriseUsageCensusData(bad()),{code:'pool_proof_invalid_graph'});
+});

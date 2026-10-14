@@ -5,7 +5,7 @@
 // refresh access, deliver mail, or authorize commissions. Server-calculated
 // groups are trusted-server content, not SQL attestation of that calculation.
 const { isDeepStrictEqual } = require('node:util');
-const { snapshotStripeSdkData: snapshot } = require('./enterprisePoolPaymentProof');
+const { snapshotEnterpriseUsageCensusData: snapshot } = require('./enterprisePoolPaymentProof');
 const { verifyEnterpriseBillingReceipt } = require('./existingEnterpriseBillingReceipt');
 const { allocateInterviewRows } = require('./interviewAllocation');
 const { isUsedInterviewRow } = require('./roleInterviewAvailability');

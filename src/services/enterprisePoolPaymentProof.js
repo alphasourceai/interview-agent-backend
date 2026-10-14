@@ -22,13 +22,19 @@ function check(value, code) { if (!value) fail(code); }
 // Snapshot plain own-data JSON without invoking accessors, proxies or toJSON.
 // Shared ordinary object references are fine; cycles, holes and oversized graphs
 // are not. A caller cannot alter the graph between successive proof predicates.
-function safeSnapshot(input, sdkRoot = false) {
+function safeSnapshot(input, sdkRoot = false, nativeCensus = false) {
   let count = 0;
+  let bytes = 0;
   const active = new Set();
   function copy(v, depth) {
-    check(++count <= 10000 && depth <= 20, 'pool_proof_invalid_graph');
+    check(++count <= (nativeCensus ? 1000000 : 10000) && depth <= (nativeCensus ? 64 : 20), 'pool_proof_invalid_graph');
+    if (nativeCensus) {
+      check(v !== undefined, 'pool_proof_invalid_graph');
+      bytes += typeof v === 'string' ? Buffer.byteLength(v, 'utf8') + 8 : 16;
+      check(bytes <= 16777216, 'pool_proof_invalid_graph');
+    }
     if (v == null || ['string', 'boolean', 'undefined'].includes(typeof v)) {
-      check(typeof v !== 'string' || v.length <= 8192, 'pool_proof_invalid_graph');
+      check(nativeCensus || typeof v !== 'string' || v.length <= 8192, 'pool_proof_invalid_graph');
       return v;
     }
     if (typeof v === 'number') { check(Number.isFinite(v), 'pool_proof_invalid_graph'); return v; }
@@ -48,7 +54,10 @@ function safeSnapshot(input, sdkRoot = false) {
       && Number(k) < v.length), 'pool_proof_invalid_graph');
     active.add(v);
     const result = array ? [] : Object.create(null);
-    for (const k of dataKeys) result[k] = copy(descriptors[k].value, depth + 1);
+    for (const k of dataKeys) {
+      if (nativeCensus) { bytes += Buffer.byteLength(k, 'utf8') + 8; check(bytes <= 16777216, 'pool_proof_invalid_graph'); }
+      result[k] = copy(descriptors[k].value, depth + 1);
+    }
     active.delete(v);
     return result;
   }
@@ -58,6 +67,10 @@ function safeSnapshot(input, sdkRoot = false) {
 // Trusted SDK adapter boundary only; projection is NOT provider authentication.
 // The pure policy below still rejects hidden properties on its entire input.
 function snapshotStripeSdkData(input) { return safeSnapshot(input, true); }
+// Same own-data/proxy/accessor/cycle checks, separate bounded native JSON
+// census profile. Real signed agreement HTML is much larger than an SDK id.
+// This does not enlarge ANY existing SDK/proof caller's default limits.
+function snapshotEnterpriseUsageCensusData(input) { return safeSnapshot(input, false, true); }
 
 function list(value, prefix, length) {
   check(value?.object === 'list' && value.has_more === false && Array.isArray(value.data)
@@ -220,4 +233,4 @@ function proveEnterprisePoolPayment(raw = {}) {
     membership_activation_required: true, native_receipt_required: true });
 }
 
-module.exports = { proveEnterprisePoolPayment, snapshotStripeSdkData };
+module.exports = { proveEnterprisePoolPayment, snapshotStripeSdkData, snapshotEnterpriseUsageCensusData };
