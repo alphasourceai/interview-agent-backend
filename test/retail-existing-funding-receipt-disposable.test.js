@@ -5,13 +5,15 @@ const {buildRetailPackageSnapshot}=require('../src/services/membershipPackageCom
 const {OFFER_VERSION,anchoredMonthInstant}=require('../src/services/membershipOffers');
 const enabled=process.env.RETAIL_FUNDING_RECEIPT_DISPOSABLE==='true',opts={skip:!enabled};
 const migration=path.resolve(__dirname,'../supabase/migrations/20261013231615_retail_existing_initial_funding_receipt.sql');
+const linkedMemberMigrationPath=path.resolve(__dirname,'../supabase/migrations/20261014045836_retail_existing_linked_buyer_member.sql');
 const customerIndex='CREATE UNIQUE INDEX billing_customers_stripe_customer_id_uniq ON public.billing_customers USING btree (stripe_customer_id) WHERE (stripe_customer_id IS NOT NULL)';
 const lit=v=>v==null?'null':typeof v==='object'?`'${JSON.stringify(v).replaceAll("'","''")}'::jsonb`:typeof v==='boolean'||typeof v==='number'?String(v):`'${String(v).replaceAll("'","''")}'`;
 function run(q){return cp.spawnSync('/opt/homebrew/opt/postgresql@17/bin/psql',['-X','-q','-At','-v','ON_ERROR_STOP=1','-c',q],{encoding:'utf8'});}
 function sql(q){const r=run(q);assert.equal(r.status,0,r.stderr);return r.stdout.trim();}
 function denied(q,pattern=/retail_funding_/){const r=run(q);assert.notEqual(r.status,0);assert.match(r.stderr,pattern);}
 const acl=()=>sql("select jsonb_agg(jsonb_build_array(relname,relacl::text,relrowsecurity) order by relname) from pg_class where oid in('clients'::regclass,'membership_agreements'::regclass,'public_purchase_intents'::regclass,'billing_customers'::regclass);");
-let priorAcl,legacyBefore,priorFunctions,historicalV2,historicalBillingV2,historicalBefore,historicalIntentBefore;const legacyId=crypto.randomUUID();
+let priorAcl,legacyBefore,priorFunctions,historicalV2,historicalBillingV2,historicalBefore,historicalIntentBefore,linkedOriginalCatalog;const legacyId=crypto.randomUUID();
+const linkedOriginalFunctions=()=>sql("select jsonb_agg(jsonb_build_array(oid::regprocedure::text,pg_get_functiondef(oid),proowner::regrole::text,proacl::text) order by oid::regprocedure::text) from pg_proc where proname in('apply_public_purchase_billing','ensure_public_purchase_buyer_member','locked_purchase_context');");
 const functionCatalog=()=>sql("select jsonb_agg(jsonb_build_array(proname,md5(prosrc),provolatile,prosecdef,proconfig,proowner::regrole::text,proacl::text) order by proname) from pg_proc where proname in ('retail_existing_funding_context','record_retail_existing_funding');");
 before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/tmp\/alphascreen-retail-funding-pg\.[A-Za-z0-9]+$/);
  assert.equal(process.env.PGPORT,'55456');assert.equal(process.env.PGUSER,'postgres');assert.equal(process.env.PGDATABASE,'postgres');assert.equal(process.env.PGPASSWORD,undefined);
@@ -77,6 +79,14 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
   assert.equal(sql("select to_regprocedure('public.retail_admin_existing_member_schema_guard()') is null;"),'t');
  }finally{sql('drop function public.ensure_retail_existing_admin_buyer_member(uuid);');}
  sql(memberMigration);
+ const linkedMemberMigration=fs.readFileSync(linkedMemberMigrationPath,'utf8');
+ linkedOriginalCatalog=linkedOriginalFunctions();
+ try{sql("create function public.ensure_retail_existing_linked_buyer_member(uuid) returns void language sql as 'select null::void';");
+  denied(linkedMemberMigration,/retail_linked_member_schema_drift/);
+  assert.equal(sql("select to_regprocedure('retail_linked_existing_member_schema_guard()') is null;"),'t');
+ }finally{sql('drop function public.ensure_retail_existing_linked_buyer_member(uuid);');}
+ sql(linkedMemberMigration);
+ assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
  // Exact old-data oracles remain, with ONLY the new nullable receipt column.
  // Derive expected JSON from the prior saved oracle, not a fresh row read that
  // could hide migration DML or changes to an accepted historical agreement.
@@ -147,6 +157,17 @@ function billingCall(f,patch={}){
  return 'select apply_public_purchase_billing('+Object.values(args).map(lit).join(',')+');';
 }
 const nativeBilling=(f,patch)=>JSON.parse(sql('set role service_role;'+billingCall(f,patch)));
+// Native linked membership delegates to the unchanged original four-arg RPC.
+// User IDs/current provider data are synthetic, not hosted Auth acceptance.
+function linkedMemberFixture(plan='basic',months=3,payment='prepaid',role=false,source='sales_assisted',seconds=null){
+ const f=fixture(plan,months,payment,role,true,false,'admin',source);
+ if(seconds!==null)f.proof.period.provider_period_end=Math.floor(Date.now()/1000)+seconds;
+ record(f);nativeComplete(f);f.digest=nativeBilling(f).digest;f.user=crypto.randomUUID();return f;
+}
+const linkedMemberCurrent=f=>({...adminSubscription(f),cancel_at:null,pause_collection:null});
+const linkedMemberCall=(f,user=f.user,current=linkedMemberCurrent(f),digest=f.digest,key=f.key,name='Synthetic Buyer')=>
+ 'select ensure_retail_existing_linked_buyer_member('+[f.intent,key,digest,current,user,name].map(lit).join(',')+');';
+const nativeLinkedMember=(f,...args)=>JSON.parse(sql('set role service_role;'+linkedMemberCall(f,...args)));
 const billingState=f=>sql(`select jsonb_build_object('client',(select to_jsonb(c) from clients c where id=${lit(f.client)}),
  'intent',(select to_jsonb(i) from public_purchase_intents i where id=${lit(f.intent)}),
  'plan',(select to_jsonb(p) from client_plan_settings p where client_id=${lit(f.client)}),
@@ -1774,4 +1795,199 @@ test('linked installed Supabase SDK transports SAME original digest RPC through 
   // Actual installed SDK/real native SQL, authored gateway only. No real
   // PostgREST instance, hosted authorization, account or provider acceptance.
  }finally{await new Promise(resolve=>server.close(resolve));await b.close();}
+});
+
+for(const source of ['sales_assisted','public_purchase_intent'])for(const plan of ['basic','pro'])for(const months of [3,6,12])
+for(const payment of source==='sales_assisted'?['prepaid','monthly_installments']:['prepaid'])for(const credit of [false,true])
+test(`native SAME original linked buyer RPC ${source}/${plan}/${months}/${payment}/credit:${credit}`,opts,()=>{
+ const f=linkedMemberFixture(plan,months,payment,credit,source),financial=billingState(f);
+ assert.deepEqual(nativeLinkedMember(f),{status:'created',role:'manager'});const first=members(f);
+ assert.equal(first.length,1);assert.equal(first[0].user_id,f.user);assert.equal(first[0].user_id_uuid,f.user);
+ assert.equal(first[0].email,'buyer@example.invalid');assert.equal(first[0].name,'Synthetic Buyer');
+ const tuple=sql(`select xmin::text from client_members where client_id=${lit(f.client)} and user_id=${lit(f.user)};`);
+ assert.deepEqual(nativeLinkedMember(f),{status:'existing',role:'manager'});assert.deepEqual(members(f),first);
+ assert.equal(sql(`select xmin::text from client_members where client_id=${lit(f.client)} and user_id=${lit(f.user)};`),tuple);
+ assert.equal(billingState(f),financial);assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
+});
+test('linked member retains ORIGINAL legacy viewer/other and valid privileged roles; no-DML existing, blank becomes manager',opts,()=>{
+ const check=sql("select pg_get_constraintdef(oid) from pg_constraint where conrelid='client_members'::regclass and conname='client_members_role_chk';");
+ for(const role of ['manager','admin','owner','super_admin','viewer','member','other','']){
+  const f=linkedMemberFixture();
+  // NOT VALID permits historical out-of-enum rows, but not new invalid rows.
+  // Author only such a synthetic legacy row, restoring the exact constraint
+  // before invoking the ORIGINAL routine. No production constraint change.
+  try{sql('alter table client_members drop constraint client_members_role_chk;');
+   sql(`insert into client_members(client_id,user_id,email,name,role) values(${lit(f.client)},${lit(f.user)},' BUYER@example.invalid ','Original Name',${lit(role)});`);
+  }finally{sql('alter table client_members add constraint client_members_role_chk '+check+';');}
+  assert.equal(nativeLinkedMember(f).role,role.trim().toLowerCase()||'manager');const m=members(f)[0];
+  assert.equal(m.name,'Original Name');assert.equal(m.email,' BUYER@example.invalid ');
+  const prior=members(f);assert.equal(nativeLinkedMember(f).status,'existing');assert.deepEqual(members(f),prior);
+ }
+ const f=linkedMemberFixture();sql(`insert into client_members(client_id,user_id,email,name,role) values(${lit(f.client)},${lit(f.user)},null,null,'member');`);
+ assert.deepEqual(nativeLinkedMember(f),{status:'updated',role:'member'});assert.equal(members(f)[0].name,'Synthetic Buyer');
+ assert.equal(members(f)[0].email,'buyer@example.invalid');
+});
+test('linked member refuses foreign/ambiguous identities and missing/zero user; no rebinding',opts,()=>{
+ for(const mode of ['foreign-user','foreign-email','ambiguous']){
+  const f=linkedMemberFixture(),other=crypto.randomUUID();sql(`insert into client_members(client_id,user_id,email,role)
+   values(${lit(f.client)},${lit(mode==='foreign-email'?f.user:other)},${lit(mode==='foreign-email'?'other@example.invalid':'buyer@example.invalid')},'member');`);
+  if(mode==='ambiguous')sql(`insert into client_members(client_id,user_id,role) values(${lit(f.client)},${lit(f.user)},'member');`);
+  const before=members(f);denied('set role service_role;'+linkedMemberCall(f),/retail_linked_member_identity_conflict/);assert.deepEqual(members(f),before);
+ }
+ const f=linkedMemberFixture();for(const user of [null,'00000000-0000-0000-0000-000000000000'])
+  denied('set role service_role;'+linkedMemberCall(f,user),/retail_linked_member_user_denied/);
+ assert.deepEqual(members(f),[]);
+});
+test('linked member actual current closed7 rejects unknown/inactive/trialing/paused/newer periods and early cancellation',opts,()=>{
+ const f=linkedMemberFixture();for(const patch of [{status:'trialing'},{status:'canceled'},{status:'past_due'},{status:'paused'},
+  {id:'sub_OTHER'},{customer:'cus_OTHER'},{current_period_end:f.proof.period.provider_period_end+1},{current_period_end:'2000000000'},
+  {current_period_end:null},{cancel_at_period_end:null},{cancel_at:f.proof.period.provider_period_end-1},
+  {cancel_at:253402300800},{cancel_at:'later'},{cancel_at:2000000000.5},{pause_collection:{behavior:'keep_as_draft'}},{extra:true}]){
+  denied('set role service_role;'+linkedMemberCall(f,f.user,{...linkedMemberCurrent(f),...patch}),/retail_linked_member_current_subscription_denied/);
+  assert.deepEqual(members(f),[]);
+ }
+ const missing=linkedMemberCurrent(f);delete missing.pause_collection;
+ denied('set role service_role;'+linkedMemberCall(f,f.user,missing),/retail_linked_member_current_subscription_denied/);
+});
+test('linked member keeps nonrenewal/future cancellation, mutable plan and consumed credits without financial reset',opts,()=>{
+ const f=linkedMemberFixture('pro',6,'monthly_installments',true),used=crypto.randomUUID();
+ sql(`insert into roles(id,client_id,title,slug_or_token) values(${lit(used)},${lit(f.client)},'Synthetic linked credit use',${lit('SYNTHETIC_'+used)});
+  update client_role_credits set status='used',used_at=clock_timestamp(),used_by_role_id=${lit(used)} where source_public_purchase_intent_id=${lit(f.intent)};
+  update client_plan_settings set platform_fee=17,billing_model='usage' where client_id=${lit(f.client)};
+  update clients set auto_renew=false,cancel_at_term_end=true where id=${lit(f.client)};`);
+ const before=billingState(f);assert.equal(nativeLinkedMember(f,f.user,{...linkedMemberCurrent(f),cancel_at_period_end:true,cancel_at:f.proof.period.provider_period_end}).status,'created');
+ assert.equal(billingState(f),before);
+});
+test('linked member current native source/client/owner/paid clock/digest/claim refusal before membership',opts,()=>{
+ const fields={archive:'archived_at=clock_timestamp()',customer:"stripe_customer_id='cus_OTHER'",subscription:"stripe_subscription_id='sub_OTHER'",
+  status:"subscription_status='past_due'",billing:"billing_status='inactive'",period:"current_term_end=current_term_end+interval '1 second'",
+  start:"contract_start_at=contract_start_at+interval '1 second'",end:"contract_end_at=contract_end_at+interval '1 second'",override:"access_override_mode='force_inactive'"};
+ for(const mode of [...Object.keys(fields),'profile','active-agreement','voided','current','digest','stamp','future-claim','expired-claim','plan']){
+  const f=linkedMemberFixture();
+  if(mode==='active-agreement'){
+   // Current table enum disallows active; author that unknown legacy state
+   // only inside a transaction that MUST roll back the DDL and record edit.
+   const before=billingState(f);denied(`begin;alter table membership_agreements drop constraint membership_agreements_status_check;
+    update membership_agreements set status='active' where id=${lit(f.id)};set role service_role;${linkedMemberCall(f)}commit;`,/retail_linked_member_source_denied/);
+   assert.deepEqual(members(f),[]);assert.equal(billingState(f),before);continue;
+  }
+  if(fields[mode])sql(`update clients set ${fields[mode]} where id=${lit(f.client)};`);
+  else if(mode==='profile')sql(`update billing_customers set stripe_customer_id=null where client_id=${lit(f.client)};`);
+  else if(mode==='plan')sql(`delete from client_plan_settings where client_id=${lit(f.client)};`);
+  else if(['active-agreement','voided','current'].includes(mode))sql(`update membership_agreements set ${mode==='active-agreement'?"status='active'":mode==='voided'?'voided_at=clock_timestamp()':'is_current=false'} where id=${lit(f.id)};`);
+  else sql(`update public_purchase_intents set ${{digest:"billing_apply_digest=repeat('0',64)",stamp:"billing_applied_at=clock_timestamp()+interval '1 minute'",'future-claim':"activation_claimed_at=clock_timestamp()+interval '1 minute'",'expired-claim':"activation_claimed_at=clock_timestamp()-interval '6 minutes'"}[mode]} where id=${lit(f.intent)};`);
+  const before=billingState(f);denied('set role service_role;'+linkedMemberCall(f),/retail_linked_member_|retail_funding_/);
+  assert.deepEqual(members(f),[]);assert.equal(billingState(f),before);
+ }
+ const f=linkedMemberFixture();for(const digest of [null,'short'])denied('set role service_role;'+linkedMemberCall(f,f.user,linkedMemberCurrent(f),digest),/retail_linked_member_billing_denied/);
+ denied('set role service_role;'+linkedMemberCall(f,f.user,linkedMemberCurrent(f),f.digest,'WRONG_CLAIM'),/retail_linked_member_|retail_funding_claim_denied/);
+});
+test('linked member same/different user concurrency uses retained root lock with actual blocking observer',opts,async()=>{
+ for(const same of [true,false]){
+  const f=linkedMemberFixture(),user=same?f.user:crypto.randomUUID(),tag='SYNTHETIC_LINKED_'+f.id.replaceAll('-','');
+  const [holder,writer,observer]=await Promise.all([
+   parallel(`set application_name=${lit(tag+'_holder')};set role service_role;begin;${linkedMemberCall(f)}select pg_sleep(1);commit;`),
+   parallel(`set application_name=${lit(tag+'_writer')};set role service_role;select pg_sleep(0.1);${linkedMemberCall(f,user)}`),
+   parallel(`select pg_sleep(0.35);select exists(select 1 from pg_stat_activity w join pg_stat_activity h on h.pid=any(pg_blocking_pids(w.pid))
+    where w.application_name=${lit(tag+'_writer')} and h.application_name=${lit(tag+'_holder')} and w.wait_event_type='Lock');`)]);
+  assert.equal(holder.code,0,holder.err);assert.equal(observer.code,0,observer.err);assert.equal(observer.out.trim(),'t');
+  if(same){assert.equal(writer.code,0,writer.err);assert.equal(JSON.parse(writer.out.split('\n').find(s=>s.startsWith('{'))).status,'existing');}
+  else{assert.notEqual(writer.code,0);assert.match(writer.err,/retail_linked_member_identity_conflict/);}
+  assert.equal(members(f).length,1);assert.equal(members(f)[0].user_id,f.user);
+ }
+});
+test('linked member native clock rejects actual member wait past B and delayed deferred COMMIT, financial work remains',opts,async()=>{
+ const f=linkedMemberFixture('basic',3,'monthly_installments',false,'sales_assisted',2);
+ sql(`insert into client_members(client_id,user_id,email,name,role) values(${lit(f.client)},${lit(f.user)},'buyer@example.invalid',null,'member');`);
+ const before=members(f),financial=billingState(f);
+ const [holder,writer]=await Promise.all([parallel(`begin;select 1 from client_members where client_id=${lit(f.client)} for update;select pg_sleep(2.5);commit;`),
+  parallel('set role service_role;select pg_sleep(0.07);'+linkedMemberCall(f))]);
+ assert.equal(holder.code,0,holder.err);assert.notEqual(writer.code,0);assert.match(writer.err,/retail_linked_member_paid_period_ended/);
+ assert.deepEqual(members(f),before);assert.equal(billingState(f),financial);
+ const g=linkedMemberFixture('basic',3,'monthly_installments',false,'sales_assisted',2),saved=billingState(g);
+ denied('set role service_role;begin;'+linkedMemberCall(g)+'select pg_sleep(2.5);commit;',/retail_linked_member_paid_period_ended/);
+ assert.deepEqual(members(g),[]);assert.equal(billingState(g),saved);
+});
+test('linked member native clock rejects expired lease after member wait and deferred COMMIT',opts,async()=>{
+ for(const wait of [true,false]){
+  const f=linkedMemberFixture();sql(`update public_purchase_intents set activation_claimed_at=clock_timestamp()-interval '298 seconds' where id=${lit(f.intent)};`);
+  if(wait)sql(`insert into client_members(client_id,user_id,email,name,role) values(${lit(f.client)},${lit(f.user)},'buyer@example.invalid',null,'member');`);
+  const before=members(f);let writer;
+  if(wait){const results=await Promise.all([parallel(`begin;select 1 from client_members where client_id=${lit(f.client)} for update;select pg_sleep(2.5);commit;`),
+   parallel('set role service_role;select pg_sleep(0.07);'+linkedMemberCall(f))]);assert.equal(results[0].code,0,results[0].err);writer=results[1];}
+  else writer=await parallel('set role service_role;begin;'+linkedMemberCall(f)+'select pg_sleep(2.5);commit;');
+  assert.notEqual(writer.code,0);assert.match(writer.err,/retail_linked_member_claim_denied|retail_funding_claim_denied/);assert.deepEqual(members(f),before);
+ }
+});
+test('linked member deferred COMMIT binding/source/identity catches same-tx changes; independent contexts and divergent same-key',opts,()=>{
+ for(const mode of ['client','role','identity','claim','current']){
+  const f=linkedMemberFixture(),before=billingState(f);
+  const change={client:`update clients set billing_status='inactive' where id=${lit(f.client)};`,role:`update client_members set role='owner' where client_id=${lit(f.client)};`,
+   identity:`update client_members set email='other@example.invalid' where client_id=${lit(f.client)};`,claim:`update public_purchase_intents set activation_claim_key='CHANGED' where id=${lit(f.intent)};`,
+   current:`update membership_agreements set is_current=false where id=${lit(f.id)};`}[mode];
+  denied('set role service_role;begin;'+linkedMemberCall(f)+change+'commit;',/retail_linked_member_|retail_funding_/);assert.deepEqual(members(f),[]);assert.equal(billingState(f),before);
+ }
+ const a=linkedMemberFixture(),b=linkedMemberFixture();sql('set role service_role;begin;'+linkedMemberCall(a)+linkedMemberCall(b)+'commit;');
+ assert.equal(members(a).length,1);assert.equal(members(b).length,1);
+ const f=linkedMemberFixture();denied('set role service_role;begin;'+linkedMemberCall(f)+linkedMemberCall(f,f.user,{...linkedMemberCurrent(f),cancel_at_period_end:true})+'commit;',/retail_linked_member_binding_conflict/);assert.deepEqual(members(f),[]);
+});
+test('linked member early IMMEDIATE nested DEFINER execution fails safely; explicit deferred flush succeeds',opts,()=>{
+ const f=linkedMemberFixture();denied('set role service_role;begin;set constraints all immediate;'+linkedMemberCall(f)+'commit;',/retail_linked_member_commit_binding_denied/);
+ assert.deepEqual(members(f),[]);
+ sql('set role service_role;begin;'+linkedMemberCall(f)+'set constraints all immediate;commit;');assert.equal(members(f).length,1);
+ assert.equal(sql("select proconfig::text from pg_proc where oid='retail_linked_existing_member_commit_guard()'::regprocedure;"),'{search_path=pg_catalog,lock_timeout=10s}');
+});
+test('linked member real original PK adoption preserves role and post-adoption full candidate count refuses ambiguity',opts,async()=>{
+ // Test-only sleep at the actual original INSERT. A privileged non-RPC
+ // synthetic writer uses replica mode to bypass the root FK lock, emulating
+ // the original routine's documented non-RPC PK-adoption race. This is not
+ // an arbitrary privileged-writer security defense or normal app behavior.
+ sql(`create function public.synthetic_linked_insert_wait() returns trigger language plpgsql as $$ begin
+  if nullif(current_setting('private_sales.retail_linked_member_contexts',true),'') is not null then perform pg_sleep(0.8);end if;return new;end $$;
+  create trigger synthetic_linked_insert_wait before insert on public.client_members for each row execute function public.synthetic_linked_insert_wait();`);
+ try{for(const ambiguous of [false,true]){
+  const f=linkedMemberFixture(),other=crypto.randomUUID();
+  const [member,writer]=await Promise.all([
+   parallel('set role service_role;'+linkedMemberCall(f)),
+   parallel(`select pg_sleep(0.2);set session_replication_role=replica;
+    insert into client_members(client_id,user_id,user_id_uuid,email,name,role)
+     values(${lit(f.client)},${lit(f.user)},${lit(f.user)},'buyer@example.invalid','Racing Name','tester');
+    ${ambiguous?`insert into client_members(client_id,user_id,user_id_uuid,email,role) values(${lit(f.client)},${lit(other)},${lit(other)},'buyer@example.invalid','member');`:''}`)]);
+  assert.equal(writer.code,0,writer.err);
+  if(ambiguous){assert.notEqual(member.code,0);assert.match(member.err,/retail_linked_member_identity_conflict/);assert.equal(members(f).length,2);}
+  else{assert.equal(member.code,0,member.err);assert.deepEqual(JSON.parse(member.out),{status:'existing',role:'tester'});
+   assert.equal(members(f)[0].name,'Racing Name');assert.equal(members(f).length,1);}
+ }}finally{sql('drop trigger synthetic_linked_insert_wait on public.client_members;drop function public.synthetic_linked_insert_wait();');}
+});
+test('linked member ACL/RLS/sync/deferred/body drift and unknown overload/reapply fail without changing original routines',opts,()=>{
+ const f=linkedMemberFixture();for(const role of ['anon','authenticated'])denied('set role '+role+';'+linkedMemberCall(f),/permission denied/);
+ denied(fs.readFileSync(linkedMemberMigrationPath,'utf8'),/retail_linked_member_schema_drift/);
+ for(const name of ['ensure_public_purchase_buyer_member','locked_purchase_context','apply_public_purchase_billing','retail_existing_terms_months',
+  'retail_linked_existing_member_schema_guard','retail_linked_existing_member_context','retail_linked_existing_member_commit_guard','ensure_retail_existing_linked_buyer_member']){
+  const definition=sql(`select pg_get_functiondef(oid) from pg_proc where proname=${lit(name)};`);
+  try{sql(definition.replace(/\nAS \$function\$\n/,'\nAS $function$\n -- synthetic linked drift\n'));denied('set role service_role;'+linkedMemberCall(f),/retail_linked_member_prerequisite_drift/);}
+  finally{sql(definition);}
+ }
+ for(const trigger of ['trg_client_members_sync_user_uuid','retail_linked_existing_member_commit_guard']){
+  try{sql(`alter table client_members disable trigger ${trigger};`);denied('set role service_role;'+linkedMemberCall(f),/retail_.*member_trigger_drift/);}
+  finally{sql(`alter table client_members enable trigger ${trigger};`);}
+ }
+ try{sql('alter table client_members disable row level security;');denied('set role service_role;'+linkedMemberCall(f),/retail_admin_member_schema_drift/);}
+ finally{sql('alter table client_members enable row level security;');}
+ for(const privilege of ['SELECT','INSERT','UPDATE']){
+  try{sql('revoke '+privilege+' on client_members from service_role;');denied('set role service_role;'+linkedMemberCall(f),/retail_admin_member_schema_drift/);}
+  finally{sql('grant '+privilege+' on client_members to service_role;');}
+ }
+ try{sql("grant execute on function ensure_public_purchase_buyer_member(uuid,text,uuid,text) to authenticated;");denied('set role service_role;'+linkedMemberCall(f),/retail_linked_member_prerequisite_drift/);}
+ finally{sql('revoke execute on function ensure_public_purchase_buyer_member(uuid,text,uuid,text) from authenticated;');}
+ try{sql("create function ensure_retail_existing_linked_buyer_member(uuid) returns void language sql as 'select null::void';");denied('set role service_role;'+linkedMemberCall(f),/retail_linked_member_prerequisite_drift/);}
+ finally{sql('drop function ensure_retail_existing_linked_buyer_member(uuid);');}
+ assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);assert.deepEqual(members(f),[]);
+});
+test('linked member guard is UNMOUNTED and adds no member mutation/definer/tables/browser grants',()=>{
+ const source=fs.readFileSync(linkedMemberMigrationPath,'utf8');assert.doesNotMatch(source,/security definer|create table|alter table|insert into|update public\.client_members/i);
+ assert.match(source,/ack:=public\.ensure_public_purchase_buyer_member\(p_intent,p_claim,p_user,p_name\)/);
+ const root=path.resolve(__dirname,'../src');function scan(dir){for(const e of fs.readdirSync(dir,{withFileTypes:true})){
+  const file=path.join(dir,e.name);if(e.isDirectory())scan(file);else if(file.endsWith('.js'))assert.ok(!fs.readFileSync(file,'utf8').includes('ensure_retail_existing_linked_buyer_member'),file);
+ }}scan(root);
 });
