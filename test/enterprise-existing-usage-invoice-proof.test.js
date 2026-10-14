@@ -102,6 +102,17 @@ test('fresh full census revalidates reserved ledger and allocation without repri
     r=>{r.census.interviews[0].completed_at=null;},r=>{r.receipt.client_initial.stripe_customer_id='cus_OTHER';}]){
     const bad=clone(read);change(bad);assert.throws(()=>proof.usageInvoiceFreshBinding(bad));
   }
+  const {readEnterpriseExistingUsageProvider,changeEnterpriseExistingUsageProvider}=require('../src/services/enterpriseExistingUsageReservation');
+  const calls=[];
+  const db={async rpc(name,args){calls.push({name,args});return{error:null,data:args.p_action==='read'
+    ?{...read,provider_effect_authorized:false,paid_access_authorized:false,payroll_authorized:false}
+    :{status:'store',provider_effect_authorized:false,paid_access_authorized:false,payroll_authorized:false,leaf:{generation:1}}};}};
+  const state=await readEnterpriseExistingUsageProvider({db,billingClientId:raw.owner_id});
+  assert.deepEqual(state.binding,b);
+  await changeEnterpriseExistingUsageProvider({db,state,action:'store',step:'invoice',request:proof.usageInvoiceCreateRequest(b)});
+  assert.equal(calls.length,2);assert.equal(calls[1].name,'change_enterprise_existing_usage_provider');
+  assert.deepEqual(clone(calls[1].args.p_observation),census);
+  assert.equal(calls[1].args.p_generation,0);assert.equal(Object.keys(calls[1].args).some(k=>/clock|until|sent_at/.test(k)),false);
 });
 test('shell and per-role partial proofs precede full finalized proof; never claim cash or effects', async () => {
   const { b } = await binding();

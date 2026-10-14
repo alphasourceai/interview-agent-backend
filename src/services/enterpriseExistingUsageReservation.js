@@ -138,4 +138,32 @@ async function prepareAndReserveEnterpriseExistingUsage({ db, billingClientId })
   return { phase: reserved.data.phase, batch_id: reserved.data.batch_id, total_cents: plan.total_cents,
     provider_effect_authorized: false, paid_access_authorized: false, payroll_authorized: false };
 }
-module.exports = { planEnterpriseExistingUsage, prepareAndReserveEnterpriseExistingUsage };
+async function providerCommand(db,args) {
+  let r;try{r=snapshot(await db.rpc('change_enterprise_existing_usage_provider',args));}catch(_){hold();}
+  check(r&&!r.error&&r.data&&['read','not_due','store','stored','claim','busy','sent','observe','stamp'].includes(r.data.status)
+    &&r.data.provider_effect_authorized===false&&r.data.paid_access_authorized===false&&r.data.payroll_authorized===false);
+  return r.data;
+}
+function providerArgs(owner,batch,action) {
+  return {p_owner:owner,p_batch:batch,p_action:action,p_generation:null,p_step:null,p_lease:null,
+    p_request:null,p_observation:null,p_proof:null};
+}
+async function readEnterpriseExistingUsageProvider({db,billingClientId,batchId=null}) {
+  check(UUID.test(billingClientId||'')&&(batchId===null||UUID.test(batchId)));
+  const state=await providerCommand(db,providerArgs(billingClientId,batchId,'read'));
+  if(state.status==='not_due')return state;
+  check(state.status==='read'&&state.batch?.owner_id===billingClientId&&(batchId===null||state.batch.id===batchId));
+  // Lazy load avoids a cycle: invoice proofs reuse this module's same kernel.
+  const binding=require('./enterpriseExistingUsageInvoiceProof').usageInvoiceFreshBinding(state);
+  return {...state,binding};
+}
+async function changeEnterpriseExistingUsageProvider({db,state,action,step,leaseId=null,request=null,proof=null}) {
+  check(['store','claim','sent','observe','stamp'].includes(action));
+  const current=snapshot(state),binding=require('./enterpriseExistingUsageInvoiceProof').usageInvoiceFreshBinding(current);
+  const generation=current.batch.provider_operation?.generation??0;
+  check(whole(generation)&&typeof step==='string'&&(leaseId===null||UUID.test(leaseId)));
+  return providerCommand(db,{...providerArgs(binding.owner_id,binding.batch_id,action),p_generation:generation,
+    p_step:step,p_lease:leaseId,p_request:request,p_observation:current.census,p_proof:proof});
+}
+module.exports = { planEnterpriseExistingUsage, prepareAndReserveEnterpriseExistingUsage,
+  readEnterpriseExistingUsageProvider,changeEnterpriseExistingUsageProvider };
