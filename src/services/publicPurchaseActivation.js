@@ -860,7 +860,7 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
 
   const { data: agreement, error: agreementErr } = await db
     .from('membership_agreements')
-    .select('id,client_id,status,is_current,checkout_status,checkout_session_id,checkout_paid_at,primary_admin_name,admin_email,client_legal_name,dba_trade_name,membership_tier,billing_option,auto_renew,template_snapshot,template_version,retail_funding_receipt,retail_admin_billing_receipt,superseded_by_agreement_id')
+    .select('id,client_id,status,is_current,checkout_status,checkout_session_id,checkout_paid_at,primary_admin_name,admin_email,client_legal_name,dba_trade_name,membership_tier,billing_option,auto_renew,template_snapshot,template_version,retail_funding_receipt,retail_admin_billing_receipt,replaces_stripe_subscription_id,replacement_policy,replaced_stripe_subscription_canceled_at,superseded_by_agreement_id')
     .eq('id', agreementId)
     .maybeSingle();
   if (agreementErr) throw new Error(agreementErr.message || 'Agreement lookup failed');
@@ -1031,6 +1031,11 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     if (retailOffer && agreement.template_version === 'membership_agreement_retail_terms_v2' && agreement.retail_funding_receipt) {
       if (!['public_purchase_intent', 'sales_assisted'].includes(getTemplateSnapshot(agreement).source)) {
         const e = new Error('retail_linked_member_tail_source_unknown'); e.code = e.message; e.status = 503; throw e;
+      }
+      if (agreement.replaces_stripe_subscription_id) {
+        const { executeExistingRetailReplacementCancellation } = require('./existingRetailReplacementCancellation');
+        await executeExistingRetailReplacementCancellation({ db, stripe: options.stripe, agreementId, intentId: intent.id,
+          claimKey, assertFence: originalFence });
       }
       const { prepareExistingRetailLinkedMemberTail } = require('./existingRetailLinkedMemberTail');
       retailLinkedMemberTail = await prepareExistingRetailLinkedMemberTail({ db, stripe: options.stripe, agreementId,

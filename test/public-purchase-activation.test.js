@@ -59,6 +59,17 @@ test('new activation payload cannot invent its first-paid clock or accept confli
   const old=buildClientActivationPayload({...base,billingInterval:'monthly',packageSnapshot:undefined});
   assert.equal(new Date(old.contract_end_at).getUTCFullYear(),new Date(old.contract_start_at).getUTCFullYear()+1);
 });
+test('replacement cancellation mounts only after funded fenced retail activation and before the existing financial tail',()=>{
+  const source=fs.readFileSync(require.resolve('../src/services/publicPurchaseActivation'),'utf8');
+  const branch=source.indexOf("if (retailOffer && agreement.template_version === 'membership_agreement_retail_terms_v2' && agreement.retail_funding_receipt)");
+  const guard=source.indexOf('if (agreement.replaces_stripe_subscription_id)',branch);
+  const call=source.indexOf('executeExistingRetailReplacementCancellation({',guard);
+  const tail=source.indexOf('prepareExistingRetailLinkedMemberTail({',call);
+  const billing=source.indexOf("db.rpc('apply_public_purchase_billing'",branch);
+  assert.ok(branch>=0&&guard>branch&&call>guard&&tail>call);
+  assert.ok(billing>tail,'replacement mutation must precede existing financial writer');
+  assert.equal((source.match(/executeExistingRetailReplacementCancellation\(/g)||[]).length,1);
+});
 test('new pricing uses existing fenced activation and password-email behavior; retry keeps original paid term and fees',async()=>{
   for(const existing of [false,true]){
     const db=makeDb(),s=revisedSnapshot(),a=db.membershipAgreements[0],i=db.purchaseIntents[0],calls=[];

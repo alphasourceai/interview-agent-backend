@@ -91,6 +91,7 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014092615_legacy_contract_atomic_actions.sql'),'utf8'));
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014105926_retail_existing_replacement_reservations.sql'),'utf8'));
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014122919_retail_existing_replacement_canceled_observations.sql'),'utf8'));
+ sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014173000_retail_existing_replacement_cancellation_claim_fence.sql'),'utf8'));
  assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
  const originalFunctions=JSON.parse(linkedOriginalCatalog),oldGuard=sql("select prosrc from pg_proc where oid='public.retail_linked_existing_member_schema_guard()'::regprocedure;");
  sql(fs.readFileSync(replacementBillingMigrationPath,'utf8'));
@@ -2421,7 +2422,7 @@ test('REPLACEMENT RESERVE expired claim after actual last advisory wait refuses 
   parallel(`set application_name=${lit(tag+'H')};begin;select pg_advisory_xact_lock(1632842307,hashtext(${lit(f.id)}::uuid::text));select pg_sleep(2.7);commit;`),
   parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;${replacementCall(f)}`),
   parallel(`select pg_sleep(0.8);select exists(select 1 from pg_stat_activity w join pg_stat_activity h on h.pid=any(pg_blocking_pids(w.pid))
-   where w.application_name=${lit(tag+'W')} and h.application_name=${lit(tag+'H')} and w.wait_event_type='Lock' and w.wait_event='advisory');`)]);
+   where w.application_name=${lit(tag+'W')} and h.application_name=${lit(tag+'H')} and w.wait_event_type='Lock');`)]);
  assert.equal(holder.code,0,holder.err);assert.notEqual(writer.code,0);assert.match(writer.err,/retail_replacement_(claim|clock)_denied/);
  assert.equal(observer.code,0,observer.err);assert.equal(observer.out.trim(),'t');
  assert.deepEqual(replacementRows(f),saved);
@@ -2487,45 +2488,85 @@ test('REPLACEMENT RESERVE forged writer context cannot substitute body or timest
 
 // Real native FACT recording over authored old-SDK descriptors. No Stripe
 // cancellation or inference that our actor performed the provider action.
-const observationMigration=path.resolve(__dirname,'../supabase/migrations/20261014122919_retail_existing_replacement_canceled_observations.sql');
+const observationMigration=path.resolve(__dirname,'../supabase/migrations/20261014173000_retail_existing_replacement_cancellation_claim_fence.sql');
 const canceledProjection=q=>({id:q.old_subscription_id,customer:q.customer_id,currency:'usd',livemode:q.livemode,status:'canceled',canceled_at:Math.floor(Date.now()/1000)});
 const observationCall=(f,q,old=canceledProjection(q),account=q?.provider_account_id)=>
- 'select record_retail_existing_replacement_canceled('+[f.id,q,account,old].map(lit).join(',')+');';
+ 'select record_retail_existing_replacement_canceled('+[f.id,f.intent,f.key,q,account,old].map(lit).join(',')+');';
 const observationRecord=(f,q,old,account)=>JSON.parse(sql('set role service_role;'+observationCall(f,q,old,account)));
 const observationRows=f=>JSON.parse(sql(`select coalesce(jsonb_agg(to_jsonb(r)),'[]') from private_retail_replacement.cancellations r where agreement_id=${lit(f.id)};`));
-for(const linked of [true,false])for(const plan of ['basic','pro'])for(const months of [3,6,12])
-for(const payment of ['prepaid','monthly_installments'])for(const paid of [true,false])
-test(`CANCEL OBSERVE actual native ${linked?'linked':'admin'}/${plan}/${months}/${payment}/${paid?'paid':'pending'}`,opts,()=>{
- const f=fixture(plan,months,payment,paid,linked,true);record(f);if(paid){if(linked)nativeComplete(f);else markAdminPaid(f);}
+const observationClaimRows=f=>JSON.parse(sql(`select coalesce(jsonb_agg(to_jsonb(r)),'[]') from private_retail_replacement.observation_claim_checks r where agreement_id=${lit(f.id)};`));
+for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])
+test(`CANCEL OBSERVE actual native linked/${plan}/${months}/${payment}/paid`,opts,()=>{
+ const f=fixture(plan,months,payment,true,true,true);record(f);nativeComplete(f);
  const q=replacementReserve(f).request,old=canceledProjection(q),before=replacementPublic(f),journal=replacementRows(f);
  const first=observationRecord(f,q,old),again=observationRecord(f,q,old);
  assert.equal(first.status,'observed');assert.equal(again.status,'existing');assert.deepEqual(again.observation,first.observation);assert.equal(again.observed_at,first.observed_at);
  assert.equal(Object.keys(first).length,3);assert.equal(Object.keys(first.observation).length,6);assert.deepEqual(first.observation.request,q);
  assert.deepEqual(first.observation.old_subscription,old);assert.equal(first.observation.provider_account_id,q.provider_account_id);
  assert.equal(first.observation.api_version,'2023-10-16');assert.equal(first.observation.version,'retail_existing_replacement_canceled_observation_v1');
- assert.match(first.observed_at,/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/);assert.equal(observationRows(f).length,1);
+ assert.match(first.observed_at,/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$/);assert.equal(observationRows(f).length,1);assert.equal(observationClaimRows(f).length,0);
  assert.equal(replacementPublic(f),before);assert.deepEqual(replacementRows(f),journal);assert.equal(row(f).replaced_stripe_subscription_canceled_at,null);
  assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
 });
-test('CANCEL OBSERVE delayed fact after expired claim, voided source and archived root is not new billing/access authority',opts,()=>{
- const f=fixture('basic',3,'prepaid',false,true,true);record(f);const q=replacementReserve(f).request,old=canceledProjection(q);
+test('CANCEL OBSERVE rejects stale claim before any immutable observation write',opts,()=>{
+ const f=fixture('basic',3,'prepaid',true,true,true);record(f);nativeComplete(f);const q=replacementReserve(f).request,old=canceledProjection(q);
  sql(`update public_purchase_intents set activation_claimed_at=clock_timestamp()-interval '6 minutes' where id=${lit(f.intent)};
-  update membership_agreements set status='voided',is_current=false where id=${lit(f.id)};
-  update clients set archived_at=clock_timestamp() where id=${lit(f.client)};`);
- const before=replacementPublic(f);denied('set role service_role;'+replacementCall(f),/retail_(funding|replacement)_/);
- assert.equal(observationRecord(f,q,old).status,'observed');assert.equal(observationRecord(f,q,old).status,'existing');
- assert.equal(replacementPublic(f),before);assert.equal(row(f).replaced_stripe_subscription_canceled_at,null);
+  `);
+ const before=replacementPublic(f);denied('set role service_role;'+observationCall(f,q,old),/retail_cancel_observation_claim_denied/);
+ assert.equal(observationRows(f).length,0);assert.equal(replacementPublic(f),before);assert.equal(row(f).replaced_stripe_subscription_canceled_at,null);
+});
+test('CANCEL OBSERVE stale claim cannot replay an already saved provider fact',opts,()=>{
+ const f=fixture('basic',3,'prepaid',true,true,true);record(f);nativeComplete(f);const q=replacementReserve(f).request,old=canceledProjection(q);
+ const saved=observationRecord(f,q,old);assert.equal(saved.status,'observed');const before=observationRows(f);
+ sql(`update public_purchase_intents set activation_claimed_at=clock_timestamp()-interval '6 minutes' where id=${lit(f.intent)};`);
+ denied('set role service_role;'+observationCall(f,q,old),/retail_cancel_observation_claim_denied/);
+ assert.deepEqual(observationRows(f),before);assert.equal(observationClaimRows(f).length,0);
+});
+test('CANCEL OBSERVE deferred commit fence rolls back observation and staging if claim expires after function return',opts,()=>{
+ const f=fixture('basic',3,'prepaid',true,true,true);record(f);nativeComplete(f);const q=replacementReserve(f).request,old=canceledProjection(q);
+ sql(`update public_purchase_intents set activation_claimed_at=clock_timestamp()-interval '4 minutes 55 seconds' where id=${lit(f.intent)};`);
+ denied(`begin;set role service_role;${observationCall(f,q,old)}select pg_sleep(6);commit;`,/retail_cancel_observation_claim_denied/);
+ assert.equal(observationRows(f).length,0);assert.equal(observationClaimRows(f).length,0);
+});
+test('CANCEL OBSERVE deferred commit fence rechecks exact source, funding and reservation hashes',opts,()=>{
+ for(const change of ['source','funding','reservation']){
+  const f=fixture('basic',3,'prepaid',true,true,true);record(f);nativeComplete(f);const q=replacementReserve(f).request,old=canceledProjection(q);
+  const before=replacementPublic(f);
+  let tamper='';
+  if(change==='source')tamper=`alter table public.membership_agreements disable trigger user;
+   update public.membership_agreements set checkout_attempt_source=jsonb_set(checkout_attempt_source,'{source}','"tampered"') where id=${lit(f.id)};
+   alter table public.membership_agreements enable trigger user;`;
+  if(change==='funding')tamper=`alter table public.membership_agreements disable trigger user;
+   update public.membership_agreements set retail_funding_receipt=jsonb_set(retail_funding_receipt,'{proof,period,invoice_id}','"in_TAMPERED"') where id=${lit(f.id)};
+   alter table public.membership_agreements enable trigger user;`;
+  if(change==='reservation')tamper=`alter table private_retail_replacement.reservations disable trigger user;
+   update private_retail_replacement.reservations set request=jsonb_set(request,'{source_digest}',to_jsonb(repeat('0',64))) where agreement_id=${lit(f.id)};
+   alter table private_retail_replacement.reservations enable trigger user;`;
+  denied(`begin;set role service_role;${observationCall(f,q,old)}reset role;${tamper}set role service_role;commit;`,/retail_cancel_observation_claim_denied/);
+  assert.equal(observationRows(f).length,0);assert.equal(observationClaimRows(f).length,0);assert.equal(replacementPublic(f),before);
+ }
+});
+test('CANCEL OBSERVE unique-race identical fact is claim-fenced through the same deferred commit path',opts,async()=>{
+ const f=fixture('basic',3,'prepaid',true,true,true);record(f);nativeComplete(f);const q=replacementReserve(f).request,old=canceledProjection(q),
+  expected=JSON.parse(sql(`set role service_role;select private_retail_replacement.observation_proof(${[f.id,q,q.provider_account_id,old].map(lit).join(',')});`)),tag='CU'+crypto.randomUUID().replaceAll('-','');
+ const [holder,follower]=await Promise.all([
+  parallel(`set application_name=${lit(tag+'H')};set role service_role;begin;select set_config('private_retail_replacement.observation_writer',${lit(JSON.stringify(expected))},true);
+   insert into private_retail_replacement.cancellations(agreement_id,observation) values(${lit(f.id)},${lit(expected)});select pg_sleep(0.65);commit;`),
+  parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;${observationCall(f,q,old)}`)]);
+ assert.equal(holder.code,0,holder.err);assert.equal(follower.code,0,follower.err);assert.match(follower.out,/existing/);
+ assert.equal(observationRows(f).length,1);assert.equal(observationClaimRows(f).length,0);
 });
 test('CANCEL OBSERVE missing, unfunded and legacy cannot mint a canceled fact from a supplied request',opts,()=>{
- const f=fixture('basic',3,'prepaid',false,true,true);record(f);const q=replacementReserve(f).request;
- for(const other of [fixture('basic',3,'prepaid',false,true,true),{id:legacyId},{id:crypto.randomUUID()}]){
-  denied('set role service_role;'+observationCall(other,q),/retail_cancel_observation_request_denied/);assert.equal(observationRows(other).length,0);
+ const f=fixture('basic',3,'prepaid',false,true,true);record(f);nativeComplete(f);const q=replacementReserve(f).request;
+ const fundedOther=fixture('basic',3,'prepaid',false,true,true);record(fundedOther);nativeComplete(fundedOther);
+ for(const other of [fundedOther,fixture('basic',3,'prepaid',false,true,true),{id:legacyId},{id:crypto.randomUUID()}]){
+  denied('set role service_role;'+observationCall(other,q),/retail_cancel_observation_(request|claim)_denied/);assert.equal(observationRows(other).length,0);
  }
  denied('set role service_role;'+observationCall(f,null,{}),/retail_cancel_observation_request_denied/);
  assert.equal(observationRows(f).length,0);
 });
 test('CANCEL OBSERVE closed typed old projection rejects identity, mode, status, unit and clock drift',opts,()=>{
- const f=fixture('pro',6,'prepaid',false,true,true);record(f);const q=replacementReserve(f).request,old=canceledProjection(q);
+ const f=fixture('pro',6,'prepaid',false,true,true);record(f);nativeComplete(f);const q=replacementReserve(f).request,old=canceledProjection(q);
  for(const patch of [{id:q.new_subscription_id},{customer:'cus_OTHER'},{currency:'eur'},{livemode:true},{livemode:'false'},
   {status:'active'},{canceled_at:null},{canceled_at:0},{canceled_at:-1},{canceled_at:1.5},{canceled_at:'123'},
   {canceled_at:Date.now()},{canceled_at:Math.floor(Date.now()/1000)+1000},{extra:true}]){
@@ -2537,38 +2578,36 @@ test('CANCEL OBSERVE closed typed old projection rejects identity, mode, status,
  assert.equal(observationRows(f).length,0);
 });
 test('CANCEL OBSERVE changed canceled fact conflicts, discarded native ACK replays same body and native stamp',opts,()=>{
- const f=fixture('basic',3,'prepaid',false,true,true);record(f);const q=replacementReserve(f).request,old=canceledProjection(q);
+ const f=fixture('basic',3,'prepaid',false,true,true);record(f);nativeComplete(f);const q=replacementReserve(f).request,old=canceledProjection(q);
  sql('set role service_role;'+observationCall(f,q,old));const saved=observationRows(f),ack=observationRecord(f,q,old);
  assert.equal(ack.status,'existing');assert.deepEqual(ack.observation,saved[0].observation);assert.equal(observationRows(f).length,1);
  denied('set role service_role;'+observationCall(f,q,{...old,canceled_at:old.canceled_at-1}),/retail_cancel_observation_body_denied/);
  assert.deepEqual(observationRows(f),saved);
 });
-test('CANCEL OBSERVE two real writers serialize on same advisory key and retain one body/stamp',opts,async()=>{
- const f=fixture('basic',3,'prepaid',false,true,true);record(f);const q=replacementReserve(f).request,old=canceledProjection(q),tag='CO'+crypto.randomUUID().replaceAll('-','');
- const [h,w,o]=await Promise.all([
+test('CANCEL OBSERVE two real writers serialize on the activation claim and retain one body/stamp',opts,async()=>{
+ const f=fixture('basic',3,'prepaid',false,true,true);record(f);nativeComplete(f);const q=replacementReserve(f).request,old=canceledProjection(q),tag='CO'+crypto.randomUUID().replaceAll('-','');
+ const started=Date.now();const [h,w]=await Promise.all([
   parallel(`set application_name=${lit(tag+'H')};set role service_role;begin;${observationCall(f,q,old)}select pg_sleep(0.65);commit;`),
-  parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;${observationCall(f,q,old)}`),
-  parallel(`select pg_sleep(0.35);select exists(select 1 from pg_stat_activity w join pg_stat_activity h on h.pid=any(pg_blocking_pids(w.pid))
-   where w.application_name=${lit(tag+'W')} and h.application_name=${lit(tag+'H')} and w.wait_event_type='Lock' and w.wait_event='advisory');`)]);
- assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.out.trim(),'t');
+  parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;${observationCall(f,q,old)}`)]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.ok(Date.now()-started>=500,'second writer should wait for first commit');
  const first=JSON.parse(h.out.trim().split('\n').find(x=>x.startsWith('{'))),second=JSON.parse(w.out.trim().split('\n').find(x=>x.startsWith('{')));
  assert.equal(first.status,'observed');assert.equal(second.status,'existing');assert.deepEqual(first.observation,second.observation);assert.equal(first.observed_at,second.observed_at);
  assert.equal(observationRows(f).length,1);
 });
 test('CANCEL OBSERVE original journal and fact writer in either order wait without reverse upstream locks',opts,async()=>{
  for(const journalFirst of [true,false]){
-  const f=fixture('basic',3,'prepaid',false,true,true);record(f);const q=replacementReserve(f).request,old=canceledProjection(q),tag='CJ'+crypto.randomUUID().replaceAll('-','');
+  const f=fixture('basic',3,'prepaid',false,true,true);record(f);nativeComplete(f);const q=replacementReserve(f).request,old=canceledProjection(q),tag='CJ'+crypto.randomUUID().replaceAll('-','');
   const journal=replacementCall(f),observe=observationCall(f,q,old);
   const [h,w,o]=await Promise.all([
    parallel(`set application_name=${lit(tag+'H')};set role service_role;begin;${journalFirst?journal:observe}select pg_sleep(0.65);commit;`),
    parallel(`set application_name=${lit(tag+'W')};select pg_sleep(0.1);set role service_role;${journalFirst?observe:journal}`),
    parallel(`select pg_sleep(0.35);select exists(select 1 from pg_stat_activity w join pg_stat_activity h on h.pid=any(pg_blocking_pids(w.pid))
-    where w.application_name=${lit(tag+'W')} and h.application_name=${lit(tag+'H')} and w.wait_event='advisory');`)]);
+    where w.application_name=${lit(tag+'W')} and h.application_name=${lit(tag+'H')} and w.wait_event_type='Lock');`)]);
   assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.out.trim(),'t');assert.equal(observationRows(f).length,1);
  }
 });
 test('CANCEL OBSERVE own GUC cleared while original journal GUC untouched; genuine direct proof cannot backdate fact',opts,()=>{
- const f=fixture('basic',3,'prepaid',false,false,true);record(f);const q=replacementReserve(f).request,old=canceledProjection(q);
+ const f=fixture('basic',3,'prepaid',false,true,true);record(f);nativeComplete(f);const q=replacementReserve(f).request,old=canceledProjection(q);
  const ctx=JSON.parse(sql('set role service_role;select private_retail_replacement.observation_proof('+[f.id,q,q.provider_account_id,old].map(lit).join(',')+');'));
  denied(`set role service_role;insert into private_retail_replacement.cancellations(agreement_id,observation) values(${lit(f.id)},${lit(ctx)});`,/retail_cancel_observation_writer_denied/);
  denied(`set role service_role;select set_config('private_retail_replacement.observation_writer',${lit(JSON.stringify(ctx))},true);
@@ -2577,12 +2616,15 @@ test('CANCEL OBSERVE own GUC cleared while original journal GUC untouched; genui
   insert into private_retail_replacement.cancellations(agreement_id,observation,observed_at) values(${lit(f.id)},${lit(ctx)},'2000-01-01Z');`);
  assert.ok(Date.parse(observationRows(f)[0].observed_at)>Date.parse('2026-01-01Z'));
  const out=sql(`set role service_role;begin;select set_config('private_retail_replacement.writer','SYNTHETIC_SENTINEL',true);
-  select set_config('private_retail_replacement.observation_writer','{}',true);${observationCall(f,q,old)}
-  select current_setting('private_retail_replacement.writer')='SYNTHETIC_SENTINEL' and current_setting('private_retail_replacement.observation_writer')='';commit;`);
+  ${observationCall(f,q,old)}
+  set constraints private_retail_replacement.observation_claim_commit_fence immediate;
+  select current_setting('private_retail_replacement.writer')='SYNTHETIC_SENTINEL'
+   and coalesce(current_setting('private_retail_replacement.observation_writer',true),'')=''
+   and current_setting('private_retail_replacement.observation_claim')='';commit;`);
  assert.equal(out.split('\n').at(-1),'t');assert.equal(observationRows(f).length,1);
 });
 test('CANCEL OBSERVE browser, owner mutation, grants/helper/trigger drift and reapplication refuse',opts,()=>{
- const f=fixture('basic',3,'prepaid',false,true,true);record(f);const q=replacementReserve(f).request,old=canceledProjection(q);observationRecord(f,q,old);const saved=observationRows(f);
+ const f=fixture('basic',3,'prepaid',false,true,true);record(f);nativeComplete(f);const q=replacementReserve(f).request,old=canceledProjection(q);observationRecord(f,q,old);const saved=observationRows(f);
  for(const role of ['anon','authenticated']){
   denied(`set role ${role};${observationCall(f,q,old)}`,/permission denied/);
   denied(`set role ${role};select * from private_retail_replacement.cancellations;`,/permission denied/);
@@ -2597,7 +2639,7 @@ test('CANCEL OBSERVE browser, owner mutation, grants/helper/trigger drift and re
  }
  const def=sql("select pg_get_functiondef('private_retail_replacement.observation_proof(uuid,jsonb,text,jsonb)'::regprocedure);");
  denied(`begin;${def.replace('\nbegin\n','\nbegin\n -- synthetic body drift\n')};set role service_role;${observationCall(f,q,old)}commit;`,/retail_cancel_observation_function_drift/);
- denied(fs.readFileSync(observationMigration,'utf8'),/retail_cancel_observation_schema_drift/);
+ denied(fs.readFileSync(observationMigration,'utf8'),/retail_cancel_(observation_schema|claim_baseline)_drift/);
  assert.deepEqual(observationRows(f),saved);assert.equal(linkedOriginalFunctions(),linkedOriginalCatalog);
  assert.equal(sql("select has_schema_privilege('service_role','private_sales','USAGE');"),'f');
 });
