@@ -5,12 +5,14 @@ const {buildRetailPackageSnapshot}=require('../src/services/membershipPackageCom
 const {OFFER_VERSION,anchoredMonthInstant}=require('../src/services/membershipOffers');
 const enabled=process.env.RETAIL_FUNDING_RECEIPT_DISPOSABLE==='true',opts={skip:!enabled};
 const migration=path.resolve(__dirname,'../supabase/migrations/20261013231615_retail_existing_initial_funding_receipt.sql');
+const customerIndex='CREATE UNIQUE INDEX billing_customers_stripe_customer_id_uniq ON public.billing_customers USING btree (stripe_customer_id) WHERE (stripe_customer_id IS NOT NULL)';
 const lit=v=>v==null?'null':typeof v==='object'?`'${JSON.stringify(v).replaceAll("'","''")}'::jsonb`:typeof v==='boolean'||typeof v==='number'?String(v):`'${String(v).replaceAll("'","''")}'`;
 function run(q){return cp.spawnSync('/opt/homebrew/opt/postgresql@17/bin/psql',['-X','-q','-At','-v','ON_ERROR_STOP=1','-c',q],{encoding:'utf8'});}
 function sql(q){const r=run(q);assert.equal(r.status,0,r.stderr);return r.stdout.trim();}
 function denied(q,pattern=/retail_funding_/){const r=run(q);assert.notEqual(r.status,0);assert.match(r.stderr,pattern);}
 const acl=()=>sql("select jsonb_agg(jsonb_build_array(relname,relacl::text,relrowsecurity) order by relname) from pg_class where oid in('clients'::regclass,'membership_agreements'::regclass,'public_purchase_intents'::regclass,'billing_customers'::regclass);");
-let priorAcl,legacyBefore;const legacyId=crypto.randomUUID();
+let priorAcl,legacyBefore,priorFunctions;const legacyId=crypto.randomUUID();
+const functionCatalog=()=>sql("select jsonb_agg(jsonb_build_array(proname,md5(prosrc),provolatile,prosecdef,proconfig,proowner::regrole::text,proacl::text) order by proname) from pg_proc where proname in ('retail_existing_funding_context','record_retail_existing_funding');");
 before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/tmp\/alphascreen-retail-funding-pg\.[A-Za-z0-9]+$/);
  assert.equal(process.env.PGPORT,'55456');assert.equal(process.env.PGUSER,'postgres');assert.equal(process.env.PGDATABASE,'postgres');assert.equal(process.env.PGPASSWORD,undefined);
  sql(`insert into membership_agreements(id,status,is_current,client_legal_name,primary_admin_name,admin_email,membership_tier,billing_option,
@@ -20,6 +22,25 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
  legacyBefore=sql(`select to_jsonb(a) from membership_agreements a where id=${lit(legacyId)};`);
  priorAcl=acl();sql(fs.readFileSync(migration,'utf8'));
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261013232342_retail_existing_purchase_intent_prepaid.sql'),'utf8'));
+ const amendment=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261013235104_retail_existing_funding_prerequisites.sql'),'utf8');
+ priorFunctions=functionCatalog();
+ for(const name of ['retail_existing_funding_context','record_retail_existing_funding']){
+  const definition=sql(`select pg_get_functiondef(oid) from pg_proc where proname='${name}';`);
+  try{sql(definition.replace('\nbegin\n','\nbegin\n -- disposable drift sentinel\n'));
+   denied(amendment,/retail_funding_prerequisite_drift/);
+   assert.equal(sql("select to_regprocedure('public.retail_existing_funding_schema_guard()') is null;"),'t');
+   assert.equal(acl(),priorAcl);
+  }finally{sql(definition);}
+  assert.equal(functionCatalog(),priorFunctions);
+ }
+ // Migration must roll back even after creating the new helper. Deliberately
+ // remove only this disposable existing index, then restore its exact DDL.
+ try{sql('drop index public.billing_customers_stripe_customer_id_uniq;');
+  denied(amendment,/retail_funding_schema_drift/);
+  assert.equal(functionCatalog(),priorFunctions);assert.equal(acl(),priorAcl);
+  assert.equal(sql("select to_regprocedure('public.retail_existing_funding_schema_guard()') is null;"),'t');
+ }finally{sql(customerIndex+';');}
+ sql(amendment);
 });
 function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true){
  const id=crypto.randomUUID(),client=crypto.randomUUID(),intent=crypto.randomUUID(),key='SYNTHETIC_CLAIM_'+crypto.randomUUID(),suffix=id.replaceAll('-','');
@@ -76,6 +97,98 @@ test(`native first funding ${plan}/${months}/${payment}/role:${role}`,opts,()=>{
 test('admin no-intent receipt does not fabricate intent or paid/access state',opts,()=>{
  const f=fixture('pro',6,'prepaid',true,false);assert.deepEqual(record(f).proof,f.proof);
  assert.equal(sql(`select count(*) from public_purchase_intents where agreement_id=${lit(f.id)};`),'0');assert.equal(row(f).checkout_paid_at,null);
+});
+const checkoutTrigger=()=>sql("select jsonb_build_array(tgenabled,pg_get_triggerdef(oid),tgfoid::regprocedure::text) from pg_trigger where tgrelid='public.membership_agreements'::regclass and tgname='retail_existing_checkout_attempt_guard';");
+function agedFixture(missingDeadline=false){
+ const f=fixture(),now=Math.floor(Date.now()/1000),signed=now-5*86400,created=now-4*86400,paid=now-3*86400,expiry=now-2*86400;
+ // Disposable-owner fixture time travel ONLY, before any funding exists. A
+ // native claim/pin was actually obtained above. Restore its exact original
+ // immutability trigger before calling the receipt RPC; no hosted backfill.
+ const trigger=checkoutTrigger();
+ try{sql(`begin;alter table membership_agreements disable trigger retail_existing_checkout_attempt_guard;
+  update public_purchase_intents set expires_at=to_timestamp(${expiry}) where id=${lit(f.intent)};
+  update membership_agreements set signed_at=to_timestamp(${signed}),agreement_expires_at=to_timestamp(${expiry}),
+   checkout_created_at=to_timestamp(${created}) where id=${lit(f.id)};
+  update membership_agreements a set checkout_attempt_source=retail_existing_checkout_material(to_jsonb(a),
+   (select to_jsonb(i) from public_purchase_intents i where i.id=${lit(f.intent)}),${lit(f.proof.period.customer_id)})
+   ||jsonb_build_object('config',a.checkout_attempt_source->'config') where a.id=${lit(f.id)};
+  set constraints all immediate;
+  ${missingDeadline?`update membership_agreements set agreement_expires_at=null where id=${lit(f.id)};`:''}
+  alter table membership_agreements enable trigger retail_existing_checkout_attempt_guard;commit;`);
+ }finally{assert.equal(checkoutTrigger(),trigger);}
+ denied(`set role service_role;update membership_agreements set signed_at=clock_timestamp() where id=${lit(f.id)};`,/retail_checkout_attempt_immutable/);
+ f.source=row(f).checkout_attempt_source;
+ Object.assign(f.proof,{checkout_created:created,invoice_created:created});
+ Object.assign(f.proof.period,{paid_at:new Date(paid*1000).toISOString(),provider_period_start:created,provider_period_end:created+90*86400});
+ // Fresh native activation lease immediately before record (old deadlines
+ // concern actual payment A, never the processing clock or lease timestamp).
+ assert.equal(sql(`set role service_role;select release_public_purchase_activation(${lit(f.intent)},${lit(f.key)});`),'t');
+ const claim=JSON.parse(sql(`set role service_role;select claim_public_purchase_activation(${lit(f.id)},${lit(f.key)});`));
+ assert.equal(claim.status,'claimed');
+ return{f,expiry,paid,trigger};
+}
+test('late processing stores actual paid A before expired legal deadline, without granting access',opts,()=>{
+ const {f,expiry,paid,trigger}=agedFixture(),rawB=structuredClone(f.proof.period);
+ const client=sql(`select to_jsonb(c) from clients c where id=${lit(f.client)};`),r=record(f);
+ assert.equal(r.proof.period.paid_at,new Date(paid*1000).toISOString());
+ assert.ok(Date.parse(r.recorded_at)>expiry*1000);assert.deepEqual(r.proof,f.proof);
+ assert.deepEqual(r.proof.period,rawB);assert.deepEqual(record(f),r);assert.equal(checkoutTrigger(),trigger);
+ assert.equal(row(f).checkout_paid_at,null);assert.equal(row(f).checkout_status,'pending_payment');
+ assert.equal(sql(`select activated_at is null from public_purchase_intents where id=${lit(f.intent)};`),'t');
+ assert.equal(sql(`select to_jsonb(c) from clients c where id=${lit(f.client)};`),client);
+});
+test('late delivery rejects equal/after deadline and absent A/deadline without a receipt',opts,()=>{
+ for(const shape of ['equal','after','no_paid','no_deadline']){
+  const {f,expiry,trigger}=agedFixture(shape==='no_deadline');
+  f.proof.period.paid_at=shape==='no_paid'?null:new Date((shape==='after'?expiry+1:expiry)*1000).toISOString();
+  const before=row(f);denied('set role service_role;'+call(f),/retail_funding_|retail_checkout_source_mismatch/);
+  assert.deepEqual(row(f),before);assert.equal(row(f).retail_funding_receipt,null);assert.equal(checkoutTrigger(),trigger);
+ }
+});
+test('fixture construction error rolls trigger disable back before any record is possible',opts,()=>{
+ const f=fixture(),trigger=checkoutTrigger();
+ denied(`begin;alter table membership_agreements disable trigger retail_existing_checkout_attempt_guard;
+  select 1/0;commit;`,/division by zero/);
+ assert.equal(checkoutTrigger(),trigger);
+ denied(`set role service_role;update membership_agreements set signed_at=clock_timestamp() where id=${lit(f.id)};`,/retail_checkout_attempt_immutable/);
+ assert.equal(row(f).retail_funding_receipt,null);
+});
+test('missing global customer uniqueness refuses receipt and restores the existing index exactly',opts,()=>{
+ const f=fixture();assert.equal(sql("select pg_get_indexdef('public.billing_customers_stripe_customer_id_uniq'::regclass);"),customerIndex);
+ try{sql('drop index public.billing_customers_stripe_customer_id_uniq;');
+  const before=row(f),grants=acl();denied('set role service_role;'+call(f),/retail_funding_schema_drift/);
+  assert.deepEqual(row(f),before);assert.equal(acl(),grants);assert.equal(row(f).retail_funding_receipt,null);
+ }finally{sql(customerIndex+';');}
+});
+test('each missing SELECT or UPDATE lock prerequisite refuses without broadening table grants',opts,()=>{
+ const f=fixture();
+ for(const table of ['membership_agreements','public_purchase_intents','clients','billing_customers'])for(const privilege of ['SELECT','UPDATE']){
+  const prior=acl();
+  try{sql(`revoke ${privilege} on public.${table} from service_role;`);
+   assert.equal(sql(`select has_table_privilege('service_role','public.${table}','${privilege}');`),'f');
+   denied('set role service_role;select retail_existing_funding_schema_guard();',/retail_funding_schema_drift/);
+   denied('set role service_role;'+call(f),/retail_funding_schema_drift/);assert.equal(row(f).retail_funding_receipt,null);
+  }finally{sql(`grant ${privilege} on public.${table} to service_role;`);}
+  assert.equal(acl(),prior);
+ }
+ for(const role of ['anon','authenticated'])denied(`set role ${role};select retail_existing_funding_schema_guard();`,/permission denied/);
+});
+test('prerequisite migration refuses reapplication and preserves RLS and original table ACL',opts,()=>{
+ denied(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261013235104_retail_existing_funding_prerequisites.sql'),'utf8'),/retail_funding_prerequisite_drift/);
+ assert.equal(acl(),priorAcl);
+ assert.equal(sql("select count(*) from pg_proc where proname in ('retail_existing_funding_context','record_retail_existing_funding') and not prosecdef and position('perform public.retail_existing_funding_schema_guard();' in prosrc)>0;"),'2');
+ const after=JSON.parse(functionCatalog()),before=JSON.parse(priorFunctions);
+ const original=fs.readFileSync(migration,'utf8');
+ for(let n=0;n<after.length;n++){
+  assert.deepEqual(after[n].slice(2),before[n].slice(2));
+  const body=original.split('create function public.'+after[n][0]+'(')[1].split('as $$')[1].split('end $$;')[0]+'end ';
+  const patched=body.replace('\nbegin\n','\nbegin\n perform public.retail_existing_funding_schema_guard();\n');
+  assert.equal(after[n][1],crypto.createHash('md5').update(patched).digest('hex'));
+ }
+ assert.equal(sql("select current_user;"),'postgres');
+ assert.equal(sql("set role service_role;select current_user;"),'service_role');
+ assert.equal(sql("select jsonb_build_array(rolsuper,rolbypassrls) from pg_roles where rolname='service_role';"),'[false, true]');
+ assert.equal(sql("select bool_and(grantee in ((select oid from pg_roles where rolname='service_role'),(select oid from pg_roles where rolname='postgres'))) from pg_proc p cross join lateral aclexplode(p.proacl) where proname='retail_existing_funding_schema_guard';"),'t');
 });
 test('malformed IDs/mode/period, clocks, cents, source, role fee and proof shapes record nothing',opts,()=>{
  for(const mutate of [p=>p.cash_cents=0,p=>p.cash_cents++,p=>p.platform_gross_cents++,p=>p.platform_discount_cents=1,
