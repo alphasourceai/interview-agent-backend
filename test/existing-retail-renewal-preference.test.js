@@ -34,6 +34,7 @@ function fixture(months = 3, payment = 'prepaid') {
     if (args.p_action === 'unknown') operation.status = 'unknown';
     if (args.p_action === 'finish') operation.status = 'applied';
     if (args.p_action === 'hold') operation.status = 'held';
+    if (args.p_action === 'reject') operation.status = 'held';
     return { data: { status: operation?.status || 'none', operation: structuredClone(operation) }, error: null };
   };
   f.sdk.subscriptions = { retrieve: async () => structuredClone(sub), update: async (id, body, options) => {
@@ -66,6 +67,21 @@ test('known Stripe4xx is held once instead of retried until key age', async () =
   f.sdk.subscriptions.update = async () => { updates++; throw Object.assign(Error('SYNTHETIC rejection'), { statusCode: 400 }); };
   assert.equal((await requestExistingRetailRenewal({ ...f.input, autoRenew: false })).status, 'held');
   assert.equal((await reconcileExistingRetailRenewal(f.input)).status, 'held'); assert.equal(updates, 1);
+});
+for (const readKind of ['subscription', 'account', 'pending']) test(`HTTP4xx from post-write ${readKind} read retains original unknown operation`, async () => {
+  const f = fixture(); let failed = false;
+  const wrap = fn => async (...args) => {
+    if (f.writes.length && !failed) { failed = true; throw Object.assign(Error('SYNTHETIC read denied'), { statusCode: 400 }); }
+    return fn(...args);
+  };
+  if (readKind === 'subscription') f.sdk.subscriptions.retrieve = wrap(f.sdk.subscriptions.retrieve);
+  if (readKind === 'account') f.sdk.accounts.retrieve = wrap(f.sdk.accounts.retrieve);
+  if (readKind === 'pending') f.sdk.invoiceItems.list = wrap(f.sdk.invoiceItems.list);
+  await assert.rejects(requestExistingRetailRenewal({ ...f.input, autoRenew: false }));
+  assert.equal(f.operation.status, 'unknown'); assert.equal(f.nativeCalls.some(c => c.p_action === 'reject'), false);
+  const id = f.operation.operation_id;
+  assert.equal((await reconcileExistingRetailRenewal(f.input)).status, 'applied');
+  assert.equal(f.operation.operation_id, id); assert.equal(f.writes.length, 1);
 });
 test('same operation and body retry without treating key age as absence proof', async () => {
   const f = fixture(); f.failAt('provider');

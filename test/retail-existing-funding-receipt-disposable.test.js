@@ -284,7 +284,11 @@ test('NATIVE RENEWAL claim/unknown replay keeps identity; opposite cannot replac
  const a={op:id,generation:1,observation:obs};assert.equal(nativeRenewal(f,s,'send',a).status,'claimed');
  assert.equal(nativeRenewal(f,s,'request',{auto:true}).operation.operation_id,id);
  assert.equal(nativeRenewal(f,s,'claim',{op:id,generation:1,observation:obs}).status,'busy');
+ assert.equal(nativeRenewal(f,s,'hold',{op:id,generation:1}).status,'busy');
+ assert.equal(nativeRenewal(f,s,'request',{auto:true}).operation.operation_id,id);
  assert.equal(nativeRenewal(f,s,'unknown',{op:id,generation:1}).status,'unknown');
+ assert.equal(nativeRenewal(f,s,'hold',{op:id,generation:1}).status,'unknown');
+ assert.equal(nativeRenewal(f,s,'request',{auto:true}).operation.operation_id,id);
  const next=nativeRenewal(f,s,'claim',{op:id,generation:1,observation:obs});assert.equal(next.operation.generation,2);
  denied('set role service_role;'+renewalCall(f,s,'finish',{op:id,generation:1,observation:obs}),/retail_renewal_identity_denied/);
  denied('set role service_role;'+renewalCall(f,s,'finish',{op:id,generation:2,observation:obs}),/retail_renewal_readback_denied/);
@@ -294,6 +298,17 @@ test('NATIVE RENEWAL claim/unknown replay keeps identity; opposite cannot replac
  after.client.auto_renew=before.client.auto_renew;after.client.cancel_at_term_end=before.client.cancel_at_term_end;
  delete before.client.retail_renewal_change;delete after.client.retail_renewal_change;assert.deepEqual(after,before);
  assert.equal(sql(`select count(distinct stripe_event_id)=count(*) from billing_events where client_id=${lit(f.client)};`),'t');
+});
+test('NATIVE RENEWAL only known dispatch rejection can hold a sent claim; generic observers cannot replace it',opts,()=>{
+ const{f,s}=paidRenewalFixture(),obs=renewalProjection(f),r=nativeRenewal(f,s,'request',{auto:false}),id=r.operation.operation_id;
+ nativeRenewal(f,s,'claim',{op:id,generation:0,observation:obs});
+ denied('set role service_role;'+renewalCall(f,s,'reject',{op:id,generation:1,observation:obs}),/retail_renewal_rejection_denied/);
+ nativeRenewal(f,s,'send',{op:id,generation:1,observation:obs});
+ denied('set role service_role;'+renewalCall(f,s,'reject',{op:id,generation:1,observation:{...obs,current_period_end:obs.current_period_end+1}}),/retail_renewal_rejection_denied/);
+ assert.equal(nativeRenewal(f,s,'hold',{op:id,generation:1}).status,'busy');
+ assert.equal(nativeRenewal(f,s,'reject',{op:id,generation:1,observation:obs}).status,'held');
+ assert.equal(nativeRenewal(f,s,'request',{auto:true}).operation.operation_id,id);
+ assert.equal(sql(`select count(*) from billing_events where client_id=${lit(f.client)} and type='retail.renewal.setting-rejected';`),'1');
 });
 test('NATIVE RENEWAL actual elapsed B still permits proven lost-ACK finish with no new send or access rewrite',opts,async()=>{
  const f=fixture('basic',3,'prepaid',true,true,false,'admin','sales_assisted','buyer@example.invalid',

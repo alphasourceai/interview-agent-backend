@@ -97,9 +97,9 @@ async function reconcileExistingRetailRenewal(input) {
   if (!r.operation || ['applied', 'held'].includes(r.status)) return r;
   const { stripe, db } = input, op = r.operation;
   const api = () => check(stripe.getApiField('version') === '2023-10-16');
-  const provider = async fn => { api(); try { return await fn(); } catch (e) {
+  const provider = async (fn, setting = false) => { api(); try { return await fn(); } catch (e) {
     const error = new RenewalError();
-    error.knownRejection = Number.isInteger(e?.statusCode) && e.statusCode >= 400 && e.statusCode < 500;
+    error.knownRejection = setting && Number.isInteger(e?.statusCode) && e.statusCode >= 400 && e.statusCode < 500;
     throw error;
   } };
   const account = async () => {
@@ -152,7 +152,7 @@ async function reconcileExistingRetailRenewal(input) {
     const body = current.requested_auto_renew ? { cancel_at_period_end: false }
       : { cancel_at_period_end: true, proration_behavior: 'none' };
     const known = renewalSubscriptionProjection(await provider(() => stripe.subscriptions.update(
-      source.original_period.subscription_id, body, { idempotencyKey: `retail-renewal:${current.operation_id}` })), source);
+      source.original_period.subscription_id, body, { idempotencyKey: `retail-renewal:${current.operation_id}` }), true), source);
     unchanged(before, known);
     // A known response may leave an explicit cancel_at. Clearing is its own
     // fixed operation key, never a different request body under the first key.
@@ -162,7 +162,7 @@ async function reconcileExistingRetailRenewal(input) {
       await native(db, source, 'repair', { ...args, p_observation: fresh });
       const repaired = renewalSubscriptionProjection(await provider(() => stripe.subscriptions.update(
         source.original_period.subscription_id, { cancel_at: '' },
-        { idempotencyKey: `retail-renewal:${current.operation_id}:clear-cancel-at` })), source);
+        { idempotencyKey: `retail-renewal:${current.operation_id}:clear-cancel-at` }), true), source);
       unchanged(before, repaired); check(desired(repaired, current));
     } else check(desired(known, current));
     const after = await read(); await account(); unchanged(before, after); check(desired(after, current));
@@ -174,7 +174,7 @@ async function reconcileExistingRetailRenewal(input) {
   } catch (error) {
     if (error.knownRejection === true) {
       // Known rejected request is held once; transport/commit loss is different.
-      try { return await native(db, source, 'hold', args); } catch (_) { throw new RenewalError(); }
+      try { return await native(db, source, 'reject', { ...args, p_observation: before }); } catch (_) { throw new RenewalError(); }
     }
     // Provider or commit acknowledgement may be lost. Keep the same operation.
     try { await native(db, source, 'unknown', args); } catch (_) { /* lease remains */ }

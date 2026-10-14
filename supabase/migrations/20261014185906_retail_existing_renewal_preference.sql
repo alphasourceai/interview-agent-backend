@@ -71,7 +71,7 @@ declare c public.clients;s jsonb;o jsonb;b jsonb;r jsonb;prior jsonb;clock times
  months integer;step integer;status text;fact text;now_text text;operation uuid;generation integer;obs jsonb;matches boolean;
 begin
  if current_user<>'service_role' then raise exception 'retail_renewal_server_only';end if;
- if p_action is null or p_action not in('read','request','claim','send','repair','unknown','finish','hold')
+ if p_action is null or p_action not in('read','request','claim','send','repair','unknown','finish','hold','reject')
   then raise exception 'retail_renewal_action_denied';end if;
  perform 1 from public.public_purchase_intents where agreement_id=p_agreement order by id for update;
  perform 1 from public.membership_agreements where id=p_agreement for update;
@@ -113,9 +113,17 @@ begin
   cutoff:=(r->>'billing_cutoff_at')::timestamptz;
   if status='applied' then return jsonb_build_object('status',status,'operation',r);end if;
   if p_action='hold' then
-   -- Exact generation is required above, so only the current claimant can
-   -- terminally hold its known rejection. Do not lose known 4xx in busy state.
+   -- A preflight observer knows the same generation, not the claimant's SDK
+   -- result. Never make a sent/unknown operation terminal or replaceable.
+   if status in('claimed','unknown') or r->'sent_at'<>'null'::jsonb then
+    return jsonb_build_object('status',case when status='claimed' then 'busy' else status end,'operation',r);end if;
    r:=jsonb_set(r,'{status}','"held"');fact:='held';
+  elsif p_action='reject' then
+   -- Only a known setting-update rejection, never a read failure. Trusted
+   -- adapter supplies the exact dispatch observation under its current claim.
+   if status<>'claimed' or r->'sent_at'='null'::jsonb or p_observation is distinct from r->'observation'
+    then raise exception 'retail_renewal_rejection_denied';end if;
+   r:=jsonb_set(r,'{status}','"held"');fact:='setting-rejected';
   elsif p_action='claim' then
    if status='held' then return jsonb_build_object('status',status,'operation',r);end if;
    if status in('claimed','unknown') and(r->>'lease_until')::timestamptz>clock then
