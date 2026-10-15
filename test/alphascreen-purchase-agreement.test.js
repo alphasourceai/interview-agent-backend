@@ -610,9 +610,10 @@ test('retail saved source mismatches refused before PDF Storage or agreement wri
 test('prospective generation-date public agreement saves real dates once and refresh preserves the original PDF and calendar',async()=>{
   const {retailGenerationTermDates}=require('../src/services/membershipOffers');
   for(const months of [3,6,12])for(const role of [false,true]){
-    // A synthetic already-saved prospective intent. Public new-offer issuance
-    // intentionally still refuses v3 until native financial writers are ready.
-    const source=retailIntent(months,role,'retail-stripe-terms-2026-10-15-v3');
+    const version=require('../src/services/retailQuoteSelection').retailQuoteCatalog('public',
+      {MEMBERSHIP_PRICING_TERMS_ENABLED:'true'}).pricing_version;
+    assert.equal(version,'retail-stripe-terms-2026-10-15-v3');
+    const source=retailIntent(months,role,version);
     source.term_start_basis='generation_date';
     const db=makeDb({purchaseIntents:[source]}),app=buildApp(db);
     const sent=await postAgreement(app,BASIC_INTENT_ID);assert.equal(sent.status,201,JSON.stringify(sent.body));

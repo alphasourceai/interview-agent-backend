@@ -84,9 +84,11 @@ test('prospective dates render all 24 price/term/payment/role variants without m
       assert.equal(text.includes('First-Role Prepay Credit'),firstRolePrepaySelected);
     }
   const env={MEMBERSHIP_PRICING_TERMS_ENABLED:'true'};
-  assert.equal(retailQuoteCatalog('public',env).pricing_version,STRIPE_RECURRING_OFFER_VERSION);
+  assert.equal(retailQuoteCatalog('public',env).pricing_version,VERSION);
+  assert.equal(normalizeRetailQuoteSelection({plan_key:'basic',commitment_months:3,
+    payment_option:'prepaid',offer_version:VERSION},{channel:'public',env}).offer_version,VERSION);
   assert.throws(()=>normalizeRetailQuoteSelection({plan_key:'basic',commitment_months:3,
-    payment_option:'prepaid',offer_version:VERSION},{channel:'public',env}),{code:'stale_offer_version'});
+    payment_option:'prepaid',offer_version:STRIPE_RECURRING_OFFER_VERSION},{channel:'public',env}),{code:'stale_offer_version'});
 });
 
 test('stored generation instant, snapshot dates and row dates must agree; a later render clock cannot move them',()=>{

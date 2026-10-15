@@ -6,6 +6,8 @@ const http = require('node:http')
 const path = require('node:path')
 const projectRoot = path.resolve(__dirname, '..')
 const { test } = require('node:test')
+const {retailQuoteCatalog}=require('../src/services/retailQuoteSelection')
+const currentQuoteVersion=()=>retailQuoteCatalog('public',{MEMBERSHIP_PRICING_TERMS_ENABLED:'true'}).pricing_version
 
 const routePath = path.join(__dirname, '..', 'src', 'routes', 'public', 'alphascreen', 'index.js')
 const supabaseClientPath = path.join(__dirname, '..', 'src', 'clients', 'supabase.js')
@@ -643,12 +645,13 @@ test('new public quote matrix persists server prices and explicit fenced source'
     for(const plan_key of ['basic','pro'])for(const months of [3,6,12])for(const selected of [false,true]){
       const db=makeDb(),app=buildApp(db);
       const response=await request(app,validBody({plan_key,billing_cadence:'prepaid',commitment_months:months,
-        payment_option:'prepaid',offer_version:'retail-stripe-terms-2026-10-14-v2',first_role_prepay_selected:selected,
+        payment_option:'prepaid',offer_version:currentQuoteVersion(),first_role_prepay_selected:selected,
         platform_fee_cents:1,package_snapshot:{platform_fee_cents:1}}));
       assert.equal(response.status,201,JSON.stringify(response.body));
       const row=db.inserts[0].row;
       assert.equal(row.protocol,'fenced_v2');assert.equal(row.package_snapshot.commitment_months,months);
       assert.equal(row.selected_billing_cadence,'prepaid');
+      assert.equal(row.term_start_basis,'generation_date');
       assert.equal(row.first_role_prepay_amount_cents,selected?(plan_key==='basic'?35900:62900):null);
       assert.ok(row.package_snapshot.platform_fee_cents>=120000);
       assert.equal(response.body.selected_package.commitment_months,months);
@@ -660,7 +663,7 @@ test('new public duplicate binds term and offer version rather than cadence alon
   const prior=process.env.MEMBERSHIP_PRICING_TERMS_ENABLED;
   process.env.MEMBERSHIP_PRICING_TERMS_ENABLED='true';
   try {
-    const body=validBody({billing_cadence:'prepaid',commitment_months:3,payment_option:'prepaid',offer_version:'retail-stripe-terms-2026-10-14-v2'});
+    const body=validBody({billing_cadence:'prepaid',commitment_months:3,payment_option:'prepaid',offer_version:currentQuoteVersion()});
     const first=makeDb();assert.equal((await request(buildApp(first),body)).status,201);
     const saved=first.inserts[0].row,db=makeDb({purchaseIntents:[saved]});
     const repeated=await request(buildApp(db),body);
@@ -680,7 +683,7 @@ test('new quote gate refuses legacy price bypass and missing stale conflicting s
   const prior=process.env.MEMBERSHIP_PRICING_TERMS_ENABLED;
   process.env.MEMBERSHIP_PRICING_TERMS_ENABLED='true';
   try{
-    const keys={billing_cadence:'prepaid',commitment_months:3,payment_option:'prepaid',offer_version:'retail-stripe-terms-2026-10-14-v2'};
+    const keys={billing_cadence:'prepaid',commitment_months:3,payment_option:'prepaid',offer_version:currentQuoteVersion()};
     for(const input of [validBody(),validBody({...keys,offer_version:'old'}),validBody({...keys,payment_option:'monthly_installments'}),
       validBody({...keys,commitmentMonths:6}),validBody({...keys,billing_cadence:'annual'})]){
       const db=makeDb(),r=await request(buildApp(db),input);assert.ok([400,409].includes(r.status));

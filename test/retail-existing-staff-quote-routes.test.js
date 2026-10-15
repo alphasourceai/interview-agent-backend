@@ -2,7 +2,9 @@
 const assert=require('node:assert/strict'),{test}=require('node:test'),express=require('express'),request=require('supertest'),path=require('node:path');
 const root=path.resolve(__dirname,'..');
 const client='11111111-1111-4111-8111-111111111111';
-const version='retail-stripe-terms-2026-10-14-v2',marker='membership_agreement_retail_terms_v2';
+const {retailQuoteCatalog}=require('../src/services/retailQuoteSelection');
+const {retailGenerationTermDates}=require('../src/services/membershipOffers');
+const version=retailQuoteCatalog('sales',{MEMBERSHIP_PRICING_TERMS_ENABLED:'true'}).pricing_version,marker='membership_agreement_retail_terms_v2';
 function stub(name,exports){const filename=path.join(root,name);require.cache[filename]={id:filename,filename,loaded:true,exports};}
 class Query{
   constructor(db,table){this.db=db;this.table=table;this.predicates=[];this.mode='select';}
@@ -97,9 +99,10 @@ test('existing staff preview and idempotent send persist new terms and markers; 
     const response=await request(app).post('/sales/deals').set('Idempotency-Key','synthetic-create').send(createBody);
     assert.equal(response.status,201,JSON.stringify(response.body));
     const intent=d.rows.public_purchase_intents[0],a=d.rows.membership_agreements[0];
-    assert.equal(intent.protocol,'fenced_v2');assert.equal(intent.term_start_basis,'successful_payment');
+    assert.equal(intent.protocol,'fenced_v2');assert.equal(intent.term_start_basis,'generation_date');
     assert.equal(a.template_version,marker);assert.equal(a.template_snapshot.template_version,marker);
-    assert.equal(a.initial_term_start,null);assert.equal(a.initial_renewal_date,null);
+    const dates=retailGenerationTermDates({generatedAt:a.template_snapshot.generated_at,commitmentMonths:months});
+    assert.equal(a.initial_term_start,dates.initial_term_start);assert.equal(a.initial_renewal_date,dates.initial_renewal_date);
     assert.equal(a.agreement_expires_at,saved.agreement_expires_at);assert.equal(a.auto_renew,true);
     assert.equal(a.template_snapshot.values.commitment_months,months);
     assert.equal(d.emails.length,1);
@@ -107,14 +110,15 @@ test('existing staff preview and idempotent send persist new terms and markers; 
     assert.equal(replay.status,201);assert.equal(d.emails.length,1);assert.equal(d.rows.membership_agreements.length,1);
   }
 }));
-test('existing admin retail send ignores browser prices and derives accepted quote with null dates',async()=>gate(async()=>{
+test('existing admin retail send ignores browser prices and freezes real generation dates',async()=>gate(async()=>{
   for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments']){
     const d=db(),app=adminApp(d),body={client_id:client,client_legal_name:'Synthetic Client',primary_admin_name:'QA Buyer',
       admin_email:'buyer@example.invalid',membership_tier:'basic',platform_fee:1,per_role_fee:1,...keys(months,payment)};
     const response=await request(app).post('/billing/agreements/send').set('Authorization','Bearer synthetic').send(body);
     assert.equal(response.status,200,JSON.stringify(response.body));
     const a=d.rows.membership_agreements[0];assert.equal(a.template_version,marker);
-    assert.equal(a.initial_term_start,null);assert.equal(a.initial_renewal_date,null);
+    const dates=retailGenerationTermDates({generatedAt:a.template_snapshot.generated_at,commitmentMonths:months});
+    assert.equal(a.initial_term_start,dates.initial_term_start);assert.equal(a.initial_renewal_date,dates.initial_renewal_date);
     assert.equal(a.template_snapshot.values.per_role_fee,'399');assert.equal(a.template_snapshot.values.scored_question_count,'5');
     assert.equal(a.template_snapshot.package_snapshot.commitment_months,months);
     assert.equal(a.template_snapshot.values.billing_option,payment==='prepaid'?'prepaid':'monthly');

@@ -1,14 +1,14 @@
 'use strict';
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {OFFER_VERSION,STRIPE_RECURRING_OFFER_VERSION,listRetailOffers} = require('../src/services/membershipOffers');
+const {OFFER_VERSION,STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION,listRetailOffers,retailGenerationTermDates} = require('../src/services/membershipOffers');
 const {buildRetailPackageSnapshot} = require('../src/services/membershipPackageCompatibility');
 const {normalizeRetailQuoteSelection,retailQuoteCatalog,validateRetailIntentSource,validateRetailAgreementSource,RETAIL_TEMPLATE}
   = require('../src/services/retailQuoteSelection');
 const {normalizeSalesDraft,validateSalesDraft,calculatePricing,agreementInputFromDraft,fingerprint} = require('../src/services/salesWorkspace');
 const {buildMembershipAgreementHtml} = require('../src/render/membershipAgreement');
 const on = {MEMBERSHIP_PRICING_TERMS_ENABLED:'true'}, off = {};
-const keys = (months=3,payment='prepaid') => ({plan_key:'basic',commitment_months:months,payment_option:payment,offer_version:STRIPE_RECURRING_OFFER_VERSION});
+const keys = (months=3,payment='prepaid') => ({plan_key:'basic',commitment_months:months,payment_option:payment,offer_version:retailQuoteCatalog('sales',on).pricing_version});
 const identity = {company_legal_name:'Synthetic Only',buyer_first_name:'QA',buyer_last_name:'Buyer',buyer_email:'buyer@example.invalid',
   buyer_phone:'555-555-0100',buyer_title:'Owner',candidate_assistance_name:'QA Buyer',candidate_assistance_email:'buyer@example.invalid'};
 test('quote gate is exact default-off and legacy selection unchanged',()=>{
@@ -20,9 +20,9 @@ test('quote gate is exact default-off and legacy selection unchanged',()=>{
 test('public catalog prepaid only and staff catalog both payment choices from same factory',()=>{
   assert.equal(retailQuoteCatalog('public',on).offers.length,6);
   assert.equal(retailQuoteCatalog('sales',on).offers.length,12);
-  assert.equal(retailQuoteCatalog('admin',on).pricing_version,STRIPE_RECURRING_OFFER_VERSION);
+  assert.equal(retailQuoteCatalog('admin',on).pricing_version,GENERATION_DATE_OFFER_VERSION);
   for(const channel of ['public','sales','admin'])assert.ok(retailQuoteCatalog(channel,on).offers
-    .every(o=>o.offer_version===STRIPE_RECURRING_OFFER_VERSION));
+    .every(o=>o.offer_version===GENERATION_DATE_OFFER_VERSION));
   assert.ok(listRetailOffers({channel:'public'}).every(o=>o.offer_version===OFFER_VERSION));
   assert.ok(retailQuoteCatalog('public',on).offers.every(o=>o.payment_option==='prepaid'));
   const publicCatalog=retailQuoteCatalog('public',on);
@@ -33,13 +33,14 @@ test('public catalog prepaid only and staff catalog both payment choices from sa
   assert.equal(Object.hasOwn(retailQuoteCatalog('sales',on),'monthly_payment_references'),false);
 });
 test('enabled selection refuses missing stale forbidden or conflicting keys',()=>{
-  const bad=[{},keys(4),{...keys(),offer_version:'old'},{...keys(),offer_version:OFFER_VERSION},keys(3,'monthly_installments'),
+  const bad=[{},keys(4),{...keys(),offer_version:'old'},{...keys(),offer_version:OFFER_VERSION},
+    {...keys(),offer_version:STRIPE_RECURRING_OFFER_VERSION},keys(3,'monthly_installments'),
     {...keys(),billing_cadence:'annual'},{...keys(),commitmentMonths:6},
     {...keys(),paymentOption:'monthly_installments'},{...keys(),pricingVersion:'old'},{...keys(),plan:'pro'}];
   for(const body of bad) assert.throws(()=>normalizeRetailQuoteSelection(body,{channel:'public',env:on}));
   assert.equal(normalizeRetailQuoteSelection({...keys(),commitmentMonths:'3',billing_cadence:'prepaid'},{channel:'public',env:on}).commitment_months,3);
 });
-test('staff matrix reuses current draft/pricing/render structure without inventing start dates',()=>{
+test('staff matrix reuses draft/pricing/render structure and captures fixed dates at generation',()=>{
   let count=0;
   for(const plan_key of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])for(const role of [false,true]){
     const draft=validateSalesDraft(normalizeSalesDraft({...identity,...keys(months,payment),plan_key,first_role_prepay_selected:role},{env:on}));
@@ -47,10 +48,14 @@ test('staff matrix reuses current draft/pricing/render structure without inventi
     assert.equal(s.commitment_months,months);assert.equal(s.payment_option,payment);
     assert.equal(pricing.initial_payment_cents,s.platform_fee_cents+(role?s.first_role_prepay.discounted_credit_amount_cents:0));
     assert.equal(pricing.platform_commitment_total_cents,s.platform_fee_cents*(payment==='prepaid'?1:months));
-    const input=agreementInputFromDraft(draft,s);
-    assert.equal(input.initial_term_start,null);assert.equal(input.initial_renewal_date,null);
-    assert.equal(input.term_start_basis,'successful_payment');
-    assert.match(buildMembershipAgreementHtml(input,{packageSnapshot:s}).html,new RegExp(`initial term of ${months} calendar months`));
+    const generatedAt='2026-01-31T12:00:00.000Z',dates=retailGenerationTermDates({generatedAt,commitmentMonths:months});
+    const input=agreementInputFromDraft(draft,s,undefined,{generatedAt});
+    assert.equal(input.initial_term_start,dates.initial_term_start);assert.equal(input.initial_renewal_date,dates.initial_renewal_date);
+    assert.equal(input.term_start_basis,'generation_date');
+    const rendered=buildMembershipAgreementHtml(input,{packageSnapshot:s,generatedAt});
+    assert.equal(rendered.normalized.initial_term_start,dates.initial_term_start);
+    assert.equal(rendered.normalized.initial_renewal_date,dates.initial_renewal_date);
+    assert.match(rendered.html.replace(/<[^>]*>/g,' ').replace(/\s+/g,' '),new RegExp(`initial ${months}-month Membership term begins`));
     assert.equal(normalizeSalesDraft(draft,{savedPackageSnapshot:s,env:off}).commitment_months,months);
     count++;
   }
@@ -71,6 +76,8 @@ test('saved retail intent and agreement require protocol columns markers and mat
   assert.equal(validateRetailIntentSource(intent).commitment_months,3);
   // Historical v1 sources keep their exact accepted version even with gateoff.
   assert.equal(normalizeRetailQuoteSelection({},{channel:'public',env:off,savedPackageSnapshot:s}).offer_version,OFFER_VERSION);
+  const v2=buildRetailPackageSnapshot({planKey:'basic',commitmentMonths:3,paymentOption:'prepaid',offerVersion:STRIPE_RECURRING_OFFER_VERSION,channel:'public'});
+  assert.equal(normalizeRetailQuoteSelection({},{channel:'public',env:on,savedPackageSnapshot:v2}).offer_version,STRIPE_RECURRING_OFFER_VERSION);
   for(const override of [{protocol:'legacy_complete'},{selected_billing_cadence:'annual'}, {selected_plan_key:'pro'},
     {first_role_prepay_selected:true},{first_role_prepay_amount_cents:0}])
     assert.throws(()=>validateRetailIntentSource({...intent,...override}),{code:'retail_quote_source_mismatch'});

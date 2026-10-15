@@ -76,7 +76,7 @@ function normalizeAgreementClientMode(value) {
   return AGREEMENT_CLIENT_MODE_ATTACH;
 }
 
-function normalizeAgreementPayload(raw) {
+function normalizeAgreementPayload(raw, { generatedAt } = {}) {
   const body = raw || {};
   const tier = String(body.membership_tier || body.membershipTier || '').trim().toLowerCase();
   const selection = tier === 'enterprise' ? null : normalizeRetailQuoteSelection(body, { channel: 'admin' });
@@ -95,11 +95,11 @@ function normalizeAgreementPayload(raw) {
       additional_interview_fee: retailPackage.additional_interview_fee,
       included_interviews_per_role: retailPackage.included_interviews_per_role,
       max_interview_minutes: retailPackage.max_interview_minutes, first_role_prepay: retailPackage.first_role_prepay,
-      ...retailAgreementTerms(retailPackage) };
+      ...retailAgreementTerms(retailPackage, { generatedAt }) };
   }
   // Draft pricing is server-owned, never a browser-supplied accepted snapshot.
   const normalized = normalizeMembershipAgreementInput(retailInput || {...body,pool_offer_snapshot:null,pool_offer_digest:null},
-    retailPackage ? { packageSnapshot: retailPackage } : {});
+    retailPackage ? { packageSnapshot: retailPackage, generatedAt } : {});
   const normalizedClientId = UUID_RE.test(normalized.client_id || '') ? normalized.client_id : null;
   const attachedClientIdRaw = String(
     body.attached_client_id ||
@@ -778,7 +778,8 @@ router.post('/agreements/:id/void', async (req, res) => {
 router.post('/agreements/preview-html', async (req, res) => {
   const request_id = req.request_id || null;
   try {
-    const payload = normalizeAgreementPayload(req.body || {});
+    const generatedAt = new Date().toISOString();
+    const payload = normalizeAgreementPayload(req.body || {}, { generatedAt });
     const validation = validateAgreementPayload(payload);
     if (!validation.ok) {
       return res.status(400).json({
@@ -794,7 +795,6 @@ router.post('/agreements/preview-html', async (req, res) => {
       if (!parentGuard.ok) return respondWithParentClientGuard(res, parentGuard, request_id);
     }
 
-    const generatedAt = new Date().toISOString();
     const priced = await withPricedPool(payload);
     const { html } = buildMembershipAgreementHtml({ ...priced,
       ...(priced.retail_package_snapshot ? retailAgreementTerms(priced.retail_package_snapshot, { generatedAt }) : {}) },
@@ -810,7 +810,8 @@ router.post('/agreements/preview-html', async (req, res) => {
 async function renderAgreementPreviewPdf(req, res) {
   const request_id = req.request_id || null;
   try {
-    const payload = normalizeAgreementPayload(req.body || {});
+    const generatedAt = new Date().toISOString();
+    const payload = normalizeAgreementPayload(req.body || {}, { generatedAt });
     const validation = validateAgreementPayload(payload);
     if (!validation.ok) {
       return res.status(400).json({
@@ -847,7 +848,6 @@ async function renderAgreementPreviewPdf(req, res) {
       }
     }
 
-    const generatedAt = new Date().toISOString();
     const priced = await withPricedPool(payload);
     const { html } = buildMembershipAgreementHtml({ ...priced,
       ...(priced.retail_package_snapshot ? retailAgreementTerms(priced.retail_package_snapshot, { generatedAt }) : {}) },
@@ -872,7 +872,8 @@ router.post('/agreements/preview', renderAgreementPreviewPdf);
 router.post('/agreements/send', async (req, res) => {
   const request_id = req.request_id || null;
   try {
-    const payload = normalizeAgreementPayload(req.body || {});
+    const generatedAt = new Date().toISOString();
+    const payload = normalizeAgreementPayload(req.body || {}, { generatedAt });
     const validation = validateAgreementPayload(payload);
     if (!validation.ok) {
       return res.status(400).json({
@@ -897,7 +898,6 @@ router.post('/agreements/send', async (req, res) => {
       });
     }
     // Priced before a client can be created, so a pricing failure leaves nothing behind.
-    const generatedAt = new Date().toISOString();
     const pricedPayload = await withPricedPool(payload);
     if (pricedPayload.retail_package_snapshot) Object.assign(pricedPayload,
       retailAgreementTerms(pricedPayload.retail_package_snapshot, { generatedAt }));
