@@ -2,7 +2,7 @@
 // Pricing adapter for the EXISTING package/agreement/Checkout/activation flow.
 // No account, password, invitation, client-ownership or payment side effects.
 const { isProxy } = require('node:util').types;
-const { buildRetailOffer } = require('./membershipOffers');
+const { buildRetailOffer, GENERATION_DATE_OFFER_VERSION } = require('./membershipOffers');
 const PROTOCOL = 'retail_package_terms_v2';
 const FIELDS = ['schema_version','offer_version','offer_key','plan_key','display_name','currency','commitment_months',
   'term_start_basis','contract_timezone','payment_option','platform_payment_cents','platform_commitment_total_cents',
@@ -26,7 +26,8 @@ function acceptedOffer(value) {
     && ['basic','pro'].includes(o.plan_key) && typeof o.display_name === 'string' && o.display_name.length > 0 && o.display_name.length <= 100
     && [3,6,12].includes(o.commitment_months) && ['prepaid','monthly_installments'].includes(o.payment_option)
     && o.offer_key === `${o.plan_key}-${o.commitment_months}-${o.payment_option}` && o.currency === 'usd'
-    && o.term_start_basis === 'first_payment_success' && o.contract_timezone === 'UTC');
+    && o.term_start_basis === (o.offer_version === GENERATION_DATE_OFFER_VERSION ? 'generation_date' : 'first_payment_success')
+    && o.contract_timezone === 'UTC');
   const count = o.payment_option === 'prepaid' ? 1 : o.commitment_months;
   check(positive(o.platform_payment_cents) && positive(o.platform_commitment_total_cents)
     && o.platform_commitment_total_cents === o.platform_payment_cents * count && o.installment_count === count

@@ -7,6 +7,9 @@ const OFFER_VERSION = 'retail-terms-2026-10-11-v1';
 // The separate subscription policy retains Stripe's native billing schedule.
 // Do not change OFFER_VERSION: the older payment-mode executor pins that value.
 const STRIPE_RECURRING_OFFER_VERSION = 'retail-stripe-terms-2026-10-14-v2';
+// Prospective only; current quote producers remain on v2 until the new native
+// paid-period proof and activation path have their independent release gate.
+const GENERATION_DATE_OFFER_VERSION = 'retail-stripe-terms-2026-10-15-v3';
 const COMMITMENT_MONTHS = Object.freeze([3, 6, 12]);
 const PAYMENT_OPTIONS = Object.freeze(['prepaid', 'monthly_installments']);
 const CHANNELS = Object.freeze(['public', 'sales', 'admin']);
@@ -64,7 +67,7 @@ function whole(value, code) {
 
 function normalizeSelection({ planKey, commitmentMonths, paymentOption, channel, offerVersion } = {}) {
   if (!CHANNELS.includes(channel)) fail('invalid_offer_channel');
-  if (![OFFER_VERSION,STRIPE_RECURRING_OFFER_VERSION].includes(offerVersion)) fail('stale_offer_version');
+  if (![OFFER_VERSION,STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(offerVersion)) fail('stale_offer_version');
   const normalizedPlan = typeof planKey === 'string' ? planKey.trim().toLowerCase() : '';
   const plan = normalizedPlan === 'essential' ? 'basic' : normalizedPlan;
   if (!Object.hasOwn(RETAIL_TERMS, plan)) fail('invalid_retail_plan');
@@ -92,7 +95,7 @@ function buildRetailOffer(input = {}) {
     display_name: pkg.display_name,
     currency: 'usd',
     commitment_months: months,
-    term_start_basis: 'first_payment_success',
+    term_start_basis: input.offerVersion === GENERATION_DATE_OFFER_VERSION ? 'generation_date' : 'first_payment_success',
     contract_timezone: 'UTC',
     payment_option: paymentOption,
     platform_payment_cents: platformPayment,
@@ -179,6 +182,18 @@ function retailTermWindow({ originalStart, commitmentMonths, termIndex = 0 } = {
   };
 }
 
+// Prospective generation-date terms only. Existing offers, payment evidence
+// and billing paths do not call this helper or change their accepted anchor.
+// The caller must provide its one server-captured generation instant; there is
+// deliberately no current-clock fallback that could redraft dates on a retry.
+function retailGenerationTermDates({ generatedAt, commitmentMonths } = {}) {
+  const generation = instant(generatedAt, 'invalid_generation_instant').toISOString();
+  const start = generation.slice(0, 10) + 'T00:00:00.000Z';
+  const term = retailTermWindow({ originalStart: start, commitmentMonths });
+  return deepFreeze({ generated_at: generation, initial_term_start: term.term_start_at.slice(0, 10),
+    initial_renewal_date: term.term_end_at.slice(0, 10) });
+}
+
 function assertRenewalPreferenceChange({ autoRenew, requestedAt, termStart, termEnd } = {}) {
   if (typeof autoRenew !== 'boolean') fail('invalid_auto_renew');
   const requested = instant(requestedAt, 'invalid_request_instant').getTime();
@@ -190,7 +205,7 @@ function assertRenewalPreferenceChange({ autoRenew, requestedAt, termStart, term
 }
 
 module.exports = {
-  OFFER_VERSION, STRIPE_RECURRING_OFFER_VERSION, COMMITMENT_MONTHS, PAYMENT_OPTIONS, RENEWAL_REMINDER_DAYS,
+  OFFER_VERSION, STRIPE_RECURRING_OFFER_VERSION, GENERATION_DATE_OFFER_VERSION, COMMITMENT_MONTHS, PAYMENT_OPTIONS, RENEWAL_REMINDER_DAYS,
   RETAIL_PRICES_CENTS, buildRetailOffer, listRetailOffers, anchoredMonthInstant,
-  retailTermWindow, assertRenewalPreferenceChange
+  retailTermWindow, retailGenerationTermDates, assertRenewalPreferenceChange
 };

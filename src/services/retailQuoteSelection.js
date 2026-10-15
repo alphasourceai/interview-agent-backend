@@ -1,7 +1,7 @@
 'use strict';
 
 // Selection adapter for the current quote paths, not a second checkout system.
-const { STRIPE_RECURRING_OFFER_VERSION, listRetailOffers, buildRetailOffer, RETAIL_PRICES_CENTS } = require('./membershipOffers');
+const { STRIPE_RECURRING_OFFER_VERSION, listRetailOffers, buildRetailOffer, RETAIL_PRICES_CENTS, retailGenerationTermDates } = require('./membershipOffers');
 const { buildRetailPackageSnapshot, readRetailPackageOffer } = require('./membershipPackageCompatibility');
 const RETAIL_TEMPLATE = 'membership_agreement_retail_terms_v2';
 const enabled = (env = process.env) => env.MEMBERSHIP_PRICING_TERMS_ENABLED === 'true';
@@ -46,11 +46,15 @@ function quotePackageOptions(selection, channel, firstRolePrepaySelected) {
   return { firstRolePrepaySelected, ...(selection ? { commitmentMonths: selection.commitment_months,
     paymentOption: selection.payment_option, offerVersion: selection.offer_version, channel } : {}) };
 }
-function retailAgreementTerms(pkg) {
+function retailAgreementTerms(pkg, { generatedAt } = {}) {
   const offer = readRetailPackageOffer(pkg);
+  const generation = offer?.term_start_basis === 'generation_date';
+  const dates = generation && generatedAt !== undefined
+    ? retailGenerationTermDates({ generatedAt, commitmentMonths: offer.commitment_months }) : null;
   return offer ? { commitment_months: offer.commitment_months, payment_option: offer.payment_option,
-    pricing_version: offer.offer_version, term_start_basis: 'successful_payment',
-    billing_option: pkg.billing_cadence, initial_term_start: null, initial_renewal_date: null,
+    pricing_version: offer.offer_version, term_start_basis: generation ? 'generation_date' : 'successful_payment',
+    billing_option: pkg.billing_cadence, initial_term_start: dates?.initial_term_start ?? null,
+    initial_renewal_date: dates?.initial_renewal_date ?? null,
     scored_question_count: offer.scored_question_count, billing_model: offer.billing_model,
     rollover_days: offer.rollover_days, auto_renew: true, notice_deadline_days: offer.renewal.reminder_days } : null;
 }
@@ -94,8 +98,11 @@ function validateRetailAgreementSource(agreement, intent) {
     fail('retail_agreement_terms_mismatch', 409);
   }
   // The existing renderer owns own-field/alias arithmetic correspondence.
-  require('../render/membershipAgreement').normalizeMembershipAgreementInput(snapshot.values,
-    { packageSnapshot: snapshot.package_snapshot });
+  const generation=offer.term_start_basis==='generation_date';
+  const normalized=require('../render/membershipAgreement').normalizeMembershipAgreementInput(snapshot.values,
+    { packageSnapshot: snapshot.package_snapshot, ...(generation?{generatedAt:snapshot.generated_at}:{}) });
+  if(generation && (!snapshot.generated_at || agreement.initial_term_start!==normalized.initial_term_start
+    || agreement.initial_renewal_date!==normalized.initial_renewal_date)) fail('retail_agreement_terms_mismatch',409);
   if (intent !== undefined) {
     const intentOffer = validateRetailIntentSource(intent);
     if (!intentOffer || JSON.stringify(intentOffer) !== JSON.stringify(offer)

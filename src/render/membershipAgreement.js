@@ -5,7 +5,7 @@ const path = require('path');
 const Handlebars = require('handlebars');
 const {readEnterprisePoolSnapshot,enterprisePoolCheckoutQuote}=require('../services/enterprisePoolSnapshot');
 const {readRetailPackageOffer}=require('../services/membershipPackageCompatibility');
-const {STRIPE_RECURRING_OFFER_VERSION}=require('../services/membershipOffers');
+const {STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION,retailGenerationTermDates,anchoredMonthInstant}=require('../services/membershipOffers');
 
 const templatePath = path.join(__dirname, '..', '..', 'templates', 'pdf', 'membership-agreement.hbs');
 const templateSrc = fs.readFileSync(templatePath, 'utf8');
@@ -14,6 +14,8 @@ const template = Handlebars.compile(templateSrc);
 // silently move their cancellation deadline to a different billing policy.
 const nativeStripeTemplate=Handlebars.compile(fs.readFileSync(path.join(__dirname,'..','..','templates','pdf',
   'membership-agreement-native-stripe.hbs'),'utf8'));
+const generationDateTemplate=Handlebars.compile(fs.readFileSync(path.join(__dirname,'..','..','templates','pdf',
+  'membership-agreement-generation-date.hbs'),'utf8'));
 
 const LOGO_FILENAME = 'No bg - color logo - dark text.png';
 
@@ -234,12 +236,24 @@ function readLogoAsDataUri() {
 
 function retailAgreementMismatch() { const e=new Error('retail_agreement_terms_mismatch');e.code=e.message;e.status=409;throw e; }
 
-function normalizeRetailAgreementInput(input, offer, normalized) {
+function normalizeRetailAgreementInput(input, offer, normalized, options = {}) {
   const supplied=(keys, expected, convert=value=>value)=>{
     for(const key of keys) if(Object.hasOwn(input,key) && input[key]!==undefined && convert(input[key])!==expected) retailAgreementMismatch();
   };
   const number=value=>typeof value==='number'?value:(typeof value==='string' && value.trim()!==''?Number(value.replace(/[$,\s]/g,'')):NaN);
   const cadence=offer.payment_option==='prepaid'?'prepaid':'monthly';
+  const generation=offer.offer_version===GENERATION_DATE_OFFER_VERSION;
+  let dates=null;
+  if(generation) {
+    // Creation supplies the server generation instant. Stored-source replay
+    // supplies its original date pair, never a fresh current-clock fallback.
+    const captured=options.generatedAt ?? (normalized.initial_term_start
+      ? normalized.initial_term_start+'T00:00:00.000Z' : undefined);
+    try { dates=retailGenerationTermDates({generatedAt:captured,commitmentMonths:offer.commitment_months}); }
+    catch (_) { retailAgreementMismatch(); }
+    supplied(['initial_term_start','initialTermStart'],dates.initial_term_start,normalizeDateInput);
+    supplied(['initial_renewal_date','initialRenewalDate'],dates.initial_renewal_date,normalizeDateInput);
+  }
   supplied(['membership_tier','membershipTier'],offer.plan_key,value=>{
     const tier=normalizeText(value).toLowerCase();return tier==='essential'?'basic':tier;
   });
@@ -247,7 +261,7 @@ function normalizeRetailAgreementInput(input, offer, normalized) {
   supplied(['commitment_months','commitmentMonths'],offer.commitment_months,number);
   supplied(['payment_option','paymentOption'],offer.payment_option);
   supplied(['pricing_version','pricingVersion','offer_version','offerVersion'],offer.offer_version);
-  supplied(['term_start_basis','termStartBasis'],'successful_payment',value=>value==='first_payment_success'?'successful_payment':value);
+  supplied(['term_start_basis','termStartBasis'],generation?'generation_date':'successful_payment',value=>value==='first_payment_success'?'successful_payment':value);
   supplied(['auto_renew','autoRenew'],true,value=>typeof value==='boolean'?value:
     (typeof value==='string' && ['1','true','yes','y'].includes(value.trim().toLowerCase())));
   for(const [keys,expected] of [
@@ -277,7 +291,8 @@ function normalizeRetailAgreementInput(input, offer, normalized) {
     per_role_fee:String(offer.per_role_fee_cents/100),additional_interview_fee:String(offer.additional_interview_fee_cents/100),
     included_interviews_per_role:String(offer.included_interviews_per_role),max_interview_minutes:String(offer.max_interview_minutes),
     scored_question_count:String(offer.scored_question_count),billing_model:offer.billing_model,rollover_days:offer.rollover_days,
-    initial_term_start:'',initial_renewal_date:'',term_start_basis:'successful_payment',auto_renew:offer.renewal.default_auto_renew,
+    initial_term_start:dates?.initial_term_start||'',initial_renewal_date:dates?.initial_renewal_date||'',
+    term_start_basis:generation?'generation_date':'successful_payment',auto_renew:offer.renewal.default_auto_renew,
     first_role_prepay:{present:true,selected:offer.first_role_prepay.selected,credit_type:'first_role_prepay',
       normal_role_fee_cents:offer.per_role_fee_cents,discounted_credit_amount_cents:offer.first_role_prepay.amount_cents,
       discount_percent:10,non_refundable:true,expires:false}};
@@ -340,7 +355,7 @@ function normalizeMembershipAgreementInput(input = {}, options = {}) {
     auto_renew: normalizeAutoRenew(input.auto_renew ?? input.autoRenew),
     notice_deadline_days: normalizeNoticeDays(input.notice_deadline_days || input.noticeDeadlineDays)
   };
-  return retailOffer?normalizeRetailAgreementInput(input,retailOffer,normalized):normalized;
+  return retailOffer?normalizeRetailAgreementInput(input,retailOffer,normalized,options):normalized;
 }
 
 const ENTERPRISE_BILLING_MODEL_WORDS = Object.freeze({
@@ -490,7 +505,8 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
   const execution = normalizeExecutionInput(options.execution || payload.execution || {});
   const showPackageTerms = !!retailOffer || shouldShowPackageTerms(payload, options);
   const now = options.generatedAt ? new Date(options.generatedAt) : new Date();
-  const displayTimeZone = normalizeText(options.timeZone || options.time_zone) || undefined;
+  const generation=retailOffer?.offer_version===GENERATION_DATE_OFFER_VERSION;
+  const displayTimeZone = generation ? 'UTC' : normalizeText(options.timeZone || options.time_zone) || undefined;
   const generatedAtIso = now.toISOString();
   const generatedAtLabel = now.toLocaleDateString('en-US', {
     year: 'numeric',
@@ -551,6 +567,8 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
     notice_deadline_plain: `${normalized.notice_deadline_days}`,
     initial_term_start_long: formatDateLong(normalized.initial_term_start),
     initial_renewal_date_long: formatDateLong(normalized.initial_renewal_date),
+    first_platform_collection_date_long: generation ? formatDateLong(anchoredMonthInstant(
+      normalized.initial_term_start+'T00:00:00.000Z',retailOffer.stripe_recurrence.interval_count)) : '',
     ack_checkbox_symbol: execution.accepted ? '☑' : '☐',
     acceptance_checkbox_symbol: execution.accepted ? '☑' : '☐',
     signer_name_line: execution.signer_typed_name || '______________________________',
@@ -562,7 +580,7 @@ function buildMembershipAgreementHtml(payload = {}, options = {}) {
   };
 
   return {
-    html: (retailOffer?.offer_version===STRIPE_RECURRING_OFFER_VERSION?nativeStripeTemplate:template)(renderData),
+    html: (generation?generationDateTemplate:retailOffer?.offer_version===STRIPE_RECURRING_OFFER_VERSION?nativeStripeTemplate:template)(renderData),
     normalized,
     commercial_terms: enterpriseTerms
   };
