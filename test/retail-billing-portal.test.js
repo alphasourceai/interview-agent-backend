@@ -69,6 +69,38 @@ test('genuine legacy and unmarked Enterprise preserve exact existing default-por
   assert.deepEqual(f.calls,[{op:'create',payload:{customer:CUSTOMER,return_url:RETURN}},{op:'read',id:CONFIG}]);
  }
 });
+test('documented query-secret URLs retain mode, configuration and owner controls for retail and legacy',async()=>{
+ for(const live of [false,true])for(const legacy of [false,true]){
+  const f=fixture();f.config.livemode=f.session.livemode=f.subscription.livemode=live;
+  if(legacy){f.client.billing_interval='monthly';f.tables.membership_agreements=[];f.subscription.metadata={};}
+  f.session.url=`https://billing.stripe.com/p/session?secret=${live?'live':'test'}_SYNTHETIC_ONLY`;
+  const result=await service(f,{stripeKey:`sk_${live?'live':'test'}_SYNTHETIC`,...(legacy?{configurationId:'',authorizeRetail:false}:{})});
+  assert.equal(result.url,f.session.url);assert.equal(f.calls.filter(x=>x.op==='create').length,1);
+  assert.deepEqual(f.calls.find(x=>x.op==='create').payload,
+   {customer:CUSTOMER,return_url:RETURN,...(legacy?{}:{configuration:CONFIG})});
+ }
+});
+test('query-secret shape refuses extra/duplicate/empty/oversized/mismatched secrets and unsafe origins',async()=>{
+ for(const url of ['https://billing.stripe.com/p/session','https://billing.stripe.com/p/session?secret=',
+  'https://billing.stripe.com/p/session?secret=test_','https://billing.stripe.com/p/session?secret=live_SYNTHETIC',
+  'https://billing.stripe.com/p/session?secret=test_SYNTHETIC&secret=test_OTHER',
+  'https://billing.stripe.com/p/session?secret=test_SYNTHETIC&redirect=foreign',
+  'https://billing.stripe.com/p/session?other=test_SYNTHETIC',
+  'https://billing.stripe.com/p/session?secret=test_%20SYNTHETIC',
+  'https://billing.stripe.com/p/session?secret=test_'+ 'a'.repeat(8192),
+  'https://billing.stripe.com/p/session/SYNTHETIC?secret=test_SYNTHETIC',
+  'https://billing.stripe.com/p/session/?secret=test_SYNTHETIC',
+  'https://billing.stripe.com/p/login?secret=test_SYNTHETIC',
+  'https://billing.stripe.com/p/session?secret=test_SYNTHETIC#foreign',
+  'http://billing.stripe.com/p/session?secret=test_SYNTHETIC',
+  'https://billing.stripe.com.evil.invalid/p/session?secret=test_SYNTHETIC',
+  'https://user@billing.stripe.com/p/session?secret=test_SYNTHETIC',
+  'https://billing.stripe.com:444/p/session?secret=test_SYNTHETIC']){
+  const f=fixture();f.session.url=url;
+  await assert.rejects(service(f),{code:'RETAIL_PORTAL_UNAVAILABLE'});
+  assert.equal(f.calls.filter(x=>x.op==='create').length,1);
+ }
+});
 test('pending, malformed, missing and read-error marked sources never fall back to default portal',async()=>{
  for(const mutate of [f=>{f.agreement.checkout_status='pending_payment';},f=>{f.agreement.checkout_paid_at=null;},
   f=>{f.agreement.template_snapshot.package_snapshot.membership_terms.commitment_months=9;},
@@ -306,10 +338,13 @@ test('installed SDK16/API2023 serializes only restricted portal fields using loo
  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
  try{
   const stripe=new Stripe(KEY,{apiVersion:'2023-10-16',host:'127.0.0.1',port:server.address().port,protocol:'http',maxNetworkRetries:0});
-  assert.equal((await service(f,{stripe})).url,f.session.url);
-  assert.ok(requests.every(r=>r.version==='2023-10-16'));
-  const writes=requests.filter(r=>r.method!=='GET');assert.equal(writes.length,1);
-  assert.equal(writes[0].path,'/v1/billing_portal/sessions');
-  assert.deepEqual(Object.fromEntries(new URLSearchParams(writes[0].body)),{customer:CUSTOMER,return_url:RETURN,configuration:CONFIG});
+  for(const url of ['https://billing.stripe.com/p/session/SYNTHETIC','https://billing.stripe.com/p/session?secret=test_SYNTHETIC_ONLY']){
+   requests.length=0;f.session.url=url;
+   assert.equal((await service(f,{stripe})).url,url);
+   assert.ok(requests.every(r=>r.version==='2023-10-16'));
+   const writes=requests.filter(r=>r.method!=='GET');assert.equal(writes.length,1);
+   assert.equal(writes[0].path,'/v1/billing_portal/sessions');
+   assert.deepEqual(Object.fromEntries(new URLSearchParams(writes[0].body)),{customer:CUSTOMER,return_url:RETURN,configuration:CONFIG});
+  }
  }finally{await new Promise(resolve=>server.close(resolve));}
 });

@@ -97,8 +97,13 @@ function assertSession(session,{customerId,configurationId,returnUrl,livemode,re
   else requireFact(session.configuration?.object === 'billing_portal.configuration' && session.configuration.id === configurationId
     && session.configuration.livemode === livemode);
   let url;try { url=new URL(session.url); } catch (_) { throw hold(); }
+  const keys=[...url.searchParams.keys()], secret=url.searchParams.get('secret');
+  const legacyPath=/^\/p\/session\/[^/]+$/.test(url.pathname) && !url.search;
+  const currentPath=url.pathname==='/p/session' && keys.length===1 && keys[0]==='secret'
+    && typeof secret==='string' && secret.length<=8192 && /^(test|live)_[A-Za-z0-9_-]+$/.test(secret)
+    && secret.startsWith(livemode?'live_':'test_');
   requireFact(url.protocol === 'https:' && url.hostname === 'billing.stripe.com' && !url.username && !url.password
-    && !url.port && !url.search && !url.hash && /^\/p\/session\/[^/]+/.test(url.pathname));
+    && !url.port && !url.hash && (legacyPath || currentPath));
 }
 
 async function createClientBillingPortalSession(options) {
