@@ -177,6 +177,7 @@ function verifyGenerationRetailFunding(input) {
     && invoice.currency==='usd' && invoice.livemode===checkout.livemode && id(invoice.customer)===expected.customerId
     && id(invoice.subscription)===subscription.id && id(checkout.invoice)===invoice.id,'retail_funding_invoice_identity');
   check(epoch(paid) && epoch(invoice.created) && invoice.created>=checkout.created && invoice.created<=paid
+    && Date.parse(expected.signedAt)>=Date.parse(expected.generatedAt)
     && paid*1000>=Date.parse(expected.signedAt) && paid*1000<Date.parse(expected.agreementDeadline)
     && (!expected.intentDeadline || paid*1000<Date.parse(expected.intentDeadline))
     && paid<schedule.trial_end,'retail_funding_paid_clock_invalid');
@@ -261,13 +262,19 @@ async function readExistingRetailCheckoutFunding({db,stripe,agreementId,intentId
     && customers.length===1 && bCount===1 && customers.every(c=>c.client_id===agreement.client_id && c.stripe_customer_id===client.stripe_customer_id),'retail_funding_customer_mismatch');
   const expected={checkoutId,customerId:client.stripe_customer_id,signedAt:agreement.signed_at,
     agreementDeadline:agreement.agreement_expires_at,intentDeadline:intent?.expires_at};
+  const generation=terms.offer.offer_version===GENERATION_DATE_OFFER_VERSION;
+  if(generation) Object.assign(expected,{generatedAt:agreement.template_snapshot.generated_at,
+    initialTermStart:agreement.initial_term_start,initialRenewalDate:agreement.initial_renewal_date,
+    prices:structuredClone(agreement.retail_checkout_prices)});
   const source={agreementId,clientId:agreement.client_id,packageSnapshot:structuredClone(terms.packageSnapshot),
     sourceTemplate:structuredClone(agreement.template_snapshot),sourceTemplateVersion:agreement.template_version,
-    sourceIntentId:intent?.id || null};
+    sourceIntentId:intent?.id || null,
+    ...(generation?{sourceCheckoutPrices:structuredClone(agreement.retail_checkout_prices)}:{})};
   await assertFence();const checkout=await stripe.checkout.sessions.retrieve(checkoutId);
   check(typeof id(checkout?.subscription)==='string','retail_funding_subscription_mismatch');
   await assertFence();const subscription=await stripe.subscriptions.retrieve(id(checkout.subscription));
   sessionIdentity({checkout,subscription,expected,eventLivemode,eventSubscriptionId});
+  if(generation) Object.assign(expected,{subscriptionId:subscription.id,eventLivemode});
   const applied=agreement.checkout_paid_at||intent?.activated_at;
   if(applied) {
     check((!linked || agreement.checkout_paid_at===intent.activated_at) && Number.isFinite(Date.parse(applied))
@@ -316,6 +323,8 @@ async function assertExistingRetailFundingSource({db,funding}) {
   const current=readSavedRetailCheckoutTerms({agreement:a,intent:i,deadlineMode:'stored'});
   check(current && isDeepStrictEqual(current.packageSnapshot,funding.packageSnapshot)
     && (!a.checkout_paid_at || new Date(a.checkout_paid_at).toISOString()===funding.paidAt),'retail_funding_source_changed');
+  if(current.offer.offer_version===GENERATION_DATE_OFFER_VERSION) check(isDeepStrictEqual(a.retail_checkout_prices,
+    funding.sourceCheckoutPrices),'retail_funding_source_changed');
   const {data:c,error:ce}=await db.from('clients').select('id,stripe_customer_id,stripe_subscription_id').eq('id',funding.clientId).maybeSingle();
   if(ce)throw new Error(ce.message||'retail_funding_client_read_failed');
   const {data:customers,error:be,count:bCount}=await db.from('billing_customers').select('id,client_id,stripe_customer_id',{count:'exact'})
