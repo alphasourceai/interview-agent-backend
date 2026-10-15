@@ -16,6 +16,7 @@ const { buildClientPwResetUrl } = require('../config/urlConfig');
 const { enqueueSalesWonDelivery } = require('./salesIntegrations');
 const { readRetailPackageOffer } = require('./membershipPackageCompatibility');
 const { retailTermWindow } = require('./membershipOffers');
+const { retailAgreementTermWindow } = require('./retailQuoteSelection');
 const { assertExistingEnterprisePoolActivationAvailable } = require('./existingEnterprisePoolActivationHold');
 const { readVerifiedEnterpriseBillingReceipt } = require('./existingEnterpriseBillingReceipt');
 const { verifyEnterprisePaymentRows } = require('./existingEnterprisePaymentRows');
@@ -518,7 +519,9 @@ async function ensureLinkedClient({ db, agreement, intent, planKey, billingInter
 
 function buildClientActivationPayload({ agreement, subscription, planKey, billingInterval, fallbackCustomerId, fallbackSubscriptionId, packageSnapshot, paidAt }) {
   const retail = readRetailPackageOffer(packageSnapshot);
-  const term = retail ? retailTermWindow({ originalStart:paidAt, commitmentMonths:retail.commitment_months }) : null;
+  const term = retail ? retail.term_start_basis === 'generation_date'
+    ? retailAgreementTermWindow({ agreement, paidAt })
+    : retailTermWindow({ originalStart:paidAt, commitmentMonths:retail.commitment_months }) : null;
   if (retail && (planKey !== retail.plan_key || billingInterval !== (retail.payment_option === 'prepaid' ? 'prepaid' : 'monthly'))) {
     const e = new Error('retail_terms_source_mismatch'); e.code = e.message; throw e;
   }
@@ -895,7 +898,7 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
 
   const { data: agreement, error: agreementErr } = await db
     .from('membership_agreements')
-    .select('id,client_id,status,is_current,checkout_status,checkout_session_id,checkout_paid_at,primary_admin_name,admin_email,client_legal_name,dba_trade_name,membership_tier,billing_option,auto_renew,template_snapshot,template_version,retail_funding_receipt,retail_admin_billing_receipt,replaces_stripe_subscription_id,replacement_policy,replaced_stripe_subscription_canceled_at,superseded_by_agreement_id,enterprise_checkout_source,enterprise_checkout_pool_id,enterprise_checkout_prices,enterprise_funding_receipt,enterprise_billing_receipt')
+    .select('id,client_id,status,is_current,checkout_status,checkout_session_id,checkout_paid_at,primary_admin_name,admin_email,client_legal_name,dba_trade_name,membership_tier,billing_option,auto_renew,template_snapshot,template_version,retail_funding_receipt,retail_admin_billing_receipt,replaces_stripe_subscription_id,replacement_policy,replaced_stripe_subscription_canceled_at,superseded_by_agreement_id,enterprise_checkout_source,enterprise_checkout_pool_id,enterprise_checkout_prices,enterprise_funding_receipt,enterprise_billing_receipt,notice_deadline_days,initial_term_start,initial_renewal_date')
     .eq('id', agreementId)
     .maybeSingle();
   if (agreementErr) throw new Error(agreementErr.message || 'Agreement lookup failed');
@@ -944,7 +947,8 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     if (persistedOriginal && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/.test(persistedOriginal)
       && Number.isFinite(Date.parse(persistedOriginal))) original = new Date(persistedOriginal).toISOString();
     if (!original) { const e = new Error('retail_original_payment_time_required'); e.code = e.message; throw e; }
-    retailTermWindow({ originalStart:original, commitmentMonths:retailOffer.commitment_months });
+    if (retailOffer.term_start_basis === 'generation_date') retailAgreementTermWindow({ agreement, paidAt:original });
+    else retailTermWindow({ originalStart:original, commitmentMonths:retailOffer.commitment_months });
     paidAt = original;
     if (!getTemplateSnapshot(agreement).package_snapshot || (intent?.id && cleanText(intent.protocol) !== 'fenced_v2')) {
       const e = new Error('retail_terms_source_mismatch'); e.code = e.message; throw e;
@@ -987,7 +991,9 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
     const proposedClientId = linkedClientId || stablePurchaseClientId(intent.id);
     const paidDate = new Date(paidAt);
     if (!Number.isFinite(paidDate.getTime())) throw new Error('Invalid public purchase payment timestamp');
-    const renewalDate = retailOffer ? retailTermWindow({ originalStart:paidAt, commitmentMonths:retailOffer.commitment_months }).term_end_at.slice(0,10) : new Date(Date.UTC(
+    const renewalDate = retailOffer ? (retailOffer.term_start_basis === 'generation_date'
+      ? retailAgreementTermWindow({ agreement, paidAt })
+      : retailTermWindow({ originalStart:paidAt, commitmentMonths:retailOffer.commitment_months })).term_end_at.slice(0,10) : new Date(Date.UTC(
       paidDate.getUTCFullYear() + 1,
       paidDate.getUTCMonth(),
       paidDate.getUTCDate()

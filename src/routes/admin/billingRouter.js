@@ -794,8 +794,11 @@ router.post('/agreements/preview-html', async (req, res) => {
       if (!parentGuard.ok) return respondWithParentClientGuard(res, parentGuard, request_id);
     }
 
-    const { html } = buildMembershipAgreementHtml(await withPricedPool(payload),
-      payload.retail_package_snapshot ? { packageSnapshot: payload.retail_package_snapshot } : {});
+    const generatedAt = new Date().toISOString();
+    const priced = await withPricedPool(payload);
+    const { html } = buildMembershipAgreementHtml({ ...priced,
+      ...(priced.retail_package_snapshot ? retailAgreementTerms(priced.retail_package_snapshot, { generatedAt }) : {}) },
+      { generatedAt, ...(payload.retail_package_snapshot ? { packageSnapshot: payload.retail_package_snapshot } : {}) });
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     return res.status(200).send(html);
   } catch (e) {
@@ -844,8 +847,11 @@ async function renderAgreementPreviewPdf(req, res) {
       }
     }
 
-    const { html } = buildMembershipAgreementHtml(await withPricedPool(payload),
-      payload.retail_package_snapshot ? { packageSnapshot: payload.retail_package_snapshot } : {});
+    const generatedAt = new Date().toISOString();
+    const priced = await withPricedPool(payload);
+    const { html } = buildMembershipAgreementHtml({ ...priced,
+      ...(priced.retail_package_snapshot ? retailAgreementTerms(priced.retail_package_snapshot, { generatedAt }) : {}) },
+      { generatedAt, ...(payload.retail_package_snapshot ? { packageSnapshot: payload.retail_package_snapshot } : {}) });
     const pdf = await htmlToPdf(html, {
       format: 'Letter',
       margin: { top: '0.75in', right: '0.75in', bottom: '0.75in', left: '0.75in' }
@@ -891,7 +897,10 @@ router.post('/agreements/send', async (req, res) => {
       });
     }
     // Priced before a client can be created, so a pricing failure leaves nothing behind.
+    const generatedAt = new Date().toISOString();
     const pricedPayload = await withPricedPool(payload);
+    if (pricedPayload.retail_package_snapshot) Object.assign(pricedPayload,
+      retailAgreementTerms(pricedPayload.retail_package_snapshot, { generatedAt }));
 
     // Only new marked pool drafts acquire a frozen checkout deadline. Use the
     // existing seven-day signing window when none was explicitly chosen; legacy
@@ -964,7 +973,7 @@ router.post('/agreements/send', async (req, res) => {
     };
 
     const { html, normalized } = buildMembershipAgreementHtml(payloadWithClient,
-      retailPackage ? { packageSnapshot: retailPackage } : {});
+      { generatedAt, ...(retailPackage ? { packageSnapshot: retailPackage } : {}) });
     const pdf = await htmlToPdf(html, {
       format: 'Letter',
       margin: { top: '0.75in', right: '0.75in', bottom: '0.75in', left: '0.75in' }
@@ -1006,9 +1015,9 @@ router.post('/agreements/send', async (req, res) => {
     const templateSnapshot = {
       template_name: 'membership-agreement',
       template_version: templateVersion,
-      ...(retailPackage ? { package_snapshot: retailPackage, term_start_basis: 'successful_payment' } : {}),
+      ...(retailPackage ? { package_snapshot: retailPackage, term_start_basis: normalized.term_start_basis } : {}),
       source_document: 'alphaScreen Membership Agreementv2.docx',
-      generated_at: new Date().toISOString(),
+      generated_at: generatedAt,
       client_association: {
         mode: payload.client_mode,
         client_id: resolvedClientId,
@@ -1033,8 +1042,8 @@ router.post('/agreements/send', async (req, res) => {
         primary_admin_name: normalized.primary_admin_name,
         admin_email: normalized.admin_email,
         membership_tier: normalized.membership_tier,
-        initial_term_start: retailPackage ? null : normalized.initial_term_start,
-        initial_renewal_date: retailPackage ? null : normalized.initial_renewal_date,
+        initial_term_start: retailPackage && normalized.term_start_basis !== 'generation_date' ? null : normalized.initial_term_start,
+        initial_renewal_date: retailPackage && normalized.term_start_basis !== 'generation_date' ? null : normalized.initial_renewal_date,
         billing_option: normalized.billing_option,
         auto_renew: normalized.auto_renew,
         notice_deadline_days: normalized.notice_deadline_days,

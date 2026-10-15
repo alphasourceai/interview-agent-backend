@@ -185,7 +185,7 @@ function isAgreementExpired(agreement = {}, now = new Date()) {
   return Number.isFinite(deadline) && Number.isFinite(clock) && deadline <= clock
 }
 
-function agreementInputFromDraft(draft, packageSnapshot, schedule = agreementSchedule()) {
+function agreementInputFromDraft(draft, packageSnapshot, schedule = agreementSchedule(), { generatedAt } = {}) {
   return {
     client_id: '',
     client_legal_name: draft.company_legal_name,
@@ -206,7 +206,7 @@ function agreementInputFromDraft(draft, packageSnapshot, schedule = agreementSch
     billing_option: draft.billing_cadence,
     auto_renew: true,
     notice_deadline_days: 30,
-    ...(retailAgreementTerms(packageSnapshot) || {})
+    ...(retailAgreementTerms(packageSnapshot, { generatedAt }) || {})
   }
 }
 

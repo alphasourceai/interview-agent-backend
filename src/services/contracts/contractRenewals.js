@@ -6,7 +6,8 @@
 
 const { supabaseAdmin } = require('../../clients/supabase');
 const { readRetailPackageOffer } = require('../membershipPackageCompatibility');
-const { retailTermWindow,STRIPE_RECURRING_OFFER_VERSION } = require('../membershipOffers');
+const { retailTermWindow,STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION } = require('../membershipOffers');
+const { retailAgreementTermWindow } = require('../retailQuoteSelection');
 const {refreshExistingRetailCoverage}=require('../existingRetailRecurringPayment');
 const {reconcileExistingRetailRenewal}=require('../existingRetailRenewalPreference');
 const { legacyContractAction } = require('./legacyContractActions');
@@ -24,11 +25,13 @@ function getRetailRenewalWindow(client, agreement) {
       || agreement?.template_version === marker || snapshot?.template_version === marker) invalidRetailRenewal();
     return null; // Legacy contracts keep their original twelve-month behavior.
   }
-  const original = new Date(agreement?.checkout_paid_at || NaN);
+  const original = new Date(offer.term_start_basis === 'generation_date'
+    ? retailAgreementTermWindow({ agreement, paidAt:agreement?.checkout_paid_at }).original_start_at
+    : agreement?.checkout_paid_at || NaN);
   const start = new Date(client?.contract_start_at || NaN);
   const end = new Date(client?.contract_end_at || NaN);
   if (agreement.client_id !== client.id || agreement.is_current !== true
-    || !(agreement.status==='signed'||offer.offer_version===STRIPE_RECURRING_OFFER_VERSION&&agreement.status==='active')
+    || !(agreement.status==='signed'||[STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(offer.offer_version)&&agreement.status==='active')
     || agreement.checkout_status !== 'paid' || agreement.superseded_by_agreement_id
     || agreement.template_version !== marker || snapshot.template_version !== marker
     || client.plan_tier !== offer.plan_key || agreement.membership_tier !== offer.plan_key
@@ -145,7 +148,7 @@ async function processContractRenewals(context = {}, dependencies = {}) {
         // Inspect the current row before filtering by payment/signature status:
         // an unpaid/malformed new agreement must not disappear into legacy.
         const {data:agreement, error:agreementError} = await db.from('membership_agreements')
-          .select('id,client_id,status,is_current,checkout_status,checkout_paid_at,membership_tier,billing_option,template_version,template_snapshot,superseded_by_agreement_id')
+          .select('id,client_id,status,is_current,checkout_status,checkout_paid_at,membership_tier,billing_option,template_version,template_snapshot,superseded_by_agreement_id,auto_renew,notice_deadline_days,initial_term_start,initial_renewal_date')
           .eq('client_id', client.id).eq('is_current', true).maybeSingle();
         if (agreementError) throw new Error(agreementError.message || 'renewal_agreement_read_failed');
         if(agreement?.template_snapshot?.package_snapshot?.membership_terms?.offer_version===STRIPE_RECURRING_OFFER_VERSION){

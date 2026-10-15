@@ -694,9 +694,9 @@ function validatePurchaseIntentForAgreement(intent) {
   return { ok: true, planKey, billingCadence, snapshot }
 }
 
-function buildAgreementInputFromPurchaseIntent(intent) {
+function buildAgreementInputFromPurchaseIntent(intent, { generatedAt } = {}) {
   const snapshot = intent?.package_snapshot && typeof intent.package_snapshot === 'object' ? intent.package_snapshot : {}
-  const retail = retailAgreementTerms(snapshot)
+  const retail = retailAgreementTerms(snapshot, { generatedAt })
   const now = new Date()
   const firstName = trimText(intent?.buyer_first_name, 80)
   const lastName = trimText(intent?.buyer_last_name, 80)

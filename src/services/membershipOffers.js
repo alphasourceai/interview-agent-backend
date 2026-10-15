@@ -194,6 +194,31 @@ function retailGenerationTermDates({ generatedAt, commitmentMonths } = {}) {
     initial_renewal_date: term.term_end_at.slice(0, 10) });
 }
 
+// Native Stripe collection dates are distinct from the fixed legal calendar.
+// Only the prospective version uses an initial full one-time platform payment
+// and a recurring price deferred to this boundary. Never infer paid access
+// from the provider's `trialing` schedule state.
+function retailGenerationCollectionSchedule({ offer, generatedAt, initialTermStart, initialRenewalDate, now } = {}) {
+  if (offer?.offer_version !== GENERATION_DATE_OFFER_VERSION || offer.term_start_basis !== 'generation_date'
+    || !PAYMENT_OPTIONS.includes(offer.payment_option)) {
+    fail('generation_date_offer_required');
+  }
+  const dates = retailGenerationTermDates({ generatedAt, commitmentMonths: offer.commitment_months });
+  if (initialTermStart !== dates.initial_term_start || initialRenewalDate !== dates.initial_renewal_date) {
+    fail('retail_agreement_terms_mismatch');
+  }
+  const current = instant(now, 'invalid_checkout_instant').getTime();
+  if (current < Date.parse(dates.generated_at)) fail('invalid_checkout_instant');
+  const start = `${dates.initial_term_start}T00:00:00.000Z`;
+  const firstCollection = anchoredMonthInstant(start, offer.payment_option === 'prepaid' ? offer.commitment_months : 1);
+  // Stripe requires trial_end at least 48 hours ahead. Refuse stale offers;
+  // never move their signed dates to make an otherwise invalid session work.
+  if (Date.parse(firstCollection) - current < 2 * DAY_MS
+    || current >= Date.parse(`${dates.initial_renewal_date}T00:00:00.000Z`)) fail('retail_checkout_window_closed');
+  return deepFreeze({ initial_term_start: dates.initial_term_start, initial_renewal_date: dates.initial_renewal_date,
+    first_collection_at: firstCollection, trial_end: Date.parse(firstCollection) / 1000 });
+}
+
 function assertRenewalPreferenceChange({ autoRenew, requestedAt, termStart, termEnd } = {}) {
   if (typeof autoRenew !== 'boolean') fail('invalid_auto_renew');
   const requested = instant(requestedAt, 'invalid_request_instant').getTime();
@@ -207,5 +232,5 @@ function assertRenewalPreferenceChange({ autoRenew, requestedAt, termStart, term
 module.exports = {
   OFFER_VERSION, STRIPE_RECURRING_OFFER_VERSION, GENERATION_DATE_OFFER_VERSION, COMMITMENT_MONTHS, PAYMENT_OPTIONS, RENEWAL_REMINDER_DAYS,
   RETAIL_PRICES_CENTS, buildRetailOffer, listRetailOffers, anchoredMonthInstant,
-  retailTermWindow, retailGenerationTermDates, assertRenewalPreferenceChange
+  retailTermWindow, retailGenerationTermDates, retailGenerationCollectionSchedule, assertRenewalPreferenceChange
 };

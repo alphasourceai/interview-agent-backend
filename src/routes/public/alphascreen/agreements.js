@@ -77,7 +77,7 @@ router.post('/purchase-intents/:id/agreement', async (req, res) => {
     if (intent.agreement_id) {
       const { data, error: existingErr } = await supabaseAdmin
         .from('membership_agreements')
-        .select('id,status,signer_token_expires_at,draft_pdf_path,sent_at,agreement_expires_at,template_version,template_snapshot,membership_tier,billing_option,auto_renew,notice_deadline_days')
+        .select('id,status,signer_token_expires_at,draft_pdf_path,sent_at,agreement_expires_at,template_version,template_snapshot,membership_tier,billing_option,auto_renew,notice_deadline_days,initial_term_start,initial_renewal_date')
         .eq('id', intent.agreement_id)
         .maybeSingle()
 
@@ -140,7 +140,10 @@ router.post('/purchase-intents/:id/agreement', async (req, res) => {
       }
     }
 
-    const agreementInput = buildAgreementInputFromPurchaseIntent(intent)
+    // One server clock owns both the PDF and persisted snapshot. Rendering or
+    // uploading across UTC midnight must not silently move the legal dates.
+    const generatedAt = new Date().toISOString()
+    const agreementInput = buildAgreementInputFromPurchaseIntent(intent, { generatedAt })
     const agreementInputValidation = validateAgreementInput(agreementInput)
     if (!agreementInputValidation.ok) {
       return res.status(agreementInputValidation.status).json({
@@ -160,7 +163,7 @@ router.post('/purchase-intents/:id/agreement', async (req, res) => {
     if (retail) agreementInput.agreement_expires_at = new Date(deadline).toISOString()
     const templateVersion = retail ? RETAIL_TEMPLATE : 'membership_agreement_v2_phase1'
     const { html, normalized } = buildMembershipAgreementHtml(agreementInput, {
-      showPackageTerms: true, ...(retail ? { packageSnapshot: intentValidation.snapshot } : {})
+      showPackageTerms: true, generatedAt, ...(retail ? { packageSnapshot: intentValidation.snapshot } : {})
     })
     const pdf = await htmlToPdf(html, {
       format: 'Letter',
@@ -199,7 +202,7 @@ router.post('/purchase-intents/:id/agreement', async (req, res) => {
       template_version: templateVersion,
       source: 'public_purchase_intent',
       source_document: 'alphaScreen Membership Agreementv2.docx',
-      generated_at: nowIso,
+      generated_at: generatedAt,
       purchase_intent: {
         id: intent.id,
         source_path: intent.source_path || null,
@@ -223,8 +226,8 @@ router.post('/purchase-intents/:id/agreement', async (req, res) => {
         primary_admin_name: normalized.primary_admin_name,
         admin_email: normalized.admin_email,
         membership_tier: normalized.membership_tier,
-        initial_term_start: retail ? null : normalized.initial_term_start,
-        initial_renewal_date: retail ? null : normalized.initial_renewal_date,
+        initial_term_start: retail && normalized.term_start_basis !== 'generation_date' ? null : normalized.initial_term_start,
+        initial_renewal_date: retail && normalized.term_start_basis !== 'generation_date' ? null : normalized.initial_renewal_date,
         billing_option: normalized.billing_option,
         auto_renew: normalized.auto_renew,
         notice_deadline_days: normalized.notice_deadline_days,

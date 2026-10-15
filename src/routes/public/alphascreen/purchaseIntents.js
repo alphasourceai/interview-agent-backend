@@ -3,7 +3,7 @@
 // Package listing, checkout status and purchase intent creation.
 
 const express = require('express');
-const { quotePackageOptions, retailQuoteCatalog, validateRetailIntentSource } = require('../../../services/retailQuoteSelection');
+const { quotePackageOptions, retailQuoteCatalog, validateRetailIntentSource, retailAgreementTerms } = require('../../../services/retailQuoteSelection');
 const {
   DUPLICATE_WINDOW_MS,
   INTENT_EXPIRATION_MS,
@@ -198,6 +198,7 @@ router.post('/purchase-intents', async (req, res) => {
       selected_plan_key: input.selected_plan_key,
       selected_billing_cadence: input.selected_billing_cadence,
       package_snapshot: packageSnapshot,
+      ...(retailAgreementTerms(packageSnapshot) ? { term_start_basis:retailAgreementTerms(packageSnapshot).term_start_basis } : {}),
       ...prepayColumns,
       company_legal_name: input.company_legal_name,
       company_dba: input.company_dba || null,

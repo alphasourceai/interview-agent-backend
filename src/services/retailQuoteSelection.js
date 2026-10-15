@@ -1,7 +1,7 @@
 'use strict';
 
 // Selection adapter for the current quote paths, not a second checkout system.
-const { STRIPE_RECURRING_OFFER_VERSION, listRetailOffers, buildRetailOffer, RETAIL_PRICES_CENTS, retailGenerationTermDates } = require('./membershipOffers');
+const { STRIPE_RECURRING_OFFER_VERSION, listRetailOffers, buildRetailOffer, RETAIL_PRICES_CENTS, retailGenerationTermDates, retailTermWindow } = require('./membershipOffers');
 const { buildRetailPackageSnapshot, readRetailPackageOffer } = require('./membershipPackageCompatibility');
 const RETAIL_TEMPLATE = 'membership_agreement_retail_terms_v2';
 const enabled = (env = process.env) => env.MEMBERSHIP_PRICING_TERMS_ENABLED === 'true';
@@ -110,5 +110,25 @@ function validateRetailAgreementSource(agreement, intent) {
   }
   return offer;
 }
+
+// Reuse the existing contract calendar for both cohorts. Actual cash remains
+// paidAt; only prospective generation-date agreements take their legal anchor
+// from the immutable rendered source. This computes dates, not payment proof.
+function retailAgreementTermWindow({ agreement, paidAt, termIndex = 0 } = {}) {
+  const offer = readRetailPackageOffer(agreement?.template_snapshot?.package_snapshot);
+  if (!offer) fail('retail_agreement_terms_mismatch', 409);
+  let originalStart = paidAt;
+  if (offer.term_start_basis === 'generation_date') {
+    validateRetailAgreementSource(agreement);
+    const generated = agreement.template_snapshot.generated_at;
+    const paid = Date.parse(paidAt);
+    if (typeof paidAt !== 'string' || !Number.isFinite(paid) || paid < Date.parse(generated)
+      || paid >= Date.parse(`${agreement.initial_renewal_date}T00:00:00.000Z`)) {
+      fail('retail_original_payment_time_required', 409);
+    }
+    originalStart = `${agreement.initial_term_start}T00:00:00.000Z`;
+  }
+  return retailTermWindow({ originalStart, commitmentMonths: offer.commitment_months, termIndex });
+}
 module.exports = { RETAIL_TEMPLATE, enabled, normalizeRetailQuoteSelection, quotePackageOptions,
-  retailAgreementTerms, validateRetailIntentSource, validateRetailAgreementSource, retailQuoteCatalog };
+  retailAgreementTerms, validateRetailIntentSource, validateRetailAgreementSource, retailQuoteCatalog, retailAgreementTermWindow };

@@ -298,9 +298,10 @@ function createSalesRouter(options = {}) {
       first_role_prepay_selected: intent.package_snapshot?.first_role_prepay?.selected === true,
       promotion_code: intent.promotion_code
     }, { savedPackageSnapshot: intent.package_snapshot }))
-    const agreementInput = agreementInputFromDraft(draft, intent.package_snapshot, schedule)
+    const generatedAt = nowIso()
+    const agreementInput = agreementInputFromDraft(draft, intent.package_snapshot, schedule, { generatedAt })
     const templateVersion = retail ? RETAIL_TEMPLATE : 'membership_agreement_v3_sales_assisted'
-    const { html, normalized } = renderAgreement(agreementInput, { showPackageTerms: true, generatedAt: nowIso(), timeZone: 'America/Denver',
+    const { html, normalized } = renderAgreement(agreementInput, { showPackageTerms: true, generatedAt, timeZone: 'America/Denver',
       ...(retail ? { packageSnapshot: intent.package_snapshot } : {}) })
     const pdf = await renderPdf(html, {
       format: 'Letter',
@@ -316,13 +317,12 @@ function createSalesRouter(options = {}) {
 
     const signerToken = crypto.randomBytes(32).toString('hex')
     const signerTokenHash = crypto.createHash('sha256').update(signerToken).digest('hex')
-    const generatedAt = nowIso()
     const templateSnapshot = {
       template_name: 'membership-agreement',
       template_version: templateVersion,
       source: 'sales_assisted',
       generated_at: generatedAt,
-      term_start_basis: retail ? 'successful_payment' : 'agreement_date',
+      term_start_basis: retail ? normalized.term_start_basis : 'agreement_date',
       agreement_expires_at: schedule.expires_at,
       purchase_intent: { id: intent.id, channel: 'sales_assisted' },
       package_snapshot: intent.package_snapshot,
@@ -340,8 +340,8 @@ function createSalesRouter(options = {}) {
       primary_admin_name: normalized.primary_admin_name,
       admin_email: normalized.admin_email,
       membership_tier: normalized.membership_tier,
-      initial_term_start: retail ? null : normalized.initial_term_start,
-      initial_renewal_date: retail ? null : normalized.initial_renewal_date,
+      initial_term_start: retail && normalized.term_start_basis !== 'generation_date' ? null : normalized.initial_term_start,
+      initial_renewal_date: retail && normalized.term_start_basis !== 'generation_date' ? null : normalized.initial_renewal_date,
       agreement_expires_at: schedule.expires_at,
       billing_option: normalized.billing_option,
       auto_renew: normalized.auto_renew,
@@ -614,8 +614,9 @@ function createSalesRouter(options = {}) {
       const { package_snapshot: packageSnapshot, pricing } = calculatePricing(draft, promotion)
       await requireRetailSalesAttribution(req, packageSnapshot)
       const schedule = agreementSchedule()
-      const agreementInput = agreementInputFromDraft(draft, packageSnapshot, schedule)
-      const { html } = renderAgreement(agreementInput, { showPackageTerms: true, generatedAt: nowIso(), timeZone: 'America/Denver',
+      const generatedAt = nowIso()
+      const agreementInput = agreementInputFromDraft(draft, packageSnapshot, schedule, { generatedAt })
+      const { html } = renderAgreement(agreementInput, { showPackageTerms: true, generatedAt, timeZone: 'America/Denver',
         ...(retailAgreementTerms(packageSnapshot) ? { packageSnapshot } : {}) })
       const pdf = await renderPdf(html, {
         format: 'Letter',
@@ -791,7 +792,7 @@ function createSalesRouter(options = {}) {
         promotion_discount_cents: Number(preview.pricing_snapshot?.promotion_discount_cents || 0),
         platform_fee_cents: Number(preview.pricing_snapshot?.platform_fee_cents || 0),
         initial_payment_cents: Number(preview.pricing_snapshot?.initial_payment_cents || 0),
-        term_start_basis: retailAgreementTerms(preview.package_snapshot) ? 'successful_payment' : 'agreement_date',
+        term_start_basis: retailAgreementTerms(preview.package_snapshot)?.term_start_basis || 'agreement_date',
         sales_preview_id: previewId,
         created_at: now,
         updated_at: now
@@ -829,7 +830,7 @@ function createSalesRouter(options = {}) {
         renewal_date: preview.agreement_renewal_date,
         expires_at: preview.agreement_expires_at
       }
-      const agreementInput = agreementInputFromDraft(draft, preview.package_snapshot, agreementScheduleSnapshot)
+      const agreementInput = agreementInputFromDraft(draft, preview.package_snapshot, agreementScheduleSnapshot, { generatedAt: now })
       const retail = retailAgreementTerms(preview.package_snapshot)
       const templateVersion = retail ? RETAIL_TEMPLATE : 'membership_agreement_v3_sales_assisted'
       const { html, normalized } = renderAgreement(agreementInput, { showPackageTerms: true, generatedAt: now, timeZone: 'America/Denver',
@@ -855,7 +856,7 @@ function createSalesRouter(options = {}) {
         template_version: templateVersion,
         source: 'sales_assisted',
         generated_at: now,
-        term_start_basis: retail ? 'successful_payment' : 'agreement_date',
+        term_start_basis: retail ? normalized.term_start_basis : 'agreement_date',
         agreement_expires_at: signerTokenExpiresAt,
         purchase_intent: { id: intentId, channel: 'sales_assisted' },
         package_snapshot: preview.package_snapshot,
@@ -872,8 +873,8 @@ function createSalesRouter(options = {}) {
         primary_admin_name: normalized.primary_admin_name,
         admin_email: normalized.admin_email,
         membership_tier: normalized.membership_tier,
-        initial_term_start: retail ? null : normalized.initial_term_start,
-        initial_renewal_date: retail ? null : normalized.initial_renewal_date,
+        initial_term_start: retail && normalized.term_start_basis !== 'generation_date' ? null : normalized.initial_term_start,
+        initial_renewal_date: retail && normalized.term_start_basis !== 'generation_date' ? null : normalized.initial_renewal_date,
         billing_option: normalized.billing_option,
         auto_renew: normalized.auto_renew,
         notice_deadline_days: normalized.notice_deadline_days,
