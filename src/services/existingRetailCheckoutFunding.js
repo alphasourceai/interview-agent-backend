@@ -153,7 +153,7 @@ function verifyGenerationRetailFunding(input) {
   try{canonical=buildRetailOffer({planKey:offer.plan_key,commitmentMonths:offer.commitment_months,paymentOption:offer.payment_option,
     firstRolePrepaySelected:offer.first_role_prepay?.selected,channel:'sales',offerVersion:GENERATION_DATE_OFFER_VERSION});}
   catch(_){fail('retail_generation_funding_source_mismatch');}
-  check(isDeepStrictEqual(offer,canonical),'retail_generation_funding_source_mismatch');
+  check(isDeepStrictEqual(offer,snapshot(canonical)),'retail_generation_funding_source_mismatch');
   const prices=expected?.prices;
   check(prices && Object.keys(prices).sort().join(',')==='first_role_price_id,initial_platform_price_id,recurring_platform_price_id'
     && [prices.initial_platform_price_id,prices.recurring_platform_price_id].every(p=>/^price_[A-Za-z0-9_]+$/.test(p||''))
