@@ -2,10 +2,10 @@
 // UNMOUNTED existing SDK/receipt -> native CLIENT tuple only. Not full billing,
 // plan/credit/Auth completion or delivery. No new payment/account engine.
 const { isDeepStrictEqual } = require('node:util');
-const { snapshotStripeSdkData } = require('./enterprisePoolPaymentProof');
+const { snapshotStripeSdkData, snapshotEnterpriseUsageCensusData: contractSnapshot } = require('./enterprisePoolPaymentProof');
 const { readExistingRetailActivationFunding } = require('./existingRetailActivationFunding');
 const {retailInitialEvidenceGeometry}=require('./membershipOffers');
-const equal = (a, b) => isDeepStrictEqual(snapshotStripeSdkData(a), snapshotStripeSdkData(b));
+const equal = (a, b) => a === undefined || b === undefined ? a === b : isDeepStrictEqual(contractSnapshot(a), contractSnapshot(b));
 const plain = v => JSON.parse(JSON.stringify(v));
 const id = v => typeof v === 'string' ? v : v?.id;
 function periodEnded() {
@@ -26,7 +26,7 @@ function freeze(v) {
 }
 async function row(db, table, key, value) {
   const r = await db.from(table).select('*').eq(key, value).maybeSingle();
-  check(r && !r.error); return snapshotStripeSdkData(r.data);
+  check(r && !r.error); return contractSnapshot(r.data);
 }
 async function applyClient(options) {
   const { db, agreementId, stripe, assertFence = async () => {} } = options;

@@ -16,7 +16,9 @@ const socket=process.env.PGHOST||'',port='55458',bin='/opt/homebrew/opt/postgres
 const database=`retail_generation_funded_${process.pid}`,root=path.join(__dirname,'../supabase/migrations');
 const lit=v=>v==null?'null':typeof v==='object'?`'${JSON.stringify(v).replaceAll("'","''")}'::jsonb`
  :typeof v==='boolean'||typeof v==='number'?String(v):`'${String(v).replaceAll("'","''")}'`;
-const run=q=>cp.spawnSync(bin+'psql',['-h',socket,'-p',port,'-U','postgres','-d',database,'-X','-q','-At','-v','ON_ERROR_STOP=1','-c',q],{encoding:'utf8'});
+// Full rendered agreements exceed the OS argv limit. Feed local SQL on stdin;
+// retain exact native statements and no external network/provider effects.
+const run=q=>cp.spawnSync(bin+'psql',['-h',socket,'-p',port,'-U','postgres','-d',database,'-X','-q','-At','-v','ON_ERROR_STOP=1','-f','-'],{input:q,encoding:'utf8',maxBuffer:16777216});
 function sql(q){const r=run(q);assert.equal(r.status,0,r.stderr);return r.stdout.trim();}
 const json=q=>JSON.parse(sql(q));
 function denied(q,re=/retail_|constraint/){const r=run(q);assert.notEqual(r.status,0);assert.match(r.stderr,re);}
@@ -54,7 +56,7 @@ function authoredSdk(r){const list=data=>({object:'list',has_more:false,data:str
   paymentIntents:{retrieve:async()=>structuredClone(r.pi)},charges:{retrieve:async()=>structuredClone(r.ch)}};
 }
 
-function setup({plan='basic',months=3,payment='prepaid',role=false,admin=false,generation=true,legacyVersion,sales=false,replacement=false}={}){
+function setup({plan='basic',months=3,payment='prepaid',role=false,admin=false,generation=true,legacyVersion,sales=false,replacement=false,largeContract=false}={}){
  const now=Date.now(),generatedAt=new Date(now-3*3600000).toISOString(),paidAt=new Date(Math.floor(now/1000)*1000).toISOString();
  const f=generation?generationFixture(plan,months,payment,role,{admin,generatedAt,paidAt}):legacyFixture(plan,months,payment,role,{admin});
  if(!generation){
@@ -67,6 +69,11 @@ function setup({plan='basic',months=3,payment='prepaid',role=false,admin=false,g
  Object.assign(f.g,{id:G,client_id:C,initial_term_start:generation?f.g.initial_term_start:null,initial_renewal_date:generation?f.g.initial_renewal_date:null});
  Object.assign(f.i,{id:I,client_id:C,agreement_id:G});Object.assign(f.c,{id:C,stripe_customer_id:'cus_'+key});
  if(!admin)f.g.template_snapshot.purchase_intent.id=I;
+ if(largeContract){
+  const rendered=require('../src/render/membershipAgreement').buildMembershipAgreementHtml(
+   f.g.template_snapshot.values,{packageSnapshot:f.pkg,generatedAt:f.g.template_snapshot.generated_at});
+  assert.ok(rendered.html.length>8192);f.g.template_snapshot.rendered_html=rendered.html;
+ }
  Object.assign(f.cs,{id:'cs_'+key,customer:f.c.stripe_customer_id,subscription:'sub_'+key,invoice:'in_'+key});
  Object.assign(f.s,{id:'sub_'+key,customer:f.c.stripe_customer_id});
  Object.assign(f.inv,{id:'in_'+key,customer:f.c.stripe_customer_id,subscription:f.s.id,payment_intent:'pi_'+key,charge:'ch_'+key});
@@ -373,11 +380,33 @@ for(const admin of [false,true])test(`application funding/billing adapter + actu
  assert.equal(sql(`select count(*) from client_members where client_id=${lit(r.c.id)} and user_id=${lit(userId)};`),'1');
 });
 
+for(const cohort of ['v1','v2','v3'])for(const payment of ['prepaid','monthly_installments'])for(const admin of [false,true])
+test(`full rendered agreement traverses original native billing and member tail ${cohort}/${payment}/admin=${admin}`,opts,async()=>{
+ const r=setup({plan:'basic',months:6,payment,role:true,admin,generation:cohort==='v3',
+  legacyVersion:cohort==='v2'?STRIPE_RECURRING_OFFER_VERSION:undefined,largeContract:true}),db=nativeDb(),stripe=authoredSdk(r);
+ const options={db,stripe,agreementId:r.g.id,intentId:admin?null:r.i.id,claimKey:r.claimKey,
+  eventSessionId:r.cs.id,eventSubscriptionId:r.s.id,eventLivemode:false};
+ await require('../src/services/existingRetailFundingReceipt').recordExistingRetailFunding(options);
+ complete(r);initial(r);
+ const original=agreement(r),prepare=admin?require('../src/services/existingRetailAdminMemberTail').prepareExistingRetailAdminMemberTail
+  :require('../src/services/existingRetailLinkedMemberTail').prepareExistingRetailLinkedMemberTail;
+ const tail=await prepare(options);await tail.assertReady();
+ const userId=crypto.randomUUID();sql(`insert into auth.users(id,email) values(${lit(userId)},${lit(original.admin_email)});`);
+ assert.equal((await tail.ensureMember({userId,name:'Synthetic Buyer'})).status,'created');
+ assert.equal((await tail.ensureMember({userId,name:'Synthetic Buyer'})).status,'existing');
+ const after=agreement(r);assert.deepEqual(after.template_snapshot,original.template_snapshot);
+ assert.deepEqual(after.checkout_attempt_source,original.checkout_attempt_source);
+ assert.equal(new Date(after.checkout_paid_at).toISOString(),r.paidAt);
+ assert.equal(client(r).billing_status,'active');
+ assert.equal(sql(`select count(*) from client_role_credits where source_membership_agreement_id=${lit(r.g.id)};`),'1');
+ assert.equal(sql(`select count(*) from client_members where client_id=${lit(r.c.id)} and user_id=${lit(userId)};`),'1');
+});
+
 const replacementOpts={skip:!enabled||process.env.RETAIL_GENERATION_REPLACEMENT_COMPAT!=='true'};
 for(const cohort of ['v1','v2','v3'])for(const payment of ['prepaid','monthly_installments'])
 test(`replacement application/native compatibility ${cohort}/${payment}`,replacementOpts,async()=>{
  const r=setup({generation:cohort==='v3',legacyVersion:cohort==='v2'?STRIPE_RECURRING_OFFER_VERSION:undefined,
-  payment,role:true,replacement:true}),db=nativeDb(),stripe=authoredSdk(r);
+  payment,role:true,replacement:true,largeContract:true}),db=nativeDb(),stripe=authoredSdk(r);
  const options={db,stripe,agreementId:r.g.id,intentId:r.i.id,claimKey:r.claimKey,
   eventSessionId:r.cs.id,eventSubscriptionId:r.s.id,eventLivemode:false};
  let deletes=0;const old={object:'subscription',id:r.replacementId,customer:r.c.stripe_customer_id,currency:'usd',

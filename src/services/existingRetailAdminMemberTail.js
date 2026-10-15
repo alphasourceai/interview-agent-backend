@@ -2,10 +2,10 @@
 // Internal seam for the ORIGINAL post-payment account helper. Not a new Auth
 // engine. SDK reads/native guards are not hosted account/email acceptance.
 const { isDeepStrictEqual } = require('node:util');
-const { snapshotStripeSdkData } = require('./enterprisePoolPaymentProof');
+const { snapshotStripeSdkData, snapshotEnterpriseUsageCensusData: contractSnapshot } = require('./enterprisePoolPaymentProof');
 const { applyExistingRetailAdminBilling } = require('./existingRetailAdminBillingAdapter');
 const plain = v => JSON.parse(JSON.stringify(v));
-const equal = (a, b) => isDeepStrictEqual(snapshotStripeSdkData(a), snapshotStripeSdkData(b));
+const equal = (a, b) => a === undefined || b === undefined ? a === b : isDeepStrictEqual(contractSnapshot(a), contractSnapshot(b));
 const id = v => typeof v === 'string' ? v : v?.id;
 const roles = new Set(['manager', 'admin', 'owner', 'super_admin']);
 function fail(code = 'retail_admin_member_tail_unknown', status = 503) {
@@ -29,7 +29,7 @@ async function native(db, name, args) {
     'retail_funding_source_denied', 'retail_funding_paid_source_denied', 'retail_funding_source_changed'].includes(r?.error?.message))
     fail('retail_admin_member_tail_conflict', 409);
   check(r && !r.error && r.data, 'retail_admin_member_tail_ack_unknown');
-  return snapshotStripeSdkData(r.data);
+  return name === 'retail_admin_existing_member_context' ? contractSnapshot(r.data) : snapshotStripeSdkData(r.data);
 }
 function memberAck(r) {
   check(r && !Array.isArray(r) && Object.keys(r).sort().join(',') === 'role,status'
@@ -40,7 +40,7 @@ async function prepare(options) {
   const { db, assertFence = async () => {} } = options;
   const billing = await applyExistingRetailAdminBilling(options);
   if (!billing) return null;
-  const receipt = snapshotStripeSdkData(billing.receipt), source = receipt.source, period = receipt.funding_receipt.proof.period;
+  const receipt = contractSnapshot(billing.receipt), source = receipt.source, period = receipt.funding_receipt.proof.period;
   async function ready() {
     await assertFence();
     // Completed financial replay is ZERO DML; actual current SDK sub stays

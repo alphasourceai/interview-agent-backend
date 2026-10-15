@@ -2,13 +2,13 @@
 // UNMOUNTED provider GET-only observation + existing pending journal. This
 // neither authorizes nor executes cancellation, billing, access or recovery.
 const { isDeepStrictEqual, types } = require('node:util');
-const { snapshotStripeSdkData: snap } = require('./enterprisePoolPaymentProof');
+const { snapshotStripeSdkData: snap, snapshotEnterpriseUsageCensusData: contractSnapshot } = require('./enterprisePoolPaymentProof');
 const { readExistingRetailFundingReceipt } = require('./existingRetailFundingReplay');
 const { readSavedRetailCheckoutTerms } = require('./savedMembershipCheckoutTerms');
 const { collect, verifyExistingRetailFunding } = require('./existingRetailCheckoutFunding');
 const {retailInitialEvidenceGeometry,GENERATION_DATE_OFFER_VERSION}=require('./membershipOffers');
 const plain = v => JSON.parse(JSON.stringify(v));
-const equal = (a, b) => isDeepStrictEqual(snap(a), snap(b));
+const equal = (a, b) => a === undefined || b === undefined ? a === b : isDeepStrictEqual(contractSnapshot(a), contractSnapshot(b));
 const id = v => typeof v === 'string' ? v : v?.id;
 class Hold extends Error {
   constructor(suffix) { super('retail_replacement_preflight_' + suffix); this.code = this.message; this.status = 503; }
@@ -58,11 +58,11 @@ async function prepare(options) {
   async function read() {
     const r = await readExistingRetailFundingReceipt({ ...options, db: readDb, claimKey });
     check(r?.native_receipt_required === true && r.funding?.receiptReplay === true, 'source_unknown');
-    return snap(r);
+    return contractSnapshot(r);
   }
   async function row(table, key, value) {
     await assertFence(); const r = await db.from(table).select('*').eq(key, value).maybeSingle();
-    check(r && !r.error, 'source_unknown'); return snap(r.data);
+    check(r && !r.error, 'source_unknown'); return contractSnapshot(r.data);
   }
   async function get(call) { api(); await assertFence(); const v = snap(await call()); api(); return v; }
   const first = await read();

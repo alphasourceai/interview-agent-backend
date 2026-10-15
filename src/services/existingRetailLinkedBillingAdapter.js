@@ -2,12 +2,12 @@
 // UNMOUNTED trusted SDK -> SAME original 28-argument billing writer/digest.
 // Historical financial replay is not current access, Auth or renewal proof.
 const { isDeepStrictEqual } = require('node:util');
-const { snapshotStripeSdkData } = require('./enterprisePoolPaymentProof');
+const { snapshotStripeSdkData, snapshotEnterpriseUsageCensusData: contractSnapshot } = require('./enterprisePoolPaymentProof');
 const { readExistingRetailActivationFunding } = require('./existingRetailActivationFunding');
 const { buildAlphaScreenPlanSettingsPayload } = require('./alphaScreenPackages');
 const {retailInitialEvidenceGeometry}=require('./membershipOffers');
 const plain = v => JSON.parse(JSON.stringify(v));
-const equal = (a, b) => isDeepStrictEqual(snapshotStripeSdkData(a), snapshotStripeSdkData(b));
+const equal = (a, b) => a === undefined || b === undefined ? a === b : isDeepStrictEqual(contractSnapshot(a), contractSnapshot(b));
 const id = v => typeof v === 'string' ? v : v?.id;
 function fail(code = 'retail_linked_billing_unknown', status = 503) {
   const e = new Error(code); e.code = code; e.status = status;
@@ -31,7 +31,7 @@ function marker(i) {
 }
 async function row(db, table, key, value) {
   const r = await db.from(table).select('*').eq(key, value).maybeSingle();
-  check(r && !r.error); return snapshotStripeSdkData(r.data);
+  check(r && !r.error); return contractSnapshot(r.data);
 }
 const conflicts = new Set(['retail_funding_billing_source_denied', 'retail_funding_billing_customer_denied',
   'invalid_billing_payload', 'credit_selection_mismatch', 'package_snapshot_mismatch', 'credit_payload_mismatch',

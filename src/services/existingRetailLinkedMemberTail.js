@@ -2,10 +2,10 @@
 // Internal trusted seam for the ORIGINAL post-payment account helper. No new
 // Auth engine or provider writes. Native initial-period proof is not renewal.
 const { isDeepStrictEqual } = require('node:util');
-const { snapshotStripeSdkData } = require('./enterprisePoolPaymentProof');
+const { snapshotStripeSdkData, snapshotEnterpriseUsageCensusData: contractSnapshot } = require('./enterprisePoolPaymentProof');
 const { applyExistingRetailLinkedBilling } = require('./existingRetailLinkedBillingAdapter');
 const plain = v => JSON.parse(JSON.stringify(v));
-const equal = (a, b) => isDeepStrictEqual(snapshotStripeSdkData(a), snapshotStripeSdkData(b));
+const equal = (a, b) => a === undefined || b === undefined ? a === b : isDeepStrictEqual(contractSnapshot(a), contractSnapshot(b));
 const id = v => typeof v === 'string' ? v : v?.id;
 const contextKeys = 'agreement_id,billing_applied_at,buyer_email,claim,client_id,current,digest,intent_id,receipt,source';
 // Native closed JSON currently has TEN fields (SQL is the authority), not an
@@ -34,7 +34,8 @@ async function native(db, name, args) {
   if (message === 'retail_linked_member_paid_period_ended') fail('retail_linked_member_tail_period_ended', 410);
   if (conflicts.has(message)) fail('retail_linked_member_tail_conflict', 409);
   check(r && !r.error && r.data, 'retail_linked_member_tail_ack_unknown');
-  return snapshotStripeSdkData(r.data);
+  // The native context includes the complete accepted contract/source.
+  return name === 'retail_linked_existing_member_context' ? contractSnapshot(r.data) : snapshotStripeSdkData(r.data);
 }
 function memberAck(r) {
   check(r && !Array.isArray(r) && Object.keys(r).sort().join(',') === 'role,status'

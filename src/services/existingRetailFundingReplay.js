@@ -2,17 +2,18 @@
 // UNMOUNTED persisted-original-evidence reader. No first receipt, paid state,
 // access/Auth/settings/credit/provider writes, or historical money reproof.
 const {isDeepStrictEqual}=require('node:util');
-const {snapshotStripeSdkData}=require('./enterprisePoolPaymentProof');
+const {snapshotStripeSdkData,snapshotEnterpriseUsageCensusData:contractSnapshot}=require('./enterprisePoolPaymentProof');
 const {readSavedRetailCheckoutTerms}=require('./savedMembershipCheckoutTerms');
 const {assertExistingRetailFundingSource}=require('./existingRetailCheckoutFunding');
 const {GENERATION_DATE_OFFER_VERSION}=require('./membershipOffers');
 function fail(code='retail_funding_replay_unknown'){const e=new Error(code);e.code=code;e.status=503;throw e;}
 const check=(v,code)=>{if(!v)fail(code);};
-const equal=(a,b)=>isDeepStrictEqual(snapshotStripeSdkData(a),snapshotStripeSdkData(b));
+const equal=(a,b)=>a===undefined||b===undefined?a===b:isDeepStrictEqual(contractSnapshot(a),contractSnapshot(b));
 const id=v=>typeof v==='string'?v:v?.id;
 function freeze(v){if(v&&typeof v==='object'){for(const x of Object.values(v))freeze(x);Object.freeze(v);}return v;}
 async function row(db,table,key,value){
- try{const r=await db.from(table).select('*').eq(key,value).maybeSingle();check(r&&!r.error);return snapshotStripeSdkData(r.data);}
+ // DB rows carry full rendered contracts, not small SDK response payloads.
+ try{const r=await db.from(table).select('*').eq(key,value).maybeSingle();check(r&&!r.error);return contractSnapshot(r.data);}
  catch(_){fail();}
 }
 function envelope(v,receipt){

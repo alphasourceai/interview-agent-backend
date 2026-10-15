@@ -2,12 +2,12 @@
 // Internal trusted existing SDK/receipt -> SAME native original billing.
 // Historical financial completion is never current access/Auth/renewal proof.
 const { isDeepStrictEqual } = require('node:util');
-const { snapshotStripeSdkData } = require('./enterprisePoolPaymentProof');
+const { snapshotStripeSdkData, snapshotEnterpriseUsageCensusData: contractSnapshot } = require('./enterprisePoolPaymentProof');
 const { readExistingRetailActivationFunding } = require('./existingRetailActivationFunding');
 const { buildAlphaScreenPlanSettingsPayload } = require('./alphaScreenPackages');
 const {retailInitialEvidenceGeometry}=require('./membershipOffers');
 const plain = v => JSON.parse(JSON.stringify(v));
-const equal = (a, b) => isDeepStrictEqual(snapshotStripeSdkData(a), snapshotStripeSdkData(b));
+const equal = (a, b) => a === undefined || b === undefined ? a === b : isDeepStrictEqual(contractSnapshot(a), contractSnapshot(b));
 const id = v => typeof v === 'string' ? v : v?.id;
 const closed = (v, keys) => v && typeof v === 'object' && !Array.isArray(v)
   && Object.keys(v).sort().join(',') === [...keys].sort().join(',');
@@ -30,7 +30,7 @@ function stamp(v) {
 }
 async function row(db, table, key, value) {
   const r = await db.from(table).select('*').eq(key, value).maybeSingle();
-  check(r && !r.error); return snapshotStripeSdkData(r.data);
+  check(r && !r.error); return contractSnapshot(r.data);
 }
 function initialSubscription(period,pkg) {
   const g=retailInitialEvidenceGeometry({offer:pkg.membership_terms,evidence:period});
@@ -45,7 +45,7 @@ function initialClient(agreement, funding, subscription) {
     packageSnapshot: funding.packageSnapshot, paidAt: funding.paidAt });
 }
 function verifyReceipt(receipt, agreement, funding, initial) {
-  const r = snapshotStripeSdkData(receipt), p = funding.packageSnapshot, role = p.first_role_prepay;
+  const r = contractSnapshot(receipt), p = funding.packageSnapshot, role = p.first_role_prepay;
   check(closed(r, ['version', 'source', 'funding_receipt', 'subscription', 'client_initial', 'plan_initial',
     'credit_initial', 'credit_id', 'applied_at']) && r.version === 'retail_admin_existing_billing_v1'
     && equal(r.source, agreement.checkout_attempt_source) && equal(r.funding_receipt, agreement.retail_funding_receipt)
@@ -135,7 +135,7 @@ async function applyBilling(options) {
       'retail_admin_client_payload_denied', 'retail_funding_customer_denied', 'retail_funding_source_denied',
       'retail_funding_paid_source_denied', 'retail_funding_source_changed'].includes(r?.error?.message)) fail('retail_admin_billing_adapter_conflict', 409);
     check(r && !r.error && r.data, 'retail_admin_billing_adapter_ack_unknown');
-    const ack = snapshotStripeSdkData(r.data);
+    const ack = contractSnapshot(r.data);
     check(closed(ack, ['status', 'receipt']) && ['applied', 'already_applied'].includes(ack.status),
       'retail_admin_billing_adapter_ack_unknown');
     verifyReceipt(ack.receipt, saved, funding, initial); return ack;
