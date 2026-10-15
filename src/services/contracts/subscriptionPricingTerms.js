@@ -4,7 +4,7 @@
 // agreement terms from our DB; provider metadata is never a price authority.
 const { readRetailPackageOffer } = require('../membershipPackageCompatibility');
 const { getRetailRenewalWindow } = require('./contractRenewals');
-const {STRIPE_RECURRING_OFFER_VERSION}=require('../membershipOffers');
+const {STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION}=require('../membershipOffers');
 const TEMPLATE = 'membership_agreement_retail_terms_v2';
 function mismatch() { const e = new Error('retail_subscription_terms_mismatch'); e.code=e.message; throw e; }
 const id = value => typeof value === 'string' ? value : value?.id;
@@ -15,7 +15,7 @@ async function loadExistingRetailSubscriptionTerms({db, clientId, subscription} 
     .eq('id',clientId).maybeSingle();
   if(clientError) throw new Error(clientError.message || 'retail_subscription_client_read_failed');
   const {data:agreement,error} = await db.from('membership_agreements')
-    .select('id,client_id,status,is_current,checkout_status,checkout_paid_at,membership_tier,billing_option,template_version,template_snapshot,superseded_by_agreement_id')
+    .select('id,client_id,status,is_current,checkout_status,checkout_paid_at,membership_tier,billing_option,auto_renew,notice_deadline_days,template_version,template_snapshot,superseded_by_agreement_id,initial_term_start,initial_renewal_date,retail_checkout_prices')
     .eq('client_id',clientId).eq('is_current',true).maybeSingle();
   if(error) throw new Error(error.message || 'retail_subscription_agreement_read_failed');
   const pkg=agreement?.template_snapshot?.package_snapshot;
@@ -27,7 +27,7 @@ async function loadExistingRetailSubscriptionTerms({db, clientId, subscription} 
     return null;
   }
   if(agreement.client_id!==clientId || agreement.is_current!==true
-    || !(agreement.status==='signed'||offer.offer_version===STRIPE_RECURRING_OFFER_VERSION&&agreement.status==='active')
+    || !(agreement.status==='signed'||[STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(offer.offer_version)&&agreement.status==='active')
     || agreement.superseded_by_agreement_id || agreement.template_version!==TEMPLATE
     || agreement.template_snapshot.template_version!==TEMPLATE
     || agreement.membership_tier!==offer.plan_key
@@ -37,7 +37,10 @@ async function loadExistingRetailSubscriptionTerms({db, clientId, subscription} 
   if(agreement.checkout_status!=='paid') return {pending:true};
   if(!client || !client.stripe_customer_id || !client.stripe_subscription_id || typeof client.auto_renew!=='boolean') mismatch();
   getRetailRenewalWindow(client,agreement); // Validate the current original-anchored window, not today's catalog.
-  return {pending:false,client,agreementId:agreement.id,offer,packageSnapshot:pkg};
+  const generation=offer.offer_version===GENERATION_DATE_OFFER_VERSION;
+  const recurringPriceId=agreement.retail_checkout_prices?.recurring_platform_price_id;
+  if(generation&&!(typeof recurringPriceId==='string'&&/^price_[A-Za-z0-9_]{1,250}$/.test(recurringPriceId)))mismatch();
+  return {pending:false,client,agreementId:agreement.id,offer,packageSnapshot:pkg,...(generation?{recurringPriceId}:{})};
 }
 
 function assertExistingRetailSubscription(context, subscription) {
@@ -52,7 +55,8 @@ function assertExistingRetailSubscription(context, subscription) {
     || price?.object!=='price' || price.type!=='recurring' || price.currency!=='usd'
     || price.unit_amount!==offer.platform_payment_cents || price.recurring?.interval!=='month'
     || price.recurring.interval_count!==offer.stripe_recurrence.interval_count
-    || price.recurring.usage_type!=='licensed') mismatch();
+    || price.recurring.usage_type!=='licensed'
+    || (offer.offer_version===GENERATION_DATE_OFFER_VERSION&&(!context.recurringPriceId||price.id!==context.recurringPriceId))) mismatch();
 }
 
 module.exports = { loadExistingRetailSubscriptionTerms, assertExistingRetailSubscription };

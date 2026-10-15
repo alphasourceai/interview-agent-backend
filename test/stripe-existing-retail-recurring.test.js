@@ -1,17 +1,28 @@
 'use strict';
 const {test}=require('node:test'),assert=require('node:assert/strict'),crypto=require('node:crypto'),express=require('express'),request=require('supertest');
 const {recurringFixture}=require('./fixtures/existing-retail-recurring-funding-fixture');
+const {generationRecurringFixture,generationCycle}=require('./fixtures/generation-retail-recurring-funding-fixture');
 const {createFakeSupabase}=require('./helpers/fakeSupabase');
 const {anchoredMonthInstant}=require('../src/services/membershipOffers');
 function inject(name,value){const p=require.resolve(name);require.cache[p]={id:p,filename:p,loaded:true,exports:value};}
 function setup(options={}){
-  const f=recurringFixture('basic',3,'monthly_installments',true),s=f.source,p=s.original_period,
+  let f=recurringFixture('basic',3,'monthly_installments',true),generationAgreement=null;
+  if(options.generation){const g=generationRecurringFixture('basic',3,'monthly_installments',true),graph=generationCycle(g.f,g.source);
+    f={...graph,sdk:g.f.sdk};generationAgreement=g.f.g;
+    const list=data=>({object:'list',has_more:false,data:structuredClone(data)});
+    f.sdk.invoices={list:async()=>list([g.f.inv,graph.invoice]),retrieve:async()=>structuredClone(graph.invoice),listLineItems:async()=>list(graph.invoiceLines.data)};
+    f.sdk.paymentIntents={retrieve:async()=>structuredClone(graph.paymentIntent)};f.sdk.charges={retrieve:async()=>structuredClone(graph.charge)};
+  }
+  const s=f.source,p=s.original_period,
     client={id:s.client_id,stripe_customer_id:p.customer_id,stripe_subscription_id:p.subscription_id,
       plan_tier:'basic',billing_interval:'monthly',billing_status:'inactive',auto_renew:true,subscription_status:'past_due',
       contract_start_at:p.paid_at,contract_end_at:anchoredMonthInstant(p.paid_at,3)},
     agreement={id:s.agreement_id,client_id:s.client_id,is_current:true,status:'signed',checkout_status:'paid',checkout_paid_at:p.paid_at,
       membership_tier:'basic',billing_option:'monthly',template_version:'membership_agreement_retail_terms_v2',
       template_snapshot:{template_version:'membership_agreement_retail_terms_v2',package_snapshot:s.package_snapshot}};
+  if(generationAgreement){Object.assign(agreement,generationAgreement,{checkout_status:'paid',checkout_paid_at:p.paid_at});
+    client.contract_start_at=generationAgreement.initial_term_start+'T00:00:00.000Z';
+    client.contract_end_at=generationAgreement.initial_renewal_date+'T00:00:00.000Z';}
   const tables={clients:[client],membership_agreements:[agreement],public_purchase_intents:[],billing_events:[],billing_invoices:[],
     client_members:[],client_plan_settings:[],client_role_credits:[]},db=createFakeSupabase(tables),rpcs=[],records=new Map();
   let lost=options.lostAck===true,failedRefresh=options.failedRefresh===true,event;
@@ -47,16 +58,16 @@ function setup(options={}){
   };
   return{f,db,tables,records,rpcs,client,agreement,post};
 }
-for(const order of [['invoice.paid','invoice.payment_succeeded'],['invoice.payment_succeeded','invoice.paid']])
-test(`new native recurring ${order.join(' then ')} stores once, refreshes twice, creates no account`,async()=>{
-  const x=setup();for(const[type,id]of order.map((t,i)=>[t,'evt_'+i]))assert.equal((await x.post(type,id)).status,200);
+for(const generation of [false,true])for(const order of [['invoice.paid','invoice.payment_succeeded'],['invoice.payment_succeeded','invoice.paid']])
+test(`new native recurring generation=${generation}/${order.join(' then ')} stores once, refreshes twice, creates no account`,async()=>{
+  const x=setup({generation});for(const[type,id]of order.map((t,i)=>[t,'evt_'+i]))assert.equal((await x.post(type,id)).status,200);
   assert.equal(x.records.size,1);assert.equal(x.rpcs.filter(r=>r.name==='record_retail_existing_paid_period').length,2);
   assert.equal(x.rpcs.filter(r=>r.name==='refresh_retail_existing_paid_coverage').length,2);
   assert.ok(x.tables.billing_events.every(e=>e.processed_ok===true));
   assert.equal(x.db.calls.filter(c=>['client_members','client_role_credits','client_plan_settings'].includes(c.table)).length,0);
 });
-for(const mode of ['lostAck','failedRefresh'])test(`new recurring ${mode} retains incomplete event and original receipt on retry`,async()=>{
-  const x=setup({[mode]:true});assert.equal((await x.post('invoice.paid')).status,503);
+for(const generation of [false,true])for(const mode of ['lostAck','failedRefresh'])test(`new recurring generation=${generation}/${mode} retains incomplete event and original receipt on retry`,async()=>{
+  const x=setup({generation,[mode]:true});assert.equal((await x.post('invoice.paid')).status,503);
   assert.equal(x.tables.billing_events.length,1);assert.equal(x.tables.billing_events[0].processed_ok,false);assert.equal(x.records.size,1);
   const original=structuredClone([...x.records.values()][0]);assert.equal((await x.post('invoice.paid')).status,200);
   assert.deepEqual([...x.records.values()][0],original);assert.equal(x.tables.billing_events[0].processed_ok,true);
@@ -73,9 +84,9 @@ test('provider failure, foreign pointer and malformed new cohort hold before leg
     assert.ok(!JSON.stringify(r.body).includes('PRIVATE_TOKEN'));
   }
 });
-for(const type of ['customer.subscription.updated','customer.subscription.deleted','invoice.payment_failed'])
-test(`${type} cannot grant new version access from Stripe active/trialing`,async()=>{
-  const x=setup({coverageStatus:'inactive',providerStatus:'active'}),before=structuredClone(x.client);
+for(const generation of [false,true])for(const type of ['customer.subscription.updated','customer.subscription.deleted','invoice.payment_failed'])
+test(`${type} generation=${generation} cannot grant new version access from Stripe active/trialing`,async()=>{
+  const x=setup({generation,coverageStatus:'inactive',providerStatus:'active'}),before=structuredClone(x.client);
   assert.equal((await x.post(type)).status,200);assert.equal(x.client.billing_status,'inactive');
   for(const k of ['contract_start_at','contract_end_at','auto_renew','plan_tier','billing_interval'])assert.equal(x.client[k],before[k]);
   assert.equal(x.client.subscription_status,'active');

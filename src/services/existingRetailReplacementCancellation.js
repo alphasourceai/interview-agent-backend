@@ -37,7 +37,9 @@ async function execute(options = {}) {
   let prepared;
   try {
     prepared = await (options.prepareExistingRetailReplacement || prepareExistingRetailReplacement)({
-      db, stripe, agreementId, claimKey, assertFence
+      db, stripe, agreementId, intentId, claimKey, assertFence,
+      eventSessionId: options.eventSessionId, eventSubscriptionId: options.eventSubscriptionId,
+      eventInvoiceId: options.eventInvoiceId, eventLivemode: options.eventLivemode
     });
   } catch (error) {
     if (error?.code === 'public_purchase_activation_guard_lost') fail('public_purchase_activation_guard_lost');

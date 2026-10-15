@@ -7,7 +7,7 @@ require.cache[clientPath] = { id:clientPath, filename:clientPath, loaded:true, e
 const { processContractRenewals, getRetailRenewalWindow } = require('../src/services/contracts/contractRenewals');
 const { buildRetailPackageSnapshot } = require('../src/services/membershipPackageCompatibility');
 const { OFFER_VERSION, retailTermWindow } = require('../src/services/membershipOffers');
-const {STRIPE_RECURRING_OFFER_VERSION}=require('../src/services/membershipOffers');
+const {STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION}=require('../src/services/membershipOffers');
 
 const ORIGINAL = '2026-01-31T12:13:14.000Z';
 const TEMPLATE = 'membership_agreement_retail_terms_v2';
@@ -107,9 +107,9 @@ test('accepted 3/6/12 prepaid and installment renewals keep the original UTC anc
   const f=fixture(3); assert.equal(getRetailRenewalWindow(f.client,f.agreement).term_end_at,'2026-07-31T12:13:14.000Z');
 });
 
-test('new native billing coverage is refreshed before in-term monthly expiry; old scanner behavior is retained',async()=>{
+for(const version of [STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION])test(`native ${version} coverage is refreshed before monthly expiry; old scanner retained`,async()=>{
   const f=fixture(3,'monthly_installments'),s=f.agreement.template_snapshot.package_snapshot;
-  s.pricing_version=STRIPE_RECURRING_OFFER_VERSION;s.membership_terms.offer_version=STRIPE_RECURRING_OFFER_VERSION;
+  s.pricing_version=version;s.membership_terms.offer_version=version;
   const db=makeDb(f),calls=[];
   db.rpc=async(name,args)=>{calls.push({name,args});assert.equal(name,'refresh_retail_existing_paid_coverage');
     return{data:{status:'refreshed',billing_status:'inactive',contiguous_ordinal:0},error:null};};

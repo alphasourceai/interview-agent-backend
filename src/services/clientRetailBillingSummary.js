@@ -3,7 +3,7 @@
 // Read-only projection of the accepted agreement. No catalog repricing or
 // inference about receipts, remaining payments, or funded access periods.
 const { loadExistingRetailSubscriptionTerms } = require('./contracts/subscriptionPricingTerms');
-const { STRIPE_RECURRING_OFFER_VERSION } = require('./membershipOffers');
+const { STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION } = require('./membershipOffers');
 const { readExistingRetailRenewalSummary } = require('./existingRetailRenewalPreference');
 
 async function readClientRetailBillingSummary({ db, client }) {
@@ -24,7 +24,7 @@ async function readClientRetailBillingSummary({ db, client }) {
     current_term_start_at: context.client.contract_start_at,
     current_term_end_at: context.client.contract_end_at,
     auto_renew: context.client.auto_renew,
-    ...(offer.offer_version === STRIPE_RECURRING_OFFER_VERSION
+    ...([STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(offer.offer_version)
       ? await readExistingRetailRenewalSummary({ db, agreementId: context.agreementId, clientId: client.id }) : {})
   };
 }

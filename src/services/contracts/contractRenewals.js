@@ -151,7 +151,7 @@ async function processContractRenewals(context = {}, dependencies = {}) {
           .select('id,client_id,status,is_current,checkout_status,checkout_paid_at,membership_tier,billing_option,template_version,template_snapshot,superseded_by_agreement_id,auto_renew,notice_deadline_days,initial_term_start,initial_renewal_date')
           .eq('client_id', client.id).eq('is_current', true).maybeSingle();
         if (agreementError) throw new Error(agreementError.message || 'renewal_agreement_read_failed');
-        if(agreement?.template_snapshot?.package_snapshot?.membership_terms?.offer_version===STRIPE_RECURRING_OFFER_VERSION){
+        if([STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(agreement?.template_snapshot?.package_snapshot?.membership_terms?.offer_version)){
           const result=await refreshExistingRetailCoverage({db,agreementId:agreement.id,clientId:client.id});
           // Coverage's own transaction has committed; this separate setting
           // operation cannot cancel owed months or authorize funded access.

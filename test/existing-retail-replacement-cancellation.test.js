@@ -36,6 +36,17 @@ test('executes one bounded, no-retry cancellation and records the native observa
  assert.ok(h.calls.fence>=3);
 });
 
+test('retains the original payment-event identity through the preflight handoff',async()=>{
+ const h=harness();let received;
+ Object.assign(h.options,{eventSessionId:'cs_SYNTHETIC',eventSubscriptionId:request.new_subscription_id,
+  eventInvoiceId:'in_SYNTHETIC',eventLivemode:false});
+ h.options.prepareExistingRetailReplacement=async options=>{received=options;return prepared();};
+ await execute(h.options);
+ for(const key of ['agreementId','intentId','claimKey','eventSessionId','eventSubscriptionId','eventInvoiceId','eventLivemode'])
+  assert.equal(received[key],h.options[key]);
+ assert.equal(received.assertFence,h.options.assertFence);
+});
+
 test('ambiguous DELETE result is resolved by exactly one fresh GET; it is never blindly retried',async()=>{
  const h=harness({cancelError:new Error('provider detail must not escape'),fresh:old('canceled')});
  assert.deepEqual(await execute(h.options),{status:'observed'});assert.equal(h.calls.cancel.length,1);assert.equal(h.calls.retrieve.length,1);assert.equal(h.calls.rpc.length,1);

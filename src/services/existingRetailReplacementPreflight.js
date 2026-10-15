@@ -6,6 +6,7 @@ const { snapshotStripeSdkData: snap } = require('./enterprisePoolPaymentProof');
 const { readExistingRetailFundingReceipt } = require('./existingRetailFundingReplay');
 const { readSavedRetailCheckoutTerms } = require('./savedMembershipCheckoutTerms');
 const { collect, verifyExistingRetailFunding } = require('./existingRetailCheckoutFunding');
+const {retailInitialEvidenceGeometry,GENERATION_DATE_OFFER_VERSION}=require('./membershipOffers');
 const plain = v => JSON.parse(JSON.stringify(v));
 const equal = (a, b) => isDeepStrictEqual(snap(a), snap(b));
 const id = v => typeof v === 'string' ? v : v?.id;
@@ -24,13 +25,18 @@ function stamp(v) {
   check(Number.isFinite(t) && new Date(t).toISOString() === v.replace(/(\.\d{3})\d{3}Z$/, '$1Z') && t <= Date.now(), 'ack_unknown');
   return t;
 }
-function current(s, b) {
+function current(s, b,offer) {
+  const geometry=retailInitialEvidenceGeometry({offer,evidence:b});
   check(s?.object === 'subscription' && s.id === b.subscription_id && id(s.customer) === b.customer_id
-    && s.currency === 'usd' && s.livemode === b.livemode && s.status === 'active'
-    && epoch(s.current_period_end) && s.current_period_end === b.provider_period_end
+    && s.currency === 'usd' && s.livemode === b.livemode && s.status === geometry.initialSubscriptionStatus
+    && epoch(s.current_period_end) && s.current_period_end === geometry.initialCoverageEndEpoch
     && s.current_period_end > Date.now() / 1000 && s.cancel_at_period_end === false
     && Object.hasOwn(s, 'cancel_at') && s.cancel_at === null
     && Object.hasOwn(s, 'pause_collection') && s.pause_collection === null, 'current_unknown');
+  // Preserve legacy current() admission exactly. Only the new schedule needs
+  // these additional checks; do not retroactively constrain accepted sources.
+  if(geometry.generation)check(s.current_period_start===b.provider_trial_start&&s.trial_start===b.provider_trial_start
+    && s.trial_end===b.provider_trial_end&&s.billing_cycle_anchor===b.provider_trial_end&&s.schedule===null,'current_unknown');
   return { id: s.id, customer: id(s.customer), status: s.status, current_period_end: s.current_period_end,
     cancel_at_period_end: s.cancel_at_period_end, cancel_at: s.cancel_at, pause_collection: s.pause_collection };
 }
@@ -69,13 +75,18 @@ async function prepare(options) {
     && equal(a.template_snapshot, f.sourceTemplate) && a.template_version === f.sourceTemplateVersion, 'source_unknown');
   const terms = readSavedRetailCheckoutTerms({ agreement: plain(a), intent: i ? plain(i) : null, deadlineMode: 'stored' });
   check(terms && equal(terms.packageSnapshot, f.packageSnapshot), 'source_unknown');
+  const generation=terms.offer.offer_version===GENERATION_DATE_OFFER_VERSION;
+  function evidence(value){const selected=generation?'initialProviderSchedule':'initialProviderPeriod',other=generation?'initialProviderPeriod':'initialProviderSchedule';
+    check(!Object.hasOwn(value,other)&&value[selected]?.version===(generation?'retail_generation_initial_schedule_v1':'retail_initial_provider_period_v1'),
+      'source_unknown');return value[selected];}
+  check(equal(evidence(f),b),'source_unknown');
   const checkout = await get(() => stripe.checkout.sessions.retrieve(b.checkout_session_id));
   check(checkout?.object === 'checkout.session' && checkout.id === b.checkout_session_id && checkout.mode === 'subscription'
     && checkout.status === 'complete' && checkout.payment_status === 'paid' && checkout.currency === 'usd'
     && checkout.livemode === b.livemode && id(checkout.customer) === b.customer_id
     && id(checkout.subscription) === b.subscription_id && (!id(checkout.invoice) || id(checkout.invoice) === b.invoice_id), 'checkout_unknown');
   const subscription = await get(() => stripe.subscriptions.retrieve(b.subscription_id));
-  const initialCurrent = current(subscription, b);
+  const initialCurrent = current(subscription, b,terms.offer);
   const invoice = await get(() => stripe.invoices.retrieve(b.invoice_id));
   const checkoutLines = snap(await collect(after => get(() => stripe.checkout.sessions.listLineItems(b.checkout_session_id,
     { limit: 100, ...(after ? { starting_after: after } : {}) })), assertFence));
@@ -89,13 +100,16 @@ async function prepare(options) {
   let proof;
   try { proof = snap(verifyExistingRetailFunding({ offer: plain(terms.offer), checkout, checkoutLines, subscription,
     subscriptionItems, invoice, invoiceLines, paymentIntent, charge, expected: { checkoutId: b.checkout_session_id,
-      customerId: b.customer_id, signedAt: a.signed_at, agreementDeadline: a.agreement_expires_at, intentDeadline: i?.expires_at } }));
+      customerId: b.customer_id, signedAt: a.signed_at, agreementDeadline: a.agreement_expires_at, intentDeadline: i?.expires_at,
+      ...(terms.offer.offer_version===GENERATION_DATE_OFFER_VERSION?{subscriptionId:b.subscription_id,eventLivemode:b.livemode,
+        generatedAt:a.template_snapshot.generated_at,initialTermStart:a.initial_term_start,initialRenewalDate:a.initial_renewal_date,
+        prices:a.retail_checkout_prices}:{}) } }));
   } catch (_) { fail('cash_unknown'); }
   const fields = { paymentIntentId: 'payment_intent_id', chargeId: 'charge_id', checkoutCreatedEpoch: 'checkout_created',
     invoiceCreatedEpoch: 'invoice_created', platformGrossCents: 'platform_gross_cents', platformDiscountCents: 'platform_discount_cents',
     platformNetCents: 'platform_net_cents', roleGrossCents: 'role_gross_cents', roleDiscountCents: 'role_discount_cents',
     roleNetCents: 'role_net_cents', taxCents: 'tax_cents', cashCents: 'cash_cents' };
-  check(proof.paidAt === b.paid_at && proof.invoiceId === b.invoice_id && equal(proof.initialProviderPeriod, b)
+  check(proof.paidAt === b.paid_at && proof.invoiceId === b.invoice_id && equal(evidence(proof), b)
     && Object.entries(fields).every(([k, v]) => proof[k] === p[v]), 'cash_changed');
   async function reserve(projected) {
     api(); await assertFence(); const r = await db.rpc('reserve_retail_existing_replacement_cancel', {
@@ -136,8 +150,9 @@ async function prepare(options) {
   check(trace.length === 4 && trace.every(v => equal(v, trace[0])) && equal(last.receipt, first.receipt)
     && ['agreementId', 'clientId', 'sourceIntentId', 'sourceTemplateVersion'].every(k => last.funding[k] === f[k])
     && equal(last.funding.sourceTemplate, f.sourceTemplate) && equal(last.funding.packageSnapshot, f.packageSnapshot)
-    && equal(last.funding.initialProviderPeriod, f.initialProviderPeriod), 'read_changed');
-  const finalCurrent = current(last.funding.subscription, b), finalReservation = await reserve(finalCurrent);
+    && equal(evidence(last.funding),evidence(f))
+    && equal(last.funding.sourceCheckoutPrices,f.sourceCheckoutPrices), 'read_changed');
+  const finalCurrent = current(last.funding.subscription, b,terms.offer), finalReservation = await reserve(finalCurrent);
   check(finalReservation.status === (reservation.request ? 'existing' : 'no_replacement')
     && equal(finalReservation.request, reservation.request) && finalReservation.created_at === reservation.created_at, 'ack_changed');
   await assertFence(); api();

@@ -3,7 +3,7 @@
 // Reminder rendering/policy only. No configured mail client, provider, DB,
 // source/clock authority or access change. Existing processor owns dispatch.
 const {readRetailPackageOffer}=require('../membershipPackageCompatibility');
-const {STRIPE_RECURRING_OFFER_VERSION}=require('../membershipOffers');
+const {STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION}=require('../membershipOffers');
 const {validMembershipBuyerEmail}=require('../membershipCapabilityPredicates');
 const {createHash}=require('node:crypto');
 const {isDeepStrictEqual}=require('node:util');
@@ -23,7 +23,7 @@ function noticeProviderAck(result){
 }
 function checkedNoticeFacts(facts){
  const offer=readRetailPackageOffer(facts?.package_snapshot),b=facts?.billing_cutoff_at;
- if(offer?.offer_version!==STRIPE_RECURRING_OFFER_VERSION||offer.renewal.reminder_days!==30
+ if(![STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(offer?.offer_version)||offer.renewal.reminder_days!==30
   ||typeof b!=='string'||!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.000Z$/.test(b)
   ||!Number.isFinite(Date.parse(b))||new Date(b).toISOString()!==b)held();
  return{offer,b};

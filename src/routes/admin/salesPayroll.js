@@ -4,7 +4,7 @@ const express = require('express');
 const { fromZonedTime } = require('date-fns-tz');
 const { calculateReceiptCommission, weekRangeForTimestamp } = require('../../services/salesCommissionPolicy');
 const { loadMembershipCommissionTerms } = require('../../services/membershipCommissionTerms');
-const { STRIPE_RECURRING_OFFER_VERSION } = require('../../services/membershipOffers');
+const { STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION } = require('../../services/membershipOffers');
 const { loadExistingRetailCommissionPayment, assertCommissionPaymentInput } = require('../../services/existingRetailCommissionPaymentProof');
 const { parseMercuryPayrollCsv } = require('../../services/mercuryPayrollCsv');
 const { loadSalesPayrollReport } = require('../../services/salesPayrollReportQuery');
@@ -247,7 +247,7 @@ function createAdminSalesPayrollRouter({ db } = {}) {
       if (!membership && (intent.status !== 'completed' || intent.channel !== 'sales_assisted' || !intent.created_by_user_id || !intent.activated_at)) throw failure('unverified_qualifying_sale');
       const client = await one(db, 'clients', 'id,billing_status,subscription_status', 'id', intent.client_id);
       if (!isActiveClient(client)) throw failure('client_not_active');
-      if (membership?.offerVersion === STRIPE_RECURRING_OFFER_VERSION) {
+      if ([STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(membership?.offerVersion)) {
         const proof = await loadExistingRetailCommissionPayment(db, intent, paymentId);
         assertCommissionPaymentInput(proof, { gross, discount, paymentAt });
         paymentId = proof.provider_payment_id;

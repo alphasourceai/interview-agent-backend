@@ -30,9 +30,10 @@ const config={public_backend_base:'https://api.example.invalid',public_sign_base
 // Same application JS adapters against REAL native RPCs/rows. This shim only
 // translates their existing read API to a private Unix-socket test connection;
 // no stubbed RPC ACK or application/table writes are supplied by the shim.
-function nativeDb(){return{
+function nativeDb(){const rpcErrors=[];return{rpcErrors,
  async rpc(name,args){assert.match(name,/^[a-z_]+$/);const out=run('set role service_role;'+rpc(name,args));
-  return out.status?{data:null,error:{message:out.stderr}}:{data:JSON.parse(out.stdout),error:null};},
+  if(out.status){rpcErrors.push({name,error:out.stderr.split('\n')[0]});return{data:null,error:{message:out.stderr}};}
+  return{data:JSON.parse(out.stdout),error:null};},
  from(table){assert.ok(['membership_agreements','public_purchase_intents','clients','billing_customers','client_members'].includes(table));
   const filters=[];let counted=false;
   const query={select(_columns,options={}){counted=options.count==='exact';return query;},
@@ -53,7 +54,7 @@ function authoredSdk(r){const list=data=>({object:'list',has_more:false,data:str
   paymentIntents:{retrieve:async()=>structuredClone(r.pi)},charges:{retrieve:async()=>structuredClone(r.ch)}};
 }
 
-function setup({plan='basic',months=3,payment='prepaid',role=false,admin=false,generation=true,legacyVersion,sales=false}={}){
+function setup({plan='basic',months=3,payment='prepaid',role=false,admin=false,generation=true,legacyVersion,sales=false,replacement=false}={}){
  const now=Date.now(),generatedAt=new Date(now-3*3600000).toISOString(),paidAt=new Date(Math.floor(now/1000)*1000).toISOString();
  const f=generation?generationFixture(plan,months,payment,role,{admin,generatedAt,paidAt}):legacyFixture(plan,months,payment,role,{admin});
  if(!generation){
@@ -99,8 +100,10 @@ function setup({plan='basic',months=3,payment='prepaid',role=false,admin=false,g
    insert into sales_reps(user_id,email,display_name,active) values(${lit(rep)},${lit('rep-'+key+'@example.invalid')},'Synthetic Rep',true);
    update public_purchase_intents set channel='sales_assisted',created_by_user_id=${lit(rep)} where id=${lit(I)};`);
  }
+ const replacementId=replacement?'sub_OLD_'+key:null;
+ if(replacement)sql(`set role service_role;update clients set stripe_subscription_id=${lit(replacementId)} where id=${lit(C)};`);
  const attempt=call('claim_retail_existing_checkout_attempt',{p_agreement:G,p_client:C,p_expected_template:f.g.template_snapshot,
-  p_customer:f.c.stripe_customer_id,p_embedded:false,p_replacement:null,p_config:config});
+  p_customer:f.c.stripe_customer_id,p_embedded:false,p_replacement:replacementId,p_config:config});
  const prices=generation?{initial_platform_price_id:f.cl[0].price.id,recurring_platform_price_id:f.cl[1].price.id,
   first_role_price_id:role?f.cl[2].price.id:null}:undefined;
  call('pin_retail_existing_checkout_session',{p_agreement:G,p_client:C,p_attempt:{...attempt,...(generation?{prices}:{})},p_session:f.cs.id});
@@ -114,6 +117,7 @@ function setup({plan='basic',months=3,payment='prepaid',role=false,admin=false,g
   f.s.start_date=A;f.s.current_period_start=A;f.s.current_period_end=end;
   f.il.filter(l=>l.type==='subscription').forEach(l=>l.period={start:A,end});}
  if(generation)f.il.forEach(l=>l.period={start:A,end:f.s.trial_end});
+ Object.assign(f.s,{cancel_at_period_end:false,cancel_at:null,pause_collection:null});
  const list=data=>({object:'list',data,has_more:false});
  const funding=verifyExistingRetailFunding({offer:f.pkg.membership_terms,checkout:f.cs,checkoutLines:list(f.cl),subscription:f.s,
   subscriptionItems:f.s.items,invoice:f.inv,invoiceLines:list(f.il),paymentIntent:f.pi,charge:f.ch,
@@ -125,7 +129,7 @@ function setup({plan='basic',months=3,payment='prepaid',role=false,admin=false,g
   platform_gross_cents:funding.platformGrossCents,platform_discount_cents:funding.platformDiscountCents,platform_net_cents:funding.platformNetCents,
   role_gross_cents:funding.roleGrossCents,role_discount_cents:funding.roleDiscountCents,role_net_cents:funding.roleNetCents,
   tax_cents:funding.taxCents,cash_cents:funding.cashCents};
- return {...f,admin,generation,claimKey:admin?null:claimKey,attempt,proof,paidAt:funding.paidAt,key,rep,reviewer};
+ return {...f,admin,generation,claimKey:admin?null:claimKey,attempt,proof,paidAt:funding.paidAt,key,rep,reviewer,replacementId};
 }
 function record(r,proof=r.proof){return call('record_retail_existing_funding',{p_agreement:r.g.id,p_client:r.c.id,
  p_claim:r.claimKey,p_source:r.attempt.source,p_proof:proof});}
@@ -169,6 +173,8 @@ before(()=>{
  // empty local schema bootstrap. This is NOT a migration grant/change.
  sql('grant usage on schema extensions to service_role;');
  sql(fs.readFileSync(path.join(root,'20261015165725_retail_generation_checkout_compat.sql'),'utf8'));sql(migration);
+ if(process.env.RETAIL_GENERATION_REPLACEMENT_COMPAT==='true')
+  sql(fs.readFileSync(path.join(root,'20261015180910_retail_generation_replacement_compat.sql'),'utf8'));
 });
 after(()=>{if(enabled){const r=cp.spawnSync(bin+'dropdb',['-h',socket,'-p',port,'-U','postgres',database],{encoding:'utf8'});assert.equal(r.status,0,r.stderr);}});
 test('combined native migration composes on the39-migration empty baseline, with all guard chains live',opts,()=>{
@@ -221,6 +227,13 @@ test(`native generation recurring prefix and renewal ${plan}/${months}/${payment
  assert.equal(coverage.contiguous_ordinal,2);
  assert.equal(new Date(coverage.funded_through).toISOString(),anchoredMonthInstant(r.g.initial_term_start+'T00:00:00.000Z',3*span));
  assert.equal(new Date(coverage.contract_start_at).toISOString(),r.g.initial_term_start+'T00:00:00.000Z','early future-period cash does not advance today’s contract');
+ for(const zone of ['UTC','America/Denver','Pacific/Kiritimati']){
+  const zoned=json(`set time zone ${lit(zone)};set role service_role;`+
+   rpc('refresh_retail_existing_paid_coverage',{p_agreement:r.g.id,p_client:r.c.id}));
+  assert.equal(new Date(zoned.contract_start_at).getTime(),Date.parse(coverage.contract_start_at));
+  assert.equal(new Date(zoned.contract_end_at).getTime(),Date.parse(coverage.contract_end_at));
+  assert.equal(new Date(zoned.funded_through).getTime(),Date.parse(coverage.funded_through));
+ }
  for(const bad of [{...p1,invoice_id:'in_FORGED',line_id:s.original_period.initial_platform_invoice_line_id},
   {...p1,invoice_id:'in_FORGED',line_id:s.original_period.recurring_invoice_line_id},
   {...p1,invoice_id:'in_FORGED',line_id:'il_FORGED',payment_intent_id:r.proof.payment_intent_id},
@@ -358,4 +371,45 @@ for(const admin of [false,true])test(`application funding/billing adapter + actu
  assert.equal((await tail.ensureMember({userId,name:'Synthetic Buyer'})).status,'created');
  assert.equal((await tail.ensureMember({userId,name:'Synthetic Buyer'})).status,'existing');
  assert.equal(sql(`select count(*) from client_members where client_id=${lit(r.c.id)} and user_id=${lit(userId)};`),'1');
+});
+
+const replacementOpts={skip:!enabled||process.env.RETAIL_GENERATION_REPLACEMENT_COMPAT!=='true'};
+for(const cohort of ['v1','v2','v3'])for(const payment of ['prepaid','monthly_installments'])
+test(`replacement application/native compatibility ${cohort}/${payment}`,replacementOpts,async()=>{
+ const r=setup({generation:cohort==='v3',legacyVersion:cohort==='v2'?STRIPE_RECURRING_OFFER_VERSION:undefined,
+  payment,role:true,replacement:true}),db=nativeDb(),stripe=authoredSdk(r);
+ const options={db,stripe,agreementId:r.g.id,intentId:r.i.id,claimKey:r.claimKey,
+  eventSessionId:r.cs.id,eventSubscriptionId:r.s.id,eventLivemode:false};
+ let deletes=0;const old={object:'subscription',id:r.replacementId,customer:r.c.stripe_customer_id,currency:'usd',
+  livemode:false,status:'active',canceled_at:null};
+ stripe.subscriptions.retrieve=async id=>structuredClone(id===old.id?old:r.s);
+ stripe.subscriptions.cancel=async(id,body)=>{assert.equal(id,old.id);assert.deepEqual(body,{invoice_now:false,prorate:false});
+  deletes++;old.status='canceled';old.canceled_at=Math.floor(Date.now()/1000);
+  if(r.generation&&payment==='monthly_installments')throw Error('SYNTHETIC lost DELETE acknowledgment');
+  return structuredClone(old);};
+ // Real DB admission and existing app orchestration; SDK DELETE is authored
+ // only and must NEVER reach a provider (external preload blocks networking).
+ await require('../src/services/existingRetailFundingReceipt').recordExistingRetailFunding(options);
+ complete(r);initial(r);
+ const {executeExistingRetailReplacementCancellation:cancel}=require('../src/services/existingRetailReplacementCancellation');
+ if(r.generation){const original=structuredClone(r.s);
+  for(const patch of [{current_period_start:r.s.current_period_start+1},{trial_start:r.s.trial_start+1},
+   {trial_end:r.s.trial_end+1},{billing_cycle_anchor:r.s.billing_cycle_anchor+1},{status:'active'},{status:'canceled'},
+   {current_period_end:r.s.current_period_end+1},{customer:'cus_FOREIGN'}]){
+   Object.assign(r.s,patch);await assert.rejects(cancel(options));
+   Object.assign(r.s,structuredClone(original));assert.equal(deletes,0);
+  }
+  await assert.rejects(cancel({...options,claimKey:'SYNTHETIC_WRONG_CLAIM_000000000000000000'}));assert.equal(deletes,0);
+  assert.equal(sql(`select count(*) from private_retail_replacement.reservations where agreement_id=${lit(r.g.id)};`),'0');
+ }
+ try{await require('../src/services/existingRetailReplacementPreflight').prepareExistingRetailReplacement(options);}
+ catch(error){throw Error('SYNTHETIC preflight diagnostic '+error.code+' '+JSON.stringify(db.rpcErrors));}
+ assert.equal((await cancel(options)).status,'observed');
+ const apply=require('../src/services/existingRetailLinkedBillingAdapter').applyExistingRetailLinkedBilling;
+ assert.equal((await apply(options)).status,'applied');
+ assert.equal((await cancel(options)).status,'existing');assert.equal(deletes,1);
+ assert.equal((await apply(options)).status,'already_applied');
+ assert.equal(client(r).stripe_subscription_id,r.s.id);
+ assert.equal(new Date(client(r).contract_start_at).toISOString(),r.generation?r.g.initial_term_start+'T00:00:00.000Z':r.paidAt);
+ assert.equal(sql(`select count(*) from client_role_credits where source_membership_agreement_id=${lit(r.g.id)};`),'1');
 });

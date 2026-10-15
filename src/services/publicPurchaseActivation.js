@@ -1081,7 +1081,9 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
       if (agreement.replaces_stripe_subscription_id) {
         const { executeExistingRetailReplacementCancellation } = require('./existingRetailReplacementCancellation');
         await executeExistingRetailReplacementCancellation({ db, stripe: options.stripe, agreementId, intentId: intent.id,
-          claimKey, assertFence: originalFence });
+          claimKey, assertFence: originalFence, eventSessionId: checkoutSessionId,
+          eventSubscriptionId: pickId(options.subscription?.id) || options.fallbackSubscriptionId || null,
+          eventInvoiceId: options.eventInvoiceId, eventLivemode: options.eventLivemode });
       }
       const { prepareExistingRetailLinkedMemberTail } = require('./existingRetailLinkedMemberTail');
       retailLinkedMemberTail = await prepareExistingRetailLinkedMemberTail({ db, stripe: options.stripe, agreementId,

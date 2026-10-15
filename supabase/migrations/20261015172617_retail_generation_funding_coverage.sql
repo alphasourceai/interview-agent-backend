@@ -338,6 +338,25 @@ select pg_temp.generation_patch('refresh_retail_existing_paid_coverage(uuid,uuid
  $new$a:=case when o->>'offer_version'='retail-stripe-terms-2026-10-15-v3'
   then (s->'original_period'->>'initial_term_start')::date::timestamp at time zone 'UTC'
   else(s->'original_period'->>'paid_at')::timestamptz end;$new$);
+-- New contractual C geometry is UTC in BOTH writer and renewal reader.
+-- Keep old cohorts' original session-zone extraction unchanged.
+do $utc_geometry$
+declare d text;spec text[];needle text;replacement_ text;
+begin
+ select definition into strict d from generation_patch_buffer where signature='refresh_retail_existing_paid_coverage(uuid,uuid)';
+ foreach spec slice 1 in array array[
+  array['clock','year','1'],array['clock','month','1'],array['a','year','4'],array['a','month','4'],
+  array['old_start','year','3'],array['old_start','month','3']
+ ] loop
+  needle:='extract('||spec[2]||' from '||spec[1]||')';
+  if(length(d)-length(replace(d,needle,'')))/length(needle)<>spec[3]::integer
+   then raise exception 'retail_generation_coverage_utc_patch_drift';end if;
+  replacement_:='(case when o->>''offer_version''=''retail-stripe-terms-2026-10-15-v3'' then extract('||spec[2]
+   ||' from '||spec[1]||' at time zone ''UTC'') else '||needle||' end)';
+  d:=replace(d,needle,replacement_);
+ end loop;
+ update generation_patch_buffer set definition=d where signature='refresh_retail_existing_paid_coverage(uuid,uuid)';
+end $utc_geometry$;
 select pg_temp.generation_patch('retail_existing_assert_commission_receipt(jsonb,boolean)',
  $old$if i.package_snapshot->'membership_terms'->>'offer_version'='retail-stripe-terms-2026-10-14-v2' then$old$,
  $new$if i.package_snapshot->'membership_terms'->>'offer_version' in('retail-stripe-terms-2026-10-14-v2','retail-stripe-terms-2026-10-15-v3') then$new$);

@@ -30,7 +30,7 @@ function setup(months=3,payment='monthly_installments',plan='basic'){
 function body(f,changes={}){return {purchase_intent_id:I,provider:'stripe',provider_payment_id:'pi_SYNTHETIC_RENEWAL',
   payment_kind:f.q.payment_kind,payment_success_at:'2026-08-01T00:00:00Z',funds_received_at:'2026-08-03T00:00:00Z',
   gross_membership_cents:f.q.platform_cap_cents,discount_cents:1500,provider_fee_cents:101,evidence_reference:'synthetic admin-reviewed platform receipt',...changes};}
-function nativeSetup(){
+function nativeSetup(generation=false){
  const f=setup();
  f.pkg=structuredClone(f.pkg);f.i.package_snapshot=f.pkg;f.g.template_snapshot=structuredClone(f.g.template_snapshot);
  f.g.template_snapshot.package_snapshot=f.pkg;
@@ -38,7 +38,17 @@ function nativeSetup(){
  f.g.template_snapshot.values.pricing_version=STRIPE_RECURRING_OFFER_VERSION;
  const {recurringFixture,proofInput}=require('./fixtures/existing-retail-recurring-funding-fixture');
  const {verifyExistingRetailRecurringFunding}=require('../src/services/existingRetailCheckoutFunding');
- const pfx=recurringFixture('basic',3,'monthly_installments',true),source=pfx.source,p=verifyExistingRetailRecurringFunding(proofInput(pfx));
+ let pfx=recurringFixture('basic',3,'monthly_installments',true),source=pfx.source,p=verifyExistingRetailRecurringFunding(proofInput(pfx));
+ if(generation){const {generationRecurringFixture,generationCycle}=require('./fixtures/generation-retail-recurring-funding-fixture');
+  const g=generationRecurringFixture('basic',3,'monthly_installments',true);source=g.source;
+  p=verifyExistingRetailRecurringFunding(generationCycle(g.f,source));f.pkg=g.f.pkg;
+  Object.assign(f.g,g.f.g,{checkout_status:'paid',checkout_paid_at:source.original_period.paid_at});
+  Object.assign(f.i,g.f.i,{status:'completed',activated_at:source.original_period.paid_at,
+   billing_applied_at:'2026-02-03T00:00:00Z'});
+  const a=source.original_period.paid_at;
+  Object.assign(f.q,{original_start_at:a,original_term_end_at:anchoredMonthInstant(a,3),
+   qualification_closed_at:a,commission_window_end_at:anchoredMonthInstant(a,12)});
+ }
  f.g.retail_funding_receipt={version:'retail_existing_funding_v1',proof:{period:source.original_period,
   provider_account_id:source.original_provider_account_id,platform_gross_cents:f.q.platform_cap_cents,
   platform_discount_cents:0,payment_intent_id:'pi_INITIAL',charge_id:'ch_INITIAL'}};
@@ -123,9 +133,9 @@ test('new report and effective-date adjustment preserve original rep without tou
   f.tables.retail_existing_sales_qualifications=[];
   await assert.rejects(loadSalesPayrollReport(f.db,{date_from:'2026-09-01',date_to:'2026-09-02'}),/qualification.*join_failed/);
 });
-test('existing receipt API canonicalizes native invoice/PI/charge aliases and retains reviewed bank fee and date',async()=>{
+for(const generation of [false,true])test(`existing receipt API generation=${generation} canonicalizes native aliases and retains reviewed bank fee and date`,async()=>{
  for(const alias of ['invoice_id','payment_intent_id','charge_id']){
-  const f=nativeSetup();await withServer(f,async send=>{
+  const f=nativeSetup(generation);await withServer(f,async send=>{
    const r=await send(body(f,{provider_payment_id:f.p[alias],payment_success_at:f.p.paid_at,discount_cents:0}));
    assert.equal(r.status,201,JSON.stringify(r));const stored=f.tables.sales_commission_receipts[0];
    assert.equal(stored.provider_payment_id,f.p.invoice_id);assert.equal(stored.provider_fee_cents,101);

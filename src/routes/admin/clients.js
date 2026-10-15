@@ -17,7 +17,7 @@ const {
 } = require('../../services/admin/adminHelpers');
 const { ensureUserIdAndInvite } = require('../../services/users/userProvisioning');
 const { loadExistingRetailSubscriptionTerms } = require('../../services/contracts/subscriptionPricingTerms');
-const { STRIPE_RECURRING_OFFER_VERSION } = require('../../services/membershipOffers');
+const { STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION } = require('../../services/membershipOffers');
 const { requestExistingRetailRenewal } = require('../../services/existingRetailRenewalPreference');
 
 const router = express.Router();
@@ -157,7 +157,7 @@ router.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (req, r
   // path below; a marked-source error never falls through to legacy mutation.
   try {
     const terms = await loadExistingRetailSubscriptionTerms({ db: supabaseAdmin, clientId: client.id });
-    if (terms?.offer?.offer_version === STRIPE_RECURRING_OFFER_VERSION) {
+    if ([STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(terms?.offer?.offer_version)) {
       const renewal = await requestExistingRetailRenewal({ db: supabaseAdmin,
         stripe: require('../../clients/stripe'), clientId: client.id, agreementId: terms.agreementId,
         autoRenew, effectsEnabled: process.env.RETAIL_STRIPE_RENEWAL_CONTROL_ENABLED === 'true' });

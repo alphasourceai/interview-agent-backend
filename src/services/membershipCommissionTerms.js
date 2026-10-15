@@ -93,10 +93,10 @@ async function loadExistingRetailCommissionTerms(db, supplied) {
     'purchase_intent_id',supplied.id);
   if (!q) fail('membership_sales_qualification_required',409);
   const intent=await read(db,'public_purchase_intents',
-    'id,status,protocol,agreement_id,client_id,activated_at,billing_applied_at,selected_plan_key,selected_billing_cadence,package_snapshot,expires_at,promotion_code_id,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type',
+    'id,status,protocol,agreement_id,client_id,activated_at,billing_applied_at,selected_plan_key,selected_billing_cadence,package_snapshot,term_start_basis,expires_at,promotion_code_id,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type',
     'id',supplied.id);
   const agreement=await read(db,'membership_agreements',
-    'id,client_id,status,is_current,checkout_status,checkout_paid_at,signed_at,signer_accepted,membership_tier,billing_option,auto_renew,template_version,template_snapshot,agreement_expires_at,superseded_by_agreement_id',
+    'id,client_id,status,is_current,checkout_status,checkout_paid_at,signed_at,signer_accepted,membership_tier,billing_option,auto_renew,notice_deadline_days,initial_term_start,initial_renewal_date,template_version,template_snapshot,agreement_expires_at,superseded_by_agreement_id',
     'id',q.agreement_id);
   if (!intent || !agreement || intent.status!=='completed' || !intent.billing_applied_at
     || !Number.isFinite(Date.parse(intent.billing_applied_at)) || agreement.status!=='signed' || agreement.checkout_status!=='paid'

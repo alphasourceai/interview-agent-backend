@@ -21,7 +21,7 @@ const { applyUsageToInvoice } = require('../../services/usageBilling');
 const { fenceAcceptedEnterpriseUsageWriter } = require('../../services/acceptedEnterpriseUsageTerms');
 const { markPoolFailed, markPoolPaid } = require('../../services/interviewPool');
 const { loadExistingRetailSubscriptionTerms, assertExistingRetailSubscription } = require('../../services/contracts/subscriptionPricingTerms');
-const {STRIPE_RECURRING_OFFER_VERSION}=require('../../services/membershipOffers');
+const {STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION}=require('../../services/membershipOffers');
 const {completeExistingRetailRecurringPayment,refreshExistingRetailCoverage,classifyExistingRetailRecurringEvent}=require('../../services/existingRetailRecurringPayment');
 const {reconcileExistingRetailRenewal}=require('../../services/existingRetailRenewalPreference');
 const { assertExistingRetailFundingSource } = require('../../services/existingRetailCheckoutFunding');
@@ -351,7 +351,7 @@ function buildClientSubscriptionUpdatesFromStripe(subscription, options = {}) {
       stripe_subscription_schedule_id: pickId(subscription.schedule) || null,
       subscription_status: subStatus || null,
       current_term_end: currentTermEnd,
-      ...(options.retailTerms.offer.offer_version===STRIPE_RECURRING_OFFER_VERSION?{}:
+      ...([STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(options.retailTerms.offer.offer_version)?{}:
         {billing_status: LIVE_SUB_STATUSES.has(subStatus) ? 'active' : 'inactive'})
     };
   }
@@ -893,7 +893,7 @@ router.post('/', async (req, res) => {
         await completeExistingRetailRecurringPayment({db:supabaseAdmin,stripe,agreementId,clientId,invoiceId:pickId(eventObject.id)});
       }else{
         const context=await loadExistingRetailSubscriptionTerms({db:supabaseAdmin,clientId});
-        if(!context||context.pending||context.offer.offer_version!==STRIPE_RECURRING_OFFER_VERSION)throw new Error('retail_recurring_source_changed');
+        if(!context||context.pending||![STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(context.offer.offer_version))throw new Error('retail_recurring_source_changed');
         const current=await stripe.subscriptions.retrieve(subscriptionId);
         const updates=buildClientSubscriptionUpdatesFromStripe(current,{fallbackCustomerId:customerId,fallbackSubscriptionId:subscriptionId,retailTerms:context});
         const {data:updated,error:ue}=await guardRetailSubscriptionUpdate(supabaseAdmin.from('clients').update(updates).eq('id',clientId),context).select('id').maybeSingle();
