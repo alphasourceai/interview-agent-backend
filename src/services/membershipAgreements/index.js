@@ -404,7 +404,7 @@ async function loadPublicPurchaseIntentForAgreement(agreement) {
 
   const { data, error } = await supabaseAdmin
     .from('public_purchase_intents')
-    .select('id,status,protocol,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,company_legal_name,company_dba,buyer_first_name,buyer_last_name,buyer_email,buyer_phone,buyer_title,source_path,agreement_id,stripe_checkout_session_id,client_id,promotion_code_id,expires_at,created_at')
+    .select('id,status,protocol,term_start_basis,selected_plan_key,selected_billing_cadence,package_snapshot,first_role_prepay_selected,first_role_prepay_amount_cents,first_role_normal_role_fee_cents,first_role_prepay_discount_percent,first_role_prepay_credit_type,company_legal_name,company_dba,buyer_first_name,buyer_last_name,buyer_email,buyer_phone,buyer_title,source_path,agreement_id,stripe_checkout_session_id,client_id,promotion_code_id,expires_at,created_at')
     .eq('id', purchaseIntentId)
     .maybeSingle();
   if (error) {

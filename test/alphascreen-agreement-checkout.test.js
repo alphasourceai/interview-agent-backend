@@ -710,3 +710,57 @@ test('real loader-shaped selects include the legal template version and public i
     assert.equal(db.checkoutCalls.length, 1);
   }
 });
+
+function generationRows({ plan = 'basic', months = 6, payment = 'prepaid', role = true, source = 'public_purchase_intent' } = {}) {
+  const { buildRetailPackageSnapshot } = require('../src/services/membershipPackageCompatibility');
+  const { GENERATION_DATE_OFFER_VERSION } = require('../src/services/membershipOffers');
+  const { retailAgreementTerms } = require('../src/services/retailQuoteSelection');
+  const { buildMembershipAgreementHtml } = require('../src/render/membershipAgreement');
+  const rows = retailRows({ plan, months, payment, role, source });
+  const pkg = buildRetailPackageSnapshot({ planKey: plan, commitmentMonths: months, paymentOption: payment,
+    firstRolePrepaySelected: role, channel: 'sales', offerVersion: GENERATION_DATE_OFFER_VERSION });
+  const generatedAt = new Date(Date.now() - 60000).toISOString();
+  const { normalized } = buildMembershipAgreementHtml({ ...rows.a.template_snapshot.values,
+    ...retailAgreementTerms(pkg, { generatedAt }), first_role_prepay: pkg.first_role_prepay },
+  { packageSnapshot: pkg, generatedAt });
+  Object.assign(rows.a, { initial_term_start: normalized.initial_term_start, initial_renewal_date: normalized.initial_renewal_date });
+  Object.assign(rows.a.template_snapshot, { generated_at: generatedAt, values: normalized, package_snapshot: pkg });
+  Object.assign(rows.i, { package_snapshot: structuredClone(pkg), term_start_basis: 'generation_date' });
+  if (source === 'admin') {
+    rows.a.client_id = CLIENT_ID;
+    delete rows.a.template_snapshot.purchase_intent;
+  }
+  return rows;
+}
+
+test('generation-date checkout reads the persisted intent basis through actual selected columns', async () => {
+  for (const source of ['public_purchase_intent', 'sales_assisted', 'admin'])
+    for (const plan of ['basic', 'pro']) for (const months of [3, 6, 12])
+      for (const payment of source === 'public_purchase_intent' ? ['prepaid'] : ['prepaid', 'monthly_installments'])
+        for (const role of [false, true]) {
+          const { a, i } = generationRows({ source, plan, months, payment, role });
+          const before = structuredClone(a.template_snapshot);
+          const db = makeDb({ membershipAgreements: [a], purchaseIntents: source === 'admin' ? [] : [i],
+            clients: source === 'admin' ? [{ id: CLIENT_ID }] : [], projectSelectedColumns: true });
+          const result = await postCheckout(buildApp(db));
+          assert.equal(result.status, 200, `${source}/${plan}/${months}/${payment}/${role}: ${JSON.stringify(result.body)}`);
+          assert.equal(db.checkoutCalls.length, 1);
+          assert.deepEqual(db.checkoutCalls[0].packageSnapshot, before.package_snapshot);
+          assert.deepEqual(a.template_snapshot, before);
+          assert.equal(a.initial_term_start, before.values.initial_term_start);
+          assert.equal(a.initial_renewal_date, before.values.initial_renewal_date);
+          assert.equal(db.clientMembers.length, 0);
+        }
+});
+
+test('generation-date checkout still refuses absent or wrong stored intent basis before any effect', async () => {
+  for (const basis of [undefined, null, 'successful_payment', 'browser_date']) {
+    const { a, i } = generationRows();
+    if (basis === undefined) delete i.term_start_basis;
+    else i.term_start_basis = basis;
+    const db = makeDb({ membershipAgreements: [a], purchaseIntents: [i], projectSelectedColumns: true });
+    const result = await postCheckout(buildApp(db));
+    assert.equal(result.status, 409); assert.equal(result.body.code, 'package_snapshot_mismatch');
+    noCheckoutEffects(db);
+  }
+});
