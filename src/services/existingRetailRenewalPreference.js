@@ -6,7 +6,8 @@ const { isDeepStrictEqual } = require('node:util');
 const { snapshotStripeSdkData: snapshot } = require('./enterprisePoolPaymentProof');
 const { readExistingRetailRecurringSource } = require('./existingRetailRecurringSource');
 const { readExistingRetailRecurringCensus } = require('./existingRetailRecurringCensus');
-const { anchoredMonthInstant, STRIPE_RECURRING_OFFER_VERSION } = require('./membershipOffers');
+const { anchoredMonthInstant, STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION,
+  retailInitialEvidenceGeometry } = require('./membershipOffers');
 const { readRetailPackageOffer } = require('./membershipPackageCompatibility');
 
 class RenewalError extends Error {
@@ -21,39 +22,46 @@ const anchor = (b, months) => Date.parse(anchoredMonthInstant(new Date(b * 1000)
 
 function renewalBillingCutoff(source, now = Date.now()) {
   const offer = readRetailPackageOffer(source?.package_snapshot);
-  check(offer?.offer_version === STRIPE_RECURRING_OFFER_VERSION && Number.isFinite(now));
-  const b = source.original_period.provider_period_start, n = offer.commitment_months;
+  const generation=offer?.offer_version===GENERATION_DATE_OFFER_VERSION;
+  check([STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(offer?.offer_version) && Number.isFinite(now));
+  const geometry=retailInitialEvidenceGeometry({offer,evidence:source.original_period});
+  const b = generation?Date.parse(geometry.contractStartAt)/1000:source.original_period.provider_period_start, n = offer.commitment_months;
   check(epoch(b));
   const original = new Date(b * 1000), current = new Date(now);
   let step = Math.max(1, Math.floor(((current.getUTCFullYear() - original.getUTCFullYear()) * 12
     + current.getUTCMonth() - original.getUTCMonth()) / n));
   check(step <= 1000);
   while (anchor(b, step * n) * 1000 <= now) { step++; check(step <= 1000); }
-  return new Date(anchor(b, step * n) * 1000).toISOString();
+  return new Date((generation?anchor(geometry.providerAnchorEpoch,step*n-offer.stripe_recurrence.interval_count):anchor(b,step*n))*1000).toISOString();
 }
 
 function renewalSubscriptionProjection(raw, source) {
   const sub = snapshot(raw), p = source.original_period, offer = readRetailPackageOffer(source.package_snapshot);
-  check(offer?.offer_version === STRIPE_RECURRING_OFFER_VERSION
+  const generation=offer?.offer_version===GENERATION_DATE_OFFER_VERSION;
+  const geometry=retailInitialEvidenceGeometry({offer,evidence:p});
+  check([STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(offer?.offer_version)
     && sub?.object === 'subscription' && sub.id === p.subscription_id && sub.customer === p.customer_id
-    && sub.livemode === p.livemode && sub.currency === 'usd' && sub.billing_cycle_anchor === p.provider_period_start
+    && sub.livemode === p.livemode && sub.currency === 'usd' && sub.billing_cycle_anchor === geometry.providerAnchorEpoch
     && epoch(sub.current_period_start) && epoch(sub.current_period_end)
-    && ['active', 'past_due', 'unpaid', 'canceled'].includes(sub.status) && typeof sub.cancel_at_period_end === 'boolean'
+    && ['active', 'past_due', 'unpaid', 'canceled',...(generation?['trialing']:[])].includes(sub.status) && typeof sub.cancel_at_period_end === 'boolean'
     && (sub.cancel_at === null || epoch(sub.cancel_at)) && (sub.canceled_at === null || epoch(sub.canceled_at))
-    && sub.schedule === null && sub.pause_collection === null && sub.trial_start === null && sub.trial_end === null
+    && sub.schedule === null && sub.pause_collection === null
+    && (generation?sub.trial_start===p.provider_trial_start&&sub.trial_end===p.provider_trial_end:sub.trial_start===null&&sub.trial_end===null)
     && sub.items?.object === 'list' && sub.items.has_more === false && sub.items.data?.length === 1
     && (sub.test_clock === null || (!sub.livemode && typeof sub.test_clock === 'string')));
   const item = sub.items.data[0], price = item.price;
   check(item.id === p.subscription_item_id && item.subscription === p.subscription_id && item.quantity === 1
-    && price?.object === 'price' && price.id === p.price_id && price.currency === 'usd'
+    && price?.object === 'price' && price.id === geometry.recurringPriceId && price.currency === 'usd'
     && price.type === 'recurring' && price.unit_amount === offer.platform_payment_cents
     && price.recurring?.interval === 'month' && price.recurring.interval_count === offer.stripe_recurrence.interval_count
     && price.recurring.usage_type === 'licensed');
-  const first = new Date(p.provider_period_start * 1000), start = new Date(sub.current_period_start * 1000);
+  const first = new Date(geometry.providerAnchorEpoch * 1000), start = new Date(sub.current_period_start * 1000);
   const offset = (start.getUTCFullYear() - first.getUTCFullYear()) * 12 + start.getUTCMonth() - first.getUTCMonth();
-  check(offset >= 0 && offset % offer.stripe_recurrence.interval_count === 0
-    && offset <= 12000 && anchor(p.provider_period_start, offset) === sub.current_period_start
-    && anchor(p.provider_period_start, offset + offer.stripe_recurrence.interval_count) === sub.current_period_end);
+  const initial=generation&&sub.current_period_start===p.provider_trial_start&&sub.current_period_end===p.provider_trial_end
+    && ['trialing','canceled'].includes(sub.status);
+  check(initial||(sub.status!=='trialing'&&offset>=0&&offset%offer.stripe_recurrence.interval_count===0
+    && offset<=12000&&anchor(geometry.providerAnchorEpoch,offset)===sub.current_period_start
+    && anchor(geometry.providerAnchorEpoch,offset+offer.stripe_recurrence.interval_count)===sub.current_period_end));
   return snapshot({ subscription_id: sub.id, customer_id: sub.customer, livemode: sub.livemode,
     price_id: price.id, subscription_item_id: item.id, unit_amount: price.unit_amount,
     interval_count: price.recurring.interval_count, quantity: item.quantity, currency: sub.currency,
@@ -81,8 +89,11 @@ async function sourceFor(input) {
   return readExistingRetailRecurringSource({ db: input.db, agreementId: input.agreementId, clientId: input.clientId });
 }
 function desired(sub, op) {
+  const generation=op.source?.package_snapshot?.membership_terms?.offer_version===GENERATION_DATE_OFFER_VERSION;
   return op.requested_auto_renew ? sub.status !== 'canceled' && sub.cancel_at_period_end === false && sub.cancel_at === null
-    : sub.cancel_at_period_end === true && sub.cancel_at === Date.parse(op.billing_cutoff_at) / 1000;
+    : (sub.cancel_at_period_end===true||(generation&&sub.cancel_at_period_end===false))
+      && sub.cancel_at === Date.parse(op.billing_cutoff_at) / 1000
+      && (!generation||!sub.cancel_at_period_end||sub.current_period_end===sub.cancel_at);
 }
 function unchanged(before, after) {
   const keys = ['subscription_id', 'customer_id', 'livemode', 'price_id', 'subscription_item_id', 'unit_amount',
@@ -96,6 +107,7 @@ async function reconcileExistingRetailRenewal(input) {
   const source = await sourceFor(input), r = await native(input.db, source, 'read');
   if (!r.operation || ['applied', 'held'].includes(r.status)) return r;
   const { stripe, db } = input, op = r.operation;
+  const generation=source.package_snapshot.membership_terms.offer_version===GENERATION_DATE_OFFER_VERSION;
   const api = () => check(stripe.getApiField('version') === '2023-10-16');
   const provider = async (fn, setting = false) => { api(); try { return await fn(); } catch (e) {
     const error = new RenewalError();
@@ -127,10 +139,11 @@ async function reconcileExistingRetailRenewal(input) {
   if (before.test_clock !== null) return native(db, source, 'hold', {
     p_operation: op.operation_id, p_generation: op.generation });
   // Waiting is a saved preference, never a premature cancellation of owed installments.
-  if (before.current_period_end < cutoff) return r;
+  if (!generation&&before.current_period_end < cutoff) return r;
   const alreadyDesired = desired(before, op);
-  if (before.status !== 'active' && !alreadyDesired) return r; // Waiting, not a provider send.
-  if (before.current_period_end !== cutoff || (!alreadyDesired && cutoff * 1000 <= Date.now())
+  if (before.status !== 'active' && !(generation&&before.status==='trialing') && !alreadyDesired) return r; // Waiting, not a provider send.
+  if ((generation?before.current_period_end>cutoff:before.current_period_end!==cutoff)
+    || (generation&&before.cancel_at_period_end&&before.current_period_end!==cutoff) || (!alreadyDesired && cutoff * 1000 <= Date.now())
     || (before.cancel_at !== null && before.cancel_at !== cutoff)) return native(db, source, 'hold', {
     p_operation: op.operation_id, p_generation: op.generation
   });
@@ -150,7 +163,7 @@ async function reconcileExistingRetailRenewal(input) {
   if (armed.status !== 'claimed') return armed;
   try {
     const body = current.requested_auto_renew ? { cancel_at_period_end: false }
-      : { cancel_at_period_end: true, proration_behavior: 'none' };
+      : generation?{cancel_at:cutoff,proration_behavior:'none'}:{ cancel_at_period_end: true, proration_behavior: 'none' };
     const known = renewalSubscriptionProjection(await provider(() => stripe.subscriptions.update(
       source.original_period.subscription_id, body, { idempotencyKey: `retail-renewal:${current.operation_id}` }), true), source);
     unchanged(before, known);
@@ -158,7 +171,8 @@ async function reconcileExistingRetailRenewal(input) {
     // fixed operation key, never a different request body under the first key.
     if (current.requested_auto_renew && known.cancel_at_period_end === false && known.cancel_at === cutoff) {
       const fresh = await read(); unchanged(before, fresh);
-      check(fresh.current_period_end === cutoff && cutoff * 1000 > Date.now() && fresh.cancel_at === cutoff);
+      check((generation?fresh.current_period_end<=cutoff:fresh.current_period_end===cutoff)
+        && cutoff * 1000 > Date.now() && fresh.cancel_at === cutoff);
       await native(db, source, 'repair', { ...args, p_observation: fresh });
       const repaired = renewalSubscriptionProjection(await provider(() => stripe.subscriptions.update(
         source.original_period.subscription_id, { cancel_at: '' },
@@ -195,8 +209,11 @@ async function readExistingRetailRenewalSummary(input) {
   // A completed renewal-on is a past setting operation, not a permanent
   // display anchor. Open/uncertain/off operations retain their stored cutoff.
   const completedOn = result.status === 'applied' && op?.requested_auto_renew === true;
+  const generation=source.package_snapshot.membership_terms.offer_version===GENERATION_DATE_OFFER_VERSION;
+  if(generation)check(typeof result.billing_cutoff_at==='string'&&Number.isFinite(Date.parse(result.billing_cutoff_at)));
+  const nextCutoff=generation?result.billing_cutoff_at:renewalBillingCutoff(source);
   return {
-    stripe_renewal_billing_cutoff_at: completedOn ? renewalBillingCutoff(source) : op?.billing_cutoff_at || renewalBillingCutoff(source),
+    stripe_renewal_billing_cutoff_at: completedOn ? nextCutoff : op?.billing_cutoff_at || nextCutoff,
     renewal_request_status: result.status,
     requested_auto_renew: op?.requested_auto_renew ?? null,
     renewal_requested_at: op?.requested_at ?? null

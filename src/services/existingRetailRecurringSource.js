@@ -49,8 +49,12 @@ async function read(input) {
         billing_reason: 'subscription_create', currency: 'usd', livemode: p.livemode,
         customer: p.customer_id, subscription: p.subscription_id }] } });
     // Native receipt IDs use a total 255-char bound; preserve it here too.
-    valid([source.original_provider_account_id, ...['invoice_id', 'platform_invoice_line_id', 'price_id', 'subscription_id',
-      'subscription_item_id', 'customer_id', 'checkout_session_id'].map(key => p[key])].every(id => id.length <= 255));
+    const generation=p.version==='retail_generation_initial_schedule_v1';
+    const identityKeys=['invoice_id','subscription_id','subscription_item_id','customer_id','checkout_session_id',
+      ...(generation?['initial_platform_invoice_line_id','recurring_invoice_line_id','initial_platform_price_id',
+        'recurring_platform_price_id']:['platform_invoice_line_id','price_id'])];
+    valid([source.original_provider_account_id,...identityKeys.map(key=>p[key]),
+      ...(generation&&p.first_role_price_id!==null?[p.first_role_price_id]:[])].every(id=>typeof id==='string'&&id.length<=255));
   } catch (_) { throw new SourceError(true); }
   return freeze(source);
 }

@@ -4,7 +4,7 @@
 const { isDeepStrictEqual } = require('node:util');
 const { snapshotStripeSdkData: snapshot } = require('./enterprisePoolPaymentProof');
 const { readRetailPackageOffer } = require('./membershipPackageCompatibility');
-const { STRIPE_RECURRING_OFFER_VERSION } = require('./membershipOffers');
+const { STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION,anchoredMonthInstant } = require('./membershipOffers');
 function fail(code = 'native_commission_proof_unavailable', status = 409) {
   throw Object.assign(new Error(code), { code, status });
 }
@@ -15,7 +15,8 @@ function canonicalExistingRetailCommissionPayment(input) {
   let data; try { data = snapshot(input); } catch (_) { fail(); }
   const { source, initialReceipt, periodRows, paymentId } = data;
   const offer = readRetailPackageOffer(source?.package_snapshot), b = source?.original_period;
-  check(offer?.offer_version === STRIPE_RECURRING_OFFER_VERSION && id(paymentId)
+  const generation=offer?.offer_version===GENERATION_DATE_OFFER_VERSION;
+  check([STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(offer?.offer_version) && id(paymentId)
     && Array.isArray(periodRows) && periodRows.length <= 1000
     && initialReceipt?.version === 'retail_existing_funding_v1'
     && isDeepStrictEqual(initialReceipt.proof?.period, b)
@@ -33,7 +34,7 @@ function canonicalExistingRetailCommissionPayment(input) {
       && isDeepStrictEqual(receipt.source, source) && p.agreement_id === source.agreement_id && p.client_id === source.client_id
       && p.offer_version === offer.offer_version && p.provider_account_id === source.original_provider_account_id
       && p.livemode === b.livemode && p.customer_id === b.customer_id && p.subscription_id === b.subscription_id
-      && p.price_id === b.price_id && p.subscription_item_id === b.subscription_item_id
+      && p.price_id === (generation?b.recurring_platform_price_id:b.price_id) && p.subscription_item_id === b.subscription_item_id
       && row.stripe_invoice_id === p.invoice_id && Number.isSafeInteger(p.ordinal) && p.ordinal > 0);
     candidates.push(p);
   }
@@ -48,7 +49,8 @@ function canonicalExistingRetailCommissionPayment(input) {
   // INSERT guard must perform that census atomically before accepting a receipt.
   for (const field of ['invoice_id','payment_intent_id','charge_id']) if (p[field] != null)
     check(candidates.filter(candidate => candidate[field] === p[field]).length === 1);
-  if (p.ordinal * offer.stripe_recurrence.interval_count >= 12) fail('outside_original_first_year', 422);
+  if (p.ordinal * offer.stripe_recurrence.interval_count >= 12
+    || (generation&&Date.parse(p.paid_at)>=Date.parse(anchoredMonthInstant(b.paid_at,12)))) fail('outside_original_first_year', 422);
   return { provider_payment_id: p.invoice_id, gross_membership_cents: p.platform_gross_cents,
     discount_cents: p.platform_discount_cents, payment_success_at: p.paid_at,
     ordinal: p.ordinal, settlement_verified: false, payroll_authorized: false };

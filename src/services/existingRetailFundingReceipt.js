@@ -4,6 +4,7 @@
 const {isDeepStrictEqual}=require('node:util');
 const {readExistingRetailCheckoutFunding,assertExistingRetailFundingSource}=require('./existingRetailCheckoutFunding');
 const {snapshotStripeSdkData}=require('./enterprisePoolPaymentProof');
+const {GENERATION_DATE_OFFER_VERSION}=require('./membershipOffers');
 function fail(code='retail_funding_receipt_ack_unknown'){const e=new Error(code);e.code=code;e.status=503;throw e;}
 const check=(v,code)=>{if(!v)fail(code);};
 function freeze(v){if(v&&typeof v==='object'){for(const x of Object.values(v))freeze(x);Object.freeze(v);}return v;}
@@ -29,12 +30,16 @@ async function recordExistingRetailFunding({db,stripe,agreementId,intentId,event
  let funding;try{funding=await readExistingRetailCheckoutFunding({db,stripe,agreementId,intentId,eventSessionId,eventSubscriptionId,eventInvoiceId,eventLivemode,assertFence});}
  catch(e){if(typeof e.code==='string'&&e.message===e.code&&/^(retail_|package_|agreement_|purchase_intent_)[a-z_]+$/.test(e.code))throw e;fail();}
  if(!funding)return null;
- check(!funding.replay&&funding.initialProviderPeriod,'retail_funding_receipt_historical_enrollment_held');
+ const generation=funding.packageSnapshot?.membership_terms?.offer_version===GENERATION_DATE_OFFER_VERSION;
+ const period=generation?funding.initialProviderSchedule:funding.initialProviderPeriod;
+ check(!funding.replay&&period && (generation?funding.initialProviderPeriod==null:funding.initialProviderSchedule==null)
+  && period.version===(generation?'retail_generation_initial_schedule_v1':'retail_initial_provider_period_v1'),
+ 'retail_funding_receipt_historical_enrollment_held');
  check(funding.sourceIntentId ? typeof claimKey==='string'&&claimKey.length>=32 : claimKey===null,'retail_funding_receipt_claim_required');
  await assertFence();await assertExistingRetailFundingSource({db,funding});const a=await source(db,funding);
  await assertFence();let account;try{account=snapshotStripeSdkData(await stripe.accounts.retrieve());}catch(_){fail();}
  check(account?.object==='account'&&/^acct_[A-Za-z0-9_]{1,250}$/.test(account.id||''),'retail_funding_receipt_account_unknown');
- const proof=snapshotStripeSdkData({provider_account_id:account.id,period:funding.initialProviderPeriod,
+ const proof=snapshotStripeSdkData({provider_account_id:account.id,period,
   payment_intent_id:funding.paymentIntentId,charge_id:funding.chargeId,
   checkout_created:funding.checkoutCreatedEpoch,invoice_created:funding.invoiceCreatedEpoch,
   platform_gross_cents:funding.platformGrossCents,platform_discount_cents:funding.platformDiscountCents,platform_net_cents:funding.platformNetCents,

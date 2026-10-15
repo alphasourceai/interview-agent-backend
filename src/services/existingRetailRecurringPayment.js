@@ -5,7 +5,7 @@ const {isDeepStrictEqual}=require('node:util');
 const {snapshotStripeSdkData:snapshot}=require('./enterprisePoolPaymentProof');
 const {readExistingRetailRecurringFunding}=require('./existingRetailCheckoutFunding');
 const {readRetailPackageOffer}=require('./membershipPackageCompatibility');
-const {STRIPE_RECURRING_OFFER_VERSION}=require('./membershipOffers');
+const {STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION}=require('./membershipOffers');
 function unknown(){const e=new Error('retail_recurring_record_unknown');e.code=e.message;e.status=503;throw e;}
 async function rpc(db,name,args){
   let r;try{r=snapshot(await db.rpc(name,args));}catch(_){unknown();}
@@ -47,9 +47,9 @@ async function classifyExistingRetailRecurringEvent({db,event}){
   const {data:a,error:ae}=await db.from('membership_agreements')
     .select('id,client_id,template_snapshot,template_version,checkout_status,is_current,status')
     .eq('client_id',c.id).eq('is_current',true).maybeSingle();if(ae)unknown();
-  if(a?.template_snapshot?.package_snapshot?.membership_terms?.offer_version!==STRIPE_RECURRING_OFFER_VERSION)return null;
+  if(![STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(a?.template_snapshot?.package_snapshot?.membership_terms?.offer_version))return null;
   const offer=readRetailPackageOffer(a.template_snapshot.package_snapshot);
-  if(offer?.offer_version!==STRIPE_RECURRING_OFFER_VERSION)unknown();
+  if(![STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(offer?.offer_version))unknown();
   // Initial Checkout activation remains on its existing path. An unpaid
   // cyclic event cannot become a generic subscription-status activation.
   const base={agreementId:a.id,clientId:c.id,subscriptionId,customerId,requiresReentry:true};

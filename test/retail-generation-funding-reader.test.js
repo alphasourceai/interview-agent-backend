@@ -43,11 +43,18 @@ test('price provenance is rechecked after SDK awaits; no source mutation is acce
  f.g.retail_checkout_prices.initial_platform_price_id='price_MOVED';
  await assert.rejects(assertSource({db:f.db,funding:r}),{code:'retail_funding_source_changed'});
 });
-test('generation receipt persistence stays held until native schedule receipt adaptation',async()=>{
- const f=generationFixture();let rpcs=0;f.db.rpc=async()=>{rpcs++;throw Error('must not persist');};
- await assert.rejects(record({...f.options,claimKey:'SYNTHETIC_CLAIM_000000000000000000000000'}),
-  {code:'retail_funding_receipt_historical_enrollment_held'});
- assert.equal(rpcs,0);assert.equal(f.g.checkout_paid_at,null);assert.equal(f.i.activated_at,null);
+test('generation writer sends the new typed schedule to the existing RPC without activating anything',async()=>{
+ const f=generationFixture();let rpcs=0;f.db.rpc=async(name,args)=>{
+  rpcs++;assert.equal(name,'record_retail_existing_funding');
+  assert.equal(args.p_proof.period.version,'retail_generation_initial_schedule_v1');
+  assert.equal(args.p_proof.period.provider_period_start,undefined);
+  const receipt={version:'retail_existing_funding_v1',proof:structuredClone(args.p_proof),recorded_at:'2026-02-02T11:00:21.000000Z'};
+  f.g.retail_funding_receipt=receipt;return{data:receipt,error:null};
+ };
+ const r=await record({...f.options,claimKey:'SYNTHETIC_CLAIM_000000000000000000000000'});
+ assert.equal(r.receipt.proof.period.version,'retail_generation_initial_schedule_v1');
+ assert.equal(rpcs,1);assert.equal(f.g.checkout_paid_at,null);assert.equal(f.i.activated_at,null);
+ // This ACK is a stub; the disposable PG test owns actual native proof.
 });
 test('checking a saved generation source does not alter or replace the accepted snapshot',()=>{
  const f=generationFixture(),before=structuredClone(f.g);

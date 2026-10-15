@@ -4,6 +4,7 @@
 const { isDeepStrictEqual } = require('node:util');
 const { snapshotStripeSdkData } = require('./enterprisePoolPaymentProof');
 const { readExistingRetailActivationFunding } = require('./existingRetailActivationFunding');
+const {retailInitialEvidenceGeometry}=require('./membershipOffers');
 const equal = (a, b) => isDeepStrictEqual(snapshotStripeSdkData(a), snapshotStripeSdkData(b));
 const plain = v => JSON.parse(JSON.stringify(v));
 const id = v => typeof v === 'string' ? v : v?.id;
@@ -43,6 +44,7 @@ async function applyClient(options) {
   check(funding && funding.receiptReplay === true && funding.replay === true && funding.sourceIntentId === null,
     'retail_admin_adapter_source_unknown');
   const receipt = before.retail_funding_receipt, period = receipt?.proof?.period;
+  const geometry=retailInitialEvidenceGeometry({offer:funding.packageSnapshot.membership_terms,evidence:period});
   await assertFence();
   const checkout = snapshotStripeSdkData(await stripe.checkout.sessions.retrieve(period.checkout_session_id));
   check(checkout?.object === 'checkout.session' && checkout.id === period.checkout_session_id
@@ -55,11 +57,11 @@ async function applyClient(options) {
   // active. Never substitute original B for a newer current provider period.
   const subscription = { id: current?.id, customer: id(current?.customer), status: current?.status,
     current_period_end: current?.current_period_end, cancel_at_period_end: current?.cancel_at_period_end };
-  check(current?.object === 'subscription' && subscription.status === 'active'
+  check(current?.object === 'subscription' && subscription.status === geometry.initialSubscriptionStatus
     && subscription.cancel_at_period_end === false && Number.isSafeInteger(subscription.current_period_end)
     && subscription.current_period_end > 0 && subscription.current_period_end <= 253402300799
     && current.cancel_at == null && current.pause_collection == null
-    && subscription.current_period_end === period?.provider_period_end && subscription.id === period?.subscription_id
+    && subscription.current_period_end === geometry.initialCoverageEndEpoch && subscription.id === period?.subscription_id
     && subscription.customer === period?.customer_id, 'retail_admin_adapter_subscription_unknown');
   if (subscription.current_period_end <= Date.now() / 1000) periodEnded();
   await assertFence();

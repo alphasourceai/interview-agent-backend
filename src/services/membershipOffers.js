@@ -229,8 +229,32 @@ function assertRenewalPreferenceChange({ autoRenew, requestedAt, termStart, term
   return { auto_renew: autoRenew, requested_at: requestedAt, effective_at: termEnd };
 }
 
+// Geometry of ALREADY qualified initial evidence, not financial/access proof.
+// Keep the new schedule's fields/type intact; never manufacture a v1 period.
+function retailInitialEvidenceGeometry({offer,evidence}={}) {
+  const generation=offer?.offer_version===GENERATION_DATE_OFFER_VERSION;
+  if(!offer || evidence?.api_version!=='2023-10-16'
+    || evidence.version!==(generation?'retail_generation_initial_schedule_v1':'retail_initial_provider_period_v1'))
+    fail('retail_initial_evidence_mismatch');
+  if(generation){
+    if(offer.term_start_basis!=='generation_date')fail('retail_initial_evidence_mismatch');
+    const dates=retailGenerationTermDates({generatedAt:evidence.generated_at,commitmentMonths:offer.commitment_months});
+    const start=dates.initial_term_start+'T00:00:00.000Z',end=dates.initial_renewal_date+'T00:00:00.000Z';
+    const first=anchoredMonthInstant(start,offer.stripe_recurrence.interval_count),epoch=Date.parse(first)/1000;
+    if(evidence.initial_term_start!==dates.initial_term_start || evidence.initial_renewal_date!==dates.initial_renewal_date
+      || evidence.first_collection_at!==first || evidence.provider_trial_end!==epoch || evidence.billing_cycle_anchor!==epoch)
+      fail('retail_initial_evidence_mismatch');
+    return deepFreeze({generation:true,contractStartAt:start,contractEndAt:end,initialCoverageEndEpoch:epoch,
+      providerAnchorEpoch:epoch,recurringPriceId:evidence.recurring_platform_price_id,initialSubscriptionStatus:'trialing'});
+  }
+  const term=retailTermWindow({originalStart:evidence.paid_at,commitmentMonths:offer.commitment_months});
+  return deepFreeze({generation:false,contractStartAt:term.term_start_at,contractEndAt:term.term_end_at,
+    initialCoverageEndEpoch:evidence.provider_period_end,providerAnchorEpoch:evidence.provider_period_start,
+    recurringPriceId:evidence.price_id,initialSubscriptionStatus:'active'});
+}
+
 module.exports = {
   OFFER_VERSION, STRIPE_RECURRING_OFFER_VERSION, GENERATION_DATE_OFFER_VERSION, COMMITMENT_MONTHS, PAYMENT_OPTIONS, RENEWAL_REMINDER_DAYS,
   RETAIL_PRICES_CENTS, buildRetailOffer, listRetailOffers, anchoredMonthInstant,
-  retailTermWindow, retailGenerationTermDates, retailGenerationCollectionSchedule, assertRenewalPreferenceChange
+  retailTermWindow, retailGenerationTermDates, retailGenerationCollectionSchedule, assertRenewalPreferenceChange,retailInitialEvidenceGeometry
 };

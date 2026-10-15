@@ -46,7 +46,8 @@ function fundingSame(a, b) {
   return a?.agreementId === b?.agreementId && a?.clientId === b?.clientId && a?.sourceIntentId === b?.sourceIntentId
     && a?.paidAt === b?.paidAt && a?.customerId === b?.customerId && a?.checkoutSessionId === b?.checkoutSessionId
     && a?.sourceTemplateVersion === b?.sourceTemplateVersion && equal(a?.packageSnapshot, b?.packageSnapshot)
-    && equal(a?.sourceTemplate, b?.sourceTemplate) && equal(a?.initialProviderPeriod, b?.initialProviderPeriod);
+    && equal(a?.sourceTemplate, b?.sourceTemplate) && equal(a?.initialProviderPeriod, b?.initialProviderPeriod)
+    && equal(a?.initialProviderSchedule,b?.initialProviderSchedule) && equal(a?.sourceCheckoutPrices,b?.sourceCheckoutPrices);
 }
 async function prepare(options) {
   const { db, assertFence = async () => {} } = options;
@@ -76,7 +77,7 @@ async function prepare(options) {
       && Number.isFinite(Date.parse(context.billing_applied_at)) && Date.parse(context.billing_applied_at) <= Date.now()
       && context.source?.intent?.id === options.intentId && context.source.agreement_id === options.agreementId
       && context.source.client_id === funding.clientId && equal(context.source.template_snapshot, funding.sourceTemplate)
-      && equal(context.receipt?.proof?.period, funding.initialProviderPeriod) && equal(context.current, current)
+      && equal(context.receipt?.proof?.period, funding.initialProviderSchedule||funding.initialProviderPeriod) && equal(context.current, current)
       && typeof context.buyer_email === 'string' && context.buyer_email.length > 0
       && context.buyer_email === context.buyer_email.trim().toLowerCase(), 'retail_linked_member_tail_readback_unknown');
     const stable = plain(context); delete stable.current;

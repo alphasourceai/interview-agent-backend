@@ -5,6 +5,7 @@ const { isDeepStrictEqual } = require('node:util');
 const { snapshotStripeSdkData } = require('./enterprisePoolPaymentProof');
 const { readExistingRetailActivationFunding } = require('./existingRetailActivationFunding');
 const { buildAlphaScreenPlanSettingsPayload } = require('./alphaScreenPackages');
+const {retailInitialEvidenceGeometry}=require('./membershipOffers');
 const plain = v => JSON.parse(JSON.stringify(v));
 const equal = (a, b) => isDeepStrictEqual(snapshotStripeSdkData(a), snapshotStripeSdkData(b));
 const id = v => typeof v === 'string' ? v : v?.id;
@@ -56,8 +57,9 @@ async function apply(options) {
   check(funding?.receiptReplay === true && funding.replay === true && funding.sourceIntentId === i.id
     && funding.agreementId === a.id && funding.clientId === a.client_id, 'retail_linked_billing_source_unknown');
   const period = a.retail_funding_receipt.proof.period;
+  const geometry=retailInitialEvidenceGeometry({offer:funding.packageSnapshot.membership_terms,evidence:period});
   check(iso(a.checkout_paid_at) === period.paid_at && iso(i.activated_at) === period.paid_at
-    && equal(funding.initialProviderPeriod, period) && equal(funding.sourceTemplate, a.template_snapshot)
+    && equal(geometry.generation?funding.initialProviderSchedule:funding.initialProviderPeriod, period) && equal(funding.sourceTemplate, a.template_snapshot)
     && funding.sourceTemplateVersion === a.template_version, 'retail_linked_billing_source_unknown');
   await assertFence();
   const checkout = snapshotStripeSdkData(await stripe.checkout.sessions.retrieve(period.checkout_session_id));
@@ -68,18 +70,18 @@ async function apply(options) {
   'retail_linked_billing_checkout_unknown');
   const current = snapshotStripeSdkData(funding.subscription);
   if (!prior) {
-    check(current?.status === 'active' && current.id === period.subscription_id && id(current.customer) === period.customer_id
+    check(current?.status === geometry.initialSubscriptionStatus && current.id === period.subscription_id && id(current.customer) === period.customer_id
       && current.cancel_at_period_end === false && Object.hasOwn(current, 'cancel_at') && current.cancel_at === null
       && Object.hasOwn(current, 'pause_collection') && current.pause_collection === null
       && Number.isSafeInteger(current.current_period_end) && current.current_period_end > 0
-      && current.current_period_end <= 253402300799 && current.current_period_end === period.provider_period_end,
+      && current.current_period_end <= 253402300799 && current.current_period_end === geometry.initialCoverageEndEpoch,
     'retail_linked_billing_subscription_unknown');
     if (current.current_period_end <= Date.now() / 1000) fail('retail_linked_billing_period_ended', 410);
   }
   // Financial INITIAL projection only. Do not replace the separately returned
   // actual CURRENT subscription with this historical active/B snapshot.
-  const initialSub = { id: period.subscription_id, customer: period.customer_id, status: 'active',
-    current_period_end: period.provider_period_end, cancel_at_period_end: false };
+  const initialSub = { id: period.subscription_id, customer: period.customer_id, status:geometry.initialSubscriptionStatus,
+    current_period_end:geometry.initialCoverageEndEpoch, cancel_at_period_end: false };
   const pkg = funding.packageSnapshot;
   const { buildClientActivationPayload } = require('./publicPurchaseActivation');
   const clientInitial = buildClientActivationPayload({ agreement: plain(a), subscription: initialSub,

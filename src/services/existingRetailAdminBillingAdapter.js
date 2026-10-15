@@ -5,6 +5,7 @@ const { isDeepStrictEqual } = require('node:util');
 const { snapshotStripeSdkData } = require('./enterprisePoolPaymentProof');
 const { readExistingRetailActivationFunding } = require('./existingRetailActivationFunding');
 const { buildAlphaScreenPlanSettingsPayload } = require('./alphaScreenPackages');
+const {retailInitialEvidenceGeometry}=require('./membershipOffers');
 const plain = v => JSON.parse(JSON.stringify(v));
 const equal = (a, b) => isDeepStrictEqual(snapshotStripeSdkData(a), snapshotStripeSdkData(b));
 const id = v => typeof v === 'string' ? v : v?.id;
@@ -31,9 +32,10 @@ async function row(db, table, key, value) {
   const r = await db.from(table).select('*').eq(key, value).maybeSingle();
   check(r && !r.error); return snapshotStripeSdkData(r.data);
 }
-function initialSubscription(period) {
-  return { id: period.subscription_id, customer: period.customer_id, status: 'active',
-    current_period_end: period.provider_period_end, cancel_at_period_end: false };
+function initialSubscription(period,pkg) {
+  const g=retailInitialEvidenceGeometry({offer:pkg.membership_terms,evidence:period});
+  return { id: period.subscription_id, customer: period.customer_id, status:g.initialSubscriptionStatus,
+    current_period_end:g.initialCoverageEndEpoch, cancel_at_period_end: false };
 }
 function initialClient(agreement, funding, subscription) {
   // SAME original pure builder. This initial projection is financial only.
@@ -47,7 +49,7 @@ function verifyReceipt(receipt, agreement, funding, initial) {
   check(closed(r, ['version', 'source', 'funding_receipt', 'subscription', 'client_initial', 'plan_initial',
     'credit_initial', 'credit_id', 'applied_at']) && r.version === 'retail_admin_existing_billing_v1'
     && equal(r.source, agreement.checkout_attempt_source) && equal(r.funding_receipt, agreement.retail_funding_receipt)
-    && equal(r.subscription, initialSubscription(agreement.retail_funding_receipt.proof.period))
+    && equal(r.subscription, initialSubscription(agreement.retail_funding_receipt.proof.period,funding.packageSnapshot))
     && equal(r.client_initial, initial), 'retail_admin_billing_adapter_receipt_unknown');
   const expected = buildAlphaScreenPlanSettingsPayload({ clientId: agreement.client_id, planKey: p.plan_key,
     billingInterval: p.billing_cadence, packageSnapshot: p });
@@ -101,10 +103,10 @@ async function applyBilling(options) {
     && checkout.livemode === period.livemode && id(checkout.customer) === period.customer_id
     && id(checkout.subscription) === period.subscription_id && id(checkout.invoice) === period.invoice_id,
   'retail_admin_billing_adapter_checkout_unknown');
-  const current = snapshotStripeSdkData(funding.subscription), sub = initialSubscription(period);
+  const current = snapshotStripeSdkData(funding.subscription), sub = initialSubscription(period,funding.packageSnapshot);
   const historical = before.retail_admin_billing_receipt != null;
   if (!historical) {
-    check(current?.object === 'subscription' && current.status === 'active' && current.cancel_at_period_end === false
+    check(current?.object === 'subscription' && current.status === sub.status && current.cancel_at_period_end === false
       && Number.isSafeInteger(current.current_period_end) && current.current_period_end > 0 && current.current_period_end <= 253402300799
       && current.current_period_end === sub.current_period_end && id(current.customer) === sub.customer && current.id === sub.id
       && current.cancel_at == null && current.pause_collection == null, 'retail_admin_billing_adapter_subscription_unknown');

@@ -346,29 +346,36 @@ function verifyExistingRetailRecurringFunding(raw) {
     'retail_recurring_funding_invalid_input');
   const {source,cycle,invoice,invoiceLines,paymentIntent,charge,providerAccountId}=input;
   const offer=readRetailPackageOffer(source?.package_snapshot), p=source?.original_period;
-  check(offer?.offer_version===STRIPE_RECURRING_OFFER_VERSION
+  const generation=offer?.offer_version===GENERATION_DATE_OFFER_VERSION;
+  check([STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(offer?.offer_version)
     && source?.version==='retail_existing_recurring_source_v1'
     && ['effect_authorized','collection_ready','paid_access_authorized','payroll_authorized'].every(k=>source[k]===false)
     && providerId(providerAccountId,'acct_') && providerAccountId===source.original_provider_account_id,
     'retail_recurring_funding_source_mismatch');
   const cycleKeys=['ordinal','invoice_id','line_id','provider_period_start','provider_period_end',
-    'observed_original_a_period_start','observed_original_a_period_end','term_index','installment_index',
+    ...(generation?['observed_generation_period_start','observed_generation_period_end']:
+      ['observed_original_a_period_start','observed_original_a_period_end']),'term_index','installment_index',
     'observed_term_start_at','observed_term_end_at'];
   check(cycle && Object.keys(cycle).length===cycleKeys.length && cycleKeys.every(k=>Object.hasOwn(cycle,k))
     && Number.isSafeInteger(cycle.ordinal) && cycle.ordinal>0 && cycle.ordinal<=999
-    && p?.version==='retail_initial_provider_period_v1' && p.api_version==='2023-10-16'
-    && typeof p.livemode==='boolean' && epoch(p.provider_period_start) && epoch(p.provider_period_end)
-    && Number.isFinite(Date.parse(p.paid_at)) && Date.parse(p.paid_at)/1000>=p.provider_period_start,
+    && p?.version===(generation?'retail_generation_initial_schedule_v1':'retail_initial_provider_period_v1') && p.api_version==='2023-10-16'
+    && typeof p.livemode==='boolean' && Number.isFinite(Date.parse(p.paid_at)),
     'retail_recurring_funding_period_mismatch');
+  const {retailInitialEvidenceGeometry}=require('./membershipOffers');
+  const geometry=retailInitialEvidenceGeometry({offer,evidence:p});
   const interval=offer.stripe_recurrence.interval_count, offset=cycle.ordinal*interval;
-  const b=new Date(p.provider_period_start*1000).toISOString();
+  const b=new Date(geometry.providerAnchorEpoch*1000).toISOString(),providerOffset=generation?offset-interval:offset;
+  check(epoch(geometry.providerAnchorEpoch)&&epoch(geometry.initialCoverageEndEpoch)
+    && (generation?Date.parse(p.paid_at)<Date.parse(b):Date.parse(p.paid_at)/1000>=p.provider_period_start),
+    'retail_recurring_funding_period_mismatch');
   const termIndex=offer.payment_option==='prepaid'?cycle.ordinal:Math.floor(cycle.ordinal/offer.commitment_months);
-  const term=retailTermWindow({originalStart:p.paid_at,commitmentMonths:offer.commitment_months,termIndex});
-  check(p.provider_period_end===Date.parse(anchoredMonthInstant(b,interval))/1000
-    && cycle.provider_period_start===Date.parse(anchoredMonthInstant(b,offset))/1000
-    && cycle.provider_period_end===Date.parse(anchoredMonthInstant(b,offset+interval))/1000
-    && cycle.observed_original_a_period_start===anchoredMonthInstant(p.paid_at,offset)
-    && cycle.observed_original_a_period_end===anchoredMonthInstant(p.paid_at,offset+interval)
+  const contractStart=generation?geometry.contractStartAt:p.paid_at;
+  const term=retailTermWindow({originalStart:contractStart,commitmentMonths:offer.commitment_months,termIndex});
+  check((generation||p.provider_period_end===Date.parse(anchoredMonthInstant(b,interval))/1000)
+    && cycle.provider_period_start===Date.parse(anchoredMonthInstant(b,providerOffset))/1000
+    && cycle.provider_period_end===Date.parse(anchoredMonthInstant(b,providerOffset+interval))/1000
+    && cycle[generation?'observed_generation_period_start':'observed_original_a_period_start']===anchoredMonthInstant(contractStart,offset)
+    && cycle[generation?'observed_generation_period_end':'observed_original_a_period_end']===anchoredMonthInstant(contractStart,offset+interval)
     && cycle.term_index===termIndex && cycle.observed_term_start_at===term.term_start_at
     && cycle.observed_term_end_at===term.term_end_at
     && cycle.installment_index===(offer.payment_option==='prepaid'?1:cycle.ordinal%offer.commitment_months+1),
@@ -382,9 +389,10 @@ function verifyExistingRetailRecurringFunding(raw) {
     'retail_recurring_funding_unexpected_lines');
   const line=lines[0];
   check(line?.object==='line_item' && providerId(line.id,'il_') && line.id===cycle.line_id
-    && line.id!==p.platform_invoice_line_id && line.type==='subscription' && line.proration===false
+    && (generation?![p.initial_platform_invoice_line_id,p.recurring_invoice_line_id].includes(line.id):line.id!==p.platform_invoice_line_id)
+    && line.type==='subscription' && line.proration===false
     && line.quantity===1 && line.currency==='usd' && line.subscription===p.subscription_id
-    && line.subscription_item===p.subscription_item_id && id(line.price)===p.price_id
+    && line.subscription_item===p.subscription_item_id && id(line.price)===geometry.recurringPriceId
     && priceMatches(line.price,offer.platform_payment_cents,offer.stripe_recurrence)
     && line.amount===offer.platform_payment_cents
     && line.period?.start===cycle.provider_period_start && line.period?.end===cycle.provider_period_end,
@@ -396,6 +404,7 @@ function verifyExistingRetailRecurringFunding(raw) {
   const discount=discounts(line.discount_amounts),tax=taxes(line.tax_amounts),gross=offer.platform_payment_cents;
   const net=gross-discount,total=net+tax;
   check(discount<=gross && cents(net) && cents(total) && total<=2147483647
+    && (!generation||(net>0&&(offer.payment_option!=='prepaid'||discount===0)))
     && discounts(invoice.total_discount_amounts)===discount && taxes(invoice.total_tax_amounts)===tax
     && invoice.subtotal===gross && invoice.total===total,
     'retail_recurring_funding_amount_mismatch');
@@ -423,7 +432,7 @@ function verifyExistingRetailRecurringFunding(raw) {
   }
   const result={version:'retail_existing_recurring_funding_proof_v1',agreement_id:source.agreement_id,client_id:source.client_id,
     offer_version:offer.offer_version,provider_account_id:providerAccountId,livemode:p.livemode,currency:'usd',
-    ordinal:cycle.ordinal,invoice_id:invoice.id,line_id:line.id,price_id:p.price_id,subscription_id:p.subscription_id,
+    ordinal:cycle.ordinal,invoice_id:invoice.id,line_id:line.id,price_id:geometry.recurringPriceId,subscription_id:p.subscription_id,
     subscription_item_id:p.subscription_item_id,customer_id:p.customer_id,original_paid_at:p.paid_at,
     paid_at:new Date(paid*1000).toISOString(),invoice_created:invoice.created,
     provider_period_start:cycle.provider_period_start,provider_period_end:cycle.provider_period_end,
@@ -451,7 +460,7 @@ async function readExistingRetailRecurringFunding(input) {
     async function source(){try{return await readExistingRetailRecurringSource({db,agreementId,clientId});}catch(e){
       if(e?.code==='retail_recurring_source_invalid')invalid('retail_recurring_funding_source_mismatch');unknown();}}
     api();const original=await source(),p=original.original_period;
-    check(readRetailPackageOffer(original.package_snapshot)?.offer_version===STRIPE_RECURRING_OFFER_VERSION,
+    check([STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(readRetailPackageOffer(original.package_snapshot)?.offer_version),
       'retail_recurring_funding_source_mismatch');
     const account=async()=>{const a=await provider(()=>stripe.accounts.retrieve());
       check(a?.object==='account' && a.id===original.original_provider_account_id,'retail_recurring_funding_source_mismatch');};
