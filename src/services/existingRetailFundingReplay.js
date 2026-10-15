@@ -5,6 +5,7 @@ const {isDeepStrictEqual}=require('node:util');
 const {snapshotStripeSdkData}=require('./enterprisePoolPaymentProof');
 const {readSavedRetailCheckoutTerms}=require('./savedMembershipCheckoutTerms');
 const {assertExistingRetailFundingSource}=require('./existingRetailCheckoutFunding');
+const {GENERATION_DATE_OFFER_VERSION}=require('./membershipOffers');
 function fail(code='retail_funding_replay_unknown'){const e=new Error(code);e.code=code;e.status=503;throw e;}
 const check=(v,code)=>{if(!v)fail(code);};
 const equal=(a,b)=>isDeepStrictEqual(snapshotStripeSdkData(a),snapshotStripeSdkData(b));
@@ -34,7 +35,9 @@ async function readReceipt({db,stripe,agreementId,intentId,eventSessionId,eventS
   return envelope(data,a.retail_funding_receipt);
  }
  const first=await locked(),p=first.receipt.proof,b=p?.period;
- check(first.receipt.version==='retail_existing_funding_v1'&&b?.version==='retail_initial_provider_period_v1',
+ const generation=terms.offer.offer_version===GENERATION_DATE_OFFER_VERSION;
+ check(first.receipt.version==='retail_existing_funding_v1'&&b?.version===(generation
+  ?'retail_generation_initial_schedule_v1':'retail_initial_provider_period_v1'),
   'retail_funding_replay_ack_unknown');
  check(typeof eventLivemode==='boolean'&&eventLivemode===b.livemode
   &&(!eventSessionId||eventSessionId===b.checkout_session_id)
@@ -64,7 +67,8 @@ async function readReceipt({db,stripe,agreementId,intentId,eventSessionId,eventS
  const funding={agreementId,clientId:a.client_id,packageSnapshot:plain(terms.packageSnapshot),sourceTemplate:plain(a.template_snapshot),
   sourceTemplateVersion:a.template_version,sourceIntentId:i?.id||null,paidAt:b.paid_at,
   checkoutSessionId:b.checkout_session_id,customerId:b.customer_id,subscription,
-  replay:first.phase==='paid',initialProviderPeriod:b,receiptReplay:true,
+  replay:first.phase==='paid',...(generation?{initialProviderSchedule:b,sourceCheckoutPrices:plain(a.retail_checkout_prices)}
+    :{initialProviderPeriod:b}),receiptReplay:true,
   invoiceId:b.invoice_id,paymentIntentId:p.payment_intent_id,chargeId:p.charge_id,
   checkoutCreatedEpoch:p.checkout_created,invoiceCreatedEpoch:p.invoice_created,
   platformGrossCents:p.platform_gross_cents,platformDiscountCents:p.platform_discount_cents,platformNetCents:p.platform_net_cents,
