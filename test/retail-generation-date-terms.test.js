@@ -6,6 +6,7 @@ const {buildRetailPackageSnapshot,readRetailPackageOffer}=require('../src/servic
 const {retailAgreementTerms,validateRetailAgreementSource,retailQuoteCatalog,normalizeRetailQuoteSelection,RETAIL_TEMPLATE,retailAgreementTermWindow}=require('../src/services/retailQuoteSelection');
 const {buildMembershipAgreementHtml}=require('../src/render/membershipAgreement');
 const VERSION='retail-stripe-terms-2026-10-15-v3';
+const {retailSigningRenewalNotice}=require('../src/services/retailQuoteSelection');
 const selection=(months,version=VERSION)=>({planKey:'basic',commitmentMonths:months,paymentOption:'prepaid',
   channel:'public',offerVersion:version,firstRolePrepaySelected:false});
 
@@ -119,6 +120,19 @@ function agreementFixture(months=3,payment='prepaid',generatedAt='2026-01-31T23:
     template_version:RETAIL_TEMPLATE,initial_term_start:terms.initial_term_start,initial_renewal_date:terms.initial_renewal_date,
     template_snapshot:{template_version:RETAIL_TEMPLATE,generated_at:generatedAt,package_snapshot:pkg,values:normalized}}};
 }
+
+test('signer reminder-only classification requires the validated accepted retail source, not a plan label',()=>{
+  const {agreement}=agreementFixture();
+  assert.equal(retailSigningRenewalNotice(agreement),'reminder_only');
+  for(const changed of [
+    {membership_tier:'basic',notice_deadline_days:30},
+    {membership_tier:'enterprise',notice_deadline_days:30},
+    {...agreement,initial_renewal_date:'2027-01-01'},
+    {...agreement,template_version:'legacy'},
+    {...agreement,notice_deadline_days:60},
+    {...agreement,template_snapshot:{...agreement.template_snapshot,generated_at:null}}
+  ]) assert.equal(retailSigningRenewalNotice(changed),null);
+});
 
 test('delayed payment cannot move the fixed term or month-end renewals; actual cash date stays separate',()=>{
   for(const payment of ['prepaid','monthly_installments'])for(const months of [3,6,12]){

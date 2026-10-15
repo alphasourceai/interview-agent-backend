@@ -1,5 +1,5 @@
 'use strict';
-const { validateRetailAgreementSource } = require('../../../services/retailQuoteSelection');
+const { validateRetailAgreementSource, retailSigningRenewalNotice } = require('../../../services/retailQuoteSelection');
 
 // Opening a signing session and recording the signature.
 
@@ -104,6 +104,7 @@ router.post('/session', publicAgreementTokenRateLimit, async (req, res) => {
         billing_option: agreement.billing_option,
         auto_renew: agreement.auto_renew,
         notice_deadline_days: agreement.notice_deadline_days,
+        renewal_notice_type: retailSigningRenewalNotice(agreement),
         initial_term_start: agreement.initial_term_start,
         initial_renewal_date: agreement.initial_renewal_date,
         expires_at: agreement.agreement_expires_at || agreement.signer_token_expires_at,

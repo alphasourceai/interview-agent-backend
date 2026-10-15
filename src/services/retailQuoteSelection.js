@@ -111,6 +111,17 @@ function validateRetailAgreementSource(agreement, intent) {
   return offer;
 }
 
+// Display classification from the accepted source, never from tier/cadence.
+// Old/Enterprise agreements retain their own notice deadline. A malformed
+// retail source must not acquire the more permissive reminder-only wording.
+function retailSigningRenewalNotice(agreement) {
+  try {
+    const offer = validateRetailAgreementSource(agreement);
+    return offer?.renewal?.non_renewal_cutoff === 'before_term_end'
+      ? 'reminder_only' : null;
+  } catch (_) { return null; }
+}
+
 // Reuse the existing contract calendar for both cohorts. Actual cash remains
 // paidAt; only prospective generation-date agreements take their legal anchor
 // from the immutable rendered source. This computes dates, not payment proof.
@@ -131,4 +142,5 @@ function retailAgreementTermWindow({ agreement, paidAt, termIndex = 0 } = {}) {
   return retailTermWindow({ originalStart, commitmentMonths: offer.commitment_months, termIndex });
 }
 module.exports = { RETAIL_TEMPLATE, enabled, normalizeRetailQuoteSelection, quotePackageOptions,
-  retailAgreementTerms, validateRetailIntentSource, validateRetailAgreementSource, retailQuoteCatalog, retailAgreementTermWindow };
+  retailAgreementTerms, validateRetailIntentSource, validateRetailAgreementSource, retailQuoteCatalog, retailAgreementTermWindow,
+  retailSigningRenewalNotice };
