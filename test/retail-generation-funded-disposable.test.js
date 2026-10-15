@@ -27,6 +27,32 @@ const agreement=r=>json(`select to_jsonb(t) from membership_agreements t where i
 const client=r=>json(`select to_jsonb(t) from clients t where id=${lit(r.c.id)};`);
 const config={public_backend_base:'https://api.example.invalid',public_sign_base:'https://site.example.invalid'};
 
+// Same application JS adapters against REAL native RPCs/rows. This shim only
+// translates their existing read API to a private Unix-socket test connection;
+// no stubbed RPC ACK or application/table writes are supplied by the shim.
+function nativeDb(){return{
+ async rpc(name,args){assert.match(name,/^[a-z_]+$/);const out=run('set role service_role;'+rpc(name,args));
+  return out.status?{data:null,error:{message:out.stderr}}:{data:JSON.parse(out.stdout),error:null};},
+ from(table){assert.ok(['membership_agreements','public_purchase_intents','clients','billing_customers','client_members'].includes(table));
+  const filters=[];let counted=false;
+  const query={select(_columns,options={}){counted=options.count==='exact';return query;},
+   eq(key,value){assert.match(key,/^[a-z_]+$/);filters.push(key+'='+lit(value));return query;},
+   async maybeSingle(){const r=await execute();assert.ok(r.data.length<=1);return{data:r.data[0]||null,error:null};},
+   then(resolve,reject){return execute().then(resolve,reject);}};
+  async function execute(){const rows=json(`set role service_role;select coalesce(jsonb_agg(to_jsonb(t)),'[]') from ${table} t${filters.length?' where '+filters.join(' and '):''};`);
+   return{data:rows,error:null,...(counted?{count:rows.length}:{})};}
+  return query;
+ }
+};}
+function authoredSdk(r){const list=data=>({object:'list',has_more:false,data:structuredClone(data)});
+ return{getApiField:key=>key==='version'?'2023-10-16':null,
+  accounts:{retrieve:async()=>({object:'account',id:'acct_SYNTHETIC'})},
+  checkout:{sessions:{retrieve:async()=>structuredClone(r.cs),listLineItems:async()=>list(r.cl)}},
+  subscriptions:{retrieve:async()=>structuredClone(r.s)},subscriptionItems:{list:async()=>list(r.s.items.data)},
+  invoices:{retrieve:async()=>structuredClone(r.inv),listLineItems:async()=>list(r.il)},
+  paymentIntents:{retrieve:async()=>structuredClone(r.pi)},charges:{retrieve:async()=>structuredClone(r.ch)}};
+}
+
 function setup({plan='basic',months=3,payment='prepaid',role=false,admin=false,generation=true,legacyVersion,sales=false}={}){
  const now=Date.now(),generatedAt=new Date(now-3*3600000).toISOString(),paidAt=new Date(Math.floor(now/1000)*1000).toISOString();
  const f=generation?generationFixture(plan,months,payment,role,{admin,generatedAt,paidAt}):legacyFixture(plan,months,payment,role,{admin});
@@ -306,4 +332,30 @@ for(const payment of ['prepaid','monthly_installments'])test(`native pure date/c
   assert.equal(call('retail_existing_period_proof_valid',{p:proof,s:source}),true);
   assert.equal(call('retail_existing_period_proof_valid',{p:{...proof,provider_period_start:proof.provider_period_start+86400},s:source}),false);
  }
+});
+
+for(const admin of [false,true])test(`application funding/billing adapter + actual native database admin=${admin}`,opts,async()=>{
+ const r=setup({plan:'pro',months:6,payment:'monthly_installments',role:true,admin}),db=nativeDb(),stripe=authoredSdk(r);
+ const options={db,stripe,agreementId:r.g.id,intentId:admin?null:r.i.id,claimKey:r.claimKey,
+  eventSessionId:r.cs.id,eventSubscriptionId:r.s.id,eventLivemode:false};
+ const {recordExistingRetailFunding}=require('../src/services/existingRetailFundingReceipt');
+ const recorded=await recordExistingRetailFunding(options);
+ assert.equal(recorded.receipt.proof.period.version,'retail_generation_initial_schedule_v1');
+ assert.equal(agreement(r).checkout_paid_at,null);
+ complete(r);initial(r); // Load the existing pure client builder with no hosted client.
+ const apply=admin?require('../src/services/existingRetailAdminBillingAdapter').applyExistingRetailAdminBilling:
+  require('../src/services/existingRetailLinkedBillingAdapter').applyExistingRetailLinkedBilling;
+ const result=await apply(options);assert.equal(result.status,'applied');
+ assert.equal((await apply(options)).status,'already_applied');
+ assert.equal(client(r).billing_status,'active');assert.equal(client(r).subscription_status,'trialing');
+ assert.equal(new Date(client(r).contract_start_at).toISOString(),r.g.initial_term_start+'T00:00:00.000Z');
+ assert.equal(sql(`select count(*) from client_role_credits where source_membership_agreement_id=${lit(r.g.id)};`),'1');
+ const prepare=admin?require('../src/services/existingRetailAdminMemberTail').prepareExistingRetailAdminMemberTail:
+  require('../src/services/existingRetailLinkedMemberTail').prepareExistingRetailLinkedMemberTail;
+ const tail=await prepare(options);await tail.assertReady();
+ const userId=crypto.randomUUID();
+ sql(`insert into auth.users(id,email) values(${lit(userId)},${lit(agreement(r).admin_email)});`);
+ assert.equal((await tail.ensureMember({userId,name:'Synthetic Buyer'})).status,'created');
+ assert.equal((await tail.ensureMember({userId,name:'Synthetic Buyer'})).status,'existing');
+ assert.equal(sql(`select count(*) from client_members where client_id=${lit(r.c.id)} and user_id=${lit(userId)};`),'1');
 });
