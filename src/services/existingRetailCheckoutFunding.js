@@ -263,6 +263,10 @@ async function readExistingRetailCheckoutFunding({db,stripe,agreementId,intentId
   const expected={checkoutId,customerId:client.stripe_customer_id,signedAt:agreement.signed_at,
     agreementDeadline:agreement.agreement_expires_at,intentDeadline:intent?.expires_at};
   const generation=terms.offer.offer_version===GENERATION_DATE_OFFER_VERSION;
+  // Only the trusted SDK response root may carry inert lastResponse metadata.
+  // Strip it before composing the v3 pure proof graph, not inside that policy.
+  // Historical cohorts keep their existing raw-response behavior.
+  const readProvider=async call=>{const value=await call();return generation?snapshot(value):value;};
   if(generation) Object.assign(expected,{generatedAt:agreement.template_snapshot.generated_at,
     initialTermStart:agreement.initial_term_start,initialRenewalDate:agreement.initial_renewal_date,
     prices:structuredClone(agreement.retail_checkout_prices)});
@@ -270,9 +274,9 @@ async function readExistingRetailCheckoutFunding({db,stripe,agreementId,intentId
     sourceTemplate:structuredClone(agreement.template_snapshot),sourceTemplateVersion:agreement.template_version,
     sourceIntentId:intent?.id || null,
     ...(generation?{sourceCheckoutPrices:structuredClone(agreement.retail_checkout_prices)}:{})};
-  await assertFence();const checkout=await stripe.checkout.sessions.retrieve(checkoutId);
+  await assertFence();const checkout=await readProvider(()=>stripe.checkout.sessions.retrieve(checkoutId));
   check(typeof id(checkout?.subscription)==='string','retail_funding_subscription_mismatch');
-  await assertFence();const subscription=await stripe.subscriptions.retrieve(id(checkout.subscription));
+  await assertFence();const subscription=await readProvider(()=>stripe.subscriptions.retrieve(id(checkout.subscription)));
   sessionIdentity({checkout,subscription,expected,eventLivemode,eventSubscriptionId});
   if(generation) Object.assign(expected,{subscriptionId:subscription.id,eventLivemode});
   const applied=agreement.checkout_paid_at||intent?.activated_at;
@@ -292,21 +296,21 @@ async function readExistingRetailCheckoutFunding({db,stripe,agreementId,intentId
       'retail_funding_original_clock_mismatch');
   }
   let invoice;
-  if(id(checkout.invoice)){await assertFence();invoice=await stripe.invoices.retrieve(id(checkout.invoice));}
+  if(id(checkout.invoice)){await assertFence();invoice=await readProvider(()=>stripe.invoices.retrieve(id(checkout.invoice)));}
   else {
-    const all=await collect(after=>stripe.invoices.list({subscription:subscription.id,limit:100,...(after?{starting_after:after}:{})}),assertFence);
+    const all=await collect(after=>readProvider(()=>stripe.invoices.list({subscription:subscription.id,limit:100,...(after?{starting_after:after}:{})})),assertFence);
     const initial=all.data.filter(i=>i.billing_reason==='subscription_create' && epoch(i.created) && epoch(i.status_transitions?.paid_at)
       && i.created>=checkout.created && i.created<=i.status_transitions.paid_at);
-    check(initial.length===1,'retail_funding_initial_invoice_ambiguous');await assertFence();invoice=await stripe.invoices.retrieve(initial[0].id);
+    check(initial.length===1,'retail_funding_initial_invoice_ambiguous');await assertFence();invoice=await readProvider(()=>stripe.invoices.retrieve(initial[0].id));
   }
   check(!eventInvoiceId || eventInvoiceId===invoice.id,'retail_funding_invoice_identity');
-  const checkoutLines=await collect(after=>stripe.checkout.sessions.listLineItems(checkoutId,{limit:100,...(after?{starting_after:after}:{})}),assertFence);
-  const invoiceLines=await collect(after=>stripe.invoices.listLineItems(invoice.id,{limit:100,...(after?{starting_after:after}:{})}),assertFence);
-  const subscriptionItems=await collect(after=>stripe.subscriptionItems.list({subscription:subscription.id,limit:100,...(after?{starting_after:after}:{})}),assertFence);
+  const checkoutLines=await collect(after=>readProvider(()=>stripe.checkout.sessions.listLineItems(checkoutId,{limit:100,...(after?{starting_after:after}:{})})),assertFence);
+  const invoiceLines=await collect(after=>readProvider(()=>stripe.invoices.listLineItems(invoice.id,{limit:100,...(after?{starting_after:after}:{})})),assertFence);
+  const subscriptionItems=await collect(after=>readProvider(()=>stripe.subscriptionItems.list({subscription:subscription.id,limit:100,...(after?{starting_after:after}:{})})),assertFence);
   if(invoice.total===0)verifyExistingRetailFunding({offer:terms.offer,checkout,checkoutLines,subscription,subscriptionItems,invoice,invoiceLines,expected});
   check(typeof id(invoice.payment_intent)==='string' && typeof id(invoice.charge)==='string','retail_funding_charge_identity');
-  await assertFence();const paymentIntent=await stripe.paymentIntents.retrieve(id(invoice.payment_intent));
-  await assertFence();const charge=await stripe.charges.retrieve(id(invoice.charge));
+  await assertFence();const paymentIntent=await readProvider(()=>stripe.paymentIntents.retrieve(id(invoice.payment_intent)));
+  await assertFence();const charge=await readProvider(()=>stripe.charges.retrieve(id(invoice.charge)));
   const proof=verifyExistingRetailFunding({offer:terms.offer,checkout,checkoutLines,subscription,subscriptionItems,invoice,invoiceLines,paymentIntent,charge,expected});
   check(!applied || proof.paidAt===new Date(applied).toISOString(),'retail_funding_original_clock_mismatch');
   await assertFence();return{...source,...proof,checkoutSessionId:checkoutId,subscription,customerId:expected.customerId,replay:false};
