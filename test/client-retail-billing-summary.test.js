@@ -40,6 +40,7 @@ test('all retail terms show accepted platform payment and original-anchored memb
     assert.equal(result.platform_payment_cents, f.pkg.membership_terms.platform_payment_cents);
     assert.equal(result.platform_commitment_total_cents, f.pkg.membership_terms.platform_commitment_total_cents);
     assert.equal(result.current_term_end_at, f.client.contract_end_at);
+    assert.equal(result.term_start_basis, 'first_payment_success');
     assert.notEqual(result.current_term_end_at, f.client.current_term_end);
     assert.equal(result.auto_renew, false);
     assert.deepEqual(f.tables, before);

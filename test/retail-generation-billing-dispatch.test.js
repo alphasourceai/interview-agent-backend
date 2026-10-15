@@ -29,6 +29,7 @@ test(`new accepted terms use existing summary/subscription/notice ${plan}/${mont
  const bad=structuredClone(f.s);bad.items.data[0].price.id=f.g.retail_checkout_prices.initial_platform_price_id;
  assert.throws(()=>verify(context,bad),{code:'retail_subscription_terms_mismatch'});
  const result=await summary({db:f.db,client:f.c});assert.equal(result.stripe_renewal_billing_cutoff_at,cutoff);
+ assert.equal(result.term_start_basis,'generation_date');
  assert.equal(result.current_term_start_at,f.c.contract_start_at);assert.equal(result.current_term_end_at,f.c.contract_end_at);
  assert.ok(calls.includes('change_retail_existing_renewal'));
  const notice=render({package_snapshot:f.pkg,billing_cutoff_at:cutoff},{escapeHtml:x=>x,buildBrandedEmailShell:x=>x.contentHtml});

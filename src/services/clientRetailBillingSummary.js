@@ -23,6 +23,7 @@ async function readClientRetailBillingSummary({ db, client }) {
     installment_count: offer.installment_count,
     current_term_start_at: context.client.contract_start_at,
     current_term_end_at: context.client.contract_end_at,
+    term_start_basis: offer.term_start_basis,
     auto_renew: context.client.auto_renew,
     ...([STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(offer.offer_version)
       ? await readExistingRetailRenewalSummary({ db, agreementId: context.agreementId, clientId: client.id }) : {})
