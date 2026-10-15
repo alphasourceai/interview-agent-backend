@@ -14,6 +14,8 @@ const { enterpriseSettingsMetadata, validateEnterpriseSettings } = require('./en
 const {createExistingEnterpriseCheckout}=require('./existingEnterpriseCheckoutAttempt')
 const { readRetailPackageOffer } = require('./membershipPackageCompatibility')
 const { isDeepStrictEqual } = require('node:util')
+const { retailGenerationCollectionSchedule } = require('./membershipOffers')
+const { validateRetailAgreementSource } = require('./retailQuoteSelection')
 const { claimExistingRetailAttempt, assertWindow, frozenRetailCancelUrl, readOpenRetailSession,
   pinExistingRetailSession,ensureRetailBillingProfile } = require('./existingRetailCheckoutAttempt')
 
@@ -344,6 +346,13 @@ async function createSubscriptionCheckoutSession({
     throw makeError(409, 'retail_checkout_source_required', 'The existing signed agreement checkout source is required.')
   }
   const nowMs = now ? new Date(now).getTime() : Date.now()
+  let generationSchedule = null
+  if (retailOffer?.term_start_basis === 'generation_date') {
+    validateRetailAgreementSource(retailAgreement)
+    generationSchedule = retailGenerationCollectionSchedule({ offer:retailOffer,
+      generatedAt:retailAgreement.template_snapshot.generated_at,initialTermStart:retailAgreement.initial_term_start,
+      initialRenewalDate:retailAgreement.initial_renewal_date,now:new Date(nowMs).toISOString() })
+  }
   let checkoutExpiresAtEpoch = null
   if (checkoutExpiresAt && !retailOffer) {
     const requestedExpiryMs = new Date(checkoutExpiresAt).getTime()
@@ -607,6 +616,9 @@ async function createSubscriptionCheckoutSession({
       }
     }
   } else if (retailOffer) {
+    if (generationSchedule) lineItems.push({ quantity:1, price_data:{ currency:'usd',unit_amount:retailOffer.platform_payment_cents,
+      product_data:{ name:`alphaScreen ${retailOffer.display_name} — initial ${retailOffer.payment_option === 'prepaid' ? `${retailOffer.commitment_months}-month platform payment` : 'monthly platform installment'}`,
+        metadata:{...retailMetadata,purchase_type:'initial_platform_membership'} } } })
     lineItems.push({ quantity:1, price_data:{ currency:'usd', unit_amount:retailOffer.platform_payment_cents,
       recurring:{ interval:'month', interval_count:retailOffer.stripe_recurrence.interval_count },
       product_data:{ name:`alphaScreen ${retailOffer.display_name} — ${retailOffer.commitment_months}-month ${retailOffer.payment_option === 'prepaid' ? 'prepaid' : 'commitment'}`,
@@ -706,12 +718,13 @@ async function createSubscriptionCheckoutSession({
             billing_cycle_anchor: nextFirstOfMonthEpoch(nowMs),
             proration_behavior: 'create_prorations'
           }
-        : {})
+        : generationSchedule ? { trial_end:generationSchedule.trial_end } : {})
     },
     ...(checkoutExpiresAtEpoch ? { expires_at: checkoutExpiresAtEpoch } : {})
   }
 
   let checkoutClientSecret = null
+  let retailPriceBinding = null
   let primaryCheckoutSession = null
   let hostedFallbackSession = null
   const createOptions = (suffix = '') => {
@@ -722,7 +735,8 @@ async function createSubscriptionCheckoutSession({
 
   if (retailAttempt?.checkout_session_id) {
     primaryCheckoutSession = await readOpenRetailSession({ stripe, sessionId:retailAttempt.checkout_session_id,
-      attempt:retailAttempt, offer:retailOffer, promotion:retailPromotion, metadata:checkoutMetadata,successUrl:checkoutSuccessUrl,cancelUrl:normalizedCancelUrl })
+      attempt:retailAttempt, offer:retailOffer, promotion:retailPromotion, metadata:checkoutMetadata,successUrl:checkoutSuccessUrl,cancelUrl:normalizedCancelUrl,
+      onPriceBinding:prices=>{retailPriceBinding=prices} })
     checkoutClientSecret = retailAttempt.embedded ? primaryCheckoutSession.client_secret : null
   }
 
@@ -775,9 +789,9 @@ async function createSubscriptionCheckoutSession({
     assertWindow(retailAttempt)
     if (!retailAttempt.checkout_session_id) primaryCheckoutSession = await readOpenRetailSession({ stripe,
       sessionId:primaryCheckoutSession?.id,attempt:retailAttempt,offer:retailOffer,promotion:retailPromotion,metadata:checkoutMetadata,
-      successUrl:checkoutSuccessUrl,cancelUrl:normalizedCancelUrl })
+      successUrl:checkoutSuccessUrl,cancelUrl:normalizedCancelUrl,onPriceBinding:prices=>{retailPriceBinding=prices} })
     await pinExistingRetailSession({ db:supabaseAdmin,agreement:retailAgreement,customerId:resolvedStripeCustomerId,
-      attempt:retailAttempt,sessionId:primaryCheckoutSession.id })
+      attempt:retailAttempt,sessionId:primaryCheckoutSession.id,priceBinding:retailPriceBinding })
     checkoutClientSecret = retailAttempt.embedded ? primaryCheckoutSession.client_secret : null
   }
 

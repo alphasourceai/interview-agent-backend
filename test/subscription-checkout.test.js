@@ -140,7 +140,13 @@ function makeDb() {
         return{data:structuredClone(attempt),error:null};
       }
       assert.equal(name,'pin_retail_existing_checkout_session');
-      const actual=this.attempts.get(args.p_agreement);assert.deepEqual(args.p_attempt,{...actual,checkout_session_id:args.p_attempt.checkout_session_id});
+      const actual=this.attempts.get(args.p_agreement);
+      const generation=actual.source.template_snapshot.package_snapshot.membership_terms?.term_start_basis==='generation_date';
+      if(generation){
+        assert.deepEqual(args.p_attempt,{...actual,prices:args.p_attempt.prices,checkout_session_id:args.p_attempt.checkout_session_id});
+        assert.ok(!actual.prices||require('node:util').isDeepStrictEqual(actual.prices,args.p_attempt.prices));
+        actual.prices=structuredClone(args.p_attempt.prices);
+      }else assert.deepEqual(args.p_attempt,{...actual,checkout_session_id:args.p_attempt.checkout_session_id});
       assert.ok(!actual.checkout_session_id||actual.checkout_session_id===args.p_session);
       actual.checkout_session_id=args.p_session;return{data:structuredClone(actual),error:null};
     },
@@ -178,8 +184,9 @@ function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder, custom
     }
   })
   let lastPayload,lastSession,lastPromotion;
+  const initialLineAmount=line=>lastPayload.subscription_data?.trial_end&&line.price_data.recurring?0:line.price_data.unit_amount;
   const lineDiscounts = () => {
-    const amounts=lastPayload.line_items.map(line=>line.price_data.unit_amount);
+    const amounts=lastPayload.line_items.map(initialLineAmount);
     if(!lastPayload.discounts?.length)return amounts.map(()=>0);
     const c=lastPromotion.coupon;
     if(c.percent_off!=null)return amounts.map(amount=>Math.round(amount*c.percent_off/100));
@@ -221,7 +228,7 @@ function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder, custom
             return lastSession;
           },
           retrieve:async sessionId=>{
-            const total=lastPayload.line_items.reduce((sum,l)=>sum+l.price_data.unit_amount,0);
+            const total=lastPayload.line_items.reduce((sum,l)=>sum+initialLineAmount(l),0);
             const promoId=lastPayload.discounts?.[0]?.promotion_code;
             const discount=lineDiscounts().reduce((sum,amount)=>sum+amount,0);
             const s={object:'checkout.session',id:sessionId,mode:'subscription',status:'open',payment_status:'unpaid',
@@ -235,9 +242,9 @@ function loadCheckout({ stripeCalls, stripeConstructor, sessionResponder, custom
             return sessionMutation?sessionMutation(s):s;
           },
           listLineItems:async()=>{ const lines={object:'list',has_more:false,data:lastPayload.line_items.map((l,n)=>({
-            id:`li_SYNTHETIC_${n}`,quantity:l.quantity,currency:'usd',amount_subtotal:l.price_data.unit_amount,
+            id:`li_SYNTHETIC_${n}`,quantity:l.quantity,currency:'usd',amount_subtotal:initialLineAmount(l),
             amount_discount:lineDiscounts()[n],amount_tax:0,
-            amount_total:l.price_data.unit_amount-lineDiscounts()[n],
+            amount_total:initialLineAmount(l)-lineDiscounts()[n],
             price:{object:'price',id:`price_SYNTHETIC_${n}`,currency:'usd',unit_amount:l.price_data.unit_amount,
               type:l.price_data.recurring?'recurring':'one_time',recurring:l.price_data.recurring?{...l.price_data.recurring,usage_type:'licensed'}:null}
           }))};return lineMutation?lineMutation(lines):lines; }
@@ -431,6 +438,63 @@ function retailSnapshot(planKey='basic',commitmentMonths=3,paymentOption='prepai
   })
 }
 function retailCalls() {return {sessions:[],customerUpdates:[],customerCreates:[],subscriptionLists:[]}}
+function generationArgs(plan,months,payment,role){
+  const {buildRetailPackageSnapshot}=require('../src/services/membershipPackageCompatibility');
+  const {GENERATION_DATE_OFFER_VERSION}=require('../src/services/membershipOffers');
+  const {retailAgreementTerms,RETAIL_TEMPLATE}=require('../src/services/retailQuoteSelection');
+  const {buildMembershipAgreementHtml}=require('../src/render/membershipAgreement');
+  const snapshot=buildRetailPackageSnapshot({planKey:plan,commitmentMonths:months,paymentOption:payment,
+    firstRolePrepaySelected:role,offerVersion:GENERATION_DATE_OFFER_VERSION,channel:'admin'});
+  const args=retailArgs(snapshot),generatedAt=new Date().toISOString();
+  const terms=retailAgreementTerms(snapshot,{generatedAt});
+  const {normalized}=buildMembershipAgreementHtml({...terms,client_legal_name:'SYNTHETIC ONLY'},
+    {packageSnapshot:snapshot,generatedAt});
+  Object.assign(args.retailAgreement,{...terms,membership_tier:plan,template_version:RETAIL_TEMPLATE,signer_accepted:true,
+    signed_at:generatedAt,status:'signed',is_current:true});
+  Object.assign(args.retailAgreement.template_snapshot,{template_version:RETAIL_TEMPLATE,generated_at:generatedAt,values:normalized});
+  return args;
+}
+test('generation-date Checkout charges initial platform once, defers recurring boundary, and pins distinct prices on the existing attempt',async()=>{
+  for(const plan of ['basic','pro'])for(const months of [3,6,12])
+  for(const payment of ['prepaid','monthly_installments'])for(const role of [false,true])for(const embedded of [false,true]){
+    const calls=retailCalls(),db=makeDb(),args={...generationArgs(plan,months,payment,role),embedded};
+    const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,db,
+      sessionResponder:()=>({id:'cs_GENERATION',url:'https://checkout.stripe.test/generation',
+        ...(embedded?{client_secret:'SYNTHETIC_NO_REAL_SECRET'}:{})})});
+    const result=await create(args),offer=args.packageSnapshot.membership_terms,p=calls.sessions[0].payload;
+    assert.equal(calls.sessions.length,1);assert.equal(result.fallbackSession,null);
+    assert.equal(p.line_items.length,role?3:2);
+    assert.equal(p.line_items[0].price_data.unit_amount,offer.platform_payment_cents);
+    assert.equal(p.line_items[0].price_data.recurring,undefined);
+    assert.deepEqual(p.line_items[1].price_data.recurring,{interval:'month',interval_count:payment==='prepaid'?months:1});
+    const {retailGenerationCollectionSchedule}=require('../src/services/membershipOffers');
+    const a=args.retailAgreement;
+    assert.equal(p.subscription_data.trial_end,retailGenerationCollectionSchedule({offer,generatedAt:a.template_snapshot.generated_at,
+      initialTermStart:a.initial_term_start,initialRenewalDate:a.initial_renewal_date,now:new Date().toISOString()}).trial_end);
+    assert.deepEqual(Object.keys(p.subscription_data).sort(),['metadata','trial_end']);
+    assert.equal(result.session.amount_subtotal,offer.initial_payment_cents);
+    const pin=db.rpcCalls.find(c=>c.name==='pin_retail_existing_checkout_session');
+    assert.deepEqual(pin.args.p_attempt.prices,{initial_platform_price_id:'price_SYNTHETIC_0',
+      recurring_platform_price_id:'price_SYNTHETIC_1',first_role_price_id:role?'price_SYNTHETIC_2':null});
+    const retry=await create(args);assert.equal(retry.session.id,result.session.id);
+    assert.equal(calls.sessions.length,1,'retry reuses the same confirmed payable Session');
+  }
+});
+test('generation-date malformed source, shifted dates, recurring initial charge and swapped prices hold without a replacement Session',async()=>{
+  for(const mutate of [a=>a.retailAgreement.initial_term_start='2099-01-01',
+    a=>a.retailAgreement.template_snapshot.generated_at='2099-01-01T00:00:00.000Z']){
+    const calls=retailCalls(),args=generationArgs('basic',3,'prepaid',true);mutate(args);
+    const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls});
+    await assert.rejects(create(args));assert.equal(calls.sessions.length,0);assert.equal(calls.customerUpdates.length,0);
+  }
+  for(const mutate of [list=>{list.data[1].amount_subtotal=list.data[1].price.unit_amount},
+    list=>{list.data[1].price.id=list.data[0].price.id},list=>{list.data[0].price.unit_amount--}]){
+    const calls=retailCalls(),args=generationArgs('basic',3,'prepaid',true),db=makeDb();
+    const {createSubscriptionCheckoutSession:create}=loadCheckout({stripeCalls:calls,db,lineMutation:list=>{mutate(list);return list}});
+    await assert.rejects(create(args),{code:'retail_checkout_session_prices_mismatch'});
+    assert.equal(calls.sessions.length,1);assert.equal(db.rpcCalls.filter(c=>c.name==='pin_retail_existing_checkout_session').length,0);
+  }
+});
 test('existing subscription checkout prices all24 retail variants from frozen package terms, without new Auth or Stripe-price configuration',async()=>{
   for(const planKey of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments'])for(const role of [false,true]){
     const calls=retailCalls(),snapshot=retailSnapshot(planKey,months,payment,role),offer=snapshot.membership_terms;

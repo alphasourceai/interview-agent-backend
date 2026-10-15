@@ -1007,7 +1007,8 @@ async function activatePublicPurchaseAgreementCheckout(options = {}) {
       p_create_client: !linkedClientId,
       p_plan_key: planKey,
       p_billing_interval: billingInterval,
-      p_term_start: paidDate.toISOString().slice(0, 10),
+      p_term_start: retailOffer?.term_start_basis === 'generation_date'
+        ? agreement.initial_term_start : paidDate.toISOString().slice(0, 10),
       p_renewal_date: renewalDate
     });
     if (prepareError) throw new Error(prepareError.message || 'Public purchase completion failed');

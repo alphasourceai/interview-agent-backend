@@ -6,7 +6,8 @@ const { readSavedRetailCheckoutTerms } = require('./savedMembershipCheckoutTerms
 const { isDeepStrictEqual } = require('node:util');
 const { snapshotStripeSdkData: snapshot } = require('./enterprisePoolPaymentProof');
 const { readRetailPackageOffer } = require('./membershipPackageCompatibility');
-const { STRIPE_RECURRING_OFFER_VERSION, anchoredMonthInstant, retailTermWindow } = require('./membershipOffers');
+const { STRIPE_RECURRING_OFFER_VERSION, GENERATION_DATE_OFFER_VERSION, anchoredMonthInstant, retailTermWindow,
+  retailGenerationCollectionSchedule, buildRetailOffer } = require('./membershipOffers');
 const { readExistingRetailRecurringSource } = require('./existingRetailRecurringSource');
 const { readExistingRetailRecurringCensus } = require('./existingRetailRecurringCensus');
 function fail(code, permanent = false) { const e = new Error(code); e.code = code; e.status = 409; if(permanent)e.permanentFailure=true; throw e; }
@@ -54,6 +55,8 @@ function sessionIdentity({checkout,subscription,expected,eventLivemode,eventSubs
     && id(subscription.customer)===expected.customerId,'retail_funding_subscription_mismatch');
 }
 function verifyExistingRetailFunding({offer,checkout,checkoutLines,subscription,subscriptionItems,invoice,invoiceLines,paymentIntent,charge,expected}) {
+  if (offer?.offer_version === GENERATION_DATE_OFFER_VERSION) return verifyGenerationRetailFunding({offer,checkout,checkoutLines,
+    subscription,subscriptionItems,invoice,invoiceLines,paymentIntent,charge,expected});
   check((checkout.payment_status==='paid' || invoice?.total===0 && checkout.payment_status==='no_payment_required')
     && subscription.status==='active','retail_funding_not_settled');
   check(invoice?.object==='invoice' && invoice.billing_reason==='subscription_create' && invoice.currency==='usd'
@@ -90,25 +93,7 @@ function verifyExistingRetailFunding({offer,checkout,checkoutLines,subscription,
     else{check(roleNet===0,'retail_funding_unexpected_lines');roleNet=l.amount-d;roleDiscount=d;}
   }
   check(platformNet!==undefined,'retail_funding_unexpected_lines');
-  const invoiceDiscount=discounts(invoice.total_discount_amounts),tax=taxes(invoice.total_tax_amounts);
-  check(invoiceDiscount===sum(totals) && tax===lineTaxes && invoice.subtotal===offer.initial_payment_cents
-    && invoice.total===invoice.subtotal-invoiceDiscount+tax && cents(invoice.total)
-    && checkout.amount_subtotal===invoice.subtotal && checkout.amount_total===invoice.total,'retail_funding_invoice_amount_mismatch');
-  check(invoice.paid===true && invoice.status==='paid' && invoice.amount_remaining===0 && invoice.paid_out_of_band===false
-    && invoice.starting_balance===0 && invoice.ending_balance===0 && invoice.pre_payment_credit_notes_amount===0
-    && invoice.post_payment_credit_notes_amount===0 && invoice.amount_due===invoice.total && invoice.amount_paid===invoice.total,'retail_funding_cash_mismatch');
-  if(invoice.total===0)fail('retail_funding_zero_cash_requires_review',true);
-  check(paymentIntent?.object==='payment_intent' && charge?.object==='charge'
-    && paymentIntent.livemode===checkout.livemode && charge.livemode===checkout.livemode
-    && paymentIntent.currency==='usd' && charge.currency==='usd'
-    && id(paymentIntent.customer)===expected.customerId && id(charge.customer)===expected.customerId
-    && id(invoice.payment_intent)===paymentIntent.id && id(invoice.charge)===charge.id
-    && id(paymentIntent.invoice)===invoice.id && id(paymentIntent.latest_charge)===charge.id
-    && id(charge.invoice)===invoice.id && id(charge.payment_intent)===paymentIntent.id,'retail_funding_charge_identity');
-  check(paymentIntent.status==='succeeded' && paymentIntent.amount===invoice.total && paymentIntent.amount_received===invoice.total
-    && charge.status==='succeeded' && charge.paid===true && charge.captured===true
-    && charge.amount===invoice.total && charge.amount_captured===invoice.total
-    && charge.amount_refunded===0 && charge.refunded===false && charge.disputed===false,'retail_funding_cash_mismatch');
+  const tax=verifyInitialRetailSettlement({offer,checkout,invoice,paymentIntent,charge,expected,lineDiscounts:totals,lineTaxes});
   // Preserve the ORIGINAL platform invoice-line period B, separately from real
   // first cash A. Current subscription dates and role-line periods are not an
   // original-period receipt. Raw Stripe inclusive endpoints are not converted
@@ -129,6 +114,127 @@ function verifyExistingRetailFunding({offer,checkout,checkoutLines,subscription,
     checkoutCreatedEpoch:checkout.created,invoiceCreatedEpoch:invoice.created,
     platformGrossCents:offer.platform_payment_cents,platformDiscountCents:platformDiscount,platformNetCents:platformNet,
     roleGrossCents:offer.first_role_prepay.amount_cents,roleDiscountCents:roleDiscount,roleNetCents:roleNet,taxCents:tax,cashCents:invoice.total,initialProviderPeriod};
+}
+// Shared existing cash proof, without normalizing or inventing any provider
+// objects. Both accepted cohorts must reconcile the same actual captured money.
+function verifyInitialRetailSettlement({offer,checkout,invoice,paymentIntent,charge,expected,lineDiscounts,lineTaxes}) {
+  const invoiceDiscount=discounts(invoice.total_discount_amounts),tax=taxes(invoice.total_tax_amounts);
+  check(invoiceDiscount===sum(lineDiscounts) && tax===lineTaxes && invoice.subtotal===offer.initial_payment_cents
+    && invoice.total===invoice.subtotal-invoiceDiscount+tax && cents(invoice.total)
+    && checkout.amount_subtotal===invoice.subtotal && checkout.amount_total===invoice.total,'retail_funding_invoice_amount_mismatch');
+  check(invoice.paid===true && invoice.status==='paid' && invoice.amount_remaining===0 && invoice.paid_out_of_band===false
+    && invoice.starting_balance===0 && invoice.ending_balance===0 && invoice.pre_payment_credit_notes_amount===0
+    && invoice.post_payment_credit_notes_amount===0 && invoice.amount_due===invoice.total && invoice.amount_paid===invoice.total,'retail_funding_cash_mismatch');
+  if(invoice.total===0)fail('retail_funding_zero_cash_requires_review',true);
+  check(paymentIntent?.object==='payment_intent' && charge?.object==='charge'
+    && paymentIntent.livemode===checkout.livemode && charge.livemode===checkout.livemode
+    && paymentIntent.currency==='usd' && charge.currency==='usd'
+    && id(paymentIntent.customer)===expected.customerId && id(charge.customer)===expected.customerId
+    && id(invoice.payment_intent)===paymentIntent.id && id(invoice.charge)===charge.id
+    && id(paymentIntent.invoice)===invoice.id && id(paymentIntent.latest_charge)===charge.id
+    && id(charge.invoice)===invoice.id && id(charge.payment_intent)===paymentIntent.id,'retail_funding_charge_identity');
+  check(paymentIntent.status==='succeeded' && paymentIntent.amount===invoice.total && paymentIntent.amount_received===invoice.total
+    && charge.status==='succeeded' && charge.paid===true && charge.captured===true
+    && charge.amount===invoice.total && charge.amount_captured===invoice.total
+    && charge.amount_refunded===0 && charge.refunded===false && charge.disputed===false,'retail_funding_cash_mismatch');
+  return tax;
+}
+
+// Prospective native initial-invoice shape. A zero recurring trial line is a
+// schedule, NOT a funded recurring period. Classify cash using the distinct
+// IDs pinned on the existing attempt, never by "one_time" alone.
+function verifyGenerationRetailFunding(input) {
+  let saved;
+  try{saved=snapshot(input);}catch(_){fail('retail_generation_funding_source_mismatch');}
+  const {offer,checkout,checkoutLines,subscription,subscriptionItems,invoice,invoiceLines,paymentIntent,charge,expected}=saved;
+  check(offer?.offer_version===GENERATION_DATE_OFFER_VERSION && offer.term_start_basis==='generation_date',
+    'retail_generation_funding_source_mismatch');
+  let canonical;
+  try{canonical=buildRetailOffer({planKey:offer.plan_key,commitmentMonths:offer.commitment_months,paymentOption:offer.payment_option,
+    firstRolePrepaySelected:offer.first_role_prepay?.selected,channel:'sales',offerVersion:GENERATION_DATE_OFFER_VERSION});}
+  catch(_){fail('retail_generation_funding_source_mismatch');}
+  check(isDeepStrictEqual(offer,canonical),'retail_generation_funding_source_mismatch');
+  const prices=expected?.prices;
+  check(prices && Object.keys(prices).sort().join(',')==='first_role_price_id,initial_platform_price_id,recurring_platform_price_id'
+    && [prices.initial_platform_price_id,prices.recurring_platform_price_id].every(p=>/^price_[A-Za-z0-9_]+$/.test(p||''))
+    && (offer.first_role_prepay.selected ? /^price_[A-Za-z0-9_]+$/.test(prices.first_role_price_id||'') : prices.first_role_price_id===null)
+    && new Set(Object.values(prices).filter(Boolean)).size===Object.values(prices).filter(Boolean).length,
+    'retail_generation_funding_price_binding_required');
+  check(checkout && subscription && invoice && epoch(checkout.created)
+    && /^cs_[A-Za-z0-9_]{1,250}$/.test(expected.checkoutId||'')
+    && /^sub_[A-Za-z0-9_]{1,250}$/.test(expected.subscriptionId||'')
+    && /^cus_[A-Za-z0-9_]{1,250}$/.test(expected.customerId||'')
+    && /^pi_[A-Za-z0-9_]{1,250}$/.test(paymentIntent?.id||'')
+    && /^ch_[A-Za-z0-9_]{1,250}$/.test(charge?.id||''),'retail_generation_funding_source_mismatch');
+  sessionIdentity({checkout,subscription,expected,eventLivemode:expected.eventLivemode,eventSubscriptionId:expected.subscriptionId});
+  check(checkout.payment_status==='paid' && ['trialing','active'].includes(subscription.status), 'retail_funding_not_settled');
+  let schedule;
+  try{schedule=retailGenerationCollectionSchedule({offer,generatedAt:expected.generatedAt,
+    initialTermStart:expected.initialTermStart,initialRenewalDate:expected.initialRenewalDate,
+    now:new Date(checkout.created*1000).toISOString()});}catch(_){fail('retail_generation_funding_calendar_mismatch');}
+  const paid=invoice.status_transitions?.paid_at;
+  check(invoice.object==='invoice' && /^in_[A-Za-z0-9_]+$/.test(invoice.id||'') && invoice.billing_reason==='subscription_create'
+    && invoice.currency==='usd' && invoice.livemode===checkout.livemode && id(invoice.customer)===expected.customerId
+    && id(invoice.subscription)===subscription.id && id(checkout.invoice)===invoice.id,'retail_funding_invoice_identity');
+  check(epoch(paid) && epoch(invoice.created) && invoice.created>=checkout.created && invoice.created<=paid
+    && paid*1000>=Date.parse(expected.signedAt) && paid*1000<Date.parse(expected.agreementDeadline)
+    && (!expected.intentDeadline || paid*1000<Date.parse(expected.intentDeadline))
+    && paid<schedule.trial_end,'retail_funding_paid_clock_invalid');
+  check(epoch(subscription.trial_start) && subscription.trial_start>=checkout.created
+    && subscription.start_date===subscription.trial_start && subscription.trial_start<=invoice.created
+    && subscription.trial_end===schedule.trial_end && subscription.billing_cycle_anchor===schedule.trial_end
+    && subscription.schedule===null && subscription.pause_collection===null && subscription.cancel_at===null
+    && subscription.cancel_at_period_end===false,'retail_generation_funding_schedule_mismatch');
+  if(subscription.status==='trialing')check(subscription.current_period_start===subscription.trial_start
+    && subscription.current_period_end===schedule.trial_end,'retail_generation_funding_schedule_mismatch');
+  const cs=list(checkoutLines),items=list(subscriptionItems),lines=list(invoiceLines),n=offer.first_role_prepay.selected?3:2;
+  check(cs.length===n && lines.length===n && items.length===1
+    && new Set(cs.map(l=>l.id)).size===n && new Set(lines.map(l=>l.id)).size===n
+    && new Set(cs.map(l=>id(l.price))).size===n && new Set(lines.map(l=>id(l.price))).size===n,'retail_funding_unexpected_lines');
+  const item=items[0];
+  check(item.object==='subscription_item' && /^si_[A-Za-z0-9_]+$/.test(item.id||'') && item.quantity===1
+    && id(item.subscription)===subscription.id && id(item.price)===prices.recurring_platform_price_id
+    && priceMatches(item.price,offer.platform_payment_cents,offer.stripe_recurrence),'retail_funding_price_mismatch');
+  let platformLine,recurringLine,platformNet,platformDiscount,roleNet=0,roleDiscount=0,lineTaxes=0;
+  const lineDiscounts=[];
+  for(const l of lines){
+    const priceId=id(l.price),initial=priceId===prices.initial_platform_price_id,
+      recurring=priceId===prices.recurring_platform_price_id,role=prices.first_role_price_id!==null&&priceId===prices.first_role_price_id;
+    const amount=initial?offer.platform_payment_cents:role?offer.first_role_prepay.amount_cents:0;
+    const priceAmount=recurring?offer.platform_payment_cents:amount;
+    const csLine=cs.find(c=>id(c.price)===priceId);
+    check((initial||recurring||role) && csLine && l.object==='line_item' && /^il_[A-Za-z0-9_]+$/.test(l.id||'')
+      && l.quantity===1 && l.currency==='usd' && l.proration===false && l.amount===amount
+      && priceMatches(l.price,priceAmount,recurring?offer.stripe_recurrence:null)
+      && priceMatches(csLine.price,priceAmount,recurring?offer.stripe_recurrence:null)
+      && csLine.quantity===1 && csLine.currency==='usd' && csLine.amount_subtotal===amount
+      && (recurring ? l.type==='subscription' && id(l.subscription)===subscription.id && id(l.subscription_item)===item.id
+        && l.period?.start===subscription.trial_start && l.period?.end===schedule.trial_end
+        : l.type==='invoiceitem' && !l.subscription_item && (!l.subscription||id(l.subscription)===subscription.id)),
+      'retail_funding_invoice_line_mismatch');
+    const d=discounts(l.discount_amounts),t=taxes(l.tax_amounts);
+    check(d<=amount && (offer.payment_option!=='prepaid'||d===0) && (!recurring||(d===0&&t===0))
+      && csLine.amount_discount===d && csLine.amount_tax===t && csLine.amount_total===amount-d+t,
+      'retail_funding_checkout_line_mismatch');
+    lineDiscounts.push(d);lineTaxes+=t;
+    if(initial){platformLine=l;platformNet=amount-d;platformDiscount=d;}
+    if(recurring)recurringLine=l;
+    if(role){roleNet=amount-d;roleDiscount=d;}
+  }
+  check(platformLine && recurringLine && platformNet>0,'retail_funding_not_settled');
+  const tax=verifyInitialRetailSettlement({offer,checkout,invoice,paymentIntent,charge,expected,lineDiscounts,lineTaxes});
+  const initialProviderSchedule=Object.freeze({version:'retail_generation_initial_schedule_v1',api_version:'2023-10-16',
+    generated_at:expected.generatedAt,initial_term_start:schedule.initial_term_start,initial_renewal_date:schedule.initial_renewal_date,
+    first_collection_at:schedule.first_collection_at,invoice_id:invoice.id,initial_platform_invoice_line_id:platformLine.id,
+    recurring_invoice_line_id:recurringLine.id,initial_platform_price_id:prices.initial_platform_price_id,
+    recurring_platform_price_id:prices.recurring_platform_price_id,first_role_price_id:prices.first_role_price_id,
+    subscription_id:subscription.id,subscription_item_id:item.id,customer_id:expected.customerId,checkout_session_id:checkout.id,
+    livemode:checkout.livemode,paid_at:new Date(paid*1000).toISOString(),provider_trial_start:subscription.trial_start,
+    provider_trial_end:schedule.trial_end,billing_cycle_anchor:subscription.billing_cycle_anchor});
+  return {paidAt:new Date(paid*1000).toISOString(),invoiceId:invoice.id,paymentIntentId:paymentIntent.id,chargeId:charge.id,
+    checkoutCreatedEpoch:checkout.created,invoiceCreatedEpoch:invoice.created,platformGrossCents:offer.platform_payment_cents,
+    platformDiscountCents:platformDiscount,platformNetCents:platformNet,roleGrossCents:offer.first_role_prepay.amount_cents,
+    roleDiscountCents:roleDiscount,roleNetCents:roleNet,taxCents:tax,cashCents:invoice.total,initialProviderSchedule};
 }
 async function readExistingRetailCheckoutFunding({db,stripe,agreementId,intentId,eventSessionId,eventSubscriptionId,eventInvoiceId,eventLivemode,assertFence=async()=>{}}) {
   await assertFence();
@@ -371,5 +477,5 @@ async function readExistingRetailRecurringFunding(input) {
     unknown();
   }
 }
-module.exports={readExistingRetailCheckoutFunding,verifyExistingRetailFunding,collect,assertExistingRetailFundingSource,
+module.exports={readExistingRetailCheckoutFunding,verifyExistingRetailFunding,verifyGenerationRetailFunding,collect,assertExistingRetailFundingSource,
   verifyExistingRetailRecurringFunding,readExistingRetailRecurringFunding};

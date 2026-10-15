@@ -5,6 +5,7 @@
 const { isDeepStrictEqual } = require('node:util');
 const { createHash } = require('node:crypto');
 const { collect } = require('./existingRetailCheckoutFunding');
+const { GENERATION_DATE_OFFER_VERSION } = require('./membershipOffers');
 function fail(code, status = 409) { const e = new Error(code);e.code = code;e.status = status;throw e; }
 const check = (v, code, status) => { if (!v) fail(code, status); };
 const id = v => typeof v === 'string' ? v : v?.id;
@@ -103,7 +104,24 @@ function priceMatches(price, amount, recurring) {
     && (recurring ? price.recurring?.interval === 'month' && price.recurring.interval_count === recurring.interval_count
       && price.recurring.usage_type === 'licensed' : price.recurring === null);
 }
-async function readOpenRetailSession({ stripe, sessionId, attempt, offer, promotion = null, metadata, successUrl, cancelUrl }) {
+function generationRetailPriceBinding({ offer, lines }) {
+  check(offer?.offer_version === GENERATION_DATE_OFFER_VERSION && offer.term_start_basis === 'generation_date',
+    'retail_checkout_generation_source_required');
+  check(Array.isArray(lines) && lines.length === (offer.first_role_prepay.selected ? 3 : 2)
+    && lines.every(l => l.quantity === 1 && l.currency === 'usd' && integer(l.amount_subtotal)),
+    'retail_checkout_session_prices_mismatch');
+  const recurring = lines.filter(l => priceMatches(l.price, offer.platform_payment_cents, offer.stripe_recurrence));
+  const initial = lines.filter(l => priceMatches(l.price, offer.platform_payment_cents, null));
+  const role = lines.filter(l => priceMatches(l.price, offer.first_role_prepay.amount_cents, null));
+  check(recurring.length === 1 && initial.length === 1 && role.length === (offer.first_role_prepay.selected ? 1 : 0)
+    && recurring[0].amount_subtotal === 0 && initial[0].amount_subtotal === offer.platform_payment_cents
+    && (!role.length || role[0].amount_subtotal === offer.first_role_prepay.amount_cents)
+    && new Set(lines.map(l => l.price.id)).size === lines.length,
+    'retail_checkout_session_prices_mismatch');
+  return Object.freeze({ initial_platform_price_id:initial[0].price.id, recurring_platform_price_id:recurring[0].price.id,
+    first_role_price_id:role[0]?.price.id || null });
+}
+async function readOpenRetailSession({ stripe, sessionId, attempt, offer, promotion = null, metadata, successUrl, cancelUrl, onPriceBinding }) {
   assertWindow(attempt);
   check(/^cs_[A-Za-z0-9_]+$/.test(sessionId || ''), 'retail_checkout_ack_unknown', 503);
   const session = await stripe.checkout.sessions.retrieve(sessionId, {expand:['total_details.breakdown']});
@@ -131,13 +149,20 @@ async function readOpenRetailSession({ stripe, sessionId, attempt, offer, promot
     check(price?.id === priceId && price.object === 'price', 'retail_checkout_session_prices_mismatch');
     line.price = price;
   }
-  check(data.length === (offer.first_role_prepay.selected ? 2 : 1)
+  const generation = offer.offer_version === GENERATION_DATE_OFFER_VERSION;
+  let prices;
+  if (generation) {
+    prices = generationRetailPriceBinding({ offer, lines:data });
+    if (attempt.prices != null) check(isDeepStrictEqual(prices, attempt.prices), 'retail_checkout_session_prices_mismatch');
+  } else check(data.length === (offer.first_role_prepay.selected ? 2 : 1)
     && data.every(l => l.quantity === 1 && l.currency === 'usd' && integer(l.amount_subtotal)
       && l.amount_subtotal === l.price?.unit_amount)
     && data.filter(l => priceMatches(l.price, offer.platform_payment_cents, offer.stripe_recurrence)).length === 1
     && data.filter(l => priceMatches(l.price, offer.first_role_prepay.amount_cents, null)).length === (offer.first_role_prepay.selected ? 1 : 0)
     && session.amount_subtotal === offer.initial_payment_cents && integer(session.amount_total) && session.amount_total > 0,
   'retail_checkout_session_prices_mismatch');
+  check(session.amount_subtotal === offer.initial_payment_cents && integer(session.amount_total) && session.amount_total > 0,
+    'retail_checkout_session_prices_mismatch');
   if (offer.payment_option === 'prepaid') check(session.allow_promotion_codes === false
     && session.total_details?.amount_discount === 0
     && (session.total_details?.amount_shipping === 0 || session.total_details?.amount_shipping === null)
@@ -188,15 +213,24 @@ async function readOpenRetailSession({ stripe, sessionId, attempt, offer, promot
     let u;try { u = new URL(session.url); }catch (_) { /* safe refusal */ }
     check(u?.protocol === 'https:' && !u.username && !u.password, 'retail_checkout_ack_unknown', 503);
   }
+  if (generation && typeof onPriceBinding === 'function') onPriceBinding(prices);
   return session;
 }
-async function pinExistingRetailSession({ db, agreement, customerId, attempt, sessionId }) {
+async function pinExistingRetailSession({ db, agreement, customerId, attempt, sessionId, priceBinding }) {
   assertAttempt(attempt, { agreement, customerId });
+  const generation = agreement.template_snapshot?.package_snapshot?.membership_terms?.offer_version === GENERATION_DATE_OFFER_VERSION;
+  if (generation) check(priceBinding && Object.keys(priceBinding).sort().join(',') === 'first_role_price_id,initial_platform_price_id,recurring_platform_price_id'
+    && Object.values(priceBinding).every(p => p === null || /^price_[A-Za-z0-9_]+$/.test(p))
+    && priceBinding.initial_platform_price_id && priceBinding.recurring_platform_price_id
+    && Boolean(priceBinding.first_role_price_id) === agreement.template_snapshot.package_snapshot.membership_terms.first_role_prepay.selected
+    && new Set(Object.values(priceBinding).filter(Boolean)).size === Object.values(priceBinding).filter(Boolean).length
+    && (attempt.prices == null || isDeepStrictEqual(attempt.prices,priceBinding)), 'retail_checkout_price_binding_required');
+  const pinnedAttempt = generation ? { ...attempt, prices:priceBinding } : attempt;
   const actual = await rpc(db, 'pin_retail_existing_checkout_session', {
-    p_agreement: agreement.id, p_client: agreement.client_id, p_attempt: attempt, p_session: sessionId
+    p_agreement: agreement.id, p_client: agreement.client_id, p_attempt: pinnedAttempt, p_session: sessionId
   });
-  check(isDeepStrictEqual(actual, { ...attempt, checkout_session_id: sessionId }), 'retail_checkout_pin_ack_unknown', 503);
+  check(isDeepStrictEqual(actual, { ...pinnedAttempt, checkout_session_id: sessionId }), 'retail_checkout_pin_ack_unknown', 503);
   return actual;
 }
 module.exports = { claimExistingRetailAttempt, assertAttempt, assertWindow, frozenRetailCancelUrl,
-  readOpenRetailSession, pinExistingRetailSession,ensureRetailBillingProfile };
+  readOpenRetailSession, pinExistingRetailSession,ensureRetailBillingProfile,generationRetailPriceBinding };
