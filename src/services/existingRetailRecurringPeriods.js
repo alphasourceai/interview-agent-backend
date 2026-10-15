@@ -4,12 +4,16 @@
 // provenance; these observations authorize no collection, access or payroll.
 const { isProxy } = require('node:util').types;
 const { readRetailPackageOffer } = require('./membershipPackageCompatibility');
-const { anchoredMonthInstant, retailTermWindow } = require('./membershipOffers');
+const { anchoredMonthInstant, retailTermWindow, GENERATION_DATE_OFFER_VERSION, retailGenerationTermDates } = require('./membershipOffers');
 const { snapshotStripeSdkData: snapshot } = require('./enterprisePoolPaymentProof');
 
 const INPUT_KEYS = ['packageSnapshot', 'originalPeriod', 'originalProviderAccountId', 'providerAccountId', 'invoices'];
 const PERIOD_KEYS = ['version', 'api_version', 'invoice_id', 'platform_invoice_line_id', 'price_id', 'subscription_id',
   'subscription_item_id', 'customer_id', 'checkout_session_id', 'livemode', 'paid_at', 'provider_period_start', 'provider_period_end'];
+const SCHEDULE_KEYS = ['version','api_version','generated_at','initial_term_start','initial_renewal_date','first_collection_at',
+  'invoice_id','initial_platform_invoice_line_id','recurring_invoice_line_id','initial_platform_price_id','recurring_platform_price_id',
+  'first_role_price_id','subscription_id','subscription_item_id','customer_id','checkout_session_id','livemode','paid_at',
+  'provider_trial_start','provider_trial_end','billing_cycle_anchor'];
 class PeriodError extends Error {
   constructor(code) { super(code); this.code = code; this.status = 409; }
 }
@@ -80,6 +84,30 @@ function originalTuple(value, interval) {
   if (endIso !== anchored(startIso, interval)) unsupported();
   return { period, startIso };
 }
+function generationTuple(value, offer) {
+  const period=snapshot(value);
+  check(period && exactKeys(period,SCHEDULE_KEYS) && period.version==='retail_generation_initial_schedule_v1'
+    && period.api_version==='2023-10-16' && typeof period.livemode==='boolean'
+    && offer.term_start_basis==='generation_date');
+  for(const [key,prefix] of [['invoice_id','in'],['initial_platform_invoice_line_id','il'],['recurring_invoice_line_id','il'],
+    ['initial_platform_price_id','price'],['recurring_platform_price_id','price'],['subscription_id','sub'],
+    ['subscription_item_id','si'],['customer_id','cus'],['checkout_session_id','cs']])check(nativeId(period[key],prefix));
+  check(offer.first_role_prepay.selected?nativeId(period.first_role_price_id,'price'):period.first_role_price_id===null);
+  check(new Set([period.initial_platform_price_id,period.recurring_platform_price_id,period.first_role_price_id].filter(Boolean)).size
+    ===(offer.first_role_prepay.selected?3:2) && period.initial_platform_invoice_line_id!==period.recurring_invoice_line_id);
+  const dates=retailGenerationTermDates({generatedAt:period.generated_at,commitmentMonths:offer.commitment_months});
+  const contractStart=dates.initial_term_start+'T00:00:00.000Z';
+  const first=anchored(contractStart,offer.stripe_recurrence.interval_count);
+  check(period.initial_term_start===dates.initial_term_start && period.initial_renewal_date===dates.initial_renewal_date
+    && period.first_collection_at===first && epochIso(period.provider_trial_end)===first
+    && period.billing_cycle_anchor===period.provider_trial_end
+    && typeof period.paid_at==='string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.000Z$/.test(period.paid_at));
+  const paid=Date.parse(period.paid_at)/1000;
+  check(epochIso(paid)===period.paid_at && epochIso(period.provider_trial_start)
+    && period.provider_trial_start*1000>=Date.parse(period.generated_at)
+    && paid>=period.provider_trial_start && paid<period.provider_trial_end);
+  return {period,startIso:first,contractStart};
+}
 function invoiceIdentity(invoice, period) {
   check(invoice?.object === 'invoice' && nativeId(invoice.id, 'in') && invoice.currency === 'usd'
     && typeof invoice.livemode === 'boolean' && invoice.livemode === period.livemode
@@ -100,9 +128,13 @@ function inspect(input) {
   const account = fields.providerAccountId.value;
   check(nativeId(originalAccount, 'acct') && nativeId(account, 'acct') && account === originalAccount);
   const interval = offer.stripe_recurrence.interval_count;
-  const { period, startIso } = originalTuple(fields.originalPeriod.value, interval);
-  const originalStart = new Date(period.provider_period_start * 1000);
-  const invoiceIds = new Set(), lineIds = new Set([period.platform_invoice_line_id]), cycles = [];
+  const generation=offer.offer_version===GENERATION_DATE_OFFER_VERSION;
+  const { period, startIso, contractStart } = generation
+    ? generationTuple(fields.originalPeriod.value,offer) : originalTuple(fields.originalPeriod.value, interval);
+  const originalStart = new Date(startIso);
+  const priceId=generation?period.recurring_platform_price_id:period.price_id;
+  const invoiceIds = new Set(), lineIds = new Set(generation
+    ? [period.initial_platform_invoice_line_id,period.recurring_invoice_line_id] : [period.platform_invoice_line_id]), cycles = [];
   let initialCount = 0;
   for (const rawInvoice of closedList(fields.invoices.value, 1000)) {
     const invoice = snapshot(rawInvoice);
@@ -122,7 +154,7 @@ function inspect(input) {
       && line.type === 'subscription' && line.proration === false && line.quantity === 1
       && line.currency === 'usd' && line.subscription === period.subscription_id
       && line.subscription_item === period.subscription_item_id
-      && price?.object === 'price' && price.id === period.price_id && price.currency === 'usd'
+      && price?.object === 'price' && price.id === priceId && price.currency === 'usd'
       && price.type === 'recurring' && price.unit_amount === offer.platform_payment_cents
       && line.amount === offer.platform_payment_cents && price.recurring?.interval === 'month'
       && price.recurring.interval_count === interval && price.recurring.usage_type === 'licensed');
@@ -132,17 +164,20 @@ function inspect(input) {
     const lineStart = new Date(line.period.start * 1000);
     const offset = (lineStart.getUTCFullYear() - originalStart.getUTCFullYear()) * 12
       + lineStart.getUTCMonth() - originalStart.getUTCMonth();
-    if (offset <= 0 || offset % interval !== 0 || lineStartIso !== anchored(startIso, offset)
+    if ((generation?offset<0:offset<=0) || offset % interval !== 0 || lineStartIso !== anchored(startIso, offset)
       || lineEndIso !== anchored(startIso, offset + interval)) unsupported();
-    const ordinal = offset / interval;
+    const ordinal = offset / interval + (generation?1:0);
     const termIndex = offer.payment_option === 'prepaid' ? ordinal : Math.floor(ordinal / offer.commitment_months);
     let term;
-    try { term = retailTermWindow({ originalStart: period.paid_at, commitmentMonths: offer.commitment_months, termIndex }); }
+    try { term = retailTermWindow({ originalStart: generation?contractStart:period.paid_at, commitmentMonths: offer.commitment_months, termIndex }); }
     catch (_) { unsupported(); }
     cycles.push({ ordinal, invoice_id: invoice.id, line_id: line.id,
       provider_period_start: line.period.start, provider_period_end: line.period.end,
-      observed_original_a_period_start: anchored(period.paid_at, offset),
-      observed_original_a_period_end: anchored(period.paid_at, offset + interval),
+      ...(generation?{
+        observed_generation_period_start:anchored(contractStart,ordinal*interval),
+        observed_generation_period_end:anchored(contractStart,(ordinal+1)*interval)
+      }:{observed_original_a_period_start: anchored(period.paid_at, offset),
+        observed_original_a_period_end: anchored(period.paid_at, offset + interval)}),
       term_index: term.term_index,
       installment_index: offer.payment_option === 'prepaid' ? 1 : ordinal % offer.commitment_months + 1,
       observed_term_start_at: term.term_start_at, observed_term_end_at: term.term_end_at });
@@ -150,7 +185,7 @@ function inspect(input) {
   check(initialCount === 1);
   cycles.sort((a, b) => a.ordinal - b.ordinal);
   check(cycles.every((cycle, index) => cycle.ordinal === index + 1));
-  return freeze({ version: 'retail_recurring_period_observation_v1', effect_authorized: false, collection_ready: false,
+  return freeze({ version: generation?'retail_generation_recurring_period_observation_v1':'retail_recurring_period_observation_v1', effect_authorized: false, collection_ready: false,
     paid_access_authorized: false, collection_absence_proven: false, provider_effect_absence_proven: false,
     cycle_count: cycles.length, cycles });
 }

@@ -5,23 +5,24 @@ const {buildRetailPackageSnapshot}=require('../../src/services/membershipPackage
 const {GENERATION_DATE_OFFER_VERSION,retailGenerationTermDates,retailGenerationCollectionSchedule}=require('../../src/services/membershipOffers');
 const {retailAgreementTerms}=require('../../src/services/retailQuoteSelection');
 const {buildMembershipAgreementHtml}=require('../../src/render/membershipAgreement');
-const GENERATED='2026-01-31T10:00:00.000Z',PAID='2026-02-02T11:00:20.000Z',A=Date.parse(PAID)/1000;
-function generationFixture(plan='basic',months=3,payment='prepaid',role=false,{admin=false}={}){
+const GENERATED='2026-01-31T10:00:00.000Z',PAID='2026-02-02T11:00:20.000Z';
+function generationFixture(plan='basic',months=3,payment='prepaid',role=false,{admin=false,generatedAt=GENERATED,paidAt=PAID}={}){
+ const A=Date.parse(paidAt)/1000,deadline=new Date((A+5*86400)*1000).toISOString();
  const f=fixture(plan,months,payment,role,{admin});
  const pkg=buildRetailPackageSnapshot({planKey:plan,commitmentMonths:months,paymentOption:payment,
   firstRolePrepaySelected:role,channel:'sales',offerVersion:GENERATION_DATE_OFFER_VERSION});
- const dates=retailGenerationTermDates({generatedAt:GENERATED,commitmentMonths:months});
- const {normalized}=buildMembershipAgreementHtml({...retailAgreementTerms(pkg,{generatedAt:GENERATED}),
+ const dates=retailGenerationTermDates({generatedAt,commitmentMonths:months});
+ const {normalized}=buildMembershipAgreementHtml({...retailAgreementTerms(pkg,{generatedAt}),
   client_legal_name:'SYNTHETIC ONLY',primary_admin_name:'Synthetic Buyer',admin_email:'buyer@example.invalid'},
-  {packageSnapshot:pkg,generatedAt:GENERATED});
- const schedule=retailGenerationCollectionSchedule({offer:pkg.membership_terms,generatedAt:GENERATED,
+  {packageSnapshot:pkg,generatedAt});
+ const schedule=retailGenerationCollectionSchedule({offer:pkg.membership_terms,generatedAt,
   initialTermStart:dates.initial_term_start,initialRenewalDate:dates.initial_renewal_date,now:new Date((A-20)*1000).toISOString()});
- Object.assign(f.g,{...dates,signed_at:'2026-02-02T10:00:00.000Z',agreement_expires_at:'2026-02-07T10:00:00.000Z',
-  template_snapshot:{source:admin?'admin':'sales_assisted',template_version:f.g.template_version,generated_at:GENERATED,
+ Object.assign(f.g,{...dates,signed_at:new Date((A-3600)*1000).toISOString(),agreement_expires_at:deadline,
+  template_snapshot:{source:admin?'admin':'sales_assisted',template_version:f.g.template_version,generated_at:generatedAt,
    package_snapshot:pkg,values:normalized,...(admin?{}:{purchase_intent:{id:f.i.id}})}});
  f.g.checkout_attempt_source={version:'retail_existing_checkout_attempt_v1',agreement_id:f.g.id,client_id:f.c.id,
   customer_id:f.c.stripe_customer_id,template_snapshot:structuredClone(f.g.template_snapshot)};
- Object.assign(f.i,{package_snapshot:pkg,term_start_basis:'generation_date',expires_at:'2026-02-07T10:00:00.000Z'});
+ Object.assign(f.i,{package_snapshot:pkg,term_start_basis:'generation_date',expires_at:deadline});
  const recurring=f.cl[0].price,initial={...recurring,id:'price_INITIAL_PLATFORM',type:'one_time',recurring:null};
  const rolePrice=role?f.cl[1].price:null;
  const entries=[{id:'li_INITIAL_PLATFORM',price:initial,amount:pkg.platform_fee_cents},
