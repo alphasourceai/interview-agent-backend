@@ -217,6 +217,12 @@ router.post('/purchase-intents/:id/email-verification/send', async (req, res) =>
         .eq('id', issued.verification_id)
         .is('used_at', null)
       console.error('[alphascreen/email-verification] send_failed:', error?.code || 'unknown')
+      if (error?.code === 'DEV_PRICING_TEST_MAIL_DENIED') {
+        return sendVerificationResponse(res, req, 403, {
+          code: 'DEV_PRICING_TEST_MAIL_DENIED',
+          detail: 'Dev email delivery is limited to approved test addresses.'
+        })
+      }
       return sendVerificationResponse(res, req, 503, {
         code: 'RETAIL_EMAIL_VERIFICATION_SEND_FAILED',
         detail: 'We couldn\'t send the verification code. Try again in a moment.'

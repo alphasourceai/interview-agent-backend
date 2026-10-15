@@ -6,9 +6,16 @@ const msg={from:'info@alphasourceai.com',to:a,subject:'SYNTHETIC DEV ONLY',text:
 test('configured recipient set is exact, bounded and only owner-controlled dev aliases',()=>{
  assert.deepEqual(policy.ownerMailRecipients(undefined),[]);assert.deepEqual(policy.ownerMailRecipients(''),[]);
  assert.deepEqual(policy.ownerMailRecipients(' '+a+', '+b+' '),[a,b]);
+ assert.deepEqual(policy.ownerMailRecipients(a+',jason+devcorp@alphasourceai.com'),[a,'jason+devcorp@alphasourceai.com']);
  for(const raw of [a.toUpperCase(),a+',',a+','+a,'jason@alphasourceai.com','jason+salesbuyerqa@alphasourceai.com',
-  'michael@alphasourceai.com','jason+pricingdev-test@untrusted.invalid','jason+pricingdev-*','Name <'+a+'>',a+'\r\nBcc:'+b,
+  'michael@alphasourceai.com','jason+devcorp-other@alphasourceai.com','jason+devcorp@untrusted.invalid',
+  'jason+pricingdev-test@untrusted.invalid','jason+pricingdev-*','Name <'+a+'>',a+'\r\nBcc:'+b,
   Array.from({length:31},(_,i)=>`jason+pricingdev-${i}@alphasourceai.com`).join(',')])assert.throws(()=>policy.ownerMailRecipients(raw));
+});
+test('devcorp is eligible for explicit configuration, never implicitly allowed to receive mail',()=>{
+ const devcorp='jason+devcorp@alphasourceai.com';
+ assert.throws(()=>policy.assertOwnerOnlyMail({...msg,to:devcorp},[a,b]),{code:'DEV_PRICING_TEST_MAIL_DENIED'});
+ policy.assertOwnerOnlyMail({...msg,to:devcorp},[a,b,devcorp]);
 });
 test('actual installed SendGrid canonicalization covers each real to/cc/bcc and personalization before send',()=>{
  for(const value of [msg,{...msg,to:[a,b],cc:{email:b,name:'Owner QA'}},

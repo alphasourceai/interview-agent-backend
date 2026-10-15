@@ -2,7 +2,7 @@
 // Exact owner-only recipient fence on the existing SendGrid transport, not a
 // new sender, invitation, queue or notification workflow.
 const {validMembershipBuyerEmail}=require('../services/membershipCapabilityPredicates');
-function denied(){throw new Error('dev_pricing_test_mail_denied');}
+function denied(){throw Object.assign(new Error('dev_pricing_test_mail_denied'),{code:'DEV_PRICING_TEST_MAIL_DENIED'});}
 function address(value){
  if(value&&typeof value==='object'&&!Array.isArray(value)){
   if(!Object.keys(value).every(k=>['email','name'].includes(k))||typeof value.email!=='string'
@@ -19,7 +19,7 @@ function ownerMailRecipients(raw){
  const result=parts.map(address);
  if(parts.some((s,i)=>s!==result[i]))denied();
  if(!result.length||result.length>30||new Set(result).size!==result.length
-  ||result.some(e=>!/^jason\+pricingdev-[a-z0-9-]+@alphasourceai\.com$/.test(e)))denied();
+  ||result.some(e=>e!=='jason+devcorp@alphasourceai.com'&&!/^jason\+pricingdev-[a-z0-9-]+@alphasourceai\.com$/.test(e)))denied();
  return result;
 }
 function assertOwnerOnlyMail(messages,allowed){

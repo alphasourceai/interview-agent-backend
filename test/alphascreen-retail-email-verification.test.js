@@ -258,7 +258,9 @@ function buildApp(db, options = {}) {
   })
   injectModule(mailerPath, {
     async sendRetailSignupEmailVerificationCode(to, code, details) {
-      if (options.mailerError) throw new Error('mail_send_failed')
+      if (options.mailerError) throw Object.assign(new Error('mail_send_failed'), {
+        ...(typeof options.mailerError === 'string' ? { code: options.mailerError } : {})
+      })
       emails.push({ to, code, details })
       return { statusCode: 202 }
     }
@@ -499,6 +501,18 @@ test('email delivery failure invalidates the issued verification and never marks
   assert.equal(response.body.code, 'RETAIL_EMAIL_VERIFICATION_SEND_FAILED')
   assert.equal(db.purchaseIntents[0].email_verified_at, null)
   assert.equal(db.verifications[0].invalidation_reason, 'delivery_failed')
+})
+
+test('dev recipient denial is explicit, invalidates the undelivered code and never verifies the buyer', async () => {
+  const db = makeDb()
+  const { app, emails } = buildApp(db, { mailerError: 'DEV_PRICING_TEST_MAIL_DENIED' })
+  const response = await request(app, `/api/alphascreen/purchase-intents/${INTENT_ID}/email-verification/send`, { method: 'POST' })
+  assert.equal(response.status, 403)
+  assert.equal(response.body.code, 'DEV_PRICING_TEST_MAIL_DENIED')
+  assert.equal(db.purchaseIntents[0].email_verified_at, null)
+  assert.equal(db.verifications[0].invalidation_reason, 'delivery_failed')
+  assert.equal(emails.length, 0)
+  assert.equal(JSON.stringify(response.body).includes('mail_send_failed'), false)
 })
 
 test('retail SMS routes require consent, keep codes private, and verify through a timing-safe boolean boundary', async () => {
