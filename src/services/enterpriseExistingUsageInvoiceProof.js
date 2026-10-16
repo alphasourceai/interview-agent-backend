@@ -223,7 +223,11 @@ function verifyUsageInvoicePaid({ binding: b, invoiceId, invoice, items, lines, 
     && epoch(observationEpoch) && epoch(i.status_transitions?.paid_at) && i.status_transitions.paid_at <= observationEpoch);
   for (const [o, kind] of [[pi, 'payment_intent'], [ch, 'charge']]) check(o?.object === kind
     && o.customer === b.customer_id && o.livemode === b.livemode && o.currency === 'usd'
-    && o.amount === b.total_cents && epoch(o.created) && o.created <= i.status_transitions.paid_at);
+    // Provider object creation and invoice transition timestamps are separate
+    // clocks: a real Charge can be created just after invoice.paid_at. The
+    // fresh native observation bounds both, while the exact invoice/PI/charge
+    // graph, captured cash and refund census below still establish payment.
+    && o.amount === b.total_cents && epoch(o.created) && o.created <= observationEpoch);
   check(id(paymentMethodId, 'pm') && pi.payment_method === paymentMethodId && ch.payment_method === paymentMethodId
     && id(pi.id, 'pi') && id(ch.id, 'ch') && i.payment_intent === pi.id && i.charge === ch.id
     && pi.invoice === i.id && pi.latest_charge === ch.id && ch.invoice === i.id && ch.payment_intent === pi.id

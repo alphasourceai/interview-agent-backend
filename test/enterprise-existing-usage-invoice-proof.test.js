@@ -249,6 +249,23 @@ test('API2023 usage paid proof accepts omitted optional embedded refunds only wi
   const result=proof.verifyUsageInvoicePaid(f);
   assert.equal(result.amount_cents,5000);assert.equal(result.payroll_authorized,false);assert.equal(result.paid_access_authorized,false);
 });
+test('paid proof does not order independent provider object creation clocks against invoice paid_at',async()=>{
+  const {b}=await binding(),f=paidObjects(b);
+  f.charge.created=f.invoice.status_transitions.paid_at+1;
+  assert.equal(f.charge.created,f.observationEpoch);
+  const result=proof.verifyUsageInvoicePaid(f);
+  assert.equal(result.paid_at,f.invoice.status_transitions.paid_at);
+  assert.equal(result.amount_cents,5000);assert.equal(result.payroll_authorized,false);
+});
+test('paid proof still rejects future or malformed provider clocks against native observation',async()=>{
+  const {b}=await binding();
+  for(const field of ['paymentIntent','charge'])for(const value of ['future',null,0,1.5,'1793491202']){
+    const f=paidObjects(b);f[field].created=value==='future'?f.observationEpoch+1:value;
+    assert.throws(()=>proof.verifyUsageInvoicePaid(f),{code:'enterprise_usage_invoice_held'});
+  }
+  const f=paidObjects(b);f.invoice.status_transitions.paid_at=f.observationEpoch+1;
+  assert.throws(()=>proof.verifyUsageInvoicePaid(f),{code:'enterprise_usage_invoice_held'});
+});
 for(const [label,change] of [
   ['missing fresh refunds',f=>{delete f.refunds;}],['nonarray fresh refunds',f=>{f.refunds={object:'list',data:[],has_more:false};}],
   ['nonempty fresh refunds',f=>{f.refunds=[{id:'re_SYNTHETIC'}];}],
