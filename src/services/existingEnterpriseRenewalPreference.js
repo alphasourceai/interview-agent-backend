@@ -243,9 +243,9 @@ async function reconcileExistingEnterpriseRenewal(raw) {
 async function requestExistingEnterpriseRenewal(raw) {
   const input = inputFields(raw, ['autoRenew']); check(typeof input.autoRenew === 'boolean');
   const source = await sourceFor(input), r = await native(input, source, 'request', { p_auto_renew: input.autoRenew });
-  // Busy means the requested preference was NOT accepted. Do not reconcile
-  // the old operation and return it as an acknowledgment of this request.
-  if (r.status === 'busy' || input.effectsEnabled !== true) return r;
+  // Busy or a deadline hold means this preference was NOT accepted. Do not
+  // reconcile an older operation and overwrite this request's rejection.
+  if (['busy', 'held'].includes(r.status) || input.effectsEnabled !== true) return r;
   const { autoRenew, ...reconcile } = input;
   return reconcileExistingEnterpriseRenewal(reconcile);
 }

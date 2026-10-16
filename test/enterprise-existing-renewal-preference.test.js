@@ -156,6 +156,22 @@ test('Enterprise SDK native busy does not acknowledge a newly requested preferen
   assert.equal((await request({ ...f.args, autoRenew: true })).status, 'busy');
   assert.equal(f.updates.length, 0); assert.deepEqual(f.actions.map(x => x.args.p_action), ['request']);
 });
+for (const prior of ['none', 'opposite']) test(`Enterprise SDK deadline-held request keeps rejection with ${prior} prior operation, no read or reconcile`, async t => {
+  const f = await setup(t, { on: true });
+  const held = { status: 'held', reason: 'request_deadline_passed', operation: prior === 'none' ? null : clone(f.operation),
+    legal_term_end: f.operation.effective_at, notice_cutoff_at: f.operation.notice_cutoff_at,
+    provider_effect_authorized: false, paid_access_authorized: false, payroll_authorized: false };
+  f.onRpc = (name, args) => {
+    if (args.p_action === 'request') return { error: null, data: clone(held) };
+    if (prior === 'none' && args.p_action === 'read') {
+      const { reason, ...read } = held; return { error: null, data: { ...read, status: 'none' } };
+    }
+    return null;
+  };
+  const result = await request({ ...f.args, autoRenew: false });
+  assert.equal(result.status, 'held'); assert.equal(result.reason, 'request_deadline_passed');
+  assert.deepEqual(f.actions.map(x => x.args.p_action), ['request']); assert.equal(f.updates.length, 0);
+});
 test('Enterprise SDK summary uses current legal E after completed ON, not the old operation E', async t => {
   const f = await setup(t, { on: true, status: 'applied' }); f.legalEnd = new Date((f.fullEnd+31536000)*1000).toISOString();
   const r = await summary(f.args); assert.equal(r.stripe_renewal_billing_cutoff_at, f.legalEnd);
