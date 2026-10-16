@@ -5,7 +5,9 @@ const {buildRetailPackageSnapshot}=require('../src/services/membershipPackageCom
 const {OFFER_VERSION,STRIPE_RECURRING_OFFER_VERSION,anchoredMonthInstant}=require('../src/services/membershipOffers');
 const enabled=process.env.RETAIL_FUNDING_RECEIPT_DISPOSABLE==='true',opts={skip:!enabled};
 const enterpriseFenceEnabled=enabled&&process.env.ENTERPRISE_LEGACY_FENCE_DISPOSABLE==='true';
-const enterpriseCoverageEnabled=enabled&&process.env.ENTERPRISE_PAID_COVERAGE_DISPOSABLE==='true';
+const enterpriseStatusEnabled=enabled&&process.env.ENTERPRISE_STATUS_DISPOSABLE==='true';
+const enterpriseStatusOpts={skip:!enterpriseStatusEnabled};
+const enterpriseCoverageEnabled=enabled&&(process.env.ENTERPRISE_PAID_COVERAGE_DISPOSABLE==='true'||enterpriseStatusEnabled);
 const enterpriseCoverageOpts={skip:!enterpriseCoverageEnabled};
 const enterprisePeriodEnabled=enabled&&(process.env.ENTERPRISE_PLATFORM_PERIOD_DISPOSABLE==='true'||enterpriseCoverageEnabled);
 const enterprisePeriodOpts={skip:!enterprisePeriodEnabled};
@@ -178,6 +180,14 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
    'grant execute on function public.record_enterprise_existing_paid_period(uuid,uuid,jsonb,jsonb) to anon',
    'alter table billing_invoices disable trigger enterprise_existing_period_receipt_guard','alter table billing_invoices disable row level security'])
    denied('begin;'+change+';'+candidate,/enterprise_coverage_.*drift/);
+  sql(candidate);
+ }
+ if(enterpriseStatusEnabled){
+  const candidate=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261016045106_enterprise_existing_subscription_observation.sql'),'utf8');
+  const def=sql("select pg_get_functiondef('public.read_enterprise_existing_billing(uuid)'::regprocedure)");
+  for(const change of [def.replace(/AS \$function\$/,'AS $function$\n -- synthetic status drift\n'),
+   'grant execute on function public.read_enterprise_existing_billing(uuid) to anon','alter table clients disable row level security'])
+   denied('begin;'+change+';'+candidate,/enterprise_status_.*drift/);
   sql(candidate);
  }
 });
@@ -2812,6 +2822,71 @@ test('ENTERPRISE COVERAGE source root lock actually blocks refresh until existin
   parallel(`select pg_sleep(0.3);select count(*) from pg_stat_activity where application_name=${lit(tag)} and wait_event_type='Lock';`)]);
  assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.code,0,o.err);assert.equal(o.out.trim(),'1');
  assert.equal(JSON.parse(w.out.trim()).billing_status,'active');
+});
+
+function enterpriseStatusExpected(f){const c=enterpriseClient(f);return Object.fromEntries(
+ ['subscription_status','current_term_end','stripe_subscription_schedule_id','cancel_at_term_end'].map(k=>[k,c[k]??null]));}
+function enterpriseStatusProof(f){return{version:'enterprise_existing_subscription_status_proof_v1',agreement_id:f.id,client_id:f.client,
+ provider_account_id:f.funding.provider_account_id,livemode:f.funding.livemode,currency:'usd',customer_id:f.customer,
+ subscription_id:f.funding.subscription_id,subscription_item_id:f.funding.platform_item_id,price_id:f.funding.platform_price_id,
+ platform_nominal_cents:f.funding.platform_nominal_cents,platform_interval:f.funding.platform_interval,
+ billing_cycle_anchor:f.billing.subscription.current_period_end,provider_period_start:Math.floor(Date.parse(f.funding.payment_success_at)/1000),
+ provider_period_end:f.billing.subscription.current_period_end,subscription_status:'past_due',cancel_at_term_end:false,
+ stripe_subscription_schedule_id:null,observed_at:new Date().toISOString()};}
+function enterpriseStatusCall(f,p=enterpriseStatusProof(f),expected=enterpriseStatusExpected(f),w=f.billing){return`select record_enterprise_existing_subscription_observation(${[f.id,f.client,w,expected,p].map(lit).join(',')});`;}
+const withoutStatusFields=c=>{const x=structuredClone(c);for(const k of ['subscription_status','current_term_end','stripe_subscription_schedule_id','cancel_at_term_end','updated_at'])delete x[k];return x;};
+for(const cadence of ['monthly','annual'])test(`ENTERPRISE STATUS ${cadence} native CAS projects only provider fields`,enterpriseStatusOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{cadence}),before=enterpriseClient(f),original=enterprisePeriodUnchanged(f),p=enterpriseStatusProof(f);
+ p.cancel_at_term_end=true;const out=JSON.parse(sql('set role service_role;'+enterpriseStatusCall(f,p)));
+ assert.equal(out.status,'observed');assert.equal(out.projection.subscription_status,'past_due');assert.equal(out.projection.cancel_at_term_end,true);
+ const after=enterpriseClient(f);assert.equal(after.subscription_status,'past_due');assert.equal(after.billing_status,'active');assert.equal(after.auto_renew,true);
+ assert.deepEqual(withoutStatusFields(after),withoutStatusFields(before));
+ const unchanged=JSON.parse(original),current=JSON.parse(enterprisePeriodUnchanged(f));
+ delete unchanged.client;delete current.client;assert.deepEqual(current,unchanged);
+ assert.equal(sql(`select enterprise_billing_receipt=${lit(f.billing)} from membership_agreements where id=${lit(f.id)}`),'t');
+ assert.equal(enterpriseCoverage(f,true).billing_status,'active');
+});
+test('ENTERPRISE STATUS stale projection conflicts; fresh repeat reuses same row and no payment',enterpriseStatusOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql),expected=enterpriseStatusExpected(f),p=enterpriseStatusProof(f);
+ sql('set role service_role;'+enterpriseStatusCall(f,p,expected));
+ denied('set role service_role;'+enterpriseStatusCall(f,p,expected),/enterprise_status_compare_changed/);
+ assert.equal(JSON.parse(sql('set role service_role;'+enterpriseStatusCall(f,p))).status,'observed');
+ assert.equal(sql(`select count(*) from billing_invoices where enterprise_period_receipt->'proof'->>'agreement_id'=${lit(f.id)}`),'0');
+});
+test('ENTERPRISE STATUS foreign/malformed/future proof and extra authority cannot change client',enterpriseStatusOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql),before=enterpriseClient(f),p=enterpriseStatusProof(f);
+ for(const patch of [{provider_account_id:'acct_FOREIGN'},{client_id:crypto.randomUUID()},{subscription_id:'sub_FOREIGN'},
+  {platform_nominal_cents:1},{livemode:true},{subscription_status:'unknown'},{stripe_subscription_schedule_id:'sub_sched_FOREIGN'},
+  {paid_access_authorized:true},{provider_period_start:0},{provider_period_end:p.provider_period_end-1},
+  {observed_at:'2099-01-01T00:00:00.000Z'}])
+  denied('set role service_role;'+enterpriseStatusCall(f,{...p,...patch}),/enterprise_status_(proof|period)_denied/);
+ assert.deepEqual(enterpriseClient(f),before);
+});
+test('ENTERPRISE STATUS browser/wrong owner/source denied; preferences/overrides/terms preserved',enterpriseStatusOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql);
+ sql(`update clients set auto_renew=false,cancel_effective_at=contract_end_at,access_override_mode='force_inactive',manual_active_override=true where id=${lit(f.client)}`);
+ const before=enterpriseClient(f),p=enterpriseStatusProof(f);p.subscription_status='canceled';
+ for(const role of ['anon','authenticated'])denied('set role '+role+';'+enterpriseStatusCall(f,p),/permission denied/);
+ denied('set role service_role;'+enterpriseStatusCall({...f,client:crypto.randomUUID()},p,enterpriseStatusExpected(f)),/enterprise_status_client_denied/);
+ denied('set role service_role;'+enterpriseStatusCall(f,p,enterpriseStatusExpected(f),{...f.billing,applied_at:'2020-01-01T00:00:00.000000Z'}),/enterprise_status_source_denied/);
+ sql('set role service_role;'+enterpriseStatusCall(f,p));assert.deepEqual(withoutStatusFields(enterpriseClient(f)),withoutStatusFields(before));
+});
+test('ENTERPRISE STATUS later active provider period cannot fund a missing paid cycle',enterpriseStatusOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{initialPeriodSeconds:2}),end=f.billing.subscription.current_period_end;
+ await new Promise(r=>setTimeout(r,Math.max(1,end*1000-Date.now()+50)));
+ const p=enterpriseStatusProof(f);Object.assign(p,{subscription_status:'active',provider_period_start:end,
+  provider_period_end:Date.parse(anchoredMonthInstant(new Date(end*1000).toISOString(),f.funding.platform_interval==='year'?12:1))/1000});
+ sql('set role service_role;'+enterpriseStatusCall(f,p));assert.equal(enterpriseClient(f).subscription_status,'active');
+ assert.equal(enterpriseCoverage(f,true).billing_status,'inactive');assert.equal(enterpriseClient(f).auto_renew,true);
+ assert.equal(Date.parse(enterpriseClient(f).contract_end_at),Date.parse(f.billing.client_initial.contract_end_at));
+});
+test('ENTERPRISE STATUS root client lock causally blocks native projection',enterpriseStatusOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql),tag='EST'+crypto.randomUUID().replaceAll('-',''),call=enterpriseStatusCall(f);
+ const [h,w,o]=await Promise.all([
+  parallel(`begin;select 1 from clients where id=${lit(f.client)} for update;select pg_sleep(0.6);commit;`),
+  parallel(`set application_name=${lit(tag)};select pg_sleep(0.1);set role service_role;${call}`),
+  parallel(`select pg_sleep(0.3);select count(*) from pg_stat_activity where application_name=${lit(tag)} and wait_event_type='Lock';`)]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.code,0,o.err);assert.equal(o.out.trim(),'1');
 });
 
 // Actual original-schema native scanner guard, never hosted/provider effects.

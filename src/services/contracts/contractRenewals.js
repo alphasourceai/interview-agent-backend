@@ -10,6 +10,8 @@ const { retailTermWindow,STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VE
 const { retailAgreementTermWindow } = require('../retailQuoteSelection');
 const {refreshExistingRetailCoverage}=require('../existingRetailRecurringPayment');
 const {reconcileExistingRetailRenewal}=require('../existingRetailRenewalPreference');
+const {refreshExistingEnterpriseCoverage}=require('../existingEnterprisePaymentCompletion');
+const {hasNativeMarker}=require('../existingEnterprisePaymentWebhook');
 const { legacyContractAction } = require('./legacyContractActions');
 
 function invalidRetailRenewal() {
@@ -148,9 +150,18 @@ async function processContractRenewals(context = {}, dependencies = {}) {
         // Inspect the current row before filtering by payment/signature status:
         // an unpaid/malformed new agreement must not disappear into legacy.
         const {data:agreement, error:agreementError} = await db.from('membership_agreements')
-          .select('id,client_id,status,is_current,checkout_status,checkout_paid_at,membership_tier,billing_option,template_version,template_snapshot,superseded_by_agreement_id,auto_renew,notice_deadline_days,initial_term_start,initial_renewal_date')
+          .select('id,client_id,status,is_current,checkout_status,checkout_paid_at,membership_tier,billing_option,template_version,template_snapshot,superseded_by_agreement_id,auto_renew,notice_deadline_days,initial_term_start,initial_renewal_date,enterprise_checkout_source,enterprise_checkout_pool_id,enterprise_checkout_prices,enterprise_funding_receipt,enterprise_billing_receipt')
           .eq('client_id', client.id).eq('is_current', true).maybeSingle();
         if (agreementError) throw new Error(agreementError.message || 'renewal_agreement_read_failed');
+        if(hasNativeMarker(agreement)){
+          const result=await refreshExistingEnterpriseCoverage({db,agreementId:agreement.id,clientId:client.id});
+          summary.skipped_no_action+=1;
+          items.push({id:client.id,name:client.name||null,action:'paid_coverage_refreshed',detail:result.status,
+            contract_end_at_before:oldContractEnd});
+          // Provider active/auto-renew does not fund a new term. Existing
+          // native paid-prefix source owns base access; no legacy fallthrough.
+          continue;
+        }
         if([STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(agreement?.template_snapshot?.package_snapshot?.membership_terms?.offer_version)){
           const result=await refreshExistingRetailCoverage({db,agreementId:agreement.id,clientId:client.id});
           // Coverage's own transaction has committed; this separate setting

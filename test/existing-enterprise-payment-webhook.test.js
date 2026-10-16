@@ -79,6 +79,14 @@ test('paid native pair cannot route a different provider subscription into cycle
   id:'in_synthetic_cycle',object:'invoice',billing_reason:'subscription_cycle',status:'paid',amount_paid:99999,
   customer:f.client.stripe_customer_id,subscription:'sub_FOREIGN',metadata:{source:'agreement_checkout',agreement_id:f.a.id}})}),{status:503});
 });
+for(const type of ['invoice.created','invoice.payment_failed','customer.subscription.created','customer.subscription.updated','customer.subscription.deleted'])
+test(`paid pair ${type} uses existing status observer, never initial activation`,async()=>{
+ const f=await paidReady(),sub=type.startsWith('customer.subscription.');
+ const raw=sub?{...f.p.subscription}:{id:'in_synthetic_cycle',object:'invoice',billing_reason:'subscription_cycle',status:'draft',amount_paid:0,
+  customer:f.client.stripe_customer_id,subscription:f.p.subscription.id,metadata:{}};
+ const r=await classify({db:f.db,stripe:f.stripe,event:event(f,type,raw)});
+ assert.equal(r.action,type==='invoice.created'?'cycle_observed':'subscription_observed');assert.equal(r.requiresReentry,true);
+});
 test('classifies failed delayed Checkout as a no-write event and does not trust the event metadata alone',async()=>{
  const f=ready();f.p.checkout.payment_status='unpaid';
  const r=await classify({db:f.db,stripe:f.stripe,event:event(f,'checkout.session.async_payment_failed',{

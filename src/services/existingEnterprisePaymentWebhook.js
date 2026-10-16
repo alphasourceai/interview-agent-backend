@@ -199,6 +199,10 @@ function actionFor(event,checkout,scope){
   &&checkout.status==='complete'&&checkout.payment_status==='paid'
   &&o.status==='paid'&&Number.isSafeInteger(o.amount_paid)&&o.amount_paid>0
   &&(!Object.hasOwn(o,'paid')||o.paid===true))return'cycle_paid';
+ if(scope?.a.checkout_status==='paid'&&scope.billingReceipt&&checkout.status==='complete'&&checkout.payment_status==='paid'){
+  if(type==='invoice.created'&&o.billing_reason==='subscription_cycle')return'cycle_observed';
+  if(type==='invoice.payment_failed'||SUBSCRIPTION_EVENTS.has(type))return'subscription_observed';
+ }
  if(INVOICE_EVENTS.has(type)||SUBSCRIPTION_EVENTS.has(type))return'held';
  return null;
 }

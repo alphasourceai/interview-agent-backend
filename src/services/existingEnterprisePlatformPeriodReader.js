@@ -1,6 +1,6 @@
 'use strict';
 
-// Internal, UNMOUNTED GET-only adapter. Reuses the original native scope and
+// Internal GET-only adapter. Reuses the original native scope and
 // payment proof; this is not an invoice receipt, writer or effect reservation.
 const {isDeepStrictEqual,types:{isProxy}}=require('node:util');
 const {readExistingEnterpriseCheckoutScope}=require('./existingEnterpriseCheckoutFunding');
@@ -8,6 +8,7 @@ const {proveExistingEnterprisePlatformPeriod}=require('./existingEnterprisePlatf
 const {snapshotStripeSdkData:snapshot}=require('./enterprisePoolPaymentProof');
 const {collect}=require('./existingRetailCheckoutFunding');
 const {freeze}=require('./existingEnterpriseBillingReceipt');
+const {anchoredMonthInstant}=require('./membershipOffers');
 const uuid=v=>typeof v==='string'&&/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(v);
 const id=(v,p)=>typeof v==='string'&&v.length<=255&&new RegExp(`^${p}_[A-Za-z0-9_]+$`).test(v);
 function hold(){throw Object.assign(new Error('enterprise_platform_period_unverified'),{code:'enterprise_platform_period_unverified',status:503});}
@@ -70,4 +71,61 @@ async function readExistingEnterprisePlatformPeriod(input){
   return freeze({source,proof});
  }catch(_){hold();}
 }
-module.exports={readExistingEnterprisePlatformPeriod};
+const providerTuple=c=>snapshot({subscription_status:c.subscription_status??null,current_term_end:c.current_term_end??null,
+ stripe_subscription_schedule_id:c.stripe_subscription_schedule_id??null,cancel_at_term_end:c.cancel_at_term_end??null});
+// Internal observer. Provider state is not funding, a legal
+// contract window or renewal consent. Native CAS may project four fields only.
+async function readExistingEnterpriseSubscriptionStatus(input){
+ try{
+  check(input&&typeof input==='object'&&!isProxy(input)&&[Object.prototype,null].includes(Object.getPrototypeOf(input)));
+  const d=Object.getOwnPropertyDescriptors(input),keys=['db','stripe','agreementId','clientId'];
+  check(Reflect.ownKeys(d).length===keys.length&&keys.every(k=>d[k])
+   &&Reflect.ownKeys(d).every(k=>keys.includes(k))&&Object.values(d).every(v=>v.enumerable&&Object.hasOwn(v,'value')));
+  const {db,stripe,agreementId,clientId}=Object.fromEntries(Object.entries(d).map(([k,v])=>[k,v.value]));
+  check(uuid(agreementId)&&uuid(clientId));
+  const api=()=>check(typeof stripe?.getApiField==='function'&&stripe.getApiField('version')==='2023-10-16');api();
+  const load=async()=>{
+   const n=await readExistingEnterpriseCheckoutScope({db,agreementId});
+   check(n&&n.client.id===clientId&&n.a.client_id===clientId&&n.a.checkout_status==='paid'&&n.billingReceipt);return n;
+  };
+  const n=await load(),source=sourceProjection(n),expected=providerTuple(n.client),w=n.billingReceipt,p=w.funding_receipt.proof;
+  const get=async fn=>{api();const value=snapshot(await fn());api();return value;};
+  const account=await get(()=>stripe.accounts.retrieve());check(account?.object==='account'&&account.id===p.provider_account_id);
+  const sub=await get(()=>stripe.subscriptions.retrieve(p.subscription_id)),item=sub?.items?.data?.[0],price=item?.price;
+  check(sub?.object==='subscription'&&sub.id===p.subscription_id&&sub.customer===p.customer_id&&sub.livemode===p.livemode
+   &&sub.currency==='usd'&&sub.collection_method==='charge_automatically'
+   &&['active','past_due','unpaid','canceled','incomplete','incomplete_expired','paused'].includes(sub.status)
+   &&sub.items?.object==='list'&&sub.items.has_more===false&&Array.isArray(sub.items.data)&&sub.items.data.length===1
+   &&item?.object==='subscription_item'&&item.id===p.platform_item_id&&item.subscription===p.subscription_id&&item.quantity===1
+   &&price?.object==='price'&&price.id===p.platform_price_id&&price.livemode===p.livemode&&price.currency==='usd'
+   &&price.unit_amount===p.platform_nominal_cents&&price.type==='recurring'&&price.billing_scheme==='per_unit'
+   &&price.recurring?.interval===p.platform_interval&&price.recurring.interval_count===1&&price.recurring.usage_type==='licensed'
+   &&price.transform_quantity===null&&price.tiers_mode===null&&price.custom_unit_amount===null
+   &&sub.schedule===null&&sub.pause_collection===null&&sub.trial_start===null&&sub.trial_end===null&&sub.test_clock===null
+   &&sub.cancel_at===null&&typeof sub.cancel_at_period_end==='boolean'&&sub.billing_cycle_anchor===w.subscription.current_period_end);
+  const start=sub.current_period_start,end=sub.current_period_end,anchor=w.subscription.current_period_end;
+  const epoch=v=>Number.isSafeInteger(v)&&v>0&&v<=253402300799;
+  const now=Date.now();check(Number.isSafeInteger(now)&&epoch(start)&&epoch(end)&&end>start&&start*1000<=now
+   &&epoch(sub.created)&&sub.created>=Math.floor(Date.parse(n.a.enterprise_checkout_source.created_at)/1000)
+   &&sub.created*1000<=Date.parse(p.payment_success_at));
+  if(start<anchor){check(end===anchor&&start>=Math.floor(Date.parse(n.a.enterprise_checkout_source.created_at)/1000)
+   &&start*1000<=Date.parse(p.payment_success_at));}
+  else{
+   const a=new Date(anchor*1000),s=new Date(start*1000),offset=(s.getUTCFullYear()-a.getUTCFullYear())*12+s.getUTCMonth()-a.getUTCMonth();
+   const span=p.platform_interval==='month'?1:12;
+   check(offset>=0&&offset%span===0&&offset/span<=999
+    &&Date.parse(anchoredMonthInstant(a.toISOString(),offset))===start*1000
+    &&Date.parse(anchoredMonthInstant(a.toISOString(),offset+span))===end*1000);
+  }
+  check(isDeepStrictEqual(account,await get(()=>stripe.accounts.retrieve()))
+   &&isDeepStrictEqual(sub,await get(()=>stripe.subscriptions.retrieve(p.subscription_id))));
+  const final=await load();check(isDeepStrictEqual(source,sourceProjection(final))&&isDeepStrictEqual(expected,providerTuple(final.client)));api();
+  return freeze({source,billingReceipt:w,expected,proof:{version:'enterprise_existing_subscription_status_proof_v1',
+   agreement_id:agreementId,client_id:clientId,provider_account_id:p.provider_account_id,livemode:p.livemode,currency:'usd',
+   customer_id:p.customer_id,subscription_id:p.subscription_id,subscription_item_id:p.platform_item_id,price_id:p.platform_price_id,
+   platform_nominal_cents:p.platform_nominal_cents,platform_interval:p.platform_interval,billing_cycle_anchor:anchor,
+   provider_period_start:start,provider_period_end:end,subscription_status:sub.status,cancel_at_term_end:sub.cancel_at_period_end,
+   stripe_subscription_schedule_id:null,observed_at:new Date(now).toISOString()}});
+ }catch(_){hold();}
+}
+module.exports={readExistingEnterprisePlatformPeriod,readExistingEnterpriseSubscriptionStatus};

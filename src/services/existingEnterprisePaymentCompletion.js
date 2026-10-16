@@ -8,7 +8,8 @@ const { readExistingEnterpriseCheckoutFunding } = require('./existingEnterpriseC
 const { verifyEnterpriseBillingReceipt, readVerifiedEnterpriseBillingReceipt, freeze } = require('./existingEnterpriseBillingReceipt');
 const { verifyEnterprisePaymentRows } = require('./existingEnterprisePaymentRows');
 const { snapshotStripeSdkData } = require('./enterprisePoolPaymentProof');
-const { readExistingEnterprisePlatformPeriod } = require('./existingEnterprisePlatformPeriodReader');
+const { readExistingEnterprisePlatformPeriod, readExistingEnterpriseSubscriptionStatus } = require('./existingEnterprisePlatformPeriodReader');
+const { readExistingEnterpriseCheckoutScope } = require('./existingEnterpriseCheckoutFunding');
 const { anchoredMonthInstant } = require('./membershipOffers');
 const PROOF_KEYS = require('./enterpriseExistingFundingKeys');
 function fail() { const e = new Error('enterprise_payment_ack_unknown'); e.code = e.message; e.status = 503; throw e; }
@@ -68,6 +69,25 @@ function nativeStamp(value) {
   cycleCheck(Number.isFinite(millis) && new Date(millis).toISOString() === value.replace(/(\.\d{3})\d{3}Z$/, '$1Z'));
   return BigInt(millis) * 1000n + BigInt(value.slice(-4, -1));
 }
+function verifyPaidCoverage(raw, { source, agreementId, clientId, digest, minimumObserved }) {
+  const coverage = snapshotStripeSdkData(raw), status = coverage?.status;
+  cycleCheck(['refreshed', 'manual_override'].includes(status) && closed(coverage, [
+    'version', 'agreement_id', 'client_id', 'billing_source_digest', 'contiguous_ordinal', 'funded_from',
+    'funded_through', 'observed_at', 'provider_effect_authorized', 'paid_access_authorized', 'payroll_authorized',
+    'status', status === 'manual_override' ? 'computed_billing_status' : 'billing_status'
+  ]) && coverage.version === 'enterprise_existing_paid_coverage_v1'
+    && coverage.agreement_id === agreementId && coverage.client_id === clientId
+    && /^[0-9a-f]{32}$/.test(coverage.billing_source_digest) && (digest == null || coverage.billing_source_digest === digest)
+    && Number.isSafeInteger(coverage.contiguous_ordinal) && coverage.contiguous_ordinal >= 0 && coverage.contiguous_ordinal <= 999
+    && ['active', 'inactive'].includes(status === 'manual_override' ? coverage.computed_billing_status : coverage.billing_status)
+    && coverage.provider_effect_authorized === false && coverage.paid_access_authorized === false && coverage.payroll_authorized === false
+    && nativeStamp(coverage.observed_at) >= minimumObserved
+    && nativeStamp(coverage.funded_from) === BigInt(Date.parse(source.funding_receipt.proof.payment_success_at)) * 1000n);
+  const span = source.funding_receipt.proof.platform_interval === 'year' ? 12 : 1;
+  const end = anchoredMonthInstant(new Date(source.subscription.current_period_end * 1000).toISOString(), coverage.contiguous_ordinal * span);
+  cycleCheck(nativeStamp(coverage.funded_through) === BigInt(Date.parse(end)) * 1000n);
+  return coverage;
+}
 // Existing paid-cycle path only. Re-read actual provider cash; the native writer
 // owns receipt persistence and idempotency. No original activation/account tail,
 // generic billing sync, collection, renewal preference or commission effect.
@@ -101,25 +121,47 @@ async function completeExistingEnterprisePlatformPeriod(input) {
       && row.data.retail_period_receipt == null && cycleSame(row.data.enterprise_period_receipt, receipt));
     const refresh = await db.rpc('refresh_enterprise_existing_paid_coverage', { p_agreement: agreementId, p_client: clientId });
     cycleCheck(refresh && !refresh.error);
-    const coverage = snapshotStripeSdkData(refresh.data), status = coverage?.status;
-    cycleCheck(['refreshed', 'manual_override'].includes(status) && closed(coverage, [
-      'version', 'agreement_id', 'client_id', 'billing_source_digest', 'contiguous_ordinal', 'funded_from',
-      'funded_through', 'observed_at', 'provider_effect_authorized', 'paid_access_authorized', 'payroll_authorized',
-      'status', status === 'manual_override' ? 'computed_billing_status' : 'billing_status'
-    ]) && coverage.version === 'enterprise_existing_paid_coverage_v1'
-      && coverage.agreement_id === agreementId && coverage.client_id === clientId
-      && coverage.billing_source_digest === receipt.source_digest
-      && Number.isSafeInteger(coverage.contiguous_ordinal) && coverage.contiguous_ordinal >= 0 && coverage.contiguous_ordinal <= 999
-      && ['active', 'inactive'].includes(status === 'manual_override' ? coverage.computed_billing_status : coverage.billing_status)
-      && coverage.provider_effect_authorized === false && coverage.paid_access_authorized === false && coverage.payroll_authorized === false
-      && nativeStamp(coverage.observed_at) >= nativeStamp(receipt.recorded_at)
-      && nativeStamp(coverage.funded_from) === BigInt(Date.parse(source.funding_receipt.proof.payment_success_at)) * 1000n);
-    const span = source.funding_receipt.proof.platform_interval === 'year' ? 12 : 1;
-    const expectedEnd = anchoredMonthInstant(new Date(source.subscription.current_period_end * 1000).toISOString(), coverage.contiguous_ordinal * span);
-    cycleCheck(nativeStamp(coverage.funded_through) === BigInt(Date.parse(expectedEnd)) * 1000n);
+    const coverage = verifyPaidCoverage(refresh.data, { source, agreementId, clientId,
+      digest: receipt.source_digest, minimumObserved: nativeStamp(receipt.recorded_at) });
     // This may succeed after an earlier lost response. Native replay is exact,
     // and coverage refresh still runs; a processed event is not funding proof.
     return freeze({ status: saved.data.status, invoiceId: saved.data.invoice_id, receipt, coverage });
   } catch (_) { cycleFail(); }
 }
-module.exports = { completeExistingEnterprisePayment, completeExistingEnterprisePlatformPeriod };
+// Existing webhook and scanner bridges. Native CAS projects only four
+// provider fields; a separate funded-prefix refresh owns base billing_status.
+async function observeExistingEnterpriseSubscription(input) {
+  try {
+    const r = await readExistingEnterpriseSubscriptionStatus(input), { db, agreementId, clientId } = input;
+    const saved = await db.rpc('record_enterprise_existing_subscription_observation', {
+      p_agreement: agreementId, p_client: clientId, p_billing: r.billingReceipt, p_expected: r.expected, p_proof: r.proof
+    });
+    cycleCheck(saved && !saved.error);
+    const ack = snapshotStripeSdkData(saved.data), projection = ack?.projection;
+    cycleCheck(closed(ack, ['status', 'agreement_id', 'client_id', 'source_digest', 'projection', 'observed_at'])
+      && ack.status === 'observed' && ack.agreement_id === agreementId && ack.client_id === clientId
+      && /^[0-9a-f]{32}$/.test(ack.source_digest)
+      && closed(projection, ['subscription_status', 'current_term_end', 'stripe_subscription_schedule_id', 'cancel_at_term_end'])
+      && projection.subscription_status === r.proof.subscription_status && projection.stripe_subscription_schedule_id === null
+      && projection.cancel_at_term_end === r.proof.cancel_at_term_end
+      && nativeStamp(projection.current_term_end) === BigInt(r.proof.provider_period_end) * 1000000n
+      && nativeStamp(ack.observed_at) >= BigInt(Date.parse(r.proof.observed_at)) * 1000n);
+    const refresh = await db.rpc('refresh_enterprise_existing_paid_coverage', { p_agreement: agreementId, p_client: clientId });
+    cycleCheck(refresh && !refresh.error);
+    const coverage = verifyPaidCoverage(refresh.data, { source: r.billingReceipt, agreementId, clientId,
+      digest: ack.source_digest, minimumObserved: nativeStamp(ack.observed_at) });
+    return freeze({ status: 'observed', observation: ack, coverage });
+  } catch (_) { throw Object.assign(new Error('enterprise_subscription_observation_unknown'), { code: 'enterprise_subscription_observation_unknown', status: 503 }); }
+}
+async function refreshExistingEnterpriseCoverage({ db, agreementId, clientId }) {
+  try {
+    const scope = await readExistingEnterpriseCheckoutScope({ db, agreementId });
+    cycleCheck(scope && scope.client.id === clientId && scope.a.checkout_status === 'paid' && scope.billingReceipt);
+    const result = await db.rpc('refresh_enterprise_existing_paid_coverage', { p_agreement: agreementId, p_client: clientId });
+    cycleCheck(result && !result.error);
+    return freeze(verifyPaidCoverage(result.data, { source: scope.billingReceipt, agreementId, clientId,
+      minimumObserved: nativeStamp(scope.billingReceipt.applied_at) }));
+  } catch (_) { throw Object.assign(new Error('enterprise_paid_coverage_unknown'), { code: 'enterprise_paid_coverage_unknown', status: 503 }); }
+}
+module.exports = { completeExistingEnterprisePayment, completeExistingEnterprisePlatformPeriod,
+  observeExistingEnterpriseSubscription, refreshExistingEnterpriseCoverage };

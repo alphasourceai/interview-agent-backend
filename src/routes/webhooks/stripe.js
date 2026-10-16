@@ -8,7 +8,7 @@ const { getRoleInterviewAvailability } = require('../../services/roleInterviewAv
 const { buildAlphaScreenPlanSettingsPayload } = require('../../services/alphaScreenPackages');
 const { activatePublicPurchaseAgreementCheckout, finishExistingEnterpriseAccountSetup } = require('../../services/publicPurchaseActivation');
 const { classifyExistingEnterprisePaymentEvent } = require('../../services/existingEnterprisePaymentWebhook');
-const { completeExistingEnterprisePayment, completeExistingEnterprisePlatformPeriod } = require('../../services/existingEnterprisePaymentCompletion');
+const { completeExistingEnterprisePayment, completeExistingEnterprisePlatformPeriod, observeExistingEnterpriseSubscription } = require('../../services/existingEnterprisePaymentCompletion');
 const { finalizePendingRolePurchase } = require('../../services/rolePurchaseFinalizer');
 const { getPlanCapacity } = require('../../services/planCapacity');
 const {
@@ -815,7 +815,8 @@ router.post('/', async (req, res) => {
   const eventObject = event?.data?.object || null;
   // Fence marked usage owners before agreement classification can make any
   // provider read. This also follows markers after mutable model edits.
-  if (event.type === 'invoice.created' && eventObject?.billing_reason === 'subscription_cycle') {
+  if (event.type === 'invoice.created' && eventObject?.billing_reason === 'subscription_cycle'
+    && (!pickId(eventObject?.subscription) || eventObject?.metadata?.source === 'usage_billing')) {
     try {
       const usageClient = await resolveUsageInvoiceClient(eventObject);
       if (usageClient?.id) await fenceAcceptedEnterpriseUsageWriter({ db: supabaseAdmin, clientId: usageClient.id });
@@ -859,7 +860,7 @@ router.post('/', async (req, res) => {
       // A historical empty cycle ACK is not a native invoice receipt. Exact
       // paid-cycle reentry revalidates current cash and refreshes coverage even
       // if an older delivery already marked this event processed.
-      if (priorEvent.processed_ok === true && existingEnterprisePaymentEvent?.action !== 'cycle_paid') return res.status(200).json({ ok: true });
+      if (priorEvent.processed_ok === true && !['cycle_paid', 'cycle_observed', 'subscription_observed'].includes(existingEnterprisePaymentEvent?.action)) return res.status(200).json({ ok: true });
       // An incomplete verified paid agreement event may re-enter. The fenced
       // claim below serializes it with another retry or the initial invoice.
     } else {
@@ -907,6 +908,13 @@ router.post('/', async (req, res) => {
       await reconcileExistingRetailRenewal({db:supabaseAdmin,stripe,agreementId,clientId,
         effectsEnabled:process.env.RETAIL_STRIPE_RENEWAL_CONTROL_ENABLED==='true'});
       await markProcessed(true,null);return res.status(200).json({ok:true});
+    }
+    if (['cycle_observed', 'subscription_observed'].includes(existingEnterprisePaymentEvent?.action)) {
+      const observation = await observeExistingEnterpriseSubscription({ db: supabaseAdmin, stripe,
+        agreementId: existingEnterprisePaymentEvent.agreementId, clientId: existingEnterprisePaymentEvent.clientId });
+      if (observation?.status !== 'observed') throw Object.assign(new Error('enterprise_subscription_observation_unknown'), { code: 'enterprise_subscription_observation_unknown' });
+      await markProcessed(true, null);
+      return res.status(200).json({ ok: true });
     }
     if (existingEnterprisePaymentEvent?.action === 'cycle_paid') {
       const cycle = await completeExistingEnterprisePlatformPeriod({ db: supabaseAdmin, stripe,

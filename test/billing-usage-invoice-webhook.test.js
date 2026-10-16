@@ -337,11 +337,20 @@ test('the transient failure is not tagged permanent, so Stripe keeps retrying', 
     'a Stripe outage must not be acknowledged as permanent');
   assert.match(source, /event\.type === 'invoice\.created'/);
 });
-for(const partial of [false,true])test(`cycle webhook reaches marked hold despite fixed settings (${partial}) before provider calls`,async()=>{
+for(const partial of [false,true])test(`platform cycle draft reaches marked source hold despite fixed settings (${partial}); no usage writer`,async()=>{
   const f=await require('./helpers/accepted-enterprise-usage-fixture')();f.plan.billing_model='fixed';
   if(partial)f.a.enterprise_billing_receipt=null;
   const event=invoiceEvent({customer:f.client.stripe_customer_id,subscription:f.client.stripe_subscription_id});
   const loaded=loadApp(event,f.db),response=await post(loaded.app);
-  assert.equal(response.status,503);assert.deepEqual(loaded.providerCalls,[]);
+  assert.equal(response.status,503);assert.deepEqual(loaded.providerCalls,['subscriptionRetrieve']);
   assert.equal(f.db.calls.some(c=>c.table==='usage_billing_ledger'),false);
+});
+for(const partial of [false,true])test(`usage-shaped draft retains early native fence (${partial}) before any provider call`,async()=>{
+ const f=await require('./helpers/accepted-enterprise-usage-fixture')();f.plan.billing_model='fixed';
+ if(partial)f.a.enterprise_billing_receipt=null;
+ const event=invoiceEvent({customer:f.client.stripe_customer_id,subscription:f.client.stripe_subscription_id});
+ event.data.object.metadata={source:'usage_billing'};
+ const loaded=loadApp(event,f.db),response=await post(loaded.app);
+ assert.equal(response.status,503);assert.deepEqual(loaded.providerCalls,[]);
+ assert.equal(f.db.calls.some(c=>c.table==='usage_billing_ledger'),false);
 });

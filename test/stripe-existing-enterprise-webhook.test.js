@@ -40,6 +40,8 @@ function load({action,duplicate=false,priorProcessed=false,activationFails=false
   calls.push({complete:x.agreementId,session:x.eventSessionId,subscription:x.eventSubscriptionId,invoice:x.eventInvoiceId});
   if(completionMissing)return null;
   return{billing_applied:true,paid_pool_recorded:true};
+ },observeExistingEnterpriseSubscription:async x=>{
+  calls.push({observe:x.agreementId,client:x.clientId});if(cycleFails)throw Error('synthetic observation unavailable');return cycleMissing?null:{status:'observed'};
  },completeExistingEnterprisePlatformPeriod:async x=>{
   calls.push({cycle:x.agreementId,client:x.clientId,invoice:x.invoiceId});
   if(cycleFails)throw Object.assign(new Error('synthetic cash unverified'),{code:'enterprise_platform_period_unverified'});
@@ -90,6 +92,15 @@ for(const type of ['invoice.paid','invoice.payment_succeeded'])for(const priorPr
  assert.equal(r.status,200);assert.equal(f.db.events[0].processed_ok,true);
  assert.deepEqual(f.calls,[{cycle:'00000000-0000-4000-8000-000000000001',client:'00000000-0000-4000-8000-000000000002',invoice:'in_SYNTHETIC'}]);
  assert.deepEqual(f.db.rpcs,[]); // no activation claim/account tail/generic invoice sync
+});
+for(const action of ['cycle_observed','subscription_observed'])for(const priorProcessed of [false,true])test(`${action} only fresh owned status branch reenters processed=${priorProcessed}`,async()=>{
+ const f=load({action,duplicate:true,priorProcessed}),r=await f.post('customer.subscription.updated');assert.equal(r.status,200);
+ assert.deepEqual(f.calls,[{observe:'00000000-0000-4000-8000-000000000001',client:'00000000-0000-4000-8000-000000000002'}]);
+ assert.deepEqual(f.db.rpcs,[]);assert.equal(f.db.events[0].processed_ok,true);
+});
+for(const options of [{cycleFails:true},{cycleMissing:true}])test(`status branch failure never generic-falls-through ${JSON.stringify(options)}`,async()=>{
+ const f=load({action:'subscription_observed',...options}),r=await f.post('customer.subscription.updated');
+ assert.equal(r.status,503);assert.equal(f.calls.length,1);assert.ok(f.calls[0].observe);assert.deepEqual(f.db.rpcs,[]);assert.equal(f.db.events[0].processed_ok,false);
 });
 for(const priorProcessed of [false,true])for(const options of [{cycleFails:true},{cycleMissing:true}])test(`cycle hold/null cannot empty-ACK or fall through, processed=${priorProcessed} ${JSON.stringify(options)}`,async()=>{
  const f=load({action:'cycle_paid',duplicate:true,priorProcessed,...options}),r=await f.post('invoice.paid');

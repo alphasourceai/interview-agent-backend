@@ -106,6 +106,24 @@ test('accepted 3/6/12 prepaid and installment renewals keep the original UTC anc
   }
   const f=fixture(3); assert.equal(getRetailRenewalWindow(f.client,f.agreement).term_end_at,'2026-07-31T12:13:14.000Z');
 });
+test('current paid Enterprise scanner refreshes real native coverage bridge before legal expiry without legacy or provider writes',async t=>{
+ const f=await require('./helpers/enterprise-status-observation-fixture')(t),db=f.native.db;
+ db.tables.contract_processing_runs=[];const before=structuredClone(db.tables);
+ const result=await processContractRenewals({}, {db,now:new Date('2026-11-01T00:01:03Z'),stripe:f.stripe});
+ assert.equal(result.summary.due,0);assert.equal(result.summary.errors,0);assert.equal(result.summary.skipped_no_action,1);
+ assert.equal(result.items[0].action,'paid_coverage_refreshed');assert.equal(f.refreshes,1);assert.equal(f.calls.length,0);
+ assert.ok(f.rpcCalls.every(x=>['read_enterprise_existing_billing','refresh_enterprise_existing_paid_coverage'].includes(x.name)));
+ assert.deepEqual(db.tables.membership_agreements,before.membership_agreements);assert.deepEqual(db.updates,[]);
+});
+test('every partial Enterprise marker holds the existing scanner before any legacy action',async()=>{
+ for(const field of ['enterprise_checkout_source','enterprise_checkout_pool_id','enterprise_checkout_prices','enterprise_funding_receipt','enterprise_billing_receipt']){
+  const f=fixture();f.agreement[field]={synthetic:true};const db=makeDb(f),r=await processContractRenewals({},deps(db));
+  assert.equal(r.summary.errors,1);assert.equal(r.summary.renewed,0);assert.equal(r.summary.deactivated,0);
+  assert.deepEqual(db.writes,[]);assert.deepEqual(db.subscriptionWrites,[]);
+  const selected=db.reads.find(x=>x.table==='membership_agreements').columns;
+  for(const marker of ['enterprise_checkout_source','enterprise_checkout_pool_id','enterprise_checkout_prices','enterprise_funding_receipt','enterprise_billing_receipt'])assert.ok(selected.split(',').includes(marker));
+ }
+});
 
 for(const version of [STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION])test(`native ${version} coverage is refreshed before monthly expiry; old scanner retained`,async()=>{
   const f=fixture(3,'monthly_installments'),s=f.agreement.template_snapshot.package_snapshot;
