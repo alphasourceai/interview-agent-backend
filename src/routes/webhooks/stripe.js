@@ -8,7 +8,7 @@ const { getRoleInterviewAvailability } = require('../../services/roleInterviewAv
 const { buildAlphaScreenPlanSettingsPayload } = require('../../services/alphaScreenPackages');
 const { activatePublicPurchaseAgreementCheckout, finishExistingEnterpriseAccountSetup } = require('../../services/publicPurchaseActivation');
 const { classifyExistingEnterprisePaymentEvent } = require('../../services/existingEnterprisePaymentWebhook');
-const { completeExistingEnterprisePayment } = require('../../services/existingEnterprisePaymentCompletion');
+const { completeExistingEnterprisePayment, completeExistingEnterprisePlatformPeriod } = require('../../services/existingEnterprisePaymentCompletion');
 const { finalizePendingRolePurchase } = require('../../services/rolePurchaseFinalizer');
 const { getPlanCapacity } = require('../../services/planCapacity');
 const {
@@ -856,7 +856,10 @@ router.post('/', async (req, res) => {
       if (priorEventError || !priorEvent) {
         return res.status(503).json({ error: 'server_error', code: 'BILLING_EVENT_REENTRY_LOOKUP_FAILED', request_id });
       }
-      if (priorEvent.processed_ok === true) return res.status(200).json({ ok: true });
+      // A historical empty cycle ACK is not a native invoice receipt. Exact
+      // paid-cycle reentry revalidates current cash and refreshes coverage even
+      // if an older delivery already marked this event processed.
+      if (priorEvent.processed_ok === true && existingEnterprisePaymentEvent?.action !== 'cycle_paid') return res.status(200).json({ ok: true });
       // An incomplete verified paid agreement event may re-enter. The fenced
       // claim below serializes it with another retry or the initial invoice.
     } else {
@@ -904,6 +907,16 @@ router.post('/', async (req, res) => {
       await reconcileExistingRetailRenewal({db:supabaseAdmin,stripe,agreementId,clientId,
         effectsEnabled:process.env.RETAIL_STRIPE_RENEWAL_CONTROL_ENABLED==='true'});
       await markProcessed(true,null);return res.status(200).json({ok:true});
+    }
+    if (existingEnterprisePaymentEvent?.action === 'cycle_paid') {
+      const cycle = await completeExistingEnterprisePlatformPeriod({ db: supabaseAdmin, stripe,
+        agreementId: existingEnterprisePaymentEvent.agreementId, clientId: existingEnterprisePaymentEvent.clientId,
+        invoiceId: pickId(eventObject?.id) });
+      if (!cycle || !['recorded', 'already_recorded'].includes(cycle.status)) {
+        throw Object.assign(new Error('enterprise_platform_period_ack_unknown'), { code: 'enterprise_platform_period_ack_unknown' });
+      }
+      await markProcessed(true, null);
+      return res.status(200).json({ ok: true });
     }
     if (['usage_paid_ack', 'usage_stale_ack'].includes(existingEnterprisePaymentEvent?.action)) {
       await markProcessed(true, null);

@@ -1,6 +1,6 @@
 'use strict';
 // Complete the existing financial rows, reuse once-billing. The later-platform
-// bridge below is UNMOUNTED until its webhook/status integration is reviewed.
+// path reuses this service from the existing payment webhook only.
 // No new Auth/contract/pool ledger, provider writes or messages.
 const { isDeepStrictEqual } = require('node:util');
 const { applyExistingEnterpriseBilling } = require('./existingEnterpriseBillingAdapter');

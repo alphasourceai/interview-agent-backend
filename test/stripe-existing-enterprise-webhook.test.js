@@ -28,7 +28,7 @@ function memoryDb({duplicate=false,priorProcessed=false}={}){
   throw Error('Unexpected RPC '+name);
  }};
 }
-function load({action,duplicate=false,priorProcessed=false,activationFails=false,completionMissing=false}={}){
+function load({action,duplicate=false,priorProcessed=false,activationFails=false,completionMissing=false,cycleFails=false,cycleMissing=false,cycleReplay=false}={}){
  const db=memoryDb({duplicate,priorProcessed}),calls=[];let current;
  inject('../src/clients/supabase',{supabaseAdmin:db});
  inject('../src/clients/stripe',{webhooks:{constructEvent:()=>current},subscriptions:{retrieve:async id=>({id})}});
@@ -40,6 +40,11 @@ function load({action,duplicate=false,priorProcessed=false,activationFails=false
   calls.push({complete:x.agreementId,session:x.eventSessionId,subscription:x.eventSubscriptionId,invoice:x.eventInvoiceId});
   if(completionMissing)return null;
   return{billing_applied:true,paid_pool_recorded:true};
+ },completeExistingEnterprisePlatformPeriod:async x=>{
+  calls.push({cycle:x.agreementId,client:x.clientId,invoice:x.invoiceId});
+  if(cycleFails)throw Object.assign(new Error('synthetic cash unverified'),{code:'enterprise_platform_period_unverified'});
+  if(cycleMissing)return null;
+  return{status:cycleReplay?'already_recorded':'recorded'};
  }});
  inject('../src/services/existingRetailCheckoutFunding',{readExistingRetailCheckoutFunding:async()=>{calls.push('retailReader');return null;},
   assertExistingRetailFundingSource:async()=>{calls.push('retailSourceAssert');}});
@@ -50,7 +55,7 @@ function load({action,duplicate=false,priorProcessed=false,activationFails=false
  const routerPath=require.resolve('../src/routes/webhooks/stripe');delete require.cache[routerPath];const router=require(routerPath);
  const app=express();app.use('/webhook/stripe',express.raw({type:'application/json'}),router);
  return{db,calls,post:async(type='checkout.session.completed')=>{current={id:'evt_SYNTHETIC',type,created:1,livemode:false,data:{object:{
-  id:'cs_SYNTHETIC',object:'checkout.session',mode:'subscription',status:'complete',payment_status:'paid',customer:'cus_SYNTHETIC',
+  id:action==='cycle_paid'?'in_SYNTHETIC':'cs_SYNTHETIC',object:action==='cycle_paid'?'invoice':'checkout.session',mode:'subscription',status:'complete',payment_status:'paid',customer:'cus_SYNTHETIC',
   subscription:'sub_SYNTHETIC',metadata:{source:'agreement_checkout',agreement_id:'00000000-0000-4000-8000-000000000001'}}}};
   return request(app).post('/webhook/stripe').set('content-type','application/json').send('{}');}};
 }
@@ -79,6 +84,21 @@ test('marked payment completion returning null cannot fall through to legacy ret
 test('processed duplicate is acknowledged only after the native marked classifier reenters',async()=>{
  const f=load({action:'held',duplicate:true,priorProcessed:true}),r=await f.post('customer.subscription.updated');
  assert.equal(r.status,200);assert.equal(f.db.events.length,1);assert.deepEqual(f.calls,[]);
+});
+for(const type of ['invoice.paid','invoice.payment_succeeded'])for(const priorProcessed of [false,true])test(`${type} cycle always reenters native completion even processed=${priorProcessed}`,async()=>{
+ const f=load({action:'cycle_paid',duplicate:true,priorProcessed,cycleReplay:true}),r=await f.post(type);
+ assert.equal(r.status,200);assert.equal(f.db.events[0].processed_ok,true);
+ assert.deepEqual(f.calls,[{cycle:'00000000-0000-4000-8000-000000000001',client:'00000000-0000-4000-8000-000000000002',invoice:'in_SYNTHETIC'}]);
+ assert.deepEqual(f.db.rpcs,[]); // no activation claim/account tail/generic invoice sync
+});
+for(const priorProcessed of [false,true])for(const options of [{cycleFails:true},{cycleMissing:true}])test(`cycle hold/null cannot empty-ACK or fall through, processed=${priorProcessed} ${JSON.stringify(options)}`,async()=>{
+ const f=load({action:'cycle_paid',duplicate:true,priorProcessed,...options}),r=await f.post('invoice.paid');
+ assert.equal(r.status,503);assert.equal(f.calls.length,1);assert.ok(f.calls[0].cycle);assert.deepEqual(f.db.rpcs,[]);
+ assert.equal(f.db.events[0].processed_ok,priorProcessed); // never downgrade true, but HTTP remains retryable
+});
+test('first cycle delivery records only billing event and native period, not initial account setup',async()=>{
+ const f=load({action:'cycle_paid'}),r=await f.post('invoice.paid');assert.equal(r.status,200);
+ assert.equal(f.calls.length,1);assert.ok(f.calls[0].cycle);assert.deepEqual(f.db.rpcs,[]);assert.equal(f.db.events[0].processed_ok,true);
 });
 for(const action of ['usage_paid_ack','usage_stale_ack'])test(`${action} only marks billing event; no invoice/account/financial writer`,async()=>{
  const f=load({action}),r=await f.post('invoice.paid');assert.equal(r.status,200);

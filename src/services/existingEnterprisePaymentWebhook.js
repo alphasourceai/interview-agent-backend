@@ -167,7 +167,7 @@ async function matchCandidate({db,stripe,event,eventObject,eventSub,eventCustome
  }
  return {scope,checkout,subscription};
 }
-function actionFor(event,checkout){
+function actionFor(event,checkout,scope){
  const type=event.type,o=event.data?.object||{};
  if(type==='checkout.session.completed'||type==='checkout.session.async_payment_succeeded'){
   const eventStatus=String(o.status||''),sdkStatus=String(checkout.status||'');
@@ -192,6 +192,13 @@ function actionFor(event,checkout){
  if(['invoice.payment_succeeded','invoice.paid'].includes(type)&&o.billing_reason==='subscription_create'
   &&o.status==='paid'&&Number.isSafeInteger(o.amount_paid)&&o.amount_paid>0
   &&(!Object.hasOwn(o,'paid')||o.paid===true))return'initial_paid';
+ // Classification is not cash authority. Only a previously completed native
+ // pair can enter the later-cycle GET proof/writer, never initial activation.
+ if(['invoice.payment_succeeded','invoice.paid'].includes(type)&&o.billing_reason==='subscription_cycle'
+  &&scope?.a.checkout_status==='paid'&&scope.billingReceipt
+  &&checkout.status==='complete'&&checkout.payment_status==='paid'
+  &&o.status==='paid'&&Number.isSafeInteger(o.amount_paid)&&o.amount_paid>0
+  &&(!Object.hasOwn(o,'paid')||o.paid===true))return'cycle_paid';
  if(INVOICE_EVENTS.has(type)||SUBSCRIPTION_EVENTS.has(type))return'held';
  return null;
 }
@@ -239,7 +246,7 @@ async function classifyExistingEnterprisePaymentEvent({db,stripe,event}){
   return null;
  }
  if(matches.length!==1)fail('enterprise_payment_event_binding_ambiguous');
- const match=matches[0],action=actionFor(event,match.checkout);
+ const match=matches[0],action=actionFor(event,match.checkout,match.scope);
  if(!action)return null;
  return Object.freeze({cohort:'existing_enterprise',action,agreementId:match.candidate.id,clientId:match.candidate.client_id,
   sessionId:match.checkout.id,subscriptionId:match.subscription.id,customerId:match.scope.client.stripe_customer_id,

@@ -50,11 +50,34 @@ for(const type of ['invoice.payment_succeeded','invoice.paid'])test(`${type} ini
   assert.equal((await classify({db:f.db,stripe:f.stripe,event:event(f,type,{...raw,...patch})})).action,'held');
  }
 });
-test('marked Enterprise cycle invoice.paid remains explicitly retryable until platform receipt writer exists',async()=>{
+test('unpaid marked Enterprise cycle invoice.paid stays held; no initial native pair',async()=>{
  const f=ready(),r=await classify({db:f.db,stripe:f.stripe,event:event(f,'invoice.paid',{
   id:'in_synthetic_cycle',object:'invoice',billing_reason:'subscription_cycle',status:'paid',amount_paid:30000,
   customer:f.client.stripe_customer_id,subscription:f.p.subscription.id,metadata:{}})});
  assert.equal(r.action,'held');assert.equal(r.requiresReentry,true);
+});
+async function paidReady(){
+ const accepted=await require('./helpers/accepted-enterprise-usage-fixture')(),f=accepted.nativeFixture,p=accepted.w.funding_receipt.proof;
+ Object.assign(f.pool,{status:'paid',paid_at:p.payment_success_at,stripe_payment_intent_id:p.payment_intent_id});
+ f.db.rpc=async(name,args)=>{assert.equal(name,'read_enterprise_existing_billing');assert.equal(args.p_agreement,f.a.id);
+  return{data:structuredClone(f.a.enterprise_billing_receipt),error:null};};
+ return f;
+}
+for(const type of ['invoice.paid','invoice.payment_succeeded'])test(`${type} paid native pair dispatches cycle completion, never initial activation`,async()=>{
+ const f=await paidReady(),raw={id:'in_synthetic_cycle',object:'invoice',billing_reason:'subscription_cycle',status:'paid',amount_paid:99999,
+  customer:f.client.stripe_customer_id,subscription:f.p.subscription.id,metadata:{}};
+ const r=await classify({db:f.db,stripe:f.stripe,event:event(f,type,raw)});
+ assert.equal(r.action,'cycle_paid');assert.equal(r.requiresReentry,true);assert.equal(r.clientId,f.client.id);
+ for(const patch of [{amount_paid:'99999'},{amount_paid:0},{paid:false},{status:'open'}]){
+  assert.equal((await classify({db:f.db,stripe:f.stripe,event:event(f,type,{...raw,...patch})})).action,'held');
+ }
+ f.p.checkout.payment_status='unpaid';
+ assert.equal((await classify({db:f.db,stripe:f.stripe,event:event(f,type,raw)})).action,'held');
+});
+test('paid native pair cannot route a different provider subscription into cycle writer',async()=>{
+ const f=await paidReady();await assert.rejects(classify({db:f.db,stripe:f.stripe,event:event(f,'invoice.paid',{
+  id:'in_synthetic_cycle',object:'invoice',billing_reason:'subscription_cycle',status:'paid',amount_paid:99999,
+  customer:f.client.stripe_customer_id,subscription:'sub_FOREIGN',metadata:{source:'agreement_checkout',agreement_id:f.a.id}})}),{status:503});
 });
 test('classifies failed delayed Checkout as a no-write event and does not trust the event metadata alone',async()=>{
  const f=ready();f.p.checkout.payment_status='unpaid';
