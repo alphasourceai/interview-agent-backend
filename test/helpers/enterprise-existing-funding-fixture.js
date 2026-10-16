@@ -6,8 +6,8 @@ const {metadataFor}=require('../../src/services/existingEnterpriseCheckoutAttemp
 const {enterprisePoolCheckoutQuote}=require('../../src/services/enterprisePoolSnapshot');
 const {validateEnterpriseSettings}=require('../../src/services/enterpriseSettings');
 const clone=v=>structuredClone(v);
-module.exports=function fixture({cadence='monthly',embedded=false,platformAmount=7000}={}){
- const f=T({cadence,embedded}),{a,client,seal,db}=f;
+module.exports=function fixture({cadence='monthly',embedded=false,platformAmount=7000,clientLegalName=null}={}){
+ const f=T({cadence,embedded,clientLegalName}),{a,client,seal,db}=f;
  const b=Date.parse('2026-10-01T12:00:00.000Z'),signed=new Date(b-1000).toISOString(),paid=b/1000+3600,observed=b+2*86400000;
  a.signed_at=signed;a.template_snapshot.execution.signed_at=signed;seal.signed_at=signed;seal.execution.signed_at=signed;
  a.auto_renew=true;a.agreement_expires_at=new Date(b+7*86400000).toISOString();

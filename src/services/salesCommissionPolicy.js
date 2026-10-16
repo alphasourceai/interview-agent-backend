@@ -71,27 +71,40 @@ function calculateReceiptCommission(input = {}) {
   // source uses a real agreement qualification, never a fabricated contract ID.
   // This calculator is not receipt authentication; native/API source checks own it.
   const v2 = ['retail_terms_v2', 'retail_existing_terms_v2'].includes(input.membership_terms_protocol);
-  if (input.membership_terms_protocol != null && !v2) throw policyError('unsupported_membership_terms_protocol');
+  const enterprise = input.membership_terms_protocol === 'enterprise_existing_terms_v1';
+  const firstYear = v2 || enterprise;
+  if (input.membership_terms_protocol != null && !firstYear) throw policyError('unsupported_membership_terms_protocol');
+  if (enterprise && !['monthly','paid_in_full'].includes(input.payment_kind)) throw policyError('invalid_enterprise_payment_kind');
   // These prospective fields must come from the immutable accepted contract and
   // original sale qualification, not renewal metadata or browser receipt input.
   // Existing callers omit the marker and retain their exact legacy policy.
-  const closed = instant(v2 ? input.original_qualification_closed_at : input.qualification_closed_at,
-    v2 ? 'original_qualification_closed_at' : 'qualification_closed_at');
+  const closed = instant(firstYear ? input.original_qualification_closed_at : input.qualification_closed_at,
+    firstYear ? 'original_qualification_closed_at' : 'qualification_closed_at');
   const termStart = instant(input.first_term_start_at, 'first_term_start_at');
   const termEnd = instant(input.first_term_end_at, 'first_term_end_at');
   if (termEnd <= termStart) throw policyError('invalid_first_term');
   let windowEnd = termEnd;
   let qualificationVerified = input.qualification_verified;
-  if (v2) {
+  if (firstYear) {
     const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-    if (![3,6,12].includes(input.original_commitment_months)) throw policyError('invalid_original_commitment_months');
     if (!uuid.test(input.original_salesperson_user_id || '') || !uuid.test(input.sales_rep_user_id || '')
       || input.original_salesperson_user_id !== input.sales_rep_user_id) throw policyError('original_salesperson_mismatch');
     const original = input.original_membership_start_at;
-    const initialEnd = new Date(anchoredMonthInstant(original,input.original_commitment_months));
-    windowEnd = new Date(anchoredMonthInstant(original,12));
-    if (termStart.toISOString() !== new Date(original).toISOString() || termEnd.getTime() !== initialEnd.getTime()) {
-      throw policyError('original_membership_term_mismatch');
+    if (enterprise) {
+      // Server-qualified original cash A and ORIGINAL custom legal E. Neither
+      // today's advanced legal window nor a fake Retail month count sets this.
+      const a = instant(original,'original_membership_start_at');
+      const e = instant(input.original_term_end_at,'original_term_end_at');
+      if (input.original_commitment_months !== undefined || termStart.getTime() !== a.getTime()
+        || termEnd.getTime() !== e.getTime() || closed.getTime() !== a.getTime()) throw policyError('original_membership_term_mismatch');
+      windowEnd = new Date(anchoredMonthInstant(a.toISOString(),12));
+    } else {
+      if (![3,6,12].includes(input.original_commitment_months)) throw policyError('invalid_original_commitment_months');
+      const initialEnd = new Date(anchoredMonthInstant(original,input.original_commitment_months));
+      windowEnd = new Date(anchoredMonthInstant(original,12));
+      if (termStart.toISOString() !== new Date(original).toISOString() || termEnd.getTime() !== initialEnd.getTime()) {
+        throw policyError('original_membership_term_mismatch');
+      }
     }
     qualificationVerified = input.original_qualification_verified;
   }
@@ -102,8 +115,8 @@ function calculateReceiptCommission(input = {}) {
   let reason = null;
   if (input.payment_succeeded !== true) reason = 'payment_not_successful';
   else if (qualificationVerified !== true) reason = 'sale_not_verified';
-  else if (closed < termStart || closed >= termEnd || paid >= windowEnd || (v2 && paid < termStart)) {
-    reason = v2 ? 'outside_original_first_year' : 'outside_first_term';
+  else if (closed < termStart || closed >= termEnd || paid >= windowEnd || (firstYear && paid < termStart)) {
+    reason = firstYear ? 'outside_original_first_year' : 'outside_first_term';
   }
   else if (cutoff && (paid >= cutoff || closed >= cutoff)) reason = 'after_departure_window';
   else if (net <= 0) reason = 'no_net_membership_fee';

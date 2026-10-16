@@ -8,7 +8,7 @@ const {proveEnterprisePoolPayment}=require('../../src/services/enterprisePoolPay
 const paidFixture=require('./enterprise-pool-payment-fixture');
 const lit=v=>v==null?'null':typeof v==='object'?`'${JSON.stringify(v).replaceAll("'","''")}'::jsonb`:
  typeof v==='boolean'||typeof v==='number'?String(v):`'${String(v).replaceAll("'","''")}'`;
-module.exports=async function fixture(sql,{cadence='monthly',ordinal=1,initialPeriodSeconds=86400,noticeDays=null,termDays=null,termStartDays=0}={}){
+module.exports=async function fixture(sql,{cadence='monthly',ordinal=1,initialPeriodSeconds=86400,noticeDays=null,termDays=null,termStartDays=0,clientLegalName=null,platformLineCents=null}={}){
  const id=crypto.randomUUID(),client=crypto.randomUUID(),attempt=crypto.randomUUID(),suffix=id.replaceAll('-','');
  const customer='cus_PERIOD_'+suffix,token=crypto.createHash('sha256').update(id).digest('hex');
  const start=sql(`select to_char(current_date+make_interval(days=>${Number.isSafeInteger(termStartDays)?termStartDays:0}),'YYYY-MM-DD')`),end=termDays===null?sql("select to_char(current_date+interval '1 year','YYYY-MM-DD')"):
@@ -17,6 +17,7 @@ module.exports=async function fixture(sql,{cadence='monthly',ordinal=1,initialPe
   per_role_fee:'0',included_interviews_per_role:'0',additional_interview_fee:'0',pool_quantity:30,usage_interview_fee_cents:2500,
   max_interview_minutes:'20',scored_question_count:'5',term_start_basis:'agreement_date',initial_term_start:start,initial_renewal_date:end});
  if(noticeDays!==null)Object.assign(values,{notice_deadline_plain:String(noticeDays),notice_deadline_days:String(noticeDays)+' Days'});
+ if(clientLegalName!==null)values.client_legal_name=clientLegalName;
  const unsigned={values,rendered_html:'SYNTHETIC ONLY'};
  sql(`set role service_role;insert into clients(id,name,email,stripe_customer_id) values(${lit(client)},'Synthetic Period','period@example.invalid',${lit(customer)});
   insert into membership_agreements(id,client_id,status,client_legal_name,primary_admin_name,admin_email,membership_tier,initial_term_start,
@@ -44,6 +45,8 @@ module.exports=async function fixture(sql,{cadence='monthly',ordinal=1,initialPe
   checkout_session_id:a.checkout_session_id,subscription_id:'sub_PERIOD_'+suffix,invoice_id:'in_INITIAL_'+suffix,
   payment_intent_id:'pi_INITIAL_'+suffix,charge_id:'ch_INITIAL_'+suffix,platform_price_id:prices.platform_price_id,pool_price_id:prices.pool_price_id,
   payment_success_at:new Date(now*1000).toISOString()};
+ if(platformLineCents!==null){assertPlatformLine(platformLineCents,funding.platform_nominal_cents);
+  funding.collected_cents+=platformLineCents-funding.platform_line_cents;funding.platform_line_cents=platformLineCents;}
  const saved=JSON.parse(sql(`set role service_role;select record_enterprise_existing_funding(${[id,client,pending.source,prices,funding].map(lit).join(',')});`));
  const sub={id:funding.subscription_id,customer,status:'active',current_period_end:now+initialPeriodSeconds,cancel_at_period_end:false};
  const billing=JSON.parse(sql(`set role service_role;select apply_enterprise_existing_billing(${[id,client,pending.source,prices,saved,sub].map(lit).join(',')});`));
@@ -58,3 +61,4 @@ module.exports=async function fixture(sql,{cadence='monthly',ordinal=1,initialPe
   payment_intent_id:'pi_CYCLE_'+suffix,charge_id:'ch_CYCLE_'+suffix,provider_effect_authorized:false,paid_access_authorized:false,payroll_authorized:false};
  return{id,client,customer,billing,funding,proof};
 };
+function assertPlatformLine(value,nominal){if(!Number.isSafeInteger(value)||value<0||value>nominal)throw Error('invalid authored platform line');}

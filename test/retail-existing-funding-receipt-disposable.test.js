@@ -7,7 +7,9 @@ const enabled=process.env.RETAIL_FUNDING_RECEIPT_DISPOSABLE==='true',opts={skip:
 const enterpriseFenceEnabled=enabled&&process.env.ENTERPRISE_LEGACY_FENCE_DISPOSABLE==='true';
 const enterpriseUsageWindowEnabled=enabled&&process.env.ENTERPRISE_USAGE_WINDOW_DISPOSABLE==='true';
 const enterpriseUsageWindowOpts={skip:!enterpriseUsageWindowEnabled};
-const enterpriseOwnedStatusEnabled=enabled&&process.env.ENTERPRISE_OWNED_STATUS_DISPOSABLE==='true';
+const enterpriseCommissionEnabled=enabled&&process.env.ENTERPRISE_COMMISSION_DISPOSABLE==='true';
+const enterpriseCommissionOpts={skip:!enterpriseCommissionEnabled};
+const enterpriseOwnedStatusEnabled=enabled&&(process.env.ENTERPRISE_OWNED_STATUS_DISPOSABLE==='true'||enterpriseCommissionEnabled);
 const enterpriseOwnedStatusOpts={skip:!enterpriseOwnedStatusEnabled};
 const enterpriseDispatchEnabled=enabled&&(process.env.ENTERPRISE_RENEWAL_DISPATCH_DISPOSABLE==='true'||enterpriseOwnedStatusEnabled);
 const enterpriseDispatchOpts={skip:!enterpriseDispatchEnabled};
@@ -119,7 +121,7 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014165458_retail_existing_recurring_source_read.sql'),'utf8'));
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014181400_retail_existing_recurring_invoice_receipts.sql'),'utf8'));
  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014185906_retail_existing_renewal_preference.sql'),'utf8'));
- if(process.env.RETAIL_NATIVE_COMMISSION_PROOF==='true'){
+ if(process.env.RETAIL_NATIVE_COMMISSION_PROOF==='true'||enterpriseCommissionEnabled){
   // Verified read-only on dev: existing Supabase extensions USAGE + digest
   // EXECUTE. Schema-only export omits this external-schema baseline grant.
   sql('grant usage on schema extensions to service_role;');
@@ -288,6 +290,32 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
    denied('begin;'+change+';'+currentMigration,/enterprise_usage_current_window_prerequisite_drift/);assert.deepEqual(providerCatalog(),prior);
   }
   sql(currentMigration);assert.deepEqual(providerCatalog().metadata,prior.metadata);assert.notEqual(providerCatalog().body,prior.body);
+ }
+ if(enterpriseCommissionEnabled){
+  // A real old-protocol receipt exists BEFORE ALTER TABLE. Preserve its exact
+  // financial/attribution JSON, allowing only the two new nullable fields.
+  const historical=fixture('basic',3,'monthly_installments',false,true,false,'admin','sales_assisted','historical-payroll@example.invalid');
+  commissionRep(historical);record(historical);nativeComplete(historical);nativeBilling(historical);
+  sql('set role service_role;'+commissionInsert(commissionRow(historical)));
+  const migration=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261016091147_enterprise_existing_manual_commission_receipts.sql'),'utf8');
+  const sig='public.require_sales_commission_sales_assisted()';
+  const catalog=()=>JSON.parse(sql(`select jsonb_build_object('body',md5(prosrc),'metadata',to_jsonb(p)-'prosrc') from pg_proc p where oid=${lit(sig)}::regprocedure`));
+  const original=catalog(),def=sql(`select pg_get_functiondef(${lit(sig)}::regprocedure)`);
+  const tableState=()=>sql("select md5(coalesce(jsonb_agg(to_jsonb(r) order by id)::text,'[]')) from sales_commission_receipts r");
+  const before=tableState(),permissions=sql("select relacl::text from pg_class where oid='sales_commission_receipts'::regclass");
+  for(const change of [def.replace(/AS \$function\$/,'AS $function$\n -- synthetic commission drift\n'),
+   `grant execute on function ${sig} to anon`,`alter function ${sig} security definer`,`alter function ${sig} parallel safe`,
+   `alter function ${sig} set search_path=public`,'alter table sales_commission_receipts disable row level security',
+   'alter table sales_commission_receipts disable trigger sales_commission_receipts_immutable',
+   'alter table sales_commission_receipts alter column purchase_intent_id drop not null']){
+   denied('begin;'+change+';'+migration,/enterprise_commission_.*drift/);assert.deepEqual(catalog(),original);
+   assert.equal(sql("select count(*) from pg_attribute where attrelid='sales_commission_receipts'::regclass and attname='enterprise_agreement_id' and not attisdropped"),'0');
+  }
+  sql(migration);assert.deepEqual(catalog().metadata,original.metadata);assert.notEqual(catalog().body,original.body);
+  assert.equal(sql("select relacl::text from pg_class where oid='sales_commission_receipts'::regclass"),permissions);
+  // Additive nullable fields only, not a row backfill or alteration of history.
+  assert.equal(sql("select md5(coalesce(jsonb_agg(to_jsonb(r)-'enterprise_agreement_id'-'enterprise_commission_source' order by id)::text,'[]')) from sales_commission_receipts r"),before);
+  console.log('LOCAL Enterprise commission attribution catalog',JSON.stringify(catalog()));
  }
 });
 function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false,adminSource='admin',linkedSource='sales_assisted',buyerEmail='buyer@example.invalid',options={}){
@@ -2744,6 +2772,94 @@ test('internal linked member seam is mounted only by original activation and nev
 
 // Actual original-schema Enterprise period receipt, no provider/Auth/access effects.
 const enterprisePeriodFixture=require('./helpers/enterprise-native-paid-period-fixture');
+async function enterpriseCommissionFixture(options={}){
+ const f=await enterprisePeriodFixture(sql,{clientLegalName:'Cedar Vale Synthetic Enterprise',platformLineCents:12345,...options});
+ f.rep=crypto.randomUUID();f.reviewer=crypto.randomUUID();f.other=crypto.randomUUID();
+ sql(`insert into auth.users(id,email) values(${lit(f.rep)},${lit(f.rep+'@example.invalid')}),(${lit(f.other)},${lit(f.other+'@example.invalid')}),(${lit(f.reviewer)},${lit(f.reviewer+'@example.invalid')});
+  insert into sales_reps(user_id,email,display_name,active) values(${lit(f.rep)},${lit(f.rep+'@example.invalid')},'Synthetic Original Rep',true),
+  (${lit(f.other)},${lit(f.other+'@example.invalid')},'Synthetic Other Rep',true);`);
+ return f;
+}
+const enterpriseCommissionReadCall=(f,invoice=f.funding.invoice_id,rep=f.rep,attested=true)=>
+ `select read_enterprise_existing_commission_payment(${[f.id,f.client,invoice,rep,attested].map(lit).join(',')});`;
+const enterpriseCommissionRead=(...args)=>JSON.parse(sql('set role service_role;'+enterpriseCommissionReadCall(...args)));
+function enterpriseCommissionRow(f,p,patch={}){
+ const q=p.qualification,{weekRangeForTimestamp}=require('../src/services/salesCommissionPolicy');
+ return{id:crypto.randomUUID(),purchase_intent_id:null,enterprise_agreement_id:f.id,enterprise_commission_source:q,
+  rep_user_id:q.rep_user_id,provider:'stripe',provider_payment_id:p.provider_payment_id,payment_kind:q.payment_kind,currency:'usd',
+  payment_success_at:p.payment_success_at,funds_received_at:p.payment_success_at,qualification_closed_at:q.qualification_closed_at,
+  first_term_start_at:q.original_paid_at,first_term_end_at:q.original_term_end_at,
+  gross_membership_cents:p.gross_membership_cents,discount_cents:p.discount_cents,provider_fee_cents:101,
+  statement_week_start:weekRangeForTimestamp(new Date()).date_from,evidence_reference:'SYNTHETIC admin attested platform funds and original salesperson',
+  reviewed_by_user_id:f.reviewer,membership_terms_protocol:'enterprise_existing_terms_v1',policy_version:'enterprise-existing-commission-v1',...patch};
+}
+test('ENTERPRISE COMMISSION initial prorated platform only, original rep attestation, immutable snapshot and no customer effects',enterpriseCommissionOpts,async()=>{
+ const f=await enterpriseCommissionFixture(),before=enterprisePeriodUnchanged(f);
+ denied('set role service_role;'+enterpriseCommissionReadCall(f,f.funding.invoice_id,f.rep,false),/original_rep_attestation_required/);
+ const p=enterpriseCommissionRead(f),r=enterpriseCommissionRow(f,p);
+ assert.equal(p.gross_membership_cents,12345);assert.equal(p.discount_cents,0);assert.equal(p.qualification.client_legal_name,'Cedar Vale Synthetic Enterprise');
+ assert.equal(p.settlement_verified,false);assert.equal(p.payroll_authorized,false);assert.equal(p.qualification.original_paid_at.slice(0,23),f.funding.payment_success_at.slice(0,23));
+ for(const patch of [{gross_membership_cents:f.funding.collected_cents},{gross_membership_cents:f.funding.platform_nominal_cents},
+  {discount_cents:1},{provider_payment_id:f.funding.payment_intent_id},{rep_user_id:f.other},{purchase_intent_id:crypto.randomUUID()},
+  {membership_terms_protocol:'legacy_receipt_v1'},{payment_kind:'financed_checkout'},
+  {enterprise_commission_source:{...p.qualification,rep_user_id:f.other}}])
+  denied('set role service_role;'+commissionInsert({...r,...patch}),/enterprise_commission_|commission_sale_|unverified_qualifying_sale|check constraint/);
+ sql('set role service_role;'+commissionInsert(r));
+ assert.equal(sql(`select net_membership_cents||'|'||commission_cents from sales_commission_receipts where id=${lit(r.id)}`),'12244|6122');
+ denied('set role service_role;'+commissionInsert({...r,id:crypto.randomUUID()}),/duplicate key/);
+ denied(`set role service_role;update sales_commission_receipts set rep_user_id=${lit(f.other)} where id=${lit(r.id)}`,/append.only|immutable/);
+ assert.equal(enterprisePeriodUnchanged(f),before);
+});
+for(const cadence of ['monthly','annual'])test(`ENTERPRISE COMMISSION ${cadence} later platform receipt retains original rep/A/E and exact discount`,enterpriseCommissionOpts,async()=>{
+ const f=await enterpriseCommissionFixture({cadence}),initial=enterpriseCommissionRead(f);
+ sql('set role service_role;'+commissionInsert(enterpriseCommissionRow(f,initial)));
+ recordEnterprisePeriod(f,{...f.proof,platform_discount_cents:1001,platform_net_cents:98998,cash_cents:100998,tax_cents:2000});
+ const p=enterpriseCommissionRead(f,f.proof.invoice_id,null,false),r=enterpriseCommissionRow(f,p);
+ assert.deepEqual(p.qualification,initial.qualification);assert.equal(p.gross_membership_cents,99999);assert.equal(p.discount_cents,1001);
+ assert.equal(p.qualification.payment_kind,cadence==='annual'?'paid_in_full':'monthly');
+ denied('set role service_role;'+enterpriseCommissionReadCall(f,f.proof.invoice_id,f.other,true),/original_rep_mismatch/);
+ sql('set role service_role;'+commissionInsert(r));
+ assert.equal(sql(`select net_membership_cents||'|'||commission_cents from sales_commission_receipts where id=${lit(r.id)}`),'98897|49449');
+});
+test('ENTERPRISE COMMISSION zero initial platform creates no ledger row; later first receipt still freezes original cash clock',enterpriseCommissionOpts,async()=>{
+ const f=await enterpriseCommissionFixture({platformLineCents:0});
+ denied('set role service_role;'+enterpriseCommissionReadCall(f),/enterprise_commission_payment_denied/);
+ recordEnterprisePeriod(f);const p=enterpriseCommissionRead(f,f.proof.invoice_id);
+ sql('set role service_role;'+commissionInsert(enterpriseCommissionRow(f,p)));
+ assert.equal(Date.parse(p.qualification.original_paid_at),Date.parse(f.funding.payment_success_at));
+ assert.equal(sql(`select count(*) from sales_commission_receipts where enterprise_agreement_id=${lit(f.id)}`),'1');
+});
+test('ENTERPRISE COMMISSION root lock serializes two first receipts for different reps, second cannot reset attribution',enterpriseCommissionOpts,async()=>{
+ const f=await enterpriseCommissionFixture();recordEnterprisePeriod(f);
+ const first=enterpriseCommissionRow(f,enterpriseCommissionRead(f)),second=enterpriseCommissionRow(f,enterpriseCommissionRead(f,f.proof.invoice_id,f.other));
+ const tag='ECOM'+crypto.randomUUID().replaceAll('-','');
+ const [a,b,o]=await Promise.all([
+  parallel('begin;set role service_role;'+commissionInsert(first)+'select pg_sleep(0.7);commit;'),
+  parallel(`set application_name=${lit(tag)};select pg_sleep(0.1);set role service_role;${commissionInsert(second)}`),
+  parallel(`select pg_sleep(0.35);select count(*) from pg_stat_activity where application_name=${lit(tag)} and wait_event_type='Lock';`)]);
+ assert.equal(a.code,0,a.err);assert.notEqual(b.code,0);assert.match(b.err,/original_rep_mismatch/);assert.equal(o.out.trim(),'1');
+ assert.equal(sql(`select count(*)||'|'||min(rep_user_id::text) from sales_commission_receipts where enterprise_agreement_id=${lit(f.id)}`),'1|'+f.rep);
+});
+test('ENTERPRISE COMMISSION linked refund retains original snapshot after client archive and rep departure',enterpriseCommissionOpts,async()=>{
+ const f=await enterpriseCommissionFixture(),p=enterpriseCommissionRead(f),r=enterpriseCommissionRow(f,p);
+ sql('set role service_role;'+commissionInsert(r));
+ sql(`update clients set archived_at=clock_timestamp() where id=${lit(f.client)};update sales_reps set active=false where user_id=${lit(f.rep)};`);
+ denied('set role service_role;'+enterpriseCommissionReadCall(f),/enterprise_commission_client_denied/);
+ sql(`set role service_role;insert into sales_commission_adjustments(receipt_id,adjustment_type,provider_event_id,
+  net_membership_delta_cents,commission_delta_cents,effective_at,statement_week_start,evidence_reference,reviewed_by_user_id)
+  values(${lit(r.id)},'refund',${lit('SYNTHETIC_REFUND_'+r.id)},-100,-50,clock_timestamp(),${lit(r.statement_week_start)},'Synthetic reviewed refund',${lit(f.reviewer)});`);
+ assert.equal(sql(`select commission_delta_cents from sales_commission_adjustments where receipt_id=${lit(r.id)}`),'-50');
+ assert.deepEqual(JSON.parse(sql(`select enterprise_commission_source from sales_commission_receipts where id=${lit(r.id)}`)),p.qualification);
+});
+test('ENTERPRISE COMMISSION browser roles, foreign invoice and missing original source cannot qualify',enterpriseCommissionOpts,async()=>{
+ const f=await enterpriseCommissionFixture();
+ for(const role of ['anon','authenticated'])denied(`set role ${role};`+enterpriseCommissionReadCall(f),/permission denied/);
+ denied('set role service_role;'+enterpriseCommissionReadCall(f,'in_FOREIGN_MISSING'),/no rows|invoice_denied/);
+ denied('set role service_role;'+enterpriseCommissionReadCall({...f,client:crypto.randomUUID()}),/client_denied/);
+ const p=enterpriseCommissionRead(f),bad={...p.qualification,billing_source_digest:'0'.repeat(32)};
+ denied('set role service_role;'+commissionInsert(enterpriseCommissionRow(f,p,{enterprise_commission_source:bad})),/proof_conflict/);
+ assert.equal(sql(`select count(*) from sales_commission_receipts where enterprise_agreement_id=${lit(f.id)}`),'0');
+});
 const enterprisePeriodCall=(f,p=f.proof,b=f.billing)=>`select record_enterprise_existing_paid_period(${[f.id,f.client,b,p].map(lit).join(',')});`;
 const recordEnterprisePeriod=(f,p=f.proof,b=f.billing)=>JSON.parse(sql('set role service_role;'+enterprisePeriodCall(f,p,b)));
 const enterprisePeriodUnchanged=f=>sql(`select jsonb_build_object('agreement',(select to_jsonb(a) from membership_agreements a where id=${lit(f.id)}),

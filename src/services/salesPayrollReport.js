@@ -55,7 +55,19 @@ function buildSalesPayrollReport({ dateFrom, dateTo, representatives, receipts, 
     const representative = repById.get(receipt.rep_user_id);
     const intent = intentById.get(receipt.purchase_intent_id);
     const protocol=receipt.membership_terms_protocol;
-    if (protocol != null && !['legacy_receipt_v1','retail_terms_v2','retail_existing_terms_v2'].includes(protocol)) throw new Error('report_invalid_membership_protocol');
+    if (protocol != null && !['legacy_receipt_v1','retail_terms_v2','retail_existing_terms_v2','enterprise_existing_terms_v1'].includes(protocol)) throw new Error('report_invalid_membership_protocol');
+    if (protocol==='enterprise_existing_terms_v1') {
+      // Native insertion froze this qualification; never join a current owner
+      // or current agreement to re-attribute historical refunds and payouts.
+      const q=receipt.enterprise_commission_source;
+      if(!representative || receipt.purchase_intent_id!==null || receipt.membership_contract_id!=null || receipt.membership_contract_version!=null
+        || receipt.sales_qualification_id!=null || !q || q.version!=='enterprise_existing_commission_qualification_v1'
+        || q.agreement_id!==receipt.enterprise_agreement_id || q.rep_user_id!==receipt.rep_user_id
+        || q.original_rep_attested!==true || q.payroll_authorized!==false
+        || typeof q.client_legal_name!=='string' || !q.client_legal_name.trim()
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(q.agreement_id||'')) throw new Error('report_missing_sales_attribution');
+      return{representative,client:q.client_legal_name,dealKey:`agreement:${q.agreement_id}`};
+    }
     const q=qualificationByContract.get(receipt.membership_contract_id);
     const existing=existingByIntent.get(receipt.sales_qualification_id);
     const attributed=protocol==='retail_terms_v2'
@@ -70,11 +82,11 @@ function buildSalesPayrollReport({ dateFrom, dateTo, representatives, receipts, 
     }
     const client = String(intent.company_legal_name || intent.buyer_email || '').trim();
     if (!client) throw new Error('report_missing_client_name');
-    return { representative, client };
+    return { representative, client, dealKey:receipt.purchase_intent_id };
   }
 
   for (const receipt of receipts) {
-    const { representative, client } = context(receipt);
+    const { representative, client, dealKey } = context(receipt);
     const gross = integer(receipt.gross_membership_cents, 'gross');
     const discount = integer(receipt.discount_cents, 'discount');
     const fee = integer(receipt.provider_fee_cents, 'provider_fee');
@@ -83,13 +95,16 @@ function buildSalesPayrollReport({ dateFrom, dateTo, representatives, receipts, 
     if (gross <= 0 || discount < 0 || fee < 0 || gross - discount - fee !== net) throw new Error('report_receipt_reconciliation_failed');
     addEvent(representative, {
       id: `receipt:${receipt.id}`, date: localDate(receipt.funds_received_at), client_name: client,
-      activity: ['retail_terms_v2','retail_existing_terms_v2'].includes(receipt.membership_terms_protocol)
+      activity: receipt.membership_terms_protocol==='enterprise_existing_terms_v1'
+        ? (receipt.payment_kind==='monthly'?'Enterprise monthly platform payment':'Enterprise annual platform payment')
+        : ['retail_terms_v2','retail_existing_terms_v2'].includes(receipt.membership_terms_protocol)
         ? (receipt.payment_kind==='monthly'?'Monthly installment':'Prepaid membership payment')
         : receipt.payment_kind === 'monthly' ? 'Monthly payment' : receipt.payment_kind === 'financed_checkout' ? 'Financed payment' : 'Annual payment',
       gross_sales_cents: gross, adjustment_cents: -discount - fee, net_revenue_cents: net,
       commission_cents: commission, purchase_intent_id: receipt.purchase_intent_id, receipt_id: receipt.id,
+      ...(receipt.membership_terms_protocol==='enterprise_existing_terms_v1'?{enterprise_agreement_id:receipt.enterprise_agreement_id}:{}),
     });
-    salesByRep.get(representative.user_id).add(receipt.purchase_intent_id);
+    salesByRep.get(representative.user_id).add(dealKey);
   }
 
   for (const adjustment of adjustments) {
@@ -103,6 +118,7 @@ function buildSalesPayrollReport({ dateFrom, dateTo, representatives, receipts, 
       activity: adjustment.adjustment_type === 'refund' ? 'Refund' : adjustment.adjustment_type === 'chargeback' ? 'Chargeback' : 'Recovery',
       gross_sales_cents: 0, adjustment_cents: delta, net_revenue_cents: delta,
       commission_cents: commission, purchase_intent_id: receipt.purchase_intent_id, receipt_id: receipt.id,
+      ...(receipt.membership_terms_protocol==='enterprise_existing_terms_v1'?{enterprise_agreement_id:receipt.enterprise_agreement_id}:{}),
     });
   }
 

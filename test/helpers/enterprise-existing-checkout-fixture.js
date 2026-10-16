@@ -19,10 +19,11 @@ class Query{
  }
  then(resolve,reject){return this.exec().then(resolve,reject);}async maybeSingle(){const r=await this.exec();return{data:r.data?.[0]||null,error:r.error};}async single(){return this.maybeSingle();}
 }
-function fixture({cadence='monthly',embedded=false,platformSubtotal,emptyProfile=false}={}){
+function fixture({cadence='monthly',embedded=false,platformSubtotal,emptyProfile=false,clientLegalName=null}={}){
  const aid=crypto.randomUUID(),attemptId=crypto.randomUUID(),signedAt=new Date(Date.now()-1000).toISOString(),prefix=`enterprise-v2/${aid}/attempts/${attemptId}/`;
  const fees=prepareEnterprisePoolTerms({membership_tier:'enterprise',billing_model:'usage',billing_option:cadence,platform_fee:'999.99',per_role_fee:'0',
   included_interviews_per_role:'0',additional_interview_fee:'0',usage_interview_fee_cents:2500,pool_quantity:30,rollover_days:'',max_interview_minutes:'20',scored_question_count:'5'});
+ if(clientLegalName!==null)fees.client_legal_name=clientLegalName;
  const execution={version:'enterprise_execution_v2',attempt_id:attemptId,signed_at:signedAt,signer_typed_name:'SYNTHETIC OWNER',signer_accepted:true,
   signature_sha256:'a'.repeat(64),signature_image_path:prefix+'signature.png',executed_pdf_path:prefix+'executed.pdf',signer_ip:null,signer_user_agent:'SYNTHETIC'};
  const unsigned={values:fees,rendered_html:'SYNTHETIC ONLY'},a={id:aid,client_id:litClient,membership_tier:'enterprise',billing_option:cadence,template_version:'membership_agreement_v2_phase1',

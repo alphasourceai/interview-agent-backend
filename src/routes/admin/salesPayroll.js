@@ -4,6 +4,7 @@ const express = require('express');
 const { fromZonedTime } = require('date-fns-tz');
 const { calculateReceiptCommission, weekRangeForTimestamp } = require('../../services/salesCommissionPolicy');
 const { loadMembershipCommissionTerms } = require('../../services/membershipCommissionTerms');
+const { loadExistingEnterpriseCommissionTerms } = require('../../services/existingEnterpriseCommissionTerms');
 const { STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION } = require('../../services/membershipOffers');
 const { loadExistingRetailCommissionPayment, assertCommissionPaymentInput } = require('../../services/existingRetailCommissionPaymentProof');
 const { parseMercuryPayrollCsv } = require('../../services/mercuryPayrollCsv');
@@ -57,7 +58,9 @@ async function one(db, table, columns, column, value) {
 async function list(db, table, columns, order = 'created_at') {
   const { data, error } = await db.from(table).select(columns).order(order, { ascending: false }).limit(MAX_ROWS);
   if (error || !Array.isArray(data)) throw failure(`${table}_read_failed`, 503);
-  return data;
+  // Keep private native qualification/source fields out of overview responses,
+  // even if a database adapter returns more than the requested projection.
+  return data.map(row=>Object.fromEntries(columns.split(',').filter(key=>Object.hasOwn(row,key)).map(key=>[key,row[key]])));
 }
 
 function latestWeek(...values) {
@@ -112,28 +115,36 @@ function createAdminSalesPayrollRouter({ db } = {}) {
 
   router.get('/', async (_req, res) => {
     try {
-      const [reps, intents, receipts, adjustments, payouts, reversals, departures, locks] = await Promise.all([
+      const [reps, intents, receipts, adjustments, payouts, reversals, departures, locks, enterpriseRead] = await Promise.all([
         list(db, 'sales_reps', 'user_id,email,display_name,active', 'email'),
         list(db, 'sales_commission_review_candidates', 'id,company_legal_name,buyer_email,selected_plan_key,selected_billing_cadence,created_by_user_id,activated_at', 'activated_at'),
-        list(db, 'sales_commission_receipts', 'id,purchase_intent_id,rep_user_id,provider,provider_payment_id,payment_kind,payment_success_at,funds_received_at,qualification_closed_at,rep_final_day,gross_membership_cents,discount_cents,provider_fee_cents,net_membership_cents,commission_cents,statement_week_start,evidence_reference,reviewed_at', 'reviewed_at'),
+        list(db, 'sales_commission_receipts', 'id,purchase_intent_id,enterprise_agreement_id,rep_user_id,provider,provider_payment_id,payment_kind,payment_success_at,funds_received_at,qualification_closed_at,rep_final_day,gross_membership_cents,discount_cents,provider_fee_cents,net_membership_cents,commission_cents,statement_week_start,evidence_reference,reviewed_at', 'reviewed_at'),
         list(db, 'sales_commission_adjustments', 'id,receipt_id,adjustment_type,provider_event_id,net_membership_delta_cents,commission_delta_cents,statement_week_start,evidence_reference,reviewed_at', 'reviewed_at'),
         list(db, 'sales_commission_payouts', 'id,receipt_id,bank_transaction_id,amount_cents,ach_reference,paid_at,recorded_at', 'recorded_at'),
         list(db, 'sales_commission_bank_reversals', 'bank_transaction_id', 'recorded_at'),
         list(db, 'sales_commission_departures', 'rep_user_id,final_day,reviewed_at', 'reviewed_at'),
         list(db, 'sales_commission_statement_locks', 'rep_user_id,week_start,snapshot_sha256,locked_at', 'locked_at'),
+        db.from('membership_agreements').select('id,client_legal_name,billing_option,checkout_paid_at')
+          .eq('is_current', true).eq('membership_tier', 'enterprise').eq('checkout_status', 'paid')
+          .not('enterprise_billing_receipt', 'is', null).order('checkout_paid_at', {ascending:false}).limit(MAX_ROWS),
       ]);
+      if (enterpriseRead?.error || !Array.isArray(enterpriseRead?.data)) throw failure('enterprise_receipt_candidates_unavailable',503);
       const receiptCountByIntent = new Map();
       for (const row of receipts) receiptCountByIntent.set(row.purchase_intent_id, (receiptCountByIntent.get(row.purchase_intent_id) || 0) + 1);
       const reviewCandidates = intents.map((row) => ({ ...row, reviewed_receipt_count: receiptCountByIntent.get(row.id) || 0 }));
       const pendingEvidence = reviewCandidates.filter((row) => row.reviewed_receipt_count === 0);
+      const enterpriseCandidates=enterpriseRead.data.map(row=>({id:row.id,client_legal_name:row.client_legal_name,billing_option:row.billing_option,checkout_paid_at:row.checkout_paid_at,
+        reviewed_receipt_count:receipts.filter(r=>r.enterprise_agreement_id===row.id).length,
+        original_rep_user_id:receipts.find(r=>r.enterprise_agreement_id===row.id)?.rep_user_id||null}));
       const reversedBankIds = new Set(reversals.map((row) => row.bank_transaction_id));
       const effectivePayouts = payouts.filter((row) => !row.bank_transaction_id || !reversedBankIds.has(row.bank_transaction_id));
       return res.json({
-        policy: { rate: 0.5, basis: 'each reviewed net platform payment; original first year for new retail terms, first term for legacy', timezone: 'America/Denver', annual_paid_monthly: 'each funded monthly receipt', automation_enabled: false },
+        policy: { rate: 0.5, basis: 'each reviewed net platform payment; original first year for new retail and Enterprise terms, first term for legacy', timezone: 'America/Denver', annual_paid_monthly: 'each funded monthly receipt', automation_enabled: false },
         automation: { enabled: false, can_enable: false, reason: 'Worker, reconciliation, and payout controls require a separate reviewed release.' },
         representatives: reps, pending_evidence: pendingEvidence, review_candidates: reviewCandidates,
+        enterprise_review_candidates: enterpriseCandidates,
         receipts, adjustments, payouts: effectivePayouts, departures, locked_statements: locks,
-        truncated: [reps, intents, receipts, adjustments, payouts, reversals].some((rows) => rows.length === MAX_ROWS),
+        truncated: [reps, intents, receipts, adjustments, payouts, reversals, enterpriseRead.data].some((rows) => rows.length === MAX_ROWS),
       });
     } catch (error) { return safeError(res, error); }
   });
@@ -228,7 +239,9 @@ function createAdminSalesPayrollRouter({ db } = {}) {
   router.post('/receipts', async (req, res) => {
     try {
       const body = req.body || {};
-      const intentId = uuid(body.purchase_intent_id, 'purchase_intent_id');
+      const enterprise = body.enterprise_agreement_id != null;
+      if (enterprise && body.purchase_intent_id != null) throw failure('ambiguous_commission_source');
+      const intentId = enterprise ? null : uuid(body.purchase_intent_id, 'purchase_intent_id');
       const provider = String(body.provider || '');
       const paymentKind = String(body.payment_kind || '');
       if (!PROVIDERS.has(provider) || !PAYMENT_KINDS.has(paymentKind)) throw failure('invalid_payment_source');
@@ -241,18 +254,25 @@ function createAdminSalesPayrollRouter({ db } = {}) {
       const fundsAt = timestamp(body.funds_received_at, 'funds_received_at');
       if (new Date(paymentAt) > new Date()) throw failure('future_payment_not_allowed');
       if (new Date(fundsAt) > new Date()) throw failure('future_funds_not_allowed');
-      const intent = await one(db, 'public_purchase_intents', 'id,status,channel,created_by_user_id,agreement_id,client_id,activated_at,selected_billing_cadence,platform_fee_cents', 'id', intentId);
-      if (!intent || !intent.agreement_id || !intent.client_id) throw failure('unverified_qualifying_sale');
-      const membership = await loadMembershipCommissionTerms(db, intent);
+      const intent = enterprise ? null : await one(db, 'public_purchase_intents', 'id,status,channel,created_by_user_id,agreement_id,client_id,activated_at,selected_billing_cadence,platform_fee_cents', 'id', intentId);
+      if (!enterprise && (!intent || !intent.agreement_id || !intent.client_id)) throw failure('unverified_qualifying_sale');
+      const membership = enterprise ? await loadExistingEnterpriseCommissionTerms(db, {
+        agreementId: uuid(body.enterprise_agreement_id, 'enterprise_agreement_id'), paymentId,
+        repUserId: body.original_rep_user_id == null || body.original_rep_user_id === '' ? null : uuid(body.original_rep_user_id, 'original_rep_user_id'),
+        originalRepAttested: body.original_rep_attested === true,
+      }) : await loadMembershipCommissionTerms(db, intent);
       if (!membership && (intent.status !== 'completed' || intent.channel !== 'sales_assisted' || !intent.created_by_user_id || !intent.activated_at)) throw failure('unverified_qualifying_sale');
-      const client = await one(db, 'clients', 'id,billing_status,subscription_status', 'id', intent.client_id);
+      const client = await one(db, 'clients', 'id,billing_status,subscription_status', 'id', enterprise ? membership.clientId : intent.client_id);
       if (!isActiveClient(client)) throw failure('client_not_active');
-      if ([STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(membership?.offerVersion)) {
+      if (enterprise) {
+        assertCommissionPaymentInput(membership.paymentProof, { gross, discount, paymentAt });
+        paymentId = membership.paymentProof.provider_payment_id;
+      } else if ([STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(membership?.offerVersion)) {
         const proof = await loadExistingRetailCommissionPayment(db, intent, paymentId);
         assertCommissionPaymentInput(proof, { gross, discount, paymentAt });
         paymentId = proof.provider_payment_id;
       }
-      const cadence = String(intent.selected_billing_cadence || '').toLowerCase();
+      const cadence = String(intent?.selected_billing_cadence || '').toLowerCase();
       if (membership ? paymentKind !== membership.paymentKind || provider !== 'stripe' : !((cadence === 'monthly' && paymentKind === 'monthly') ||
         (cadence === 'annual' && (paymentKind === 'paid_in_full' || paymentKind === 'financed_checkout')))) {
         throw failure('payment_kind_billing_cadence_mismatch');
@@ -297,7 +317,8 @@ function createAdminSalesPayrollRouter({ db } = {}) {
         reviewed_by_user_id: req.user.id,
       }).select('id,net_membership_cents,commission_cents,statement_week_start').single();
       if (error) throw error;
-      return res.status(201).json({ receipt: data });
+      return res.status(201).json({ receipt: { id:data?.id,net_membership_cents:data?.net_membership_cents,
+        commission_cents:data?.commission_cents,statement_week_start:data?.statement_week_start } });
     } catch (error) { return safeError(res, error); }
   });
 

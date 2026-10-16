@@ -63,7 +63,7 @@ async function matchingIds(db, table, columns, ids, idColumn = 'id') {
   return rows;
 }
 
-const RECEIPT_COLUMNS = 'id,purchase_intent_id,rep_user_id,funds_received_at,payment_kind,gross_membership_cents,discount_cents,provider_fee_cents,net_membership_cents,commission_cents,membership_terms_protocol,membership_contract_id,membership_contract_version,sales_qualification_id';
+const RECEIPT_COLUMNS = 'id,purchase_intent_id,rep_user_id,funds_received_at,payment_kind,gross_membership_cents,discount_cents,provider_fee_cents,net_membership_cents,commission_cents,membership_terms_protocol,membership_contract_id,membership_contract_version,sales_qualification_id,enterprise_agreement_id,enterprise_commission_source';
 
 async function loadSalesPayrollReport(db, query, generatedAt = new Date().toISOString()) {
   const bounds = reportBounds(query);
@@ -77,7 +77,7 @@ async function loadSalesPayrollReport(db, query, generatedAt = new Date().toISOS
   const receiptIds = new Set(receipts.map((row) => row.id));
   const linkedIds = [...new Set(adjustments.map((row) => row.receipt_id))].filter((id) => !receiptIds.has(id));
   const linkedReceipts = await matchingIds(db, 'sales_commission_receipts', RECEIPT_COLUMNS, linkedIds);
-  const intentIds = [...new Set([...receipts, ...linkedReceipts].map((row) => row.purchase_intent_id))];
+  const intentIds = [...new Set([...receipts, ...linkedReceipts].filter(row=>row.membership_terms_protocol!=='enterprise_existing_terms_v1').map((row) => row.purchase_intent_id))];
   const intents = await matchingIds(db, 'public_purchase_intents', 'id,channel,created_by_user_id,company_legal_name,buyer_email', intentIds);
   const v2Contracts = [...new Set([...receipts,...linkedReceipts]
     .filter(row=>row.membership_terms_protocol==='retail_terms_v2').map(row=>row.membership_contract_id))];

@@ -91,9 +91,8 @@ test('payroll overview excludes a reversed bank payout from paid totals', async 
     ],
     sales_commission_bank_reversals: [{ bank_transaction_id: 'bank-1' }],
   };
-  const db = { from(table) { return { select() { return { order() { return {
-    limit: async () => ({ data: tables[table] || [], error: null }),
-  }; } }; } }; } };
+  const { createFakeSupabase } = require('./helpers/fakeSupabase');
+  const db = createFakeSupabase(tables);
   await withServer(async (base) => {
     const response = await fetch(`${base}/admin/sales-payroll`);
     assert.equal(response.status, 200);
