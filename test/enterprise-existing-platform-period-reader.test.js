@@ -152,11 +152,11 @@ test('installed SDK uses only local GET requests and pinned API2023',async(t)=>{
   assert.equal(requests.length,12);assert.ok(requests.every(r=>r.method==='GET'&&r.version==='2023-10-16'));
  }finally{await new Promise(r=>server.close(r));}
 });
-test('platform reader is unmounted: only tests import it',()=>{
+test('platform reader is internal: only the unmounted cycle completion imports it',()=>{
  const fs=require('node:fs'),path=require('node:path'),root=path.resolve(__dirname,'../src');
  const walk=dir=>{for(const e of fs.readdirSync(dir,{withFileTypes:true})){
   const p=path.join(dir,e.name);if(e.isDirectory())walk(p);
-  else if(e.name.endsWith('.js')&&e.name!=='existingEnterprisePlatformPeriodReader.js')assert.ok(!fs.readFileSync(p,'utf8').includes('existingEnterprisePlatformPeriodReader'),p);
+  else if(e.name.endsWith('.js')&&!['existingEnterprisePlatformPeriodReader.js','existingEnterprisePaymentCompletion.js'].includes(e.name))assert.ok(!fs.readFileSync(p,'utf8').includes('existingEnterprisePlatformPeriodReader'),p);
  }};walk(root);
 });
 
