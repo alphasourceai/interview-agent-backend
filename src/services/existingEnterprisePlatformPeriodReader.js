@@ -29,11 +29,10 @@ async function readExistingEnterprisePlatformPeriod(input){
  try{
   check(input&&typeof input==='object'&&!isProxy(input)&&[Object.prototype,null].includes(Object.getPrototypeOf(input)));
   const d=Object.getOwnPropertyDescriptors(input),required=['db','stripe','agreementId','clientId','invoiceId'];
-  check(Reflect.ownKeys(d).every(k=>[...required,'now'].includes(k))&&required.every(k=>d[k])
+  check(Reflect.ownKeys(d).length===required.length&&Reflect.ownKeys(d).every(k=>required.includes(k))&&required.every(k=>d[k])
    &&Object.values(d).every(v=>v.enumerable&&Object.hasOwn(v,'value')));
   const {db,stripe,agreementId,clientId,invoiceId}=Object.fromEntries(Object.entries(d).map(([k,v])=>[k,v.value]));
-  const now=d.now?.value??Date.now;
-  check(uuid(agreementId)&&uuid(clientId)&&id(invoiceId,'in')&&typeof now==='function');
+  check(uuid(agreementId)&&uuid(clientId)&&id(invoiceId,'in'));
   const api=()=>check(typeof stripe?.getApiField==='function'&&stripe.getApiField('version')==='2023-10-16');
   api();
   const load=async()=>{
@@ -58,7 +57,7 @@ async function readExistingEnterprisePlatformPeriod(input){
   const charge=await get(()=>stripe.charges.retrieve(invoice.charge));
   check(charge?.id===invoice.charge);
   const refundList=()=>pages(after=>stripe.refunds.list({charge:charge.id,limit:100,...(after?{starting_after:after}:{})}));
-  const refunds=await refundList(),observed=now();check(Number.isSafeInteger(observed));
+  const refunds=await refundList(),observed=Date.now();check(Number.isSafeInteger(observed));
   const proof=proveExistingEnterprisePlatformPeriod({agreement:n.a,invoice,invoiceLines:lines.data,paymentIntent,charge,
    refunds:refunds.data,providerAccountId:p.provider_account_id,observedAt:new Date(observed).toISOString()});
   check(isDeepStrictEqual(originalAccount,await account())
