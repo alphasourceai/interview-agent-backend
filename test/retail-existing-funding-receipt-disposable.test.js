@@ -242,6 +242,16 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
   }
   const old=catalog(),permissions=acl();sql(migration);assert.equal(acl(),permissions);
   for(const p of catalog()){const before=old.find(x=>x.name===p.name);assert.deepEqual(p.metadata,before.metadata);assert.notEqual(p.body,before.body);}
+  const currentMigration=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261016065917_enterprise_existing_usage_current_window.sql'),'utf8');
+  const providerSig='public.change_enterprise_existing_usage_provider(uuid,uuid,text,integer,text,uuid,jsonb,jsonb,jsonb)';
+  const providerCatalog=()=>JSON.parse(sql(`select jsonb_build_object('body',md5(prosrc),'metadata',to_jsonb(p)-'prosrc') from pg_proc p where oid=${lit(providerSig)}::regprocedure`));
+  const prior=providerCatalog(),providerDef=sql(`select pg_get_functiondef(${lit(providerSig)}::regprocedure)`);
+  console.log('LOCAL current usage reader predecessor hash',prior.body);
+  for(const change of [providerDef.replace(/AS \$function\$/,'AS $function$\n -- synthetic provider drift\n'),
+   `grant execute on function ${providerSig} to anon`,`alter function ${providerSig} set statement_timeout='9s'`]){
+   denied('begin;'+change+';'+currentMigration,/enterprise_usage_current_window_prerequisite_drift/);assert.deepEqual(providerCatalog(),prior);
+  }
+  sql(currentMigration);assert.deepEqual(providerCatalog().metadata,prior.metadata);assert.notEqual(providerCatalog().body,prior.body);
  }
 });
 function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false,adminSource='admin',linkedSource='sales_assisted',buyerEmail='buyer@example.invalid',options={}){
@@ -3145,6 +3155,24 @@ test('ENTERPRISE USAGE WINDOW unavailable native legal proof rolls back before b
  assert.equal(sql(`select count(*) from usage_billing_ledger where client_id=${lit(f.client)}`),'0');
  assert.equal(enterprisePeriodUnchanged(f),before);
  assert.equal(sql("select pg_get_functiondef('public.read_enterprise_existing_legal_window(uuid,uuid)'::regprocedure)"),def);
+});
+test('ENTERPRISE USAGE WINDOW actual provider READ carries current legal proof without changing pinned debt or mutation phases',enterpriseUsageWindowOpts,async()=>{
+ const f=await enterpriseUsageWindowFixture(),p=usageWindowPrepare(f),plan=require('../src/services/enterpriseExistingUsageReservation').planEnterpriseExistingUsage(p.snapshot);
+ sql('set role service_role;'+usageWindowReserve(p,plan));
+ const before=sql(`select to_jsonb(b) from enterprise_existing_usage_batches b where id=${lit(p.batch_id)}`);
+ const ledger=sql(`select jsonb_agg(to_jsonb(l) order by id) from usage_billing_ledger l where enterprise_usage_batch_id=${lit(p.batch_id)}`);
+ const command=`select change_enterprise_existing_usage_provider(${[f.client,p.batch_id,'read',null,null,null,null,null,null].map(lit).join(',')})`;
+ const read=JSON.parse(sql("set statement_timeout='2s';set role service_role;"+command));
+ assert.equal(read.status,'read');assert.equal(read.legal_window.version,'enterprise_existing_legal_window_v1');
+ assert.equal(read.legal_window.client_id,f.client);assert.equal(read.legal_window.agreement_id,f.id);
+ assert.ok(Date.parse(read.observed_at)>=Date.parse(read.legal_window.observed_at));
+ const binding=require('../src/services/enterpriseExistingUsageInvoiceProof').usageInvoiceFreshBinding(read);
+ assert.equal(binding.total_cents,2500);assert.equal(binding.batch_id,p.batch_id);
+ assert.equal(sql(`select to_jsonb(b) from enterprise_existing_usage_batches b where id=${lit(p.batch_id)}`),before);
+ assert.equal(sql(`select jsonb_agg(to_jsonb(l) order by id) from usage_billing_ledger l where enterprise_usage_batch_id=${lit(p.batch_id)}`),ledger);
+ for(const role of ['anon','authenticated'])denied(`set role ${role};`+command,/permission denied/);
+ const migration=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261016065917_enterprise_existing_usage_current_window.sql'),'utf8');
+ denied(migration,/enterprise_usage_current_window_prerequisite_drift/);
 });
 test('ENTERPRISE LEGAL actual native window is accepted by the JS reader without projection or provider effects',enterpriseLegalOpts,async()=>{
  const f=await enterprisePeriodFixture(sql,{noticeDays:30}),before=enterprisePeriodUnchanged(f);

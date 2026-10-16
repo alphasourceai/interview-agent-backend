@@ -74,6 +74,15 @@ function usageInvoiceFreshBinding(raw) {
   check(seen.size === expected.size);
   const current = { ...b.snapshot, ...census, observed_at: read.observed_at, receipt: read.receipt,
     ledger: census.ledger.filter(row => row.enterprise_usage_batch_id !== b.id) };
+  // The pinned snapshot proves OLD debt and never changes. Today's complete
+  // census may include interviews in a genuinely renewed term; validate those
+  // against the SAME native current-window reader, not the old invoice's E.
+  if(read.legal_window!=null){
+    check(Date.parse(read.legal_window.term_end_at)>=Date.parse(b.snapshot.legal_window?.term_end_at||b.snapshot.receipt.client_initial.contract_end_at));
+    current.version='enterprise_existing_usage_snapshot_v2';current.legal_window=read.legal_window;
+  }else check(b.snapshot.version==='enterprise_existing_usage_snapshot_v1');
+  // v1 without a fresh proof is only the old pre-patch compatibility path.
+  // It may hold later service; it must never infer a renewed window.
   let planned; try { planned = planEnterpriseExistingUsage(current); } catch (_) { held(); }
   check(isDeepStrictEqual(clean(planned.groups, native), b.groups) && isDeepStrictEqual(clean(planned.prefix, native), b.prefix));
   // Original labels/digest/key remain frozen; current census only revalidates
