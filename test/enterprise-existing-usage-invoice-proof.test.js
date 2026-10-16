@@ -9,7 +9,7 @@ const { planEnterpriseExistingUsage: plan } = require('../src/services/enterpris
 const { usageOperationKey } = require('../src/services/usageBilling');
 const proof = require('../src/services/enterpriseExistingUsageInvoiceProof');
 const clone = v => structuredClone(v);
-async function binding() {
+async function binding({v2=false}={}) {
   const f = await accepted(), role = randomUUID(), role2 = randomUUID(), quantity = f.w.funding_receipt.proof.quantity;
   const s = { version: 'enterprise_existing_usage_snapshot_v1', owner_id: f.client.id, agreement_id: f.a.id,
     month_start: '2026-10-01T00:00:00.000Z', month_end: '2026-11-01T00:00:00.000Z', observed_at: '2026-11-01T00:00:01.000Z',
@@ -25,6 +25,7 @@ async function binding() {
     pools: [{ id: f.w.funding_receipt.proof.pool_id, client_id: f.client.id, quantity_purchased: quantity,
       status: 'paid', paid_at: f.w.funding_receipt.proof.payment_success_at, created_at: '2026-10-01T12:00:00.000Z' }],
     purchases: [], credits: [], ledger: [], intents: [], customers: [], seals: [], history: [] };
+  if(v2){s.version='enterprise_existing_usage_snapshot_v2';s.legal_window=clone(f.legal);}
   const p = plan(s), b = { id: randomUUID(), owner_id: s.owner_id, agreement_id: s.agreement_id,
     account_id: f.w.funding_receipt.proof.provider_account_id, livemode: f.w.funding_receipt.proof.livemode,
     customer_id: f.w.client_initial.stripe_customer_id, subscription_id: f.w.client_initial.stripe_subscription_id,
@@ -113,6 +114,19 @@ test('fresh full census revalidates reserved ledger and allocation without repri
   assert.equal(calls.length,2);assert.equal(calls[1].name,'change_enterprise_existing_usage_provider');
   assert.deepEqual(clone(calls[1].args.p_observation),census);
   assert.equal(calls[1].args.p_generation,0);assert.equal(Object.keys(calls[1].args).some(k=>/clock|until|sent_at/.test(k)),false);
+});
+test('v2 reserved debt keeps its pinned native legal proof and identical invoice keys through fresh census validation',async()=>{
+ const {raw,b}=await binding({v2:true}),before=clone(raw.snapshot.legal_window);
+ const census=Object.fromEntries(['clients','agreements','settings','roles','interviews','pools','purchases','credits','ledger','intents','customers','seals']
+  .map(k=>[k,clone(raw.snapshot[k])]));
+ census.ledger=raw.groups.flatMap(g=>g.interview_ids.map(interview_id=>({id:randomUUID(),client_id:raw.owner_id,
+  role_id:g.role_id,interview_id,unit_price_cents:g.unit_price_cents,enterprise_usage_batch_id:raw.id,
+  period_start:raw.snapshot.month_start,period_end:raw.snapshot.month_end,stripe_invoice_id:null,stripe_invoice_item_id:null,billed_at:null})));
+ const fresh=proof.usageInvoiceFreshBinding({status:'read',batch:raw,census,receipt:raw.snapshot.receipt,observed_at:'2026-11-02T00:00:00.000000Z'});
+ assert.deepEqual(fresh,b);assert.deepEqual(raw.snapshot.legal_window,before);
+ assert.deepEqual(proof.usageInvoiceCreateRequest(fresh),proof.usageInvoiceCreateRequest(b));
+ census.settings[0].usage_interview_fee_cents=1;
+ assert.deepEqual(proof.usageInvoiceFreshBinding({status:'read',batch:raw,census,receipt:raw.snapshot.receipt,observed_at:'2026-11-02T00:00:00.000000Z'}),b);
 });
 test('shell and per-role partial proofs precede full finalized proof; never claim cash or effects', async () => {
   const { b } = await binding();

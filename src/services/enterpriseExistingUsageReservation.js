@@ -7,6 +7,7 @@
 const { isDeepStrictEqual } = require('node:util');
 const { snapshotEnterpriseUsageCensusData: snapshot } = require('./enterprisePoolPaymentProof');
 const { verifyEnterpriseBillingReceipt } = require('./existingEnterpriseBillingReceipt');
+const { verifyExistingEnterpriseLegalWindow } = require('./existingEnterpriseLegalWindow');
 const { allocateInterviewRows } = require('./interviewAllocation');
 const { isUsedInterviewRow } = require('./roleInterviewAvailability');
 const UUID = /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
@@ -20,7 +21,7 @@ const sameInstant = (a,b) => instant(a) && instant(b) && Date.parse(a) === Date.
 
 function planEnterpriseExistingUsage(raw) {
   let s; try { s = snapshot(raw); } catch (_) { hold(); }
-  check(s?.version === 'enterprise_existing_usage_snapshot_v1' && UUID.test(s.owner_id)
+  check(['enterprise_existing_usage_snapshot_v1','enterprise_existing_usage_snapshot_v2'].includes(s?.version) && UUID.test(s.owner_id)
     && UUID.test(s.agreement_id) && instant(s.month_start) && instant(s.month_end) && instant(s.observed_at)
     && /^\d{4}-\d{2}-01T00:00:00\.000Z$/.test(s.month_start)
     && /^\d{4}-\d{2}-01T00:00:00\.000Z$/.test(s.month_end));
@@ -50,6 +51,12 @@ function planEnterpriseExistingUsage(raw) {
     prices: a.enterprise_checkout_prices, fundingReceipt: a.enterprise_funding_receipt }); } catch (_) { hold(); }
   check(isDeepStrictEqual(snapshot(receipt), a.enterprise_billing_receipt));
   const accepted = receipt.plan_initial, initial = receipt.client_initial, proof = receipt.funding_receipt.proof;
+  let serviceStart=initial.contract_start_at,serviceEnd=initial.contract_end_at;
+  if(s.version==='enterprise_existing_usage_snapshot_v2'){
+    let window;try{window=verifyExistingEnterpriseLegalWindow(s.legal_window,{agreement:a,billingReceipt:receipt});}catch(_){hold();}
+    check(Date.parse(window.observed_at)<=Date.parse(s.observed_at));
+    serviceStart=window.initial_term_start;serviceEnd=window.term_end_at;
+  }else check(!Object.hasOwn(s,'legal_window')); // A pinned v1 debt keeps its original bounds.
   check(proof.client_id === s.owner_id && owner.stripe_customer_id === initial.stripe_customer_id
     && owner.stripe_subscription_id === initial.stripe_subscription_id
     && accepted.client_id === s.owner_id && accepted.billing_model === 'usage'
@@ -82,8 +89,8 @@ function planEnterpriseExistingUsage(raw) {
       && typeof row.status === 'string' && (row.completed_at === null || instant(row.completed_at))
       && instant(row.updated_at) && (row.has_substantive_response === null || typeof row.has_substantive_response === 'boolean'));
     if (isUsedInterviewRow(row)) check(instant(row.completed_at)
-      && Date.parse(row.completed_at) >= Date.parse(initial.contract_start_at)
-      && Date.parse(row.completed_at) < Date.parse(initial.contract_end_at)
+      && Date.parse(row.completed_at) >= Date.parse(serviceStart)
+      && Date.parse(row.completed_at) < Date.parse(serviceEnd)
       && Date.parse(row.completed_at) <= Date.parse(s.observed_at));
   }
   for (const row of s.ledger) check(row.client_id === s.owner_id && byInterview.has(row.interview_id)

@@ -21,8 +21,31 @@ async function fixture(cadence = 'monthly') {
     pools: [{ id: f.w.funding_receipt.proof.pool_id, client_id: f.client.id, quantity_purchased: quantity,
       status: 'paid', paid_at: f.w.funding_receipt.proof.payment_success_at, created_at: '2026-10-01T12:00:00.000Z' }],
     credits: [], purchases: [], ledger: [], intents: [], customers: [], seals: [], history: [] };
-  return { s: structuredClone(snapshot), role, quantity };
+  return { s: structuredClone(snapshot), legal: structuredClone(f.legal), role, quantity };
 }
+test('v2 initial native legal proof preserves the exact v1 allocation and rate',async()=>{
+ const f=await fixture(),old=plan(f.s);f.s.version='enterprise_existing_usage_snapshot_v2';f.s.legal_window=f.legal;
+ assert.deepEqual(plan(f.s),old);assert.equal(plan(f.s).total_cents,5000);
+});
+test('v2 anniversary keeps original pool/prefix and bills only new closed-month excess without resetting rate',async()=>{
+ const f=await fixture(),original=plan(f.s);f.s.version='enterprise_existing_usage_snapshot_v2';
+ Object.assign(f.legal,{term_index:1,term_start_at:f.legal.original_term_end,term_end_at:'2028-10-01T13:00:00.000000Z',
+  notice_cutoff_at:'2028-09-01T13:00:00.000000Z',funded_through:'2027-11-01T00:00:00.000000Z',observed_at:'2027-10-02T00:00:00.000000Z'});
+ f.s.legal_window=f.legal;Object.assign(f.s,{month_start:'2027-10-01T00:00:00.000Z',month_end:'2027-11-01T00:00:00.000Z',observed_at:'2027-11-01T00:00:01.000000Z'});
+ f.s.history.push({id:crypto.randomUUID(),owner_id:f.s.owner_id,agreement_id:f.s.agreement_id,phase:'reserved',prefix:original.prefix});
+ f.s.interviews.push({...f.s.interviews[0],id:crypto.randomUUID(),completed_at:'2027-10-02T00:00:00.000Z'});
+ const out=plan(f.s);assert.equal(out.total_cents,2500);assert.equal(out.groups[0].quantity,1);
+ assert.equal(out.prefix.filter(x=>x.source==='pool').length,f.quantity);
+ assert.deepEqual(out.prefix.slice(0,original.prefix.length),original.prefix);
+ f.s.settings[0].usage_interview_fee_cents=1;assert.equal(plan(f.s).total_cents,2500);
+ f.s.interviews.at(-1).completed_at=f.legal.term_end_at;assert.throws(()=>plan(f.s),{status:503});
+});
+test('v2 missing/wrong proof and v1 downgrade with new proof hold before any reservation',async()=>{
+ for(const change of [f=>{f.s.version='enterprise_existing_usage_snapshot_v2';},
+  f=>{f.s.version='enterprise_existing_usage_snapshot_v2';f.s.legal_window={...f.legal,client_id:crypto.randomUUID()};},
+  f=>{f.s.version='enterprise_existing_usage_snapshot_v2';f.s.legal_window={...f.legal,observed_at:'2026-11-01T00:00:02.000000Z'};},
+  f=>{f.s.legal_window=f.legal;}]){const f=await fixture();change(f);assert.throws(()=>plan(f.s),{status:503});}
+});
 for (const cadence of ['monthly','annual']) test(`same allocator uses accepted pool/rate for ${cadence} platform cadence`, async () => {
   const f = await fixture(cadence), before = structuredClone(f.s), result = plan(f.s);
   assert.equal(result.total_cents, 5000); assert.equal(result.groups.length, 1);

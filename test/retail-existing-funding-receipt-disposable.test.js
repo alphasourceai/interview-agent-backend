@@ -5,7 +5,9 @@ const {buildRetailPackageSnapshot}=require('../src/services/membershipPackageCom
 const {OFFER_VERSION,STRIPE_RECURRING_OFFER_VERSION,anchoredMonthInstant}=require('../src/services/membershipOffers');
 const enabled=process.env.RETAIL_FUNDING_RECEIPT_DISPOSABLE==='true',opts={skip:!enabled};
 const enterpriseFenceEnabled=enabled&&process.env.ENTERPRISE_LEGACY_FENCE_DISPOSABLE==='true';
-const enterpriseLegalEnabled=enabled&&process.env.ENTERPRISE_LEGAL_DISPOSABLE==='true';
+const enterpriseUsageWindowEnabled=enabled&&process.env.ENTERPRISE_USAGE_WINDOW_DISPOSABLE==='true';
+const enterpriseUsageWindowOpts={skip:!enterpriseUsageWindowEnabled};
+const enterpriseLegalEnabled=enabled&&(process.env.ENTERPRISE_LEGAL_DISPOSABLE==='true'||enterpriseUsageWindowEnabled);
 const enterpriseLegalOpts={skip:!enterpriseLegalEnabled};
 const enterpriseRenewalEnabled=enabled&&(process.env.ENTERPRISE_RENEWAL_DISPOSABLE==='true'||enterpriseLegalEnabled);
 const enterpriseRenewalOpts={skip:!enterpriseRenewalEnabled};
@@ -28,6 +30,7 @@ function run(q){return cp.spawnSync('/opt/homebrew/opt/postgresql@17/bin/psql',[
 function sql(q){const r=run(q);assert.equal(r.status,0,r.stderr);return r.stdout.trim();}
 function denied(q,pattern=/retail_funding_/){const r=run(q);assert.notEqual(r.status,0);assert.match(r.stderr,pattern);}
 const acl=()=>sql("select jsonb_agg(jsonb_build_array(relname,relacl::text,relrowsecurity) order by relname) from pg_class where oid in('clients'::regclass,'membership_agreements'::regclass,'public_purchase_intents'::regclass,'billing_customers'::regclass);");
+let usageWindowPriorDefinitions=[];
 let priorAcl,legacyBefore,priorFunctions,historicalV2,historicalBillingV2,historicalBefore,historicalIntentBefore,linkedOriginalCatalog;const legacyId=crypto.randomUUID();
 const linkedOriginalFunctions=()=>sql("select jsonb_agg(jsonb_build_array(oid::regprocedure::text,pg_get_functiondef(oid),proowner::regrole::text,proacl::text) order by oid::regprocedure::text) from pg_proc where proname in('apply_public_purchase_billing','ensure_public_purchase_buyer_member','locked_purchase_context');");
 const functionCatalog=()=>sql("select jsonb_agg(jsonb_build_array(proname,md5(prosrc),provolatile,prosecdef,proconfig,proowner::regrole::text,proacl::text) order by proname) from pg_proc where proname in ('retail_existing_funding_context','record_retail_existing_funding');");
@@ -219,6 +222,26 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
     'public.change_enterprise_existing_renewal(uuid,uuid,jsonb,text,boolean)'::regprocedure)`));
   const before=state(),permissions=acl(),original=catalog();sql(candidate);assert.equal(state(),before);assert.equal(acl(),permissions);
   for(const p of catalog()){const prior=original.find(x=>x.name===p.name);assert.deepEqual(p.metadata,prior.metadata);assert.notEqual(p.body,prior.body);}
+ }
+ if(enterpriseUsageWindowEnabled){
+  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014194623_enterprise_existing_usage_preparation.sql'),'utf8'));
+  sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014215100_enterprise_existing_usage_provider_leaf.sql'),'utf8'));
+  const migration=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261016064324_enterprise_existing_usage_legal_window.sql'),'utf8');
+  const catalog=()=>JSON.parse(sql(`select jsonb_agg(jsonb_build_object('name',proname,'body',md5(prosrc),'metadata',to_jsonb(p)-'prosrc') order by proname) from pg_proc p where oid in
+   ('public.prepare_enterprise_existing_usage(uuid)'::regprocedure,'public.reserve_enterprise_existing_usage(uuid,integer,text,jsonb,jsonb)'::regprocedure)`));
+  console.log('LOCAL usage window predecessor hashes',JSON.stringify(catalog().map(p=>({name:p.name,body:p.body}))));
+  usageWindowPriorDefinitions=['prepare_enterprise_existing_usage(uuid)','reserve_enterprise_existing_usage(uuid,integer,text,jsonb,jsonb)']
+   .map(sig=>sql(`select pg_get_functiondef('public.${sig}'::regprocedure)`)+';');
+  const baseline=catalog();
+  for(const change of [usageWindowPriorDefinitions[0].replace(/AS \$function\$/,'AS $function$\n -- synthetic usage source drift\n'),
+   'grant execute on function public.reserve_enterprise_existing_usage(uuid,integer,text,jsonb,jsonb) to anon',
+   'alter table enterprise_existing_usage_batches disable row level security',
+   'alter table enterprise_existing_usage_batches disable trigger enterprise_existing_usage_batch_guard',
+   "alter function public.prepare_enterprise_existing_usage(uuid) set statement_timeout='9s'"]){
+   denied('begin;'+change+';'+migration,/enterprise_usage_legal_.*drift/);assert.deepEqual(catalog(),baseline);
+  }
+  const old=catalog(),permissions=acl();sql(migration);assert.equal(acl(),permissions);
+  for(const p of catalog()){const before=old.find(x=>x.name===p.name);assert.deepEqual(p.metadata,before.metadata);assert.notEqual(p.body,before.body);}
  }
 });
 function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false,adminSource='admin',linkedSource='sales_assisted',buyerEmail='buyer@example.invalid',options={}){
@@ -3038,6 +3061,91 @@ test('ENTERPRISE RENEWAL native root lock prevents stale simultaneous preference
 });
 
 const enterpriseLegal=(f,refresh=false)=>JSON.parse(sql(`set role service_role;select ${refresh?'refresh':'read'}_enterprise_existing_legal_window(${[f.id,f.client].map(lit).join(',')})`));
+async function enterpriseUsageWindowFixture(count=31){
+ const f=await enterprisePeriodFixture(sql,{noticeDays:30,termStartDays:-45}),role=crypto.randomUUID();
+ sql(`set role service_role;insert into roles(id,client_id,title,status,slug_or_token) values(${lit(role)},${lit(f.client)},'SYNTHETIC WINDOW ROLE','active',${lit('SYNTHETIC_'+role)});
+  insert into interviews(id,client_id,role_id,completed_at,updated_at,status,has_substantive_response)
+  select gen_random_uuid(),${lit(f.client)},${lit(role)},${lit(f.billing.client_initial.contract_start_at)}::timestamptz+interval '1 day'+i*interval '1 second',
+   clock_timestamp(),'completed',true from generate_series(1,${count})i;`);
+ return{...f,role};
+}
+const usageWindowPrepare=f=>JSON.parse(sql(`set statement_timeout='2s';set role service_role;select prepare_enterprise_existing_usage(${lit(f.client)})`));
+const usageWindowReserve=(p,plan)=>`select reserve_enterprise_existing_usage(${[p.batch_id,p.generation,p.snapshot_digest,plan.groups,plan.prefix].map(lit).join(',')})`;
+test('ENTERPRISE USAGE WINDOW actual native prepare reuses stable v2 proof and reserves the same global ledger once',enterpriseUsageWindowOpts,async()=>{
+ const f=await enterpriseUsageWindowFixture(),p=usageWindowPrepare(f),again=usageWindowPrepare(f);
+ assert.equal(p.phase,'prepared');assert.equal(p.snapshot.version,'enterprise_existing_usage_snapshot_v2');
+ assert.deepEqual(again,p);assert.equal(p.snapshot.legal_window.term_index,0);
+ assert.equal(p.snapshot.legal_window.initial_term_start,f.billing.client_initial.contract_start_at);
+ assert.equal(p.snapshot.legal_window.term_end_at,f.billing.client_initial.contract_end_at);
+ const plan=require('../src/services/enterpriseExistingUsageReservation').planEnterpriseExistingUsage(p.snapshot);
+ assert.equal(plan.total_cents,2500);assert.equal(plan.prefix.filter(x=>x.source==='pool').length,30);
+ const command=usageWindowReserve(p,plan),first=JSON.parse(sql("set statement_timeout='2s';set role service_role;"+command));
+ assert.equal(first.phase,'reserved');assert.equal(first.total_cents,2500);
+ assert.deepEqual(JSON.parse(sql('set role service_role;'+command)),first);
+ assert.equal(sql(`select count(*) from usage_billing_ledger where enterprise_usage_batch_id=${lit(p.batch_id)}`),'1');
+ assert.equal(sql(`select count(*) from usage_billing_ledger where enterprise_usage_batch_id=${lit(p.batch_id)} and (stripe_invoice_id is not null or billed_at is not null)`),'0');
+ const b=JSON.parse(sql(`select to_jsonb(b) from enterprise_existing_usage_batches b where id=${lit(p.batch_id)}`));
+ assert.deepEqual(b.source_identity,{agreement_id:f.id,owner_id:f.client,service_month:b.service_month,receipt:f.billing});
+ assert.equal(first.provider_effect_authorized,false);assert.equal(first.paid_access_authorized,false);assert.equal(first.payroll_authorized,false);
+});
+test('ENTERPRISE USAGE WINDOW changed consent holds stale prepared snapshot and reprepare retains immutable source identity',enterpriseUsageWindowOpts,async()=>{
+ const f=await enterpriseUsageWindowFixture(),p=usageWindowPrepare(f),plan=require('../src/services/enterpriseExistingUsageReservation').planEnterpriseExistingUsage(p.snapshot);
+ const prior=sql(`select source_identity from enterprise_existing_usage_batches where id=${lit(p.batch_id)}`);
+ sql(`set role service_role;select change_enterprise_existing_renewal(${[f.id,f.client,f.billing,'request',false].map(lit).join(',')})`);
+ denied('set role service_role;'+usageWindowReserve(p,plan),/enterprise_usage_reserve_snapshot_or_expiry_changed/);
+ const next=usageWindowPrepare(f);assert.equal(next.batch_id,p.batch_id);assert.equal(next.generation,p.generation+1);
+ assert.equal(next.snapshot.legal_window.auto_renew,false);assert.equal(next.snapshot_digest===p.snapshot_digest,false);
+ assert.equal(sql(`select source_identity from enterprise_existing_usage_batches where id=${lit(p.batch_id)}`),prior);
+ assert.equal(sql(`select count(*) from usage_billing_ledger where client_id=${lit(f.client)}`),'0');
+});
+test('ENTERPRISE USAGE WINDOW old v1 prepared snapshot must reprepare; browser roles and repeat migration stay denied',enterpriseUsageWindowOpts,async()=>{
+ const f=await enterpriseUsageWindowFixture(0),p=usageWindowPrepare(f);
+ for(const role of ['anon','authenticated'])denied(`set role ${role};select prepare_enterprise_existing_usage(${lit(f.client)})`,/permission denied/);
+ const migration=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261016064324_enterprise_existing_usage_legal_window.sql'),'utf8');
+ denied(migration,/enterprise_usage_legal_prerequisite_drift/);
+ // Trusted-service rollback-only compatibility fixture, not a supported DML
+ // writer. Same original identity; no reserved debt or audit is rewritten.
+ const old={...p.snapshot,version:'enterprise_existing_usage_snapshot_v1'};delete old.legal_window;
+ const query=`begin;set role service_role;select set_config('private_sales.enterprise_usage_writer',${lit(p.batch_id)},true);
+  update enterprise_existing_usage_batches set snapshot=${lit(old)},snapshot_digest=encode(sha256(convert_to((${lit(old)})::text,'UTF8')),'hex'),
+   generation=generation+1 where id=${lit(p.batch_id)};
+  select prepare_enterprise_existing_usage(${lit(f.client)});rollback;`;
+ const next=JSON.parse(sql(query).split('\n').at(-1));assert.equal(next.snapshot.version,'enterprise_existing_usage_snapshot_v2');
+ assert.equal(next.generation,p.generation+2);
+});
+test('ENTERPRISE USAGE WINDOW genuine old v1 no-usage reservation replays unchanged after the additive patch',enterpriseUsageWindowOpts,async()=>{
+ const f=await enterpriseUsageWindowFixture(0),before=enterprisePeriodUnchanged(f);
+ const migration=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261016064324_enterprise_existing_usage_legal_window.sql'),'utf8')
+  .replace(/^begin;$/m,'').replace(/^commit;$/m,'');
+ const result=sql('begin;'+usageWindowPriorDefinitions.join('\n')+`set role service_role;
+  create temp table synthetic_v1_usage(p jsonb);insert into synthetic_v1_usage select prepare_enterprise_existing_usage(${lit(f.client)});
+  select reserve_enterprise_existing_usage((p->>'batch_id')::uuid,(p->>'generation')::integer,p->>'snapshot_digest','[]','[]') from synthetic_v1_usage;
+  reset role;`+migration+`set role service_role;
+  select jsonb_build_object('version',b.snapshot->>'version','phase',b.phase,'replay',
+   reserve_enterprise_existing_usage(b.id,b.generation,b.snapshot_digest,'[]','[]'))
+   from enterprise_existing_usage_batches b join synthetic_v1_usage t on b.id=(t.p->>'batch_id')::uuid;rollback;`);
+ const out=JSON.parse(result.split('\n').at(-1));assert.equal(out.version,'enterprise_existing_usage_snapshot_v1');
+ assert.equal(out.phase,'no_usage');assert.equal(out.replay.phase,'no_usage');assert.equal(out.replay.total_cents,0);
+ assert.equal(enterprisePeriodUnchanged(f),before);
+});
+test('ENTERPRISE USAGE WINDOW concurrent prepare gets one stable generation with bounded existing RPCs',enterpriseUsageWindowOpts,async()=>{
+ const f=await enterpriseUsageWindowFixture(0),command=`set statement_timeout='2s';set role service_role;select prepare_enterprise_existing_usage(${lit(f.client)})`;
+ const rows=await Promise.all([parallel(command),parallel(command)]);
+ for(const r of rows)assert.equal(r.code,0,r.err);
+ const [first,second]=rows.map(r=>JSON.parse(r.out));assert.deepEqual(first,second);assert.equal(first.generation,1);
+ assert.equal(sql(`select count(*) from enterprise_existing_usage_batches where owner_id=${lit(f.client)}`),'1');
+ assert.equal(sql(`select count(*) from usage_billing_ledger where client_id=${lit(f.client)}`),'0');
+});
+test('ENTERPRISE USAGE WINDOW unavailable native legal proof rolls back before batch, audit or ledger persistence',enterpriseUsageWindowOpts,async()=>{
+ const f=await enterpriseUsageWindowFixture(0),before=enterprisePeriodUnchanged(f);
+ const def=sql("select pg_get_functiondef('public.read_enterprise_existing_legal_window(uuid,uuid)'::regprocedure)");
+ const broken=def.replace(/AS \$function\$[\s\S]*\$function\$;?/,()=>"AS $function$ begin raise exception 'synthetic_legal_unavailable';end $function$;");
+ denied('begin;'+broken+`set role service_role;select prepare_enterprise_existing_usage(${lit(f.client)});rollback;`,/synthetic_legal_unavailable/);
+ assert.equal(sql(`select count(*) from enterprise_existing_usage_batches where owner_id=${lit(f.client)}`),'0');
+ assert.equal(sql(`select count(*) from usage_billing_ledger where client_id=${lit(f.client)}`),'0');
+ assert.equal(enterprisePeriodUnchanged(f),before);
+ assert.equal(sql("select pg_get_functiondef('public.read_enterprise_existing_legal_window(uuid,uuid)'::regprocedure)"),def);
+});
 test('ENTERPRISE LEGAL actual native window is accepted by the JS reader without projection or provider effects',enterpriseLegalOpts,async()=>{
  const f=await enterprisePeriodFixture(sql,{noticeDays:30}),before=enterprisePeriodUnchanged(f);
  const agreement=JSON.parse(sql(`select to_jsonb(a) from membership_agreements a where id=${lit(f.id)}`));
@@ -3157,9 +3265,26 @@ function enterpriseLegalComposition(f,{through,off=false,offPrevious=false,futur
   perform set_config('private_sales.enterprise_renewal_writer','',true);end $setup$;`;
  const action=request?`select change_enterprise_existing_renewal(${[f.id,f.client,w,'request',false].map(lit).join(',')});`:
   `select refresh_enterprise_existing_legal_window(${[f.id,f.client].map(lit).join(',')});`;
- return{query:setup+action+(request?`select read_enterprise_existing_legal_window(${[f.id,f.client].map(lit).join(',')});`:'')+
+ return{setup,query:setup+action+(request?`select read_enterprise_existing_legal_window(${[f.id,f.client].map(lit).join(',')});`:'')+
   `select to_jsonb(c) from clients c where id=${lit(f.client)};rollback;`,i,start,end,boundary};
 }
+test('ENTERPRISE USAGE WINDOW isolated historical SQL composition keeps old owed month while using current legal E',enterpriseUsageWindowOpts,async()=>{
+ const f=await enterpriseUsageWindowFixture(0),before=enterprisePeriodUnchanged(f),x=enterpriseLegalComposition(f,{through:'after'});
+ // Authored historical billing/coverage dependencies inside ROLLBACK ONLY.
+ // Actual legal-window/prepare/reserve/guard/native clock execute. This is NOT
+ // native historical financial admission; do not pass the mocked snapshot off
+ // as an independently verified original receipt or provider payment.
+ const out=JSON.parse(sql(x.setup+`create temp table synthetic_historical_usage(p jsonb);
+  insert into synthetic_historical_usage select prepare_enterprise_existing_usage(${lit(f.client)});
+  select jsonb_build_object('snapshot',p->'snapshot','reserved',reserve_enterprise_existing_usage(
+   (p->>'batch_id')::uuid,(p->>'generation')::integer,p->>'snapshot_digest','[]','[]')) from synthetic_historical_usage;rollback;`).split('\n').at(-1));
+ assert.equal(out.snapshot.version,'enterprise_existing_usage_snapshot_v2');
+ assert.equal(out.snapshot.month_start,'2019-11-01T00:00:00.000Z');
+ assert.equal(out.snapshot.legal_window.term_index,x.i);assert.equal(Date.parse(out.snapshot.legal_window.term_end_at),Date.parse(x.end));
+ assert.equal(out.snapshot.legal_window.initial_term_start,'2019-11-07T00:00:00.000000Z');
+ assert.equal(out.reserved.phase,'no_usage');assert.equal(out.reserved.provider_effect_authorized,false);
+ assert.equal(enterprisePeriodUnchanged(f),before);
+});
 test('ENTERPRISE LEGAL isolated SQL composition requires funded_through strictly after the native-clock anniversary',enterpriseLegalOpts,async()=>{
  const f=await enterprisePeriodFixture(sql,{noticeDays:30}),before=enterprisePeriodUnchanged(f);
  for(const through of ['equal','after']){
