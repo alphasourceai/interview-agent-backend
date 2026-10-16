@@ -76,7 +76,7 @@ begin
  full_end:=public.retail_existing_month_anchor(to_timestamp(anchor),offset_m+span);
  if to_timestamp(s)>=cutoff or full_end<cutoff or e<=s or to_timestamp(s)>(o->>'observed_at')::timestamptz then return false;end if;
  owned:=r->'requested_auto_renew'='false'::jsonb and r->'sent_at'<>'null'::jsonb
-  or r->'requested_auto_renew'='true'::jsonb and r->>'provider_cancel_operation_id' is not null;
+  or r->>'provider_cancel_operation_id' is not null;
  if p->'cancel_at' is distinct from 'null'::jsonb then
   if not coalesce(owned,false) or jsonb_typeof(p->'cancel_at') is distinct from 'number'
    or p->>'cancel_at' !~ '^[1-9][0-9]*$' or(p->>'cancel_at')::numeric>253402300799
@@ -118,7 +118,7 @@ begin
    or r->>'status' not in('waiting','claimed','unknown','applied','held')
    or(r->'provider_cancel_operation_id'<>'null'::jsonb and(jsonb_typeof(r->'provider_cancel_operation_id') is distinct from 'string'
     or r->>'provider_cancel_operation_id' !~ '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
-    or r->'requested_auto_renew' is distinct from 'true'::jsonb or r->'provider_cancel_operation_id'=r->'operation_id')) then return false;end if;
+    or r->'provider_cancel_operation_id'=r->'operation_id')) then return false;end if;
   foreach k in array array['lease_until','sent_at','completed_at','repair_sent_at'] loop
    if r->k<>'null'::jsonb and(jsonb_typeof(r->k) is distinct from 'string' or not isfinite((r->>k)::timestamptz)
     or(r->>k)::timestamptz<(r->>'accepted_at')::timestamptz) then return false;end if;
@@ -135,11 +135,13 @@ begin
     or(r->>'status'='unknown' and r->'sent_at'='null'::jsonb)
     or(r->>'status'='applied' and(r->'completed_at'='null'::jsonb or r->'lease_until'<>'null'::jsonb))
     or(r->>'status'<>'applied' and r->'completed_at'<>'null'::jsonb)
-    or(r->'repair_sent_at'<>'null'::jsonb and(r->'sent_at'='null'::jsonb or r->>'provider_cancel_operation_id' is null)) then return false;end if;
+    or(r->'repair_sent_at'<>'null'::jsonb and(r->'sent_at'='null'::jsonb or r->>'provider_cancel_operation_id' is null
+     or r->'requested_auto_renew' is distinct from 'true'::jsonb)) then return false;end if;
    if r->>'status'='applied' and(case when r->'requested_auto_renew'='true'::jsonb then
     r->'observation'->'subscription'->'cancel_at'<>'null'::jsonb or r->'observation'->'subscription'->'cancel_at_period_end'<>'false'::jsonb
      or r->'observation'->'subscription'->>'status'='canceled'
-    else r->'sent_at'='null'::jsonb or r->'observation'->'subscription'->'cancel_at'='null'::jsonb end) then return false;end if;
+    else (r->'sent_at'='null'::jsonb and r->>'provider_cancel_operation_id' is null)
+     or r->'observation'->'subscription'->'cancel_at'='null'::jsonb end) then return false;end if;
   end if;
   -- Reuse the original immutable source/calendar/notice acceptance validator.
   return public.enterprise_existing_renewal_operation_valid((r-'repair_sent_at'-'provider_cancel_operation_id')||jsonb_build_object(
@@ -173,7 +175,12 @@ $x$||old);
    'repair_sent_at',null,'provider_cancel_operation_id',case
     when p_auto_renew and prior->>'status'='applied' and prior->'requested_auto_renew'='false'::jsonb
      and(prior->>'effective_at')::timestamptz=end_ and prior->'sent_at'<>'null'::jsonb then prior->'operation_id'
-    when p_auto_renew then prior->'provider_cancel_operation_id' else null end);$x$);
+    -- Unsent preference toggles never changed the known provider setting.
+    -- A no-send applied OFF likewise retains the REAL older cancel writer.
+    when(prior->>'effective_at')::timestamptz=end_ and prior->>'provider_cancel_operation_id' is not null
+     and(prior->'sent_at'='null'::jsonb or(prior->>'status'='applied' and prior->'requested_auto_renew'='false'::jsonb))
+     then prior->'provider_cancel_operation_id'
+    else null end);$x$);
  execute replace(def,(select prosrc from pg_proc where oid='public.change_enterprise_existing_renewal(uuid,uuid,jsonb,text,boolean)'::regprocedure),body);
 end $request$;
 

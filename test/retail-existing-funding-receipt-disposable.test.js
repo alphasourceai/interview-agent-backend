@@ -2864,7 +2864,14 @@ test('ENTERPRISE COVERAGE expires on native clock without event; later ordinal c
  assert.equal(read.contiguous_ordinal,2);assert.equal(read.billing_status,'active');assert.deepEqual(withoutCoverageFields(enterpriseClient(f)),original);
 });
 test('ENTERPRISE COVERAGE provider unpaid/canceled and nonrenewal cannot truncate existing paid prefix',enterpriseCoverageOpts,async()=>{
- const f=await enterprisePeriodFixture(sql);sql(`update clients set subscription_status='unpaid',auto_renew=false,cancel_at_term_end=true,
+ const f=await enterprisePeriodFixture(sql,enterpriseRenewalEnabled?{noticeDays:30}:{});
+ if(enterpriseRenewalEnabled){
+  // The new paid-source guard forbids the old direct preference mutation.
+  // Use actual accepted consent/status CAS, not a privileged writer bypass or
+  // an invented early cancellation-effective date.
+  enterpriseRenewal(f);const p=enterpriseStatusProof(f);p.subscription_status='unpaid';p.cancel_at_term_end=true;
+  sql('set role service_role;'+enterpriseStatusCall(f,p));
+ }else sql(`update clients set subscription_status='unpaid',auto_renew=false,cancel_at_term_end=true,
   cancel_effective_at=contract_end_at where id=${lit(f.client)}`);
  const before=enterpriseClient(f);assert.equal(enterpriseCoverage(f,true).billing_status,'active');
  assert.deepEqual(withoutCoverageFields(enterpriseClient(f)),withoutCoverageFields(before));
@@ -2944,8 +2951,11 @@ test('ENTERPRISE STATUS foreign/malformed/future proof and extra authority canno
  assert.deepEqual(enterpriseClient(f),before);
 });
 test('ENTERPRISE STATUS browser/wrong owner/source denied; preferences/overrides/terms preserved',enterpriseStatusOpts,async()=>{
- const f=await enterprisePeriodFixture(sql);
- sql(`update clients set auto_renew=false,cancel_effective_at=contract_end_at,access_override_mode='force_inactive',manual_active_override=true where id=${lit(f.client)}`);
+ const f=await enterprisePeriodFixture(sql,enterpriseRenewalEnabled?{noticeDays:30}:{});
+ if(enterpriseRenewalEnabled){
+  enterpriseRenewal(f);
+  sql(`update clients set access_override_mode='force_inactive',manual_active_override=true where id=${lit(f.client)}`);
+ }else sql(`update clients set auto_renew=false,cancel_effective_at=contract_end_at,access_override_mode='force_inactive',manual_active_override=true where id=${lit(f.client)}`);
  const before=enterpriseClient(f),p=enterpriseStatusProof(f);p.subscription_status='canceled';
  for(const role of ['anon','authenticated'])denied('set role '+role+';'+enterpriseStatusCall(f,p),/permission denied/);
  denied('set role service_role;'+enterpriseStatusCall({...f,client:crypto.randomUUID()},p,enterpriseStatusExpected(f)),/enterprise_status_client_denied/);
@@ -3042,6 +3052,21 @@ test('ENTERPRISE DISPATCH ON clears only its previously applied OFF, with a sepa
  denied('set role service_role;'+enterpriseDispatchCall(f,r,'repair',off),/enterprise_renewal_dispatch_repair_denied/);
  const done=enterpriseDispatch(f,r,'finish',enterpriseDispatchObservation(f)).operation;assert.equal(done.status,'applied');
  assert.equal(done.provider_cancel_operation_id,oldId);assert.ok(done.repair_sent_at);assert.equal(enterpriseClient(f).auto_renew,true);
+});
+test('ENTERPRISE DISPATCH OFF ON OFF before ON send retains actual cancel owner, then drops it only after clear',enterpriseDispatchOpts,async()=>{
+ const f=await enterpriseDispatchFixture(),before=enterpriseDispatchObservation(f),off=enterpriseDispatchObservation(f,{cancel:true});
+ let r=enterpriseRenewal(f).operation;r=enterpriseDispatch(f,r,'claim',before).operation;r=enterpriseDispatch(f,r,'send',before).operation;
+ r=enterpriseDispatch(f,r,'finish',off).operation;const actualCancelId=r.operation_id;
+ r=enterpriseRenewal(f,'request',true).operation;assert.equal(r.provider_cancel_operation_id,actualCancelId);assert.equal(r.sent_at,null);
+ r=enterpriseRenewal(f,'request',false).operation;assert.equal(r.provider_cancel_operation_id,actualCancelId);assert.equal(r.sent_at,null);
+ const lastOffId=r.operation_id;r=enterpriseDispatch(f,r,'claim',off).operation;r=enterpriseDispatch(f,r,'finish',off).operation;
+ assert.equal(r.status,'applied');assert.equal(r.sent_at,null);assert.equal(r.provider_cancel_operation_id,actualCancelId);
+ r=enterpriseRenewal(f,'request',true).operation;assert.equal(r.provider_cancel_operation_id,actualCancelId);
+ assert.notEqual(r.provider_cancel_operation_id,lastOffId);r=enterpriseDispatch(f,r,'claim',off).operation;r=enterpriseDispatch(f,r,'send',off).operation;
+ r=enterpriseDispatch(f,r,'repair',off).operation;r=enterpriseDispatch(f,r,'finish',before).operation;assert.equal(r.status,'applied');
+ r=enterpriseRenewal(f,'request',false).operation;assert.equal(r.provider_cancel_operation_id,null);
+ denied('set role service_role;'+enterpriseDispatchCall(f,r,'claim',off),/enterprise_renewal_dispatch_observation_denied/);
+ assert.equal(enterpriseDispatch(f,r,'claim',before).operation.status,'claimed');
 });
 test('ENTERPRISE DISPATCH no authority from arbitrary cancel, stale clock, wrong source or changed debt census',enterpriseDispatchOpts,async()=>{
  const f=await enterpriseDispatchFixture(),o=enterpriseDispatchObservation(f),r=enterpriseRenewal(f).operation;
