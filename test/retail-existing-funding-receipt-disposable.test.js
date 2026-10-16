@@ -295,8 +295,9 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
   // A real old-protocol receipt exists BEFORE ALTER TABLE. Preserve its exact
   // financial/attribution JSON, allowing only the two new nullable fields.
   const historical=fixture('basic',3,'monthly_installments',false,true,false,'admin','sales_assisted','historical-payroll@example.invalid');
-  commissionRep(historical);record(historical);nativeComplete(historical);nativeBilling(historical);
-  sql('set role service_role;'+commissionInsert(commissionRow(historical)));
+  commissionRep(historical);sql('set role service_role;'+call(historical));nativeComplete(historical);sql('set role service_role;'+billingCall(historical));
+  const historicalReceipt=commissionRow(historical);
+  sql(`set role service_role;insert into sales_commission_receipts(${Object.keys(historicalReceipt).join(',')}) values(${Object.values(historicalReceipt).map(lit).join(',')});`);
   const migration=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261016091147_enterprise_existing_manual_commission_receipts.sql'),'utf8');
   const sig='public.require_sales_commission_sales_assisted()';
   const catalog=()=>JSON.parse(sql(`select jsonb_build_object('body',md5(prosrc),'metadata',to_jsonb(p)-'prosrc') from pg_proc p where oid=${lit(sig)}::regprocedure`));
@@ -2858,6 +2859,9 @@ test('ENTERPRISE COMMISSION browser roles, foreign invoice and missing original 
  denied('set role service_role;'+enterpriseCommissionReadCall({...f,client:crypto.randomUUID()}),/client_denied/);
  const p=enterpriseCommissionRead(f),bad={...p.qualification,billing_source_digest:'0'.repeat(32)};
  denied('set role service_role;'+commissionInsert(enterpriseCommissionRow(f,p,{enterprise_commission_source:bad})),/proof_conflict/);
+ const foreign=fixture('basic',3,'prepaid',false,true,false,'admin','sales_assisted','mixed-identity@example.invalid',{offerVersion:STRIPE_RECURRING_OFFER_VERSION});
+ foreign.proof.payment_intent_id=f.funding.payment_intent_id;record(foreign);
+ denied('set role service_role;'+enterpriseCommissionReadCall(f),/enterprise_commission_identity_denied/);
  assert.equal(sql(`select count(*) from sales_commission_receipts where enterprise_agreement_id=${lit(f.id)}`),'0');
 });
 const enterprisePeriodCall=(f,p=f.proof,b=f.billing)=>`select record_enterprise_existing_paid_period(${[f.id,f.client,b,p].map(lit).join(',')});`;
