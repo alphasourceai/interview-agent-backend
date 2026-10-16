@@ -5,7 +5,9 @@ const {buildRetailPackageSnapshot}=require('../src/services/membershipPackageCom
 const {OFFER_VERSION,STRIPE_RECURRING_OFFER_VERSION,anchoredMonthInstant}=require('../src/services/membershipOffers');
 const enabled=process.env.RETAIL_FUNDING_RECEIPT_DISPOSABLE==='true',opts={skip:!enabled};
 const enterpriseFenceEnabled=enabled&&process.env.ENTERPRISE_LEGACY_FENCE_DISPOSABLE==='true';
-const enterprisePeriodEnabled=enabled&&process.env.ENTERPRISE_PLATFORM_PERIOD_DISPOSABLE==='true';
+const enterpriseCoverageEnabled=enabled&&process.env.ENTERPRISE_PAID_COVERAGE_DISPOSABLE==='true';
+const enterpriseCoverageOpts={skip:!enterpriseCoverageEnabled};
+const enterprisePeriodEnabled=enabled&&(process.env.ENTERPRISE_PLATFORM_PERIOD_DISPOSABLE==='true'||enterpriseCoverageEnabled);
 const enterprisePeriodOpts={skip:!enterprisePeriodEnabled};
 const enterpriseFenceOpts={skip:!enterpriseFenceEnabled};
 const enterpriseFenceMigration=path.resolve(__dirname,'../supabase/migrations/20261016032407_enterprise_existing_legacy_contract_fence.sql');
@@ -167,6 +169,15 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
    'alter table membership_agreements disable trigger enterprise_existing_billing_guard',
    'drop index billing_invoices_stripe_invoice_id_uniq','drop index billing_customers_stripe_customer_id_uniq'])
    denied('begin;'+change+';'+candidate,/enterprise_period_.*drift/);
+  sql(candidate);
+ }
+ if(enterpriseCoverageEnabled){
+  const candidate=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261016042228_enterprise_existing_paid_coverage.sql'),'utf8');
+  const def=sql("select pg_get_functiondef('public.enterprise_existing_period_proof_valid(jsonb,public.membership_agreements)'::regprocedure)");
+  for(const change of [def.replace(/AS \$function\$/,'AS $function$\n -- synthetic coverage drift\n'),
+   'grant execute on function public.record_enterprise_existing_paid_period(uuid,uuid,jsonb,jsonb) to anon',
+   'alter table billing_invoices disable trigger enterprise_existing_period_receipt_guard','alter table billing_invoices disable row level security'])
+   denied('begin;'+change+';'+candidate,/enterprise_coverage_.*drift/);
   sql(candidate);
  }
 });
@@ -2725,6 +2736,82 @@ test('ENTERPRISE PERIOD usage line identity census rejects local SRE partial bat
   set role service_role;${enterprisePeriodCall(f)}rollback;`,/enterprise_period_usage_identity_conflict/);
  assert.equal(sql("select to_regclass('public.enterprise_existing_usage_batches') is null"),'t');
  assert.equal(sql(`select count(*) from billing_invoices where stripe_invoice_id=${lit(f.proof.invoice_id)}`),'0');
+});
+
+// LOCAL base coverage only: original receipts/terms/preferences remain frozen.
+const enterpriseCoverageCall=(f,refresh=false)=>`select ${refresh?'refresh':'read'}_enterprise_existing_paid_coverage(${[f.id,f.client].map(lit).join(',')});`;
+const enterpriseCoverage=(f,refresh=false)=>JSON.parse(sql('set role service_role;'+enterpriseCoverageCall(f,refresh)));
+const enterpriseClient=f=>JSON.parse(sql(`select to_jsonb(c) from clients c where id=${lit(f.client)}`));
+const withoutCoverageFields=c=>{const x=structuredClone(c);delete x.billing_status;delete x.updated_at;return x;};
+function enterpriseCycle(f,ordinal){
+ const {anchoredMonthInstant}=require('../src/services/membershipOffers'),span=f.funding.platform_interval==='year'?12:1;
+ const b=new Date(f.billing.subscription.current_period_end*1000).toISOString();
+ return{...f.proof,ordinal,invoice_id:f.proof.invoice_id+'N'+ordinal,line_id:f.proof.line_id+'N'+ordinal,
+  payment_intent_id:f.proof.payment_intent_id+'N'+ordinal,charge_id:f.proof.charge_id+'N'+ordinal,
+  provider_period_start:Date.parse(anchoredMonthInstant(b,(ordinal-1)*span))/1000,
+  provider_period_end:Date.parse(anchoredMonthInstant(b,ordinal*span))/1000};
+}
+for(const cadence of ['monthly','annual'])test(`ENTERPRISE COVERAGE ${cadence} reads original paid prefix and refreshes base only`,enterpriseCoverageOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{cadence}),before=enterprisePeriodUnchanged(f),r=enterpriseCoverage(f);
+ assert.equal(r.contiguous_ordinal,0);assert.equal(Date.parse(r.funded_from),Date.parse(f.funding.payment_success_at));
+ assert.equal(Date.parse(r.funded_through),f.billing.subscription.current_period_end*1000);
+ assert.equal(r.provider_effect_authorized,false);assert.equal(r.paid_access_authorized,false);assert.equal(r.payroll_authorized,false);
+ assert.equal(enterprisePeriodUnchanged(f),before);const c=enterpriseClient(f),out=enterpriseCoverage(f,true);
+ assert.equal(out.status,'refreshed');assert.equal(out.billing_status,'active');assert.deepEqual(withoutCoverageFields(enterpriseClient(f)),withoutCoverageFields(c));
+ recordEnterprisePeriod(f,enterpriseCycle(f,1));recordEnterprisePeriod(f,enterpriseCycle(f,2));
+ assert.equal(enterpriseCoverage(f).contiguous_ordinal,2);assert.equal(enterpriseCoverage(f,true).billing_status,'active');
+});
+test('ENTERPRISE COVERAGE expires on native clock without event; later ordinal cannot fill gap',enterpriseCoverageOpts,async()=>{
+ // Authored short initial provider span proves native clock behavior only,
+ // not an actual Stripe calendar/cash event. No SQL clock override exists.
+ const f=await enterprisePeriodFixture(sql,{initialPeriodSeconds:2});recordEnterprisePeriod(f,enterpriseCycle(f,2));
+ let read=enterpriseCoverage(f);assert.equal(read.contiguous_ordinal,0);
+ await new Promise(r=>setTimeout(r,Math.max(1,Date.parse(read.funded_through)-Date.now()+50)));
+ const original=withoutCoverageFields(enterpriseClient(f));
+ assert.equal(enterpriseCoverage(f,true).billing_status,'inactive');assert.deepEqual(withoutCoverageFields(enterpriseClient(f)),original);
+ recordEnterprisePeriod(f,enterpriseCycle(f,1));read=enterpriseCoverage(f,true);
+ assert.equal(read.contiguous_ordinal,2);assert.equal(read.billing_status,'active');assert.deepEqual(withoutCoverageFields(enterpriseClient(f)),original);
+});
+test('ENTERPRISE COVERAGE provider unpaid/canceled and nonrenewal cannot truncate existing paid prefix',enterpriseCoverageOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql);sql(`update clients set subscription_status='unpaid',auto_renew=false,cancel_at_term_end=true,
+  cancel_effective_at=contract_end_at where id=${lit(f.client)}`);
+ const before=enterpriseClient(f);assert.equal(enterpriseCoverage(f,true).billing_status,'active');
+ assert.deepEqual(withoutCoverageFields(enterpriseClient(f)),withoutCoverageFields(before));
+ sql(`update clients set subscription_status='canceled' where id=${lit(f.client)}`);
+ assert.equal(enterpriseCoverage(f,true).billing_status,'active');assert.equal(enterpriseClient(f).subscription_status,'canceled');
+});
+test('ENTERPRISE COVERAGE preserves both access override modes and original manual override',enterpriseCoverageOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql);
+ for(const mode of ['force_active','force_inactive']){
+  sql(`update clients set access_override_mode=${lit(mode)},billing_status='inactive' where id=${lit(f.client)}`);
+  assert.equal(enterpriseCoverage(f,true).billing_status,'active');assert.equal(enterpriseClient(f).access_override_mode,mode);
+ }
+ sql(`update clients set manual_active_override=true,billing_status='inactive' where id=${lit(f.client)}`);
+ const before=enterpriseClient(f),out=enterpriseCoverage(f,true);assert.equal(out.status,'manual_override');assert.equal(out.computed_billing_status,'active');
+ assert.deepEqual(enterpriseClient(f),before);
+});
+test('ENTERPRISE COVERAGE corrupt or future receipt rolls back without changing access',enterpriseCoverageOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql),p=recordEnterprisePeriod(f),before=enterprisePeriodUnchanged(f);
+ for(const [jsonPath,value]of [['{proof,cash_cents}',1],['{recorded_at}','2099-01-01T00:00:00.000000Z']])
+  denied(`begin;set local session_replication_role=replica;update billing_invoices set enterprise_period_receipt=jsonb_set(enterprise_period_receipt,
+   ${lit(jsonPath)},${lit(JSON.stringify(value))}::jsonb) where id=${lit(p.invoice_id)};set local session_replication_role=origin;set role service_role;
+   ${enterpriseCoverageCall(f,true)}rollback;`,/enterprise_coverage_receipt_denied/);
+ assert.equal(enterprisePeriodUnchanged(f),before);
+});
+test('ENTERPRISE COVERAGE browser and mismatched owner denied, source and receipts untouched',enterpriseCoverageOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql),before=enterprisePeriodUnchanged(f);
+ for(const role of ['anon','authenticated'])for(const refresh of [false,true])denied('set role '+role+';'+enterpriseCoverageCall(f,refresh),/permission denied/);
+ denied('set role service_role;'+enterpriseCoverageCall({...f,client:crypto.randomUUID()},true),/enterprise_coverage_client_denied/);
+ assert.equal(enterprisePeriodUnchanged(f),before);
+});
+test('ENTERPRISE COVERAGE source root lock actually blocks refresh until existing transaction commits',enterpriseCoverageOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql),tag='ECV'+crypto.randomUUID().replaceAll('-','');
+ const [h,w,o]=await Promise.all([
+  parallel(`begin;select 1 from clients where id=${lit(f.client)} for update;select pg_sleep(0.6);commit;`),
+  parallel(`set application_name=${lit(tag)};select pg_sleep(0.1);set role service_role;${enterpriseCoverageCall(f,true)}`),
+  parallel(`select pg_sleep(0.3);select count(*) from pg_stat_activity where application_name=${lit(tag)} and wait_event_type='Lock';`)]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.code,0,o.err);assert.equal(o.out.trim(),'1');
+ assert.equal(JSON.parse(w.out.trim()).billing_status,'active');
 });
 
 // Actual original-schema native scanner guard, never hosted/provider effects.

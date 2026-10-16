@@ -8,7 +8,7 @@ const {proveEnterprisePoolPayment}=require('../../src/services/enterprisePoolPay
 const paidFixture=require('./enterprise-pool-payment-fixture');
 const lit=v=>v==null?'null':typeof v==='object'?`'${JSON.stringify(v).replaceAll("'","''")}'::jsonb`:
  typeof v==='boolean'||typeof v==='number'?String(v):`'${String(v).replaceAll("'","''")}'`;
-module.exports=async function fixture(sql,{cadence='monthly',ordinal=1}={}){
+module.exports=async function fixture(sql,{cadence='monthly',ordinal=1,initialPeriodSeconds=86400}={}){
  const id=crypto.randomUUID(),client=crypto.randomUUID(),attempt=crypto.randomUUID(),suffix=id.replaceAll('-','');
  const customer='cus_PERIOD_'+suffix,token=crypto.createHash('sha256').update(id).digest('hex');
  const start=sql("select to_char(current_date,'YYYY-MM-DD')"),end=sql("select to_char(current_date+interval '1 year','YYYY-MM-DD')");
@@ -43,7 +43,7 @@ module.exports=async function fixture(sql,{cadence='monthly',ordinal=1}={}){
   payment_intent_id:'pi_INITIAL_'+suffix,charge_id:'ch_INITIAL_'+suffix,platform_price_id:prices.platform_price_id,pool_price_id:prices.pool_price_id,
   payment_success_at:new Date(now*1000).toISOString()};
  const saved=JSON.parse(sql(`set role service_role;select record_enterprise_existing_funding(${[id,client,pending.source,prices,funding].map(lit).join(',')});`));
- const sub={id:funding.subscription_id,customer,status:'active',current_period_end:now+86400,cancel_at_period_end:false};
+ const sub={id:funding.subscription_id,customer,status:'active',current_period_end:now+initialPeriodSeconds,cancel_at_period_end:false};
  const billing=JSON.parse(sql(`set role service_role;select apply_enterprise_existing_billing(${[id,client,pending.source,prices,saved,sub].map(lit).join(',')});`));
  sql(`set role service_role;select complete_enterprise_existing_payment(${[id,client,billing].map(lit).join(',')});`);
  const span=cadence==='annual'?12:1,anchor=new Date(sub.current_period_end*1000).toISOString();
