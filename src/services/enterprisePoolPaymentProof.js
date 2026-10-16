@@ -156,7 +156,9 @@ function proveEnterprisePoolPayment(raw = {}) {
   // Fresh, completely paginated refunds from the actual charge collection. An
   // absent/null embedded list is not a fabricated empty provider read.
   list(refunds, 're', 0);
-  if (charge.refunds !== null) list(charge.refunds, 're', 0);
+  // Stripe may omit this includable field. Its absence never replaces the
+  // mandatory fresh, fully paginated refund collection checked above.
+  if (Object.hasOwn(charge, 'refunds') && charge.refunds !== null) list(charge.refunds, 're', 0);
   check(pi.status === 'succeeded' && pi.amount === invoice.total && pi.amount_received === invoice.total
     && charge.status === 'succeeded' && charge.paid === true && charge.captured === true
     && charge.amount === invoice.total && charge.amount_captured === invoice.total
@@ -187,7 +189,11 @@ function proveEnterprisePoolPayment(raw = {}) {
   check(pool.type === 'invoiceitem' && pool.subscription_item == null && pool.proration === false
     && (pool.subscription == null || id(pool.subscription) === b.subscriptionId)
     && pool.amount === offer.net_cents, 'pool_proof_pool_line_mismatch');
-  check(platform.type === 'subscription' && id(platform.subscription) === b.subscriptionId
+  // An initial positive proration can be an invoiceitem in API2023. Keep its
+  // native invoice-item identity and all subscription/item/price links exact.
+  check((platform.type === 'subscription' || platform.type === 'invoiceitem'
+      && platform.proration === true && nativeId(id(platform.invoice_item), 'ii'))
+    && id(platform.subscription) === b.subscriptionId
     && id(platform.subscription_item) === b.platformItemId && typeof platform.proration === 'boolean'
     && platform.amount <= b.platformCents
     && (platform.proration || platform.amount === b.platformCents), 'pool_proof_platform_line_mismatch');

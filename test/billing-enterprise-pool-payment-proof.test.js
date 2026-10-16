@@ -31,6 +31,61 @@ test('non-prorated platform must equal nominal, not an invented partial amount',
   assert.throws(() => prove(fixture({ platformAmount: 7000, proration: false })),
     { code: 'pool_proof_platform_line_mismatch', status: 409 });
 });
+test('API2023 may omit embedded charge refunds when the fresh refund collection is complete', () => {
+  const input = fixture();
+  delete input.charge.refunds;
+  assert.equal(prove(input).pool_paid_cents, 69750);
+});
+test('API2023 initial platform proration may be an invoiceitem linked to its subscription item', () => {
+  const input = fixture({ platformCents: 30000, platformAmount: 15442 });
+  Object.assign(input.invoice.lines.data[0], { type: 'invoiceitem', invoice_item: 'ii_platform' });
+  const result = prove(input);
+  assert.equal(result.platform_line_cents, 15442);
+  assert.equal(result.collected_cents, 85192);
+  assert.equal(result.platform_nominal_cents, 30000);
+});
+test('observed API2023 invoiceitem proration and omitted embedded refunds compose', () => {
+  const input = fixture({ platformCents: 30000, platformAmount: 15442 });
+  Object.assign(input.invoice.lines.data[0], { type: 'invoiceitem', invoice_item: 'ii_platform' });
+  delete input.charge.refunds;
+  assert.equal(prove(input).collected_cents, 85192);
+});
+test('nonprorated invoiceitem is held even when its amount equals the accepted nominal', () => {
+  const input = fixture({ platformCents: 30000, platformAmount: 30000, proration: false });
+  Object.assign(input.invoice.lines.data[0], { type: 'invoiceitem', invoice_item: 'ii_platform' });
+  assert.throws(() => prove(input), { code: 'pool_proof_platform_line_mismatch', status: 409 });
+});
+for (const [label, change] of [
+  ['missing fresh collection', p => { delete p.refunds; }],
+  ['incomplete fresh collection', p => { p.refunds.has_more = true; }],
+  ['nonempty fresh collection', p => { p.refunds.data.push({ id: 're_pending' }); }],
+  ['explicit undefined embedded collection', p => { p.charge.refunds = undefined; }],
+  ['malformed embedded collection', p => { p.charge.refunds = {}; }]
+]) {
+  test(`omitted optional embedded refunds still holds ${label}`, () => {
+    const input = fixture(); delete input.charge.refunds; change(input);
+    assert.throws(() => prove(input), { code: 'pool_proof_incomplete_list', status: 409 });
+  });
+}
+for (const [label, change, code = 'pool_proof_platform_line_mismatch'] of [
+  ['nonprorated invoiceitem', l => { l.proration = false; }],
+  ['missing invoice item id', l => { delete l.invoice_item; }],
+  ['malformed invoice item id', l => { l.invoice_item = 'price_wrong'; }],
+  ['empty invoice item id', l => { l.invoice_item = 'ii_'; }],
+  ['foreign subscription', l => { l.subscription = 'sub_other'; }],
+  ['foreign subscription item', l => { l.subscription_item = 'si_other'; }],
+  ['foreign accepted price', l => { l.price.id = 'price_other'; }, 'pool_proof_price_mismatch'],
+  ['above accepted nominal amount', l => { l.amount = 30001; }],
+  ['negative proration', l => { l.amount = -1; }, 'pool_proof_invoice_line_mismatch']
+]) {
+  test(`API2023 prorated invoiceitem still holds ${label}`, () => {
+    const input = fixture({ platformCents: 30000, platformAmount: 15442 });
+    const line = input.invoice.lines.data[0];
+    Object.assign(line, { type: 'invoiceitem', invoice_item: 'ii_platform' });
+    change(line);
+    assert.throws(() => prove(input), { code, status: 409 });
+  });
+}
 test('actual exclusive pool and platform taxes reconcile separately', () => {
   const result = prove(fixture({ tax: 700, poolTax: 6975 }));
   assert.equal(result.pool_paid_cents, 69750);
