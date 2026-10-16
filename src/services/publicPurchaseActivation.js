@@ -1458,7 +1458,7 @@ async function finishExistingEnterpriseAccountSetup(options = {}) {
   if (!agreementId) throw new Error('enterprise_payment_agreement_missing');
 
   const { data: agreement, error: agreementError } = await db.from('membership_agreements')
-    .select('id,client_id,status,is_current,checkout_status,checkout_session_id,checkout_paid_at,primary_admin_name,admin_email,client_legal_name,dba_trade_name,membership_tier,billing_option,auto_renew,template_snapshot,superseded_at,superseded_by_agreement_id,enterprise_checkout_source,enterprise_checkout_prices,enterprise_funding_receipt,enterprise_billing_receipt')
+    .select('id,client_id,status,is_current,checkout_status,checkout_session_id,checkout_paid_at,primary_admin_name,admin_email,client_legal_name,dba_trade_name,membership_tier,billing_option,auto_renew,template_snapshot,superseded_at,superseded_by_agreement_id,enterprise_checkout_source,enterprise_checkout_pool_id,enterprise_checkout_prices,enterprise_funding_receipt,enterprise_billing_receipt')
     .eq('id', agreementId).maybeSingle();
   if (agreementError || !agreement) throw new Error('enterprise_payment_agreement_read_failed');
   const billingReceipt = await readVerifiedEnterpriseBillingReceipt({ db, agreement });

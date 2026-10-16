@@ -9,6 +9,7 @@ function fixture({existingMember=false}={}){
   checkout_status:'paid',checkout_session_id:'cs_SYNTHETIC',checkout_paid_at:paidAt,primary_admin_name:'Synthetic Owner',
   admin_email:'owner@example.invalid',client_legal_name:'Synthetic Client LLC',membership_tier:'enterprise',billing_option:'monthly',
   auto_renew:true,template_snapshot:{values:{}},superseded_at:null,superseded_by_agreement_id:null,
+  enterprise_checkout_pool_id:'00000000-0000-4000-8000-000000000003',
   enterprise_checkout_source:{version:'enterprise_existing_pending_v1'},enterprise_checkout_prices:{platform_price_id:'price_SYNTHETIC'},
   enterprise_funding_receipt:{version:'enterprise_existing_funding_v1'},enterprise_billing_receipt:{version:'enterprise_existing_billing_v1'}};
  const client={id:proof.client_id,parent_client_id:null,archived_at:null,stripe_customer_id:proof.customer_id,
@@ -19,13 +20,13 @@ function fixture({existingMember=false}={}){
   client_members:existingMember?[{client_id:client.id,user_id:'user_SYNTHETIC',email:'owner@example.invalid',name:'Owner',role:'admin'}]:[]};
  class Query{
   constructor(table){this.table=table;this.filters=[];this.op='select';this.payload=null;}
-  select(){return this;}eq(k,v){this.filters.push([k,v]);return this;}
+  select(columns){this.columns=columns&&columns!=='*'?columns.split(','):null;return this;}eq(k,v){this.filters.push([k,v]);return this;}
   insert(value){this.op='insert';this.payload=value;return this;}
   update(value){this.op='update';this.payload=value;return this;}
   async exec(){const target=rows[this.table];if(this.op==='insert'){target.push(structuredClone(this.payload));return{data:[structuredClone(this.payload)],error:null};}
    const found=target.filter(row=>this.filters.every(([key,value])=>row[key]===value));
    if(this.op==='update')for(const row of found)Object.assign(row,structuredClone(this.payload));
-   return{data:structuredClone(found),error:null,count:found.length};}
+   return{data:structuredClone(this.columns?found.map(row=>Object.fromEntries(this.columns.map(key=>[key,row[key]]))):found),error:null,count:found.length};}
   then(ok,bad){return this.exec().then(ok,bad);}async maybeSingle(){const r=await this.exec();return{data:r.data[0]||null,error:r.error};}
  }
  const db={rows,from(table){return new Query(table);}};
@@ -35,6 +36,7 @@ function fixture({existingMember=false}={}){
  }});
  inject('../src/services/existingEnterprisePaymentRows',{exactPaymentTime,verifyEnterprisePaymentRows:({agreement:a,pool:p,billingReceipt})=>{
   assert.equal(a.checkout_status,'paid');assert.equal(p.status,'paid');assert.equal(billingReceipt.funding_receipt.proof.subscription_id,proof.subscription_id);
+  assert.equal(a.enterprise_checkout_pool_id,p.id,'setup projection must retain the existing native pool binding');
  }});
  const path=require.resolve('../src/services/publicPurchaseActivation');delete require.cache[path];
  const service=require(path);return{db,rows,service,client};
