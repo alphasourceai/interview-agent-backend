@@ -1,5 +1,6 @@
 'use strict';
 const {test}=require('node:test'),assert=require('node:assert/strict');
+const {exactPaymentTime}=require('../src/services/existingEnterprisePaymentRows');
 function inject(path,exports){const file=require.resolve(path);require.cache[file]={id:file,filename:file,loaded:true,exports};}
 const paidAt='2026-10-13T12:00:00.000000Z';
 const proof={client_id:'00000000-0000-4000-8000-000000000002',customer_id:'cus_SYNTHETIC',subscription_id:'sub_SYNTHETIC',payment_success_at:paidAt};
@@ -32,7 +33,7 @@ function fixture({existingMember=false}={}){
  inject('../src/services/existingEnterpriseBillingReceipt',{readVerifiedEnterpriseBillingReceipt:async({agreement:a})=>{
   assert.equal(a.enterprise_billing_receipt.version,'enterprise_existing_billing_v1');return{funding_receipt:{proof}};
  }});
- inject('../src/services/existingEnterprisePaymentRows',{verifyEnterprisePaymentRows:({agreement:a,pool:p,billingReceipt})=>{
+ inject('../src/services/existingEnterprisePaymentRows',{exactPaymentTime,verifyEnterprisePaymentRows:({agreement:a,pool:p,billingReceipt})=>{
   assert.equal(a.checkout_status,'paid');assert.equal(p.status,'paid');assert.equal(billingReceipt.funding_receipt.proof.subscription_id,proof.subscription_id);
  }});
  const path=require.resolve('../src/services/publicPurchaseActivation');delete require.cache[path];
@@ -56,4 +57,25 @@ test('retry preserves an existing privileged client role and never sends a passw
   requireParentClient:async(_db,id)=>({ok:true,clientId:id}),logger:{}});
  assert.equal(r.auth_status,'existing_user');assert.equal(r.setup_email_status,'not_sent_existing_user');
  assert.equal(f.rows.client_members.length,1);assert.equal(f.rows.client_members[0].role,'admin');
+});
+for(const timestamp of ['2026-10-13T12:00:00+00:00','2026-10-13T06:00:00-06:00','2026-10-13T12:00:00.000Z'])
+test(`existing Enterprise setup accepts equivalent PostgreSQL paid timestamp ${timestamp}`,async()=>{
+ const f=fixture({existingMember:true});f.rows.membership_agreements[0].checkout_paid_at=timestamp;
+ const before=structuredClone(f.rows);
+ const r=await f.service.finishExistingEnterpriseAccountSetup({db:f.db,agreementId:f.rows.membership_agreements[0].id,
+  authAdmin:{listUsers:async()=>({data:{users:[{id:'user_SYNTHETIC',email:'owner@example.invalid'}]},error:null})},
+  ensureRecovery:async()=>{throw Error('no new account or recovery');},sendRecoveryEmail:async()=>{throw Error('no mail');},
+  requireParentClient:async(_db,id)=>({ok:true,clientId:id}),logger:{}});
+ assert.equal(r.ok,true);assert.equal(r.auth_status,'existing_user');assert.equal(r.setup_email_status,'not_sent_existing_user');
+ assert.deepEqual(f.rows,before);
+});
+for(const timestamp of [null,'','not-a-date','2026-10-13T12:00:00.000001Z','2026-10-13T12:00:00.001Z','2026-10-13T12:00:01Z','2026-10-14T12:00:00Z'])
+test(`existing Enterprise setup still denies missing/invalid/different paid instant ${timestamp}`,async()=>{
+ const f=fixture({existingMember:true});f.rows.membership_agreements[0].checkout_paid_at=timestamp;
+ const before=structuredClone(f.rows);
+ await assert.rejects(f.service.finishExistingEnterpriseAccountSetup({db:f.db,agreementId:f.rows.membership_agreements[0].id,
+  authAdmin:{listUsers:async()=>{throw Error('no auth access');}},ensureRecovery:async()=>{throw Error('no recovery');},
+  sendRecoveryEmail:async()=>{throw Error('no mail');},requireParentClient:async()=>{throw Error('no parent continuation');},logger:{}}),
+  {message:'enterprise_payment_scope_changed'});
+ assert.deepEqual(f.rows,before);
 });

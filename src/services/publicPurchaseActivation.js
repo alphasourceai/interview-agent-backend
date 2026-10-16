@@ -19,7 +19,7 @@ const { retailTermWindow } = require('./membershipOffers');
 const { retailAgreementTermWindow } = require('./retailQuoteSelection');
 const { assertExistingEnterprisePoolActivationAvailable } = require('./existingEnterprisePoolActivationHold');
 const { readVerifiedEnterpriseBillingReceipt } = require('./existingEnterpriseBillingReceipt');
-const { verifyEnterprisePaymentRows } = require('./existingEnterprisePaymentRows');
+const { verifyEnterprisePaymentRows, exactPaymentTime } = require('./existingEnterprisePaymentRows');
 
 const LIVE_SUBSCRIPTION_STATUSES = new Set(['active', 'trialing']);
 const PRIVILEGED_MEMBER_ROLES = new Set(['manager', 'admin', 'owner', 'super_admin']);
@@ -1477,7 +1477,8 @@ async function finishExistingEnterpriseAccountSetup(options = {}) {
   const pool = poolResult.data, client = clientResult.data, proof = billingReceipt.funding_receipt.proof;
   if (agreement.status !== 'signed' || agreement.is_current !== true || agreement.superseded_at
     || agreement.superseded_by_agreement_id || agreement.checkout_status !== 'paid'
-    || agreement.checkout_paid_at !== proof.payment_success_at || agreement.client_id !== proof.client_id
+    || !exactPaymentTime(agreement.checkout_paid_at, proof.payment_success_at)
+    || agreement.client_id !== proof.client_id
     || agreement.membership_tier !== 'enterprise' || client.id !== agreement.client_id
     || client.parent_client_id || client.archived_at || client.stripe_customer_id !== proof.customer_id
     || client.stripe_subscription_id !== proof.subscription_id || ownerResult.data[0].client_id !== client.id
