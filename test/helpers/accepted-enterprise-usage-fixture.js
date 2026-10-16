@@ -38,5 +38,5 @@ module.exports=async function fixture(options={}) {
     client_id:f.client.id,source:'usage',source_id:null,completed_at:'2026-10-02T12:00:00Z'};
   const allocation={billing_model:'usage',included_per_role:0,allowance_by_role:new Map([[role.id,0]]),
     usage_interview_fee_cents:9999,roles:[role],entries:[entry],entity_label_by_client:new Map()};
-  return{db,a:f.a,client:f.client,w,plan:livePlan,allocation,entry,role};
+  return{db,a:f.a,client:f.client,w,plan:livePlan,allocation,entry,role,nativeFixture:f};
 };
