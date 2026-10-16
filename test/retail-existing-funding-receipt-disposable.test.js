@@ -5,6 +5,8 @@ const {buildRetailPackageSnapshot}=require('../src/services/membershipPackageCom
 const {OFFER_VERSION,STRIPE_RECURRING_OFFER_VERSION,anchoredMonthInstant}=require('../src/services/membershipOffers');
 const enabled=process.env.RETAIL_FUNDING_RECEIPT_DISPOSABLE==='true',opts={skip:!enabled};
 const enterpriseFenceEnabled=enabled&&process.env.ENTERPRISE_LEGACY_FENCE_DISPOSABLE==='true';
+const enterprisePeriodEnabled=enabled&&process.env.ENTERPRISE_PLATFORM_PERIOD_DISPOSABLE==='true';
+const enterprisePeriodOpts={skip:!enterprisePeriodEnabled};
 const enterpriseFenceOpts={skip:!enterpriseFenceEnabled};
 const enterpriseFenceMigration=path.resolve(__dirname,'../supabase/migrations/20261016032407_enterprise_existing_legacy_contract_fence.sql');
 const legacyFunctionCatalog=()=>JSON.parse(sql("select jsonb_agg(jsonb_build_object('name',proname,'metadata',to_jsonb(p)-'prosrc','body',md5(prosrc)) order by proname) from pg_proc p where pronamespace='public'::regnamespace and proname in('legacy_contract_projection','apply_legacy_contract_action','zz_retail_legacy_cohort_gate','legacy_contract_gate_pin','legacy_contract_cohort')"));
@@ -151,6 +153,21 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
   assert.equal(state(),beforeState);assert.equal(acl(),priorPermissions);
   assert.equal(sql("select jsonb_agg(to_jsonb(t) order by tgname) from pg_trigger t where tgrelid='membership_agreements'::regclass"),triggers);
   sql('set role service_role;select legacy_contract_gate_pin()');
+ }
+ if(enterprisePeriodEnabled){
+  // The historical public-schema export omits extension-schema ACLs. This
+  // private bootstrap installs pgcrypto there; permit only the synthetic
+  // service role to call the existing offer digest, not a product grant.
+  sql('grant usage on schema extensions to service_role');
+  const candidate=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261016034832_enterprise_existing_paid_platform_periods.sql'),'utf8');
+  const def=sql("select pg_get_functiondef('public.read_enterprise_existing_billing(uuid)'::regprocedure)");
+  for(const change of [def.replace(/AS \$function\$/,'AS $function$\n -- synthetic period source drift\n'),
+   'grant execute on function public.read_enterprise_existing_billing(uuid) to anon',
+   'alter table billing_invoices disable row level security',
+   'alter table membership_agreements disable trigger enterprise_existing_billing_guard',
+   'drop index billing_invoices_stripe_invoice_id_uniq'])
+   denied('begin;'+change+';'+candidate,/enterprise_period_.*drift/);
+  sql(candidate);
  }
 });
 function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false,adminSource='admin',linkedSource='sales_assisted',buyerEmail='buyer@example.invalid',options={}){
@@ -2603,6 +2620,98 @@ test('internal linked member seam is mounted only by original activation and nev
  }}scan(root);
  const s=fs.readFileSync(path.join(root,'services/existingRetailLinkedMemberTail.js'),'utf8');
  for(const name of ['ensureRecovery','ensureBuyerAccountSetup','sendRecoveryEmail','sendWelcomeEmail','.insert(','.update(','.upsert('])assert.ok(!s.includes(name),name);
+});
+
+// Actual original-schema Enterprise period receipt, no provider/Auth/access effects.
+const enterprisePeriodFixture=require('./helpers/enterprise-native-paid-period-fixture');
+const enterprisePeriodCall=(f,p=f.proof,b=f.billing)=>`select record_enterprise_existing_paid_period(${[f.id,f.client,b,p].map(lit).join(',')});`;
+const recordEnterprisePeriod=(f,p=f.proof,b=f.billing)=>JSON.parse(sql('set role service_role;'+enterprisePeriodCall(f,p,b)));
+const enterprisePeriodUnchanged=f=>sql(`select jsonb_build_object('agreement',(select to_jsonb(a) from membership_agreements a where id=${lit(f.id)}),
+ 'client',(select to_jsonb(c) from clients c where id=${lit(f.client)}),'plan',(select to_jsonb(p) from client_plan_settings p where client_id=${lit(f.client)}),
+ 'pool',(select to_jsonb(p) from client_interview_pools p where agreement_id=${lit(f.id)}))`);
+for(const cadence of ['monthly','annual'])test(`ENTERPRISE PERIOD native ${cadence} record/replay preserves original state`,enterprisePeriodOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{cadence}),before=enterprisePeriodUnchanged(f),r=recordEnterprisePeriod(f);
+ assert.equal(r.status,'recorded');assert.equal(r.receipt.version,'enterprise_existing_paid_period_receipt_v1');
+ assert.deepEqual(r.receipt.source,f.billing);assert.deepEqual(r.receipt.proof,f.proof);
+ assert.equal(recordEnterprisePeriod(f).status,'already_recorded');assert.equal(enterprisePeriodUnchanged(f),before);
+ assert.equal(sql(`select count(*) from billing_invoices where stripe_invoice_id=${lit(f.proof.invoice_id)}`),'1');
+ for(const change of ['enterprise_period_receipt=null',"stripe_invoice_id='in_FOREIGN'",'billing_customer_id=null','amount_total_cents=1',"currency='eur'"])
+  denied(`update billing_invoices set ${change} where id=${lit(r.invoice_id)}`,/enterprise_period_receipt_immutable/);
+ denied(`delete from billing_invoices where id=${lit(r.invoice_id)}`,/enterprise_period_receipt_immutable/);
+});
+test('ENTERPRISE PERIOD conflicting replay and ordinal leave invoice/source unchanged',enterprisePeriodOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql),r=recordEnterprisePeriod(f),before=enterprisePeriodUnchanged(f);
+ for(const patch of [{invoice_id:'in_OTHER'},{line_id:'il_OTHER'},{payment_intent_id:'pi_OTHER'},
+  {charge_id:'ch_OTHER'},{platform_discount_cents:1,platform_net_cents:99998,cash_cents:99998}])
+  denied('set role service_role;'+enterprisePeriodCall(f,{...f.proof,...patch}),/enterprise_period_.*conflict|duplicate key/);
+ assert.equal(enterprisePeriodUnchanged(f),before);
+ assert.deepEqual(JSON.parse(sql(`select enterprise_period_receipt from billing_invoices where id=${lit(r.invoice_id)}`)),r.receipt);
+});
+test('ENTERPRISE PERIOD invalid proof cannot create shell invoice',enterprisePeriodOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql),before=enterprisePeriodUnchanged(f);
+ for(const patch of [{cash_cents:1},{platform_gross_cents:0},{platform_discount_cents:-1},{tax_cents:0.5},{ordinal:0},
+  {provider_period_end:f.proof.provider_period_end+1},{provider_account_id:'acct_OTHER'},{livemode:true},{customer_id:'cus_OTHER'},
+  {subscription_id:'sub_OTHER'},{subscription_item_id:'si_OTHER'},{price_id:'price_OTHER'},
+  {invoice_id:f.funding.invoice_id},{line_id:f.funding.pool_line_id},{payment_intent_id:f.funding.payment_intent_id},
+  {charge_id:f.funding.charge_id},{paid_at:'2099-01-01T00:00:00.000Z'},{paid_at:f.proof.paid_at.replace('.000Z','.001Z')},
+  {payroll_authorized:true},{extra:true}])denied('set role service_role;'+enterprisePeriodCall(f,{...f.proof,...patch}),/enterprise_period_/);
+ assert.equal(sql(`select count(*) from billing_invoices where stripe_invoice_id=${lit(f.proof.invoice_id)}`),'0');
+ assert.equal(enterprisePeriodUnchanged(f),before);
+});
+test('ENTERPRISE PERIOD browser/direct write and schema replay deny without authority',enterprisePeriodOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql),b=JSON.parse(sql(`select to_jsonb(b) from billing_customers b where client_id=${lit(f.client)}`));
+ for(const role of ['anon','authenticated'])denied('set role '+role+';'+enterprisePeriodCall(f),/permission denied/);
+ const w={version:'enterprise_existing_paid_period_receipt_v1',source:f.billing,source_digest:'0'.repeat(32),proof:f.proof,recorded_at:null};
+ denied(`set role service_role;insert into billing_invoices(billing_customer_id,title,invoice_title,amount_total_cents,currency,status,stripe_invoice_id,enterprise_period_receipt)
+  values(${lit(b.id)},'Synthetic','Synthetic',99999,'usd','paid',${lit(f.proof.invoice_id)},${lit(w)})`,/enterprise_period_writer_required/);
+ denied(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261016034832_enterprise_existing_paid_platform_periods.sql'),'utf8'),/enterprise_period_schema_drift/);
+ assert.equal(sql(`select count(*) from billing_invoices where stripe_invoice_id=${lit(f.proof.invoice_id)}`),'0');
+});
+test('ENTERPRISE PERIOD noncurrent/archived sources and changed frozen receipt hold',enterprisePeriodOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql);
+ for(const update of [`update membership_agreements set is_current=false where id=${lit(f.id)}`,
+  `update clients set archived_at=clock_timestamp() where id=${lit(f.client)}`])
+  denied('begin;'+update+';set role service_role;'+enterprisePeriodCall(f)+'commit;',/enterprise_period_|enterprise_billing_|enterprise_payment_/);
+ denied('set role service_role;'+enterprisePeriodCall(f,f.proof,{...f.billing,applied_at:'2099-01-01T00:00:00.000000Z'}),/enterprise_period_source_denied/);
+});
+test('ENTERPRISE PERIOD actual root lock serializes two identical writer calls',enterprisePeriodOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql),tag='EPC'+crypto.randomUUID().replaceAll('-','');
+ const [h,w,o]=await Promise.all([
+  parallel(`begin;select 1 from clients where id=${lit(f.client)} for update;select pg_sleep(0.6);set role service_role;${enterprisePeriodCall(f)}commit;`),
+  parallel(`set application_name=${lit(tag)};select pg_sleep(0.1);set role service_role;${enterprisePeriodCall(f)}`),
+  parallel(`select pg_sleep(0.3);select count(*) from pg_stat_activity where application_name=${lit(tag)} and wait_event_type='Lock';`)]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.code,0,o.err);assert.equal(o.out.trim(),'1');
+ assert.equal(JSON.parse(w.out.trim()).status,'already_recorded');
+ assert.equal(sql(`select count(*) from billing_invoices where stripe_invoice_id=${lit(f.proof.invoice_id)}`),'1');
+});
+test('ENTERPRISE PERIOD discounts/tax and later distinct cycle remain platform-only; reused cash rolls shell row back',enterprisePeriodOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql),before=enterprisePeriodUnchanged(f);
+ const first={...f.proof,platform_discount_cents:1000,platform_net_cents:98999,tax_cents:700,cash_cents:99699};
+ const one=recordEnterprisePeriod(f,first);assert.equal(one.receipt.proof.platform_net_cents,98999);
+ const {anchoredMonthInstant}=require('../src/services/membershipOffers');
+ const second={...f.proof,ordinal:2,invoice_id:f.proof.invoice_id+'SECOND',line_id:f.proof.line_id+'SECOND',
+  payment_intent_id:f.proof.payment_intent_id+'SECOND',charge_id:f.proof.charge_id+'SECOND',
+  provider_period_start:f.proof.provider_period_end,
+  provider_period_end:Date.parse(anchoredMonthInstant(new Date(f.proof.provider_period_start*1000).toISOString(),2))/1000};
+ denied('set role service_role;'+enterprisePeriodCall(f,{...second,payment_intent_id:first.payment_intent_id}),/duplicate key/);
+ assert.equal(sql(`select count(*) from billing_invoices where stripe_invoice_id=${lit(second.invoice_id)}`),'0');
+ assert.equal(recordEnterprisePeriod(f,second).status,'recorded');assert.equal(enterprisePeriodUnchanged(f),before);
+});
+test('ENTERPRISE PERIOD existing own invoice attaches after actual row wait, foreign owner refuses',enterprisePeriodOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql),owner=sql(`select id from billing_customers where client_id=${lit(f.client)}`);
+ const row=sql(`insert into billing_invoices(billing_customer_id,title,invoice_title,amount_total_cents,currency,status,stripe_invoice_id)
+  values(${lit(owner)},'Synthetic','Synthetic',99999,'usd','open',${lit(f.proof.invoice_id)}) returning id`);
+ const tag='EPI'+crypto.randomUUID().replaceAll('-','');
+ const [h,w,o]=await Promise.all([
+  parallel(`begin;select 1 from billing_invoices where id=${lit(row)} for update;select pg_sleep(0.6);commit;`),
+  parallel(`set application_name=${lit(tag)};select pg_sleep(0.1);set role service_role;${enterprisePeriodCall(f)}`),
+  parallel(`select pg_sleep(0.3);select count(*) from pg_stat_activity where application_name=${lit(tag)} and wait_event_type='Lock';`)]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.code,0,o.err);assert.equal(o.out.trim(),'1');
+ assert.equal(JSON.parse(w.out.trim()).invoice_id,row);assert.equal(sql(`select status from billing_invoices where id=${lit(row)}`),'paid');
+ const foreign=await enterprisePeriodFixture(sql),foreignOwner=sql(`select id from billing_customers where client_id=${lit(foreign.client)}`);
+ sql(`insert into billing_invoices(billing_customer_id,title,invoice_title,amount_total_cents,currency,status,stripe_invoice_id)
+  values(${lit(foreignOwner)},'Synthetic','Synthetic',99999,'usd','paid',${lit(foreign.proof.invoice_id+'WRONG')})`);
+ denied('set role service_role;'+enterprisePeriodCall(f,{...f.proof,invoice_id:foreign.proof.invoice_id+'WRONG'}),/enterprise_period_invoice_owner_conflict/);
 });
 
 // Actual original-schema native scanner guard, never hosted/provider effects.
