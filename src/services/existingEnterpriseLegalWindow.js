@@ -45,9 +45,15 @@ function verifyExistingEnterpriseLegalWindow(raw, { agreement, billingReceipt })
     check(from === stamp(cash) && through > from && at >= from && at >= stamp(source.applied_at)
       && (w.term_index === 0 || (at >= start && from <= start && through > start)));
     const values = agreement.enterprise_checkout_source?.material?.template_snapshot?.values;
-    check(typeof values?.notice_deadline_plain === 'string' && /^[1-9][0-9]{0,3}$/.test(values.notice_deadline_plain));
-    const days = Number(values.notice_deadline_plain);
-    check(days <= 3660 && values.notice_deadline_days === `${days} Days` && agreement.notice_deadline_days === days
+    // Stored producer snapshots use canonical digits; rendered fixtures also
+    // carry a plain field plus "N Days". Read either exact accepted shape,
+    // never invent a default or rewrite an already-signed snapshot.
+    const numericSnapshot = values && !Object.hasOwn(values, 'notice_deadline_plain');
+    const rawDays = numericSnapshot ? values.notice_deadline_days : values?.notice_deadline_plain;
+    check(typeof rawDays === 'string' && /^[1-9][0-9]{0,3}$/.test(rawDays));
+    const days = Number(rawDays);
+    check(days <= 3660 && values.notice_deadline_days === (numericSnapshot ? String(days) : `${days} Days`)
+      && agreement.notice_deadline_days === days
       && stamp(w.notice_cutoff_at) === end - BigInt(days)*86400000000n);
     // A null journal means the original frozen preference, not mutable client
     // auto_renew. A later window requires already-funded native continuity.

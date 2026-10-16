@@ -86,6 +86,25 @@ test('missing or drifted frozen notice holds rather than inventing a default',as
     const f=await fixture();change(f);assert.throws(()=>verify(f.legal,args(f)),{status:503});
   }
 });
+test('canonical producer notice snapshot without a display-only plain field retains accepted cutoff',async()=>{
+  const f=await fixture(),v=f.a.enterprise_checkout_source.material.template_snapshot.values;
+  delete v.notice_deadline_plain;v.notice_deadline_days='30';
+  const before=structuredClone(v);
+  assert.equal(verify(f.legal,args(f)).notice_cutoff_at,f.legal.notice_cutoff_at);
+  assert.deepEqual(v,before);
+});
+test('canonical producer notice rejects absent, malformed, conflicting or out-of-range accepted days',async()=>{
+  for(const value of [null,30,'030','0','3661','30 days','',undefined]){
+    const f=await fixture(),v=f.a.enterprise_checkout_source.material.template_snapshot.values;
+    delete v.notice_deadline_plain;v.notice_deadline_days=value;
+    assert.throws(()=>verify(f.legal,args(f)),{status:503});
+  }
+  for(const change of [v=>{v.notice_deadline_plain=null;v.notice_deadline_days='30';},
+    v=>{v.notice_deadline_plain='31';v.notice_deadline_days='30';}]){
+    const f=await fixture();change(f.a.enterprise_checkout_source.material.template_snapshot.values);
+    assert.throws(()=>verify(f.legal,args(f)),{status:503});
+  }
+});
 test('native unavailable or original receipt changing after the legal read holds without any write',async()=>{
   for(const error of [false,true]){
     const f=await fixture(),rpc=f.db.rpc;

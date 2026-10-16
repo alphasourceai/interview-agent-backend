@@ -8,7 +8,7 @@ const {proveEnterprisePoolPayment}=require('../../src/services/enterprisePoolPay
 const paidFixture=require('./enterprise-pool-payment-fixture');
 const lit=v=>v==null?'null':typeof v==='object'?`'${JSON.stringify(v).replaceAll("'","''")}'::jsonb`:
  typeof v==='boolean'||typeof v==='number'?String(v):`'${String(v).replaceAll("'","''")}'`;
-module.exports=async function fixture(sql,{cadence='monthly',ordinal=1,initialPeriodSeconds=86400,noticeDays=null,termDays=null,termStartDays=0,clientLegalName=null,platformLineCents=null}={}){
+module.exports=async function fixture(sql,{cadence='monthly',ordinal=1,initialPeriodSeconds=86400,noticeDays=null,noticeSnapshotFormat='display',termDays=null,termStartDays=0,clientLegalName=null,platformLineCents=null}={}){
  const id=crypto.randomUUID(),client=crypto.randomUUID(),attempt=crypto.randomUUID(),suffix=id.replaceAll('-','');
  const customer='cus_PERIOD_'+suffix,token=crypto.createHash('sha256').update(id).digest('hex');
  const start=sql(`select to_char(current_date+make_interval(days=>${Number.isSafeInteger(termStartDays)?termStartDays:0}),'YYYY-MM-DD')`),end=termDays===null?sql("select to_char(current_date+interval '1 year','YYYY-MM-DD')"):
@@ -17,6 +17,9 @@ module.exports=async function fixture(sql,{cadence='monthly',ordinal=1,initialPe
   per_role_fee:'0',included_interviews_per_role:'0',additional_interview_fee:'0',pool_quantity:30,usage_interview_fee_cents:2500,
   max_interview_minutes:'20',scored_question_count:'5',term_start_basis:'agreement_date',initial_term_start:start,initial_renewal_date:end});
  if(noticeDays!==null)Object.assign(values,{notice_deadline_plain:String(noticeDays),notice_deadline_days:String(noticeDays)+' Days'});
+ if(noticeDays!==null&&noticeSnapshotFormat==='numeric'){
+  delete values.notice_deadline_plain;values.notice_deadline_days=String(noticeDays);
+ }
  if(clientLegalName!==null)values.client_legal_name=clientLegalName;
  const unsigned={values,rendered_html:'SYNTHETIC ONLY'};
  sql(`set role service_role;insert into clients(id,name,email,stripe_customer_id) values(${lit(client)},'Synthetic Period','period@example.invalid',${lit(customer)});
