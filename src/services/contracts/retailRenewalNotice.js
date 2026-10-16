@@ -14,6 +14,15 @@ function noticeEmail(value){
  const email=value.trim().toLowerCase();if(!validMembershipBuyerEmail(email))held();return email;
 }
 function noticeRecipientHash(value){return createHash('sha256').update(noticeEmail(value),'utf8').digest('hex');}
+function configuredNoticeRecipients(env=process.env){
+ try{
+  const raw=env.RETAIL_RENEWAL_NOTICE_ALLOW_RECIPIENTS;
+  if(typeof raw!=='string'||raw.length>32768)return[];
+  const values=JSON.parse(raw);
+  if(!Array.isArray(values)||!values.length||values.length>100)return[];
+  return [...new Set(values.map(noticeEmail))];
+ }catch(_){return[];}
+}
 function noticeProviderAck(result){
  const status=result?.skipped===true?undefined:result?.statusCode;
  const outcome=status===202?'accepted':Number.isInteger(status)&&status>=400&&status<500?'rejected':'unknown';
@@ -91,4 +100,4 @@ async function processRetailRenewalNotice({db,agreementId,clientId,enabled=false
   return{status:ack.outcome}; // accepted means API acceptance, NOT recipient delivery.
  }catch(_){return{status:'held',code:'retail_renewal_notice_held'};}
 }
-module.exports={noticeEmail,noticeRecipientHash,noticeProviderAck,renderRetailRenewalNotice,processRetailRenewalNotice};
+module.exports={noticeEmail,noticeRecipientHash,configuredNoticeRecipients,noticeProviderAck,renderRetailRenewalNotice,processRetailRenewalNotice};

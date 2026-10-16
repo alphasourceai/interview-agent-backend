@@ -30,6 +30,12 @@ function referencesDemo(req) {
 function demoFence(req, res, next) {
   if (!referencesDemo(req)) return next();
   if (!isQa()) return res.status(404).json({ error: 'demo_not_available' });
+  // Overview reads candidates once per client, including the demo. Let this
+  // exact read reach its existing requireAuth + requireAdmin guards. Keep it
+  // OUT of safeDemoRequest: restricted demo managers cannot use admin routes.
+  const path = String(req.originalUrl || req.url || '').split('?')[0];
+  if (['GET', 'HEAD'].includes(String(req.method || '').toUpperCase())
+    && path === '/admin/candidates') return next();
   if (!safeDemoRequest(req)) return res.status(403).json({
     error: 'demo_action_disabled', detail: 'Demo data cannot send messages, start interviews, invite users, or create charges.'
   });

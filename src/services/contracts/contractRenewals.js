@@ -174,8 +174,10 @@ async function processContractRenewals(context = {}, dependencies = {}) {
           // Independent mail catch: a reminder hold never changes the existing
           // renewal accounting or falls through to legacy renew/deactivation.
           try{
-            const notice=await require('./retailRenewalNotice').processRetailRenewalNotice({db,agreementId:agreement.id,clientId:client.id,
-              enabled:process.env.RETAIL_RENEWAL_NOTICE_ENABLED==='true',allowRecipients:dependencies.renewalNoticeAllowRecipients||[],
+            const noticeService=require('./retailRenewalNotice');
+            const notice=await noticeService.processRetailRenewalNotice({db,agreementId:agreement.id,clientId:client.id,
+              enabled:process.env.RETAIL_RENEWAL_NOTICE_ENABLED==='true',allowRecipients:Object.hasOwn(dependencies,'renewalNoticeAllowRecipients')
+                ?dependencies.renewalNoticeAllowRecipients:noticeService.configuredNoticeRecipients(),
               send:dependencies.sendRenewalNotice||null});
             if(['held','unknown','rejected'].includes(notice.status))console.warn('retail_renewal_notice_held',{code:notice.code||notice.status});
           }catch(_){console.warn('retail_renewal_notice_held',{code:'retail_renewal_notice_held'});}

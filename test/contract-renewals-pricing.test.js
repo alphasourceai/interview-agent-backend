@@ -15,22 +15,28 @@ test('notice held or fault leaves current v2 contract accounting unchanged and c
  const names=['../src/services/contracts/contractRenewals','../src/services/existingRetailRecurringPayment',
   '../src/services/existingRetailRenewalPreference','../src/services/contracts/retailRenewalNotice'];
  const files=names.map(require.resolve),saved=files.map(f=>require.cache[f]);
+ const readRecipients=require('../src/services/contracts/retailRenewalNotice').configuredNoticeRecipients;
+ const priorRecipients=process.env.RETAIL_RENEWAL_NOTICE_ALLOW_RECIPIENTS;
+ process.env.RETAIL_RENEWAL_NOTICE_ALLOW_RECIPIENTS='["owner@example.invalid"]';
  try{
-  for(const outcome of ['held','throw']){
-   let calls=0;
+  for(const outcome of ['held','throw'])for(const override of [undefined,[],['other@example.invalid'],null]){
+   let calls=0,received;
    const exports=[null,{refreshExistingRetailCoverage:async()=>({status:'active'})},
     {reconcileExistingRetailRenewal:async()=>({status:'disabled'})},
-    {processRetailRenewalNotice:async()=>{calls++;if(outcome==='throw')throw Error('SYNTHETIC mail fault');return{status:'held'};}}];
+    {configuredNoticeRecipients:readRecipients,processRetailRenewalNotice:async args=>{calls++;received=args.allowRecipients;if(outcome==='throw')throw Error('SYNTHETIC mail fault');return{status:'held'};}}];
    delete require.cache[files[0]];
    for(let n=1;n<files.length;n++)require.cache[files[n]]={id:files[n],filename:files[n],loaded:true,exports:exports[n]};
    const f=fixture();f.agreement.template_snapshot.package_snapshot.pricing_version=STRIPE_RECURRING_OFFER_VERSION;
    f.agreement.template_snapshot.package_snapshot.membership_terms.offer_version=STRIPE_RECURRING_OFFER_VERSION;
-   const db=makeDb(f),result=await require(names[0]).processContractRenewals({}, {db,now:new Date('2026-03-01T00:00:00Z')});
+   const db=makeDb(f),result=await require(names[0]).processContractRenewals({}, {db,now:new Date('2026-03-01T00:00:00Z'),
+    ...(override===undefined?{}:{renewalNoticeAllowRecipients:override})});
+   assert.deepEqual(received,override===undefined?['owner@example.invalid']:override);
    assert.equal(calls,1);assert.equal(result.summary.skipped_no_action,1);assert.equal(result.summary.errors,0);
    assert.equal(result.summary.renewed,0);assert.equal(result.summary.deactivated,0);assert.equal(db.writes.length,0);
    assert.equal(result.items[0].action,'paid_coverage_refreshed');
   }
- }finally{files.forEach((f,n)=>{if(saved[n])require.cache[f]=saved[n];else delete require.cache[f];});}
+ }finally{files.forEach((f,n)=>{if(saved[n])require.cache[f]=saved[n];else delete require.cache[f];});
+  if(priorRecipients===undefined)delete process.env.RETAIL_RENEWAL_NOTICE_ALLOW_RECIPIENTS;else process.env.RETAIL_RENEWAL_NOTICE_ALLOW_RECIPIENTS=priorRecipients;}
 });
 function fixture(months = 3, payment = 'prepaid', index = 0, plan = 'basic') {
   const snapshot = structuredClone(buildRetailPackageSnapshot({planKey:plan, commitmentMonths:months,

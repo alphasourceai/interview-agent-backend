@@ -7,6 +7,14 @@ function fixture(months=3,payment='prepaid',version=STRIPE_RECURRING_OFFER_VERSI
  package_snapshot:buildRetailPackageSnapshot({planKey:'basic',commitmentMonths:months,paymentOption:payment,channel:'sales',offerVersion:version})};}
 const deps={escapeHtml:v=>String(v).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'),
  buildBrandedEmailShell:v=>`<main>${v.contentHtml}</main>`};
+test('hosted notice recipient configuration is exact and fails closed for absent, malformed or broad lists',()=>{
+ const {configuredNoticeRecipients:read}=require('../src/services/contracts/retailRenewalNotice');
+ assert.deepEqual(read({RETAIL_RENEWAL_NOTICE_ALLOW_RECIPIENTS:'[" Owner@Example.invalid ","owner@example.invalid"]'}),['owner@example.invalid']);
+ for(const value of [undefined,'','[','{}','null','[]','"owner@example.invalid"','["*@example.invalid"]',
+  '["owner@example.invalid","bad"]','["a@example.invalid\\r\\nBcc:b@example.invalid"]',
+  JSON.stringify(Array(101).fill('owner@example.invalid')),' '.repeat(32769)])
+  assert.deepEqual(read({RETAIL_RENEWAL_NOTICE_ALLOW_RECIPIENTS:value}),[]);
+});
 test('same accepted factory renders each3/6/12 prepay/monthly notice without new prices or obligations',()=>{
  for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments']){
   const f=fixture(months,payment),seen=[];
