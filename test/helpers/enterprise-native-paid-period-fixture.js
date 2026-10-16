@@ -17,8 +17,8 @@ module.exports=async function fixture(sql,{cadence='monthly',ordinal=1,initialPe
   per_role_fee:'0',included_interviews_per_role:'0',additional_interview_fee:'0',pool_quantity:30,usage_interview_fee_cents:2500,
   max_interview_minutes:'20',scored_question_count:'5',term_start_basis:'agreement_date',initial_term_start:start,initial_renewal_date:end});
  if(noticeDays!==null)Object.assign(values,{notice_deadline_plain:String(noticeDays),notice_deadline_days:String(noticeDays)+' Days'});
- if(noticeDays!==null&&noticeSnapshotFormat==='numeric'){
-  delete values.notice_deadline_plain;values.notice_deadline_days=String(noticeDays);
+ if(noticeDays!==null&&['numeric','number'].includes(noticeSnapshotFormat)){
+  delete values.notice_deadline_plain;values.notice_deadline_days=noticeSnapshotFormat==='number'?noticeDays:String(noticeDays);
  }
  if(clientLegalName!==null)values.client_legal_name=clientLegalName;
  const unsigned={values,rendered_html:'SYNTHETIC ONLY'};

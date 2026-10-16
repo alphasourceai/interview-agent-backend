@@ -50,9 +50,11 @@ function verifyExistingEnterpriseLegalWindow(raw, { agreement, billingReceipt })
     // never invent a default or rewrite an already-signed snapshot.
     const numericSnapshot = values && !Object.hasOwn(values, 'notice_deadline_plain');
     const rawDays = numericSnapshot ? values.notice_deadline_days : values?.notice_deadline_plain;
-    check(typeof rawDays === 'string' && /^[1-9][0-9]{0,3}$/.test(rawDays));
+    const numericValue = numericSnapshot && typeof rawDays === 'number';
+    check(numericValue ? Number.isSafeInteger(rawDays) && rawDays >= 1 :
+      typeof rawDays === 'string' && /^[1-9][0-9]{0,3}$/.test(rawDays));
     const days = Number(rawDays);
-    check(days <= 3660 && values.notice_deadline_days === (numericSnapshot ? String(days) : `${days} Days`)
+    check(days <= 3660 && values.notice_deadline_days === (numericValue ? days : numericSnapshot ? String(days) : `${days} Days`)
       && agreement.notice_deadline_days === days
       && stamp(w.notice_cutoff_at) === end - BigInt(days)*86400000000n);
     // A null journal means the original frozen preference, not mutable client

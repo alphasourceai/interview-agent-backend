@@ -6,6 +6,7 @@ const fixture=require('./helpers/enterprise-native-paid-period-fixture');
 const {verifyExistingEnterpriseLegalWindow:verify}=require('../src/services/existingEnterpriseLegalWindow');
 const enabled=process.env.ENTERPRISE_NOTICE_SNAPSHOT_DISPOSABLE==='true',opts={skip:!enabled};
 const migration=fs.readFileSync(path.join(__dirname,'../supabase/migrations/20261016131828_enterprise_existing_notice_snapshot_compat.sql'),'utf8');
+const numberMigration=fs.readFileSync(path.join(__dirname,'../supabase/migrations/20261016133257_enterprise_existing_numeric_notice_snapshot.sql'),'utf8');
 function run(q){return cp.spawnSync('/opt/homebrew/opt/postgresql@17/bin/psql',['-X','-q','-At','-v','ON_ERROR_STOP=1','-c',q],{encoding:'utf8'});}
 function sql(q){const r=run(q);assert.equal(r.status,0,r.stderr);return r.stdout.trim();}
 function denied(q,re){const r=run(q);assert.notEqual(r.status,0);assert.match(r.stderr,re);}
@@ -23,8 +24,15 @@ before(()=>{
   denied('begin;'+change+';'+migration,/enterprise_notice_prerequisite_drift/);assert.deepEqual(catalog(),before);
  }
  sql(migration);assert.deepEqual(catalog(),before);
+ const parser=()=>sql("select (to_jsonb(p)-'prosrc')::text from pg_proc p where oid='public.enterprise_existing_notice_days(public.membership_agreements)'::regprocedure");
+ const metadata=parser();
+ for(const change of ["alter function public.enterprise_existing_notice_days(public.membership_agreements) security definer",
+  "grant execute on function public.enterprise_existing_notice_days(public.membership_agreements) to authenticated"]){
+  denied('begin;'+change+';'+numberMigration,/enterprise_numeric_notice_prerequisite_drift/);assert.equal(parser(),metadata);
+ }
+ sql(numberMigration);assert.equal(parser(),metadata);assert.deepEqual(catalog(),before);
 });
-for(const format of ['numeric','display'])for(const cadence of ['monthly','annual'])
+for(const format of ['number','numeric','display'])for(const cadence of ['monthly','annual'])
  test(`native ${format} ${cadence} signed-source notice uses the same accepted cutoff without rewriting`,opts,async()=>{
   const f=await fixture(sql,{noticeDays:30,noticeSnapshotFormat:format,cadence});
   const a=JSON.parse(sql(`select to_jsonb(a) from membership_agreements a where id='${f.id}'`));
@@ -39,12 +47,15 @@ for(const format of ['numeric','display'])for(const cadence of ['monthly','annua
 test('native notice parser rejects missing, malformed, conflicting and inaccessible snapshots',opts,()=>{
  const row=v=>lit({notice_deadline_days:30,enterprise_checkout_source:{material:{template_snapshot:{values:v}}}});
  const read=v=>`select enterprise_existing_notice_days(jsonb_populate_record(null::membership_agreements,${row(v)}))`;
- for(const v of [{},{notice_deadline_days:null},{notice_deadline_days:30},{notice_deadline_days:'030'},
+ for(const v of [{},{notice_deadline_days:null},{notice_deadline_days:30.5},{notice_deadline_days:0},
+  {notice_deadline_days:3661},{notice_deadline_days:true},{notice_deadline_days:'030'},
   {notice_deadline_days:'3661'},{notice_deadline_days:'31'},{notice_deadline_days:'30 Days'},
   {notice_deadline_days:'30',notice_deadline_plain:null},{notice_deadline_days:'30',notice_deadline_plain:'31'}])
   denied('set role service_role;'+read(v),/enterprise_renewal_notice_denied/);
  for(const role of ['anon','authenticated'])denied(`set role ${role};`+read({notice_deadline_days:'30'}),/permission denied/);
  assert.equal(sql('set role service_role;'+read({notice_deadline_days:'30'})),'30');
+ assert.equal(sql('set role service_role;'+read({notice_deadline_days:30})),'30');
  assert.equal(sql('set role service_role;'+read({notice_deadline_days:'30 Days',notice_deadline_plain:'30'})),'30');
  denied(migration,/enterprise_notice_schema_drift/);
+ denied(numberMigration,/enterprise_numeric_notice_prerequisite_drift/);
 });

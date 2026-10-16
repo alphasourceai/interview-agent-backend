@@ -94,7 +94,7 @@ test('canonical producer notice snapshot without a display-only plain field reta
   assert.deepEqual(v,before);
 });
 test('canonical producer notice rejects absent, malformed, conflicting or out-of-range accepted days',async()=>{
-  for(const value of [null,30,'030','0','3661','30 days','',undefined]){
+  for(const value of [null,30.5,0,3661,true,'030','0','3661','30 days','',undefined]){
     const f=await fixture(),v=f.a.enterprise_checkout_source.material.template_snapshot.values;
     delete v.notice_deadline_plain;v.notice_deadline_days=value;
     assert.throws(()=>verify(f.legal,args(f)),{status:503});
@@ -104,6 +104,13 @@ test('canonical producer notice rejects absent, malformed, conflicting or out-of
     const f=await fixture();change(f.a.enterprise_checkout_source.material.template_snapshot.values);
     assert.throws(()=>verify(f.legal,args(f)),{status:503});
   }
+});
+test('actual JSON-number producer notice retains the signed scalar and cutoff without rewriting',async()=>{
+  const f=await fixture(),v=f.a.enterprise_checkout_source.material.template_snapshot.values;
+  delete v.notice_deadline_plain;v.notice_deadline_days=30;
+  const before=structuredClone(v);
+  assert.equal(verify(f.legal,args(f)).notice_cutoff_at,f.legal.notice_cutoff_at);
+  assert.deepEqual(v,before);
 });
 test('native unavailable or original receipt changing after the legal read holds without any write',async()=>{
   for(const error of [false,true]){
