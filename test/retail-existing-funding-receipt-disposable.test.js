@@ -5,7 +5,9 @@ const {buildRetailPackageSnapshot}=require('../src/services/membershipPackageCom
 const {OFFER_VERSION,STRIPE_RECURRING_OFFER_VERSION,anchoredMonthInstant}=require('../src/services/membershipOffers');
 const enabled=process.env.RETAIL_FUNDING_RECEIPT_DISPOSABLE==='true',opts={skip:!enabled};
 const enterpriseFenceEnabled=enabled&&process.env.ENTERPRISE_LEGACY_FENCE_DISPOSABLE==='true';
-const enterpriseRenewalEnabled=enabled&&process.env.ENTERPRISE_RENEWAL_DISPOSABLE==='true';
+const enterpriseLegalEnabled=enabled&&process.env.ENTERPRISE_LEGAL_DISPOSABLE==='true';
+const enterpriseLegalOpts={skip:!enterpriseLegalEnabled};
+const enterpriseRenewalEnabled=enabled&&(process.env.ENTERPRISE_RENEWAL_DISPOSABLE==='true'||enterpriseLegalEnabled);
 const enterpriseRenewalOpts={skip:!enterpriseRenewalEnabled};
 const enterpriseStatusEnabled=enabled&&(process.env.ENTERPRISE_STATUS_DISPOSABLE==='true'||enterpriseRenewalEnabled);
 const enterpriseStatusOpts={skip:!enterpriseStatusEnabled};
@@ -202,6 +204,21 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
   const permissions=acl();sql(candidate);
   assert.equal(sql("select md5(coalesce(jsonb_agg(to_jsonb(c)-'enterprise_renewal_change' order by id)::text,'[]')) from clients c"),before);
   assert.equal(acl(),permissions);
+ }
+ if(enterpriseLegalEnabled){
+  const candidate=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261016054426_enterprise_existing_legal_window.sql'),'utf8');
+  const def=sql("select pg_get_functiondef('public.enterprise_existing_renewal_operation_valid(jsonb,jsonb,integer)'::regprocedure)");
+  for(const change of [def.replace(/AS \$function\$/,'AS $function$\n -- synthetic legal source drift\n'),
+   'grant execute on function public.change_enterprise_existing_renewal(uuid,uuid,jsonb,text,boolean) to anon',
+   'alter table clients disable trigger enterprise_existing_renewal_guard','alter table clients disable row level security'])
+   denied('begin;'+change+';'+candidate,/enterprise_legal_.*drift/);
+  const state=()=>sql(`select md5(jsonb_build_object('clients',(select jsonb_agg(to_jsonb(c) order by id) from clients c),
+   'agreements',(select jsonb_agg(to_jsonb(a) order by id) from membership_agreements a))::text)`);
+  const catalog=()=>JSON.parse(sql(`select jsonb_agg(jsonb_build_object('name',proname,'body',md5(prosrc),'metadata',to_jsonb(p)-'prosrc') order by proname) from pg_proc p where oid in
+   ('public.enterprise_existing_renewal_operation_valid(jsonb,jsonb,integer)'::regprocedure,'public.enterprise_existing_renewal_guard()'::regprocedure,
+    'public.change_enterprise_existing_renewal(uuid,uuid,jsonb,text,boolean)'::regprocedure)`));
+  const before=state(),permissions=acl(),original=catalog();sql(candidate);assert.equal(state(),before);assert.equal(acl(),permissions);
+  for(const p of catalog()){const prior=original.find(x=>x.name===p.name);assert.deepEqual(p.metadata,prior.metadata);assert.notEqual(p.body,prior.body);}
  }
 });
 function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false,adminSource='admin',linkedSource='sales_assisted',buyerEmail='buyer@example.invalid',options={}){
@@ -3018,6 +3035,176 @@ test('ENTERPRISE RENEWAL native root lock prevents stale simultaneous preference
   parallel(`select pg_sleep(0.3);select count(*) from pg_stat_activity where application_name=${lit(tag)} and wait_event_type='Lock';`)]);
  assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.code,0,o.err);assert.equal(o.out.trim(),'1');
  const first=JSON.parse(w.out.trim());assert.deepEqual(enterpriseRenewal(f).operation,first.operation);
+});
+
+const enterpriseLegal=(f,refresh=false)=>JSON.parse(sql(`set role service_role;select ${refresh?'refresh':'read'}_enterprise_existing_legal_window(${[f.id,f.client].map(lit).join(',')})`));
+test('ENTERPRISE LEGAL native catalog retains service-only invoker ACLs and exact old function metadata',enterpriseLegalOpts,()=>{
+ const rows=JSON.parse(sql(`select jsonb_agg(jsonb_build_object('name',proname,'body',md5(prosrc),'definer',prosecdef,'config',proconfig,
+  'anon',has_function_privilege('anon',oid,'EXECUTE'),'authenticated',has_function_privilege('authenticated',oid,'EXECUTE'),
+  'service',has_function_privilege('service_role',oid,'EXECUTE')) order by proname) from pg_proc where proname in
+  ('enterprise_existing_legal_span','read_enterprise_existing_legal_window','refresh_enterprise_existing_legal_window',
+   'enterprise_existing_renewal_operation_valid','enterprise_existing_renewal_guard','change_enterprise_existing_renewal')`));
+ assert.equal(rows.length,6);for(const r of rows){assert.equal(r.definer,false);assert.equal(r.anon,false);assert.equal(r.authenticated,false);assert.equal(r.service,true);}
+ console.info('LOCAL Enterprise legal native function hashes '+JSON.stringify(rows));
+});
+test('ENTERPRISE LEGAL calendar helper preserves custom first term and original leap-day anniversaries',enterpriseLegalOpts,()=>{
+ const w={client_initial:{contract_start_at:'2023-11-07T09:10:11.123456Z',contract_end_at:'2024-02-29T23:41:59.123456Z'}};
+ for(const zone of ['UTC','America/Denver','Asia/Kolkata'])for(const [i,start,end]of [
+  [0,'2023-11-07T09:10:11.123456Z','2024-02-29T23:41:59.123456Z'],
+  [1,'2024-02-29T23:41:59.123456Z','2025-02-28T23:41:59.123456Z'],
+  [2,'2025-02-28T23:41:59.123456Z','2026-02-28T23:41:59.123456Z'],
+  [4,'2027-02-28T23:41:59.123456Z','2028-02-29T23:41:59.123456Z']]){
+  const span=JSON.parse(sql(`set timezone=${lit(zone)};set role service_role;select enterprise_existing_legal_span(${lit(w)},${i})`));
+  assert.deepEqual(span,{start_at:start,end_at:end});
+ }
+ for(const i of [-1,1000,null])denied(`set role service_role;select enterprise_existing_legal_span(${lit(w)},${lit(i)})`,/enterprise_legal_calendar_denied/);
+});
+for(const cadence of ['monthly','annual'])test(`ENTERPRISE LEGAL ${cadence} native read/refresh preserves first term and all financial state`,enterpriseLegalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{cadence,noticeDays:30}),before=enterprisePeriodUnchanged(f),out=enterpriseLegal(f);
+ assert.equal(out.version,'enterprise_existing_legal_window_v1');assert.equal(out.term_index,0);assert.equal(out.auto_renew,true);
+ assert.equal(Date.parse(out.initial_term_start),Date.parse(f.billing.client_initial.contract_start_at));
+ assert.equal(Date.parse(out.term_end_at),Date.parse(f.billing.client_initial.contract_end_at));assert.equal(out.accepted_operation_id,null);
+ assert.equal(Date.parse(out.funded_from),Date.parse(f.funding.payment_success_at));assert.equal(out.provider_effect_authorized,false);
+ assert.equal(out.paid_access_authorized,false);assert.equal(out.payroll_authorized,false);assert.equal(enterprisePeriodUnchanged(f),before);
+ assert.equal(enterpriseLegal(f,true).status,'unchanged');assert.equal(enterprisePeriodUnchanged(f),before);
+});
+test('ENTERPRISE LEGAL future paid coverage cannot renew before native clock boundary; accepted OFF retains E',enterpriseLegalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{noticeDays:1,termDays:3,initialPeriodSeconds:7*86400});
+ let out=enterpriseLegal(f);assert.ok(Date.parse(out.funded_through)>Date.parse(out.term_end_at));assert.equal(out.term_index,0);
+ const off=enterpriseRenewal(f),before=enterprisePeriodUnchanged(f);out=enterpriseLegal(f,true);
+ assert.equal(out.term_index,0);assert.equal(out.auto_renew,false);assert.equal(out.accepted_operation_id,off.operation.operation_id);
+ assert.equal(Date.parse(out.term_end_at),Date.parse(off.operation.effective_at));assert.equal(enterprisePeriodUnchanged(f),before);
+});
+test('ENTERPRISE LEGAL cash first received after expired E cannot retroactively fund the missing boundary',enterpriseLegalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{noticeDays:7,termStartDays:-10,termDays:-1}),before=enterprisePeriodUnchanged(f);
+ const out=enterpriseLegal(f,true);assert.equal(out.term_index,0);assert.equal(out.status,'unchanged');
+ assert.ok(Date.parse(out.funded_from)>Date.parse(out.term_end_at));assert.ok(Date.parse(out.funded_through)>Date.parse(out.term_end_at));
+ assert.equal(enterprisePeriodUnchanged(f),before);
+});
+test('ENTERPRISE LEGAL later journal cannot invent cash coverage or use a different anniversary',enterpriseLegalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{noticeDays:30}),r=enterpriseRenewal(f).operation;
+ // Calendar helper/validator exercise ONLY. This authored historical receipt
+ // is not installed as paid source and grants no legal/access/provider effect.
+ const w=structuredClone(r.source);Object.assign(w.client_initial,{contract_start_at:'2019-01-01T00:00:00.000000Z',contract_end_at:'2020-02-29T00:00:00.000000Z'});
+ w.applied_at='2019-01-01T00:00:00.000000Z';
+ const source=`${lit(w)}`,digest=sql(`select md5((${source})::text)`),on={...r,source:w,source_digest:digest,term_index:4,requested_auto_renew:true,
+  accepted_at:'2023-03-01T00:00:00.000000Z',effective_at:'2024-02-29T00:00:00.000000Z',notice_cutoff_at:'2024-01-30T00:00:00.000000Z'};
+ assert.equal(sql(`select enterprise_existing_renewal_operation_valid(${lit(on)},${source},30)`),'t');
+ assert.equal(sql(`select enterprise_existing_renewal_operation_valid(${lit({...on,effective_at:'2024-02-28T00:00:00.000000Z'})},${source},30)`),'f');
+ const before=enterprisePeriodUnchanged(f);
+ denied(`begin;set role service_role;select set_config('private_sales.enterprise_renewal_writer',${lit(f.client)},true);
+  update clients set enterprise_renewal_change=${lit(on)} where id=${lit(f.client)};
+  select read_enterprise_existing_legal_window(${[f.id,f.client].map(lit).join(',')});commit;`,/enterprise_renewal_operation_drift/);
+ assert.equal(enterprisePeriodUnchanged(f),before);
+});
+test('ENTERPRISE LEGAL direct date/preference drift, roles and unowned future projection cannot become authority',enterpriseLegalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{noticeDays:30}),before=enterprisePeriodUnchanged(f);
+ for(const role of ['anon','authenticated'])denied(`set role ${role};select read_enterprise_existing_legal_window(${[f.id,f.client].map(lit).join(',')})`,/permission denied/);
+ // Trusted-service corruption fixtures roll back; this is not a GUC security
+ // defense. Prove the read refuses rather than copying invented client dates.
+ for(const mutation of ["contract_end_at=contract_end_at+interval '1 year'","auto_renew=false"])
+  denied(`begin;set role service_role;select set_config('private_sales.enterprise_renewal_writer',${lit(f.client)},true);
+   update clients set ${mutation} where id=${lit(f.client)};
+   select refresh_enterprise_existing_legal_window(${[f.id,f.client].map(lit).join(',')});commit;`,/enterprise_(legal_projection|renewal_preference)_drift/);
+ assert.equal(enterprisePeriodUnchanged(f),before);
+});
+
+// Isolated SQL composition: historical source/coverage dependencies are
+// explicitly AUTHORED test doubles in a transaction that always rolls back.
+// The actual legal function, client guard, native clock and row update execute;
+// these tests do NOT prove historical financial admission or actual cash.
+function enterpriseLegalComposition(f,{through,off=false,offPrevious=false,futureProjection=false,request=false,coveragePatch={}}={}){
+ const w=structuredClone(f.billing),originalEnd='2020-02-29T00:00:00.000Z';
+ Object.assign(w.client_initial,{contract_start_at:'2019-11-07T00:00:00.000000Z',contract_end_at:originalEnd});
+ w.applied_at='2019-12-01T00:00:00.000000Z';
+ w.funding_receipt.proof.payment_success_at='2019-12-01T00:00:00.000000Z';
+ const clock=Date.parse(sql('select clock_timestamp()'));let i=0;
+ while(Date.parse(anchoredMonthInstant(originalEnd,12*i))<=clock)i++;
+ const clockIndex=i;if(offPrevious)i--;
+ const start=i===0?w.client_initial.contract_start_at:anchoredMonthInstant(originalEnd,12*(i-1));
+ const end=anchoredMonthInstant(originalEnd,12*i),boundary=anchoredMonthInstant(originalEnd,12*(clockIndex-1));
+ const coverage={version:'enterprise_existing_paid_coverage_v1',agreement_id:f.id,client_id:f.client,
+  billing_source_digest:sql(`select md5((${lit(w)})::text)`),contiguous_ordinal:0,
+  funded_from:'2019-12-01T00:00:00.000000Z',funded_through:through==='equal'?boundary:through==='short'?start:new Date(Date.parse(boundary)+1).toISOString(),
+  observed_at:new Date(clock).toISOString(),provider_effect_authorized:false,paid_access_authorized:false,payroll_authorized:false};
+ Object.assign(coverage,coveragePatch);
+ const accepted=new Date(Date.parse(start)+1000).toISOString().replace('.000Z','.000000Z');
+ const r=off?{version:'enterprise_existing_renewal_change_v1',operation_id:crypto.randomUUID(),source:w,source_digest:coverage.billing_source_digest,
+  requested_auto_renew:false,accepted_at:accepted,effective_at:end,notice_cutoff_at:new Date(Date.parse(end)-30*86400000).toISOString(),term_index:i,
+  status:'waiting',generation:0,lease_until:null,sent_at:null,observation:null,completed_at:null}:null;
+ const definitions=[['read_enterprise_existing_billing(uuid)',w],['read_enterprise_existing_paid_coverage(uuid,uuid)',coverage]].map(([sig,value])=>
+  sql(`select pg_get_functiondef('public.${sig}'::regprocedure)`).replace(/AS \$function\$[\s\S]*\$function\$;?/,
+   ()=>`AS $function$ begin return ${lit(value)}; end $function$;`));
+ const projection=futureProjection?{start:anchoredMonthInstant(originalEnd,12*i),end:anchoredMonthInstant(originalEnd,12*(i+1))}:
+  off?{start,end}:{start:w.client_initial.contract_start_at,end:originalEnd};
+ const setup=`begin;${definitions.join('\n')}set role service_role;do $setup$ begin
+  perform set_config('private_sales.enterprise_renewal_writer',${lit(f.client)},true);
+  update clients set auto_renew=${!off},enterprise_renewal_change=${lit(r)},contract_start_at=${lit(projection.start)},contract_end_at=${lit(projection.end)} where id=${lit(f.client)};
+  perform set_config('private_sales.enterprise_renewal_writer','',true);end $setup$;`;
+ const action=request?`select change_enterprise_existing_renewal(${[f.id,f.client,w,'request',false].map(lit).join(',')});`:
+  `select refresh_enterprise_existing_legal_window(${[f.id,f.client].map(lit).join(',')});`;
+ return{query:setup+action+(request?`select read_enterprise_existing_legal_window(${[f.id,f.client].map(lit).join(',')});`:'')+
+  `select to_jsonb(c) from clients c where id=${lit(f.client)};rollback;`,i,start,end,boundary};
+}
+test('ENTERPRISE LEGAL isolated SQL composition requires funded_through strictly after the native-clock anniversary',enterpriseLegalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{noticeDays:30}),before=enterprisePeriodUnchanged(f);
+ for(const through of ['equal','after']){
+  const x=enterpriseLegalComposition(f,{through}),[out,c]=sql(x.query).split('\n').map(JSON.parse);
+  assert.equal(out.term_index,through==='equal'?x.i-1:x.i);assert.equal(out.status,'refreshed');
+  assert.equal(Date.parse(c.contract_end_at),through==='equal'?Date.parse(x.boundary):Date.parse(x.end));
+  assert.equal(out.initial_term_start,'2019-11-07T00:00:00.000000Z');
+  assert.equal(c.auto_renew,true);assert.equal(c.cancel_at_term_end,false);assert.equal(c.billing_status,'active');
+  const expected=enterpriseClient(f),actual=structuredClone(c);
+  for(const k of ['contract_start_at','contract_end_at','updated_at']){delete expected[k];delete actual[k];}
+  assert.deepEqual(actual,expected);
+ }
+ assert.equal(enterprisePeriodUnchanged(f),before); // Both dependency rewrites rolled back.
+});
+test('ENTERPRISE LEGAL isolated later-year OFF preserves its accepted index; paid overlap cannot create renewal',enterpriseLegalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{noticeDays:30}),before=enterprisePeriodUnchanged(f);
+ const x=enterpriseLegalComposition(f,{off:true}),[out,c]=sql(x.query).split('\n').map(JSON.parse);
+ assert.equal(out.term_index,x.i);assert.equal(out.auto_renew,false);assert.equal(out.status,'unchanged');
+ assert.equal(Date.parse(out.term_end_at),Date.parse(x.end));assert.equal(Date.parse(c.contract_end_at),Date.parse(x.end));
+ assert.equal(out.initial_term_start,'2019-11-07T00:00:00.000000Z');assert.equal(c.enterprise_renewal_change.term_index,x.i);
+ assert.equal(enterprisePeriodUnchanged(f),before);
+ const stopped=enterpriseLegalComposition(f,{off:true,offPrevious:true}),[stop,stoppedClient]=sql(stopped.query).split('\n').map(JSON.parse);
+ assert.equal(stop.term_index,stopped.i);assert.equal(stop.auto_renew,false);assert.equal(stop.status,'unchanged');
+ assert.ok(Date.parse(stop.funded_through)>Date.parse(stop.term_end_at));assert.ok(Date.parse(stop.observed_at)>=Date.parse(stop.term_end_at));
+ assert.equal(Date.parse(stoppedClient.contract_end_at),Date.parse(stopped.end));assert.equal(enterprisePeriodUnchanged(f),before);
+ const unsupported=enterpriseLegalComposition(f,{off:true,through:'short'});
+ denied(unsupported.query,/enterprise_legal_prior_window_denied/);assert.equal(enterprisePeriodUnchanged(f),before);
+ const future=enterpriseLegalComposition(f,{futureProjection:true});
+ denied(future.query,/enterprise_legal_projection_drift/);assert.equal(enterprisePeriodUnchanged(f),before);
+});
+test('ENTERPRISE LEGAL isolated same request RPC binds new consent/audit to proved later term without rewriting dates',enterpriseLegalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{noticeDays:1}),before=enterprisePeriodUnchanged(f),x=enterpriseLegalComposition(f,{request:true});
+ const [ack,window,c]=sql(x.query).split('\n').map(JSON.parse);
+ if(Date.now()<Date.parse(x.end)-86400000){
+  assert.equal(ack.status,'waiting');assert.equal(ack.operation.term_index,x.i);
+  assert.equal(ack.operation.requested_auto_renew,false);assert.equal(Date.parse(ack.operation.effective_at),Date.parse(x.end));
+  assert.equal(window.term_index,x.i);assert.equal(window.auto_renew,false);assert.equal(c.auto_renew,false);
+  assert.equal(c.enterprise_renewal_change.operation_id,ack.operation.operation_id);
+ }else{assert.equal(ack.status,'held');assert.equal(c.auto_renew,true);}
+ // Saving preference never doubles as a legal date update. The independent
+ // refresh may project this later; both remain rollback-only authored history.
+ assert.equal(Date.parse(c.contract_end_at),Date.parse('2020-02-29T00:00:00.000Z'));assert.equal(enterprisePeriodUnchanged(f),before);
+});
+test('ENTERPRISE LEGAL read holds the original root lock until native transaction ends',enterpriseLegalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{noticeDays:30}),tag='ELW'+crypto.randomUUID().replaceAll('-','');
+ const [h,w,o]=await Promise.all([
+  parallel(`begin;select 1 from clients where id=${lit(f.client)} for update;select pg_sleep(0.6);commit;`),
+  parallel(`set application_name=${lit(tag)};select pg_sleep(0.1);set role service_role;select read_enterprise_existing_legal_window(${[f.id,f.client].map(lit).join(',')});`),
+  parallel(`select pg_sleep(0.3);select count(*) from pg_stat_activity where application_name=${lit(tag)} and wait_event_type='Lock';`)]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.code,0,o.err);assert.equal(o.out.trim(),'1');
+});
+test('ENTERPRISE LEGAL isolated wrong coverage identity, clock, first cash or authority is held without projection',enterpriseLegalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{noticeDays:30}),before=enterprisePeriodUnchanged(f);
+ for(const coveragePatch of [{agreement_id:crypto.randomUUID()},{billing_source_digest:'0'.repeat(32)},
+  {version:'unknown'},{paid_access_authorized:true},{funded_from:'2018-01-01T00:00:00.000Z'},
+  {funded_through:null},{observed_at:null},{observed_at:'2099-01-01T00:00:00.000Z'}]){
+  const x=enterpriseLegalComposition(f,{coveragePatch});denied(x.query,/enterprise_legal_(source|coverage)_denied/);
+  assert.equal(enterprisePeriodUnchanged(f),before);
+ }
 });
 
 // Actual original-schema native scanner guard, never hosted/provider effects.
