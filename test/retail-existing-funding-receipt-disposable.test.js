@@ -4,6 +4,10 @@ const {test,before}=require('node:test'),assert=require('node:assert/strict'),fs
 const {buildRetailPackageSnapshot}=require('../src/services/membershipPackageCompatibility');
 const {OFFER_VERSION,STRIPE_RECURRING_OFFER_VERSION,anchoredMonthInstant}=require('../src/services/membershipOffers');
 const enabled=process.env.RETAIL_FUNDING_RECEIPT_DISPOSABLE==='true',opts={skip:!enabled};
+const enterpriseFenceEnabled=enabled&&process.env.ENTERPRISE_LEGACY_FENCE_DISPOSABLE==='true';
+const enterpriseFenceOpts={skip:!enterpriseFenceEnabled};
+const enterpriseFenceMigration=path.resolve(__dirname,'../supabase/migrations/20261016032407_enterprise_existing_legacy_contract_fence.sql');
+const legacyFunctionCatalog=()=>JSON.parse(sql("select jsonb_agg(jsonb_build_object('name',proname,'metadata',to_jsonb(p)-'prosrc','body',md5(prosrc)) order by proname) from pg_proc p where pronamespace='public'::regnamespace and proname in('legacy_contract_projection','apply_legacy_contract_action','zz_retail_legacy_cohort_gate','legacy_contract_gate_pin','legacy_contract_cohort')"));
 const migration=path.resolve(__dirname,'../supabase/migrations/20261013231615_retail_existing_initial_funding_receipt.sql');
 const linkedMemberMigrationPath=path.resolve(__dirname,'../supabase/migrations/20261014045836_retail_existing_linked_buyer_member.sql');
 const replacementBillingMigrationPath=path.resolve(__dirname,'../supabase/migrations/20261014130713_retail_existing_replacement_billing_repair.sql');
@@ -126,6 +130,28 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
  // could hide migration DML or changes to an accepted historical agreement.
  legacyBefore=sql(`select (${lit(JSON.parse(legacyBefore))}||jsonb_build_object('retail_admin_billing_receipt',null))::text;`);
  historicalBefore=sql(`select (${lit(JSON.parse(historicalBefore))}||jsonb_build_object('retail_admin_billing_receipt',null))::text;`);
+ if(enterpriseFenceEnabled){
+  const original=legacyFunctionCatalog(),priorPermissions=acl(),text=fs.readFileSync(enterpriseFenceMigration,'utf8');
+  const state=()=>sql("select md5(jsonb_build_object('clients',(select jsonb_agg(to_jsonb(x) order by id) from clients x),'agreements',(select jsonb_agg(to_jsonb(x) order by id) from membership_agreements x))::text)");
+  const beforeState=state(),triggers=sql("select jsonb_agg(to_jsonb(t) order by tgname) from pg_trigger t where tgrelid='membership_agreements'::regclass");
+  for(const name of ['legacy_contract_cohort(public.clients)','zz_retail_legacy_cohort_gate()','legacy_contract_gate_pin()',
+   'legacy_contract_projection(public.clients)','apply_legacy_contract_action(uuid,jsonb,text)']){
+   const def=sql(`select pg_get_functiondef('public.${name}'::regprocedure)`);
+   denied('begin;'+def.replace(/AS \$function\$/,'AS $function$\n -- synthetic source drift\n')+';'+text,/enterprise_legacy_fence_prerequisite_drift/);
+   assert.deepEqual(legacyFunctionCatalog(),original);
+  }
+  denied('begin;grant execute on function public.legacy_contract_cohort(public.clients) to anon;'+text,/enterprise_legacy_fence_prerequisite_drift/);
+  denied('begin;alter table membership_agreements disable trigger zz_retail_legacy_cohort_gate;'+text,/legacy_contract_gate_unavailable/);
+  assert.deepEqual(legacyFunctionCatalog(),original);assert.equal(acl(),priorPermissions);
+  sql(text);const changed=legacyFunctionCatalog();assert.equal(changed.length,5);
+  for(const old of original){const next=changed.find(x=>x.name===old.name);assert.deepEqual(next.metadata,old.metadata);
+   if(['zz_retail_legacy_cohort_gate','legacy_contract_cohort','legacy_contract_gate_pin'].includes(old.name))assert.notEqual(next.body,old.body);
+   else assert.equal(next.body,old.body);
+  }
+  assert.equal(state(),beforeState);assert.equal(acl(),priorPermissions);
+  assert.equal(sql("select jsonb_agg(to_jsonb(t) order by tgname) from pg_trigger t where tgrelid='membership_agreements'::regclass"),triggers);
+  sql('set role service_role;select legacy_contract_gate_pin()');
+ }
 });
 function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false,adminSource='admin',linkedSource='sales_assisted',buyerEmail='buyer@example.invalid',options={}){
  const id=crypto.randomUUID(),client=crypto.randomUUID(),intent=crypto.randomUUID(),key='SYNTHETIC_CLAIM_'+crypto.randomUUID(),suffix=id.replaceAll('-','');
@@ -2594,6 +2620,116 @@ function legacyAgreement(f,current=true,snapshot={},receipt=null){const id=crypt
  membership_tier,billing_option,template_version,template_snapshot,draft_pdf_path,signer_token_hash,signer_token_expires_at)
  values(${lit(id)},${lit(f.client)},'draft',${current},'Synthetic Legacy','QA','legacy@example.invalid','basic','monthly','legacy',
  ${lit(snapshot)},'synthetic.pdf',${lit(crypto.createHash('sha256').update(id).digest('hex'))},clock_timestamp()+interval '1 day');`);return id;}
+const enterpriseMarkers=['enterprise_checkout_source','enterprise_checkout_pool_id','enterprise_checkout_prices','enterprise_funding_receipt','enterprise_billing_receipt'];
+function markedLegacyFixture(field,current=false){
+ const f=legacyFixture(),agreement=legacyAgreement(f,current),value=field==='enterprise_checkout_pool_id'?crypto.randomUUID():{};
+ const original=sql(`select to_jsonb(a) from membership_agreements a where id=${lit(agreement)}`);
+ const command=`update membership_agreements set ${field}=${lit(value)} where id=${lit(agreement)};`;
+ const guards=sql("select jsonb_agg(to_jsonb(t) order by tgname) from pg_trigger t where tgrelid='membership_agreements'::regclass");
+ const normal=run('set role service_role;'+command);
+ if(normal.status!==0){
+  assert.match(normal.stderr,/enterprise_/);
+  // LOCAL SRE fault fixture for partial markers: production financial guards
+  // correctly reject them. Never alter/drop/weaken those guards. This one
+  // local transaction bypasses ordinary trigger firing to test denial signals.
+  // It is NOT a valid paid agreement or a supported enrollment writer.
+  const injected=run('begin;set local session_replication_role=replica;'+command+'commit;');
+  if(injected.status!==0){
+   assert.ok(['enterprise_funding_receipt','enterprise_billing_receipt'].includes(field));
+   assert.match(injected.stderr,new RegExp(`violates check constraint "enterprise_existing_${field==='enterprise_funding_receipt'?'funding':'billing'}_receipt_check"`));
+   assert.equal(sql(`select to_jsonb(a) from membership_agreements a where id=${lit(agreement)}`),original);
+   assert.equal(sql("select jsonb_agg(to_jsonb(t) order by tgname) from pg_trigger t where tgrelid='membership_agreements'::regclass"),guards);
+   return{...f,agreement,value,nativeConstraintRejected:true};
+  }
+ }
+ assert.equal(sql("select jsonb_agg(to_jsonb(t) order by tgname) from pg_trigger t where tgrelid='membership_agreements'::regclass"),guards);
+ return{...f,agreement,value};
+}
+for(const field of enterpriseMarkers)for(const current of [false,true])test(`ENTERPRISE LEGACY ${field} alone current=${current}: denial signal or stronger native CHECK`,enterpriseFenceOpts,()=>{
+ const f=markedLegacyFixture(field,current),before=legacyProjection(f),a=sql(`select to_jsonb(a) from membership_agreements a where id=${lit(f.agreement)}`);
+ if(f.nativeConstraintRejected){
+  // A receipt alone cannot exist without its valid original native source.
+  // Do NOT remove a CHECK merely to fabricate impossible financial state.
+  assert.equal(JSON.parse(a)[field],null);assert.deepEqual(legacyProjection(f),before);return;
+ }
+ assert.equal(sql(`set role service_role;select legacy_contract_cohort(c) from clients c where id=${lit(f.client)}`),'held');
+ for(const action of ['renew','deactivate','check_cancel','record_cancel'])assert.equal(legacyAction(f,action).status,'held');
+ assert.deepEqual(legacyProjection(f),before);assert.equal(sql(`select to_jsonb(a) from membership_agreements a where id=${lit(f.agreement)}`),a);
+});
+test('ENTERPRISE LEGACY unmarked Enterprise remains legacy; moved marker follows new owner',enterpriseFenceOpts,()=>{
+ const old=markedLegacyFixture('enterprise_checkout_source'),next=legacyFixture();
+ sql(`update clients set plan_tier='enterprise' where id=${lit(next.client)};`);
+ assert.equal(sql(`set role service_role;select legacy_contract_cohort(c) from clients c where id=${lit(next.client)}`),'legacy');
+ sql(`begin;set local session_replication_role=replica;update membership_agreements set client_id=${lit(next.client)} where id=${lit(old.agreement)};commit;`);
+ assert.equal(sql(`set role service_role;select legacy_contract_cohort(c) from clients c where id=${lit(old.client)}`),'legacy');
+ assert.equal(legacyAction(next).status,'held');
+});
+test('ENTERPRISE LEGACY malformed retail receipt cannot bypass CHECK, exact migration repeat refuses without repair',enterpriseFenceOpts,()=>{
+ const f=legacyFixture(),a=legacyAgreement(f,false);
+ const prior=sql(`select to_jsonb(a) from membership_agreements a where id=${lit(a)}`);
+ denied(`begin;set local session_replication_role=replica;update membership_agreements set retail_funding_receipt='{}' where id=${lit(a)};commit;`,/violates check constraint "retail_existing_funding_receipt_check"/);
+ assert.equal(sql(`select to_jsonb(a) from membership_agreements a where id=${lit(a)}`),prior);
+ const before=legacyFunctionCatalog();denied(fs.readFileSync(enterpriseFenceMigration,'utf8'),/enterprise_legacy_fence_prerequisite_drift/);
+ assert.deepEqual(legacyFunctionCatalog(),before);
+});
+test('ENTERPRISE LEGACY actual action waits for root-held partial marker and sees held after commit',enterpriseFenceOpts,async()=>{
+ const f=legacyFixture(),a=legacyAgreement(f,false),before=legacyProjection(f),expected=legacyExpected(f);
+ const tag='ELC'+crypto.randomUUID().replaceAll('-','');
+ // LOCAL SRE fixture only: the native financial guards reject this partial
+ // source. Keep CHECKs and guard DDL intact; exercise read-committed cohort
+ // visibility under the real client lock, not a shadow financial enrollment.
+ const [h,w,o]=await Promise.all([
+  parallel(`begin;select 1 from clients where id=${lit(f.client)} for update;
+   set local session_replication_role=replica;
+   update membership_agreements set enterprise_checkout_source='{}' where id=${lit(a)};
+   select pg_sleep(0.6);commit;`),
+  parallel(`set application_name=${lit(tag)};select pg_sleep(0.1);set role service_role;${legacyActionCall(f,'renew',expected)}`),
+  parallel(`select pg_sleep(0.3);select count(*) from pg_stat_activity where application_name=${lit(tag)} and wait_event_type='Lock';`)]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.code,0,o.err);
+ assert.equal(o.out.trim(),'1');assert.equal(JSON.parse(w.out.trim()).status,'held');
+ assert.deepEqual(legacyProjection(f),before);
+});
+function enterpriseGateProbe(field,client){
+ const table='enterprise_legacy_probe_'+crypto.randomUUID().replaceAll('-',''),value=field==='enterprise_checkout_pool_id'?lit(crypto.randomUUID()):"'{}'::jsonb";
+ sql(`create table ${table}(id uuid primary key default gen_random_uuid(),client_id uuid,is_current boolean default false,
+  retail_funding_receipt jsonb,enterprise_checkout_source jsonb,enterprise_checkout_pool_id uuid,enterprise_checkout_prices jsonb,
+  enterprise_funding_receipt jsonb,enterprise_billing_receipt jsonb);alter table ${table} enable row level security;
+  grant select,insert,update,delete on ${table} to service_role;
+  create trigger zz_retail_legacy_cohort_gate before insert or update or delete on ${table}
+   for each row execute function zz_retail_legacy_cohort_gate();
+  insert into ${table}(client_id,${field}) values(${lit(client)},${value});`);
+ return{table,value};
+}
+for(const field of enterpriseMarkers)for(const operation of ['insert','update','delete'])test(`ENTERPRISE LEGACY gate noncurrent ${field} ${operation} waits for actual root lock`,enterpriseFenceOpts,async()=>{
+ const f=legacyFixture(),{table,value}=enterpriseGateProbe(field,f.client),tag='EL'+crypto.randomUUID().replaceAll('-','');
+ const command=operation==='insert'?`insert into ${table}(client_id,${field}) values(${lit(f.client)},${value})`:
+  operation==='delete'?`delete from ${table}`:`update ${table} set ${field}=null`;
+ const [h,w,o]=await Promise.all([
+  parallel(`begin;select 1 from clients where id=${lit(f.client)} for update;select pg_sleep(0.6);commit;`),
+  parallel(`set application_name=${lit(tag)};select pg_sleep(0.1);set role service_role;${command};`),
+  parallel(`select pg_sleep(0.3);select count(*) from pg_stat_activity where application_name=${lit(tag)} and wait_event_type='Lock';`)]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.code,0,o.err);assert.equal(o.out.trim(),'1');
+});
+for(const side of ['old','new'])test(`ENTERPRISE LEGACY marked client move locks ${side} root`,enterpriseFenceOpts,async()=>{
+ const old=legacyFixture(),next=legacyFixture(),{table}=enterpriseGateProbe('enterprise_checkout_source',old.client),tag='ELM'+crypto.randomUUID().replaceAll('-','');
+ const locked=side==='old'?old.client:next.client;
+ const [h,w,o]=await Promise.all([
+  parallel(`begin;select 1 from clients where id=${lit(locked)} for update;select pg_sleep(0.6);commit;`),
+  parallel(`set application_name=${lit(tag)};select pg_sleep(0.1);set role service_role;update ${table} set client_id=${lit(next.client)};`),
+  parallel(`select pg_sleep(0.3);select count(*) from pg_stat_activity where application_name=${lit(tag)} and wait_event_type='Lock';`)]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.code,0,o.err);assert.equal(o.out.trim(),'1');
+});
+test('ENTERPRISE LEGACY new noncurrent denial signal retains orphan and RLS-hidden-root behavior',enterpriseFenceOpts,()=>{
+ const f=legacyFixture(),{table}=enterpriseGateProbe('enterprise_checkout_source',f.client);
+ const role='enterprise_hidden_'+crypto.randomUUID().replaceAll('-','');
+ denied(`begin;create role ${role} nologin;grant usage on schema public,auth to ${role};grant select on client_members to ${role};
+  grant select,update on clients to ${role};grant select,delete on ${table} to ${role};
+  create policy synthetic_probe_visibility on ${table} for all to ${role} using(true) with check(true);
+  set local role ${role};delete from ${table};commit;`,/legacy_contract_gate_root_unavailable/);
+ assert.equal(sql(`select count(*) from ${table}`),'1');
+ sql(`delete from clients where id=${lit(f.client)};set role service_role;delete from ${table};`);
+ assert.equal(sql(`select count(*) from ${table}`),'0');
+});
 test('LEGACY ATOMIC actual native renew and nonrenewal retain original action fields and milliseconds',opts,()=>{
  const f=legacyFixture(),before=legacyProjection(f),r=legacyAction(f);assert.equal(r.status,'applied');
  assert.equal(Date.parse(r.client.contract_start_at),Date.parse(before.contract_end_at));
