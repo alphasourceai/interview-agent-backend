@@ -8,19 +8,21 @@ const {proveEnterprisePoolPayment}=require('../../src/services/enterprisePoolPay
 const paidFixture=require('./enterprise-pool-payment-fixture');
 const lit=v=>v==null?'null':typeof v==='object'?`'${JSON.stringify(v).replaceAll("'","''")}'::jsonb`:
  typeof v==='boolean'||typeof v==='number'?String(v):`'${String(v).replaceAll("'","''")}'`;
-module.exports=async function fixture(sql,{cadence='monthly',ordinal=1,initialPeriodSeconds=86400}={}){
+module.exports=async function fixture(sql,{cadence='monthly',ordinal=1,initialPeriodSeconds=86400,noticeDays=null,termDays=null,termStartDays=0}={}){
  const id=crypto.randomUUID(),client=crypto.randomUUID(),attempt=crypto.randomUUID(),suffix=id.replaceAll('-','');
  const customer='cus_PERIOD_'+suffix,token=crypto.createHash('sha256').update(id).digest('hex');
- const start=sql("select to_char(current_date,'YYYY-MM-DD')"),end=sql("select to_char(current_date+interval '1 year','YYYY-MM-DD')");
+ const start=sql(`select to_char(current_date+make_interval(days=>${Number.isSafeInteger(termStartDays)?termStartDays:0}),'YYYY-MM-DD')`),end=termDays===null?sql("select to_char(current_date+interval '1 year','YYYY-MM-DD')"):
+  sql(`select to_char(current_date+make_interval(days=>${Number.isSafeInteger(termDays)?termDays:0}),'YYYY-MM-DD')`);
  const values=prepareEnterprisePoolTerms({membership_tier:'enterprise',billing_model:'usage',billing_option:cadence,platform_fee:'999.99',
   per_role_fee:'0',included_interviews_per_role:'0',additional_interview_fee:'0',pool_quantity:30,usage_interview_fee_cents:2500,
   max_interview_minutes:'20',scored_question_count:'5',term_start_basis:'agreement_date',initial_term_start:start,initial_renewal_date:end});
+ if(noticeDays!==null)Object.assign(values,{notice_deadline_plain:String(noticeDays),notice_deadline_days:String(noticeDays)+' Days'});
  const unsigned={values,rendered_html:'SYNTHETIC ONLY'};
  sql(`set role service_role;insert into clients(id,name,email,stripe_customer_id) values(${lit(client)},'Synthetic Period','period@example.invalid',${lit(customer)});
   insert into membership_agreements(id,client_id,status,client_legal_name,primary_admin_name,admin_email,membership_tier,initial_term_start,
-   initial_renewal_date,billing_option,template_snapshot,signer_token_hash,signer_token_expires_at,agreement_expires_at,draft_pdf_path)
+   initial_renewal_date,billing_option,notice_deadline_days,template_snapshot,signer_token_hash,signer_token_expires_at,agreement_expires_at,draft_pdf_path)
   values(${lit(id)},${lit(client)},'draft','SYNTHETIC','SYNTHETIC OWNER','period@example.invalid','enterprise',${lit(start)},${lit(end)},
-   ${lit(cadence)},${lit(unsigned)},${lit(token)},clock_timestamp()+interval '1 day',clock_timestamp()+interval '1 day','synthetic/preview.pdf');
+   ${lit(cadence)},${lit(noticeDays??30)},${lit(unsigned)},${lit(token)},clock_timestamp()+interval '1 day',clock_timestamp()+interval '1 day','synthetic/preview.pdf');
   update membership_agreements set status='sent' where id=${lit(id)};`);
  const signed=sql(`set role service_role;select enterprise_v2_execution_clock(${lit(id)},${lit(token)})`),prefix=`enterprise-v2/${id}/attempts/${attempt}/`;
  const execution={version:'enterprise_execution_v2',attempt_id:attempt,signed_at:signed,signer_typed_name:'SYNTHETIC OWNER',signer_accepted:true,

@@ -5,7 +5,9 @@ const {buildRetailPackageSnapshot}=require('../src/services/membershipPackageCom
 const {OFFER_VERSION,STRIPE_RECURRING_OFFER_VERSION,anchoredMonthInstant}=require('../src/services/membershipOffers');
 const enabled=process.env.RETAIL_FUNDING_RECEIPT_DISPOSABLE==='true',opts={skip:!enabled};
 const enterpriseFenceEnabled=enabled&&process.env.ENTERPRISE_LEGACY_FENCE_DISPOSABLE==='true';
-const enterpriseStatusEnabled=enabled&&process.env.ENTERPRISE_STATUS_DISPOSABLE==='true';
+const enterpriseRenewalEnabled=enabled&&process.env.ENTERPRISE_RENEWAL_DISPOSABLE==='true';
+const enterpriseRenewalOpts={skip:!enterpriseRenewalEnabled};
+const enterpriseStatusEnabled=enabled&&(process.env.ENTERPRISE_STATUS_DISPOSABLE==='true'||enterpriseRenewalEnabled);
 const enterpriseStatusOpts={skip:!enterpriseStatusEnabled};
 const enterpriseCoverageEnabled=enabled&&(process.env.ENTERPRISE_PAID_COVERAGE_DISPOSABLE==='true'||enterpriseStatusEnabled);
 const enterpriseCoverageOpts={skip:!enterpriseCoverageEnabled};
@@ -189,6 +191,17 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
    'grant execute on function public.read_enterprise_existing_billing(uuid) to anon','alter table clients disable row level security'])
    denied('begin;'+change+';'+candidate,/enterprise_status_.*drift/);
   sql(candidate);
+ }
+ if(enterpriseRenewalEnabled){
+  const candidate=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261016051303_enterprise_existing_renewal_control.sql'),'utf8');
+  const def=sql("select pg_get_functiondef('public.read_enterprise_existing_billing(uuid)'::regprocedure)");
+  for(const change of [def.replace(/AS \$function\$/,'AS $function$\n -- synthetic renewal drift\n'),
+   'grant execute on function public.read_enterprise_existing_billing(uuid) to anon','alter table clients disable row level security'])
+   denied('begin;'+change+';'+candidate,/enterprise_renewal_.*drift/);
+  const before=sql("select md5(coalesce(jsonb_agg(to_jsonb(c) order by id)::text,'[]')) from clients c");
+  const permissions=acl();sql(candidate);
+  assert.equal(sql("select md5(coalesce(jsonb_agg(to_jsonb(c)-'enterprise_renewal_change' order by id)::text,'[]')) from clients c"),before);
+  assert.equal(acl(),permissions);
  }
 });
 function fixture(plan='basic',months=3,payment='prepaid',role=false,linked=true,replacement=false,adminSource='admin',linkedSource='sales_assisted',buyerEmail='buyer@example.invalid',options={}){
@@ -2887,6 +2900,124 @@ test('ENTERPRISE STATUS root client lock causally blocks native projection',ente
   parallel(`set application_name=${lit(tag)};select pg_sleep(0.1);set role service_role;${call}`),
   parallel(`select pg_sleep(0.3);select count(*) from pg_stat_activity where application_name=${lit(tag)} and wait_event_type='Lock';`)]);
  assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.code,0,o.err);assert.equal(o.out.trim(),'1');
+});
+
+const enterpriseRenewalCall=(f,action='request',renew=false,w=f.billing)=>
+ `select change_enterprise_existing_renewal(${[f.id,f.client,w,action,action==='read'?null:renew].map(lit).join(',')});`;
+const enterpriseRenewal=(f,...args)=>JSON.parse(sql('set role service_role;'+enterpriseRenewalCall(f,...args)));
+const withoutRenewalFields=c=>{const x=structuredClone(c);for(const k of ['enterprise_renewal_change','auto_renew','updated_at'])delete x[k];return x;};
+for(const cadence of ['monthly','annual'])test(`ENTERPRISE RENEWAL ${cadence} accepts consent now, not early cancellation or access`,enterpriseRenewalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{cadence,noticeDays:30}),before=enterpriseClient(f),financial=JSON.parse(enterprisePeriodUnchanged(f));
+ assert.equal(enterpriseRenewal(f,'read').status,'none');
+ const out=enterpriseRenewal(f),after=enterpriseClient(f),r=out.operation;
+ assert.equal(out.status,'waiting');assert.equal(after.auto_renew,false);assert.equal(after.cancel_at_term_end,false);
+ assert.equal(r.requested_auto_renew,false);assert.equal(r.sent_at,null);assert.equal(r.status,'waiting');
+ assert.equal(Date.parse(r.effective_at),Date.parse(f.billing.client_initial.contract_end_at));
+ assert.equal(Date.parse(r.notice_cutoff_at),Date.parse(r.effective_at)-30*86400000);
+ assert.ok(Date.parse(r.accepted_at)<=Date.now());assert.ok(Date.parse(r.accepted_at)>=Date.parse(f.billing.applied_at));
+ assert.equal(out.provider_effect_authorized,false);assert.equal(out.paid_access_authorized,false);assert.equal(out.payroll_authorized,false);
+ assert.deepEqual(withoutRenewalFields(after),withoutRenewalFields(before));
+ const current=JSON.parse(enterprisePeriodUnchanged(f));delete current.client;delete financial.client;assert.deepEqual(current,financial);
+ assert.equal(sql(`select count(*) from billing_events where stripe_event_id=${lit('enterprise-renewal:'+r.operation_id+':accepted')}`),'1');
+ const repeat=enterpriseRenewal(f);assert.deepEqual(repeat.operation,r);assert.deepEqual(enterpriseClient(f),after);
+ const on=enterpriseRenewal(f,'request',true);assert.equal(on.operation.requested_auto_renew,true);
+ assert.notEqual(on.operation.operation_id,r.operation_id);assert.equal(enterpriseClient(f).auto_renew,true);
+ assert.equal(sql(`select count(*) from billing_events where stripe_event_id=${lit('enterprise-renewal:'+r.operation_id+':superseded')}`),'1');
+ assert.deepEqual(enterpriseRenewal(f,'request',true).operation,on.operation);
+});
+test('ENTERPRISE RENEWAL frozen notice is only OFF cutoff; ON before E remains allowed',enterpriseRenewalOpts,async()=>{
+ // Two civil days remains future UTC even when this private PG cluster's
+ // native current_date is the prior Mountain day. No mocked DB clock.
+ const f=await enterprisePeriodFixture(sql,{noticeDays:30,termDays:2}),before=enterpriseClient(f);
+ const off=enterpriseRenewal(f);assert.equal(off.status,'held');assert.equal(off.reason,'request_deadline_passed');
+ assert.equal(off.operation,null);assert.deepEqual(enterpriseClient(f),before);
+ const on=enterpriseRenewal(f,'request',true);assert.equal(on.status,'waiting');assert.equal(on.operation.requested_auto_renew,true);
+ assert.ok(Date.parse(on.operation.accepted_at)>Date.parse(on.operation.notice_cutoff_at));
+ const prior=enterpriseClient(f),late=enterpriseRenewal(f);assert.equal(late.status,'held');assert.deepEqual(late.operation,on.operation);
+ assert.deepEqual(enterpriseClient(f),prior);assert.equal(enterpriseClient(f).auto_renew,true);
+});
+test('ENTERPRISE RENEWAL missing frozen notice, wrong scope/source and browser access are held',enterpriseRenewalOpts,async()=>{
+ const missing=await enterprisePeriodFixture(sql),before=enterpriseClient(missing);
+ denied('set role service_role;'+enterpriseRenewalCall(missing),/enterprise_renewal_notice_denied/);
+ assert.deepEqual(enterpriseClient(missing),before);
+ const f=await enterprisePeriodFixture(sql,{noticeDays:21}),original=enterpriseClient(f);
+ for(const role of ['anon','authenticated'])denied('set role '+role+';'+enterpriseRenewalCall(f),/permission denied/);
+ denied('set role service_role;'+enterpriseRenewalCall({...f,client:crypto.randomUUID()}),/enterprise_renewal_client_denied/);
+ denied('set role service_role;'+enterpriseRenewalCall(f,'request',false,{...f.billing,applied_at:'2020-01-01Z'}),/enterprise_renewal_source_denied/);
+ denied('set role service_role;'+enterpriseRenewalCall(f,'claim'),/enterprise_renewal_action_denied/);
+ assert.deepEqual(enterpriseClient(f),original);
+});
+test('ENTERPRISE RENEWAL no new ON or OFF consent at/after the accepted legal end',enterpriseRenewalOpts,async()=>{
+ // Original dated synthetic agreement is already expired; payment fixture
+ // remains authored cash/native rows, not a real provider payment.
+ const f=await enterprisePeriodFixture(sql,{noticeDays:7,termStartDays:-10,termDays:-1}),before=enterpriseClient(f);
+ for(const renew of [false,true]){
+  const out=enterpriseRenewal(f,'request',renew);assert.equal(out.status,'held');assert.equal(out.operation,null);
+  assert.equal(out.reason,'request_deadline_passed');assert.deepEqual(enterpriseClient(f),before);
+ }
+});
+test('ENTERPRISE RENEWAL closed consent journal rejects invented authority, late OFF and future generations',enterpriseRenewalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{noticeDays:30}),r=enterpriseRenewal(f).operation;
+ // Digest owns the original native jsonb representation (including numeric
+ // scale), not a JS parse/stringify reconstruction of that receipt.
+ const source=`(select enterprise_billing_receipt from membership_agreements where id=${lit(f.id)})`;
+ assert.equal(sql(`select enterprise_existing_renewal_operation_valid(${lit(r)},${source},30)`),'t');
+ for(const patch of [{source_digest:'0'.repeat(32)},{source:{}},{requested_auto_renew:null},{term_index:1},
+  {generation:1},{status:'applied'},{sent_at:r.accepted_at},{provider_effect_authorized:true},
+  {accepted_at:r.notice_cutoff_at},{accepted_at:'nonsense'},{effective_at:'2099-01-01Z'},{operation_id:'not-uuid'}])
+  assert.equal(sql(`select enterprise_existing_renewal_operation_valid(${lit({...r,...patch})},${source},30)`),'f');
+ // A timeless structural validator cannot authorize future acceptance; the
+ // locked request/read RPC independently checks native accepted_at <= clock.
+ const before=enterpriseClient(f);
+ denied(`begin;set role service_role;select set_config('private_sales.enterprise_renewal_writer',${lit(f.client)},true);
+  update clients set enterprise_renewal_change=jsonb_set(enterprise_renewal_change,'{accepted_at}',to_jsonb(${lit(r.notice_cutoff_at)}::text)) where id=${lit(f.client)};
+  ${enterpriseRenewalCall(f,'read')}commit;`,/enterprise_renewal_operation_drift/);
+ assert.deepEqual(enterpriseClient(f),before);
+});
+test('ENTERPRISE RENEWAL guard blocks bypass, permits actual status CAS and keeps paid coverage',enterpriseRenewalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{noticeDays:30}),before=enterpriseClient(f);
+ for(const mutation of ["auto_renew=false","cancel_at_term_end=true","contract_end_at=contract_end_at+interval '1 year'",
+  "contract_start_at=contract_start_at-interval '1 day'","cancel_effective_at=contract_end_at","enterprise_renewal_change='{}'"])
+  denied(`set role service_role;update clients set ${mutation} where id=${lit(f.client)}`,/enterprise_renewal_writer_required/);
+ denied(`begin;set role service_role;select set_config('private_sales.retail_renewal_writer',${lit(f.client)},true);
+  update clients set auto_renew=false where id=${lit(f.client)};commit;`,/enterprise_renewal_writer_required/);
+ assert.deepEqual(enterpriseClient(f),before);
+ enterpriseRenewal(f);const consent=enterpriseClient(f);const p=enterpriseStatusProof(f);p.cancel_at_term_end=true;
+ assert.equal(JSON.parse(sql('set role service_role;'+enterpriseStatusCall(f,p))).status,'observed');
+ const after=enterpriseClient(f);assert.equal(after.auto_renew,false);assert.deepEqual(after.enterprise_renewal_change,consent.enterprise_renewal_change);
+ assert.equal(enterpriseCoverage(f,true).billing_status,'active');
+ assert.equal(enterpriseClient(f).contract_end_at,consent.contract_end_at);
+});
+test('ENTERPRISE RENEWAL audit failure rolls back accepted preference and journal together',enterpriseRenewalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{noticeDays:30}),before=enterpriseClient(f);
+ try{sql('revoke insert on billing_events from service_role');
+  denied('set role service_role;'+enterpriseRenewalCall(f),/permission denied/);
+ }finally{sql('grant insert on billing_events to service_role');}
+ assert.deepEqual(enterpriseClient(f),before);
+ assert.equal(sql(`select count(*) from billing_events where client_id=${lit(f.client)} and type='enterprise.renewal.accepted'`),'0');
+});
+test('ENTERPRISE RENEWAL notice math is UTC; foreign source rendering cannot bypass the existing seal',enterpriseRenewalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{noticeDays:300}),out=enterpriseRenewal(f),r=out.operation;
+ assert.equal(Date.parse(r.notice_cutoff_at),Date.parse(f.billing.client_initial.contract_end_at)-300*86400000);
+ for(const zone of ['UTC','America/New_York','America/Denver','Asia/Kolkata']){
+  assert.equal(sql(`set timezone=${lit(zone)};select enterprise_existing_renewal_operation_valid(${lit(r)},
+   (select enterprise_billing_receipt from membership_agreements where id=${lit(f.id)}),300)`),'t');
+ }
+ // Existing paid-source material compares the execution-seal jsonb including
+ // its rendered timestamptz strings. A different session timezone is held by
+ // that earlier source gate, not silently normalized into another source.
+ const before=enterpriseClient(f);
+ denied(`set timezone='Asia/Kolkata';set role service_role;${enterpriseRenewalCall(f,'read')}`,/enterprise_billing_binding_denied/);
+ assert.deepEqual(enterpriseClient(f),before);
+});
+test('ENTERPRISE RENEWAL native root lock prevents stale simultaneous preference acceptance',enterpriseRenewalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{noticeDays:30}),tag='ERN'+crypto.randomUUID().replaceAll('-','');
+ const [h,w,o]=await Promise.all([
+  parallel(`begin;select 1 from clients where id=${lit(f.client)} for update;select pg_sleep(0.6);commit;`),
+  parallel(`set application_name=${lit(tag)};select pg_sleep(0.1);set role service_role;${enterpriseRenewalCall(f)}`),
+  parallel(`select pg_sleep(0.3);select count(*) from pg_stat_activity where application_name=${lit(tag)} and wait_event_type='Lock';`)]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.code,0,o.err);assert.equal(o.out.trim(),'1');
+ const first=JSON.parse(w.out.trim());assert.deepEqual(enterpriseRenewal(f).operation,first.operation);
 });
 
 // Actual original-schema native scanner guard, never hosted/provider effects.
