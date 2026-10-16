@@ -3038,6 +3038,20 @@ test('ENTERPRISE RENEWAL native root lock prevents stale simultaneous preference
 });
 
 const enterpriseLegal=(f,refresh=false)=>JSON.parse(sql(`set role service_role;select ${refresh?'refresh':'read'}_enterprise_existing_legal_window(${[f.id,f.client].map(lit).join(',')})`));
+test('ENTERPRISE LEGAL actual native window is accepted by the JS reader without projection or provider effects',enterpriseLegalOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql,{noticeDays:30}),before=enterprisePeriodUnchanged(f);
+ const agreement=JSON.parse(sql(`select to_jsonb(a) from membership_agreements a where id=${lit(f.id)}`));
+ const billingReceipt=JSON.parse(sql(`set role service_role;select read_enterprise_existing_billing(${lit(f.id)})`));
+ const calls=[],db={async rpc(name,p){calls.push(name);
+  if(name==='read_enterprise_existing_legal_window')return{data:JSON.parse(sql(`set role service_role;select read_enterprise_existing_legal_window(${[p.p_agreement,p.p_client].map(lit).join(',')})`)),error:null};
+  assert.equal(name,'read_enterprise_existing_billing');return{data:JSON.parse(sql(`set role service_role;select read_enterprise_existing_billing(${lit(p.p_agreement)})`)),error:null};
+ }};
+ const out=await require('../src/services/existingEnterpriseLegalWindow').readExistingEnterpriseLegalWindow({db,agreement,billingReceipt});
+ assert.equal(out.term_index,0);assert.equal(out.initial_term_start,billingReceipt.client_initial.contract_start_at);
+ assert.equal(out.term_end_at,billingReceipt.client_initial.contract_end_at);assert.equal(out.paid_access_authorized,false);
+ assert.deepEqual(calls,['read_enterprise_existing_legal_window','read_enterprise_existing_billing']);
+ assert.equal(enterprisePeriodUnchanged(f),before);
+});
 test('ENTERPRISE LEGAL native catalog retains service-only invoker ACLs and exact old function metadata',enterpriseLegalOpts,()=>{
  const rows=JSON.parse(sql(`select jsonb_agg(jsonb_build_object('name',proname,'body',md5(prosrc),'definer',prosecdef,'config',proconfig,
   'anon',has_function_privilege('anon',oid,'EXECUTE'),'authenticated',has_function_privilege('authenticated',oid,'EXECUTE'),

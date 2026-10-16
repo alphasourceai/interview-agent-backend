@@ -5,6 +5,7 @@
 // A marked source is never handed to the legacy invoice writers.
 const { resolveBillingOwnerForScope } = require('./clientBillingScope');
 const { readVerifiedEnterpriseBillingReceipt } = require('./existingEnterpriseBillingReceipt');
+const { readExistingEnterpriseLegalWindow } = require('./existingEnterpriseLegalWindow');
 const MARKERS = ['enterprise_checkout_source', 'enterprise_checkout_pool_id', 'enterprise_checkout_prices',
   'enterprise_funding_receipt', 'enterprise_billing_receipt'];
 function hold(reason = 'enterprise_usage_terms_unavailable') {
@@ -17,7 +18,7 @@ async function loadAcceptedEnterpriseUsageTerms({ db, clientId } = {}) {
     const owner = scope.billingClient;
     // Exact count proves the returned rows are the complete owner census;
     // truncated responses hold instead of hiding a pending/noncurrent marker.
-    const select = ['id','client_id','is_current','status','membership_tier','signed_at','checkout_status','checkout_paid_at',...MARKERS].join(',');
+    const select = ['id','client_id','is_current','status','membership_tier','signed_at','checkout_status','checkout_paid_at','notice_deadline_days',...MARKERS].join(',');
     const scan = await db.from('membership_agreements').select(select, { count: 'exact' }).eq('client_id', scope.billingClientId);
     if (scan.error || !Array.isArray(scan.data) || !Number.isSafeInteger(scan.count)
       || scan.count !== scan.data.length || scan.count < 0) hold();
@@ -38,7 +39,10 @@ async function loadAcceptedEnterpriseUsageTerms({ db, clientId } = {}) {
       || a.enterprise_checkout_pool_id !== receipt.funding_receipt.proof.pool_id
       || receipt.funding_receipt.proof.currency !== 'usd') hold();
     const unit = receipt.plan_initial.usage_interview_fee_cents;
-    const start = Date.parse(receipt.client_initial.contract_start_at), end = Date.parse(receipt.client_initial.contract_end_at);
+    const window = await readExistingEnterpriseLegalWindow({ db, agreement: a, billingReceipt: receipt });
+    // Continuous service from ORIGINAL S through the proved current E: neither
+    // renewal nor a lagging client projection resets pools or drops old debt.
+    const start = Date.parse(window.initial_term_start), end = Date.parse(window.term_end_at);
     if (!Number.isSafeInteger(unit) || unit <= 0 || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) hold();
     return Object.freeze({ billingClientId: scope.billingClientId, agreementId: a.id,
       unitPriceCents: unit, start, end, poolId: receipt.funding_receipt.proof.pool_id });

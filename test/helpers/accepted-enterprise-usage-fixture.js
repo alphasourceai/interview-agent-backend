@@ -8,6 +8,7 @@ const keys=require('../../src/services/enterpriseExistingFundingKeys');
 module.exports=async function fixture(options={}) {
   const f=fundingFixture(options),v=f.a.template_snapshot.values;
   Object.assign(v,{term_start_basis:'successful_payment',initial_term_start:'',initial_renewal_date:''});
+  Object.assign(v,{notice_deadline_plain:'30',notice_deadline_days:'30 Days'});f.a.notice_deadline_days=30;
   const {execution,...unsigned}=f.a.template_snapshot;
   f.seal.source_snapshot=structuredClone(unsigned);
   Object.assign(f.a.enterprise_checkout_source.material,{template_snapshot:structuredClone(f.a.template_snapshot),execution_seal:structuredClone(f.seal)});
@@ -32,11 +33,18 @@ module.exports=async function fixture(options={}) {
   const livePlan=structuredClone(plan);
   const db=createFakeSupabase({clients:[f.client],membership_agreements:[f.a],client_plan_settings:[livePlan],usage_billing_ledger:[],
     roles:[],interviews:[],client_interview_pools:[]});
-  db.rpc=async(name,p)=>{if(name!=='read_enterprise_existing_billing'||p.p_agreement!==f.a.id)throw Error('unexpected synthetic RPC');
+  const legal={version:'enterprise_existing_legal_window_v1',agreement_id:f.a.id,client_id:f.client.id,billing_source_digest:'a'.repeat(32),
+    term_index:0,initial_term_start:initial.contract_start_at,original_term_end:initial.contract_end_at,
+    term_start_at:initial.contract_start_at,term_end_at:initial.contract_end_at,notice_cutoff_at:'2027-09-01T13:00:00.000000Z',
+    auto_renew:true,accepted_operation_id:null,funded_from:'2026-10-01T13:00:00.000000Z',funded_through:'2026-11-01T00:00:00.000000Z',
+    observed_at:'2026-10-16T06:00:00.000000Z',provider_effect_authorized:false,paid_access_authorized:false,payroll_authorized:false};
+  db.rpc=async(name,p)=>{if(p.p_agreement!==f.a.id)throw Error('unexpected synthetic RPC');
+    if(name==='read_enterprise_existing_legal_window'&&p.p_client===f.client.id)return{data:structuredClone(legal),error:null};
+    if(name!=='read_enterprise_existing_billing')throw Error('unexpected synthetic RPC');
     return {data:structuredClone(f.a.enterprise_billing_receipt),error:null};};
   const role={id:'synthetic_role',client_id:f.client.id,title:'Synthetic Role'},entry={interview_id:'synthetic_iv',role_id:role.id,
     client_id:f.client.id,source:'usage',source_id:null,completed_at:'2026-10-02T12:00:00Z'};
   const allocation={billing_model:'usage',included_per_role:0,allowance_by_role:new Map([[role.id,0]]),
     usage_interview_fee_cents:9999,roles:[role],entries:[entry],entity_label_by_client:new Map()};
-  return{db,a:f.a,client:f.client,w,plan:livePlan,allocation,entry,role,nativeFixture:f};
+  return{db,a:f.a,client:f.client,w,legal,plan:livePlan,allocation,entry,role,nativeFixture:f};
 };
