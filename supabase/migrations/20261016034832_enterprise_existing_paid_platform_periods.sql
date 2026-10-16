@@ -37,6 +37,9 @@ begin
   or not exists(select 1 from pg_index where indexrelid=to_regclass('public.billing_invoices_stripe_invoice_id_uniq')
    and indrelid='public.billing_invoices'::regclass and indisunique and indisvalid and indisready and indislive and indimmediate
    and pg_get_indexdef(indexrelid)='CREATE UNIQUE INDEX billing_invoices_stripe_invoice_id_uniq ON public.billing_invoices USING btree (stripe_invoice_id) WHERE (stripe_invoice_id IS NOT NULL)')
+  or not exists(select 1 from pg_index where indexrelid=to_regclass('public.billing_customers_stripe_customer_id_uniq')
+   and indrelid='public.billing_customers'::regclass and indisunique and indisvalid and indisready and indislive and indimmediate
+   and pg_get_indexdef(indexrelid)='CREATE UNIQUE INDEX billing_customers_stripe_customer_id_uniq ON public.billing_customers USING btree (stripe_customer_id) WHERE (stripe_customer_id IS NOT NULL)')
   or not exists(select 1 from pg_trigger where tgrelid='public.membership_agreements'::regclass
    and tgname='enterprise_existing_billing_guard' and tgenabled='O' and tgtype=31
    and tgfoid='public.enterprise_existing_billing_guard()'::regprocedure)
@@ -199,7 +202,9 @@ begin
   if exists(select 1 from public.enterprise_existing_usage_batches x where x.account_id=p_proof->>'provider_account_id'
    and to_jsonb(x.livemode)=p_proof->'livemode' and(to_jsonb(x)->'provider_operation'->>'invoice_id'=p_proof->>'invoice_id'
     or to_jsonb(x)->'provider_operation'->'operations'->'pay'->'proof'->'payment_intent_id'=p_proof->'payment_intent_id'
-    or to_jsonb(x)->'provider_operation'->'operations'->'pay'->'proof'->'charge_id'=p_proof->'charge_id'))
+    or to_jsonb(x)->'provider_operation'->'operations'->'pay'->'proof'->'charge_id'=p_proof->'charge_id'
+    or jsonb_path_exists(to_jsonb(x)->'provider_operation','$.operations.finalize.proof.items[*] ? (@.line_id == $line)',
+     jsonb_build_object('line',p_proof->'line_id'))))
    then raise exception 'enterprise_period_usage_identity_conflict';end if;
  end if;
  if v.enterprise_period_receipt is not null then

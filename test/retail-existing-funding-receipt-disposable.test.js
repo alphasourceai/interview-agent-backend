@@ -165,7 +165,7 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
    'grant execute on function public.read_enterprise_existing_billing(uuid) to anon',
    'alter table billing_invoices disable row level security',
    'alter table membership_agreements disable trigger enterprise_existing_billing_guard',
-   'drop index billing_invoices_stripe_invoice_id_uniq'])
+   'drop index billing_invoices_stripe_invoice_id_uniq','drop index billing_customers_stripe_customer_id_uniq'])
    denied('begin;'+change+';'+candidate,/enterprise_period_.*drift/);
   sql(candidate);
  }
@@ -2712,6 +2712,19 @@ test('ENTERPRISE PERIOD existing own invoice attaches after actual row wait, for
  sql(`insert into billing_invoices(billing_customer_id,title,invoice_title,amount_total_cents,currency,status,stripe_invoice_id)
   values(${lit(foreignOwner)},'Synthetic','Synthetic',99999,'usd','paid',${lit(foreign.proof.invoice_id+'WRONG')})`);
  denied('set role service_role;'+enterprisePeriodCall(f,{...f.proof,invoice_id:foreign.proof.invoice_id+'WRONG'}),/enterprise_period_invoice_owner_conflict/);
+});
+test('ENTERPRISE PERIOD usage line identity census rejects local SRE partial batch without a shell row',enterprisePeriodOpts,async()=>{
+ const f=await enterprisePeriodFixture(sql);
+ assert.equal(sql("select to_regclass('public.enterprise_existing_usage_batches') is null"),'t');
+ // LOCAL SRE shape probe only, not a valid usage enrollment/paid leaf. The
+ // entire shadow catalog and any unintended RPC write always roll back.
+ const leaf={operations:{finalize:{proof:{items:[{line_id:f.proof.line_id}]}}}};
+ denied(`begin;create table public.enterprise_existing_usage_batches(account_id text,livemode boolean,provider_operation jsonb);
+  grant select on public.enterprise_existing_usage_batches to service_role;
+  insert into public.enterprise_existing_usage_batches values(${lit(f.proof.provider_account_id)},false,${lit(leaf)});
+  set role service_role;${enterprisePeriodCall(f)}rollback;`,/enterprise_period_usage_identity_conflict/);
+ assert.equal(sql("select to_regclass('public.enterprise_existing_usage_batches') is null"),'t');
+ assert.equal(sql(`select count(*) from billing_invoices where stripe_invoice_id=${lit(f.proof.invoice_id)}`),'0');
 });
 
 // Actual original-schema native scanner guard, never hosted/provider effects.
