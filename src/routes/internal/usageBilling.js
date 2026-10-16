@@ -17,6 +17,7 @@ const { createImmediateUsageInvoice } = require('../../services/usageBilling');
 const { normalizeBillingModel } = require('../../services/billingModel');
 const { secretsMatch } = require('../../services/secretCompare');
 const { readAllPages, validKey, CODE: CENSUS_CODE } = require('../../services/enterpriseUsageOwnerCensus');
+const { devUsageBillingClientId, CODE: DEV_HOLD_CODE } = require('../../config/guardedPricingDev');
 
 const router = express.Router();
 
@@ -47,6 +48,10 @@ router.post('/billing/usage-invoices', async (req, res) => {
   }
 
   try {
+    // No unscoped fallback on guarded dev. QA/production return null and keep
+    // their original complete census. The route still authenticates above.
+    const devScope = devUsageBillingClientId();
+    if (devScope && process.env.ENTERPRISE_MONTHLY_USAGE_ENABLED !== 'true') return unavailableCensus();
     // One complete agreement census on EVERY day. A non-null marker is a hold
     // boundary, not certification of an accepted receipt or executable owner.
     const markers = ['enterprise_checkout_source','enterprise_checkout_pool_id','enterprise_checkout_prices',
@@ -54,7 +59,9 @@ router.post('/billing/usage-invoices', async (req, res) => {
     const markedScan = await readAllPages(() => supabaseAdmin.from('membership_agreements')
       .select(['id','client_id',...markers].join(','), { count: 'exact' }).order('id', { ascending: true }));
     if (markedScan.error || markedScan.rows.some(a => !validKey(a.client_id))) return unavailableCensus();
-    const markedIds = new Set(markedScan.rows.filter(a => markers.some(k => a[k] != null)).map(a => a.client_id));
+    const markedIds = new Set(markedScan.rows.filter(a => (!devScope || a.client_id === devScope)
+      && markers.some(k => a[k] != null)).map(a => a.client_id));
+    if (devScope && !markedIds.has(devScope)) return unavailableCensus();
     const nativeUsageEnabled=process.env.ENTERPRISE_MONTHLY_USAGE_ENABLED==='true';
     if (now.getUTCDate() !== 1) {
       if (markedIds.size&&!nativeUsageEnabled) {
@@ -80,7 +87,8 @@ router.post('/billing/usage-invoices', async (req, res) => {
       .order('client_id', { ascending: true }), { key: 'client_id' })
     if (settingsError) return unavailableCensus();
     const usageSettings = (settings || [])
-      .filter((row) => normalizeBillingModel(row?.billing_model, row?.plan_tier) === 'usage')
+      .filter((row) => (!devScope || row.client_id === devScope)
+        && normalizeBillingModel(row?.billing_model, row?.plan_tier) === 'usage')
     const clientIds = [...new Set([...usageSettings.map((row) => row.client_id), ...markedIds])]
     if (!clientIds.length) {
       console.log('usage_billing_cron_summary', { request_id: requestId, considered: 0, invoiced: 0, skipped: 0, failed: 0, total_cents: 0 })
@@ -103,6 +111,8 @@ router.post('/billing/usage-invoices', async (req, res) => {
     // that census valid, but a known marker with no owner is still unavailable,
     // never a clean zero/skip. This does not certify its agreement or receipt.
     const presentIds = new Set(due.map(client => client.id))
+    if (devScope && (!presentIds.has(devScope) || due.length !== 1
+      || !due[0].name?.endsWith('SOFTWARE TEST Synthetic'))) return unavailableCensus();
     const missingMarked = [...markedIds].filter(id => !presentIds.has(id))
     const considered = due.length + missingMarked.length
 
@@ -172,6 +182,7 @@ router.post('/billing/usage-invoices', async (req, res) => {
     }
     return res.json({ ok: true, considered, invoiced, skipped, failed, total_cents: totalCents, results })
   } catch (e) {
+    if (e?.code === DEV_HOLD_CODE) return res.status(503).json({ error: 'billing_unavailable', code: DEV_HOLD_CODE });
     return res.status(500).json({ error: 'usage_invoices_failed', detail: e?.detail || e?.message || 'usage_invoices_failed' })
   }
 })

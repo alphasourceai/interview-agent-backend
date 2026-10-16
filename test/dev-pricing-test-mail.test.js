@@ -39,6 +39,7 @@ function setEnv(){
  Object.assign(process.env,{APP_ENV:'development',SUPABASE_URL:guard.DEV_DATABASE_URL,FRONTEND_URL:guard.DEV_FRONTEND_URL,
  RENDER_SERVICE_ID:guard.DEV_SERVICE_ID,RENDER_EXTERNAL_URL:guard.DEV_BACKEND_URL,DEV_PRICING_SANDBOX_ENABLED:'true',
  DEV_STRIPE_ACCOUNT_ID:guard.DEV_STRIPE_ACCOUNT_ID,STRIPE_SECRET_KEY:'rk_test_SYNTHETIC_ONLY',STRIPE_WEBHOOK_SECRET:'whsec_SYNTHETIC',
+ DEV_USAGE_BILLING_CLIENT_ID:'11111111-1111-4111-8111-111111111111',USAGE_BILLING_CRON_SECRET:'a'.repeat(64),
  SENDGRID_API_KEY:'SG.SYNTHETIC.LOCAL_ONLY',SENDGRID_FROM:'info@alphasourceai.com',DEV_PRICING_EMAIL_RECIPIENTS:a+','+b});
 }
 class FakeStripe{constructor(){this.accounts={retrieve:async()=>({id:guard.DEV_STRIPE_ACCOUNT_ID})};this.balance={retrieve:async()=>({livemode:false})};
@@ -63,14 +64,14 @@ test('only the verified dev tuple permits existing SendGrid send; no raw request
   assert.equal(calls.length,3);
  }finally{reset();if(old)require.cache[name]=old;else delete require.cache[name];if(oldMailer)require.cache[mailFile]=oldMailer;else delete require.cache[mailFile];}
 });
-test('owner-only mode lifts existing buyer email paths, never SMS/internal/invites/invoice sends',async()=>{
+test('owner-only mode lifts existing buyer email paths, never SMS/unrelated internal/invites/invoice sends',async()=>{
  try{
   setEnv();await guard.initializeDevBillingSandbox({Stripe:FakeStripe});const app=express();app.use(guard.guardedPricingDevFence);app.use((_q,r)=>r.status(209).end());
   const id='11111111-1111-4111-8111-111111111111';
   for(const p of ['/api/alphascreen/purchase-intents','/admin/billing/agreements/send','/sales/deals',
    ...['agreement','email-verification/send','email-verification/verify'].map(s=>`/api/alphascreen/purchase-intents/${id}/${s}`),
    ...['resend-agreement','send-payment-reminder','cancel'].map(s=>`/sales/deals/${id}/${s}`)])assert.equal((await request(app).post(p)).status,209,p);
-  for(const p of [`/api/alphascreen/purchase-intents/${id}/sms-verification/send`,'/admin/billing/invoices/send','/internal/billing/usage-invoices',
+  for(const p of [`/api/alphascreen/purchase-intents/${id}/sms-verification/send`,'/admin/billing/invoices/send',
    '/admin/contracts/process-renewals','/sales/enterprise-handoffs','/clients/invite','/admin/clients',`/sales/deals/${id}/nested/resend-agreement`])
    assert.equal((await request(app).post(p)).status,503,p);
   assert.equal((await request(app).post('/sales/deals').set('X-HTTP-Method-Override','DELETE')).status,503);

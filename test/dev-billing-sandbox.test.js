@@ -5,6 +5,7 @@ const prior={...process.env};
 const pins={APP_ENV:'development',SUPABASE_URL:guard.DEV_DATABASE_URL,FRONTEND_URL:guard.DEV_FRONTEND_URL,
  RENDER_SERVICE_ID:guard.DEV_SERVICE_ID,RENDER_EXTERNAL_URL:guard.DEV_BACKEND_URL,
  DEV_PRICING_SANDBOX_ENABLED:'true',DEV_STRIPE_ACCOUNT_ID:guard.DEV_STRIPE_ACCOUNT_ID,
+ DEV_USAGE_BILLING_CLIENT_ID:'11111111-1111-4111-8111-111111111111',USAGE_BILLING_CRON_SECRET:'a'.repeat(64),
  STRIPE_SECRET_KEY:'rk_test_SYNTHETIC_LOCAL_ONLY',STRIPE_WEBHOOK_SECRET:'whsec_SYNTHETIC_LOCAL_ONLY'};
 function reset(){for(const k of Object.keys(process.env))if(!Object.hasOwn(prior,k))delete process.env[k];Object.assign(process.env,prior);}
 function env(){for(const k of [...guard.OFF_FLAGS,...guard.FORBIDDEN_CREDENTIALS,...Object.keys(process.env).filter(k=>k.startsWith('STRIPE_'))])delete process.env[k];Object.assign(process.env,pins);}
@@ -18,7 +19,7 @@ function fake(patch={}){
 }
 test('preview default has no bootstrap SDK/provider call; malformed mode and copied pins/keys refuse',async()=>{
  try{
-  env();delete process.env.DEV_PRICING_SANDBOX_ENABLED;const f=fake();await guard.initializeDevBillingSandbox({Stripe:f.Stripe});
+  env();delete process.env.DEV_PRICING_SANDBOX_ENABLED;delete process.env.DEV_USAGE_BILLING_CLIENT_ID;delete process.env.USAGE_BILLING_CRON_SECRET;const f=fake();await guard.initializeDevBillingSandbox({Stripe:f.Stripe});
   assert.equal(f.calls.length,0);assert.equal(guard.isDevBillingSandbox(),false);
   for(const patch of [{DEV_PRICING_SANDBOX_ENABLED:'TRUE'},{DEV_STRIPE_ACCOUNT_ID:'acct_QA'},
    {RENDER_SERVICE_ID:''},{RENDER_EXTERNAL_URL:'https://ia-backend-qa.onrender.com'},
@@ -67,7 +68,8 @@ test('same exact HTTP paths lift after verification; sends, overrides, scheduler
    ...['billing/checkout-session','subscription-checkout','subscription-invoice','usage-invoice','cancel-contract'].map(x=>`/admin/clients/${id}/${x}`)])
    assert.equal((await request(app).post(path)).status,209,path);
   assert.equal((await request(app).patch(`/admin/clients/${id}/auto-renew`)).status,209);
-  for(const path of ['/sales/deals','/admin/billing/agreements/send','/admin/billing/invoices/send','/internal/billing/usage-invoices',
+  assert.equal((await request(app).post('/internal/billing/usage-invoices')).status,209);
+  for(const path of ['/sales/deals','/admin/billing/agreements/send','/admin/billing/invoices/send',
    '/admin/contracts/process-renewals','/clients/invite','/api/alphascreen/purchase-intents',
    `/admin/clients/${id}/nested/subscription-checkout`,`/admin/clients/${id}/access-override`,
    '/membership-agreements/%73ign','/membership-agreements/sign?_method=DELETE'])

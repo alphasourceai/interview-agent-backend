@@ -7,6 +7,11 @@ const DEV_FRONTEND_URL = 'https://interview-agent-frontend-qa.onrender.com';
 const DEV_BACKEND_URL = 'https://interview-agent-dev-backend.onrender.com';
 const DEV_STRIPE_ACCOUNT_ID = 'acct_1UPtmNHC5VkATVoE';
 const {ownerMailRecipients}=require('./devPricingTestMail');
+const DEV_USAGE_UUID = /^(?!00000000-0000-0000-0000-000000000000$)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+function devUsagePairValid(env) {
+  return DEV_USAGE_UUID.test(env.DEV_USAGE_BILLING_CLIENT_ID || '')
+    && /^[0-9a-f]{64}$/.test(env.USAGE_BILLING_CRON_SECRET || '');
+}
 let verifiedSandboxFingerprint = null;
 const CODE = 'GUARDED_DEV_BILLING_HOLD';
 const DETAIL = 'This dev build supports pricing and agreement previews. Payments, renewals, usage collection, sending and signing are not available yet.';
@@ -46,7 +51,7 @@ function hold() {
 function sandboxRequested(env = process.env) { return env.DEV_PRICING_SANDBOX_ENABLED === 'true'; }
 function sandboxFingerprint(env) {
   const keys = [...new Set(['APP_ENV','RENDER_SERVICE_ID','RENDER_EXTERNAL_URL','SUPABASE_URL','FRONTEND_URL',
-    'DEV_PRICING_SANDBOX_ENABLED','DEV_STRIPE_ACCOUNT_ID','DEV_PRICING_EMAIL_RECIPIENTS','SENDGRID_FROM',...OFF_FLAGS,...FORBIDDEN_CREDENTIALS,
+    'DEV_PRICING_SANDBOX_ENABLED','DEV_STRIPE_ACCOUNT_ID','DEV_PRICING_EMAIL_RECIPIENTS','DEV_USAGE_BILLING_CLIENT_ID','SENDGRID_FROM',...OFF_FLAGS,...FORBIDDEN_CREDENTIALS,
     ...Object.keys(env).filter(k=>k.startsWith('STRIPE_'))])].sort();
   return require('node:crypto').createHash('sha256').update(JSON.stringify(keys.map(k=>[k,env[k]??null]))).digest('hex');
 }
@@ -61,11 +66,26 @@ function isDevPricingTestMail(env=process.env){
 function assertGuardedDevOutboundAllowed(kind) {
   if (isGuardedPricingDev() && !(kind === 'billing' && isDevBillingSandbox())) throw hold();
 }
+// Only the dedicated verified Sandbox may scope the existing usage executor.
+// Non-dev callers keep the existing full census; a copied pin cannot filter QA.
+function devUsageBillingClientId(env = process.env) {
+  if (!isGuardedPricingDev(env)) return null;
+  if (!isDevBillingSandbox(env) || !devUsagePairValid(env)) throw hold();
+  return env.DEV_USAGE_BILLING_CLIENT_ID;
+}
+function assertGuardedDevUsageOwner(clientId) {
+  const scope = devUsageBillingClientId();
+  if (scope && (clientId !== scope || process.env.ENTERPRISE_MONTHLY_USAGE_ENABLED !== 'true')) throw hold();
+}
 function assertGuardedPricingDevConfiguration(env = process.env) {
   if (env.RENDER_SERVICE_ID === OLD_DEV_SERVICE_ID) throw new Error('guarded_dev_old_service_refused');
   if (!['','false','0','true'].includes(String(env.DEV_PRICING_SANDBOX_ENABLED??''))) throw new Error('guarded_dev_sandbox_mode_invalid');
   if (sandboxRequested(env) && !isGuardedPricingDev(env)) throw new Error('guarded_dev_environment_pin_mismatch');
   if (!isGuardedPricingDev(env)) return;
+  if (sandboxRequested(env) ? !devUsagePairValid(env)
+    : env.DEV_USAGE_BILLING_CLIENT_ID !== undefined || env.USAGE_BILLING_CRON_SECRET !== undefined) {
+    throw new Error('guarded_dev_usage_scope_invalid');
+  }
   const mailRecipients=ownerMailRecipients(env.DEV_PRICING_EMAIL_RECIPIENTS);
   const ownerMail=mailRecipients.length>0;
   if(ownerMail&&(!sandboxRequested(env)||!/^SG\.[A-Za-z0-9_.-]{20,}$/.test(env.SENDGRID_API_KEY||'')
@@ -80,7 +100,8 @@ function assertGuardedPricingDevConfiguration(env = process.env) {
   if (OFF_FLAGS.some(key => !['', 'false', '0', ...(allowedFlags.includes(key)?['true']:[])].includes(String(env[key] ?? '')))) {
     throw new Error('guarded_dev_external_operation_flag_refused');
   }
-  if (FORBIDDEN_CREDENTIALS.some(key => !(ownerMail&&key==='SENDGRID_API_KEY')&&String(env[key] || '').trim())) {
+  if (FORBIDDEN_CREDENTIALS.some(key => !(ownerMail&&key==='SENDGRID_API_KEY')
+    && !(sandboxRequested(env)&&devUsagePairValid(env)&&key==='USAGE_BILLING_CRON_SECRET')&&String(env[key] || '').trim())) {
     throw new Error('guarded_dev_external_credential_refused');
   }
   if (Object.entries(env).some(([key, value]) => key.startsWith('STRIPE_') && /^(?:sk|rk|pk)_live_/.test(String(value || '').trim()))) {
@@ -143,15 +164,19 @@ function guardedPricingDevFence(req, res, next) {
     '/admin/billing/customers','/admin/billing/invoices/sync','/sales/promotion-codes/validate']);
   const id='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
   const clientPost=new RegExp('^/admin/clients/'+id+'/(billing/checkout-session|subscription-checkout|subscription-invoice|usage-invoice|cancel-contract)$');
+  const usageInvoiceOwner = pathname.match(new RegExp('^/admin/clients/('+id+')/usage-invoice$'))?.[1];
+  const sandboxCron = isDevBillingSandbox() && devUsagePairValid(process.env)
+    && method === 'POST' && pathname === '/internal/billing/usage-invoices';
   const sandboxMutation=isDevBillingSandbox()&&((method==='POST'&&(sandboxPost.has(pathname)
-    ||clientPost.test(pathname)||new RegExp('^/admin/billing/agreements/'+id+'/void$').test(pathname)))
+    ||(clientPost.test(pathname)&&(!usageInvoiceOwner||usageInvoiceOwner===process.env.DEV_USAGE_BILLING_CLIENT_ID))
+    ||new RegExp('^/admin/billing/agreements/'+id+'/void$').test(pathname)))
     ||method==='PATCH'&&new RegExp('^/admin/clients/'+id+'/auto-renew$').test(pathname));
   const mailMutation=isDevPricingTestMail()&&method==='POST'&&(
     ['/api/alphascreen/purchase-intents','/admin/billing/agreements/send','/sales/deals'].includes(pathname)
     ||new RegExp('^/api/alphascreen/purchase-intents/'+id+'/(agreement|email-verification/send|email-verification/verify)$').test(pathname)
     ||new RegExp('^/sales/deals/'+id+'/(resend-agreement|send-payment-reminder|cancel)$').test(pathname));
   if (!override && (['GET', 'HEAD', 'OPTIONS'].includes(method)
-    ||sandboxMutation||mailMutation|| (method === 'POST' && (PREVIEW_POSTS.has(pathname) || pathname === '/webhook/stripe')))) return next();
+    ||sandboxMutation||sandboxCron||mailMutation|| (method === 'POST' && (PREVIEW_POSTS.has(pathname) || pathname === '/webhook/stripe')))) return next();
   res.setHeader('Cache-Control', 'no-store');
   if (req.headers?.origin === DEV_FRONTEND_URL) {
     res.setHeader('Access-Control-Allow-Origin', DEV_FRONTEND_URL);
@@ -163,6 +188,6 @@ function guardedPricingDevFence(req, res, next) {
 
 module.exports = { DEV_SERVICE_ID, DEV_DATABASE_URL, DEV_FRONTEND_URL, CODE, DETAIL,
   DEV_BACKEND_URL, DEV_STRIPE_ACCOUNT_ID, sandboxRequested, isDevBillingSandbox, isDevPricingTestMail, initializeDevBillingSandbox,
-  OFF_FLAGS, FORBIDDEN_CREDENTIALS, isGuardedPricingDev, hold,
+  OFF_FLAGS, FORBIDDEN_CREDENTIALS, isGuardedPricingDev, hold, devUsageBillingClientId, assertGuardedDevUsageOwner,
   assertGuardedDevOutboundAllowed, assertGuardedPricingDevConfiguration,
   guardedPricingCapabilities, guardedPricingDevFence };
