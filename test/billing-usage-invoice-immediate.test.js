@@ -572,8 +572,8 @@ for(const marker of ['',0,false,{},'synthetic'])test(`day2 non-null ${JSON.strin
     assert.equal(JSON.stringify(res.body).includes('synthetic'),false);
   }));
 });
-for(const column of ['id','client_id'])for(const bad of [null,0,'',' \t'])test(`day2 agreement ${column} ${JSON.stringify(bad)} refuses census before marker classification`,async()=>{
-  const db=makeDb();db.tables.membership_agreements=[{id:'a',client_id:CLIENT,[column]:bad}];
+for(const column of ['id','client_id'])for(const bad of [null,0,'',' \t'])test(`day2 marked agreement ${column} ${JSON.stringify(bad)} refuses census before collection`,async()=>{
+  const db=makeDb();db.tables.membership_agreements=[{id:'a',client_id:CLIENT,enterprise_checkout_source:{},[column]:bad}];
   const reads=watchedDb(db);
   await withCronSecret(()=>onTheSecond(async()=>{
     const app=loadCron(db,makeStripe());const imports=watchStripeImport();const res=await runCron(app);
@@ -581,8 +581,8 @@ for(const column of ['id','client_id'])for(const bad of [null,0,'',' \t'])test(`
     assert.deepEqual(reads,{membership_agreements:1});assert.equal(imports(),0);
   }));
 });
-test('unmarked day2 preserves exact legacy skip and performs only one agreement census',async()=>{
-  const db=makeDb();db.tables.membership_agreements=[{id:'a',client_id:CLIENT,enterprise_checkout_source:null}];
+for(const owner of [CLIENT,null])test(`unmarked day2 owner ${owner} preserves exact legacy skip and performs only one agreement census`,async()=>{
+  const db=makeDb();db.tables.membership_agreements=[{id:'a',client_id:owner,enterprise_checkout_source:null}];
   const reads=watchedDb(db);
   await withCronSecret(()=>onTheSecond(async()=>{
     const app=loadCron(db,makeStripe());const imports=watchStripeImport();const res=await runCron(app);

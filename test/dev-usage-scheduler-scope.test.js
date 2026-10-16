@@ -72,6 +72,26 @@ test('QA ignores a leaked dev pin and retains full authenticated legacy/marked c
   assert.equal(r.status,200);assert.equal(r.body.considered,2);assert.deepEqual(x.calls,[OWNER,OTHER]);
  }finally{global.Date=RealDate;reset();}
 });
+test('ordinary unassigned retail agreements do not block marked Enterprise owner census in dev or QA',async()=>{
+ try{for(const mode of ['dev','qa']){
+  env();if(mode==='qa'){process.env.APP_ENV='qa';delete process.env.RENDER_SERVICE_ID;}else await guard.initializeDevBillingSandbox({Stripe:FakeStripe});
+  const tables=dbFixture();tables.membership_agreements.push({id:'c',client_id:null});
+  const x=appFor(tables),r=await run(x.app);assert.equal(r.status,200,mode);
+  assert.deepEqual(x.calls,mode==='dev'?[OWNER]:[OWNER,OTHER],mode);
+ }}finally{reset();}
+});
+test('marked agreements without owners and malformed non-null owners still hold before collection',async()=>{
+ try{for(const mode of ['dev','qa'])for(const row of [
+  {id:'c',client_id:null,enterprise_checkout_source:{}},
+  {id:'c',client_id:null,enterprise_billing_receipt:{}},
+  {id:'c',client_id:''},
+  {id:'c',client_id:' '}
+ ]){
+  env();if(mode==='qa'){process.env.APP_ENV='qa';delete process.env.RENDER_SERVICE_ID;}else await guard.initializeDevBillingSandbox({Stripe:FakeStripe});
+  const tables=dbFixture();tables.membership_agreements.push(row);
+  const x=appFor(tables),r=await run(x.app);assert.equal(r.status,503,mode);assert.deepEqual(x.calls,[],mode);
+ }}finally{reset();}
+});
 test('both existing invoice service entry points refuse other dev owners before database or provider effects',async()=>{
  try{env();await guard.initializeDevBillingSandbox({Stripe:FakeStripe});
   const usage=require('../src/services/usageBilling');

@@ -58,7 +58,12 @@ router.post('/billing/usage-invoices', async (req, res) => {
       'enterprise_funding_receipt','enterprise_billing_receipt'];
     const markedScan = await readAllPages(() => supabaseAdmin.from('membership_agreements')
       .select(['id','client_id',...markers].join(','), { count: 'exact' }).order('id', { ascending: true }));
-    if (markedScan.error || markedScan.rows.some(a => !validKey(a.client_id))) return unavailableCensus();
+    // An unsigned/unfunded retail agreement may legitimately have no client
+    // yet. It is not an Enterprise owner. Marked agreements must still have
+    // an owner, including markers outside a guarded-dev pin; malformed
+    // non-null owner values also keep the complete census fail-closed.
+    if (markedScan.error || markedScan.rows.some(a =>
+      (a.client_id != null || markers.some(k => a[k] != null)) && !validKey(a.client_id))) return unavailableCensus();
     const markedIds = new Set(markedScan.rows.filter(a => (!devScope || a.client_id === devScope)
       && markers.some(k => a[k] != null)).map(a => a.client_id));
     if (devScope && !markedIds.has(devScope)) return unavailableCensus();
