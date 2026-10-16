@@ -134,3 +134,19 @@ test('Enterprise Billing waiting OFF differs honestly from true provider flag an
  assert.equal(f.native.client.cancel_at_term_end,false);
  const stale={...f.native.client,auto_renew:true};await assert.rejects(billing({db:f.native.db,client:stale}),/billing_terms_changed/);
 });
+for(const status of ['waiting','held','unknown','applied'])test(`Enterprise Billing remains readable after funded legal advance with an older ${status} ON operation`,async t=>{
+ const f=await fixture(t),oldEnd=f.legal.term_end_at,iso6=x=>new Date(x).toISOString().replace(/Z$/,'000Z');
+ const {anchoredMonthInstant}=require('../src/services/membershipOffers');
+ const originalEnd3=new Date(oldEnd).toISOString(),currentEnd=iso6(anchoredMonthInstant(originalEnd3,12)),id='10000000-0000-4000-8000-000000000094';
+ f.renewalOp={version:'enterprise_existing_renewal_change_v2',operation_id:id,source:clone(f.native.a.enterprise_billing_receipt),
+  requested_auto_renew:true,accepted_at:iso6(Date.parse(oldEnd)-86400000),effective_at:oldEnd,notice_cutoff_at:f.legal.notice_cutoff_at,
+  status,generation:0,sent_at:null,provider_cancel_operation_id:null};
+ Object.assign(f.legal,{term_index:1,term_start_at:oldEnd,term_end_at:currentEnd,accepted_operation_id:id,
+  notice_cutoff_at:iso6(Date.parse(currentEnd)-30*86400000),funded_through:iso6(anchoredMonthInstant(originalEnd3,1)),observed_at:iso6(Date.parse(oldEnd)+86400000)});
+ t.mock.method(Date,'now',()=>Date.parse(f.legal.observed_at));
+ const before=clone(f.native.db.tables),r=await billing({db:f.native.db,client:f.native.client});
+ assert.equal(r.current_term_end_at,currentEnd);assert.equal(r.stripe_renewal_billing_cutoff_at,currentEnd);
+ assert.equal(r.renewal_notice_cutoff_at,f.legal.notice_cutoff_at);assert.equal(r.renewal_request_effective_at,oldEnd);
+ assert.equal(r.auto_renew,true);assert.equal(r.renewal_request_status,status);
+ assert.deepEqual(f.native.db.tables,before);assert.equal(f.calls.length,0);
+});

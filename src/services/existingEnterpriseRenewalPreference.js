@@ -251,11 +251,12 @@ async function requestExistingEnterpriseRenewal(raw) {
 }
 async function readExistingEnterpriseRenewalSummary(raw) {
   const input = inputFields(raw), source = await sourceFor(input), r = await native(input, source, 'read'), op = r.operation;
-  const completedOn = r.status === 'applied' && op?.requested_auto_renew === true;
   check(Number.isFinite(Date.parse(r.legal_term_end)) && Number.isFinite(Date.parse(r.notice_cutoff_at)));
-  return { stripe_renewal_billing_cutoff_at: completedOn ? r.legal_term_end : op?.effective_at || r.legal_term_end,
-    renewal_notice_cutoff_at: completedOn ? r.notice_cutoff_at : op?.notice_cutoff_at || r.notice_cutoff_at,
+  // The funded legal window can advance while an ON setting remains pending.
+  // Keep current dates separate from the unchanged operation's recorded E.
+  return { stripe_renewal_billing_cutoff_at: r.legal_term_end,
+    renewal_notice_cutoff_at: r.notice_cutoff_at,
     renewal_request_status: r.status, requested_auto_renew: op?.requested_auto_renew ?? null,
-    renewal_requested_at: op?.accepted_at ?? null };
+    renewal_requested_at: op?.accepted_at ?? null, renewal_request_effective_at: op?.effective_at ?? null };
 }
 module.exports = { reconcileExistingEnterpriseRenewal, requestExistingEnterpriseRenewal, readExistingEnterpriseRenewalSummary };

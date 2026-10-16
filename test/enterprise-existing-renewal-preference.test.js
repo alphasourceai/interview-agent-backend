@@ -172,10 +172,11 @@ for (const prior of ['none', 'opposite']) test(`Enterprise SDK deadline-held req
   assert.equal(result.status, 'held'); assert.equal(result.reason, 'request_deadline_passed');
   assert.deepEqual(f.actions.map(x => x.args.p_action), ['request']); assert.equal(f.updates.length, 0);
 });
-test('Enterprise SDK summary uses current legal E after completed ON, not the old operation E', async t => {
-  const f = await setup(t, { on: true, status: 'applied' }); f.legalEnd = new Date((f.fullEnd+31536000)*1000).toISOString();
+for (const status of ['waiting','held','unknown','applied']) test(`Enterprise SDK summary uses current legal E with ${status} ON and preserves recorded operation E`, async t => {
+  const f = await setup(t, { on: true, status }); f.legalEnd = new Date((f.fullEnd+31536000)*1000).toISOString();
   const r = await summary(f.args); assert.equal(r.stripe_renewal_billing_cutoff_at, f.legalEnd);
   assert.equal(r.renewal_requested_at, f.operation.accepted_at);
+  assert.equal(r.renewal_request_effective_at, f.operation.effective_at);
 });
 test('Enterprise SDK disabled reconciliation is no source/RPC/SDK operation; strict arguments reject injected clock', async () => {
   const args = { db: null, stripe: null, agreementId: opId, clientId: oldId, effectsEnabled: false };
