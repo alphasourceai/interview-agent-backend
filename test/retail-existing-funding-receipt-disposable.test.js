@@ -3068,6 +3068,19 @@ test('ENTERPRISE DISPATCH OFF ON OFF before ON send retains actual cancel owner,
  denied('set role service_role;'+enterpriseDispatchCall(f,r,'claim',off),/enterprise_renewal_dispatch_observation_denied/);
  assert.equal(enterpriseDispatch(f,r,'claim',before).operation.status,'claimed');
 });
+test('ENTERPRISE DISPATCH no-send applied ON drops the older cancel owner before a new OFF',enterpriseDispatchOpts,async()=>{
+ const f=await enterpriseDispatchFixture(),before=enterpriseDispatchObservation(f),off=enterpriseDispatchObservation(f,{cancel:true});
+ let r=enterpriseRenewal(f).operation;r=enterpriseDispatch(f,r,'claim',before).operation;r=enterpriseDispatch(f,r,'send',before).operation;
+ r=enterpriseDispatch(f,r,'finish',off).operation;const originalCancel=r.operation_id;
+ r=enterpriseRenewal(f,'request',true).operation;assert.equal(r.provider_cancel_operation_id,originalCancel);
+ // Fresh authored read is already clear (e.g. independent admin change).
+ // Confirming that observed state is NOT proof that the old cancel persists.
+ r=enterpriseDispatch(f,r,'claim',before).operation;r=enterpriseDispatch(f,r,'finish',before).operation;
+ assert.equal(r.status,'applied');assert.equal(r.sent_at,null);assert.equal(r.repair_sent_at,null);
+ r=enterpriseRenewal(f,'request',false).operation;assert.equal(r.provider_cancel_operation_id,null);
+ denied('set role service_role;'+enterpriseDispatchCall(f,r,'claim',off),/enterprise_renewal_dispatch_observation_denied/);
+ assert.equal(enterpriseDispatch(f,r,'claim',before).operation.status,'claimed');
+});
 test('ENTERPRISE DISPATCH no authority from arbitrary cancel, stale clock, wrong source or changed debt census',enterpriseDispatchOpts,async()=>{
  const f=await enterpriseDispatchFixture(),o=enterpriseDispatchObservation(f),r=enterpriseRenewal(f).operation;
  for(const patch of [x=>{x.subscription.cancel_at=Date.parse(r.effective_at)/1000;x.subscription.current_period_end=x.subscription.cancel_at;},

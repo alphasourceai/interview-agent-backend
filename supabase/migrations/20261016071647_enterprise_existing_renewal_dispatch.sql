@@ -178,7 +178,8 @@ $x$||old);
     -- Unsent preference toggles never changed the known provider setting.
     -- A no-send applied OFF likewise retains the REAL older cancel writer.
     when(prior->>'effective_at')::timestamptz=end_ and prior->>'provider_cancel_operation_id' is not null
-     and(prior->'sent_at'='null'::jsonb or(prior->>'status'='applied' and prior->'requested_auto_renew'='false'::jsonb))
+     and((prior->'sent_at'='null'::jsonb and prior->>'status'<>'applied')
+      or(prior->>'status'='applied' and prior->'requested_auto_renew'='false'::jsonb))
      then prior->'provider_cancel_operation_id'
     else null end);$x$);
  execute replace(def,(select prosrc from pg_proc where oid='public.change_enterprise_existing_renewal(uuid,uuid,jsonb,text,boolean)'::regprocedure),body);
