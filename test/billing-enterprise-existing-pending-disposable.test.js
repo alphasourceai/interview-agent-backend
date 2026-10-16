@@ -184,14 +184,14 @@ async function nativeUsageCollectorAndAck(){
  let invoice=null,paymentIntent=null,charge=null;
  const list=data=>({object:'list',has_more:false,data:clone(data)});
  const money=()=>{const amount=items.reduce((sum,i)=>sum+i.amount,0);
-  Object.assign(invoice,{total:amount,subtotal:amount,amount_due:amount,subtotal_excluding_tax:amount,total_excluding_tax:amount});};
+  Object.assign(invoice,{total:amount,subtotal:amount,amount_due:amount,amount_remaining:invoice.paid?0:amount,subtotal_excluding_tax:amount,total_excluding_tax:amount});};
  const stripe={getApiField:()=> '2023-10-16',accounts:{retrieve:async()=>{gets.push('account');return{object:'account',id:n.proof.provider_account_id};}},
   customers:{retrieve:async customer=>{assert.equal(customer,n.s.customer);return{object:'customer',id:customer,livemode:false,
    default_source:null,invoice_settings:{default_payment_method:pm}};}},
   subscriptions:{retrieve:async sub=>{assert.equal(sub,n.proof.subscription_id);return{object:'subscription',id:sub,
    customer:n.s.customer,livemode:false,default_source:null,default_payment_method:pm};}},
   paymentMethods:{retrieve:async id=>{assert.equal(id,pm);return{object:'payment_method',id,type:'card',customer:n.s.customer,livemode:false};}},
-  invoiceItems:{list:async args=>{gets.push('items');assert.equal(args.customer,n.s.customer);assert.equal(args.invoice,invoiceId);return list(items);},
+  invoiceItems:{list:async args=>{gets.push('items');assert.equal(Object.hasOwn(args,'customer'),false);assert.equal(args.invoice,invoiceId);return list(items);},
    create:async(body,options)=>{writes.push({step:'item',body:clone(body),key:options.idempotencyKey});
     assert.equal(body.invoice,invoiceId);const item={...clone(body),id:'ii_LOCAL_USAGE',object:'invoiceitem',livemode:false,
      subscription:null,proration:false,tax_rates:[],discounts:[],price:null,unit_amount_decimal:null,amount:body.quantity*body.unit_amount};

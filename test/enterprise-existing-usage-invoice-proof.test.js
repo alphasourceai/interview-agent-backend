@@ -53,7 +53,7 @@ function objects(b, size = b.groups.length, stage = 'draft') {
   const invoice = { id: invoiceId, object: 'invoice', livemode: b.livemode, customer: b.customer_id,
     subscription: null, currency: 'usd', collection_method: 'charge_automatically', auto_advance: false,
     paid_out_of_band: false, status: stage, paid, attempted: paid, amount_paid: paid ? sum : 0,
-    amount_remaining: stage === 'open' ? sum : 0, ending_balance: stage === 'draft' ? null : 0,
+    amount_remaining: paid ? 0 : sum, ending_balance: stage === 'draft' ? null : 0,
     metadata: proof.usageInvoiceCreateRequest(b).body.metadata, automatic_tax: { enabled: false },
     default_tax_rates: [], total_tax_amounts: [], tax: null, discount: null, discounts: [], total_discount_amounts: [],
     pre_payment_credit_notes_amount: 0, post_payment_credit_notes_amount: 0, starting_balance: 0,
@@ -159,6 +159,17 @@ test('shell and per-role partial proofs precede full finalized proof; never clai
   const partial = objects(b, 1, 'open'); assert.throws(() => proof.verifyUsageInvoicePhase(partial));
   const shell = objects(b, 0); shell.replayInvoiceId = null; assert.throws(() => proof.verifyUsageInvoicePhase(shell));
   shell.stage='items';assert.throws(()=>proof.verifyUsageInvoicePhase(shell));
+});
+test('draft unpaid remaining must equal its exact verified line total, never a fictitious zero balance',async()=>{
+ const {b}=await binding();
+ for(const size of [1,2]){
+  const f=objects(b,size,'draft');assert.equal(f.invoice.amount_remaining,size*2500);
+  assert.equal(proof.verifyUsageInvoicePhase(f).total_cents,size*2500);
+  for(const wrong of [0,size*2500-1,size*2500+1]){
+   const bad=clone(f);bad.invoice.amount_remaining=wrong;
+   assert.throws(()=>proof.verifyUsageInvoicePhase(bad),{code:'enterprise_usage_invoice_held'});
+  }
+ }
 });
 test('integer-amount items accept null Price/decimal but never mismatched or coerced values',async()=>{
  const {b}=await binding(),f=objects(b);

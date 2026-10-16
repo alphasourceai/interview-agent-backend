@@ -187,7 +187,7 @@ function verifyUsageInvoicePhase({ binding: b, invoice, items, lines, provenRole
   invoiceMoney(i, sum);
   if (stage === 'shell' || stage === 'items') {
     check(i.status === 'draft' && i.paid === false && i.attempted === false && i.amount_paid === 0
-      && i.amount_remaining === 0 && i.ending_balance === null);
+      && i.amount_remaining === sum && i.ending_balance === null);
     if (stage === 'shell') check(roles.length === 0 && replayInvoiceId === invoiceId);
     else check(roles.length>0);
   } else {
