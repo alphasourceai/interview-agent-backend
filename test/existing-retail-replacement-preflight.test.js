@@ -107,7 +107,7 @@ test('read and reservation envelopes are distinct; unknown/lost ACK never grants
   for(const stage of ['read-extra','phase','receipt','res-extra','res-empty','res-body','res-stamp','res-second-reserved','throw']){
     const f=setup();f.hooks.read=(r,n)=>{if(stage==='read-extra')r.status='paid';if(n===4){if(stage==='phase')r.phase='paid';if(stage==='receipt')r.receipt.proof.cash_cents++;}};
     f.hooks.reserve=(r,n)=>{if(stage==='res-extra')r.extra=true;if(stage==='res-empty')r.request=null;
-      if(n===2){if(stage==='res-body')r.request.source_digest='c'.repeat(64);if(stage==='res-stamp')r.created_at=stamp(Date.now()-10);
+      if(n===2){if(stage==='res-body')r.request.source_digest='c'.repeat(64);if(stage==='res-stamp')r.created_at=stamp(Date.parse(r.created_at)-1);
         if(stage==='res-second-reserved')r.status='reserved';}if(stage==='throw')throw Error('PRIVATE_URL_AND_TOKEN');};
     await assert.rejects(prepare(f.opts),e=>!e.message.includes('PRIVATE_'));assert.deepEqual(f.tables,f.baseline);
   }
