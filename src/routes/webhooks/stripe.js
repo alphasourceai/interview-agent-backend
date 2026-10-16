@@ -905,6 +905,15 @@ router.post('/', async (req, res) => {
         effectsEnabled:process.env.RETAIL_STRIPE_RENEWAL_CONTROL_ENABLED==='true'});
       await markProcessed(true,null);return res.status(200).json({ok:true});
     }
+    if (['usage_paid_ack', 'usage_stale_ack'].includes(existingEnterprisePaymentEvent?.action)) {
+      await markProcessed(true, null);
+      return res.status(200).json({ ok: true });
+    }
+    if (existingEnterprisePaymentEvent?.action === 'usage_held') {
+      const error = new Error('enterprise_usage_event_held');
+      error.code = error.message;
+      throw error;
+    }
     if (existingEnterprisePaymentEvent?.action === 'held') {
       const error = new Error('enterprise_payment_lifecycle_review_required');
       error.code = error.message;

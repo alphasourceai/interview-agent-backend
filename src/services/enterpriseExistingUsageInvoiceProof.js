@@ -222,7 +222,7 @@ function verifyUsageInvoicePaid({ binding: b, invoiceId, invoice, items, lines, 
     && ch.paid === true && ch.captured === true && ch.amount_captured === b.total_cents
     && ch.amount_refunded === 0 && ch.refunded === false && ch.disputed === false
     && (!Object.hasOwn(ch, 'dispute') || ch.dispute === null) && Array.isArray(rs) && rs.length === 0
-    && (ch.refunds === null || (ch.refunds?.object === 'list' && ch.refunds.has_more === false
+    && (!Object.hasOwn(ch, 'refunds') || ch.refunds === null || (ch.refunds?.object === 'list' && ch.refunds.has_more === false
       && Array.isArray(ch.refunds.data) && ch.refunds.data.length === 0)));
   return clean({ invoice_id: i.id, payment_intent_id: pi.id, charge_id: ch.id, amount_cents: b.total_cents,
     paid_at: i.status_transitions.paid_at, provider_effect_authorized: false, paid_access_authorized: false, payroll_authorized: false });

@@ -21,6 +21,85 @@ function hasNativeMarker(row){return Boolean(row&&(row.enterprise_checkout_sourc
 function sourceHint(meta){return String(meta?.source||'').trim().toLowerCase()==='agreement_checkout';}
 function nativeVersionHint(meta){return /^enterprise_existing_/.test(String(meta?.enterprise_checkout_version||'').trim());}
 function metadata(value){return value&&typeof value==='object'&&!Array.isArray(value)?value:{};}
+// A usage hint never authorizes an ACK or falls through to a legacy writer.
+// Reuse the native paid leaf and existing GET-only invoice proof; no collection,
+// allocation, access, account, commission or native leaf update occurs here.
+async function classifyExistingEnterpriseUsageEvent({db,stripe,event}){
+ const raw=event?.data?.object,meta=metadata(raw?.metadata);
+ if(!Object.hasOwn(meta,'enterprise_usage_batch_id'))return null;
+ const deny=()=>fail('enterprise_usage_event_unverified');
+ const check=value=>{if(!value)deny();};
+ const same=(a,b)=>isDeepStrictEqual(snapshotStripeSdkData(a),snapshotStripeSdkData(b));
+ try{
+  const o=snapshotStripeSdkData(raw),m=metadata(o.metadata),batchId=m.enterprise_usage_batch_id;
+  const paidEvent=['invoice.payment_succeeded','invoice.paid'].includes(event.type);
+  check(paidEvent||['invoice.created','invoice.payment_failed'].includes(event.type));
+  check(/^evt_[A-Za-z0-9_]+$/.test(event.id||'')&&typeof event.livemode==='boolean'
+   &&o.object==='invoice'&&/^in_[A-Za-z0-9_]+$/.test(o.id||'')&&STRIPE_ID.cus.test(id(o.customer)||'')
+   &&o.subscription===null&&o.currency==='usd'&&o.livemode===event.livemode
+   &&m.source==='usage_billing'&&UUID.test(batchId||'')&&UUID.test(m.client_id||'')
+   &&Object.keys(m).sort().join(',')==='client_id,enterprise_usage_batch_id,source');
+  const owner=await maybeOne(db,'clients','stripe_customer_id',id(o.customer));
+  check(owner&&UUID.test(owner.id||'')&&owner.parent_client_id===null&&owner.archived_at===null
+   &&owner.stripe_customer_id===id(o.customer)&&m.client_id===owner.id);
+  const {readEnterpriseExistingUsageProvider:read}=require('./enterpriseExistingUsageReservation');
+  const p=require('./enterpriseExistingUsageInvoiceProof');
+  const load=async()=>{
+   const s=await read({db,billingClientId:owner.id,batchId}),b=s?.binding;
+   check(s?.status==='read'&&s.batch?.id===batchId&&s.batch.owner_id===owner.id
+    &&b?.batch_id===batchId&&b.owner_id===owner.id&&b.agreement_id===s.batch.agreement_id
+    &&b.customer_id===owner.stripe_customer_id&&b.livemode===event.livemode);
+   return s;
+  };
+  const state=await load(),b=state.binding,leaf=state.batch.provider_operation;
+  const base={cohort:'existing_enterprise_usage',agreementId:b.agreement_id,clientId:owner.id,
+   batchId,invoiceId:o.id,requiresReentry:true};
+  const prior=await maybeOne(db,'billing_events','stripe_event_id',event.id);
+  if(leaf?.status!=='paid'){
+   if(prior?.processed_ok===true)deny();
+   return Object.freeze({...base,action:'usage_held'});
+  }
+  const original=leaf.operations?.pay?.proof,request=leaf.operations?.pay?.request;
+  const pm=request?.body?.payment_method;
+  check(leaf.invoice_id===o.id&&original?.invoice_id===o.id&&original.amount_cents===b.total_cents
+   &&Object.keys(original).sort().join(',')===['invoice_id','payment_intent_id','charge_id','amount_cents','paid_at',
+    'provider_effect_authorized','paid_access_authorized','payroll_authorized'].sort().join(',')
+   &&Number.isSafeInteger(original.paid_at)&&original.paid_at>0&&original.paid_at<=253402300799
+   &&original.paid_at*1000<=Date.parse(state.observed_at)
+   &&original.provider_effect_authorized===false&&original.paid_access_authorized===false
+   &&original.payroll_authorized===false&&/^pi_[A-Za-z0-9_]+$/.test(original.payment_intent_id||'')
+   &&/^ch_[A-Za-z0-9_]+$/.test(original.charge_id||'')&&/^pm_[A-Za-z0-9_]+$/.test(pm||'')
+   &&same(request,p.usageInvoicePayRequest(b,o.id,pm)));
+  if(paidEvent)check(o.status==='paid'&&o.amount_paid===b.total_cents
+   &&(!Object.hasOwn(o,'paid')||o.paid===true));
+  else check(o.status===(event.type==='invoice.created'?'draft':'open')&&o.amount_paid===0
+   &&(!Object.hasOwn(o,'paid')||o.paid===false));
+  const api=()=>check(stripe?.getApiField('version')==='2023-10-16');
+  const get=async fn=>{api();const value=snapshotStripeSdkData(await fn());api();return value;};
+  const stable=async()=>{
+   const current=await load(),nowLeaf=current.batch.provider_operation;
+   check(nowLeaf?.status==='paid'&&nowLeaf.invoice_id===o.id&&same(current.binding,b)
+    &&same(nowLeaf.operations?.pay?.proof,original)&&same(nowLeaf.operations?.pay?.request,request));
+   return current;
+  };
+  if(prior?.processed_ok===true){
+   const a=await get(()=>stripe.accounts.retrieve());check(a.object==='account'&&a.id===b.account_id);
+   await stable();
+   return Object.freeze({...base,action:paidEvent?'usage_paid_ack':'usage_stale_ack'});
+  }
+  const census=await p.readUsageInvoiceCensus({stripe,binding:b,invoiceId:o.id});
+  check(typeof census.invoice?.payment_intent==='string'&&typeof census.invoice.charge==='string');
+  const paymentIntent=await get(()=>stripe.paymentIntents.retrieve(census.invoice.payment_intent));
+  const charge=await get(()=>stripe.charges.retrieve(census.invoice.charge));
+  const refunds=await p.completePages(args=>get(()=>stripe.refunds.list({charge:charge.id,...args})),'re');
+  const current=await stable();
+  const proof=p.verifyUsageInvoicePaid({binding:b,invoiceId:o.id,invoice:census.invoice,
+   items:census.items,lines:census.lines,paymentMethodId:pm,paymentIntent,charge,refunds,
+   observationEpoch:Math.floor(Date.parse(current.observed_at)/1000)});
+  check(same(proof,original));
+  return Object.freeze({...base,action:paidEvent?'usage_paid_ack':'usage_stale_ack'});
+ }catch(_){deny();}
+}
 function eventKind(type){
  if(CHECKOUT_EVENTS.has(type))return'checkout';
  if(INVOICE_EVENTS.has(type))return'invoice';
@@ -116,6 +195,7 @@ function actionFor(event,checkout){
  return null;
 }
 async function classifyExistingEnterprisePaymentEvent({db,stripe,event}){
+ const usage=await classifyExistingEnterpriseUsageEvent({db,stripe,event});if(usage)return usage;
  const kind=eventKind(event?.type);if(!kind)return null;
  const eventObject=event?.data?.object||{};
  const eventMetadata=metadata(eventObject.metadata);
@@ -164,4 +244,4 @@ async function classifyExistingEnterprisePaymentEvent({db,stripe,event}){
   sessionId:match.checkout.id,subscriptionId:match.subscription.id,customerId:match.scope.client.stripe_customer_id,
   subscription:match.subscription,requiresReentry:true});
 }
-module.exports={classifyExistingEnterprisePaymentEvent,hasNativeMarker};
+module.exports={classifyExistingEnterprisePaymentEvent,classifyExistingEnterpriseUsageEvent,hasNativeMarker};

@@ -177,8 +177,8 @@ test('conflicting/missing/default-source/noncard/foreign payment selection holds
     const f = methodFixture(b); change(f); assert.throws(() => proof.selectUsageInvoicePaymentMethod(f));
   }
 });
-test('paid proof requires pinned invoice, exact full phase, successful same method PI/charge and refund census', async () => {
-  const { b } = await binding(), f = objects(b, 2, 'paid');
+function paidObjects(b) {
+  const f = objects(b, 2, 'paid');
   Object.assign(f, { paymentMethodId: 'pm_SYNTHETIC', observationEpoch: 1793491204, refunds: [],
     paymentIntent: { id: 'pi_SYNTHETIC', object: 'payment_intent', customer: b.customer_id, livemode: b.livemode,
       currency: 'usd', amount: b.total_cents, amount_received: b.total_cents, created: 1793491202, status: 'succeeded',
@@ -187,12 +187,32 @@ test('paid proof requires pinned invoice, exact full phase, successful same meth
       currency: 'usd', amount: b.total_cents, amount_captured: b.total_cents, created: 1793491202, status: 'succeeded',
       invoice: f.invoiceId, payment_intent: 'pi_SYNTHETIC', payment_method: 'pm_SYNTHETIC', paid: true,
       captured: true, amount_refunded: 0, refunded: false, disputed: false, refunds: null } });
+  return f;
+}
+test('paid proof requires pinned invoice, exact full phase, successful same method PI/charge and refund census', async () => {
+  const { b } = await binding(), f = paidObjects(b);
   const result = proof.verifyUsageInvoicePaid(f); assert.equal(result.amount_cents, 5000);
   assert.equal(result.payroll_authorized, false); assert.equal(result.paid_access_authorized, false);
   for (const change of [x => { x.invoiceId = 'in_OTHER'; }, x => { x.paymentIntent.status = 'processing'; },
     x => { x.charge.payment_method = 'pm_OTHER'; }, x => { x.charge.amount_refunded = 1; },
     x => { x.refunds = [{ id: 're_SYNTHETIC' }]; }, x => { x.invoice.paid_out_of_band = true; },
     x => { x.lines.pop(); }]) { const bad = clone(f); change(bad); assert.throws(() => proof.verifyUsageInvoicePaid(bad)); }
+});
+test('API2023 usage paid proof accepts omitted optional embedded refunds only with fresh empty refunds',async()=>{
+  const {b}=await binding(),f=paidObjects(b);delete f.charge.refunds;
+  const result=proof.verifyUsageInvoicePaid(f);
+  assert.equal(result.amount_cents,5000);assert.equal(result.payroll_authorized,false);assert.equal(result.paid_access_authorized,false);
+});
+for(const [label,change] of [
+  ['missing fresh refunds',f=>{delete f.refunds;}],['nonarray fresh refunds',f=>{f.refunds={object:'list',data:[],has_more:false};}],
+  ['nonempty fresh refunds',f=>{f.refunds=[{id:'re_SYNTHETIC'}];}],
+  ['own undefined embedded',f=>{f.charge.refunds=undefined;}],['malformed embedded',f=>{f.charge.refunds={};}],
+  ['nonempty embedded',f=>{f.charge.refunds={object:'list',has_more:false,data:[{id:'re_SYNTHETIC'}]};}],
+  ['truncated embedded',f=>{f.charge.refunds={object:'list',has_more:true,data:[]};}],
+  ['refunded charge',f=>{f.charge.amount_refunded=1;}],['disputed charge',f=>{f.charge.disputed=true;}]
+])test(`usage paid proof without embedded refunds still denies ${label}`,async()=>{
+  const {b}=await binding(),f=paidObjects(b);delete f.charge.refunds;change(f);
+  assert.throws(()=>proof.verifyUsageInvoicePaid(f),{code:'enterprise_usage_invoice_held'});
 });
 test('pagination follows every page, holds ceiling/duplicates/no progress instead of claiming absence', async () => {
   const calls = []; const rows = await proof.completePages(async args => { calls.push(args);
@@ -218,4 +238,67 @@ test('read-only SDK census keeps foreign platform invoices and never writes or i
   const empty = await proof.readUsageInvoiceCensus({ stripe, binding: b });
   assert.equal(Object.hasOwn(empty, 'effect_absent'), false);
   stripe.getApiField = () => 'wrong'; await assert.rejects(() => proof.readUsageInvoiceCensus({ stripe, binding: b }));
+});
+test('usage webhook reuses actual native reader/allocation and paid proof, then processed replay only rechecks account',async()=>{
+ const {raw,b}=await binding(),f=paidObjects(b);
+ const cash=proof.verifyUsageInvoicePaid(f),finalized=proof.verifyUsageInvoicePhase(objects(b,2,'open'));
+ raw.provider_operation={version:'enterprise_existing_usage_provider_v1',generation:1,status:'paid',step:'pay',
+  invoice_id:f.invoiceId,operations:{finalize:{proof:finalized},pay:{proof:cash,
+   request:proof.usageInvoicePayRequest(b,f.invoiceId,f.paymentMethodId)}}};
+ const census=Object.fromEntries(['clients','agreements','settings','roles','interviews','pools','purchases','credits','ledger','intents','customers','seals']
+  .map(key=>[key,clone(raw.snapshot[key])]));
+ census.ledger=raw.groups.flatMap(g=>g.interview_ids.map(interview_id=>({id:randomUUID(),client_id:raw.owner_id,
+  role_id:g.role_id,interview_id,unit_price_cents:g.unit_price_cents,enterprise_usage_batch_id:raw.id,
+  period_start:raw.snapshot.month_start,period_end:raw.snapshot.month_end,stripe_invoice_id:f.invoiceId,
+  stripe_invoice_item_id:finalized.items.find(i=>i.role_id===g.role_id).invoice_item_id,billed_at:'2026-11-01T00:00:02Z'})));
+ const state={status:'read',batch:raw,census,receipt:raw.snapshot.receipt,observed_at:'2026-11-01T00:00:10Z',
+  provider_effect_authorized:false,paid_access_authorized:false,payroll_authorized:false};
+ const before=clone(state),calls=[];let processed=false;
+ const db={from(table){assert.ok(['clients','billing_events'].includes(table));return{select(){return this;},
+  eq(key,value){assert.equal(key,table==='clients'?'stripe_customer_id':'stripe_event_id');
+   assert.equal(value,table==='clients'?b.customer_id:'evt_USAGE_REAL_READER');return this;},
+  async maybeSingle(){return{error:null,data:table==='clients'?clone(raw.snapshot.clients[0]):processed?{processed_ok:true}:null};}};},
+  async rpc(name,args){assert.equal(name,'change_enterprise_existing_usage_provider');assert.equal(args.p_action,'read');
+   assert.equal(args.p_owner,b.owner_id);assert.equal(args.p_batch,b.batch_id);calls.push('native_read');return{error:null,data:clone(state)};}};
+ const list=data=>({object:'list',has_more:false,data:clone(data)});
+ const stripe={getApiField:()=> '2023-10-16',accounts:{retrieve:async()=>{calls.push('account_get');return{object:'account',id:b.account_id};}},
+  invoices:{list:async()=>{calls.push('invoice_list');return list([f.invoice]);},retrieve:async id=>{
+   assert.equal(id,f.invoiceId);calls.push('invoice_get');return clone(f.invoice);},listLineItems:async()=>list(f.lines)},
+  invoiceItems:{list:async()=>list(f.items)},paymentIntents:{retrieve:async id=>{assert.equal(id,f.paymentIntent.id);return clone(f.paymentIntent);}},
+  charges:{retrieve:async id=>{assert.equal(id,f.charge.id);return clone(f.charge);}},refunds:{list:async()=>list([])}};
+ delete f.charge.refunds;
+ const event={id:'evt_USAGE_REAL_READER',type:'invoice.paid',livemode:b.livemode,data:{object:clone(f.invoice)}};
+ delete event.data.object.paid;
+ const {classifyExistingEnterprisePaymentEvent:classify}=require('../src/services/existingEnterprisePaymentWebhook');
+ const result=await classify({db,stripe,event});assert.equal(result.action,'usage_paid_ack');assert.equal(result.requiresReentry,true);
+ assert.equal(calls.filter(c=>c==='native_read').length,2);assert.ok(calls.includes('invoice_get'));assert.deepEqual(clone(state),before);
+ processed=true;calls.length=0;
+ const repeated=await classify({db,stripe,event});assert.equal(repeated.action,'usage_paid_ack');
+ assert.deepEqual(calls,['native_read','account_get','native_read']);assert.deepEqual(clone(state),before);
+ // Same full native/proof chain through the INSTALLED SDK over loopback only.
+ // Every request is GET; actual SDK hidden response metadata must be stripped.
+ const http=require('node:http'),Stripe=require('stripe'),requests=[];
+ const server=http.createServer(async(req,res)=>{try{
+  const url=new URL(req.url,'http://127.0.0.1');requests.push({method:req.method,path:url.pathname,version:req.headers['stripe-version']});
+  assert.equal(req.method,'GET');let value;
+  if(url.pathname==='/v1/account')value=await stripe.accounts.retrieve();
+  else if(url.pathname==='/v1/invoices')value=await stripe.invoices.list();
+  else if(url.pathname===`/v1/invoices/${f.invoiceId}`)value=await stripe.invoices.retrieve(f.invoiceId);
+  else if(url.pathname===`/v1/invoices/${f.invoiceId}/lines`)value=await stripe.invoices.listLineItems();
+  else if(url.pathname==='/v1/invoiceitems')value=await stripe.invoiceItems.list();
+  else if(url.pathname===`/v1/payment_intents/${f.paymentIntent.id}`)value=await stripe.paymentIntents.retrieve(f.paymentIntent.id);
+  else if(url.pathname===`/v1/charges/${f.charge.id}`)value=await stripe.charges.retrieve(f.charge.id);
+  else if(url.pathname==='/v1/refunds')value=await stripe.refunds.list();
+  assert.ok(value,'only approved local SDK read paths');
+  res.writeHead(200,{'content-type':'application/json','request-id':'req_SYNTHETIC_GET_ONLY'});res.end(JSON.stringify(value));
+ }catch(_){res.writeHead(500,{'content-type':'application/json'});res.end(JSON.stringify({error:{message:'synthetic local read rejected'}}));}});
+ await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});
+ try{
+  processed=false;
+  const sdk=new Stripe('sk_test_SYNTHETIC_LOCAL_ONLY',{apiVersion:'2023-10-16',host:'127.0.0.1',
+   port:server.address().port,protocol:'http',maxNetworkRetries:0});
+  assert.equal((await classify({db,stripe:sdk,event})).action,'usage_paid_ack');
+  assert.ok(requests.length>=10);assert.ok(requests.every(r=>r.method==='GET'&&r.version==='2023-10-16'));
+  assert.deepEqual(clone(state),before);
+ }finally{await new Promise(resolve=>server.close(resolve));}
 });

@@ -171,6 +171,78 @@ before(()=>{if(!enabled)return;assert.match(socket,/^\/private\/tmp\/alphascreen
  }
 });
 
+// This last test applies the already-reviewed leaf migration only in the
+// disposable database. All provider writes are JS-memory mutations, not Stripe.
+// Actual SQL/guards/CAS/ledger stamping and paid-leaf reads are exercised.
+async function nativeUsageCollectorAndAck(){
+ apply('20261014215100_enterprise_existing_usage_provider_leaf.sql');
+ const n=await usagePaidFixture({closed:true,count:31});
+ const {invoiceEnterpriseExistingUsage}=require('../src/services/enterpriseExistingUsageInvoice');
+ const {classifyExistingEnterpriseUsageEvent}=require('../src/services/existingEnterprisePaymentWebhook');
+ const invoiceId='in_LOCAL_USAGE',pm='pm_LOCAL_USAGE',pi='pi_LOCAL_USAGE',chargeId='ch_LOCAL_USAGE';
+ const clone=v=>structuredClone(v),writes=[],gets=[],items=[],lines=[];
+ let invoice=null,paymentIntent=null,charge=null;
+ const list=data=>({object:'list',has_more:false,data:clone(data)});
+ const money=()=>{const amount=items.reduce((sum,i)=>sum+i.amount,0);
+  Object.assign(invoice,{total:amount,subtotal:amount,amount_due:amount,subtotal_excluding_tax:amount,total_excluding_tax:amount});};
+ const stripe={getApiField:()=> '2023-10-16',accounts:{retrieve:async()=>{gets.push('account');return{object:'account',id:n.proof.provider_account_id};}},
+  customers:{retrieve:async customer=>{assert.equal(customer,n.s.customer);return{object:'customer',id:customer,livemode:false,
+   default_source:null,invoice_settings:{default_payment_method:pm}};}},
+  subscriptions:{retrieve:async sub=>{assert.equal(sub,n.proof.subscription_id);return{object:'subscription',id:sub,
+   customer:n.s.customer,livemode:false,default_source:null,default_payment_method:pm};}},
+  paymentMethods:{retrieve:async id=>{assert.equal(id,pm);return{object:'payment_method',id,type:'card',customer:n.s.customer,livemode:false};}},
+  invoiceItems:{list:async args=>{gets.push('items');assert.equal(args.customer,n.s.customer);assert.equal(args.invoice,invoiceId);return list(items);},
+   create:async(body,options)=>{writes.push({step:'item',body:clone(body),key:options.idempotencyKey});
+    assert.equal(body.invoice,invoiceId);const item={...clone(body),id:'ii_LOCAL_USAGE',object:'invoiceitem',livemode:false,
+     subscription:null,proration:false,tax_rates:[],discounts:[],price:null,unit_amount_decimal:null,amount:body.quantity*body.unit_amount};
+    items.push(item);lines.push({id:'il_LOCAL_USAGE',object:'line_item',type:'invoiceitem',invoice:invoiceId,invoice_item:item.id,
+     subscription:null,livemode:false,currency:'usd',proration:false,tax_amounts:[],tax_rates:[],discount_amounts:[],discounts:[],price:null,
+     quantity:body.quantity,amount:item.amount,amount_excluding_tax:item.amount,unit_amount_excluding_tax:null,
+     description:body.description,period:clone(body.period),metadata:clone(body.metadata)});money();return clone(item);}},
+  invoices:{list:async args=>{gets.push('invoices');assert.equal(args.customer,n.s.customer);return list(invoice?[invoice]:[]);},
+   retrieve:async id=>{gets.push('invoice');assert.equal(id,invoiceId);return clone(invoice);},
+   listLineItems:async id=>{gets.push('lines');assert.equal(id,invoiceId);return list(lines);},
+   create:async(body,options)=>{writes.push({step:'invoice',body:clone(body),key:options.idempotencyKey});assert.equal(invoice,null);
+    invoice={...clone(body),id:invoiceId,object:'invoice',livemode:false,subscription:null,paid_out_of_band:false,status:'draft',
+     paid:false,attempted:false,amount_paid:0,amount_remaining:0,ending_balance:null,automatic_tax:{enabled:false},default_tax_rates:[],
+     total_tax_amounts:[],tax:null,discount:null,discounts:[],total_discount_amounts:[],pre_payment_credit_notes_amount:0,
+     post_payment_credit_notes_amount:0,starting_balance:0,application_fee_amount:null,transfer_data:null,on_behalf_of:null,
+     shipping_cost:null,status_transitions:{finalized_at:null,paid_at:null},payment_intent:null,charge:null};money();return clone(invoice);},
+   finalizeInvoice:async(id,body,options)=>{assert.equal(id,invoiceId);writes.push({step:'finalize',body:clone(body),key:options.idempotencyKey});
+    Object.assign(invoice,{status:'open',amount_remaining:invoice.total,ending_balance:0});
+    invoice.status_transitions.finalized_at=Math.floor(Date.now()/1000);return clone(invoice);},
+   pay:async(id,body,options)=>{assert.equal(id,invoiceId);assert.equal(body.payment_method,pm);
+    writes.push({step:'pay',body:clone(body),key:options.idempotencyKey});const paidAt=Math.floor(Date.now()/1000),amount=invoice.total;
+    Object.assign(invoice,{status:'paid',paid:true,attempted:true,amount_paid:amount,amount_remaining:0,payment_intent:pi,charge:chargeId});
+    invoice.status_transitions.paid_at=paidAt;
+    paymentIntent={object:'payment_intent',id:pi,customer:n.s.customer,livemode:false,currency:'usd',amount,amount_received:amount,
+     created:paidAt,status:'succeeded',invoice:id,latest_charge:chargeId,payment_method:pm};
+    charge={object:'charge',id:chargeId,customer:n.s.customer,livemode:false,currency:'usd',amount,amount_captured:amount,
+     created:paidAt,status:'succeeded',invoice:id,payment_intent:pi,payment_method:pm,paid:true,captured:true,
+     amount_refunded:0,refunded:false,disputed:false};return clone(invoice);}},
+  paymentIntents:{retrieve:async id=>{gets.push('pi');assert.equal(id,pi);return clone(paymentIntent);}},
+  charges:{retrieve:async id=>{gets.push('charge');assert.equal(id,chargeId);return clone(charge);}},
+  refunds:{list:async args=>{gets.push('refunds');assert.equal(args.charge,chargeId);return list([]);}}};
+ const result=await invoiceEnterpriseExistingUsage({db:nativeDb,stripe,billingClientId:n.s.client,effectsEnabled:true});
+ assert.equal(result.status,'paid');assert.deepEqual(writes.map(w=>w.step),['invoice','item','finalize','pay']);
+ const snapshot=()=>sql(`select jsonb_build_object('batch',(select to_jsonb(b) from enterprise_existing_usage_batches b where id=${lit(result.batch_id)}),
+  'ledger',(select jsonb_agg(to_jsonb(l) order by id) from usage_billing_ledger l where client_id=${lit(n.s.client)}),
+  'agreement',(select to_jsonb(a) from membership_agreements a where id=${lit(n.s.id)}),
+  'client',(select to_jsonb(c) from clients c where id=${lit(n.s.client)}),
+  'plan',(select to_jsonb(p) from client_plan_settings p where client_id=${lit(n.s.client)}),
+  'pool',(select to_jsonb(p) from client_interview_pools p where agreement_id=${lit(n.s.id)}))`);
+ const before=snapshot(),event={id:'evt_LOCAL_USAGE',type:'invoice.payment_succeeded',livemode:false,data:{object:clone(invoice)}};
+ const decision=await classifyExistingEnterpriseUsageEvent({db:nativeDb,stripe,event});
+ assert.equal(decision.action,'usage_paid_ack');assert.equal(decision.batchId,result.batch_id);assert.equal(snapshot(),before);
+ assert.equal(writes.length,4);assert.equal(invoice.amount_paid,2500);
+ const resumed=await invoiceEnterpriseExistingUsage({db:nativeDb,stripe,billingClientId:n.s.client,effectsEnabled:true});
+ assert.equal(resumed.status,'not_due');assert.equal(writes.length,4);assert.equal(snapshot(),before);
+ sql(`set role service_role;insert into billing_events(stripe_event_id,type,processed_ok,payload) values(${lit(event.id)},${lit(event.type)},true,${lit(event)})`);
+ gets.length=0;
+ assert.equal((await classifyExistingEnterpriseUsageEvent({db:nativeDb,stripe,event})).action,'usage_paid_ack');
+ assert.deepEqual(gets,['account']);assert.equal(writes.length,4);assert.equal(snapshot(),before);
+}
+
 // Receipt-only native checks use real-clock A and actual sealed/pinned rows.
 // Direct scalar proof fixtures do not authenticate Stripe or prove bank cash.
 async function fundingSource({cs,replacement=null,cadence='monthly',fees={},rowDates}={}){
@@ -837,7 +909,7 @@ test('actual native trace still denies paid/PI/credit release and retains legacy
 // hosted PostgREST: SQL, constraints, guards, seals and pins are real PG17;
 // provider objects remain injected synthetic SDK data.
 class NativeQuery{
- constructor(table){assert.ok(['membership_agreements','enterprise_v2_execution_seals','public_purchase_intents','clients','billing_customers','client_interview_pools'].includes(table));this.table=table;this.fields='*';this.filters=[];}
+ constructor(table){assert.ok(['membership_agreements','enterprise_v2_execution_seals','public_purchase_intents','clients','billing_customers','client_interview_pools','billing_events'].includes(table));this.table=table;this.fields='*';this.filters=[];}
  select(fields='*'){assert.match(fields,/^(\*|[a-z_]+(,[a-z_]+)*)$/);this.fields=fields;return this;}
  eq(k,v){assert.match(k,/^[a-z_]+$/);this.filters.push(`${k}${v==null?' is null':'='+lit(v)}`);return this;}
  is(k,v){return this.eq(k,v);}order(){return this;}update(p){this.change=p;return this;}insert(p){this.add=p;return this;}
@@ -855,7 +927,8 @@ class NativeQuery{
 }
 const nativeDb={from:table=>new NativeQuery(table),async rpc(name,args){
  assert.ok(['prepare_enterprise_existing_checkout','pin_enterprise_existing_checkout_prices','pin_enterprise_existing_checkout_session',
-  'record_enterprise_existing_funding','read_enterprise_existing_billing','apply_enterprise_existing_billing','complete_enterprise_existing_payment'].includes(name));
+  'record_enterprise_existing_funding','read_enterprise_existing_billing','apply_enterprise_existing_billing','complete_enterprise_existing_payment',
+  'prepare_enterprise_existing_usage','reserve_enterprise_existing_usage','change_enterprise_existing_usage_provider'].includes(name));
  const r=run(`set role service_role;select public.${name}(${Object.entries(args).map(([k,v])=>`${k} := ${lit(v)}`).join(',')});`);
  if(r.status!==0){if(fundingEnabled)console.error('SYNTHETIC native RPC failure:',r.stderr);return{data:null,error:{message:r.stderr}};}return{data:JSON.parse(r.stdout.trim()||'null'),error:null};
 }};
@@ -983,3 +1056,4 @@ for(const cadence of ['monthly','annual'])for(const embedded of [true,false])tes
   assert.deepEqual(clientRow(s),adminClient);assert.deepEqual(planRow(s),adminPlan);
  }
 });
+test('native existing usage collector and read-only webhook share one paid leaf without charging twice',usageOpts,nativeUsageCollectorAndAck);

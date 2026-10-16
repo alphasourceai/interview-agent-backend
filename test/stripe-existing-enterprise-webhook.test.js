@@ -80,3 +80,12 @@ test('processed duplicate is acknowledged only after the native marked classifie
  const f=load({action:'held',duplicate:true,priorProcessed:true}),r=await f.post('customer.subscription.updated');
  assert.equal(r.status,200);assert.equal(f.db.events.length,1);assert.deepEqual(f.calls,[]);
 });
+for(const action of ['usage_paid_ack','usage_stale_ack'])test(`${action} only marks billing event; no invoice/account/financial writer`,async()=>{
+ const f=load({action}),r=await f.post('invoice.paid');assert.equal(r.status,200);
+ assert.deepEqual(f.calls,[]);assert.deepEqual(f.db.rpcs,[]);assert.equal(f.db.events[0].processed_ok,true);
+ assert.deepEqual(f.db.writes.map(x=>x.op),['insert','update']);
+});
+test('usage held action retains unprocessed row and returns 503 without any writer',async()=>{
+ const f=load({action:'usage_held'}),r=await f.post('invoice.payment_failed');assert.equal(r.status,503);
+ assert.equal(f.db.events[0].processed_ok,false);assert.deepEqual(f.calls,[]);assert.deepEqual(f.db.rpcs,[]);
+});
