@@ -2,8 +2,8 @@
 // Authored graphs/RPC replies only, not SQL or provider cash.
 const assert=require('node:assert/strict'),cycleFixture=require('./enterprise-platform-cycle-fixture');
 const clone=v=>structuredClone(v),iso6=s=>new Date(s*1000).toISOString().replace(/Z$/,'000Z');
-module.exports=async function fixture(t,{cadence='monthly',initial=false}={}){
- const f=await cycleFixture(t,{cadence,prefix:0}),p=f.native.a.enterprise_funding_receipt.proof;
+module.exports=async function fixture(t,{cadence='monthly',initial=false,ordinal=1}={}){
+ const f=await cycleFixture(t,{cadence,prefix:0,ordinal}),p=f.native.a.enterprise_funding_receipt.proof;
  f.sub={object:'subscription',id:p.subscription_id,customer:p.customer_id,livemode:p.livemode,currency:'usd',
   collection_method:'charge_automatically',metadata:clone(f.native.p.subscription.metadata),created:Math.floor(Date.parse(f.native.a.enterprise_checkout_source.created_at)/1000),
   status:'active',billing_cycle_anchor:f.native.a.enterprise_billing_receipt.subscription.current_period_end,

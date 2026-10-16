@@ -73,6 +73,20 @@ async function readExistingEnterprisePlatformPeriod(input){
 }
 const providerTuple=c=>snapshot({subscription_status:c.subscription_status??null,current_term_end:c.current_term_end??null,
  stripe_subscription_schedule_id:c.stripe_subscription_schedule_id??null,cancel_at_term_end:c.cancel_at_term_end??null});
+async function ownedCancellationJournal(db,agreementId,clientId,w,cancelAt){
+ const result=snapshot(await db.rpc('change_enterprise_existing_renewal',{p_agreement:agreementId,p_client:clientId,
+  p_billing:w,p_action:'read',p_auto_renew:null})),state=result?.data,r=state?.operation;
+ check(!result?.error&&state?.provider_effect_authorized===false&&state.paid_access_authorized===false&&state.payroll_authorized===false
+  &&r?.version==='enterprise_existing_renewal_change_v2'&&uuid(r.operation_id)&&isDeepStrictEqual(r.source,snapshot(w))
+  &&Date.parse(r.effective_at)===cancelAt*1000&&typeof r.requested_auto_renew==='boolean');
+ const carried=uuid(r.provider_cancel_operation_id)&&r.provider_cancel_operation_id!==r.operation_id;
+ const off=r.requested_auto_renew===false&&(['claimed','unknown','held','applied'].includes(r.status)&&typeof r.sent_at==='string'
+  ||r.status==='applied'&&carried);
+ const on=r.requested_auto_renew===true&&['waiting','held','unknown'].includes(r.status)&&carried;
+ // Applied ON retains only HISTORICAL provenance. Claimed ON is in-flight;
+ // retry the observer after its setting operation settles, never infer owner.
+ check(off||on);return r;
+}
 // Internal observer. Provider state is not funding, a legal
 // contract window or renewal consent. Native CAS may project four fields only.
 async function readExistingEnterpriseSubscriptionStatus(input){
@@ -102,30 +116,39 @@ async function readExistingEnterpriseSubscriptionStatus(input){
    &&price.recurring?.interval===p.platform_interval&&price.recurring.interval_count===1&&price.recurring.usage_type==='licensed'
    &&price.transform_quantity===null&&price.tiers_mode===null&&price.custom_unit_amount===null
    &&sub.schedule===null&&sub.pause_collection===null&&sub.trial_start===null&&sub.trial_end===null&&sub.test_clock===null
-   &&sub.cancel_at===null&&typeof sub.cancel_at_period_end==='boolean'&&sub.billing_cycle_anchor===w.subscription.current_period_end);
+   &&(sub.cancel_at===null||Number.isSafeInteger(sub.cancel_at)&&sub.cancel_at>0&&sub.cancel_at<=253402300799)
+   &&typeof sub.cancel_at_period_end==='boolean'&&sub.billing_cycle_anchor===w.subscription.current_period_end);
   const start=sub.current_period_start,end=sub.current_period_end,anchor=w.subscription.current_period_end;
   const epoch=v=>Number.isSafeInteger(v)&&v>0&&v<=253402300799;
   const now=Date.now();check(Number.isSafeInteger(now)&&epoch(start)&&epoch(end)&&end>start&&start*1000<=now
    &&epoch(sub.created)&&sub.created>=Math.floor(Date.parse(n.a.enterprise_checkout_source.created_at)/1000)
    &&sub.created*1000<=Date.parse(p.payment_success_at));
-  if(start<anchor){check(end===anchor&&start>=Math.floor(Date.parse(n.a.enterprise_checkout_source.created_at)/1000)
+  let journal=null;
+  if(sub.cancel_at!==null){
+   check(start>=anchor&&end===sub.cancel_at&&['active','past_due','unpaid','canceled'].includes(sub.status));
+   journal=await ownedCancellationJournal(db,agreementId,clientId,w,sub.cancel_at);
+  }
+  if(start<anchor){check(sub.cancel_at===null&&end===anchor&&start>=Math.floor(Date.parse(n.a.enterprise_checkout_source.created_at)/1000)
    &&start*1000<=Date.parse(p.payment_success_at));}
   else{
    const a=new Date(anchor*1000),s=new Date(start*1000),offset=(s.getUTCFullYear()-a.getUTCFullYear())*12+s.getUTCMonth()-a.getUTCMonth();
    const span=p.platform_interval==='month'?1:12;
    check(offset>=0&&offset%span===0&&offset/span<=999
     &&Date.parse(anchoredMonthInstant(a.toISOString(),offset))===start*1000
-    &&Date.parse(anchoredMonthInstant(a.toISOString(),offset+span))===end*1000);
+    &&(journal?Date.parse(anchoredMonthInstant(a.toISOString(),offset+span))>=end*1000
+     :Date.parse(anchoredMonthInstant(a.toISOString(),offset+span))===end*1000));
   }
   check(isDeepStrictEqual(account,await get(()=>stripe.accounts.retrieve()))
    &&isDeepStrictEqual(sub,await get(()=>stripe.subscriptions.retrieve(p.subscription_id))));
   const final=await load();check(isDeepStrictEqual(source,sourceProjection(final))&&isDeepStrictEqual(expected,providerTuple(final.client)));api();
-  return freeze({source,billingReceipt:w,expected,proof:{version:'enterprise_existing_subscription_status_proof_v1',
+  if(journal)check(isDeepStrictEqual(journal,await ownedCancellationJournal(db,agreementId,clientId,w,sub.cancel_at)));
+  return freeze({source,billingReceipt:w,expected,proof:{version:journal?'enterprise_existing_subscription_status_proof_v2':'enterprise_existing_subscription_status_proof_v1',
    agreement_id:agreementId,client_id:clientId,provider_account_id:p.provider_account_id,livemode:p.livemode,currency:'usd',
    customer_id:p.customer_id,subscription_id:p.subscription_id,subscription_item_id:p.platform_item_id,price_id:p.platform_price_id,
    platform_nominal_cents:p.platform_nominal_cents,platform_interval:p.platform_interval,billing_cycle_anchor:anchor,
    provider_period_start:start,provider_period_end:end,subscription_status:sub.status,cancel_at_term_end:sub.cancel_at_period_end,
-   stripe_subscription_schedule_id:null,observed_at:new Date(now).toISOString()}});
+   stripe_subscription_schedule_id:null,observed_at:new Date(now).toISOString(),
+   ...(journal?{provider_cancel_at:sub.cancel_at,renewal_operation_id:journal.operation_id}:{})}});
  }catch(_){hold();}
 }
 module.exports={readExistingEnterprisePlatformPeriod,readExistingEnterpriseSubscriptionStatus};

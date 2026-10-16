@@ -7,7 +7,9 @@ const enabled=process.env.RETAIL_FUNDING_RECEIPT_DISPOSABLE==='true',opts={skip:
 const enterpriseFenceEnabled=enabled&&process.env.ENTERPRISE_LEGACY_FENCE_DISPOSABLE==='true';
 const enterpriseUsageWindowEnabled=enabled&&process.env.ENTERPRISE_USAGE_WINDOW_DISPOSABLE==='true';
 const enterpriseUsageWindowOpts={skip:!enterpriseUsageWindowEnabled};
-const enterpriseDispatchEnabled=enabled&&process.env.ENTERPRISE_RENEWAL_DISPATCH_DISPOSABLE==='true';
+const enterpriseOwnedStatusEnabled=enabled&&process.env.ENTERPRISE_OWNED_STATUS_DISPOSABLE==='true';
+const enterpriseOwnedStatusOpts={skip:!enterpriseOwnedStatusEnabled};
+const enterpriseDispatchEnabled=enabled&&(process.env.ENTERPRISE_RENEWAL_DISPATCH_DISPOSABLE==='true'||enterpriseOwnedStatusEnabled);
 const enterpriseDispatchOpts={skip:!enterpriseDispatchEnabled};
 const enterpriseLegalEnabled=enabled&&(process.env.ENTERPRISE_LEGAL_DISPOSABLE==='true'||enterpriseUsageWindowEnabled||enterpriseDispatchEnabled);
 const enterpriseLegalOpts={skip:!enterpriseLegalEnabled};
@@ -240,6 +242,22 @@ before(()=>{if(!enabled)return;assert.match(process.env.PGHOST||'',/^\/private\/
   for(const p of catalog()){const prior=before.find(x=>x.name===p.name);assert.deepEqual(p.metadata,prior.metadata);assert.notEqual(p.body,prior.body);}
   console.log('LOCAL renewal dispatch catalog',sql(`select jsonb_agg(jsonb_build_object('name',proname,'body',md5(prosrc),'metadata',to_jsonb(p)-'prosrc') order by proname) from pg_proc p where proname in
    ('enterprise_existing_renewal_operation_valid','change_enterprise_existing_renewal','enterprise_existing_renewal_observation_valid','advance_enterprise_existing_renewal')`));
+ }
+ if(enterpriseOwnedStatusEnabled){
+  const migration=fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261016082902_enterprise_existing_owned_subscription_status.sql'),'utf8');
+  const signature='public.record_enterprise_existing_subscription_observation(uuid,uuid,jsonb,jsonb,jsonb)';
+  const catalog=()=>JSON.parse(sql(`select jsonb_build_object('body',md5(prosrc),'metadata',to_jsonb(p)-'prosrc') from pg_proc p where oid='${signature}'::regprocedure`));
+  const original=catalog(),def=sql(`select pg_get_functiondef('${signature}'::regprocedure)`),permissions=acl();
+  assert.equal(original.body,'b6b9079c31c7c64b53d867c6b073af49');
+  const state=()=>sql("select md5(coalesce(jsonb_agg(to_jsonb(c) order by id)::text,'[]')) from clients c");const before=state();
+  for(const change of [def.replace(/AS \$function\$/,'AS $function$\n -- synthetic owned status drift\n'),
+   `grant execute on function ${signature} to anon`,`alter function ${signature} security definer`,
+   `alter function ${signature} immutable`,`alter function ${signature} parallel safe`,`alter function ${signature} set lock_timeout='20s'`,
+   'alter table clients disable row level security','alter table clients disable trigger enterprise_existing_renewal_guard']){
+   denied('begin;'+change+';'+migration,/enterprise_owned_status_.*drift/);assert.deepEqual(catalog(),original);
+  }
+  sql(migration);assert.deepEqual(catalog().metadata,original.metadata);assert.notEqual(catalog().body,original.body);
+  assert.equal(acl(),permissions);assert.equal(state(),before);console.log('LOCAL owned status catalog',JSON.stringify(catalog()));
  }
  if(enterpriseUsageWindowEnabled){
   sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261014194623_enterprise_existing_usage_preparation.sql'),'utf8'));
@@ -3002,6 +3020,73 @@ async function enterpriseDispatchFixture(cadence='monthly'){
  await new Promise(r=>setTimeout(r,3100)); // real clock crosses authored initial period; no native clock override
  return f;
 }
+function enterpriseOwnedStatusProof(f,r){const o=enterpriseDispatchObservation(f,{cancel:true});return{...enterpriseStatusProof(f),
+ version:'enterprise_existing_subscription_status_proof_v2',provider_period_start:o.subscription.current_period_start,
+ provider_period_end:o.subscription.current_period_end,provider_cancel_at:o.subscription.cancel_at,renewal_operation_id:r.operation_id,
+ subscription_status:'active',cancel_at_term_end:false,observed_at:new Date().toISOString()};}
+async function enterpriseOwnedStatusFixture(cadence='monthly'){
+ const f=await enterpriseDispatchFixture(cadence),o=enterpriseDispatchObservation(f);
+ let r=enterpriseRenewal(f).operation;r=enterpriseDispatch(f,r,'claim',o).operation;r=enterpriseDispatch(f,r,'send',o).operation;
+ r=enterpriseDispatch(f,r,'finish',enterpriseDispatchObservation(f,{cancel:true})).operation;return{f,r};
+}
+for(const cadence of ['monthly','annual'])test(`ENTERPRISE OWNED STATUS ${cadence} observes exactsentOFF E without changing access/legal/receipt/pool`,enterpriseOwnedStatusOpts,async()=>{
+ const {f,r}=await enterpriseOwnedStatusFixture(cadence),before=enterpriseClient(f),financial=JSON.parse(enterprisePeriodUnchanged(f));
+ const p=enterpriseOwnedStatusProof(f,r),out=JSON.parse(sql('set role service_role;'+enterpriseStatusCall(f,p)));
+ assert.equal(out.status,'observed');assert.equal(Date.parse(out.projection.current_term_end),p.provider_cancel_at*1000);
+ assert.equal(out.projection.cancel_at_term_end,false);assert.deepEqual(withoutStatusFields(enterpriseClient(f)),withoutStatusFields(before));
+ const after=JSON.parse(enterprisePeriodUnchanged(f));delete financial.client;delete after.client;assert.deepEqual(after,financial);
+ assert.equal(enterpriseClient(f).auto_renew,false);assert.deepEqual(enterpriseRenewal(f).operation,r);
+});
+test('ENTERPRISE OWNED STATUS pending ON permits real older cancellation but claimed/applied ON never proves owner',enterpriseOwnedStatusOpts,async()=>{
+ const {f}=await enterpriseOwnedStatusFixture();let r=enterpriseRenewal(f,'request',true).operation,p=enterpriseOwnedStatusProof(f,r);
+ assert.equal(JSON.parse(sql('set role service_role;'+enterpriseStatusCall(f,p))).status,'observed');
+ r=enterpriseDispatch(f,r,'claim',enterpriseDispatchObservation(f,{cancel:true})).operation;
+ denied('set role service_role;'+enterpriseStatusCall(f,enterpriseOwnedStatusProof(f,r)),/enterprise_status_owned_cancel_denied/);
+ r=enterpriseDispatch(f,r,'send',enterpriseDispatchObservation(f,{cancel:true})).operation;
+ r=enterpriseDispatch(f,r,'finish',enterpriseDispatchObservation(f)).operation;
+ assert.equal(r.status,'applied');assert.ok(r.provider_cancel_operation_id);
+ denied('set role service_role;'+enterpriseStatusCall(f,enterpriseOwnedStatusProof(f,r)),/enterprise_status_owned_cancel_denied/);
+});
+test('ENTERPRISE OWNED STATUS no-send applied OFF retains real old writer; unknown ON may mirror it',enterpriseOwnedStatusOpts,async()=>{
+ const {f}=await enterpriseOwnedStatusFixture();let r=enterpriseRenewal(f,'request',true).operation;
+ r=enterpriseRenewal(f,'request',false).operation;assert.ok(r.provider_cancel_operation_id);assert.equal(r.sent_at,null);
+ denied('set role service_role;'+enterpriseStatusCall(f,enterpriseOwnedStatusProof(f,r)),/enterprise_status_owned_cancel_denied/);
+ const cancel=enterpriseDispatchObservation(f,{cancel:true});r=enterpriseDispatch(f,r,'claim',cancel).operation;r=enterpriseDispatch(f,r,'finish',cancel).operation;
+ assert.equal(r.sent_at,null);assert.equal(JSON.parse(sql('set role service_role;'+enterpriseStatusCall(f,enterpriseOwnedStatusProof(f,r)))).status,'observed');
+ r=enterpriseRenewal(f,'request',true).operation;r=enterpriseDispatch(f,r,'claim',cancel).operation;r=enterpriseDispatch(f,r,'send',cancel).operation;
+ r=enterpriseDispatch(f,r,'unknown',cancel).operation;
+ assert.equal(JSON.parse(sql('set role service_role;'+enterpriseStatusCall(f,enterpriseOwnedStatusProof(f,r)))).status,'observed');
+});
+test('ENTERPRISE OWNED STATUS known rejected ON retains real older cancel and projects only provider fields',enterpriseOwnedStatusOpts,async()=>{
+ const {f}=await enterpriseOwnedStatusFixture();let r=enterpriseRenewal(f,'request',true).operation;const cancel=enterpriseDispatchObservation(f,{cancel:true});
+ r=enterpriseDispatch(f,r,'claim',cancel).operation;r=enterpriseDispatch(f,r,'send',cancel).operation;r=enterpriseDispatch(f,r,'reject',cancel).operation;
+ assert.equal(r.status,'held');const before=enterpriseClient(f);
+ assert.equal(JSON.parse(sql('set role service_role;'+enterpriseStatusCall(f,enterpriseOwnedStatusProof(f,r)))).status,'observed');
+ assert.deepEqual(withoutStatusFields(enterpriseClient(f)),withoutStatusFields(before));assert.equal(enterpriseClient(f).auto_renew,true);
+});
+test('ENTERPRISE OWNED STATUS foreignE/staleop/malformed proof/browser cannot mutate mirrors or preference',enterpriseOwnedStatusOpts,async()=>{
+ const {f,r}=await enterpriseOwnedStatusFixture(),before=enterpriseClient(f),p=enterpriseOwnedStatusProof(f,r);
+ for(const patch of [{renewal_operation_id:crypto.randomUUID()},{provider_cancel_at:p.provider_cancel_at-1},
+  {provider_period_end:p.provider_period_end+1},{provider_period_start:p.provider_period_start+1},
+  {subscription_status:'paused'},{paid_access_authorized:true},{version:'enterprise_existing_subscription_status_proof_v1'}])
+  denied('set role service_role;'+enterpriseStatusCall(f,{...p,...patch}),/enterprise_status_(proof|period|owned_cancel)_denied/);
+ for(const role of ['anon','authenticated'])denied('set role '+role+';'+enterpriseStatusCall(f,p),/permission denied/);
+ assert.deepEqual(enterpriseClient(f),before);assert.deepEqual(enterpriseRenewal(f).operation,r);
+});
+test('ENTERPRISE OWNED STATUS stale operation after a legitimate opposite request fails native CAS',enterpriseOwnedStatusOpts,async()=>{
+ const {f,r}=await enterpriseOwnedStatusFixture(),p=enterpriseOwnedStatusProof(f,r);
+ const on=enterpriseRenewal(f,'request',true).operation;assert.notEqual(on.operation_id,r.operation_id);
+ denied('set role service_role;'+enterpriseStatusCall(f,p),/enterprise_status_owned_cancel_denied/);
+ assert.equal(JSON.parse(sql('set role service_role;'+enterpriseStatusCall(f,enterpriseOwnedStatusProof(f,on)))).status,'observed');
+});
+test('ENTERPRISE OWNED STATUS existing root lock still causally blocks current-journal validation and CAS',enterpriseOwnedStatusOpts,async()=>{
+ const {f,r}=await enterpriseOwnedStatusFixture(),tag='EOS'+crypto.randomUUID().replaceAll('-',''),call=enterpriseStatusCall(f,enterpriseOwnedStatusProof(f,r));
+ const [h,w,o]=await Promise.all([
+  parallel(`begin;select 1 from clients where id=${lit(f.client)} for update;select pg_sleep(0.6);commit;`),
+  parallel(`set application_name=${lit(tag)};select pg_sleep(0.1);set role service_role;${call}`),
+  parallel(`select pg_sleep(0.3);select count(*) from pg_stat_activity where application_name=${lit(tag)} and wait_event_type='Lock';`)]);
+ assert.equal(h.code,0,h.err);assert.equal(w.code,0,w.err);assert.equal(o.code,0,o.err);assert.equal(o.out.trim(),'1');
+});
 for(const cadence of ['monthly','annual'])test(`ENTERPRISE DISPATCH ${cadence} full nominal OPEN invoice honors OFF without paying or early termination`,enterpriseDispatchOpts,async()=>{
  const f=await enterpriseDispatchFixture(cadence),financial=enterprisePeriodUnchanged(f),before=enterpriseClient(f);
  const accepted=enterpriseRenewal(f).operation,o=enterpriseDispatchObservation(f);

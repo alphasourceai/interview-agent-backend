@@ -19,6 +19,8 @@ const { ensureUserIdAndInvite } = require('../../services/users/userProvisioning
 const { loadExistingRetailSubscriptionTerms } = require('../../services/contracts/subscriptionPricingTerms');
 const { STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION } = require('../../services/membershipOffers');
 const { requestExistingRetailRenewal } = require('../../services/existingRetailRenewalPreference');
+const { requestExistingEnterpriseRenewal } = require('../../services/existingEnterpriseRenewalPreference');
+const { hasNativeMarker } = require('../../services/existingEnterprisePaymentWebhook');
 
 const router = express.Router();
 
@@ -152,6 +154,31 @@ router.patch('/clients/:id/auto-renew', requireAuth, requireAdmin, async (req, r
     .maybeSingle()
   if (clientError) return res.status(500).json({ error: 'update_client_failed', detail: clientError.message })
   if (!client) return res.status(404).json({ error: 'client_not_found' })
+  // Classify every native Enterprise marker BEFORE the Retail/legacy writers.
+  // A partial/unpaid source cannot disappear into a legacy cancellation.
+  try {
+    const { data: agreement, error } = await supabaseAdmin.from('membership_agreements')
+      .select('id,client_id,is_current,enterprise_checkout_source,enterprise_checkout_pool_id,enterprise_checkout_prices,enterprise_funding_receipt,enterprise_billing_receipt')
+      .eq('client_id', client.id).eq('is_current', true).maybeSingle();
+    if (error) throw new Error('renewal_agreement_read_failed');
+    if (hasNativeMarker(agreement)) {
+      const enabled = process.env.RETAIL_STRIPE_RENEWAL_CONTROL_ENABLED === 'true';
+      const r = await requestExistingEnterpriseRenewal({ db: supabaseAdmin,
+        stripe: enabled ? require('../../clients/stripe') : undefined, clientId: client.id,
+        agreementId: agreement.id, autoRenew, effectsEnabled: enabled });
+      const op = r.operation, renewal = { kind: 'enterprise', status: r.status, reason: r.reason ?? null,
+        operation: op ? { operation_id: op.operation_id, requested_auto_renew: op.requested_auto_renew,
+          accepted_at: op.accepted_at, effective_at: op.effective_at, status: op.status } : null,
+        requested_auto_renew: op?.requested_auto_renew ?? null,
+        stripe_renewal_billing_cutoff_at: r.legal_term_end ?? op?.effective_at ?? null,
+        renewal_notice_cutoff_at: r.notice_cutoff_at ?? op?.notice_cutoff_at ?? null };
+      if (r.status === 'busy' || r.reason === 'request_deadline_passed') return res.status(409).json({ ok: false,
+        error: 'enterprise_renewal_request_not_accepted', message: r.status === 'busy'
+          ? 'The prior renewal request is still being confirmed. This change was not accepted.'
+          : 'This renewal change was not accepted because the request deadline has passed.', renewal });
+      return res.json({ ok: r.status !== 'held', renewal });
+    }
+  } catch (_) { return res.status(503).json({ error: 'enterprise_renewal_control_unavailable' }); }
   if (!client.stripe_subscription_id) return res.status(400).json({ error: 'missing_stripe_subscription' })
   // New terms reuse this control. Old accepted agreements retain the original
   // path below; a marked-source error never falls through to legacy mutation.

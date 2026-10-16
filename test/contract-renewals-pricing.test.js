@@ -107,11 +107,12 @@ test('accepted 3/6/12 prepaid and installment renewals keep the original UTC anc
   const f=fixture(3); assert.equal(getRetailRenewalWindow(f.client,f.agreement).term_end_at,'2026-07-31T12:13:14.000Z');
 });
 test('current paid Enterprise scanner refreshes real native coverage bridge before legal expiry without legacy or provider writes',async t=>{
- const f=await require('./helpers/enterprise-status-observation-fixture')(t),db=f.native.db;
+ const f=await require('./helpers/enterprise-renewal-mount-fixture')(t),db=f.native.db;
  db.tables.contract_processing_runs=[];const before=structuredClone(db.tables);
  const result=await processContractRenewals({}, {db,now:new Date('2026-11-01T00:01:03Z'),stripe:f.stripe});
  assert.equal(result.summary.due,0);assert.equal(result.summary.errors,0);assert.equal(result.summary.skipped_no_action,1);
  assert.equal(result.items[0].action,'paid_coverage_refreshed');assert.equal(f.refreshes,1);assert.equal(f.calls.length,0);
+ assert.equal(result.items[0].legal_window_status,'unchanged');assert.equal(result.items[0].renewal_request_status,'disabled');
  assert.ok(f.rpcCalls.every(x=>['read_enterprise_existing_billing','refresh_enterprise_existing_paid_coverage'].includes(x.name)));
  assert.deepEqual(db.tables.membership_agreements,before.membership_agreements);assert.deepEqual(db.updates,[]);
 });
@@ -172,7 +173,7 @@ test('legacy renewal and manual override retain their existing behavior',async()
   const manual=fixture(); manual.client.manual_active_override=true;
   const m=makeDb(manual), r=await processContractRenewals({},deps(m));
   assert.equal(r.summary.skipped_manual_override,1); assert.equal(m.writes.length,0);
-  assert.equal(m.reads.filter(x=>x.table==='membership_agreements').length,0);
+  assert.equal(m.reads.filter(x=>x.table==='membership_agreements').length,1); // Classify before legacy-only override skip.
 });
 
 test('invalid new accepted terms never fall back to a 12-month renewal',async()=>{

@@ -68,4 +68,24 @@ async function readExistingEnterpriseLegalWindow({ db, agreement, billingReceipt
     return window;
   } catch (_) { hold(); }
 }
-module.exports = { verifyExistingEnterpriseLegalWindow, readExistingEnterpriseLegalWindow };
+async function refreshExistingEnterpriseLegalWindow({ db, agreementId, clientId }) {
+  try {
+    check(UUID.test(agreementId || '') && UUID.test(clientId || ''));
+    const { readExistingEnterpriseCheckoutScope } = require('./existingEnterpriseCheckoutFunding');
+    const n = await readExistingEnterpriseCheckoutScope({ db, agreementId });
+    check(n && n.client.id === clientId && n.a.checkout_status === 'paid' && n.billingReceipt);
+    const result = await db.rpc('refresh_enterprise_existing_legal_window', { p_agreement: agreementId, p_client: clientId });
+    check(result && !result.error);
+    const { status, ...raw } = snapshotStripeSdkData(result.data);
+    check(['unchanged', 'refreshed'].includes(status));
+    const saved = verifyExistingEnterpriseLegalWindow(raw, { agreement: n.a, billingReceipt: n.billingReceipt });
+    const current = await readExistingEnterpriseLegalWindow({ db, agreement: n.a, billingReceipt: n.billingReceipt });
+    check(saved.term_start_at === current.term_start_at && saved.term_end_at === current.term_end_at);
+    const projected = await db.from('clients').select('id,contract_start_at,contract_end_at').eq('id', clientId).maybeSingle();
+    check(projected && !projected.error && projected.data?.id === clientId
+      && Date.parse(projected.data.contract_start_at) === Date.parse(current.term_start_at)
+      && Date.parse(projected.data.contract_end_at) === Date.parse(current.term_end_at));
+    return freeze({ ...current, status });
+  } catch (_) { hold(); }
+}
+module.exports = { verifyExistingEnterpriseLegalWindow, readExistingEnterpriseLegalWindow, refreshExistingEnterpriseLegalWindow };

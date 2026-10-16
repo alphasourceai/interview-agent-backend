@@ -12,6 +12,8 @@ const {refreshExistingRetailCoverage}=require('../existingRetailRecurringPayment
 const {reconcileExistingRetailRenewal}=require('../existingRetailRenewalPreference');
 const {refreshExistingEnterpriseCoverage}=require('../existingEnterprisePaymentCompletion');
 const {hasNativeMarker}=require('../existingEnterprisePaymentWebhook');
+const {reconcileExistingEnterpriseRenewal}=require('../existingEnterpriseRenewalPreference');
+const {refreshExistingEnterpriseLegalWindow}=require('../existingEnterpriseLegalWindow');
 const { legacyContractAction } = require('./legacyContractActions');
 
 function invalidRetailRenewal() {
@@ -133,18 +135,6 @@ async function processContractRenewals(context = {}, dependencies = {}) {
       const due=oldEndDate.getTime()<=nowMs;
       if(due)summary.due += 1
 
-      if (client?.manual_active_override === true) {
-        if(!due)continue;
-        summary.skipped_manual_override += 1
-        items.push({
-          id: client.id,
-          name: client.name || null,
-          action: 'skipped_manual_override',
-          contract_end_at_before: oldContractEnd
-        })
-        continue
-      }
-
       let retailWindow = null;
       try {
         // Inspect the current row before filtering by payment/signature status:
@@ -155,11 +145,21 @@ async function processContractRenewals(context = {}, dependencies = {}) {
         if (agreementError) throw new Error(agreementError.message || 'renewal_agreement_read_failed');
         if(hasNativeMarker(agreement)){
           const result=await refreshExistingEnterpriseCoverage({db,agreementId:agreement.id,clientId:client.id});
+          const legal=await refreshExistingEnterpriseLegalWindow({db,agreementId:agreement.id,clientId:client.id});
+          const renewal=await reconcileExistingEnterpriseRenewal({db,stripe,agreementId:agreement.id,clientId:client.id,
+            effectsEnabled:process.env.RETAIL_STRIPE_RENEWAL_CONTROL_ENABLED==='true'});
           summary.skipped_no_action+=1;
           items.push({id:client.id,name:client.name||null,action:'paid_coverage_refreshed',detail:result.status,
-            contract_end_at_before:oldContractEnd});
+            contract_end_at_before:oldContractEnd,legal_window_status:legal.status,renewal_request_status:renewal.status});
           // Provider active/auto-renew does not fund a new term. Existing
           // native paid-prefix source owns base access; no legacy fallthrough.
+          continue;
+        }
+        // Manual access override is not permission to ignore an accepted
+        // Enterprise nonrenewal. Only the unchanged legacy/Retail skip is here.
+        if(client?.manual_active_override===true){
+          if(due){summary.skipped_manual_override+=1;items.push({id:client.id,name:client.name||null,
+            action:'skipped_manual_override',contract_end_at_before:oldContractEnd});}
           continue;
         }
         if([STRIPE_RECURRING_OFFER_VERSION,GENERATION_DATE_OFFER_VERSION].includes(agreement?.template_snapshot?.package_snapshot?.membership_terms?.offer_version)){
