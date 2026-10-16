@@ -18,7 +18,16 @@ test('installed Stripe16/API2023 sends existing invoice/item/finalize/pay shapes
    if(u.pathname==='/v1/account')value={object:'account',id:b.account_id};
    else if(u.pathname==='/v1/invoices')value={object:'list',data:[invoice],has_more:false};
    else if(u.pathname==='/v1/invoices/in_SYNTHETIC')value=invoice;
-   else if(['/v1/invoiceitems','/v1/invoices/in_SYNTHETIC/lines'].includes(u.pathname))value={object:'list',data:[],has_more:false};
+   else if(u.pathname==='/v1/invoiceitems'){
+    // Actual API2023 rejects the combination even though both optional fields
+    // appear in the installed SDK type. Keep the read scoped to this invoice.
+    if(u.searchParams.has('customer')||u.searchParams.get('invoice')!==invoice.id){
+     res.writeHead(400,{'content-type':'application/json'});
+     return res.end(JSON.stringify({error:{message:'You may only specify one of these parameters: customer, invoice.'}}));
+    }
+    value={object:'list',data:[],has_more:false};
+   }
+   else if(u.pathname==='/v1/invoices/in_SYNTHETIC/lines')value={object:'list',data:[],has_more:false};
   }else if(req.method==='POST'){
    if(u.pathname==='/v1/invoiceitems')value={object:'invoiceitem',id:'ii_SYNTHETIC'};
    else if(['/v1/invoices','/v1/invoices/in_SYNTHETIC/finalize','/v1/invoices/in_SYNTHETIC/pay'].includes(u.pathname))value=invoice;
@@ -47,5 +56,7 @@ test('installed Stripe16/API2023 sends existing invoice/item/finalize/pay shapes
   assert.equal(writes[2].body.get('auto_advance'),'false');assert.equal(writes[3].body.get('off_session'),'true');
   assert.equal(writes[3].body.get('payment_method'),'pm_SYNTHETIC');assert.equal(writes[3].body.has('paid_out_of_band'),false);
   assert.equal(requests.some(r=>/\/payment_intents|\/subscriptions|\/customers/.test(r.path)),false);
+  const itemRead=requests.find(r=>r.method==='GET'&&r.path==='/v1/invoiceitems');
+  assert.equal(itemRead.query.get('invoice'),invoice.id);assert.equal(itemRead.query.has('customer'),false);
  }finally{await new Promise(resolve=>server.close(resolve));}
 });

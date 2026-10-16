@@ -252,7 +252,10 @@ async function readUsageInvoiceCensus({ stripe, binding: b, invoiceId = null }) 
   if (invoiceId !== null) {
     check(id(invoiceId, 'in') && invoices.filter(i => i.id === invoiceId).length === 1);
     invoice = clean(await provider(() => stripe.invoices.retrieve(invoiceId)));
-    items = await completePages(args => provider(() => stripe.invoiceItems.list({ customer: b.customer_id, invoice: invoiceId, ...args })), 'ii');
+    // Stripe accepts invoice OR customer, not both. The invoice was found in
+    // this customer's complete census; phase proof still checks every item's
+    // exact invoice and customer before any subsequent write.
+    items = await completePages(args => provider(() => stripe.invoiceItems.list({ invoice: invoiceId, ...args })), 'ii');
     lines = await completePages(args => provider(() => stripe.invoices.listLineItems(invoiceId, args)), 'il');
     const again = clean(await provider(() => stripe.invoices.retrieve(invoiceId)));
     check(isDeepStrictEqual(invoice, again));
