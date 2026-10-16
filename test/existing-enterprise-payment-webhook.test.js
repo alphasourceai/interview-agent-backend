@@ -41,6 +41,21 @@ test('classifies initial invoice.created with missing metadata through unique cu
   customer:f.client.stripe_customer_id,subscription:f.p.subscription.id,metadata:{}})});
  assert.equal(r.action,'initial_noop');assert.equal(r.sessionId,f.a.checkout_session_id);
 });
+for(const type of ['invoice.payment_succeeded','invoice.paid'])test(`${type} initial uses the same full native activation path, never empty ACK`,async()=>{
+ const f=ready(),raw={id:'in_synthetic',object:'invoice',billing_reason:'subscription_create',status:'paid',amount_paid:85192,
+  customer:f.client.stripe_customer_id,subscription:f.p.subscription.id,metadata:{}};
+ const r=await classify({db:f.db,stripe:f.stripe,event:event(f,type,raw)});
+ assert.equal(r.action,'initial_paid');assert.equal(r.requiresReentry,true);
+ for(const patch of [{amount_paid:'85192'},{amount_paid:0},{paid:false},{status:'open'}]){
+  assert.equal((await classify({db:f.db,stripe:f.stripe,event:event(f,type,{...raw,...patch})})).action,'held');
+ }
+});
+test('marked Enterprise cycle invoice.paid remains explicitly retryable until platform receipt writer exists',async()=>{
+ const f=ready(),r=await classify({db:f.db,stripe:f.stripe,event:event(f,'invoice.paid',{
+  id:'in_synthetic_cycle',object:'invoice',billing_reason:'subscription_cycle',status:'paid',amount_paid:30000,
+  customer:f.client.stripe_customer_id,subscription:f.p.subscription.id,metadata:{}})});
+ assert.equal(r.action,'held');assert.equal(r.requiresReentry,true);
+});
 test('classifies failed delayed Checkout as a no-write event and does not trust the event metadata alone',async()=>{
  const f=ready();f.p.checkout.payment_status='unpaid';
  const r=await classify({db:f.db,stripe:f.stripe,event:event(f,'checkout.session.async_payment_failed',{

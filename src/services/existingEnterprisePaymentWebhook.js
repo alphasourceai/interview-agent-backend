@@ -10,7 +10,7 @@ const {snapshotStripeSdkData}=require('./enterprisePoolPaymentProof');
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STRIPE_ID={cs:/^cs_[A-Za-z0-9_]+$/,sub:/^sub_[A-Za-z0-9_]+$/,cus:/^cus_[A-Za-z0-9_]+$/};
 const CHECKOUT_EVENTS=new Set(['checkout.session.completed','checkout.session.async_payment_succeeded','checkout.session.async_payment_failed']);
-const INVOICE_EVENTS=new Set(['invoice.created','invoice.payment_succeeded','invoice.payment_failed']);
+const INVOICE_EVENTS=new Set(['invoice.created','invoice.payment_succeeded','invoice.paid','invoice.payment_failed']);
 const SUBSCRIPTION_EVENTS=new Set(['customer.subscription.created','customer.subscription.updated','customer.subscription.deleted']);
 function fail(code='enterprise_payment_event_unclassified'){
  const e=new Error(code);e.code=code;e.status=503;throw e;
@@ -162,7 +162,7 @@ async function matchCandidate({db,stripe,event,eventObject,eventSub,eventCustome
   ||(eventSessionId&&eventSessionId!==checkout.id)
   ||(eventSubscriptionId&&eventSubscriptionId!==subscription.id)
   ||(eventSub&&eventSub.id!==subscription.id))return false;
- if(event.type==='invoice.payment_succeeded'||event.type==='invoice.payment_failed'||event.type==='invoice.created'){
+ if(INVOICE_EVENTS.has(event.type)){
   if(id(eventObject?.subscription)!==subscription.id)return false;
  }
  return {scope,checkout,subscription};
@@ -189,8 +189,9 @@ function actionFor(event,checkout){
   return'pending_noop';
  }
  if(type==='invoice.created'&&o.billing_reason==='subscription_create')return'initial_noop';
- if(type==='invoice.payment_succeeded'&&o.billing_reason==='subscription_create'
-  &&o.status==='paid'&&Number(o.amount_paid)>0)return'initial_paid';
+ if(['invoice.payment_succeeded','invoice.paid'].includes(type)&&o.billing_reason==='subscription_create'
+  &&o.status==='paid'&&Number.isSafeInteger(o.amount_paid)&&o.amount_paid>0
+  &&(!Object.hasOwn(o,'paid')||o.paid===true))return'initial_paid';
  if(INVOICE_EVENTS.has(type)||SUBSCRIPTION_EVENTS.has(type))return'held';
  return null;
 }
