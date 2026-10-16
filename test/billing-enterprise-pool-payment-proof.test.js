@@ -50,6 +50,47 @@ test('observed API2023 invoiceitem proration and omitted embedded refunds compos
   delete input.charge.refunds;
   assert.equal(prove(input).collected_cents, 85192);
 });
+for (const omitted of [[0], [1], [0, 1]]) {
+  test(`API2023 Checkout may omit optional discounts on lines ${omitted}`, () => {
+    const input = fixture({ platformCents: 30000, platformAmount: 15442 });
+    Object.assign(input.invoice.lines.data[0], { type: 'invoiceitem', invoice_item: 'ii_platform' });
+    delete input.charge.refunds;
+    for (const index of omitted) delete input.checkoutLines.data[index].discounts;
+    const proof = prove(input);
+    assert.equal(proof.collected_cents, 85192); assert.equal(proof.pool_paid_cents, 69750);
+    assert.equal(proof.platform_line_cents, 15442);
+  });
+}
+for (const [label, change] of [
+  ['own undefined discounts', l => { l.discounts = undefined; }],
+  ['malformed discounts', l => { l.discounts = {}; }],
+  ['nonempty discounts', l => { l.discounts = [{ id: 'di_other' }]; }],
+  ['nonzero discount amount', l => { l.amount_discount = 1; }],
+  ['missing discount amount', l => { delete l.amount_discount; }],
+  ['incorrect subtotal', l => { l.amount_subtotal++; }],
+  ['incorrect tax', l => { l.amount_tax++; }],
+  ['incorrect total', l => { l.amount_total++; }]
+]) for (const index of [0, 1]) {
+  test(`omitted Checkout discounts still holds ${label} on line ${index}`, () => {
+    const input = fixture();
+    for (const line of input.checkoutLines.data) delete line.discounts;
+    change(input.checkoutLines.data[index]);
+    assert.throws(() => prove(input), { code: 'pool_proof_checkout_line_mismatch', status: 409 });
+  });
+}
+for (const index of [0, 1]) test(`omitted Checkout discounts still holds foreign price on line ${index}`, () => {
+  const input = fixture();
+  for (const line of input.checkoutLines.data) delete line.discounts;
+  input.checkoutLines.data[index].price = { ...input.checkoutLines.data[index].price, id: 'price_foreign' };
+  assert.throws(() => prove(input), { code: 'pool_proof_mixed_lines', status: 409 });
+});
+for (const index of [0, 1]) test(`omitted Checkout discounts still holds altered pinned unit price on line ${index}`, () => {
+  const input = fixture();
+  for (const line of input.checkoutLines.data) delete line.discounts;
+  const line = input.checkoutLines.data[index];
+  line.price = { ...line.price, unit_amount: line.price.unit_amount + 1 };
+  assert.throws(() => prove(input), { code: 'pool_proof_price_mismatch', status: 409 });
+});
 test('nonprorated invoiceitem is held even when its amount equals the accepted nominal', () => {
   const input = fixture({ platformCents: 30000, platformAmount: 30000, proration: false });
   Object.assign(input.invoice.lines.data[0], { type: 'invoiceitem', invoice_item: 'ii_platform' });

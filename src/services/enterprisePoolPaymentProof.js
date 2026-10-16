@@ -215,7 +215,7 @@ function proveEnterprisePoolPayment(raw = {}) {
     const isPool = line === checkoutPools[0], amount = isPool ? pool.amount : platform.amount;
     const tax = isPool ? poolTax : platformTax;
     check(line.object === 'item' && line.quantity === 1 && line.currency === 'usd'
-      && line.amount_discount === 0 && nullableEmpty(line.discounts)
+      && line.amount_discount === 0 && optionalEmpty(line, 'discounts')
       && line.amount_subtotal === amount && line.amount_tax === tax
       && line.amount_total === amount + tax, 'pool_proof_checkout_line_mismatch');
     price(line.price, isPool ? b.poolPriceId : b.platformPriceId,

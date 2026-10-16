@@ -79,13 +79,15 @@ test('opaque pinned Price ids are resolved freshly; altered expanded copy is not
  assert.equal((await read(f.args)).pool_paid_cents,69750);
  const x=fixture();x.p.checkoutLines.data[1].price.metadata={};await assert.rejects(read(x.args),{code:'enterprise_funding_expanded_price_mismatch'});
 });
-for(const providerShape of ['legacy','observed_API2023','observed_nonprorated_invoiceitem'])
+for(const providerShape of ['legacy','observed_API2023','observed_nonprorated_invoiceitem','observed_discounted_checkout'])
 test(`installed SDK executes this adapter with GET-only API2023 ${providerShape} requests, no provider connection`,async()=>{
  const f=fixture({embedded:true}),requests=[];
  if(providerShape!=='legacy'){
   delete f.p.charge.refunds;
   Object.assign(f.p.invoice.lines.data[0],{type:'invoiceitem',invoice_item:'ii_platform'});
+  for(const line of f.p.checkoutLines.data)delete line.discounts;
   if(providerShape==='observed_nonprorated_invoiceitem')f.p.invoice.lines.data[0].proration=false;
+  if(providerShape==='observed_discounted_checkout')f.p.checkoutLines.data[0].amount_discount=1;
  }
  const server=http.createServer(async(req,res)=>{try{
   const u=new URL(req.url,'http://127.0.0.1'),p=Object.fromEntries(u.searchParams),path=u.pathname;
@@ -109,8 +111,9 @@ test(`installed SDK executes this adapter with GET-only API2023 ${providerShape}
  try{
   const stripe=new Stripe('sk_test_SYNTHETIC_NO_PROVIDER',{apiVersion:'2023-10-16',host:'127.0.0.1',port:server.address().port,protocol:'http',maxNetworkRetries:0});
   let proof;
-  if(providerShape==='observed_nonprorated_invoiceitem'){
-   await assert.rejects(read({...f.args,stripe}),{code:'pool_proof_platform_line_mismatch',status:409});
+  if(['observed_nonprorated_invoiceitem','observed_discounted_checkout'].includes(providerShape)){
+   await assert.rejects(read({...f.args,stripe}),{code:providerShape==='observed_nonprorated_invoiceitem'
+    ?'pool_proof_platform_line_mismatch':'pool_proof_checkout_line_mismatch',status:409});
    assert.equal(f.db.updates.length,0);assert.equal(f.db.inserts.length,0);assert.equal(f.db.rpcCalls.length,0);
   }else{
    proof=await read({...f.args,stripe});assert.equal(proof.pool_paid_cents,69750);assert.equal(proof.payment_success_at,'2026-10-01T13:00:00.000Z');
@@ -118,6 +121,6 @@ test(`installed SDK executes this adapter with GET-only API2023 ${providerShape}
   assert.ok(requests.length>=12);assert.ok(requests.every(r=>r.method==='GET'&&r.version==='2023-10-16'));
   if(proof){
    assert.equal(JSON.stringify(proof).includes('sk_test_'),false);assert.equal(JSON.stringify(proof).includes('lastResponse'),false);
-  }else assert.equal(providerShape,'observed_nonprorated_invoiceitem');
+  }else assert.ok(['observed_nonprorated_invoiceitem','observed_discounted_checkout'].includes(providerShape));
  }finally{await new Promise(resolve=>server.close(resolve));}
 });
