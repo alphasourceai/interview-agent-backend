@@ -3,7 +3,7 @@
 // LOCAL/UNMOUNTED proof for the existing Enterprise subscription's platform
 // invoice. Does not collect, grant pool credits/access, qualify payroll or write.
 // Native receipt and GET-only reader/writer gates remain separate requirements.
-const {snapshotStripeSdkData:snapshot}=require('./enterprisePoolPaymentProof');
+const {snapshotStripeSdkData:snapshot,snapshotEnterpriseUsageCensusData:nativeSnapshot}=require('./enterprisePoolPaymentProof');
 const {verifyEnterpriseBillingReceipt}=require('./existingEnterpriseBillingReceipt');
 const {exactPaymentTime}=require('./existingEnterprisePaymentRows');
 const {isDeepStrictEqual}=require('node:util');
@@ -21,7 +21,11 @@ function sum(values,kind){check(Array.isArray(values));return values.reduce((n,v
 },0);}
 function proveExistingEnterprisePlatformPeriod(raw){
  try{
-  const x=snapshot(raw),a=x.agreement,i=x.invoice,lines=x.invoiceLines,pi=x.paymentIntent,ch=x.charge;
+  // Snapshot before destructuring so caller getters/proxies never execute.
+  // Only the native agreement uses the larger bounded profile; every provider
+  // field is checked again under the unchanged SDK limits before proof use.
+  const whole=nativeSnapshot(raw),{agreement,...provider}=whole;
+  const x={...snapshot(provider),agreement},a=x.agreement,i=x.invoice,lines=x.invoiceLines,pi=x.paymentIntent,ch=x.charge;
   check(a?.checkout_status==='paid'&&['signed','active'].includes(a.status)&&a.is_current===true
    &&a.superseded_by_agreement_id===null&&a.voided_at==null);
   const w=verifyEnterpriseBillingReceipt(a.enterprise_billing_receipt,{source:a.enterprise_checkout_source,

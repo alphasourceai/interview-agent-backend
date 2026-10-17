@@ -80,3 +80,44 @@ test('native subsecond observation retains original provider second precision',a
  const x=await fixture();x.observedAt=x.observedAt.replace('.000Z','.987654Z');
  assert.equal(prove(x).cash_cents,99999);
 });
+test('pure proof accepts actual rendered native agreement without weakening provider limits',async()=>{
+ const x=await fixture({tax:700,discount:1000}),expected=prove(x);
+ const {html}=require('../src/render/membershipAgreement').buildMembershipAgreementHtml({
+  ...x.agreement.template_snapshot.values,client_legal_name:'Synthetic Large Agreement',
+  primary_admin_name:'Synthetic Owner',admin_email:'owner@example.invalid'});
+ assert.ok(html.length>8192);
+ x.agreement.template_snapshot.rendered_html=html;
+ x.agreement.enterprise_checkout_source.material.template_snapshot.rendered_html=html;
+ const before=clone(x);assert.deepEqual(prove(x),expected);assert.deepEqual(x,before);
+ x.invoice.description='x'.repeat(8193);
+ assert.throws(()=>prove(x),{code:'enterprise_platform_period_unverified'});
+});
+test('mixed snapshot rejects original caller getters and proxies without invoking them',async()=>{
+ const x=await fixture();let touched=0;
+ const accessor={...x};Object.defineProperty(accessor,'agreement',{enumerable:true,get(){touched++;return x.agreement;}});
+ assert.throws(()=>prove(accessor),{code:'enterprise_platform_period_unverified'});assert.equal(touched,0);
+ assert.throws(()=>prove(new Proxy(x,{get(){touched++;throw Error('must not execute');}})),{code:'enterprise_platform_period_unverified'});
+ assert.equal(touched,0);
+});
+test('mixed proof keeps native total-byte and provider node/depth limits',async()=>{
+ for(const mode of ['oversized','nodes','depth','cycle','undefined','receipt']){
+  const x=await fixture();
+  if(mode==='oversized')x.agreement.extra='x'.repeat(16777217);
+  else if(mode==='nodes')x.invoice.extra=Array.from({length:10001},()=>null);
+  else if(mode==='depth'){let current=x.invoice;for(let n=0;n<22;n++){current.extra={};current=current.extra;}}
+  else if(mode==='cycle')x.invoice.extra=x;
+  else if(mode==='undefined')x.invoice.extra=undefined;
+  else x.agreement.enterprise_billing_receipt.extra='x'.repeat(8193);
+  assert.throws(()=>prove(x),{code:'enterprise_platform_period_unverified'},mode);
+ }
+});
+test('combined native and valid SDK-sized provider bytes still enforce16MiB total',async()=>{
+ const x=await fixture(),{snapshotStripeSdkData,snapshotEnterpriseUsageCensusData}=require('../src/services/enterprisePoolPaymentProof');
+ const html='x'.repeat(4*1024*1024);
+ x.agreement.template_snapshot.rendered_html=html;
+ x.agreement.enterprise_checkout_source.material.template_snapshot.rendered_html=html;
+ x.invoice.extra=Array.from({length:2048},()=> 'p'.repeat(4096));
+ assert.doesNotThrow(()=>snapshotEnterpriseUsageCensusData(x.agreement));
+ const {agreement,...provider}=x;assert.doesNotThrow(()=>snapshotStripeSdkData(provider));
+ assert.throws(()=>prove(x),{code:'enterprise_platform_period_unverified'});
+});

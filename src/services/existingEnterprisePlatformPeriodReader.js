@@ -5,7 +5,7 @@
 const {isDeepStrictEqual,types:{isProxy}}=require('node:util');
 const {readExistingEnterpriseCheckoutScope}=require('./existingEnterpriseCheckoutFunding');
 const {proveExistingEnterprisePlatformPeriod}=require('./existingEnterprisePlatformPeriodProof');
-const {snapshotStripeSdkData:snapshot}=require('./enterprisePoolPaymentProof');
+const {snapshotStripeSdkData:snapshot,snapshotEnterpriseUsageCensusData:nativeSnapshot}=require('./enterprisePoolPaymentProof');
 const {collect}=require('./existingRetailCheckoutFunding');
 const {freeze}=require('./existingEnterpriseBillingReceipt');
 const {anchoredMonthInstant}=require('./membershipOffers');
@@ -15,7 +15,9 @@ function hold(){throw Object.assign(new Error('enterprise_platform_period_unveri
 const check=v=>{if(!v)hold();};
 const pick=(v,keys)=>Object.fromEntries(keys.map(k=>[k,v[k]??null]));
 function sourceProjection(n){
- return snapshot({version:'enterprise_existing_platform_period_source_v1',agreement_id:n.a.id,client_id:n.client.id,
+ // This is a native sealed agreement (including rendered HTML), not an SDK response.
+ // Reuse the bounded native profile; provider/proof snapshots remain unchanged.
+ return nativeSnapshot({version:'enterprise_existing_platform_period_source_v1',agreement_id:n.a.id,client_id:n.client.id,
   agreement:pick(n.a,['id','client_id','status','is_current','superseded_at','superseded_by_agreement_id','voided_at',
    'membership_tier','billing_option','template_version','template_snapshot','checkout_status','checkout_session_id',
    'checkout_paid_at','enterprise_checkout_source','enterprise_checkout_pool_id','enterprise_checkout_prices',

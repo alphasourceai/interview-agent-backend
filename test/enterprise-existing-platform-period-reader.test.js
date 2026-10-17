@@ -65,6 +65,18 @@ for(const cadence of ['monthly','annual'])test(`GET-only ${cadence} platform per
  assert.deepEqual(f.native.db.tables,before);assert.equal(f.native.db.inserts.length,0);assert.equal(f.native.db.updates.length,0);
  assert.deepEqual(f.calls.map(c=>c.kind),['account','invoice','lines','pi','charge','refunds','account','invoice','lines','pi','charge','refunds']);
 });
+test('platform period reader accepts actual large rendered native agreement without writes',async(t)=>{
+ const f=await fixture(t),{html}=require('../src/render/membershipAgreement').buildMembershipAgreementHtml({
+  ...f.native.a.template_snapshot.values,client_legal_name:'Synthetic Large Agreement',
+  primary_admin_name:'Synthetic Owner',admin_email:'owner@example.invalid'});
+ assert.ok(html.length>8192);
+ for(const target of [f.native.a.template_snapshot,f.native.seal.source_snapshot,
+  f.native.a.enterprise_checkout_source.material.template_snapshot,
+  f.native.a.enterprise_checkout_source.material.execution_seal.source_snapshot])target.rendered_html=html;
+ const before=clone(f.native.db.tables),r=await read(f.args);
+ assert.equal(r.proof.ordinal,1);assert.deepEqual(f.native.db.tables,before);
+ assert.equal(f.native.db.inserts.length,0);assert.equal(f.native.db.updates.length,0);
+});
 for(const [name,change]of [
  ['active agreement',f=>{f.native.a.status='active';}],
  ['unpaid source',f=>{f.native.a.checkout_status='pending_payment';}],
