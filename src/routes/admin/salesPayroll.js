@@ -10,6 +10,7 @@ const { loadExistingRetailCommissionPayment, assertCommissionPaymentInput } = re
 const { parseMercuryPayrollCsv } = require('../../services/mercuryPayrollCsv');
 const { loadSalesPayrollReport } = require('../../services/salesPayrollReportQuery');
 const { buildSalesPayrollWorkbook } = require('../../services/salesPayrollWorkbook');
+const { readRenewalCommissionPolicy, setRenewalCommissionPolicy } = require('../../services/salesRenewalCommissionPolicy');
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PAYMENT_KINDS = new Set(['monthly', 'paid_in_full', 'financed_checkout']);
@@ -86,6 +87,7 @@ function safeError(res, error) {
   if (error?.code === '23514') return res.status(409).json({ error: 'commission_ledger_constraint' });
   if (error?.code === 'P0001') {
     const native = String(error.message || '');
+    if (native === 'renewal_commissions_disabled') return res.status(422).json({ error: native });
     if (/^retail_recurring_source_(?:schema_|prerequisite_|trigger_|server_)/.test(native))
       return res.status(503).json({ error: 'sales_payroll_unavailable' });
     if (native === 'native_commission_proof_conflict' || native === 'outside_original_first_year')
@@ -139,7 +141,7 @@ function createAdminSalesPayrollRouter({ db } = {}) {
       const reversedBankIds = new Set(reversals.map((row) => row.bank_transaction_id));
       const effectivePayouts = payouts.filter((row) => !row.bank_transaction_id || !reversedBankIds.has(row.bank_transaction_id));
       return res.json({
-        policy: { rate: 0.5, basis: 'each reviewed net platform payment; original first year for new retail and Enterprise terms, first term for legacy', timezone: 'America/Denver', annual_paid_monthly: 'each funded monthly receipt', automation_enabled: false },
+        policy: { rate: 0.5, basis: 'initial-term net platform payments; renewals require the admin setting and remain subject to existing first-year limits', timezone: 'America/Denver', annual_paid_monthly: 'each funded monthly receipt', automation_enabled: false },
         automation: { enabled: false, can_enable: false, reason: 'Worker, reconciliation, and payout controls require a separate reviewed release.' },
         representatives: reps, pending_evidence: pendingEvidence, review_candidates: reviewCandidates,
         enterprise_review_candidates: enterpriseCandidates,
@@ -147,6 +149,16 @@ function createAdminSalesPayrollRouter({ db } = {}) {
         truncated: [reps, intents, receipts, adjustments, payouts, reversals, enterpriseRead.data].some((rows) => rows.length === MAX_ROWS),
       });
     } catch (error) { return safeError(res, error); }
+  });
+
+  router.get('/renewal-commissions', async (_req, res) => {
+    try { return res.json(await readRenewalCommissionPolicy(db)); }
+    catch (error) { return safeError(res, error); }
+  });
+
+  router.post('/renewal-commissions', async (req, res) => {
+    try { return res.json(await setRenewalCommissionPolicy(db, req.body, req.user.id)); }
+    catch (error) { return safeError(res, error); }
   });
 
   router.get('/report', async (req, res) => {
@@ -305,7 +317,7 @@ function createAdminSalesPayrollRouter({ db } = {}) {
       if (result.status !== 'payable') throw failure(result.reason || 'receipt_not_payable');
       const weekStart = latestWeek(result.statement_week.from_iso, new Date().toISOString());
       await requireUnlockedWeek(db, rep.user_id, weekStart);
-      const { data, error } = await db.from('sales_commission_receipts').insert({
+      const receiptRow = {
         ...(membership ? membership.ledgerFields : {}),
         purchase_intent_id: intentId, rep_user_id: rep.user_id, provider, provider_payment_id: paymentId,
         payment_kind: paymentKind, currency: 'usd', payment_success_at: paymentAt, funds_received_at: fundsAt,
@@ -315,7 +327,16 @@ function createAdminSalesPayrollRouter({ db } = {}) {
         statement_week_start: weekStart, evidence_reference: evidence,
         review_note: String(body.review_note || '').trim().slice(0, 1000) || null,
         reviewed_by_user_id: req.user.id,
-      }).select('id,net_membership_cents,commission_cents,statement_week_start').single();
+      };
+      if (membership) {
+        // Same native proof classifier as INSERT guard; never infer renewal
+        // from cash timestamp or the buyer's mutable current coverage window.
+        const classification = await db.rpc('sales_commission_receipt_is_renewal', { r: receiptRow });
+        if (classification?.error || typeof classification?.data !== 'boolean') throw failure('renewal_commission_policy_unavailable',503);
+        if (classification.data && !(await readRenewalCommissionPolicy(db)).enabled) throw failure('renewal_commissions_disabled');
+      }
+      const { data, error } = await db.from('sales_commission_receipts').insert(receiptRow)
+        .select('id,net_membership_cents,commission_cents,statement_week_start').single();
       if (error) throw error;
       return res.status(201).json({ receipt: { id:data?.id,net_membership_cents:data?.net_membership_cents,
         commission_cents:data?.commission_cents,statement_week_start:data?.statement_week_start } });

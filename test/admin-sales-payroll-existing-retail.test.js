@@ -9,6 +9,9 @@ const REP='77777777-7777-4777-8777-777777777777',OTHER='88888888-8888-4888-8888-
 const OWNER='99999999-9999-4999-8999-999999999999';
 function setup(months=3,payment='monthly_installments',plan='basic'){
   const f=fixture(plan,months,payment,true),rpcCalls=[],reads=[];
+  // Existing first-year renewal regressions explicitly opt IN. Default OFF is
+  // exercised separately below; no production default is changed by this fixture.
+  f.tables.sales_renewal_commission_policy_events=[{version:1,enabled:true}];
   Object.assign(f.g,{checkout_status:'paid',checkout_paid_at:PAID});
   Object.assign(f.i,{status:'completed',activated_at:PAID,billing_applied_at:'2026-02-01T00:00:00Z',
     channel:'self_service',created_by_user_id:OTHER,company_legal_name:'Original Synthetic Buyer',buyer_email:'synthetic@example.invalid'});
@@ -21,6 +24,7 @@ function setup(months=3,payment='monthly_installments',plan='basic'){
   f.db.from=table=>{reads.push(table);if(table.startsWith('membership_v2_'))throw Error('retired tables must not be queried');return from(table);};
   f.db.rpc=async(name,values)=>{
     rpcCalls.push({name,values});
+    if(name==='sales_commission_receipt_is_renewal')return {data:Date.parse(values.r.payment_success_at)>=Date.parse(values.r.first_term_end_at),error:null};
     if(name==='retail_existing_commission_source')return {data:'retail_existing_terms_v2',error:null};
     if(name==='retail_existing_sales_terms_digest')return {data:'a'.repeat(64),error:null};
     throw Error('unexpected_rpc');
@@ -66,6 +70,14 @@ async function withServer(f,callback){const app=express();app.use(express.json()
     method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)});return {status:res.status,body:await res.json()};});}
   finally{await new Promise(resolve=>server.close(resolve));}
 }
+test('renewal policy defaults OFF without changing initial-term installments or old receipts',async()=>{
+  const f=setup(3);f.tables.sales_renewal_commission_policy_events=[];
+  await withServer(f,async send=>{
+    assert.deepEqual(await send(body(f)),{status:422,body:{error:'renewal_commissions_disabled'}});
+    assert.equal(f.tables.sales_commission_receipts?.length||0,0);
+    assert.equal((await send(body(f,{provider_payment_id:'pi_INITIAL_TERM',payment_success_at:'2026-02-15T00:00:00Z',funds_received_at:'2026-02-16T00:00:00Z'}))).status,201);
+  });
+});
 for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment of ['prepaid','monthly_installments']){
   test(`existing receipt API ${plan}/${months}/${payment} freezes original rep and actual platform receipt`,async()=>{
     const f=setup(months,payment,plan);
@@ -78,7 +90,7 @@ for(const plan of ['basic','pro'])for(const months of [3,6,12])for(const payment
       assert.equal(row.policy_version,'retail-existing-terms-v2-commission-v1');assert.equal(row.qualification_closed_at,PAID);
       assert.equal(row.first_term_end_at,anchoredMonthInstant(PAID,months));assert.equal(row.gross_membership_cents,f.q.platform_cap_cents);
       assert.ok(row.gross_membership_cents<f.pkg.membership_terms.initial_payment_cents);
-      assert.deepEqual([...new Set(f.rpcCalls.map(r=>r.name))],['retail_existing_commission_source','retail_existing_sales_terms_digest']);
+      assert.deepEqual([...new Set(f.rpcCalls.map(r=>r.name))],['retail_existing_commission_source','retail_existing_sales_terms_digest','sales_commission_receipt_is_renewal']);
       assert.ok(!f.reads.some(t=>t.startsWith('membership_v2_')));
     });
   });

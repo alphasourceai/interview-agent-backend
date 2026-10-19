@@ -26,6 +26,7 @@ async function setup(cadence='monthly'){
   provider_effect_authorized:false,paid_access_authorized:false,payroll_authorized:false,settlement_verified:false};
  const state={db,tables,n,w,p,q,ack,calls};
  db.rpc=async(name,args)=>{
+  if(name==='sales_commission_receipt_is_renewal')return{data:false,error:null}; // these fixtures contain only ordinal-zero initial payments
   calls.push({name,args:clone(args)});if(name==='read_enterprise_existing_billing')return{data:clone(w),error:null};
   assert.equal(name,'read_enterprise_existing_commission_payment');assert.equal(args.p_agreement,n.a.id);assert.equal(args.p_client,n.client.id);
   if(!tables.sales_commission_receipts.length&&args.p_attested!==true)return{data:null,error:{code:'P0001',message:'enterprise_commission_original_rep_attestation_required'}};

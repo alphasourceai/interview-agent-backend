@@ -161,7 +161,8 @@ function guardedPricingDevFence(req, res, next) {
   const override = req.headers?.['x-http-method-override'] != null || req.headers?.['x-method-override'] != null || url.searchParams.has('_method');
   const sandboxPost = new Set(['/membership-agreements/session','/membership-agreements/sign','/membership-agreements/checkout-session',
     '/clients/billing/portal-session','/clients/billing/additional-interviews/checkout-session','/clients/roles/checkout-session',
-    '/admin/billing/customers','/admin/billing/invoices/sync','/sales/promotion-codes/validate']);
+    '/admin/billing/customers','/admin/billing/invoices/sync','/sales/promotion-codes/validate',
+    '/admin/sales-payroll/renewal-commissions']);
   const id='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
   const clientPost=new RegExp('^/admin/clients/'+id+'/(billing/checkout-session|subscription-checkout|subscription-invoice|usage-invoice|cancel-contract)$');
   const usageInvoiceOwner = pathname.match(new RegExp('^/admin/clients/('+id+')/usage-invoice$'))?.[1];

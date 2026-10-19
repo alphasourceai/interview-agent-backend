@@ -9,6 +9,7 @@ const enterpriseUsageWindowEnabled=enabled&&process.env.ENTERPRISE_USAGE_WINDOW_
 const enterpriseUsageWindowOpts={skip:!enterpriseUsageWindowEnabled};
 const enterpriseCommissionEnabled=enabled&&process.env.ENTERPRISE_COMMISSION_DISPOSABLE==='true';
 const enterpriseCommissionOpts={skip:!enterpriseCommissionEnabled};
+const renewalPolicyNativeOpts={skip:!enterpriseCommissionEnabled||process.env.SALES_RENEWAL_NATIVE_FULL!=='true'};
 const enterpriseOwnedStatusEnabled=enabled&&(process.env.ENTERPRISE_OWNED_STATUS_DISPOSABLE==='true'||enterpriseCommissionEnabled);
 const enterpriseOwnedStatusOpts={skip:!enterpriseOwnedStatusEnabled};
 const enterpriseDispatchEnabled=enabled&&(process.env.ENTERPRISE_RENEWAL_DISPATCH_DISPOSABLE==='true'||enterpriseOwnedStatusEnabled);
@@ -2784,6 +2785,41 @@ async function enterpriseCommissionFixture(options={}){
 const enterpriseCommissionReadCall=(f,invoice=f.funding.invoice_id,rep=f.rep,attested=true)=>
  `select read_enterprise_existing_commission_payment(${[f.id,f.client,invoice,rep,attested].map(lit).join(',')});`;
 const enterpriseCommissionRead=(...args)=>JSON.parse(sql('set role service_role;'+enterpriseCommissionReadCall(...args)));
+function installRenewalPolicyForNativeTest(){
+ if(sql("select to_regprocedure('public.sales_commission_receipt_is_renewal(jsonb)') is null")!=='t')return;
+ const before=sql("select md5(coalesce(jsonb_agg(to_jsonb(r) order by id)::text,'[]')) from sales_commission_receipts r");
+ sql(fs.readFileSync(path.resolve(__dirname,'../supabase/migrations/20261019211919_sales_renewal_commission_policy.sql'),'utf8'));
+ assert.equal(sql("select md5(coalesce(jsonb_agg(to_jsonb(r) order by id)::text,'[]')) from sales_commission_receipts r"),before);
+}
+test('RENEWAL POLICY native existing Retail proof classifies monthly installment vs prepaid renewal without cash inference',renewalPolicyNativeOpts,async()=>{
+ installRenewalPolicyForNativeTest();
+ for(const payment of ['monthly_installments','prepaid']){
+  const x=await paidCycleFixture(payment,false,{beforeActivation:commissionRep,buyerEmail:'renewal-policy-native-'+payment+'@example.invalid'});
+  assert.equal(JSON.parse(sql('set role service_role;'+cycleRecord(x))).status,'recorded');
+  const r=commissionRow(x.f,x.p),isRenewal=payment==='prepaid';
+  assert.equal(sql('set role service_role;select sales_commission_receipt_is_renewal('+lit(r)+');'),isRenewal?'t':'f');
+  if(isRenewal)denied('set role service_role;'+commissionInsert(r),/renewal_commissions_disabled/);
+  else sql('set role service_role;'+commissionInsert(r));
+  if(isRenewal){
+   const on=JSON.parse(sql('set role service_role;select set_sales_renewal_commissions(true,0,'+lit(x.f.reviewer)+');'));
+   sql('set role service_role;'+commissionInsert(r));
+   assert.equal(JSON.parse(sql('set role service_role;select set_sales_renewal_commissions(false,'+on.version+','+lit(x.f.reviewer)+');')).enabled,false);
+   denied('set role service_role;'+commissionInsert({...r,id:crypto.randomUUID(),gross_membership_cents:1}),/native_commission_|retail_commission_/);
+  }
+  assert.equal(sql('select count(*) from sales_commission_receipts where id='+lit(r.id)),'1');
+ }
+});
+test('RENEWAL POLICY native Enterprise initial and later in-term platform proof remain commissionable with OFF',renewalPolicyNativeOpts,async()=>{
+ installRenewalPolicyForNativeTest();
+ const f=await enterpriseCommissionFixture(),initial=enterpriseCommissionRead(f),r=enterpriseCommissionRow(f,initial);
+ assert.equal(sql('set role service_role;select sales_commission_receipt_is_renewal('+lit(r)+');'),'f');
+ sql('set role service_role;'+commissionInsert(r));
+ recordEnterprisePeriod(f);
+ const later=enterpriseCommissionRow(f,enterpriseCommissionRead(f,f.proof.invoice_id,null,false));
+ assert.equal(sql('set role service_role;select sales_commission_receipt_is_renewal('+lit(later)+');'),'f');
+ sql('set role service_role;'+commissionInsert(later));
+ assert.equal(sql('select count(*) from sales_commission_receipts where enterprise_agreement_id='+lit(f.id)),'2');
+});
 function enterpriseCommissionRow(f,p,patch={}){
  const q=p.qualification,{weekRangeForTimestamp}=require('../src/services/salesCommissionPolicy');
  return{id:crypto.randomUUID(),purchase_intent_id:null,enterprise_agreement_id:f.id,enterprise_commission_source:q,

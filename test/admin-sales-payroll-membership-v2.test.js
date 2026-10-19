@@ -13,6 +13,7 @@ const start='2025-01-31T14:20:30.000Z',close='2025-01-31T14:20:40.000Z';
 function fixture(months=3,payment='monthly_installments') {
   const offer=buildRetailOffer({planKey:'basic',commitmentMonths:months,paymentOption:payment,channel:'sales',offerVersion:OFFER_VERSION});
   return {
+    sales_renewal_commission_policy_events:{version:1,enabled:true},
     public_purchase_intents:{id:ids.intent,status:'completed',channel:'sales_assisted',created_by_user_id:ids.rep,
       agreement_id:ids.agreement,client_id:ids.client,activated_at:close,selected_billing_cadence:'annual',platform_fee_cents:1},
     membership_v2_sales_qualifications:{contract_id:ids.contract,contract_version:1,purchase_intent_id:ids.intent,rep_user_id:ids.rep,
@@ -27,13 +28,14 @@ function fixture(months=3,payment='monthly_installments') {
 }
 function database(records,errors={}) {
   const reads=[],writes=[];
-  return {reads,writes,async rpc(name) {
+  return {reads,writes,async rpc(name,args) {
+    if(name==='sales_commission_receipt_is_renewal')return {data:Date.parse(args.r.payment_success_at)>=Date.parse(args.r.first_term_end_at),error:null};
     assert.equal(name,'retail_existing_commission_source');
     reads.push({rpc:name});return {data:records.membership_v2_contracts?'retail_terms_v2':'legacy_receipt_v1',error:null};
   },from(table) {
     return {
       select(columns) {
-        const filters=[];const query={eq(key,value){filters.push([key,value]);return query;},async maybeSingle(){
+        const filters=[];const query={order(){return query;},limit(){return query;},eq(key,value){filters.push([key,value]);return query;},async maybeSingle(){
           reads.push({table,columns,filters});
           if (errors[table] === 'throw') throw Error('private transport details must not escape');
           if (errors[table]) return {data:null,error:{message:'private DB details must not escape'}};
