@@ -34,9 +34,6 @@ function buildAuthoritativeSessionUpdate({ prompt, voice = DEFAULT_VOICE, handof
       input_audio_transcription: null,
       turn_detection: {
         type: 'server_vad',
-        threshold: 0.85,
-        silence_duration_ms: 800,
-        prefix_padding_ms: 300,
         idle_timeout_ms: null,
       },
       audio: {
@@ -130,8 +127,8 @@ function attestSessionUpdated(event, { prompt, voice = DEFAULT_VOICE, handoff = 
   const turn = session.turn_detection;
   if (!turn || typeof turn !== 'object' || Array.isArray(turn)) return sessionAttestationFailure('invalid_value', 'turn_detection');
   const turnKeys = Object.keys(turn);
-  if (turnKeys.some((key) => !['type', 'threshold', 'silence_duration_ms', 'prefix_padding_ms', 'idle_timeout_ms'].includes(key))) return sessionAttestationFailure('unexpected_field', 'turn_detection');
-  if (turn.type !== 'server_vad' || turn.threshold !== 0.85 || turn.silence_duration_ms !== 800 || turn.prefix_padding_ms !== 300) return sessionAttestationFailure('vad_drift', 'turn_detection');
+  if (turnKeys.some((key) => !['type', 'idle_timeout_ms'].includes(key))) return sessionAttestationFailure('unexpected_field', 'turn_detection');
+  if (turn.type !== 'server_vad') return sessionAttestationFailure('vad_drift', 'turn_detection');
   if (own(turn, 'idle_timeout_ms') && turn.idle_timeout_ms !== null) return sessionAttestationFailure('vad_drift', 'turn_detection.idle_timeout_ms');
   if (own(session, 'resumption') && (!exactKeys(session.resumption, ['enabled']) || session.resumption.enabled !== false)) return sessionAttestationFailure('retention_drift', 'resumption');
   return { ok: true, failure_category: null, field: null };
