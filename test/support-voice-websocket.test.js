@@ -53,7 +53,7 @@ class FakeUpstream extends EventEmitter {
             keep_context: false,
             max_response_output_tokens: 'inf',
             modalities: ['audio'],
-            model: 'grok-voice-think-fast-2.0',
+            model: 'grok-voice-2.0',
             output_audio_format: 'not specified',
             temperature: -1,
             tool_choice: 'auto',
@@ -253,7 +253,7 @@ test('authenticated browser WS receives ready only after exact provider attestat
     await waitFor(() => h.messages.some((message) => message.type === 'ready'));
     assert.equal(FakeUpstream.instances.length, 1);
     const upstream = FakeUpstream.instances[0];
-    assert.equal(upstream.url, 'wss://api.x.ai/v1/realtime?model=grok-voice-think-fast-2.0');
+    assert.equal(upstream.url, 'wss://api.x.ai/v1/realtime?model=grok-voice-2.0');
     assert.equal(upstream.options.maxPayload, 512 * 1024);
     assert.equal(upstream.options.perMessageDeflate, false);
     assert.match(upstream.options.headers.Authorization, /^Bearer /);
@@ -338,7 +338,7 @@ test('current bounded xAI control prelude is ignored until exact session attesta
       {
         type: 'session.created',
         event_id: '00000000-0000-4000-8000-000000000001',
-        session: { id: 'session-1', instructions: '', modalities: ['audio'], model: 'grok-voice-think-fast-2.0', object: 'realtime.session', tools: [], turn_detection: { type: null }, voice: 'xai_ara' },
+        session: { id: 'session-1', instructions: '', modalities: ['audio'], model: 'grok-voice-2.0', object: 'realtime.session', tools: [], turn_detection: { type: null }, voice: 'xai_ara' },
       },
       {
         type: 'conversation.created',
@@ -425,7 +425,7 @@ test('late session-created control terminates instead of resetting an attested s
     FakeUpstream.instances[0].emitProvider({
       type: 'session.created',
       event_id: '00000000-0000-4000-8000-000000000005',
-      session: { id: 'session-2', instructions: '', modalities: ['audio'], model: 'grok-voice-think-fast-2.0', object: 'realtime.session', tools: [], turn_detection: { type: 'server_vad' }, voice: 'xai_ara' },
+      session: { id: 'session-2', instructions: '', modalities: ['audio'], model: 'grok-voice-2.0', object: 'realtime.session', tools: [], turn_detection: { type: 'server_vad' }, voice: 'xai_ara' },
     });
     await waitFor(() => h.messages.some((message) => message.type === 'error'));
     assert.equal(FakeUpstream.instances[0].sent.filter((event) => event.type === 'conversation.item.create').length, 1);
@@ -531,7 +531,7 @@ test('a duplicate late session.updated is never ignored or applied twice', async
         keep_context: false,
         max_response_output_tokens: 'inf',
         modalities: ['audio'],
-        model: 'grok-voice-think-fast-2.0',
+        model: 'grok-voice-2.0',
         output_audio_format: 'not specified',
         temperature: -1,
         tool_choice: 'auto',

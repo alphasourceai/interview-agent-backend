@@ -19,7 +19,7 @@ function providerSession(prompt, overrides = {}) {
       keep_context: false,
       max_response_output_tokens: 'inf',
       modalities: ['audio'],
-      model: 'grok-voice-think-fast-2.0',
+      model: 'grok-voice-2.0',
       output_audio_format: 'not specified',
       temperature: -1,
       tool_choice: 'auto',
@@ -84,6 +84,36 @@ test('provider canary fails closed with field-only diagnostics after critical dr
   assert.deepEqual(alerts, [{ failure_category: 'provider_attestation', field: 'modalities', consecutive_failures: 2 }]);
   assert.equal(await canary.probe(), false);
   assert.equal(alerts.length, 1);
+});
+
+test('canary accepts the observed canonical provider prelude and exact consented-handoff tool', async () => {
+  class CurrentProvider extends EventEmitter {
+    constructor(url) {
+      super();
+      assert.equal(url, 'wss://api.x.ai/v1/realtime?model=grok-voice-2.0');
+      queueMicrotask(() => this.emit('open'));
+    }
+    send(encoded, callback) {
+      const update = JSON.parse(encoded);
+      assert.equal(update.type, 'session.update');
+      assert.equal(update.session.tools.length, 1);
+      const events = [
+        { type: 'session.created', event_id: 'created-model', session: { id: 'session-model', instructions: '', modalities: ['audio'], model: 'grok-voice-2.0', object: 'realtime.session', tools: [], turn_detection: { type: null }, voice: 'xai_ara' } },
+        { type: 'conversation.created', event_id: 'conversation-model', previous_item_id: null, conversation: { id: 'conversation-model', object: 'realtime.conversation' } },
+        { type: 'ping', event_id: 'ping-model', previous_item_id: null, timestamp: 1_792_458_000 },
+        providerSession(update.session.instructions, { tools: update.session.tools.map(({ type, ...fn }) => ({ type, function: fn })) }),
+      ];
+      callback?.();
+      queueMicrotask(() => { for (const event of events) this.emit('message', Buffer.from(JSON.stringify(event)), false); });
+    }
+    close() {}
+  }
+  const canary = createSupportVoiceProviderCanary({
+    env: { SUPPORT_VOICE_ENABLED: 'true', SUPPORT_HANDOFF_ENABLED: 'true', XAI_API_KEY: 'xai-test-key-not-a-real-secret', SENDGRID_API_KEY: 'sendgrid-test-not-a-real-secret' },
+    logger: { info() {}, warn() {} }, WebSocketClient: CurrentProvider, timeoutMs: 100,
+  });
+  assert.equal(await canary.probe(), true);
+  assert.equal(canary.ready(), true);
 });
 
 test('throwing diagnostic and alert sinks cannot stall or disable later probes', async () => {

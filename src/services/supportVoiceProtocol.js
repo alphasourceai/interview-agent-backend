@@ -1,4 +1,5 @@
-const MODEL = 'grok-voice-think-fast-2.0';
+// Pin the explicit provider model, not the legacy think-fast alias or mutable latest.
+const MODEL = 'grok-voice-2.0';
 const UPSTREAM_URL = `wss://api.x.ai/v1/realtime?model=${MODEL}`;
 const DEFAULT_VOICE = 'carina';
 const BROWSER_MAX_PAYLOAD = 48 * 1024;

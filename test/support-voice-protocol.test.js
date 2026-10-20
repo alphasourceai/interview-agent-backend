@@ -1,6 +1,8 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
+  MODEL,
+  UPSTREAM_URL,
   BROWSER_MAX_PAYLOAD,
   UPSTREAM_MAX_PAYLOAD,
   attestSessionUpdated,
@@ -30,7 +32,7 @@ function acceptedSession() {
       keep_context: false,
       max_response_output_tokens: 'inf',
       modalities: ['audio'],
-      model: 'grok-voice-think-fast-2.0',
+      model: 'grok-voice-2.0',
       output_audio_format: 'not specified',
       temperature: -1,
       tool_choice: 'auto',
@@ -52,6 +54,22 @@ test('authoritative update pins audio-only, transcription off, no tools, and res
 
 test('closed session.updated attestation accepts the sanitized live provider shape', () => {
   assert.equal(validateSessionUpdated(acceptedSession(), { prompt, voice: 'carina' }), true);
+});
+
+test('canonical model pin rejects retired aliases, mutable aliases and other models at both gates', () => {
+  assert.equal(MODEL, 'grok-voice-2.0');
+  assert.equal(UPSTREAM_URL, 'wss://api.x.ai/v1/realtime?model=grok-voice-2.0');
+  const created = {
+    type: 'session.created', event_id: 'model-regression',
+    session: { id: 'session-model', instructions: '', modalities: ['audio'], model: 'grok-voice-2.0', object: 'realtime.session', tools: [], turn_detection: { type: null }, voice: 'xai_ara' },
+  };
+  assert.equal(validatePreAttestationProviderEvent(created), true);
+  for (const model of ['grok-voice-think-fast-2.0', 'grok-voice-latest', 'grok-voice-3.0', 'unknown-model', '', null]) {
+    assert.equal(validatePreAttestationProviderEvent({ ...created, session: { ...created.session, model } }), false);
+    const updated = acceptedSession();
+    updated.session.model = model;
+    assert.deepEqual(attestSessionUpdated(updated, { prompt }), { ok: false, failure_category: 'model_drift', field: 'model' });
+  }
 });
 
 test('provider VAD echo accepts only documented type and disabled idle timeout', () => {
@@ -118,7 +136,7 @@ test('only the exact current bounded pre-attestation provider controls are accep
     {
       type: 'session.created',
       event_id: '00000000-0000-4000-8000-000000000001',
-      session: { id: 'session-1', instructions: '', modalities: ['audio'], model: 'grok-voice-think-fast-2.0', object: 'realtime.session', tools: [], turn_detection: { type: 'server_vad' }, voice: 'xai_ara' },
+      session: { id: 'session-1', instructions: '', modalities: ['audio'], model: 'grok-voice-2.0', object: 'realtime.session', tools: [], turn_detection: { type: 'server_vad' }, voice: 'xai_ara' },
     },
     {
       type: 'conversation.created',
@@ -156,7 +174,7 @@ test('pre-attestation session.created accepts the current content-free null turn
       id: 'session-1',
       instructions: '',
       modalities: ['audio'],
-      model: 'grok-voice-think-fast-2.0',
+      model: 'grok-voice-2.0',
       object: 'realtime.session',
       tools: [],
       turn_detection: null,
@@ -174,7 +192,7 @@ test('pre-attestation session.created accepts the current exact one-key null tur
       id: 'session-1',
       instructions: '',
       modalities: ['audio'],
-      model: 'grok-voice-think-fast-2.0',
+      model: 'grok-voice-2.0',
       object: 'realtime.session',
       tools: [],
       turn_detection: { type: null },
